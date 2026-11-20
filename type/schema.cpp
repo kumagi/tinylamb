@@ -208,6 +208,10 @@ std::ostream& operator<<(std::ostream& o, const Schema& s) {
   return o;
 }
 
+// Catalog records (Schema/Table/IndexSchema) carry no magic/version; readers
+// detect trailing extensions with Decoder::AtEnd(). A field added by a newer
+// binary is therefore indistinguishable from a truncated record to an older
+// reader -- versioning must be added before changing this format.
 Encoder& operator<<(Encoder& a, const Schema& sc) {
   a << sc.name_ << sc.columns_;
   return a;

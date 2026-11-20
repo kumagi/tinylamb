@@ -41,6 +41,7 @@
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -198,8 +199,16 @@ Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
       }
       return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
     }
+    case TypeTag::kCastExp: {
+      // Resolve aliases inside the cast's child (e.g. GROUP BY CAST(alias AS
+      // INT64)); the CAST wrapper itself is preserved with its target type.
+      const auto& cast = expression->AsCastExpression();
+      return CastExpressionExp(
+          ResolveAliasInTree(cast.Child(), schema, select_list),
+          cast.TargetTypeName(), cast.ReturnNullOnError());
+    }
     default:
-      // Aggregates, casts of aggregates, subqueries and constants stay as-is.
+      // Aggregates, subqueries and constants stay as-is.
       return expression;
   }
 }
@@ -765,7 +774,8 @@ std::shared_ptr<SelectStatement> PushGroupedCteJoinDomains(
                 if (filter.resolved && !filter.contains_query &&
                     filter.sources.size() == 1 &&
                     filter.sources.contains(dimension) &&
-                    SafeToReduceEvaluationCount(filter.expression)) {
+                    SafeToReduceEvaluationCountWithSchema(
+                        filter.expression, schemas[dimension].schema)) {
                   local.push_back(filter.expression);
                   for (const auto& ref : filter.expression->TouchedColumns()) {
                     if (auto pos =
@@ -2479,7 +2489,13 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         const auto offset =
             LocalColumnOffset(domain->schema, created->outer_columns[0]);
         if (offset) {
-          std::unordered_set<std::string> keys;
+          // T4594: transparent hashing lets erase_if probe with the raw
+          // string_view; the old std::string bucket forced a heap copy per
+          // examined inner row (up to the 2M-row domain cap) just to look
+          // up a byte-comparable key.
+          std::unordered_set<std::string, TransparentStringHash,
+                             std::equal_to<>>
+              keys;
           bool compatible = true;
           auto observe_key = [&](const Value& key) {
             if (key.IsNull()) {
@@ -2546,11 +2562,14 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             }
           }
           if (compatible) {
-            source.EnsureRowsMaterialized();
+            // T4539: nullopt here means "take the generic path", which
+            // materializes with proper Status propagation.
+            if (!source.EnsureRowsMaterialized().ok()) {
+              return std::nullopt;
+            }
             std::erase_if(source.rows, [&](const Row& row) {
               const auto& key = row[created->local_columns[0]];
-              return key.IsNull() ||
-                     !keys.contains(std::string(key.AsStringView()));
+              return key.IsNull() || !keys.contains(key.AsStringView());
             });
             created->outer_filter_relation = domain;
             created->outer_filter_serial = runtime.correlated_outer_serial;
@@ -3042,8 +3061,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           Value* extreme = created->preagg_int_scalars.TryEmplace(
               IntegerJoinKey(row, created->local_columns[0]));
           const Value& value = row[*aggregate_child_columns[0]];
-          if (value.IsNull()) { return;
-}
+          if (value.IsNull()) {
+            return;
+          }
           if (value.type == ValueType::kDouble &&
               std::isnan(value.value.double_value)) {
             *extreme = Value(std::numeric_limits<double>::quiet_NaN());
@@ -3180,7 +3200,10 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
              16UL, std::max<size_t>(1, build_rows / 4096)});
         if (workers > 1) {
-          source.EnsureRowsMaterialized();
+          // T4539: nullopt = take the generic path (builder contract).
+          if (!source.EnsureRowsMaterialized().ok()) {
+            return std::nullopt;
+          }
           std::vector<BuildWorker> build_workers(workers);
           for (BuildWorker& local : build_workers) {
             local.int_groups.set_use_flat(use_flat_groups);
@@ -3361,8 +3384,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                 chunk.columns[c].WriteValueInto(r, &scratch.values_[c]);
               }
               accumulate_one(scratch);
-              if (!group_error.ok()) { return std::nullopt;
-}
+              if (!group_error.ok()) {
+                return std::nullopt;
+              }
             }
           }
         } else if (source.ForEachRow(accumulate_one) != Status::kSuccess) {
@@ -3677,8 +3701,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         // with the wrong domain.
         for (const slot_t local : created->local_columns) {
           share_key.push_back('\x1e');
-          share_key += std::string(
-              source.schema.GetColumn(local).Name().name);
+          share_key += std::string(source.schema.GetColumn(local).Name().name);
         }
         for (const ColumnName& outer_col : created->outer_columns) {
           share_key.push_back('\x1d');
@@ -3734,21 +3757,35 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                     return left.first < right.first;
                   });
         if (shareable && build_predicates.empty() &&
-            applied_scan_predicates.empty()) {
+            applied_scan_predicates.empty() &&
+            context.execution_runtime()->shared_exists_builds.size() <
+                ExecutionRuntime::kMaxSharedExistsBuilds &&
+            context.execution_runtime()->shared_exists_retained_rows +
+                    created->int_rows.size() <=
+                ExecutionRuntime::kMaxSharedExistsRetainedRows) {
           // Only builds without build-time predicates may be published: a
           // consumer of this entry probes every loaded row under its own
-          // residual conjunction.
+          // residual conjunction.  T2426: publishing additionally needs
+          // headroom under the entry and retained-row caps; a rejected
+          // publish keeps the build's rows private (sharing is purely
+          // opportunistic, results are cap-invariant).
           auto rows =
               std::make_shared<const std::vector<std::pair<int64_t, Row>>>(
                   std::move(created->int_rows));
+          const size_t published_rows = rows->size();
           created->shared_int_rows = rows;
-          context.execution_runtime()->shared_exists_builds.emplace(
-              std::move(share_key),
-              ExecutionRuntime::SharedExistsBuild{
-                  .schema = source.schema,
-                  .rows = std::move(rows),
-                  .outer_filter_relation = domain_relation,
-                  .outer_filter_serial = domain_serial});
+          auto inserted =
+              context.execution_runtime()->shared_exists_builds.emplace(
+                  std::move(share_key),
+                  ExecutionRuntime::SharedExistsBuild{
+                      .schema = source.schema,
+                      .rows = std::move(rows),
+                      .outer_filter_relation = domain_relation,
+                      .outer_filter_serial = domain_serial});
+          if (inserted.second) {
+            context.execution_runtime()->shared_exists_retained_rows +=
+                published_rows;
+          }
         }
       }
     } else if (exists_only &&
@@ -4554,7 +4591,19 @@ bool StatementContainsVolatileFunctionCached(ExecutionRuntime* runtime,
 
 std::string UncorrelatedCacheKey(const SelectStatement& statement,
                                  const CteMap& ctes, bool exists_only) {
-  std::string key = statement.Fingerprint();
+  // Fingerprint() re-serialises the whole statement; the statement is
+  // immutable while pinned by a session, so memoise by address + runtime id.
+  struct FingerprintMemo {
+    const SelectStatement* stmt{nullptr};
+    uint64_t stmt_id{0};
+    std::string text;
+  };
+  static thread_local FingerprintMemo memo;
+  const uint64_t id = statement.RuntimeId();
+  if (memo.stmt != &statement || memo.stmt_id != id) {
+    memo = FingerprintMemo{&statement, id, statement.Fingerprint()};  // NOLINT(modernize-use-designated-initializers)
+  }
+  std::string key = memo.text;
   key += exists_only ? "|mode=exists" : "|mode=rows";
   if (ctes.empty()) {
     return key;
@@ -4658,10 +4707,15 @@ std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
         const ColumnName& candidate = current->schema->GetColumn(column).Name();
         const bool referenced = std::ranges::any_of(
             referenced_columns, [&](const ColumnName& requested) {
-              return requested == candidate ||
-                     requested.ToString() == candidate.ToString() ||
+              // Column resolution folds case (IdentifierEqualsIgnoreCase),
+              // so the cache key must too or a case-different reference drops
+              // the outer column value from the key.
+              const auto eq = [](std::string_view a, std::string_view b) {
+                return AsciiToLower(a) == AsciiToLower(b);
+              };
+              return eq(requested.ToString(), candidate.ToString()) ||
                      (requested.schema.empty() &&
-                      requested.name == candidate.name);
+                      eq(requested.name, candidate.name));
             });
         if (referenced && column < current->row->values_.size()) {
           parameters.push_back((*current->row)[column]);
@@ -4880,7 +4934,14 @@ void MaterializeArenaRange(const BaseRelationArena& arena, const Schema& schema,
                                  ? arena.slot_types[c]
                                  : schema.GetColumn(c).Type();
       if (type == ValueType::kVarChar) {
-        row.values_[c] = Value(std::string(arena.Varchar(index, c)));
+        Value cell(std::string(arena.Varchar(index, c)));
+        // Interval columns are VARCHAR cells carrying an interval tag; the
+        // arena's slot_types record only the ValueType, so restore the tag
+        // from the schema or the boxed row stops matching itself.
+        if (c < schema.ColumnCount() && schema.GetColumn(c).IsInterval()) {
+          cell.SetInterval();
+        }
+        row.values_[c] = std::move(cell);
       } else if (type == ValueType::kDouble) {
         Value value;
         value.type = ValueType::kDouble;
@@ -4902,15 +4963,21 @@ void MaterializeArenaRange(const BaseRelationArena& arena, const Schema& schema,
 
 void MaterializeCacheRowsIfNeeded(const std::string& cache_key,
                                   Relation* cached, ExecutionRuntime* runtime) {
-  if (cached == nullptr || runtime == nullptr || !cached->rows.empty()) {
+  if (cached == nullptr || runtime == nullptr) {
     return;
   }
-  const auto arena = runtime->base_relation_arenas.find(cache_key);
+  const auto arena_it = runtime->base_relation_arenas.find(cache_key);
+  if (arena_it != runtime->base_relation_arenas.end() && arena_it->second &&
+      arena_it->second->rows_boxed) {
+    return;  // already boxed, even if the cached relation is legitimately empty
+  }
+  const auto arena = arena_it;
   if (arena == runtime->base_relation_arenas.end() ||
       arena->second->rows == 0 || !arena->second->published_rowsless ||
       arena->second->rows_boxed) {
     return;
   }
+  arena->second->PrepareVarcharOrdinals();
   cached->rows.resize(arena->second->rows);
   MaterializeArenaRange(*arena->second, cached->schema, 0, arena->second->rows,
                         &cached->rows);
@@ -4930,6 +4997,8 @@ Status MaterializeCacheRowsParallel(const std::string& cache_key,
     return Status::kSuccess;
   }
   BaseRelationArena& a = *arena->second;
+  // Workers below read the arena concurrently; fill its lazy caches first.
+  a.PrepareVarcharOrdinals();
   const size_t workers = std::clamp<size_t>(
       QueryParallelWorkerLimit(std::thread::hardware_concurrency()), 1, 16);
   // RunParallelTasks is the Status boundary for worker bodies: allocation

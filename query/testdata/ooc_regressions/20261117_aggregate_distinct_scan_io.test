@@ -74,6 +74,9 @@ ins_bulk t1 1095 1430 899
 upd t0 range 163 453 1 0 vset 681 0 pad 1048 45
 sweep mem 399 :: q ord=0 heavy=0 take=-1 nv=1 vs=1031850921 ex=0 snap=0 :: SELECT COUNT(*), SUM(a.k * b.k), SUM(LENGTH(a.pad) + LENGTH(b.pad)), COUNT(a.v + b.v) FROM (SELECT * FROM t1 WHERE k BETWEEN 704 AND 718) a CROSS JOIN t0 b
 sweep io 62 :: ins_copy t3 t0 783 857 327
+-- the copy makes fewer than 62 I/O calls since 2026-11-20, so its last
+-- attempt is kept; abort restores the image this trace was recorded with.
+abort
 ins_values t3 1110 1111 463
 abort
 sweep io 66 :: q ord=0 heavy=0 take=-1 nv=1 vs=595257859 ex=0 snap=0 :: SELECT g AS c1, t AS c2, COUNT(v) AS c3, COUNTIF(v > 281) AS c4, COUNT(DISTINCT v) AS c5, COUNT(DISTINCT v) AS c6 FROM t3 GROUP BY 1, 2

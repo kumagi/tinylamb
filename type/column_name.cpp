@@ -53,6 +53,8 @@ Decoder& operator>>(Decoder& e, ColumnName& c) {
 uint64_t std::hash<tinylamb::ColumnName>::operator()(
     const tinylamb::ColumnName& c) const noexcept {
   uint64_t result = std::hash<std::string_view>()(c.schema);
-  result += std::hash<std::string_view>()(c.name);
+  // Order-sensitive combine: += would make ("a","b") and ("b","a") collide.
+  result ^= std::hash<std::string_view>()(c.name) + 0x9e3779b97f4a7c15ULL +
+            (result << 6) + (result >> 2);
   return result;
 }

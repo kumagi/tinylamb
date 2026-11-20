@@ -59,7 +59,8 @@ def summarize(output):
     for case in manifest['cases']:
         path = output / f"{case['name']}_t{case['threads']}.jsonl"
         data = [json.loads(line) for line in path.read_text().splitlines()]
-        assert len(data) == 18 and all(r['verified'] for r in data)
+        if len(data) != 18 or not all(r['verified'] for r in data):
+            raise ValueError(f'{path}: expected 18 verified samples')
         for mode in MODES:
             rows = [r for r in data if r['mode'] == mode and not r['warmup']]
             assert len(rows) == 5
@@ -125,8 +126,10 @@ def main():
         manifest = dict(started=datetime.now(timezone.utc).isoformat(), binary=str(opts.binary.resolve()),
                         binary_sha256=digest(opts.binary), source_sha256=digest(ROOT / 'benchmark/spsc_aggregation_benchmark.cpp'),
                         git_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-                        cases=run_cases, repeats=5, local_groups=4096, ring_batches=8, batch_entries=256,
-                        morsel_rows=65536, note='Dirty tree; excluded setup and validation; no SQL execution')
+                        cases=run_cases, repeats=5,
+                        # Ring/batch/local-group sizes vary per case; the
+                        # authoritative values are in each case's command.
+                        note='Dirty tree; excluded setup and validation; no SQL execution; per-case settings in cases[].command')
         if opts.q67_input:
             manifest['q67_sha256'] = digest(opts.q67_input)
         (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
@@ -141,7 +144,8 @@ def main():
             with (output / f"{case['name']}_t{case['threads']}.jsonl").open('w') as out:
                 subprocess.run(command, stdout=out, check=True, timeout=600)
         manifest['finished'] = datetime.now(timezone.utc).isoformat()
-        assert manifest['binary_sha256'] == digest(opts.binary), 'Binary changed during measurements'
+        if manifest['binary_sha256'] != digest(opts.binary):
+            raise ValueError('Binary changed during measurements')
         (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     summarize(output)
 

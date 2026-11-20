@@ -15,10 +15,12 @@ commit-filtered fuzzy crash recovery.
   `kLsmDestroy`) protected by trailing CRC32C.
 - `recovery_manager.{hpp,cpp}` — `RecoverFrom(checkpoint_lsn)`: loads the
   latest fuzzy checkpoint via `PageManager::LoadFuzzyCheckpoint` and runs a
-  2-pass WAL scan from `min(checkpoint_lsn, ckpt_replay_start_lsn)` that
-  identifies committed transactions (`kCommit`) and replays only committed
-  records in LSN order (`PageManager::ReplayCommittedRecord`). Uncommitted
-  loser transactions are naturally ignored without undo passes or CLRs.
+  2-pass WAL scan (using a memory-bounded `CompactTxnBitmap` in Pass 1) from
+  `min(checkpoint_lsn, ckpt_replay_start_lsn)` that identifies committed
+  transactions (`kCommit`) and replays only committed records in LSN order
+  (`PageManager::ReplayCommittedRecord`). Uncommitted loser transactions are
+  naturally ignored without undo passes or CLRs. Also provides `ReadLog` for
+  large-transaction WAL re-read abort/commit scans (P6a, ADR 0008).
 - `checkpoint_manager.{hpp,cpp}` — compaction-driven persistence: triggered by
   LSM-Tree flush/compaction or committed mutation threshold (no idle periodic
   WAL writes or `.last_checkpoint` sidecar), captures `oldest_active_first_lsn`,

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/string_util.hpp"
 #include "common/platform/time_format.hpp"
 
 #include <array>
@@ -240,8 +241,7 @@ const char* ParseIntField(const char* rp, int max_digits, int min_val,
 bool StartsWithIgnoreCase(const char* s, const char* prefix, size_t* len) {
   size_t i = 0;
   while (prefix[i] != '\0') {
-    if (std::tolower(static_cast<unsigned char>(s[i])) !=
-        std::tolower(static_cast<unsigned char>(prefix[i]))) {
+    if (AsciiToLower(s[i]) != AsciiToLower(prefix[i])) {
       return false;
     }
     ++i;

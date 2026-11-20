@@ -1,5 +1,7 @@
 name: benchmark
 on:
+permissions:
+  contents: read
   workflow_dispatch:
   schedule:
     # Every Monday 03:00 UTC (weekly)
@@ -7,8 +9,8 @@ on:
 
 jobs:
   tpch-sf1:
-    # P3-1 benchmark regression gate. SF=1 fixed; compares the query-time sum
-    # against the newest section of BenchmarkHistory.md via scripts/bench_gate.py.
+    # P3-1 benchmark regression gate. SF=1 fixed; bench_gate.py compares
+    # per-query times (and the q1..q22 sum) against BenchmarkHistory.md.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

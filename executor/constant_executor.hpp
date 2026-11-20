@@ -34,6 +34,9 @@ class ConstantExecutor : public ExecutorBase {
 
  private:
   std::vector<Row> rows_;
+  // Schema inferred from the first row (if any) so an empty batch still
+  // carries the relation's column types.
+  Schema schema_;
   size_t offset_{0};
 };
 

@@ -20,11 +20,13 @@
 // clang-format on
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -74,12 +76,42 @@ class CatalogTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
+TEST_F(CatalogTest, UncommittedIndexIsInvisibleToOtherCatalogReaders) {
+  auto setup = rs_->BeginContext();
+  ASSERT_TRUE(rs_->CreateTable(setup, Schema("IndexVisibility",
+                                             {Column("k", ValueType::kInt64)}))
+                  .HasValue());
+  ASSERT_SUCCESS(setup.PreCommit());
+  auto writer = rs_->BeginContext();
+  ASSERT_SUCCESS(rs_->CreateIndex(writer, "IndexVisibility",
+                                  IndexSchema("PendingIndex", {0})));
+  ASSIGN_OR_ASSERT_FAIL(Table, own, rs_->GetTable(writer, "IndexVisibility"));
+  EXPECT_EQ(own.IndexCount(), 1U);
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, visible,
+                        rs_->GetTable(reader, "IndexVisibility"));
+  EXPECT_EQ(visible.IndexCount(), 0U);
+  ASSIGN_OR_ASSERT_FAIL(Table, folded,
+                        rs_->GetTable(reader, "indexvisibility"));
+  EXPECT_EQ(folded.IndexCount(), 0U);
+  ASSERT_SUCCESS(reader.PreCommit());
+  ASSERT_SUCCESS(writer.PreCommit());
+  auto after = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, published,
+                        rs_->GetTable(after, "IndexVisibility"));
+  EXPECT_EQ(published.IndexCount(), 1U);
+}
+
 TEST_F(CatalogTest, AuditViewIndexSurvivesReplaceDeleteAndReopen) {
   {
     auto ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->PutViewDefinition(ctx, "First", "SELECT 1"));
     ASSERT_SUCCESS(rs_->PutViewDefinition(ctx, "Second", "SELECT 2"));
-    ASSERT_SUCCESS(rs_->PutViewDefinition(ctx, "FIRST", "SELECT 3"));
+    // Same name in another case: replacing it needs the OR REPLACE flag.
+    EXPECT_EQ(rs_->PutViewDefinition(ctx, "FIRST", "SELECT 3").GetCode(),
+              StatusCode::kConflicts);
+    ASSERT_SUCCESS(rs_->PutViewDefinition(ctx, "FIRST", "SELECT 3",
+                                          /*replace_existing=*/true));
     ASSIGN_OR_ASSERT_FAIL(std::vector<std::string>, names,
                           rs_->ListViewDefinitions(ctx));
     EXPECT_EQ(names, (std::vector<std::string>{"first", "second"}));
@@ -512,7 +544,7 @@ TEST_F(CatalogTest, CreateTableWithUniqueColumn) {
                                       Constraint(Constraint::kUnique)),
                                Column("name", ValueType::kVarChar)});
 
-  // Act -- create the table; this path builds a unique B+tree index
+  // Act -- create the table; this path builds a unique LSM index
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
@@ -595,6 +627,51 @@ TEST_F(CatalogTest, FailedQuiescentDropFailsPreCommitAndPreservesTable) {
   ASSERT_TRUE(restarted_lease.Value().Valid());
   restarted_lease.Value().Release();
   ASSERT_SUCCESS(restarted.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, CannotAddForeignKeyWhileParentDropWaitsForALease) {
+  const Schema parent("fk_parent", {Column("id", ValueType::kInt64)});
+  const Schema child(
+      "fk_child",
+      {Column("parent_id", ValueType::kInt64,
+              Constraint(Constraint::kForeign, Value("fk_parent(id)")))});
+  {
+    auto create = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(create, parent).GetStatus());
+    ASSERT_SUCCESS(create.PreCommit());
+  }
+
+  // Keep the parent in the catalog until the concurrent DROP has finished
+  // its reference scan and entered the lease wait.
+  std::jthread drop_thread;
+  auto reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(reader, parent.Name()));
+  ASSIGN_OR_ASSERT_FAIL(TableLease, lease,
+                        table.AcquireLease(reader.txn_.ID()));
+  drop_thread = std::jthread([&] {
+    auto drop = rs_->BeginContext();
+    EXPECT_SUCCESS(rs_->DropTable(drop, parent.Name()));
+    EXPECT_SUCCESS(drop.PreCommit());
+  });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (table.AcquireLease(reader.txn_.ID()).HasValue()) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    std::this_thread::yield();
+  }
+
+  auto create_child = rs_->BeginContext();
+  EXPECT_EQ(rs_->CreateTable(create_child, child).GetStatus(),
+            Status::kConflicts);
+  create_child.Abort();
+  lease.Release();
+  reader.Abort();
+  drop_thread.join();
+
+  auto check = rs_->BeginReadOnlyContext();
+  EXPECT_EQ(rs_->GetTable(check, parent.Name()).GetStatus(),
+            Status::kNotExists);
+  EXPECT_EQ(rs_->GetTable(check, child.Name()).GetStatus(), Status::kNotExists);
 }
 
 TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {

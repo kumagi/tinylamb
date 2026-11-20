@@ -88,12 +88,15 @@ bool SamePartitionTuple(const std::vector<Value>& a,
   return true;
 }
 
-std::vector<Value> ExtractSlice(const Row& row, size_t start, size_t count) {
+Value KeyAt(const Row& row, slot_t slot) {
+  return slot < row.Count() ? row[slot] : Value();
+}
+
+std::vector<Value> ExtractKeys(const Row& row, std::span<const slot_t> slots) {
   std::vector<Value> out;
-  out.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    const size_t idx = start + i;
-    out.push_back(idx < row.Count() ? row[idx] : Value());
+  out.reserve(slots.size());
+  for (const slot_t slot : slots) {
+    out.push_back(KeyAt(row, slot));
   }
   return out;
 }
@@ -288,7 +291,8 @@ class SegmentIndexedReader {
       RETURN_IF_FAIL(reader_.ReadExact(header.data(), sizeof(header)));
       const uint32_t row_count = header[0];
       const uint32_t payload_bytes = header[1];
-      if (payload_bytes > reader_.Remaining()) {
+      if (payload_bytes > reader_.Remaining() ||
+          row_count > payload_bytes / sizeof(uint32_t)) {
         return StatusError(StatusCode::kCorrupt, "truncated row block payload");
       }
       blocks_.push_back(BlockEntry{
@@ -388,7 +392,10 @@ bool IsStaticScalarExpr(const Expression& expr) {
           fn.FuncName() == "UUID" || fn.FuncName() == "GENERATE_UUID") {
         return false;
       }
-      for (const Expression& arg : fn.Args()) {
+      // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer
+      // here
+      for (const Expression& arg :  // NOLINT(readability-use-anyofallof)
+           fn.Args()) {  // NOLINT(readability-use-anyofallof)
         if (!IsStaticScalarExpr(arg)) {
           return false;
         }
@@ -461,8 +468,7 @@ bool RangeDistanceWithin(const Value& key, const Value& candidate, double off,
     return static_cast<platform::ExtendedFloat>(NumericValueOf(v));
   };
   const platform::ExtendedFloat diff = numeric(key) - numeric(candidate);
-  const auto bound =
-      static_cast<platform::ExtendedFloat>(off);
+  const auto bound = static_cast<platform::ExtendedFloat>(off);
   return inclusive_le ? diff <= bound : diff >= bound;
 }
 
@@ -594,16 +600,16 @@ StatusOr<int64_t> RangeIntervalBoundaryDays(const Value& key, int sign,
 // Resolves streaming monotonically moving `[lo, hi]` bounds for `RANGE` frames
 // over a sorted spilled partition segment using bounded `SegmentRowReader`
 // lookaheads.
-class RangeFrameScanner {
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding) intentional pattern
+// in this code
+class RangeFrameScanner {  // NOLINT(clang-analyzer-optin.performance.Padding)
  public:
   RangeFrameScanner(const SpillStore* store, SpillSegmentId seg_id,
-                    uint64_t total_rows, size_t order_key_start,
-                    size_t order_key_count, bool ascending,
-                    RangeBoundSpec start_bound, RangeBoundSpec end_bound,
-                    size_t buffer_bytes)
+                    uint64_t total_rows, std::span<const slot_t> order_slots,
+                    bool ascending, RangeBoundSpec start_bound,
+                    RangeBoundSpec end_bound, size_t buffer_bytes)
       : total_rows_(total_rows),
-        order_key_start_(order_key_start),
-        order_key_count_(order_key_count),
+        order_slots_(order_slots),
         ascending_(ascending),
         start_bound_(start_bound),
         end_bound_(end_bound),
@@ -628,7 +634,7 @@ class RangeFrameScanner {
     // record where each collapse run starts; RestartFloor() tells them the
     // lowest position a later frame can still read.  One sequential key pass
     // over the segment, O(1) extra memory.
-    if (order_key_count_ == 1 &&
+    if (order_slots_.size() == 1 &&
         (start_bound_.type == WindowFrameBoundType::kOffsetPreceding ||
          start_bound_.type == WindowFrameBoundType::kOffsetFollowing ||
          end_bound_.type == WindowFrameBoundType::kOffsetPreceding ||
@@ -644,7 +650,7 @@ class RangeFrameScanner {
         if (!got) {
           break;
         }
-        const Value key = ExtractSlice(r, order_key_start_, 1)[0];
+        const Value key = KeyAt(r, order_slots_.front());
         if (key.IsNull() || IsNaNOrderKey(key)) {
           if (!in_run) {
             in_run = true;
@@ -681,8 +687,7 @@ class RangeFrameScanner {
       *empty_out = true;
       return Status::kSuccess;
     }
-    const std::vector<Value> cur_keys =
-        ExtractSlice(cur_row, order_key_start_, order_key_count_);
+    const std::vector<Value> cur_keys = ExtractKeys(cur_row, order_slots_);
     if (!has_peer_ || k > peer_end_) {
       peer_start_ = k;
       peer_keys_ = cur_keys;
@@ -704,8 +709,7 @@ class RangeFrameScanner {
           if (!got) {
             break;
           }
-          peer_ahead_keys_ =
-              ExtractSlice(nxt, order_key_start_, order_key_count_);
+          peer_ahead_keys_ = ExtractKeys(nxt, order_slots_);
           peer_ahead_idx_ = peer_next_idx_++;
           peer_ahead_valid_ = true;
         }
@@ -720,8 +724,8 @@ class RangeFrameScanner {
     }
 
     const bool key_is_null =
-        order_key_count_ == 1 && !cur_keys.empty() && cur_keys[0].IsNull();
-    if (order_key_count_ == 0 || key_is_null ||
+        order_slots_.size() == 1 && !cur_keys.empty() && cur_keys[0].IsNull();
+    if (order_slots_.empty() || key_is_null ||
         (start_bound_.type != WindowFrameBoundType::kOffsetPreceding &&
          start_bound_.type != WindowFrameBoundType::kOffsetFollowing &&
          end_bound_.type != WindowFrameBoundType::kOffsetPreceding &&
@@ -790,7 +794,7 @@ class RangeFrameScanner {
               lo_idx = k;
               break;
             }
-            lo_ahead_key_ = ExtractSlice(r, order_key_start_, 1)[0];
+            lo_ahead_key_ = KeyAt(r, order_slots_.front());
             lo_ahead_idx_ = lo_next_idx_++;
             lo_ahead_valid_ = true;
           }
@@ -847,7 +851,7 @@ class RangeFrameScanner {
             if (!got) {
               break;
             }
-            lo_ahead_key_ = ExtractSlice(r, order_key_start_, 1)[0];
+            lo_ahead_key_ = KeyAt(r, order_slots_.front());
             lo_ahead_idx_ = lo_next_idx_++;
             lo_ahead_valid_ = true;
           }
@@ -907,7 +911,7 @@ class RangeFrameScanner {
             if (!got) {
               break;
             }
-            hi_ahead_key_ = ExtractSlice(r, order_key_start_, 1)[0];
+            hi_ahead_key_ = KeyAt(r, order_slots_.front());
             hi_ahead_idx_ = hi_next_idx_++;
             hi_ahead_valid_ = true;
           }
@@ -942,6 +946,7 @@ class RangeFrameScanner {
           break;
         }
         if (hi_last_reached_.has_value()) {
+          // NOLINTNEXTLINE(bugprone-optional-value-conversion) deliberate
           hi_idx = *hi_last_reached_;
         } else if (!end_bound_.is_interval) {
           hi_idx = peer_end_;
@@ -977,7 +982,7 @@ class RangeFrameScanner {
             if (!got) {
               break;
             }
-            hi_ahead_key_ = ExtractSlice(r, order_key_start_, 1)[0];
+            hi_ahead_key_ = KeyAt(r, order_slots_.front());
             hi_ahead_idx_ = hi_next_idx_++;
             hi_ahead_valid_ = true;
           }
@@ -1033,6 +1038,7 @@ class RangeFrameScanner {
           break;
         }
         if (hi_last_reached_.has_value()) {
+          // NOLINTNEXTLINE(bugprone-optional-value-conversion) deliberate
           hi_idx = *hi_last_reached_;
         }
         break;
@@ -1056,8 +1062,7 @@ class RangeFrameScanner {
 
  private:
   uint64_t total_rows_{0};
-  size_t order_key_start_{0};
-  size_t order_key_count_{0};
+  std::span<const slot_t> order_slots_;
   bool ascending_{true};
   RangeBoundSpec start_bound_;
   RangeBoundSpec end_bound_;
@@ -1377,7 +1382,10 @@ class StreamingWindowAggState {
       bit_acc_ ^= v.value.int_value;
       return Status::kSuccess;
     }
-    return StatusError(StatusCode::kMemoryLimitExceeded,
+    // T2131: "this aggregate has no streaming implementation" is a
+    // capability gap (SQLSTATE 0A000 via kNotImplemented), not a resource
+    // failure -- 53200 here made clients retry with more memory forever.
+    return StatusError(StatusCode::kNotImplemented,
                        "Unsupported streaming window aggregate: " + fn_);
   }
 
@@ -1612,7 +1620,7 @@ class SlidingMinMax {
       return Status::kSuccess;
     }
     if (v.type == ValueType::kDouble && std::isnan(v.value.double_value)) {
-      nans_.push_back(Entry{.pos=pos, .v=std::move(v)});
+      nans_.push_back(Entry{.pos = pos, .v = std::move(v)});
       return Status::kSuccess;
     }
     while (!q_.empty()) {
@@ -1624,7 +1632,7 @@ class SlidingMinMax {
       }
       q_.pop_back();
     }
-    q_.push_back(Entry{.pos=pos, .v=std::move(v)});
+    q_.push_back(Entry{.pos = pos, .v = std::move(v)});
     return Status::kSuccess;
   }
 
@@ -1637,11 +1645,12 @@ class SlidingMinMax {
     }
   }
 
-  // Matches StreamingWindowAggState::Result() for MIN/MAX: the last NaN arg
-  // wins, then the best value, then NULL for an all-NULL/empty frame.
+  // Matches StreamingWindowAggState::Result() for MIN/MAX: the FIRST NaN in
+  // the frame wins (a later NaN never replaces an existing best NaN), then
+  // the best value, then NULL for an all-NULL/empty frame.
   [[nodiscard]] Value Result() const {
     if (!nans_.empty()) {
-      return nans_.back().v;
+      return nans_.front().v;
     }
     return q_.empty() ? Value() : q_.front().v;
   }
@@ -1668,16 +1677,15 @@ class SkewCallStream {
  public:
   SkewCallStream(const SpillStore* store, SpillSegmentId seg_id,
                  uint64_t total_rows, const WindowFunctionCallExpression& call,
-                 const Schema& input_schema, size_t order_key_start,
-                 TransactionContext* txn, size_t budget_bytes,
-                 QueryMemoryGrant* grant = nullptr)
+                 const Schema& input_schema,
+                 std::span<const slot_t> order_slots, TransactionContext* txn,
+                 size_t budget_bytes, QueryMemoryGrant* grant = nullptr)
       : store_(store),
         seg_id_(seg_id),
         total_rows_(total_rows),
         call_(call),
         input_schema_(input_schema),
-        order_key_start_(order_key_start),
-        order_key_count_(call.order_by.size()),
+        order_slots_(order_slots),
         txn_(txn),
         budget_bytes_(std::max<size_t>(kMinWindowMemBudget, budget_bytes)),
         grant_(grant),
@@ -1716,7 +1724,7 @@ class SkewCallStream {
       return Status::kSuccess;
     }
     if (fn == "CUME_DIST") {
-      if (order_key_count_ == 0) {
+      if (order_slots_.empty()) {
         mode_ = Mode::kConstantValue;
         const_val_ = Value(1.0);
         return Status::kSuccess;
@@ -1868,7 +1876,7 @@ class SkewCallStream {
           ((call_.frame_unit == WindowFrameUnit::kRange ||
             call_.frame_unit == WindowFrameUnit::kGroups) &&
            call_.frame_end.type == WindowFrameBoundType::kCurrentRow)) {
-        if (order_key_count_ == 0) {
+        if (order_slots_.empty()) {
           // Every row in the partition is a peer -> same as whole partition.
           SegmentRowReader scan(store_, seg_id_,
                                 std::max<size_t>(4096, budget_bytes_ / 4));
@@ -2091,7 +2099,8 @@ class SkewCallStream {
         return Status::kSuccess;
       }
 
-      // Bounded deque sliding window capped at max(16 KiB, `budget_bytes_ / 2`):
+      // Bounded deque sliding window capped at max(16 KiB, `budget_bytes_ /
+      // 2`):
       peer_reader_ = std::make_unique<SegmentRowReader>(
           store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(peer_reader_->Open());
@@ -2126,7 +2135,7 @@ class SkewCallStream {
           start_b.type == WindowFrameBoundType::kOffsetFollowing ||
           end_b.type == WindowFrameBoundType::kOffsetPreceding ||
           end_b.type == WindowFrameBoundType::kOffsetFollowing;
-      if (has_offset && order_key_count_ != 1) {
+      if (has_offset && order_slots_.size() != 1) {
         return StatusError(
             StatusCode::kInvalidArgument,
             "RANGE with offset requires a single ORDER BY expression");
@@ -2137,8 +2146,8 @@ class SkewCallStream {
       const bool asc =
           call_.order_by.empty() ? true : call_.order_by[0].ascending;
       range_scanner_ = std::make_unique<RangeFrameScanner>(
-          store_, seg_id_, total_rows_, order_key_start_, order_key_count_, asc,
-          sspec, espec, std::max<size_t>(4096, budget_bytes_ / 4));
+          store_, seg_id_, total_rows_, order_slots_, asc, sspec, espec,
+          std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(range_scanner_->Open());
 
       if (dynamic_nth) {
@@ -2224,12 +2233,11 @@ class SkewCallStream {
         if (!got) {
           return false;
         }
-        if (order_key_count_ == 0) {
+        if (order_slots_.empty()) {
           peer_rank_ = 1;
           dense_rank_ = 1;
         } else {
-          std::vector<Value> keys =
-              ExtractSlice(*row_out, order_key_start_, order_key_count_);
+          std::vector<Value> keys = ExtractKeys(*row_out, order_slots_);
           if (!has_prev_keys_ || !SamePartitionTuple(prev_keys_, keys)) {
             peer_rank_ = k_ + 1;
             ++dense_rank_;
@@ -2260,8 +2268,8 @@ class SkewCallStream {
             ASSIGN_OR_RETURN(bool, pok,
                              peer_reader_->Next(&peer_lookahead_row_));
             if (pok) {
-              peer_lookahead_keys_ = ExtractSlice(
-                  peer_lookahead_row_, order_key_start_, order_key_count_);
+              peer_lookahead_keys_ =
+                  ExtractKeys(peer_lookahead_row_, order_slots_);
               peer_lookahead_valid_ = true;
             }
           }
@@ -2276,8 +2284,7 @@ class SkewCallStream {
               if (!pok) {
                 break;
               }
-              std::vector<Value> nxt_keys =
-                  ExtractSlice(nxt, order_key_start_, order_key_count_);
+              std::vector<Value> nxt_keys = ExtractKeys(nxt, order_slots_);
               if (SamePartitionTuple(group_keys, nxt_keys)) {
                 ++count_in_group;
               } else {
@@ -2513,8 +2520,8 @@ class SkewCallStream {
             ASSIGN_OR_RETURN(bool, pok,
                              peer_reader_->Next(&peer_lookahead_row_));
             if (pok) {
-              peer_lookahead_keys_ = ExtractSlice(
-                  peer_lookahead_row_, order_key_start_, order_key_count_);
+              peer_lookahead_keys_ =
+                  ExtractKeys(peer_lookahead_row_, order_slots_);
               peer_lookahead_valid_ = true;
             }
           }
@@ -2530,8 +2537,7 @@ class SkewCallStream {
               if (!pok) {
                 break;
               }
-              std::vector<Value> nxt_keys =
-                  ExtractSlice(nxt, order_key_start_, order_key_count_);
+              std::vector<Value> nxt_keys = ExtractKeys(nxt, order_slots_);
               if (SamePartitionTuple(group_keys, nxt_keys)) {
                 RETURN_IF_FAIL(prefix_agg_->AddRow(nxt));
                 ++count_in_group;
@@ -2660,8 +2666,11 @@ class SkewCallStream {
             empty_frame ? k_
                         : std::min<uint64_t>(static_cast<uint64_t>(raw_hi),
                                              total_rows_ - 1);
-        const uint64_t keep_lo =
-            direct_streaming ? target_lo : std::min(k_, target_lo);
+        // The deque floor must only advance to the minimum frame start that
+        // ANY future row can need. When the current frame is empty, clamping
+        // to k_ discards rows that later (non-empty) frames still reference;
+        // target_lo is already clamped to the never-decreasing raw bound.
+        const uint64_t keep_lo = target_lo;
         const uint64_t keep_hi =
             direct_streaming ? target_hi : std::max(k_, target_hi);
 
@@ -2889,8 +2898,9 @@ class SkewCallStream {
           eff_lo = *floor;
         }
         const uint64_t eff_hi = empty_frame ? k_ : target_hi;
-        const uint64_t keep_lo =
-            direct_streaming ? eff_lo : std::min(k_, eff_lo);
+        // eff_lo already carries the monotonically non-decreasing future
+        // floor (RestartFloor); never clamp it up to k_ on an empty frame.
+        const uint64_t keep_lo = eff_lo;
         const uint64_t keep_hi =
             direct_streaming ? eff_hi : std::max(k_, eff_hi);
 
@@ -3075,9 +3085,8 @@ class SkewCallStream {
           uint64_t seen = 0;
           Value result;
           const std::vector<Value> cur_order_keys =
-              call_.order_by.empty()
-                  ? std::vector<Value>{}
-                  : ExtractSlice(*row_out, order_key_start_, order_key_count_);
+              call_.order_by.empty() ? std::vector<Value>{}
+                                     : ExtractKeys(*row_out, order_slots_);
           for (uint64_t p = lo; p <= hi; ++p) {
             Row cand;
             RETURN_IF_FAIL(indexed_reader_->ReadAt(p, &cand));
@@ -3088,9 +3097,8 @@ class SkewCallStream {
               } else {
                 const bool peer =
                     call_.order_by.empty() ||
-                    SamePartitionTuple(
-                        cur_order_keys,
-                        ExtractSlice(cand, order_key_start_, order_key_count_));
+                    SamePartitionTuple(cur_order_keys,
+                                       ExtractKeys(cand, order_slots_));
                 excluded = (call_.exclusion == WindowFrameExclusion::kGroup)
                                ? peer
                                : (peer && p != k_);
@@ -3154,8 +3162,7 @@ class SkewCallStream {
   uint64_t total_rows_{0};
   const WindowFunctionCallExpression& call_;
   const Schema& input_schema_;
-  size_t order_key_start_{0};
-  size_t order_key_count_{0};
+  std::span<const slot_t> order_slots_;
   TransactionContext* txn_{nullptr};
   size_t budget_bytes_{0};
   QueryMemoryGrant* grant_{nullptr};
@@ -3263,51 +3270,46 @@ class SkewCallStream {
   }
 };
 
-// Writes rows tagged with `[base_cols, orig_seq, partition_keys...,
-// order_keys...]` into an ExternalSorter for one SpecGroup.
+// Write the base row, its original sequence, and keys that need evaluation.
 Status EncodeRowForGroup(TransactionContext* txn, const Schema& input_schema,
                          Row&& base_row, size_t base_col_count, uint64_t seq,
                          const OocWindowSink::SpecGroup& group,
                          ExternalSorter* sorter) {
-  std::vector<Value> vals = std::move(base_row.values_);
-  vals.resize(base_col_count);
-  vals.emplace_back(static_cast<int64_t>(seq));
-  for (const Expression& pexpr : group.partition_by) {
-    ASSIGN_OR_RETURN(Value, pv,
-                     EvalWindowExpr(pexpr, Row(vals), input_schema, txn));
-    pv = ApplyKeyCollation(pv, CollationOfExpression(pexpr));
-    vals.push_back(std::move(pv));
+  base_row.values_.resize(base_col_count);
+  base_row.values_.emplace_back(static_cast<int64_t>(seq));
+  for (const Expression& key : group.computed_keys) {
+    ASSIGN_OR_RETURN(Value, value,
+                     EvalWindowExpr(key, base_row, input_schema, txn));
+    base_row.values_.push_back(
+        ApplyKeyCollation(value, CollationOfExpression(key)));
   }
-  for (const WindowOrderTerm& oterm : group.order_by) {
-    ASSIGN_OR_RETURN(
-        Value, ov,
-        EvalWindowExpr(oterm.expression, Row(vals), input_schema, txn));
-    ov = ApplyKeyCollation(ov, CollationOfExpression(oterm.expression));
-    vals.push_back(std::move(ov));
-  }
-  return sorter->AddRow(Row(std::move(vals)));
+  return sorter->AddRow(std::move(base_row));
 }
 
-std::vector<OocSortKey> MakeSorterKeysForGroup(
+StatusOr<std::vector<OocSortKey>> MakeSorterKeysForGroup(
     size_t seq_col, const OocWindowSink::SpecGroup& group) {
   std::vector<OocSortKey> keys;
   const size_t p_count = group.partition_by.size();
   const size_t o_count = group.order_by.size();
+  if (seq_col > std::numeric_limits<slot_t>::max()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "sort key column index out of range");
+  }
   keys.reserve(p_count + o_count + 1);
   for (size_t i = 0; i < p_count; ++i) {
     keys.push_back(
-        OocSortKey{.column_index = static_cast<slot_t>(seq_col + 1 + i),
+        OocSortKey{.column_index = group.partition_slots[i],
                    .ascending = true,
                    .nulls_first = true,
                    .collation = CollationOfExpression(group.partition_by[i])});
   }
   for (size_t i = 0; i < o_count; ++i) {
     const WindowOrderTerm& t = group.order_by[i];
-    keys.push_back(OocSortKey{
-        .column_index = static_cast<slot_t>(seq_col + 1 + p_count + i),
-        .ascending = t.ascending,
-        .nulls_first = t.nulls_first,
-        .collation = CollationOfExpression(t.expression)});
+    keys.push_back(
+        OocSortKey{.column_index = group.order_slots[i],
+                   .ascending = t.ascending,
+                   .nulls_first = t.nulls_first,
+                   .collation = CollationOfExpression(t.expression)});
   }
   keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(seq_col),
                             .ascending = true,
@@ -3317,7 +3319,7 @@ std::vector<OocSortKey> MakeSorterKeysForGroup(
 }
 
 // Evaluates all calls in `group` on an in-memory partition `part_rows` (which
-// contains `[0..base_col_count-1]` + `[seq, p_keys..., o_keys...]`), storing
+// contains the base row, sequence number and computed keys), storing
 // the computed values into `part_rows[r][input_width + call.output_idx]`.
 Status EvalInMemoryPartitionGroup(TransactionContext* txn,
                                   const Schema& input_schema,
@@ -3355,8 +3357,7 @@ StatusOr<SpillSegmentId> EvalSpilledCallsMaterializingSegment(
     SpillStore* store, SpillSegmentId cur_seg, uint64_t total_rows,
     const Schema& input_schema, size_t input_width,
     const OocWindowSink::SpecGroup& group, bool eval_all,
-    TransactionContext* txn, size_t budget_bytes, size_t order_key_start,
-    QueryMemoryGrant* grant) {
+    TransactionContext* txn, size_t budget_bytes, QueryMemoryGrant* grant) {
   const size_t limit = eval_all
                            ? group.calls.size()
                            : (group.calls.empty() ? 0 : group.calls.size() - 1);
@@ -3364,7 +3365,7 @@ StatusOr<SpillSegmentId> EvalSpilledCallsMaterializingSegment(
   for (size_t ci = 0; ci < limit; ++ci) {
     const OocWindowSink::CallSpec& call = group.calls[ci];
     SkewCallStream stream(store, active_seg, total_rows, *call.expr,
-                          input_schema, order_key_start, txn, budget_bytes,
+                          input_schema, group.order_slots, txn, budget_bytes,
                           grant);
     RETURN_IF_FAIL(stream.Init());
 
@@ -3619,7 +3620,7 @@ class OocWindowStreamSource final : public PipelineSource {
     out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
         << "WindowExecutor(outputs=" << num_outputs_;
     if (runtime_spilled_->load(std::memory_order_relaxed)) {
-      out << ", spill=ooc, partitions="
+      out << ", spill=OOC, partitions="
           << runtime_partitions_->load(std::memory_order_relaxed)
           << ", resident-rows="
           << runtime_peak_resident_rows_->load(std::memory_order_relaxed);
@@ -3663,10 +3664,8 @@ class OocWindowStreamSource final : public PipelineSource {
       has_lookahead_ = true;
     }
 
-    const size_t p_start = base_width_ + 1;
-    const size_t p_count = group_.partition_by.size();
     const std::vector<Value> part_key =
-        ExtractSlice(lookahead_row_, p_start, p_count);
+        ExtractKeys(lookahead_row_, group_.partition_slots);
 
     std::vector<Row> part_rows;
     size_t part_bytes = 0;
@@ -3702,8 +3701,10 @@ class OocWindowStreamSource final : public PipelineSource {
         RETURN_IF_FAIL(skew_writer->Append(std::move(row)));
         ++skew_rows;
       } else {
-        if (part_rows.empty() && part_grant_cache_.has_value()) {
-          (void)part_grant_cache_->Reserve(rb);
+        if (part_rows.empty() && part_grant_cache_.has_value() &&
+            !part_grant_cache_->Reserve(rb)) {
+          return StatusError(StatusCode::kMemoryLimitExceeded,
+                             "partition grant cache reserve failed");
         }
         part_bytes += rb;
         part_rows.push_back(std::move(row));
@@ -3721,8 +3722,9 @@ class OocWindowStreamSource final : public PipelineSource {
         sorter_eof_ = true;
         break;
       }
-      if (p_count > 0 &&
-          !SamePartitionTuple(part_key, ExtractSlice(nxt, p_start, p_count))) {
+      if (!group_.partition_slots.empty() &&
+          !SamePartitionTuple(part_key,
+                              ExtractKeys(nxt, group_.partition_slots))) {
         lookahead_row_ = std::move(nxt);
         has_lookahead_ = true;
         break;
@@ -3750,7 +3752,6 @@ class OocWindowStreamSource final : public PipelineSource {
     skew_writer.reset();
     raw_skew_seg_ = seg_id;
 
-    const size_t o_start = base_width_ + 1 + p_count;
     QueryMemoryGrant* grant_ptr = ctx != nullptr ? &ctx->grant : nullptr;
     if (group_.calls.empty()) {
       return StatusError(StatusCode::kUnknown, "empty spec group in skew");
@@ -3761,7 +3762,7 @@ class OocWindowStreamSource final : public PipelineSource {
           EvalSpilledCallsMaterializingSegment(
               &ctx->spill_store, raw_skew_seg_, skew_rows, input_schema_,
               input_width_, group_, /*eval_all=*/false, ctx->txn, budget_bytes_,
-              o_start, grant_ptr));
+              grant_ptr));
       active_skew_seg_ = pre_seg;
       if (pre_seg != raw_skew_seg_) {
         ctx->spill_store.DropSegment(raw_skew_seg_);
@@ -3775,7 +3776,7 @@ class OocWindowStreamSource final : public PipelineSource {
     const auto& last_call = group_.calls.back();
     active_skew_stream_ = std::make_unique<SkewCallStream>(
         &ctx->spill_store, active_skew_seg_, skew_rows, *last_call.expr,
-        input_schema_, o_start, ctx->txn, budget_bytes_, grant_ptr);
+        input_schema_, group_.order_slots, ctx->txn, budget_bytes_, grant_ptr);
     Status init_st = active_skew_stream_->Init();
     if (init_st != Status::kSuccess) {
       CleanupActiveSkew();
@@ -3861,7 +3862,7 @@ class WindowRestoredOrderSource final : public PipelineSource {
     out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
         << "WindowExecutor(outputs=" << num_outputs_;
     if (runtime_spilled_->load(std::memory_order_relaxed)) {
-      out << ", spill=ooc, partitions="
+      out << ", spill=OOC, partitions="
           << runtime_partitions_->load(std::memory_order_relaxed)
           << ", resident-rows="
           << runtime_peak_resident_rows_->load(std::memory_order_relaxed);
@@ -3898,9 +3899,6 @@ Status DrainSortedGroupIntoSorter(
   Row next_row;
   bool have_next = false;
   bool eof = false;
-  const size_t p_start = base_width + 1;
-  const size_t p_count = cur_group.partition_by.size();
-  const size_t o_start = base_width + 1 + p_count;
   const size_t part_budget =
       std::max<size_t>(kMinWindowMemBudget, budget_bytes / 2);
 
@@ -3930,7 +3928,7 @@ Status DrainSortedGroupIntoSorter(
     }
 
     const std::vector<Value> part_key =
-        ExtractSlice(first_row, p_start, p_count);
+        ExtractKeys(first_row, cur_group.partition_slots);
     std::vector<Row> part_rows;
     size_t part_bytes = 0;
     const size_t refill =
@@ -3962,8 +3960,9 @@ Status DrainSortedGroupIntoSorter(
         RETURN_IF_FAIL(skew_writer->Append(std::move(r)));
         ++skew_rows;
       } else {
-        if (part_rows.empty()) {
-          (void)part_cache.Reserve(rb);
+        if (part_rows.empty() && !part_cache.Reserve(rb)) {
+          return StatusError(StatusCode::kMemoryLimitExceeded,
+                             "partition cache reserve failed");
         }
         part_bytes += rb;
         part_rows.push_back(std::move(r));
@@ -3980,8 +3979,9 @@ Status DrainSortedGroupIntoSorter(
         eof = true;
         break;
       }
-      if (p_count > 0 &&
-          !SamePartitionTuple(part_key, ExtractSlice(nxt, p_start, p_count))) {
+      if (!cur_group.partition_slots.empty() &&
+          !SamePartitionTuple(part_key,
+                              ExtractKeys(nxt, cur_group.partition_slots))) {
         next_row = std::move(nxt);
         have_next = true;
         break;
@@ -4014,8 +4014,7 @@ Status DrainSortedGroupIntoSorter(
     QueryMemoryGrant* grant_ptr = ctx != nullptr ? &ctx->grant : nullptr;
     StatusOr<SpillSegmentId> eval_seg_or = EvalSpilledCallsMaterializingSegment(
         &ctx->spill_store, raw_seg, skew_rows, input_schema, input_width,
-        cur_group, /*eval_all=*/false, ctx->txn, budget_bytes, o_start,
-        grant_ptr);
+        cur_group, /*eval_all=*/false, ctx->txn, budget_bytes, grant_ptr);
     if (!eval_seg_or.HasValue()) {
       ctx->spill_store.DropSegment(raw_seg);
       return eval_seg_or.GetStatus();
@@ -4027,8 +4026,8 @@ Status DrainSortedGroupIntoSorter(
 
     const auto& last_call = cur_group.calls.back();
     SkewCallStream stream(&ctx->spill_store, active_seg, skew_rows,
-                          *last_call.expr, input_schema, o_start, ctx->txn,
-                          budget_bytes, grant_ptr);
+                          *last_call.expr, input_schema, cur_group.order_slots,
+                          ctx->txn, budget_bytes, grant_ptr);
     Status st = stream.Init();
     if (st != Status::kSuccess) {
       ctx->spill_store.DropSegment(active_seg);
@@ -4075,6 +4074,7 @@ OocWindowSink::OocWindowSink(Schema input_schema, Schema output_schema,
 
 Status OocWindowSink::BuildGroups() {
   groups_.clear();
+  const size_t base_width = input_schema_.ColumnCount() + outputs_.size();
   std::vector<std::string> group_keys;
   for (size_t i = 0; i < outputs_.size(); ++i) {
     const NamedExpression& item = outputs_[i];
@@ -4085,14 +4085,42 @@ Status OocWindowSink::BuildGroups() {
     }
     const WindowFunctionCallExpression& call =
         item.expression->AsWindowFunctionCallExpression();
-    const std::string key =
+    const std::string group_key =
         WindowOrderTermsKey(call.partition_by, call.order_by);
-    auto it = std::find(group_keys.begin(), group_keys.end(), key);
+    auto it = std::find(group_keys.begin(), group_keys.end(), group_key);
     if (it == group_keys.end()) {
-      group_keys.push_back(key);
+      group_keys.push_back(group_key);
       SpecGroup grp;
       grp.partition_by = call.partition_by;
       grp.order_by = call.order_by;
+      const auto bind_key = [&](const Expression& key,
+                                std::vector<slot_t>& slots) -> Status {
+        // A plain column is already in the row. Reuse it so repeated wide
+        // keys do not turn an otherwise admissible row into an oversized one.
+        if (key && key->Type() == TypeTag::kColumnValue &&
+            CollationOfExpression(key) == Collation::kNone) {
+          const int slot =
+              input_schema_.Offset(key->AsColumnValue().GetColumnName());
+          if (slot >= 0 && std::cmp_less_equal(slot, std::numeric_limits<slot_t>::max())) {
+            slots.push_back(static_cast<slot_t>(slot));
+            return Status::kSuccess;
+          }
+        }
+        const size_t slot = base_width + 1 + grp.computed_keys.size();
+        if (slot > std::numeric_limits<slot_t>::max()) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "sort key column index out of range");
+        }
+        slots.push_back(static_cast<slot_t>(slot));
+        grp.computed_keys.push_back(key);
+        return Status::kSuccess;
+      };
+      for (const Expression& key : grp.partition_by) {
+        RETURN_IF_FAIL(bind_key(key, grp.partition_slots));
+      }
+      for (const auto& term : grp.order_by) {
+        RETURN_IF_FAIL(bind_key(term.expression, grp.order_slots));
+      }
       grp.calls.push_back(CallSpec{.output_idx = i, .expr = &call});
       groups_.push_back(std::move(grp));
     } else {
@@ -4173,7 +4201,9 @@ Status OocWindowSink::TransitionToOoc(PipelineContext* ctx) {
   opts.spill_store = &ctx->spill_store;
   opts.memory_budget_bytes = budget_bytes_;
   opts.grant = &ctx->grant;
-  opts.keys = MakeSorterKeysForGroup(base_cols, groups_[0]);
+  ASSIGN_OR_RETURN(std::vector<OocSortKey>, stage0_keys,
+                   MakeSorterKeysForGroup(base_cols, groups_[0]));
+  opts.keys = std::move(stage0_keys);
   opts.force_spill = ProcessMemoryBudget::Global().AlwaysSpillEnabled();
   stage0_sorter_ = std::make_unique<ExternalSorter>(std::move(opts));
 
@@ -4292,7 +4322,9 @@ StatusOr<std::shared_ptr<PipelineSource>> OocWindowSink::Finalize(
     next_opts.spill_store = &ctx->spill_store;
     next_opts.memory_budget_bytes = half_budget;
     next_opts.grant = &ctx->grant;
-    next_opts.keys = MakeSorterKeysForGroup(base_cols, groups_[g + 1]);
+    ASSIGN_OR_RETURN(std::vector<OocSortKey>, next_keys,
+                     MakeSorterKeysForGroup(base_cols, groups_[g + 1]));
+    next_opts.keys = std::move(next_keys);
     next_opts.force_spill = ProcessMemoryBudget::Global().AlwaysSpillEnabled();
     auto next_sorter = std::make_unique<ExternalSorter>(std::move(next_opts));
 
@@ -4315,6 +4347,12 @@ StatusOr<std::shared_ptr<PipelineSource>> OocWindowSink::Finalize(
   const bool restore_order =
       (preserve_input_order_ || !spill_capable_plan_) && maybe_reordered;
   if (restore_order) {
+    // T4855: the seq column that restores input order is indexed through
+    // the uint16 OocSortKey::column_index too; reject the wrap.
+    if (base_cols > std::numeric_limits<slot_t>::max()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "sort key column index out of range");
+    }
     ExternalSorter::Options restore_opts;
     restore_opts.spill_store = &ctx->spill_store;
     restore_opts.memory_budget_bytes = half_budget;
@@ -4368,7 +4406,7 @@ void OocWindowSink::DumpExplain(std::ostream& out, int indent) const {
   out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
       << "WindowExecutor(outputs=" << outputs_.size();
   if (Spilled()) {
-    out << ", spill=ooc, partitions="
+    out << ", spill=OOC, partitions="
         << runtime_partitions_->load(std::memory_order_relaxed)
         << ", resident-rows="
         << runtime_peak_resident_rows_->load(std::memory_order_relaxed);

@@ -95,10 +95,10 @@ void RecursiveCtePlan::Dump(std::ostream& output, int indent) const {
   }
   output << " (schema: " << schema_ << ")\n";
   if (child_) {
-    child_->Dump(output, indent + 2);
+    DumpChild(output, *child_, indent + 2);
   }
   if (recursive_child_) {
-    recursive_child_->Dump(output, indent + 2);
+    DumpChild(output, *recursive_child_, indent + 2);
   }
 }
 

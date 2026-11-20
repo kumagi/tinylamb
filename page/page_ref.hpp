@@ -18,6 +18,7 @@
 #define TINYLAMB_PAGE_REF_HPP
 
 #include <cassert>
+#include <memory>
 #include <mutex>
 #include <ostream>
 #include <shared_mutex>
@@ -31,6 +32,8 @@ class PageManager;
 class PageRef final {
  private:
   PageRef(Page* page, std::shared_mutex* page_lock, bool shared);
+  PageRef(std::shared_ptr<Page> owner, Page* page, std::shared_mutex* page_lock,
+          bool shared);
 
   PageRef() = default;
 
@@ -62,7 +65,8 @@ class PageRef final {
 
   PageRef(const PageRef&) = delete;
   PageRef(PageRef&& o) noexcept
-      : page_(o.page_),
+      : owner_(std::move(o.owner_)),
+        page_(o.page_),
         exclusive_page_lock_(std::move(o.exclusive_page_lock_)),
         shared_page_lock_(std::move(o.shared_page_lock_)) {
     o.page_ = nullptr;
@@ -73,6 +77,7 @@ class PageRef final {
       if (page_ != nullptr) {
         PageUnlock();
       }
+      owner_ = std::move(o.owner_);
       page_ = o.page_;
       exclusive_page_lock_ = std::move(o.exclusive_page_lock_);
       shared_page_lock_ = std::move(o.shared_page_lock_);
@@ -87,6 +92,7 @@ class PageRef final {
 
  private:
   friend class PageManager;
+  std::shared_ptr<Page> owner_;
   Page* page_{nullptr};
   std::unique_lock<std::shared_mutex> exclusive_page_lock_;
   std::shared_lock<std::shared_mutex> shared_page_lock_;

@@ -414,8 +414,7 @@ TEST_F(DynamicFilterJoinTest, ParallelAndSerialScansAgree) {
 
   setenv("TINYLAMB_DISABLE_PARALLEL_SCAN", "1", 1);
   const std::string serial_plan = Explain(sql);
-  EXPECT_EQ(serial_plan.find("ParallelScan"), std::string::npos)
-      << serial_plan;
+  EXPECT_EQ(serial_plan.find("ParallelScan"), std::string::npos) << serial_plan;
   std::vector<Row> serial;
   const Status serial_status = Run(sql, &serial);
   unsetenv("TINYLAMB_DISABLE_PARALLEL_SCAN");
@@ -454,9 +453,11 @@ TEST_F(DynamicFilterJoinTest, LargeBuildDomainFallsBackToRangeAndBloom) {
   ASSIGN_OR_ASSERT_FAIL(
       Table, huge_dim,
       database_->CreateTable(
-          setup, Schema("huge_dim", {Column("k", ValueType::kInt64)})));
+          setup, Schema("huge_dim", {Column("k", ValueType::kInt64),
+                                     Column("tag", ValueType::kInt64)})));
   for (int64_t i = 0; i < 5000; ++i) {
-    ASSERT_SUCCESS(huge_dim.Insert(setup.txn_, Row({Value(i)})).GetStatus());
+    ASSERT_SUCCESS(
+        huge_dim.Insert(setup.txn_, Row({Value(i), Value(1)})).GetStatus());
   }
   ASSIGN_OR_ASSERT_FAIL(
       Table, huge_probe,
@@ -474,14 +475,16 @@ TEST_F(DynamicFilterJoinTest, LargeBuildDomainFallsBackToRangeAndBloom) {
     std::vector<Row> analyzed;
     ASSERT_SUCCESS(Run("ANALYZE", &analyzed));
   }
-  const std::string plan =
-      Explain("SELECT p.k FROM huge_probe p JOIN huge_dim d ON p.k = d.k");
+  // The payload read makes this a join even if the optimizer derives an exact
+  // membership test from the dimension keys.
+  const std::string plan = Explain(
+      "SELECT p.k, d.tag FROM huge_probe p JOIN huge_dim d ON p.k = d.k");
   EXPECT_NE(plan.find("DynamicFilter"), std::string::npos) << plan;
   EXPECT_NE(plan.find("min_max"), std::string::npos) << plan;
   EXPECT_NE(plan.find("bloom"), std::string::npos) << plan;
   std::vector<Row> rows;
   ASSERT_SUCCESS(
-      Run("SELECT COUNT(*) FROM huge_probe p JOIN huge_dim d "
+      Run("SELECT SUM(d.tag) FROM huge_probe p JOIN huge_dim d "
           "ON p.k = d.k",
           &rows));
   ASSERT_EQ(rows.size(), 1U);
@@ -676,7 +679,7 @@ TEST_F(DynamicFilterExecutorTest, OuterKindsNeverFilter) {
           std::vector<slot_t>{0},
           std::make_shared<ConstantExecutor>(probe_rows),
           std::vector<slot_t>{0}, HashJoinMode::kInMemory, kind,
-          /*right_width=*/1, /*left_width=*/1);
+          /*worker_count=*/1, /*right_width=*/2, /*left_width=*/1);
       if (enable) {
         join->EnableDynamicFilter(/*build_left=*/true);
       }

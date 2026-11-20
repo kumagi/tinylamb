@@ -36,7 +36,14 @@ size_t Type::Size() const {
       return 0;
     case TypeTag::kDate:
       return sizeof(int64_t);
+    // NOLINTNEXTLINE(bugprone-branch-clone) distinct intent in each branch
     case TypeTag::kArray:
+      return 0;
+    case TypeTag::kInvalid:
+      // ResultType() reports kInvalid for "unknown" (an all-NULL CASE before
+      // type resolution, an unbound parameter): a legitimate value, not a
+      // bug.  Like the variable-width tags it has no fixed size, so report 0
+      // instead of CHECK-crashing a size-estimation caller.
       return 0;
     default:
       CHECK_MSG(false, "Invalid type");

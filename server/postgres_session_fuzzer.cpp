@@ -10,7 +10,7 @@
 //   * the ReadyForQuery transaction status tracks the BEGIN/COMMIT/ROLLBACK
 //     /error history of the session (state machine oracle),
 //   * unsupported (extended-protocol) message types answer with
-//     ErrorResponse + ReadyForQuery leaving the status unchanged,
+//     ErrorResponse only, leaving the status unchanged,
 //   * a rejected message never kills the server: a fresh connection's
 //     sanity query ("SELECT 1") must still return exactly one row.
 #include "server/postgres_session_fuzzer.hpp"
@@ -195,6 +195,10 @@ struct ServerEnv {
   std::unique_ptr<PostgresServer> server;
   std::thread runner;
   uint16_t port{0};
+  // Run() writes poller errors into this string from the runner thread,
+  // which lives until the destructor's join -- it must be a member, not a
+  // constructor local captured by reference (dangling-stack UAF).
+  std::string run_error;
 
   ServerEnv() : db("pgwire_session_fuzz") {
     if (!db) {
@@ -205,14 +209,13 @@ struct ServerEnv {
     options.port = 0;
     options.idle_timeout = std::chrono::seconds(30);
     server = std::make_unique<PostgresServer>(db.name(), options);
-    std::string error;
-    if (!server->Listen(&error)) {
+    if (!server->Listen(&run_error)) {
       server.reset();
       return;
     }
     port = server->BoundPort();
-    runner = std::thread([this, &error] {
-      const int rc = server->Run(&error);
+    runner = std::thread([this] {
+      const int rc = server->Run(&run_error);
       (void)rc;
     });
     // Wait until the sanity query answers on a real connection.
@@ -242,6 +245,10 @@ struct ServerEnv {
     if (runner.joinable()) {
       runner.join();
     }
+    // The server owns a Database holding the .db flock. Cleanup() must run
+    // only after that handle is gone, otherwise it cannot reopen the file to
+    // DeleteAll() and leaves .db/.log/.tlcs.* artifacts behind.
+    keeper.reset();
     db.Cleanup();
   }
 
@@ -720,7 +727,15 @@ void TryWriteRace(ByteStream& stream) {
            << 8) |
           static_cast<size_t>(static_cast<unsigned char>(b[first_nl + 4]));
       const std::string num = b.substr(static_cast<size_t>(first_nl) + 5, len);
-      value = std::strtoll(num.c_str(), nullptr, 10);
+      char* end = nullptr;
+      errno = 0;
+      const long long parsed = std::strtoll(num.c_str(), &end, 10);
+      if (errno != 0 || end == num.c_str() || *end != '\0') {
+        (void)fprintf(stderr, "post-race row value not numeric: '%s'\n",
+                      num.c_str());
+        __builtin_trap();
+      }
+      value = parsed;
     }
   }
   if (rows != 1 || value < 0 || value >= 2000) {
@@ -738,11 +753,15 @@ void TryWriteRace(ByteStream& stream) {
 
 }  // namespace
 
-void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
+// T4876: reports whether the session replayed to a clean end. The
+// fuzz entry aborts on false (libFuzzer still sees a crash); the replay
+// tests assert the value, so a harness regression that only *reports*
+// an illegal state instead of trapping can no longer stay green.
+bool TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
   ServerEnv* env = Env();
   if (env->port == 0) {
     (void)fprintf(stderr, "server boot failed\n");
-    abort();
+    return false;
   }
   ByteStream stream(data, size);
 
@@ -751,19 +770,19 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
     if (verbose) {
       (void)fprintf(stderr, "race ok\n");
     }
-    return;
+    return true;
   }
   if (stream.Pick(6) == 0) {
     TryPipelining(stream);
     if (verbose) {
       (void)fprintf(stderr, "pipeline ok\n");
     }
-    return;
+    return true;
   }
 
   const int fd = Connect(env->port);
   if (fd < 0) {
-    abort();  // server refused a connection
+    return false;  // server refused a connection
   }
   Conn conn(fd);
 
@@ -771,28 +790,28 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
   if (stream.Pick(4) == 0) {
     std::string sslreq;
     pgwire::AppendUint32(&sslreq, 8);
-    pgwire::AppendUint32(&sslreq, pgwire::kSslRequestCode);
+    pgwire::AppendUint32(&sslreq, pgwire::kSSLRequestCode);
     if (!conn.Send(sslreq)) {
-      abort();
+      return false;
     }
     char reply = 0;
     if (read(fd, &reply, 1) != 1 || (reply != 'N' && reply != 'S')) {
-      abort();
+      return false;
     }
   }
   if (!conn.Send(StartupMessage())) {
-    abort();
+    return false;
   }
   std::vector<std::pair<char, std::string>> reply;
   if (!conn.ReadMessages(2000, true, &reply)) {
-    abort();
+    return false;
   }
   reply.shrink_to_fit();
   bool error_seen = false;
   size_t ready_count = 0;
   char status = CheckExchange(reply, &error_seen, &ready_count);
   if (status != 'I') {
-    __builtin_trap();  // fresh session must start idle
+    return false;  // fresh session must start idle
   }
 
   const int actions = static_cast<int>(stream.Pick(12)) + 1;
@@ -813,14 +832,14 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       if (next == '~') {
         (void)fprintf(stderr, "query never reached ReadyForQuery: %s\n",
                       statement.c_str());
-        __builtin_trap();
+        return false;
       }
       const char want = ExpectedStatus(status, statement, error_seen);
       if (next != want) {
         (void)fprintf(stderr,
                       "transaction status after '%s': got '%c' want '%c'\n",
                       statement.c_str(), next, want);
-        __builtin_trap();
+        return false;
       }
       status = next;
     } else if (kind == 6) {
@@ -835,7 +854,7 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       error_seen = false;
       const char next = CheckExchange(exchange, &error_seen, &ready_count);
       if (next == '~') {
-        __builtin_trap();
+        return false;
       }
       status = next;
     } else if (kind == 7) {
@@ -846,7 +865,7 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       std::vector<std::pair<char, std::string>> exchange;
       (void)conn.ReadMessages(150, false, &exchange);
       if (!exchange.empty()) {
-        __builtin_trap();  // Flush answered
+        return false;  // Flush answered
       }
     } else if (kind == 8) {
       // Extended-protocol messages must be rejected as unsupported and
@@ -880,7 +899,7 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
                       "extended message '%c' changed status %c -> %c "
                       "(ready=%zu)\n",
                       type, status, next, ready_count);
-        __builtin_trap();
+        return false;
       }
       bool saw_error = false;
       for (const auto& [t, b] : exchange) {
@@ -888,7 +907,7 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
         saw_error |= t == 'E';
       }
       if (!saw_error) {
-        __builtin_trap();  // extended protocol silently accepted
+        return false;  // extended protocol silently accepted
       }
     } else {
       // Malformed frame: bogus length (<4 or > limit).  The server must
@@ -904,24 +923,27 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       std::vector<std::pair<char, std::string>> exchange;
       (void)conn.ReadMessages(500, false, &exchange);
       conn.Close();
-      return;  // connection is expected to be gone; sanity runs below
+      return true;  // connection is expected to be gone
     }
   }
   conn.Close();
 
   if (!env->SanityCheck()) {
     (void)fprintf(stderr, "sanity query failed after %d actions\n", actions);
-    __builtin_trap();
+    return false;
   }
   if (verbose) {
     (void)fprintf(stderr, "session ok (%d actions)\n", actions);
   }
+  return true;
 }
 
 }  // namespace tinylamb
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
-  tinylamb::TryPostgresSession(data, size, false);
+  if (!tinylamb::TryPostgresSession(data, size, false)) {
+    abort();  // libFuzzer still needs the crash signal (T4876)
+  }
   return 0;
 }

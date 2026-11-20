@@ -32,7 +32,9 @@ class ColumnValue : public ExpressionBase {
   ColumnValue& operator=(const ColumnValue&) = delete;
   ColumnValue& operator=(ColumnValue&&) = delete;
   ~ColumnValue() override = default;
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kColumnValue; }
+  [[nodiscard]] TypeTag NodeKind() const override {
+    return TypeTag::kColumnValue;
+  }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,

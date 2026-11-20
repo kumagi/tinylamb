@@ -19,11 +19,13 @@
 // fcntl, CFTimeZone).
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -31,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/platform/cpu_affinity.hpp"
 #include "common/platform/endian.hpp"
@@ -44,6 +47,11 @@
 #include "common/platform/synced_stream.hpp"
 #include "common/platform/time_zone.hpp"
 #include "gtest/gtest.h"
+
+#ifndef TINYLAMB_OS_WINDOWS
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace tinylamb::platform {
 #ifdef __SIZEOF_INT128__
@@ -185,7 +193,7 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
   mapped.AdviseRandom(0, mapped.Size());
 
   MemoryMap moved(std::move(mapped));
-  // MemoryMap guarantees that moving releases the source handle.
+  // MemoryMap guarantees that moving releases the source handle.  // NOLINT(clang-analyzer-cplusplus.Move)
   // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_FALSE(mapped.IsValid());
   EXPECT_TRUE(moved.IsValid());
@@ -346,6 +354,57 @@ TEST(PlatformEventPollerTest, WakerWakesWaitFromAnotherThread) {
   EXPECT_EQ(WaitFor(poller, waker.ReadFd(), 20), 0U);
 }
 
+// T3719: Close() used to race an unsynchronized write_fd_ read in Wake()
+// (any-thread contract). The fd slot is an atomic now and Close publishes
+// -1 before the close, so racing Wake() calls must be crash-free — and a
+// Wake() after Close must be a no-op.
+TEST(PlatformEventPollerTest, WakeDuringCloseIsRaceFree) {
+  Waker waker;
+  ASSERT_TRUE(waker.Open());
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> wakers;
+  for (int i = 0; i < 4; ++i) {
+    wakers.emplace_back(  // NOLINT(performance-inefficient-vector-operation)
+        [&] {  // NOLINT(performance-inefficient-vector-operation)
+          while (!stop.load(std::memory_order_relaxed)) {
+            waker.Wake();
+          }
+        });
+  }
+  for (int i = 0; i < 1000; ++i) {
+    waker.Drain();
+  }
+  waker.Close();
+  stop.store(true);
+  for (std::thread& waker_thread : wakers) {
+    waker_thread.join();
+  }
+  waker.Wake();
+}
+
+TEST(PlatformCpuAffinityTest, EqualityComparesBitmaskContents) {
+  // P67: ParallelPool::Work() compares batch affinities once per task
+  // batch.  Equality must distinguish distinct masks, agree with a fresh
+  // sched_getaffinity snapshot, and stay a fixed-size POD compare (the
+  // implementation contracts on std::memcmp over the raw words).
+  if (!CpuSet::Supported()) {
+    return;
+  }
+  const CpuSet a = CpuSet::Single(0);
+  const CpuSet b = CpuSet::Single(0);
+  const CpuSet c = CpuSet::Single(1);
+  EXPECT_TRUE(a == b);
+  EXPECT_FALSE(a == c);
+  if (const std::optional<CpuSet> current = CpuSet::CurrentThread();
+      current.has_value()) {
+    const std::optional<CpuSet> again = CpuSet::CurrentThread();
+    if (!again.has_value()) {
+      FAIL() << "current affinity disappeared";
+    }
+    EXPECT_TRUE(*current == *again);
+  }
+}
+
 TEST(PlatformCpuAffinityTest, CurrentThreadMatchesSupport) {
   const std::optional<CpuSet> current = CpuSet::CurrentThread();
   EXPECT_EQ(current.has_value(), CpuSet::Supported());
@@ -357,7 +416,9 @@ TEST(PlatformCpuAffinityTest, CurrentThreadMatchesSupport) {
   ASSERT_GE(first, 0);
   // Restore the original affinity on every exit path: a fatal assertion
   // below must not leave the whole test binary pinned to a single CPU.
-  struct AffinityRestore {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct AffinityRestore {  // NOLINT(cppcoreguidelines-special-member-functions)
     ~AffinityRestore() { (void)set.ApplyToCurrentThread(); }
     CpuSet set;
   } affinity_restore{*current};
@@ -388,6 +449,46 @@ TEST(PlatformTimeZoneTest, KnownZonesAreExactAndCaseSensitive) {
   EXPECT_FALSE(IsKnownTimeZone(""));
   EXPECT_FALSE(IsKnownTimeZone("../etc/passwd"));
   EXPECT_FALSE(TimeZoneOffsetAtLocalTime("Foo/Bar", 2024, 1, 1, 0, 0, 0));
+}
+
+// Cover the at_utc=true path and invalid civil-date rejection; the local-time
+// tests above exercise only the default (at_utc=false) branch.
+TEST(PlatformTimeZoneTest, AtUtcAndInvalidCivilInputs) {
+  // Asia/Tokyo has no DST, so the offset is the same at any instant.
+  EXPECT_EQ(TimeZoneOffsetAtLocalTime("Asia/Tokyo", 2024, 1, 1, 0, 0, 0, true),
+            9 * 3600);
+  // A spring-forward gap is nonexistent in local time but unambiguous in UTC.
+  const auto gap_local = TimeZoneOffsetAtLocalTime(
+      "America/New_York", 2024, 3, 10, 2, 30, 0, false);
+  const auto gap_utc = TimeZoneOffsetAtLocalTime(
+      "America/New_York", 2024, 3, 10, 2, 30, 0, true);  // NOLINT(bugprone-unchecked-optional-access)
+  EXPECT_TRUE(gap_local.has_value());
+  EXPECT_TRUE(gap_utc.has_value());
+  // Fields outside civil bounds must not be accepted.
+  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 13, 1, 0, 0, 0)
+                   .has_value());
+  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 0, 0, 0, 0)
+                   .has_value());
+  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 1, 24, 0, 0)
+                   .has_value());
+  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 1, 0, 60, 0)
+                   .has_value());
+}
+
+// T2093: Linux now memoises zone lookups (positive and negative).  Repeated
+// resolution of the same name must stay stable and identical to the uncached
+// semantics (per-call locate_zone) that macOS always had.
+TEST(PlatformTimeZoneTest, CacheKeepsRepeatedLookupsStable) {
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_TRUE(IsKnownTimeZone("Asia/Tokyo"));
+    EXPECT_FALSE(IsKnownTimeZone("Foo/Bar/Baz"));
+    const auto offset =
+        TimeZoneOffsetAtLocalTime("Asia/Tokyo", 2024, 6, 1, 12, 0, 0);
+    ASSERT_TRUE(offset.has_value());
+    EXPECT_EQ(*offset, 9 * 3600);  // NOLINT(bugprone-unchecked-optional-access)
+    EXPECT_FALSE(TimeZoneOffsetAtLocalTime("Foo/Bar/Baz", 2024, 6, 1, 12, 0, 0)
+                     .has_value());
+  }
 }
 
 TEST(PlatformTimeZoneTest, OffsetsFollowTzdbLocalInfoFirst) {
@@ -512,6 +613,92 @@ TEST(PlatformHeapPurgeTest, ReleaseFreeHeapToOsIsRateLimited) {
   EXPECT_TRUE(purged) << "purge must become available again after the window";
 #endif
 }
+
+#ifndef TINYLAMB_OS_WINDOWS
+// T2621: exec-family strings terminate at the first NUL; RunProcess must
+// reject NUL-bearing args up front rather than silently exec'ing truncated.
+TEST(ProcessAuditTest, EmbeddedNulInArgumentsIsRejected) {
+  std::string error;
+  EXPECT_EQ(
+      RunProcess("/bin/sh", {std::string("-c\0trailing", 12), "x"}, {}, &error),
+      -1);  // NOLINT(readability-uppercase-literal-suffix)
+  EXPECT_NE(error.find("embedded NUL"), std::string::npos) << error;
+  // A NUL in the executable path is rejected the same way.
+  EXPECT_EQ(RunProcess(std::filesystem::path(std::string("/bin/sh\0junk", 10)),
+                       {}, {}, &error),
+            -1);
+  EXPECT_NE(error.find("embedded NUL"), std::string::npos) << error;
+}
+
+// T2627: signal death reports the signal number instead of a generic
+// "terminated abnormally".
+TEST(ProcessAuditTest, SignalDeathReportsSignalNumber) {
+  std::string error;
+  EXPECT_EQ(RunProcess("/bin/sh", {"-c", "kill -SEGV $$"}, {}, &error), -1);
+  EXPECT_NE(error.find("signal 11"), std::string::npos) << error;
+  error.clear();
+  EXPECT_EQ(RunProcess("/bin/sh", {"-c", "kill -TERM $$"}, {}, &error), -1);
+  EXPECT_NE(error.find("signal 15"), std::string::npos) << error;
+}
+
+// T2630: PhysicalMemoryBytes must not exceed the cgroup memory limit; a
+// container auto-sizing its budgets off HOST RAM gets OOM-killed.
+TEST(ProcessMemoryAuditTest, PhysicalMemoryRespectsCgroupLimit) {
+  const uint64_t phys = PhysicalMemoryBytes();
+  EXPECT_GT(phys, 0u);  // NOLINT(readability-uppercase-literal-suffix)
+  const long pages = ::sysconf(_SC_PHYS_PAGES);
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  ASSERT_GT(pages, 0);
+  ASSERT_GT(page_size, 0);
+  const uint64_t host =
+      static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+  auto read_limit = [](const char* path) -> uint64_t {
+    std::ifstream in(path);
+    std::string text;
+    if (!in || !std::getline(in, text)) {
+      return 0;
+    }
+    if (text == "max" || text.empty()) {
+      return 0;
+    }
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(text.c_str(), &end, 10);
+    if (end == text.c_str() || v >= (1ULL << 60)) {
+      return 0;
+    }
+    return static_cast<uint64_t>(v);
+  };
+  const uint64_t v2 = read_limit("/sys/fs/cgroup/memory.max");
+  const uint64_t v1 = read_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+  uint64_t expected = host;
+  for (const uint64_t limit : {v2, v1}) {
+    if (limit > 0 && limit < expected) {
+      expected = limit;
+    }
+  }
+  EXPECT_EQ(phys, expected);
+}
+
+// T2623: the mkstemp fallback must honour the non-inheritable promise of
+// the header (O_TMPFILE/_O_NOINHERIT paths do); assert CLOEXEC is set.
+TEST(PlatformFileIoTest, UnlinkedTempFdIsCloseOnExec) {
+  std::error_code ec;
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path(ec) /
+      ("tinylamb_cloexec_test_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  ASSERT_TRUE(std::filesystem::create_directories(dir, ec)) << ec.message();
+  const int fd = OpenUnlinkedTempFile(dir);
+  ASSERT_GE(fd, 0) << "errno=" << errno;
+  const int flags = ::fcntl(fd, F_GETFD);
+  ASSERT_GE(flags, 0);
+  EXPECT_NE(flags & FD_CLOEXEC, 0);
+  (void)::close(fd);
+  std::error_code clean_ec;
+  std::filesystem::remove_all(dir, clean_ec);
+}
+#endif
 
 }  // namespace
 }  // namespace tinylamb::platform

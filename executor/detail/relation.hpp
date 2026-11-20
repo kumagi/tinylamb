@@ -73,7 +73,11 @@ struct Relation {
   void SetColumnarTable(std::shared_ptr<const ColumnarTable> table,
                         bool uniform_types);
   [[nodiscard]] Status EnsureRowsMaterializedChecked();
-  void EnsureRowsMaterialized();
+  // T4539: used to be `void` and discard EnsureRowsMaterializedChecked()'s
+  // Status, so a failed columnar->rows materialization let callers walk an
+  // EMPTY rows vector as if it were the real data. It now forwards the
+  // Status and is [[nodiscard]]: every call site must propagate or handle.
+  [[nodiscard]] Status EnsureRowsMaterialized();
 
   void ReleaseCharge();
   [[nodiscard]] static bool HasAmpleMemoryBudget();
@@ -113,6 +117,20 @@ struct Relation {
   // success over a partial result.
   [[nodiscard]] Status GetStatus() const { return spill_error_; }
 
+  // Mutable iteration over the in-memory rows only; returns false when the
+  // relation has columnar/spill payloads (callers must fall back to the
+  // read-only ForEachRow path there).
+  template <typename Fn>
+  bool ForEachMutableRow(Fn&& fn) {
+    if (HasColumnarOnly() || spill || spill_tail_ || !extra_spills.empty()) {
+      return false;
+    }
+    for (Row& row : rows) {
+      fn(row);
+    }
+    return true;
+  }
+
   template <typename Fn>
   Status ForEachRow(Fn&& fn) {
     Status first{Status::kSuccess};
@@ -147,9 +165,17 @@ struct Relation {
       }
     }
     if (spill_tail_) {
-      const Status st = spill_tail_->ForEachRow(fn);
-      if (st != Status::kSuccess && first == Status::kSuccess) {
-        first = st;
+      // SpillFile stores its count only after FinishWriting; flush the tail
+      // before reading or appended-but-unfinished rows are silently lost.
+      const Status fs = FinishSpill();
+      if (fs != Status::kSuccess && first == Status::kSuccess) {
+        first = fs;
+      }
+      if (spill_tail_) {
+        const Status st = spill_tail_->ForEachRow(fn);
+        if (st != Status::kSuccess && first == Status::kSuccess) {
+          first = st;
+        }
       }
     }
     if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
@@ -158,6 +184,9 @@ struct Relation {
     return first;
   }
 
+  // NOTE: SpillFile::ForEachRow advances a single internal read cursor and is
+  // non-const; the const_cast calls below mean a shared spilled Relation must
+  // not be traversed concurrently without external synchronisation.
   template <typename Fn>
   Status ForEachRow(Fn&& fn) const {
     Status first{Status::kSuccess};
@@ -192,6 +221,9 @@ struct Relation {
       }
     }
     if (spill_tail_) {
+      // FinishSpill finalises the tail spill file (a one-way state change);
+      // the only mutation in this const path. Callers sharing a spilled
+      // Relation across threads must provide external synchronisation.
       const Status fs = const_cast<Relation*>(this)->FinishSpill();
       if (fs != Status::kSuccess && first == Status::kSuccess) {
         first = fs;
@@ -263,6 +295,9 @@ struct Relation {
       }
     }
     if (spill_tail_) {
+      // FinishSpill finalises the tail spill file (a one-way state change);
+      // the only mutation in this const path. Callers sharing a spilled
+      // Relation across threads must provide external synchronisation.
       const Status fs = const_cast<Relation*>(this)->FinishSpill();
       if (fs != Status::kSuccess && first == Status::kSuccess) {
         first = fs;

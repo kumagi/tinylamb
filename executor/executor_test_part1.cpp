@@ -480,7 +480,7 @@ TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
 TEST_F(ExecutorTest, IndexOnlyScanServesVisibilityMapWithoutHeapFetch) {
   // The fixture's committed rows are chain-free once the background GC has
   // dropped their version chains, so every index entry is served from the
-  // B+Tree image (key + INCLUDE payload) without touching the heap.
+  // index image (key + INCLUDE payload) without touching the heap.
   WaitForChainFreePages();
   TransactionContext ctx = rs_->BeginReadOnlyContext();
   ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(ctx, kTableName));
@@ -496,7 +496,9 @@ TEST_F(ExecutorTest, IndexOnlyScanServesVisibilityMapWithoutHeapFetch) {
     key_rows.push_back(row);
   }
 
-  // Act -- Idx2 (kNonUnique {1} include {1,2}) delivers [name, name, score].
+  // Act -- Idx2 (kNonUnique {1} include {1,2}): the key column repeated in
+  // INCLUDE is dropped when the schema is built, so it delivers
+  // [name, score] like Idx1.
   IndexOnlyScan with_include(ctx.txn_, tbl, tbl.GetIndex(1), Value(), Value(),
                              true, Expression(), tbl.GetSchema());
   std::vector<Row> include_rows;
@@ -511,11 +513,10 @@ TEST_F(ExecutorTest, IndexOnlyScanServesVisibilityMapWithoutHeapFetch) {
   EXPECT_EQ(key_rows[2], Row({Value("piyo"), Value(12.2)}));
   EXPECT_EQ(key_rows[3], Row({Value("world"), Value(4.9)}));
   ASSERT_EQ(include_rows.size(), 4U);
-  EXPECT_EQ(include_rows[0],
-            Row({Value("arise"), Value("arise"), Value(4.14)}));
-  EXPECT_EQ(include_rows[1], Row({Value("hello"), Value("hello"), Value(1.2)}));
-  EXPECT_EQ(include_rows[2], Row({Value("piyo"), Value("piyo"), Value(12.2)}));
-  EXPECT_EQ(include_rows[3], Row({Value("world"), Value("world"), Value(4.9)}));
+  EXPECT_EQ(include_rows[0], Row({Value("arise"), Value(4.14)}));
+  EXPECT_EQ(include_rows[1], Row({Value("hello"), Value(1.2)}));
+  EXPECT_EQ(include_rows[2], Row({Value("piyo"), Value(12.2)}));
+  EXPECT_EQ(include_rows[3], Row({Value("world"), Value(4.9)}));
   EXPECT_EQ(rs_->TransactionStats().index_only_visible_serves,
             serves_before + 8);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -1489,7 +1490,7 @@ TEST_F(ExecutorTest, LookupJoinRechecksEqualityOnANonKeyColumn) {
   // The probe derives the (a) prefix in the index's own key order; `c` is not
   // an index key column, so `x = c` is not part of the seek. The join emits
   // the probe's over-fetch and the residual predicate above it decides.
-  auto& product = static_cast<ProductPlan&>(*plan);
+  auto& product = static_cast<ProductPlan&>(*plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   const std::optional<LookupSeek>& probe = product.Lookup();
   ASSERT_TRUE(probe.has_value());
   ASSERT_EQ(SeekOf(probe).right_columns.size(), 1U);
@@ -2149,7 +2150,7 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanWorkerFilterDecidesRows) {
   ASSERT_SUCCESS(reader.txn_.PreCommit());
 }
 
-// Rows whose worker program raises are parked for the contextful re-check on
+// Rows whose worker program raises are parked for the contextual re-check on
 // the consumer thread, and the first such error surfaces as the scan's
 // sticky status: a raising row must not be silently dropped.
 TEST_F(ExecutorTest, MorselDrivenParallelScanSurfacesDeferredRowErrors) {

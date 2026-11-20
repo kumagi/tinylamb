@@ -47,5 +47,5 @@ module's maximum: the default 4 GiB reservation trapped for this import above
 Bounds violations are checked to trap; an independent probe oracle and all
 per-worker group arrays are checked, as is packed-vs-unpacked SUM equivalence.
 
-See `docs/adr/0002-wasm-fused-execution.md` for measured results and outstanding
+See `../../docs/adr/0002-wasm-fused-execution.md` for measured results and outstanding
 acceptance gates. Do not interpret these microbenchmarks as ClickBench results.

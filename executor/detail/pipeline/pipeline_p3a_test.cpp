@@ -2,9 +2,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -13,14 +17,24 @@
 #include "common/memory_budget.hpp"
 #include "common/platform/process.hpp"
 #include "common/query_grant.hpp"
+#include "common/random_string.hpp"
+#include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "executor/detail/pipeline/ooc_sinks.hpp"
 #include "executor/detail/pipeline/pipeline_ir.hpp"
 #include "executor/detail/pipeline/pipeline_ops.hpp"
+#include "executor/pipeline_lowering.hpp"
 #include "executor/values.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/jit.hpp"
+#include "expression/unary_expression.hpp"
+#include "plan/aggregation_plan.hpp"
+#include "plan/projection_plan.hpp"
+#include "plan/selection_plan.hpp"
+#include "plan/values_plan.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -51,6 +65,68 @@ std::vector<Row> DrainExecutor(ExecutorBase* exec) {
   return rows;
 }
 
+TEST(PipelineP3aTest, FusedSumLowersAndKeepsNullAndErrorSemantics) {
+  const auto kernel =
+      JitInt64Kernels::CompileFilterProjectSum(BinaryOperation::kGreaterThan);
+  const Schema schema(
+      "v", {Column("k", ValueType::kInt64), Column("x", ValueType::kInt64)});
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Database>, db,
+                        Database::Create("fused_sum_" + RandomString()));
+  auto ctx = db->BeginReadOnlyContext();
+  auto make_plan = [&](std::vector<Row> rows) -> Plan {
+    auto values = std::make_shared<ValuesPlan>(schema, std::move(rows));
+    const auto predicate =
+        BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kGreaterThan,
+                            ConstantValueExp(Value(int64_t{0})));
+    auto selection =
+        std::make_shared<SelectionPlan>(values, predicate, values->GetStats());
+    const auto multiply =
+        BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kMultiply,
+                            ConstantValueExp(Value(int64_t{3})));
+    auto project = std::make_shared<ProjectionPlan>(
+        selection, std::vector<NamedExpression>{{"p", multiply}});
+    return std::make_shared<AggregationPlan>(
+        project, std::vector<NamedExpression>{
+                     {"s", AggregateExpressionExp(AggregationType::kSum,
+                                                  ColumnValueExp("p"))}});
+  };
+
+  std::vector<Row> values(65536, Row({Value(1), Value(2)}));
+  values.emplace_back(Row({Value(-1), Value(INT64_MAX)}));
+  values.emplace_back(Row({Value(1), Value()}));
+  ASSIGN_OR_ASSERT_FAIL(
+      Executor, fused,
+      PipelineLowering::LowerToExecutor(make_plan(std::move(values)), ctx));
+  const auto result = DrainExecutor(fused.get());
+  ASSERT_TRUE(fused->GetStatus().ok()) << fused->GetStatus();
+  ASSERT_EQ(result.size(), 1U);
+  EXPECT_EQ(result[0][0].AsInt64(), 65536 * 6);
+  if (kernel) {
+    std::ostringstream explain;
+    fused->Dump(explain, 0);
+    EXPECT_NE(explain.str().find("FusedFilterProjectSum (jit_batches=1)"),
+              std::string::npos)
+        << explain.str();
+  }
+
+  ASSIGN_OR_ASSERT_FAIL(Executor, empty,
+                        PipelineLowering::LowerToExecutor(
+                            make_plan({Row({Value(-1), Value(INT64_MAX)}),
+                                       Row({Value(), Value(1)})}),
+                            ctx));
+  const auto null_result = DrainExecutor(empty.get());
+  ASSERT_TRUE(empty->GetStatus().ok());
+  ASSERT_EQ(null_result.size(), 1U);
+  EXPECT_TRUE(null_result[0][0].IsNull());
+
+  ASSIGN_OR_ASSERT_FAIL(
+      Executor, overflow,
+      PipelineLowering::LowerToExecutor(
+          make_plan({Row({Value(1), Value(INT64_MAX)})}), ctx));
+  EXPECT_TRUE(DrainExecutor(overflow.get()).empty());
+  EXPECT_EQ(overflow->GetStatus(), StatusCode::kInvalidArgument);
+}
+
 TEST(PipelineP3aTest, FilterProjectLimitAndMetricsWorkEndToEnd) {
   Schema schema(
       "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
@@ -62,7 +138,7 @@ TEST(PipelineP3aTest, FilterProjectLimitAndMetricsWorkEndToEnd) {
   auto val_exec = std::make_shared<ValuesExecutor>(std::move(input));
   auto src = std::make_shared<StreamingExecutorSource>(val_exec, "ValuesScan");
 
-  // WHERE a >= 50 SELECT a + b AS sum_ab ORDER? no, LIMIT 5 OFFSET 2.
+  // WHERE a >= 50, project a+b AS sum_ab, LIMIT 5 OFFSET 2.
   Expression pred = BinaryExpressionExp(ColumnValueExp("a"),
                                         BinaryOperation::kGreaterThanEquals,
                                         ConstantValueExp(Value(int64_t{50})));
@@ -119,7 +195,9 @@ TEST(PipelineP3aTest, FilterProjectLimitAndMetricsWorkEndToEnd) {
   });
   PipelineExecutor legacy_exec(nullptr, std::move(legacy_graph));
   EXPECT_EQ(DrainExecutor(&legacy_exec).size(), 1U);
-  EXPECT_GT(legacy_exec.Metrics().legacy_source_ms, 0.0);
+  // Legacy-source timing is opt-in (TINYLAMB_PIPELINE_METRICS, read once per
+  // process), so only a non-negative, well-formed metric is guaranteed here.
+  EXPECT_GE(legacy_exec.Metrics().legacy_source_ms, 0.0);
 }
 
 TEST(PipelineP3aTest, OocSortAndTopNSinkHandleSpilledExpressionKeys) {
@@ -302,6 +380,118 @@ TEST(PipelineP3aTest, OocGroupAggSinkSpillsCombinableDistinctAndHandlesSkew) {
   }
 }
 
+TEST(PipelineP3aTest, FilteredHashProbeSwitchKeepsOrderAndDuplicateChains) {
+  const auto direct =
+      JitInt64Kernels::CompileFilterHashProbe(BinaryOperation::kGreaterThan);
+  const auto compact =
+      JitInt64Kernels::CompileFilter(BinaryOperation::kGreaterThan);
+  const Schema probe_schema("p", {Column("key", ValueType::kInt64),
+                                  Column("keep", ValueType::kInt64)});
+  const Schema build_schema("b", {Column("key", ValueType::kInt64),
+                                  Column("tag", ValueType::kInt64)});
+  const Schema projected_schema("pp", {Column("keep", ValueType::kInt64),
+                                       Column("key", ValueType::kInt64)});
+  const Expression compare =
+      BinaryExpressionExp(ColumnValueExp("keep"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0})));
+  const Expression filter = BinaryExpressionExp(
+      compare, BinaryOperation::kAnd,
+      UnaryExpressionExp(ColumnValueExp("key"), UnaryOperation::kIsNotNull));
+  OocHashJoinSpec spec;
+  spec.left_schema = projected_schema;
+  spec.right_schema = build_schema;
+  spec.left_cols = {1};
+  spec.right_cols = {0};
+  spec.dynamic_filter = true;
+  auto join = std::make_shared<OocHashJoinContext>(std::move(spec));
+
+  std::vector<Row> build;
+  build.emplace_back(Row({Value(7), Value(101)}));
+  build.emplace_back(Row({Value(7), Value(102)}));
+  for (int64_t i = 20; i < 150; ++i) {
+    build.emplace_back(Row({Value(i), Value(-i)}));
+  }
+
+  constexpr int64_t kMiss = 10000;
+  std::vector<DataChunk> chunks;
+  for (size_t i = 0; i < 66; ++i) {
+    DataChunk batch;
+    batch.Reset(probe_schema, 1024);
+    for (size_t row = 0; row < 1024; ++row) {
+      batch.Append(Row({Value(kMiss), Value(row == 0 ? 1 : 0)}));
+    }
+    chunks.push_back(std::move(batch));
+  }
+  DataChunk sparse;
+  sparse.Reset(probe_schema, 13);
+  for (size_t row = 0; row < 13; ++row) {
+    const bool hit = row == 1 || row == 5 || row == 12;
+    sparse.Append(Row({Value(hit ? 7 : kMiss), Value(hit ? 1 : 0)}));
+  }
+  chunks.push_back(std::move(sparse));
+  DataChunk dense;
+  dense.Reset(probe_schema, 1024);
+  for (size_t row = 0; row < 1024; ++row) {
+    dense.Append(Row({Value(row == 15 ? 7 : kMiss), Value(2)}));
+  }
+  chunks.push_back(std::move(dense));
+  DataChunk nullable;
+  nullable.Reset(probe_schema, 3);
+  nullable.Append(Row({Value(7), Value()}));
+  nullable.Append(Row({Value(), Value(3)}));
+  nullable.Append(Row({Value(7), Value(3)}));
+  chunks.push_back(std::move(nullable));
+
+  auto probe_source = std::make_shared<OocAdaptiveHashProbeSource>(
+      join, std::make_shared<ChunkVectorSource>(std::move(chunks), "Probe"),
+      std::vector<std::shared_ptr<PipelineOperator>>{
+          std::make_shared<FilterOp>(filter, probe_schema),
+          std::make_shared<ProjectOp>(
+              std::vector<NamedExpression>{{"keep", ColumnValueExp("keep")},
+                                           {"key", ColumnValueExp("key")}},
+              probe_schema),
+          std::make_shared<RenameOp>("p", "pp")});
+  PipelineGraph graph;
+  graph.output_schema = projected_schema + build_schema;
+  graph.stages.push_back(PipelineStage{
+      .id = 0,
+      .name = "Build",
+      .source = std::make_shared<RowVectorSource>(std::move(build)),
+      .operators = {},
+      .sink = std::make_shared<OocHashBuildSink>(join),
+      .output_binding = nullptr,
+  });
+  graph.stages.push_back(PipelineStage{
+      .id = 1,
+      .name = "Probe",
+      .source = probe_source,
+      .operators = {},
+      .sink = nullptr,
+      .output_binding = nullptr,
+  });
+  PipelineExecutor executor(nullptr, std::move(graph));
+  const auto rows = DrainExecutor(&executor);
+  ASSERT_TRUE(executor.GetStatus().ok()) << executor.GetStatus();
+  ASSERT_EQ(rows.size(), 10U);
+  EXPECT_EQ(join->dynamic_filter_probe_rows, 1094U);
+  EXPECT_EQ(join->dynamic_filter_rejected, 1089U);
+  constexpr std::array<int64_t, 5> kProbeTags{1, 1, 1, 2, 3};
+  for (size_t i = 0; i < rows.size(); ++i) {
+    EXPECT_EQ(rows[i][0].AsInt64(), kProbeTags[i / 2]);
+    EXPECT_EQ(rows[i][1].AsInt64(), 7);
+    EXPECT_EQ(rows[i][3].AsInt64(), 101 + static_cast<int64_t>(i % 2));
+  }
+  if (direct && compact &&
+      std::getenv("TINYLAMB_FILTER_HASH_PROBE") == nullptr) {
+    std::ostringstream explain;
+    probe_source->DumpExplain(explain, 0);
+    EXPECT_NE(explain.str().find(
+                  "FilteredHashProbe direct_batches=3 compact_batches=1"),
+              std::string::npos)
+        << explain.str();
+  }
+}
+
 TEST(PipelineP3aTest, OocHashJoinCoversAllKindsSpillAndSkewFallback) {
   OpBudgetOverrideGuard guard(64ULL << 10);
 
@@ -437,7 +627,47 @@ TEST(PipelineP3aTest, OocHashJoinCoversAllKindsSpillAndSkewFallback) {
   EXPECT_EQ(bl_lo.size(), 600U);
 }
 
+// RAII: points TINYLAMB_TEMP at a directory this test controls, so spill
+// segment files land (or must not land) where the test can count them
+// (T4131; mirrors executor/grouped_aggregate_test.cpp's ScopedTempDir).
+class ScopedSpillTempDir {  // NOLINT(cppcoreguidelines-special-member-functions)
+ public:
+  explicit ScopedSpillTempDir(std::filesystem::path path)
+      : path_(std::move(path)) {
+    const char* previous = std::getenv("TINYLAMB_TEMP");
+    if (previous != nullptr) {
+      previous_ = previous;
+      had_previous_ = true;
+    }
+    setenv("TINYLAMB_TEMP", path_.c_str(), 1);
+  }
+  ~ScopedSpillTempDir() {
+    if (had_previous_) {
+      setenv("TINYLAMB_TEMP", previous_.c_str(), 1);
+    } else {
+      unsetenv("TINYLAMB_TEMP");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+  ScopedSpillTempDir(const ScopedSpillTempDir&) = delete;
+  ScopedSpillTempDir& operator=(const ScopedSpillTempDir&) = delete;
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+  std::string previous_;
+  bool had_previous_{false};
+};
+
 TEST(PipelineP3aTest, SpilledFaultInjectionPropagatesCleanlyWithoutLeaks) {
+  // T4131: pin the name's promise. The failed sort must leave no spill
+  // segment files behind once the sink and executor are gone -- the
+  // file-count analog of SpillStoreTest.InjectedIoFailureRollsBackWithout
+  // LeakingBlocks' live_segments == 0 assertions.
+  const ScopedSpillTempDir temp_dir(std::filesystem::temp_directory_path() /
+                                    ("tinylamb_p3a_leak_" + RandomString()));
+  std::filesystem::create_directories(temp_dir.path());
   OpBudgetOverrideGuard guard(64ULL << 10);
   ProcessMemoryBudget::Global().SetTestTempLimitBytes(2ULL *
                                                       SpillStore::kBlockSize);
@@ -464,16 +694,29 @@ TEST(PipelineP3aTest, SpilledFaultInjectionPropagatesCleanlyWithoutLeaks) {
       .sink = sort_sink,
       .output_binding = nullptr,
   });
-  PipelineExecutor exec(nullptr, std::move(g));
-  const std::vector<Row> out = DrainExecutor(&exec);
-  EXPECT_TRUE(out.empty());
-  EXPECT_EQ(exec.GetStatus().GetCode(), StatusCode::kNoSpace);
+  {
+    PipelineExecutor exec(nullptr, std::move(g));
+    const std::vector<Row> out = DrainExecutor(&exec);
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(exec.GetStatus().GetCode(), StatusCode::kNoSpace);
+    sort_sink.reset();
+  }
+  std::error_code ec;
+  size_t leftover_files = 0;
+  for (std::filesystem::directory_iterator it(temp_dir.path(), ec), end;
+       it != end; it.increment(ec)) {
+    ++leftover_files;
+  }
+  EXPECT_EQ(leftover_files, 0U)
+      << "failed spilled sort leaked segment files into " << temp_dir.path();
 }
 
 TEST(PipelineP3aTest,
      ResidentHashJoinAndGroupAggManageGuardsAndZeroMaxRowsCleanly) {
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
-  struct ResetGuard {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
     ProcessMemoryBudget* budget;
@@ -607,7 +850,9 @@ TEST(PipelineP3aTest,
 
 TEST(PipelineP3aTest, GrantRequestFollowsTheConfiguredQueryBudget) {
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
-  struct ResetGuard {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
     ProcessMemoryBudget* budget;
@@ -627,7 +872,9 @@ TEST(PipelineP3aTest, GrantRequestFollowsTheConfiguredQueryBudget) {
   EXPECT_EQ(PipelineGrantRequestBytes(size_t{1} << 10), size_t{256} << 10);
 
   // TINYLAMB_QUERY_MEMORY_BYTES tightens the request downward too.
-  struct QueryMemGuard {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct QueryMemGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
     QueryMemGuard() {
       platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES",
                        std::to_string(size_t{16} << 20).c_str());

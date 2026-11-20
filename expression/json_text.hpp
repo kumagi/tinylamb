@@ -31,7 +31,12 @@ class Validator {
  public:
   explicit Validator(std::string_view text) : text_(text) {}
 
+  // Resets the parse cursor first, so calling `Valid()` twice on the same
+  // object returns the same answer instead of failing on the second pass
+  // (the descent below consumes `pos_`).
   [[nodiscard]] bool Valid() {
+    pos_ = 0;
+    depth_ = 0;
     SkipSpace();
     if (!Value()) {
       return false;

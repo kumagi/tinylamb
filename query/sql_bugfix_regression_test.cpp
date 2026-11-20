@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -17,9 +18,15 @@
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/apply.hpp"
+#include "executor/constant_executor.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/expression.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
+#include "type/column.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -49,6 +56,21 @@ class SqlBugfixRegressionTest : public ::testing::Test {
     ASSERT_TRUE(result.HasValue()) << sql << ": " << engine_->LastError();
     result.Value().Drain();
     ASSERT_EQ(result.Value().GetStatus(), Status::kSuccess) << sql;
+  }
+
+  // Execution is lazy: a statement may prepare fine and fail while its
+  // cursor is drained (DML conflicts, runtime type errors). Returns the
+  // first error text, or nullopt when the statement fully succeeded.
+  std::optional<std::string> ErrorOf(const std::string& sql) {
+    StatusOr<QueryResult> result = engine_->Execute(*context_, sql);
+    if (!result.HasValue()) {
+      return engine_->LastError() + " " + ToString(result.GetStatus());
+    }
+    result.Value().Drain();
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      return ToString(result.Value().GetStatus());
+    }
+    return std::nullopt;
   }
 
   // Runs a query and returns its rows as sorted strings (multiset compare).
@@ -143,6 +165,35 @@ TEST_F(SqlBugfixRegressionTest, SemiJoinWithRepeatedOuterKeyColumn) {
   EXPECT_EQ(Query("SELECT x0.k FROM t2 x0 WHERE NOT EXISTS (SELECT 1 FROM t1 "
                   "sq WHERE sq.a = x0.b AND sq.b = x0.b)"),
             (std::vector<std::string>{"2", "3"}));
+}
+
+// P178: the outer_to_anti_join rule published the query's target list onto the
+// AntiJoin alternative verbatim; when it named right-side columns
+// (`SELECT b.v ... WHERE b.k IS NULL`) the emitted AntiJoin's readers were
+// handed a schema its preserved-side emission does not satisfy — results
+// only matched because every surviving row is NULL-extended.  Conversion
+// must refuse when the published targets touch right-side columns; this pin
+// locks the answers and the shape stability of all three target flavours.
+TEST_F(SqlBugfixRegressionTest, AntiJoinConversionRejectsRightSideTargets) {
+  Exec("CREATE TABLE a (k INT64, v INT64)");
+  Exec("CREATE TABLE b (k INT64, v INT64)");
+  Exec("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)");
+  Exec("INSERT INTO b VALUES (1, 11), (3, 33)");
+  EXPECT_EQ(Query("SELECT b.v FROM a LEFT JOIN b ON a.k = b.k "
+                  "WHERE b.k IS NULL"),
+            (std::vector<std::string>{"NULL"}));
+  EXPECT_EQ(Query("SELECT b.v + 1 FROM a LEFT JOIN b ON a.k = b.k "
+                  "WHERE b.k IS NULL"),
+            (std::vector<std::string>{"NULL"}));
+  EXPECT_EQ(Query("SELECT a.k FROM a LEFT JOIN b ON a.k = b.k "
+                  "WHERE b.k IS NULL"),
+            (std::vector<std::string>{"2"}));
+  EXPECT_EQ(Query("SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k "
+                  "WHERE b.k IS NULL"),
+            (std::vector<std::string>{"1"}));
+  EXPECT_EQ(Query("SELECT a.k, b.k FROM a LEFT JOIN b ON a.k = b.k "
+                  "WHERE b.k IS NULL"),
+            (std::vector<std::string>{"2,NULL"}));
 }
 
 // The SQL facade routed shapes to the decorrelating optimizer that its
@@ -394,7 +445,9 @@ TEST_F(SqlBugfixRegressionTest, CreateTableIfNotExistsAndOrReplaceFlags) {
   Exec("CREATE OR REPLACE TABLE t (k INT64, w STRING(MAX))");
   EXPECT_TRUE(Query("SELECT k, w FROM t").empty());
   Exec("INSERT INTO t VALUES (2, 'two')");
-  EXPECT_EQ(Query("SELECT k, w FROM t"), (std::vector<std::string>{"2,two"}));
+  // Query() renders cells through operator<<, which quotes strings.
+  EXPECT_EQ(Query("SELECT k, w FROM t"),
+            (std::vector<std::string>{"2,\"two\""}));
   // The parser accepts both flags together; the visitor rejects the
   // ambiguous combination explicitly instead of picking one silently.
   EXPECT_FALSE(
@@ -424,6 +477,37 @@ TEST_F(SqlBugfixRegressionTest, CreateTableIfNotExistsAndOrReplaceFlags) {
   EXPECT_EQ(Query("SELECT k FROM vv"), (std::vector<std::string>{"7"}));
 }
 
+// T485: the ViewRegistry "registered at (database, epoch)" stamp is
+// per-thread, not per engine instance. Both sides must hold: a freshly
+// constructed engine on the same thread/db resolves views through the
+// shared registry (a fast-path hit must not turn into an unknown-table
+// failure), and a DROP VIEW bumps the epoch so even the shared stamp is
+// invalidated for every engine on that thread.
+TEST_F(SqlBugfixRegressionTest, ViewRegistryFastPathIsPerThreadNotPerEngine) {
+  Exec("CREATE TABLE vp (k INT64)");
+  Exec("INSERT INTO vp VALUES (3)");
+  Exec("CREATE VIEW vv AS SELECT k FROM vp");
+  {
+    SqlEngine fresh(*database_);
+    StatusOr<QueryResult> result = fresh.Execute(*context_, "SELECT k FROM vv");
+    ASSERT_TRUE(result.HasValue()) << fresh.LastError();
+    std::vector<std::string> rows;
+    result.Value().ForEach([&](const Row& row) {
+      std::ostringstream cell;
+      cell << row[0];
+      rows.push_back(cell.str());
+    });
+    EXPECT_EQ(rows, (std::vector<std::string>{"3"}));
+    EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
+  }
+  Exec("DROP VIEW vv");
+  {
+    SqlEngine fresh2(*database_);
+    StatusOr<QueryResult> gone = fresh2.Execute(*context_, "SELECT k FROM vv");
+    EXPECT_FALSE(gone.HasValue());
+  }
+}
+
 // The varchar prefilter swallowed the INTERVAL/STRING type mismatch that the
 // checked evaluator raises, so `WHERE s = INTERVAL 1 DAY` returned a silently
 // empty result and the OR variant let the surviving disjunct answer rows.
@@ -436,16 +520,18 @@ TEST_F(SqlBugfixRegressionTest, IntervalStringComparisonRaisesInFilter) {
        {"SELECT k FROM it WHERE s = INTERVAL 1 DAY",
         "SELECT k FROM it WHERE s = INTERVAL 1 DAY OR k > 0"}) {
     SCOPED_TRACE(sql);
-    StatusOr<QueryResult> result = engine_->Execute(*context_, sql);
-    ASSERT_FALSE(result.HasValue()) << sql;
-    const std::string& error = engine_->LastError();
+    const std::optional<std::string> failure = ErrorOf(sql);
+    if (!failure.has_value()) {
+      ADD_FAILURE() << sql;
+      return;
+    }
+    const std::string& error = *failure;
     EXPECT_TRUE(error.find("INTERVAL") != std::string::npos ||
                 error.find("mismatch") != std::string::npos)
         << error;
   }
   // The projection arm already raised before the fix; it must keep raising.
-  EXPECT_FALSE(engine_->Execute(*context_, "SELECT s = INTERVAL 1 DAY FROM it")
-                   .HasValue());
+  EXPECT_TRUE(ErrorOf("SELECT s = INTERVAL 1 DAY FROM it").has_value());
 }
 
 // INSERT IGNORE / OR REPLACE keyed their conflict gate on the compliance-mock
@@ -457,8 +543,7 @@ TEST_F(SqlBugfixRegressionTest, InsertConflictModesUseDeclaredPrimaryKey) {
   Exec("CREATE TABLE pk (k INT64 PRIMARY KEY, v INT64)");
   Exec("INSERT INTO pk VALUES (1, 10)");
   // A plain duplicate still fails (the storage-level unique index).
-  EXPECT_FALSE(
-      engine_->Execute(*context_, "INSERT INTO pk VALUES (1, 99)").HasValue());
+  EXPECT_TRUE(ErrorOf("INSERT INTO pk VALUES (1, 99)").has_value());
   // IGNORE skips the duplicate instead of erroring about the key.
   Exec("INSERT IGNORE INTO pk VALUES (1, 99)");
   EXPECT_EQ(Query("SELECT k, v FROM pk"), (std::vector<std::string>{"1,10"}));
@@ -467,9 +552,7 @@ TEST_F(SqlBugfixRegressionTest, InsertConflictModesUseDeclaredPrimaryKey) {
   EXPECT_EQ(Query("SELECT k, v FROM pk"), (std::vector<std::string>{"1,20"}));
   // A table without any key keeps rejecting conflict clauses.
   Exec("CREATE TABLE nopk (k INT64, v INT64)");
-  EXPECT_FALSE(
-      engine_->Execute(*context_, "INSERT IGNORE INTO nopk VALUES (1, 2)")
-          .HasValue());
+  EXPECT_TRUE(ErrorOf("INSERT IGNORE INTO nopk VALUES (1, 2)").has_value());
   // A non-first-column PK drives the detection (not column 0).
   Exec("CREATE TABLE pk2 (v INT64, k INT64 PRIMARY KEY)");
   Exec("INSERT INTO pk2 VALUES (100, 7)");
@@ -477,6 +560,289 @@ TEST_F(SqlBugfixRegressionTest, InsertConflictModesUseDeclaredPrimaryKey) {
   EXPECT_EQ(Query("SELECT v, k FROM pk2"), (std::vector<std::string>{"100,7"}));
   Exec("INSERT OR REPLACE INTO pk2 VALUES (555, 7)");
   EXPECT_EQ(Query("SELECT v, k FROM pk2"), (std::vector<std::string>{"555,7"}));
+}
+
+// T3699: the INSERT INT64->DOUBLE coercion reinterpreted the two's-complement
+// bits of an unsigned value as signed, so UINT64 values >= 2^63 landed as
+// negative doubles (UINT64_MAX became -1.0).
+TEST_F(SqlBugfixRegressionTest, InsertUnsignedIntoDoubleUsesUnsignedBits) {
+  Exec("CREATE TABLE d (v FLOAT64)");
+  Exec("INSERT INTO d VALUES (CAST(18446744073709551615 AS UINT64))");
+  Exec("INSERT INTO d VALUES (CAST(3 AS UINT64))");
+  EXPECT_EQ(Query("SELECT v < 0 FROM d"), (std::vector<std::string>{"0", "0"}));
+  EXPECT_EQ(Query("SELECT v >= 18446744073709551615.0 FROM d"),
+            (std::vector<std::string>{"0", "1"}));
+}
+
+// T4097: STRING(TIMESTAMP, zone) renders an instant, so the zone's offset
+// must be resolved AT that instant (like FORMAT_TIMESTAMP's at_utc arm), not
+// as though the UTC wall-clock fields were local time in that zone.
+TEST_F(SqlBugfixRegressionTest, StringTimestampZoneResolvesOffsetAtInstant) {
+  // 2024-03-10 06:30 UTC is 01:30 EST in New York (DST starts at 07:00
+  // UTC); reading 06:30 as New York wall time answers 02:30-04 instead.
+  EXPECT_EQ(Query("SELECT STRING(TIMESTAMP '2024-03-10 06:30:00+00', "
+                  "'America/New_York')"),
+            (std::vector<std::string>{"\"2024-03-10 01:30:00-05\""}));
+  // Past the transition the two readings agree -- pin them too.
+  EXPECT_EQ(Query("SELECT STRING(TIMESTAMP '2024-03-10 07:30:00+00', "
+                  "'America/New_York')"),
+            (std::vector<std::string>{"\"2024-03-10 03:30:00-04\""}));
+  EXPECT_EQ(Query("SELECT STRING(TIMESTAMP '2024-06-15 18:30:00+00', "
+                  "'America/New_York')"),
+            (std::vector<std::string>{"\"2024-06-15 14:30:00-04\""}));
+}
+
+// T5030: same family as T4097 -- TIME()/DATETIME() over a TIMESTAMP render
+// the instant in the zone, so the zone offset must be resolved AT the UTC
+// instant, not by reading the UTC fields as New York wall time (which picks
+// the EDT offset an hour before the transition and answers 02:30).
+TEST_F(SqlBugfixRegressionTest, TimeAndDatetimeZoneResolveOffsetAtInstant) {
+  EXPECT_EQ(Query("SELECT TIME(TIMESTAMP '2024-03-10 06:30:00+00', "
+                  "'America/New_York')"),
+            (std::vector<std::string>{"\"01:30:00\""}));
+  EXPECT_EQ(Query("SELECT DATETIME(TIMESTAMP '2024-03-10 06:30:00+00', "
+                  "'America/New_York')"),
+            (std::vector<std::string>{"\"2024-03-10 01:30:00\""}));
+  // Past the transition both readings agree; keep them pinned too.
+  EXPECT_EQ(Query("SELECT TIME(TIMESTAMP '2024-03-10 07:30:00+00', "
+                  "'America/New_York')"),
+            (std::vector<std::string>{"\"03:30:00\""}));
+  EXPECT_EQ(Query("SELECT DATETIME(TIMESTAMP '2024-03-10 07:30:00+00', "
+                  "'America/New_York')"),
+            (std::vector<std::string>{"\"2024-03-10 03:30:00\""}));
+}
+
+// T4157: EliminateUnusedOuterJoinsForIdempotentResult read a later ON's
+// column set through TouchedColumns(), which for a kQueryExp only reports
+// the Test() operand -- a correlated subquery's inner references stayed
+// invisible and its source got deleted, dangling the correlation.
+TEST_F(SqlBugfixRegressionTest, UnusedLeftJoinSurvivesLaterOnSubquery) {
+  Exec("CREATE TABLE elj_a (x INT64, k INT64)");
+  Exec("CREATE TABLE elj_b (k INT64, v INT64)");
+  Exec("CREATE TABLE elj_c (k INT64)");
+  Exec("INSERT INTO elj_a VALUES (7, 1), (8, 2)");
+  Exec("INSERT INTO elj_b VALUES (1, 100), (2, 200)");
+  Exec("INSERT INTO elj_c VALUES (100), (200)");
+  // DISTINCT makes row multiplicity irrelevant, so elj_b is an elimination
+  // candidate; the third source's ON correlates to elj_b inside a subquery.
+  // Before T4157 Prepare died with "column elj_b.v not found".
+  EXPECT_EQ(Query("SELECT DISTINCT elj_a.x FROM elj_a "
+                  "LEFT JOIN elj_b ON elj_a.k = elj_b.k "
+                  "LEFT JOIN elj_c ON elj_c.k = "
+                  "(SELECT MAX(s.v) FROM elj_b s WHERE s.v = elj_b.v)"),
+            (std::vector<std::string>{"7", "8"}));
+}
+
+// T4494: ExecutorBase::Next buffers a batch for row-at-a-time fetching;
+// mixing Next with the batch consumers must neither lose nor repeat rows.
+TEST_F(SqlBugfixRegressionTest, RowFetchMixesWithBatchConsumers) {
+  Exec("CREATE TABLE mix (k INT64)");
+  Exec("INSERT INTO mix VALUES (1), (2), (3), (4), (5)");
+  StatusOr<QueryResult> result =
+      engine_->Execute(*context_, "SELECT k FROM mix ORDER BY k");
+  ASSERT_TRUE(result.HasValue()) << engine_->LastError();
+  Row first;
+  ASSERT_TRUE(result.Value().Next(&first));
+  EXPECT_EQ(first[0].value.int_value, 1);
+  std::vector<Row> rest = result.Value().Collect();
+  ASSERT_EQ(rest.size(), 4);
+  EXPECT_EQ(rest[0][0].value.int_value, 2);
+  EXPECT_EQ(rest[3][0].value.int_value, 5);
+  EXPECT_FALSE(result.Value().Next(&first));
+}
+
+// T3668: the ApplyExecutor route that drives a compiled inner plan
+// (inner_query_ == nullptr) left inner_schema_/combined_schema_ empty, so
+// the route predicate evaluated against a zero-width schema.
+TEST_F(SqlBugfixRegressionTest,
+       ApplyCompiledInnerRouteEvaluatesOnCombinedSchema) {
+  Schema left_schema("l", {Column("k", ValueType::kInt64)});
+  Schema right_schema("r", {Column("k", ValueType::kInt64)});
+  auto outer = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})});
+  auto inner = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{3})})});
+  Expression predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("l", "k")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("r", "k")));
+  ApplyExecutor apply(*context_, left_schema, std::move(outer), nullptr, "",
+                      std::move(inner), std::move(predicate), JoinKind::kInner,
+                      left_schema + right_schema, right_schema);
+  std::vector<Row> out;
+  Row row;
+  while (apply.Next(&row)) {
+    out.push_back(row);
+    row = Row();
+  }
+  ASSERT_EQ(apply.GetStatus(), Status::kSuccess) << engine_->LastError();
+  ASSERT_EQ(out.size(), 1);
+  EXPECT_EQ(out[0][0].value.int_value, 1);
+}
+
+// T3929: "%Ez" is only interpreted by glibc strptime; the shared offset-
+// preference decision must fold the alias into "%z" so the input's own
+// offset wins over the third-argument zone on every platform.
+TEST_F(SqlBugfixRegressionTest, ParseTimestampEzAliasPrefersInputOffset) {
+  EXPECT_EQ(Query("SELECT STRING(PARSE_TIMESTAMP("
+                  "'%Y-%m-%d %H:%M:%S %Ez', '2024-03-10 06:30:00 +0000', "
+                  "'America/New_York'))"),
+            (std::vector<std::string>{"\"2024-03-10 06:30:00+00\""}));
+  // An escaped %%Ez is literal text, not an offset spec: the zone argument
+  // applies (2024-03-10 06:30 New York is already EDT, i.e. -04).
+  EXPECT_EQ(Query("SELECT STRING(PARSE_TIMESTAMP("
+                  "'%%Ez %Y-%m-%d %H:%M:%S', '%Ez 2024-03-10 06:30:00', "
+                  "'America/New_York'))"),
+            (std::vector<std::string>{"\"2024-03-10 10:30:00+00\""}));
+}
+
+// T3886: GREATEST/LEAST fall back to Value::Try{Less,Greater} for non-
+// numeric operands; those must honour the collation tag, matching ORDER BY.
+TEST_F(SqlBugfixRegressionTest, GreatestLeastRespectCollationTag) {
+  // Under 'und:ci' the order is 'a' > 'B' (raw bytes would pick 'a' as the
+  // smaller, i.e. invert both choices).
+  EXPECT_EQ(Query("SELECT GREATEST(COLLATE('B', 'und:ci'), "
+                  "COLLATE('a', 'und:ci'))"),
+            (std::vector<std::string>{"\"B\""}));
+  EXPECT_EQ(Query("SELECT LEAST(COLLATE('B', 'und:ci'), "
+                  "COLLATE('a', 'und:ci'))"),
+            (std::vector<std::string>{"\"a\""}));
+}
+
+// T2235: REGEXP_SUBSTR is the GoogleSQL synonym of REGEXP_EXTRACT.
+TEST_F(SqlBugfixRegressionTest, RegexpSubstrSynonymMatchesRegexpExtract) {
+  EXPECT_EQ(Query("SELECT REGEXP_SUBSTR('hello world', 'o.w'), "
+                  "REGEXP_EXTRACT('hello world', 'o.w')"),
+            (std::vector<std::string>{"\"o w\",\"o w\""}));
+  EXPECT_EQ(Query("SELECT REGEXP_SUBSTR(NULL, 'o.w')"),
+            (std::vector<std::string>{"NULL"}));
+}
+
+// T2239 / T2240: TO_BASE32 / FROM_BASE32 (RFC 4648 vectors, all five
+// remainder classes, case-insensitive and whitespace-tolerant decode like
+// the base64 arms).
+TEST_F(SqlBugfixRegressionTest, Base32RoundTripAndVectors) {
+  EXPECT_EQ(
+      Query("SELECT TO_BASE32('a'), TO_BASE32('ab'), "
+            "TO_BASE32('abc'), TO_BASE32('foobar')"),
+      (std::vector<std::string>{
+          "\"ME======\",\"MFRA====\",\"MFRGG===\",\"MZXW6YTBOI======\""}));
+  EXPECT_EQ(Query("SELECT FROM_BASE32('MFRGG==='), FROM_BASE32('mfrgg===')"),
+            (std::vector<std::string>{"\"abc\",\"abc\""}));
+  EXPECT_EQ(Query("SELECT FROM_BASE32(TO_BASE32('round trip 42!'))"),
+            (std::vector<std::string>{"\"round trip 42!\""}));
+  StatusOr<QueryResult> bad =
+      engine_->Execute(*context_, "SELECT FROM_BASE32('MFRG1===')");
+  ASSERT_TRUE(bad.HasValue());
+  bad.Value().Drain();
+  EXPECT_NE(bad.Value().GetStatus().GetMessage().find("FROM_BASE32"),
+            std::string::npos)
+      << bad.Value().GetStatus().GetMessage();
+}
+
+// T2398: __struct_set recurses per dot-segment of a user path; the depth
+// must be capped (64 passes, 65 is an error, not a stack overflow).
+TEST_F(SqlBugfixRegressionTest, StructSetPathDepthIsCapped) {
+  const std::string deep_64 = [] {
+    std::string p;
+    for (int i = 0; i < 64; ++i) {
+      if (i > 0) {
+        p += ".";
+      }
+      p += "a" + std::to_string(i);
+    }
+    return p;
+  }();
+  EXPECT_EQ(Query("SELECT IF(LENGTH(__struct_set(CAST('{}' AS JSON), '" +
+                  deep_64 + "', 2)) > 400, 1, 0)"),
+            (std::vector<std::string>{"1"}));
+  StatusOr<QueryResult> over =
+      engine_->Execute(*context_, "SELECT __struct_set(CAST('{}' AS JSON), '" +
+                                      deep_64 + ".a64.a65', 2)");
+  ASSERT_TRUE(over.HasValue());
+  over.Value().Drain();
+  ASSERT_NE(over.Value().GetStatus(), Status::kSuccess);
+  // Deep __struct_set paths fail during projection evaluation; depending on
+  // where the fold/eval boundary lands the message rides either on the
+  // result status or on the engine's last_error_ string.
+  const std::string detail = over.Value().GetStatus().GetMessage().find(
+                                 "exceeds 64 segments") != std::string::npos
+                                 ? over.Value().GetStatus().GetMessage()
+                                 : engine_->LastError();
+  EXPECT_NE(detail.find("exceeds 64 segments"), std::string::npos)
+      << detail << " / " << engine_->LastError();
+}
+
+// T2399: the proto path route shares the same 64-segment cap.
+TEST_F(SqlBugfixRegressionTest, ProtoSetPathDepthIsCapped) {
+  const std::string deep_65 = [] {
+    std::string p;
+    for (int i = 0; i < 65; ++i) {
+      if (i > 0) {
+        p += ".";
+      }
+      p += "f" + std::to_string(i);
+    }
+    return p;
+  }();
+  StatusOr<QueryResult> over = engine_->Execute(
+      *context_, "SELECT __proto_set('int64_key_1: 1', '" + deep_65 + "', 9)");
+  ASSERT_TRUE(over.HasValue());
+  over.Value().Drain();
+  EXPECT_NE(over.Value().GetStatus().GetMessage().find(
+                "proto field path exceeds 64 segments"),
+            std::string::npos)
+      << over.Value().GetStatus().GetMessage();
+  EXPECT_EQ(Query("SELECT __proto_set('f0 { f1 { f2: 1 } }', 'f0.f1.f2', 9)"),
+            (std::vector<std::string>{"\"f0 { f1 { f2: 9 } }\""}));
+}
+
+// T3754: the AST CURRENT_TIMESTAMP arm moved from ostringstream+put_time
+// to a strftime buffer; pin the canonical UTC text shape.
+TEST_F(SqlBugfixRegressionTest, CurrentTimestampCanonicalTextLength) {
+  EXPECT_EQ(Query("SELECT LENGTH(STRING(CURRENT_TIMESTAMP()))"),
+            (std::vector<std::string>{"22"}));
+}
+
+// Issue 2553: a persistent view must not capture a session-local SQL UDF.
+// The defining text is cataloged for every session, but the UDF lives only in
+// the creating thread's registry and session bucket, so any other reader (or
+// a read-worker offload of its own query) expands the view into "unknown
+// function".  CREATE VIEW now refuses the capture up front.
+TEST_F(SqlBugfixRegressionTest, CreateViewRejectsSessionLocalUdfCapture) {
+  Exec("CREATE TABLE base(k INT64)");
+  Exec("INSERT INTO base VALUES (1), (2)");
+  Exec("CREATE FUNCTION double_it(x INT64) AS (x * 2)");
+
+  const std::optional<std::string> err =
+      ErrorOf("CREATE VIEW v AS SELECT double_it(k) FROM base");
+  if (!err.has_value()) {
+    ADD_FAILURE() << "expected CREATE VIEW to fail";
+    return;
+  }
+  EXPECT_NE(err->find("session-local"), std::string::npos) << *err;
+  // The rejection must not leave the name occupied in the catalog.
+  Exec("CREATE VIEW v AS SELECT k + 1 AS k FROM base");
+  EXPECT_EQ(Query("SELECT k FROM v"), (std::vector<std::string>{"2", "3"}));
+
+  // Nested references (inside CASE) are captures too.
+  EXPECT_TRUE(ErrorOf("CREATE VIEW v2 AS SELECT CASE WHEN k > 1 THEN "
+                      "double_it(k) ELSE k END FROM base")
+                  .has_value());
+
+  // A name the rewriter maps to a builtin before consulting the UDF registry
+  // can never resolve to the UDF at read time, so shadowing it is not a
+  // capture and must stay creatable.
+  Exec("CREATE FUNCTION ucase(x STRING) AS (CONCAT(x, '!'))");
+  Exec("CREATE TABLE names(s STRING)");
+  Exec("INSERT INTO names VALUES ('ab')");
+  Exec("CREATE VIEW nv AS SELECT ucase(s) FROM names");
+  EXPECT_FALSE(ErrorOf("SELECT * FROM nv").has_value());
+
+  // TEMP views are session objects and MAY capture session-local UDFs
+  // (SqlUdfTest.TempViewBodyExpandsUdfCalls depends on it).
+  Exec("CREATE TEMP FUNCTION tf(x INT64) AS (x + 1)");
+  Exec("CREATE TEMP VIEW tv AS SELECT tf(k) AS n FROM base");
+  EXPECT_EQ(Query("SELECT n FROM tv"), (std::vector<std::string>{"2", "3"}));
 }
 
 }  // namespace tinylamb

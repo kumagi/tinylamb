@@ -574,7 +574,7 @@ size_t ProductPlan::AccessRowCount() const {
   }
   if (right_tbl_ != nullptr) {
     // IndexJoin.
-    return left_src_->AccessRowCount() * 3;
+    return SaturatingMul(left_src_->AccessRowCount(), size_t{3});
   }
   const size_t base =
       SaturatingAdd(left_src_->AccessRowCount(), right_src_->AccessRowCount());
@@ -662,11 +662,11 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
   }
   o << " (estimated rows: " << EmitRowCount() << ")";
   o << "\n" << Indent(static_cast<size_t>(indent) + 2);
-  left_src_->Dump(o, indent + 2);
+  DumpChild(o, *left_src_, indent + 2);
   o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   if (right_tbl_ == nullptr) {
     // CrossJoin or HashJoin.
-    right_src_->Dump(o, indent + 2);
+    DumpChild(o, *right_src_, indent + 2);
   } else {
     // IndexJoin.
     right_idx_->Dump(o);
@@ -743,6 +743,6 @@ bool ProductPlan::InstallParameterSlots(const std::vector<Value>& parameters,
   return left_src_->InstallParameterSlots(parameters, cursor, slots) &&
          (!right_src_ ||
           right_src_->InstallParameterSlots(parameters, cursor, slots)) &&
-         SlotizeInPlace(&residual_note_, parameters, cursor, slots);
+         CollectParameterSlots(&residual_note_, slots);
 }
 }  // namespace tinylamb

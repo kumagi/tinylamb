@@ -18,8 +18,11 @@ edge cases (div-by-zero, `INT64_MIN/-1`, overflow, type mismatch).
   unsupported shapes return `nullopt`/false and fall back to AST
   (env var `TINYLAMB_DISABLE_BYTECODE` to disable).
 - `jit.{hpp,cpp}` — optional LLVM ORC (`TINYLAMB_HAS_LLVM`), narrow non-NULL
-  INT64 kernels only (`Filter/Project/Sum` + overflow-checked variants that
-  throw like the AST); process-lifetime function-pointer cache.
+  INT64 kernels (`Filter/Project/Sum` + `CompileProjectionChecked` /
+  `CompileSumChecked` overflow-checked variants flagging wrapped lanes for
+  AST-identical overflow errors); runs target-aware LLVM O3 middle-end
+  (`TINYLAMB_JIT_DISABLE_OPT=1` disables, `TINYLAMB_JIT_DUMP_DIR` dumps IR/object
+  files); process-lifetime function-pointer cache.
 - `collation.{hpp,cpp}` — the *static* collation an expression asks for:
   `CollationOfExpression` (a `COLLATE(x, 'spec')` call; everything else is
   kNone) and `CollationOfOrdering` (one collated key makes the whole ORDER BY
@@ -41,4 +44,4 @@ AST first, then Bytecode, then (only if INT64-narrow) JIT. Run
 `expression_test`, `function_call_test`.
 
 Note: `expression/bytecode.* -> executor/data_chunk.hpp` is an allowlisted
-edge (S6/A1 separation candidate) — do not add more.
+edge (separation candidate) — do not add more.

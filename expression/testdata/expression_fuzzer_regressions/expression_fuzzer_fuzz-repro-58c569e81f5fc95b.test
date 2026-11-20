@@ -1,0 +1,4 @@
+# tinylamb expression_fuzzer differential repro (issue #33).
+# Self-contained: raw libFuzzer input as lowercase hex below.
+# Replay: expression_fuzzer_test over TINYLAMB_EXPR_FUZZ_REGRESSION_DIR
+74d6d6d6bcbcbcbcbcfefefefefefebcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcd6d6bcd6d6595958707469595959b9

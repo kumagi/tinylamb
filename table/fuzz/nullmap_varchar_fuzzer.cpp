@@ -52,27 +52,15 @@ bool TryShape(const Schema& sc, const StrCase& c, uint8_t shape,
 
 PaxChunk BuildStrForced(const Schema& sc, const StrCase& c, bool* ok) {
   *ok = false;
-  static std::array<int, kStrCaseCount> chosen;
-  static bool init = false;
-  if (!init) {
-    chosen.fill(-1);
-    init = true;
-  }
-  const auto idx = static_cast<size_t>(&c - kStrCases.data());
-  int& slot = chosen[idx];
-  const int first = slot >= 0 ? slot : 0;
-  for (int s = first; std::cmp_less(s, c.nshapes); ++s) {
+  // Try every shape on every call so all configured data distributions stay
+  // reachable (the old process-static first-success cache hid three of four).
+  for (int s = 0; std::cmp_less(s, c.nshapes); ++s) {
     PaxChunk chunk;
     if (TryShape(sc, c, c.shapes[static_cast<size_t>(s)], &chunk)) {
-      slot = s;
       *ok = true;
       return chunk;
     }
-    if (slot < 0 && s == 0) {
-      slot = 0;
-    }
   }
-  slot = static_cast<int>(c.nshapes);
   return PaxChunk{};
 }
 

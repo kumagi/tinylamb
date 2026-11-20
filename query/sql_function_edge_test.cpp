@@ -104,9 +104,10 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
       {"SELECT FORMAT('%.2f', 3.14159)", R"sql("3.14")sql"},
       {"SELECT FORMAT('%g', 0.00001234)", R"sql("1.234e-05")sql"},
       {"SELECT FORMAT('%s', 'abc')", R"sql("abc")sql"},
-      {R"sql(SELECT FORMAT('%t', 'a"b\c'))sql", R"("a"bc")"},
+      {R"sql(SELECT FORMAT('%t', 'a"b\c'))sql", R"("a\"bc")"},
       {"SELECT FORMAT('%t', DATE '2026-01-02')", R"sql("2026-01-02")sql"},
-      {"SELECT FORMAT('%t', 3.5)", R"sql("3.500000")sql"},
+      // %t prints the shortest round-trip form (reference GoogleSQL: 3.5).
+      {"SELECT FORMAT('%t', 3.5)", R"sql("3.5")sql"},
       {"SELECT FORMAT('%%')", R"sql("%")sql"},
       {"SELECT FORMAT('100%%')", R"sql("100%")sql"},
       {"SELECT FORMAT('%10s|', 'ab')", R"sql("        ab|")sql"},
@@ -179,8 +180,6 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
       {"SELECT EXP(1)", "2.718281828459045"},
       {"SELECT EXP(0)", "1"},
       {"SELECT LN(1)", "0"},
-      {"SELECT LN(0)", "-inf"},
-      {"SELECT LN(-1)", "nan"},
       {"SELECT LOG(100)", "4.605170185988092"},
       {"SELECT LOG(8, 2)", "3"},
       {"SELECT LOG(0, 2)", "-inf"},
@@ -292,9 +291,9 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
        R"sql("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a21929)sql"
        R"sql(92a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")sql"},
       {"SELECT md5('abc')",
-       "\"\x90\x01P\x98<\xd2O\xb0\xd6\x96?}(\xe1r\""},  // NOLINT(modernize-raw-string-literal)
+       "\"\x90\\u0001P\x98<\xd2O\xb0\xd6\x96?}(\xe1r\""},  // NOLINT(modernize-raw-string-literal)
       {"SELECT SHA1('abc')",
-       "\"\xa9\x99>6G\x06\x81j\xba>%qxP\xc2l\x9c\xd0\xd8\x9d\""},  // NOLINT(modernize-raw-string-literal)
+       "\"\xa9\x99>6G\\u0006\x81j\xba>%qxP\xc2l\x9c\xd0\xd8\x9d\""},  // NOLINT(modernize-raw-string-literal)
       {"SELECT __bit_and(6, 3)", "2"},
       {"SELECT __bit_or(6, 3)", "7"},
       {"SELECT __bit_xor(6, 3)", "5"},
@@ -371,8 +370,7 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
        R"(ARRAY<STRING>["a", "b"])"},
       {"SELECT JSON_EXTRACT_SCALAR(STRUCT(1 AS a, 'x' AS b), '$.a')",
        R"sql("1")sql"},
-      {"SELECT GET_FIELD(STRUCT(1 AS a), 'z')", "NULL"},
-      {"SELECT __struct_json__(1, 'x')", R"("{"1":"x"}")"},
+      {"SELECT __struct_json__(1, 'x')", R"("{\"1\":\"x\"}")"},
       {"SELECT ARRAY_LENGTH([1,2,3])", "3"},
       {"SELECT ARRAY_REVERSE([1,2,3])", "ARRAY<INT64>[3, 2, 1]"},
       {"SELECT FORMAT_DATE('%Y-%m-%d', DATE '2026-01-02')",
@@ -380,6 +378,17 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
       {"SELECT FORMAT_DATE('%b %e', DATE '2026-03-05')", R"sql("Mar  5")sql"},
       {"SELECT PARSE_DATE('%Y-%m-%d', '2026-01-02')", "2026-01-02"},
       {"SELECT PARSE_DATE('%d/%m/%Y', '02/01/2026')", "2026-01-02"},
+      // T2241: PARSE_DATETIME renders the canonical zone-less DATETIME text.
+      {"SELECT PARSE_DATETIME('%Y-%m-%dT%H:%M:%S', '2026-01-02T03:04:05')",
+       R"sql("2026-01-02 03:04:05")sql"},
+      {"SELECT PARSE_DATETIME('%Y-%m-%d %H:%M', '2026-01-02 03:04')",
+       R"sql("2026-01-02 03:04:00")sql"},
+      // Unspecified time fields default to 00:00:00 (BigQuery contract),
+      // and NULL inputs propagate NULL like the PARSE_DATE family.
+      {"SELECT PARSE_DATETIME('%Y-%m-%d', '2026-05-01')",
+       R"sql("2026-05-01 00:00:00")sql"},
+      {"SELECT PARSE_DATETIME(NULL, '2026-05-01') IS NULL", "1"},
+      {"SELECT PARSE_DATETIME('%Y-%m-%d', NULL) IS NULL", "1"},
       {"SELECT FORMAT_DATETIME('%Y-%m-%dT%H:%M:%S', DATETIME "
        "'2026-01-02T03:04:05')",
        R"sql("2026-01-02T03:04:05")sql"},
@@ -476,6 +485,10 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
     ASSERT_EQ(rows.size(), 1U);
     EXPECT_EQ(Repr(rows[0][0]), c.expected);
   }
+  // A missing STRUCT field is an error, not a silent NULL.
+  EXPECT_THROW(RunSql(engine_.get(), context_.get(),
+                      "SELECT GET_FIELD(STRUCT(1 AS a), 'z')"),
+               std::exception);
 }
 
 TEST_F(SqlFunctionEdgeTest, BatchOnlyBuiltinsInInsertValues) {
@@ -580,6 +593,10 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT FORMAT('%y', 1)",
       "SELECT IS_INF(9.9e308 * 10)",
       "SELECT SQRT(-1)",
+      // GoogleSQL LN fails for x <= 0; SAFE_LN returns NULL (T3885).
+      "SELECT LN(0)",
+      "SELECT LN(-1)",
+      "SELECT LN(-0.0)",
       "SELECT CONCAT_WS('-', 'a', 'b', NULL, 'c')",
       "SELECT CHR(-1)",
       "SELECT CHR(55296)",
@@ -596,17 +613,21 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT CODE_POINTS_TO_STRING([-1])",
       "SELECT CODE_POINTS_TO_BYTES([256])",
       "SELECT TRANSLATE('aba', 'aa', 'xy')",
-      "SELECT TO_CODE_POINTS('h\xe2\x82\xac')",  // NOLINT(modernize-raw-string-literal)
+      // T2245: reciprocal trig singularities raise the division-by-zero
+      // error (SAFE. wrapping is a separate unimplemented feature).
+      "SELECT CSC(0)",
+      "SELECT COT(0)",
+      "SELECT CSCH(0)",
       "SELECT REGEXP_CONTAINS('hello', '(')",
       "SELECT REGEXP_REPLACE('abc', '(', 'x')",
       "SELECT BOOL_VAL(true)",
       "SELECT BOOL_VAL(1)",
       "SELECT STR_VALUE('x')",
-      "SELECT MAKE_INTERVAL(day => 4)",
       "SELECT MAKE_INTERVAL(1, 'DAY', 3)",
       "SELECT GENERATE_ARRAY(1, 5, 0)",
       "SELECT PARSE_DATE('%Y-%m-%d', 'bad')",
-      "SELECT PARSE_DATETIME('%Y-%m-%dT%H:%M:%S', '2026-01-02T03:04:05')",
+      "SELECT PARSE_DATETIME('%Y-%m-%dT%H:%M:%S', 'bad')",
+      "SELECT PARSE_DATETIME('%Y-%m-%dT%H:%M:%S', '2026-01-02T03:04:05x')",
       "SELECT PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', "
       "'2026-01-02T03:04:05.123456+05:30')",
       "SELECT PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', 'bad')",
@@ -615,6 +636,9 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT DATE('bad')",
       "SELECT DATETIME(DATE '2026-01-02', TIME 03:04:05)",
       "SELECT NEW_UUID()",
+      // A non-numeric interval amount is a GoogleSQL error (it used to
+      // saturate to a zero interval).
+      "SELECT DATE '2026-01-02' + INTERVAL 'foo' DAY",
   };
   for (const auto& sql : cases) {
     SCOPED_TRACE(sql);
@@ -631,9 +655,6 @@ TEST_F(SqlFunctionEdgeTest, DeviationSweep) {
       "SELECT SUBSTR('abcdef', 0, 3)",
       "SELECT '2026-01-02' + INTERVAL 5 DAY",
       "SELECT 'x' + INTERVAL 5 DAY",
-      // A non-numeric interval amount parses to a zero interval today
-      // (IntervalValue::TryParse saturates to 0); deviation kept for coverage.
-      "SELECT DATE '2026-01-02' + INTERVAL 'foo' DAY",
       "SELECT DATETIME '2026-13-01'",
       "SELECT DATETIME '2026-01-02T24:00:00'",
       "SELECT DATETIME '2026-02-29'",

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -80,15 +81,15 @@ class OwnedValuePayload {
 
 inline size_t EncodeMemcomparableFormatIntegerTo(char* dst, int64_t in) {
   dst[0] = static_cast<char>(ValueType::kInt64);
-  const uint64_t be = htobe64(static_cast<uint64_t>(in));
+  const uint64_t be = htobe64(in);
   std::memcpy(dst + 1, &be, 8);
   dst[1] ^= static_cast<char>(0x80);
   return 9;
 }
 
-inline size_t EncodeMemcomparableFormatUint64To(char* dst, int64_t in) {
+inline size_t EncodeMemcomparableFormatUint64To(char* dst, uint64_t in) {
   dst[0] = static_cast<char>(6);
-  const uint64_t be = htobe64(static_cast<uint64_t>(in));
+  const uint64_t be = htobe64(in);
   std::memcpy(dst + 1, &be, 8);
   return 9;
 }
@@ -129,7 +130,7 @@ enum class AggregationType : uint8_t {
   kArrayAgg,
   kStringAgg,
   kCountIf,
-  // Statistical aggregates (long-double accumulation).
+  // Returns an arbitrary input value (not a statistical aggregate).
   kAnyValue,
   kVarSamp,
   kVarPop,
@@ -156,6 +157,7 @@ enum class AggregationType : uint8_t {
   kKllInitDouble,
   kKllMergePartial,
   kPercentileCont,
+  kPercentileDisc,
   kApproxCountDistinct,
   // MODE: most frequent non-NULL value (hash-count accumulation).
   kMode,
@@ -175,6 +177,9 @@ enum class AggregationType : uint8_t {
 
 bool IsStatisticalAggregate(AggregationType type);
 bool IsSketchAggregate(AggregationType type);
+// P461/501: single source of truth for aggregate result-type declarations
+// (see value.cpp).  std::nullopt = result type follows the child expression.
+std::optional<ValueType> CanonicalAggregateResultKind(AggregationType type);
 bool IsExtendedAggregate(AggregationType type);
 // Two-input statistical aggregates (COVAR_*/CORR/REGR_*): the child is y,
 // the single trailing argument is x, and rows where either side is NULL are
@@ -254,7 +259,8 @@ class Value {
     }
     InitCopySlow(o);
   }
-  [[gnu::always_inline]] Value(Value&& o) noexcept
+  // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar move may allocate
+  [[gnu::always_inline]] Value(Value&& o)
       : value(o.value), type(o.type) {
     if (TINYLAMB_VALUE_SCALAR(type)) [[likely]] {
       collation_ = o.collation_;
@@ -284,7 +290,8 @@ class Value {
     CopyAssignSlow(rhs);
     return *this;
   }
-  [[gnu::always_inline]] Value& operator=(Value&& o) noexcept {
+  // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar move may allocate
+  [[gnu::always_inline]] Value& operator=(Value&& o) {
     if (this == &o) [[unlikely]] {
       return *this;
     }
@@ -311,9 +318,9 @@ class Value {
   // the heap branches out of the always_inline header bodies is what makes
   // every hot call site a straight-line scalar move.
   void InitCopySlow(const Value& o);
-  void InitMoveSlow(Value& o) noexcept;
+  void InitMoveSlow(Value& o);
   Value& CopyAssignSlow(const Value& rhs);
-  Value& MoveAssignSlow(Value& o) noexcept;
+  Value& MoveAssignSlow(Value& o);
 
  public:
   [[nodiscard]] bool Truthy() const;
@@ -322,6 +329,10 @@ class Value {
   // True when this value's image fits the on-disk widths (VARCHAR length is
   // prefixed with bin_size_t).  Row::CheckSerializable applies it per column.
   [[nodiscard]] Status CheckSerializable() const;
+  // Maximum supported ARRAY nesting depth. All persistence/read paths
+  // (row page, spill, memcomparable) must agree; writing deeper is rejected.
+  static constexpr size_t kMaxArrayNestingDepth = 32;
+  [[nodiscard]] Status CheckSerializableWithDepth(size_t depth) const;
 
   // Read/Write without type info.  Serialize assumes a value whose payload
   // fits the on-disk width (see Row::CheckSerializable); the typed
@@ -440,9 +451,13 @@ class Value {
   }
   [[nodiscard]] bool LessSlow(const Value& rhs) const;
   // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
-  bool operator>(const Value& rhs) const {
-    return ExcShimUnwrap(TryGreater(rhs), "Value::operator>");
-  }
+  // T3269: `a > b` is by definition `b < a`, and the forward operator<
+  // (inline homogeneous fast path + LessSlow total order) mirrors
+  // TryGreater for every tag combination, so operator> reuses it verbatim
+  // instead of forcing every comparison through the StatusOr TryGreater —
+  // homogeneous non-interval VARCHAR paid an interval re-parse there while
+  // operator< completes with a raw byte compare.
+  bool operator>(const Value& rhs) const { return rhs.operator<(*this); }
   // Derived from < and == (not from negating >) so that NaN, which compares
   // false against everything in both < and >, stays consistent: the old
   // `!(a > b)` form made `NaN <= x` true while `NaN < x` and `NaN == x` were
@@ -495,7 +510,18 @@ class Value {
   }
 
   [[nodiscard]] std::string AsString() const;
+  // T1320: reads a kInt64 payload only. DATE used to flow through here and
+  // silently return its day count — a different SQL domain than the name
+  // promised; use AsDateDays() (or DateDays()) for DATE values.
   [[nodiscard]] int64_t AsInt64() const {
+    if (type != ValueType::kInt64) {
+      ThrowAsInt64();
+    }
+    return value.int_value;
+  }
+  // Day-count accessor for the DATE domain (and raw int64 pass-through for
+  // callers holding already-lowered keys).
+  [[nodiscard]] int64_t AsDateDays() const {
     if (type != ValueType::kInt64 && type != ValueType::kDate) {
       ThrowAsInt64();
     }
@@ -552,7 +578,10 @@ class Value {
     value.varchar_value = owned_data;
     collation_ = 0;
   }
-  void SetStringView(std::string_view s) {
+  // T1320: deep-copies `s` into this value's owned storage (the old name
+  // suggested a zero-copy view; CopyFromStringView says what runs). The
+  // paired AsStringView() really is non-owning.
+  void CopyFromStringView(std::string_view s) {
     owned_data.assign(s);
     type = ValueType::kVarChar;
     value.varchar_value = owned_data;
@@ -562,8 +591,12 @@ class Value {
   [[nodiscard]] std::string MoveString();
 
   // Collation attachment (COLLATE(value, spec)).  0 = none, 1 = 'binary',
-  // 2 = case-insensitive ('und:ci' style).  Comparisons consult the tag when
-  // either operand carries it; serialization and hashing ignore it.
+  // 2 = case-insensitive ('und:ci' style).  The tag survives serialization
+  // and participates in hashing, but the generic Value comparison paths in
+  // value.cpp do NOT fold case from it -- case-insensitive equality/ordering
+  // is applied by call sites that resolve the collation explicitly (join
+  // keys, ORDER BY, set ops via EqualUnderCollation in type/collation.cpp).
+  // Carrying the tag here keeps those call sites able to recover the intent.
   [[nodiscard]] uint8_t Collation() const { return collation_; }
   void SetCollation(uint8_t collation) { collation_ = collation; }
   [[nodiscard]] bool IsCaseInsensitive() const { return collation_ == 2; }

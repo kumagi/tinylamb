@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/exception_status.hpp"
 #include "common/platform/cpu_affinity.hpp"
 #include "common/query_parallelism.hpp"
 
@@ -37,10 +38,11 @@ Status Invoke(const std::function<void(size_t)>& task, size_t index) {
     TaskScope scope;
     task(index);
     return Status::kSuccess;
-  } catch (const std::exception& error) {
-    return StatusError(StatusCode::kRuntimeError, error.what());
   } catch (...) {
-    return StatusError(StatusCode::kRuntimeError, "parallel task failed");
+    // Canonical exception->Status conversion (ADR 0012): bad_alloc reports
+    // kMemoryLimitExceeded instead of collapsing into kRuntimeError, and
+    // invalid_argument/out_of_range/length_error keep their own codes.
+    return StatusFromCurrentException("parallel task failed");
   }
 }
 
@@ -50,6 +52,9 @@ struct TaskBatch {
   size_t next{1};  // guarded by the pool mutex
   std::atomic<size_t> remaining;
   QueryParallelismBudget budget{query_parallelism_budget};
+  // One sched_getaffinity snapshot per submission (P67): helper threads
+  // inherit the submitter's affinity; the per-batch check in Work() is the
+  // fixed-size memcmp contract from common/platform/cpu_affinity.hpp.
   std::optional<platform::CpuSet> affinity{platform::CpuSet::CurrentThread()};
   std::mutex mutex{};
   std::condition_variable done{};
@@ -78,15 +83,26 @@ class ParallelPool {
     bool wake_all = false;
     {
       std::scoped_lock lock(mutex_);
-      helpers = std::min<size_t>(
-          batch->count - 1, std::max(1U, std::thread::hardware_concurrency()));
+      // Cap the shared pool like the server's read-worker pool so many
+      // concurrent queries cannot each spawn a core-count worth of threads.
+      constexpr size_t kMaxPoolWorkers = 16;
+      helpers =
+          std::min<size_t>({batch->count - 1, kMaxPoolWorkers,
+                            std::max(1U, std::thread::hardware_concurrency())});
       try {
+        batches_.push_back(batch);
         while (threads_.size() < helpers) {
           threads_.emplace_back([this] { Work(); });
         }
-        batches_.push_back(batch);
       } catch (...) {
-        // No work was published; the caller can execute all indices serially.
+        // Publication failed: remove the batch and any threads started for
+        // it so the static pool does not accumulate orphaned workers.
+        if (!batches_.empty() && batches_.back() == batch) {
+          batches_.pop_back();
+        }
+        if (threads_.size() > helpers) {
+          threads_.resize(helpers);
+        }
         return false;
       }
       wake_all = (helpers >= threads_.size());

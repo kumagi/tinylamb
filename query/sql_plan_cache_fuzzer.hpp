@@ -1,7 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#ifndef TINYLAMB_SQL_PLANCACHE_FUZZER_HPP
-#define TINYLAMB_SQL_PLANCACHE_FUZZER_HPP
+#ifndef TINYLAMB_SQL_PLAN_CACHE_FUZZER_HPP
+#define TINYLAMB_SQL_PLAN_CACHE_FUZZER_HPP
 
 #include <cstddef>
 #include <cstdint>
@@ -58,4 +58,4 @@ void PlanCacheFuzzTry(const uint8_t* data, size_t size, bool verbose);
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_SQL_PLANCACHE_FUZZER_HPP
+#endif  // TINYLAMB_SQL_PLAN_CACHE_FUZZER_HPP

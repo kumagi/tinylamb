@@ -17,6 +17,9 @@
 #include "log_message.hpp"
 
 #include <array>
+#include <atomic>
+#include <cctype>
+#include <cstring>
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
@@ -33,6 +36,54 @@
 
 namespace tinylamb::detail {
 [[noreturn]] void LogFatalAbort() { std::abort(); }
+
+namespace {
+// One relaxed atomic is enough: a stale read only means a few extra messages
+// around a level change at process startup.
+std::atomic<int> g_min_log_level{static_cast<int>(LogLevel::kTrace)};
+
+LogLevel ParseLogLevelEnv() {
+  const char* env = std::getenv("TINYLAMB_LOG_LEVEL");
+  if (env == nullptr || *env == '\0') {
+    return LogLevel::kTrace;
+  }
+  const std::string value = [env] {
+    std::string s(env);
+    for (char& c : s) {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return s;
+  }();
+  if (value == "TRACE") return LogLevel::kTrace;  // NOLINT(readability-braces-around-statements)
+  if (value == "DEBUG") return LogLevel::kDebug;  // NOLINT(readability-braces-around-statements)
+  if (value == "USER") return LogLevel::kUser;  // NOLINT(readability-braces-around-statements)
+  if (value == "INFO") return LogLevel::kInfo;  // NOLINT(readability-braces-around-statements)
+  if (value == "NOTICE") return LogLevel::kNotice;  // NOLINT(readability-braces-around-statements)
+  if (value == "WARN" || value == "WARNING") return LogLevel::kWarn;  // NOLINT(readability-braces-around-statements)
+  if (value == "ERROR") return LogLevel::kError;  // NOLINT(readability-braces-around-statements)
+  if (value == "ALERT") return LogLevel::kAlert;  // NOLINT(readability-braces-around-statements)
+  if (value == "FATAL") return LogLevel::kFatal;  // NOLINT(readability-braces-around-statements)
+  return LogLevel::kTrace;
+}
+}  // namespace
+
+void SetMinLogLevel(LogLevel level) noexcept {
+  g_min_log_level.store(static_cast<int>(level), std::memory_order_relaxed);
+}
+
+LogLevel MinLogLevel() noexcept {
+  return static_cast<LogLevel>(g_min_log_level.load(std::memory_order_relaxed));
+}
+
+bool LogLevelEnabled(LogLevel level) noexcept {
+  const int min = g_min_log_level.load(std::memory_order_relaxed);
+  return level == LogLevel::kFatal || static_cast<int>(level) >= min;
+}
+
+struct LogLevelEnvInitializer {
+  LogLevelEnvInitializer() { SetMinLogLevel(ParseLogLevelEnv()); }
+} kLogLevelEnvInitializer;  // NOLINT(cert-err58-cpp,misc-use-internal-linkage)
+
 }  // namespace tinylamb::detail
 
 namespace {
@@ -55,15 +106,23 @@ bool LogUsesColor() {
 }  // namespace
 
 LogStream::~LogStream() {
-  tinylamb::platform::SyncedOStream(std::cerr)
-      << message_.str() << (LogUsesColor() ? "\033[0;39;49m" : "") << "\n";
+  if (enabled_) {
+    tinylamb::platform::SyncedOStream(std::cerr)
+        << message_.str() << (LogUsesColor() ? "\033[0;39;49m" : "") << "\n";
+  }
   if (fatal_) {
     std::abort();
   }
 }
 
 LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
-                       const char* func_name) {
+                       const char* func_name, bool enabled) {
+  ls.enabled_ = enabled;
+  if (!enabled) {
+    // Filtered message: skip the clock read, localtime_r, strftime and all
+    // prefix formatting; operator<< and the destructor are no-ops too.
+    return;
+  }
   if (log_level == LogLevel::kFatal) {
     ls.fatal_ = true;
   }
@@ -74,8 +133,10 @@ LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
   // localtime() is not thread-safe (shared static buffer); use the reentrant
   // form so concurrent loggers on worker threads do not race.
   tinylamb::platform::LocalTime(now_time, &now_tm);
-  std::ignore =
-      strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm);
+  if (strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm) == 0) {
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.strcpy) intentional pattern in this code
+    std::strcpy(buff.data(), "<time?> ");
+  }
 
   switch (log_level) {
     case LogLevel::kFatal:
@@ -121,7 +182,7 @@ LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
       }
       break;
     default:
-      assert(!"unknown log level");
+      assert(!"UNKNOWN LOG LEVEL");
   }
   ls << buff.data() << filename << ":" << lineno << " " << func_name;
   switch (log_level) {

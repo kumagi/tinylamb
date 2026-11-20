@@ -33,7 +33,9 @@ std::string LambdaExpression::ToString() const {
     out << parameters_[i];
   }
   out << ") -> ";
-  out << (body_ ? body_->ToString() : std::string("NULL"));
+  // A missing body is a degenerate hand-built node, not the NULL literal;
+  // render it distinctly so ToString-based keys cannot confuse the two.
+  out << (body_ ? body_->ToString() : std::string("<null>"));
   return out.str();
 }
 

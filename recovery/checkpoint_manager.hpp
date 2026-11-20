@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <ostream>
 #include <string>
@@ -51,19 +52,14 @@ class CheckpointManager {
                     PageManager* pm, size_t interval = 5);
   ~CheckpointManager();
 
-  void Start() {
-    bool notify = false;
-    {
-      std::scoped_lock lk(worker_wait_mu_);
-      if (!stop_.load(std::memory_order_acquire)) {
-        start_.store(true, std::memory_order_release);
-        notify = true;
-      }
-    }
-    if (notify) {
-      worker_wait_cv_.notify_all();
-    }
-  }
+  // T3687: Start() is restart-safe.  Before the first Stop() it just arms
+  // the worker predicate; after Stop() (which joins the worker thread out
+  // of existence) it re-arms stop_, re-registers the PageManager
+  // compaction callback and spawns a fresh worker, so a manager that was
+  // stopped -- e.g. around EmulateCrash -- becomes fully functional again
+  // instead of silently staying dead.  With interval 0 the worker exits
+  // immediately by design and Start() only logs a diagnostic.
+  void Start();
   void Stop();
   void RequestCompaction();
 
@@ -72,6 +68,35 @@ class CheckpointManager {
   StatusOr<lsn_t> WriteCheckpoint(const std::function<void()>& func_for_test =
                                       []() {});
   void SetFlushBudgetMsForTest(size_t /*budget_ms*/) {}
+  void SetWalRetentionWarnBytesForTest(uint64_t bytes) noexcept {
+    wal_retention_warn_bytes_override_.store(bytes, std::memory_order_release);
+    last_wal_retention_warn_ms_.store(0, std::memory_order_release);
+    wal_retention_warn_count_.store(0, std::memory_order_release);
+  }
+  // T4262: override for the WAL-lag checkpoint trigger used by the worker's
+  // periodic (every interval_seconds_) watchdog pass.  Default is half the
+  // retention-warning threshold.
+  void SetWalLagCheckpointBytesForTest(uint64_t bytes) noexcept {
+    wal_lag_checkpoint_bytes_override_.store(bytes, std::memory_order_release);
+  }
+  [[nodiscard]] uint64_t WalLagCheckpointBytes() const noexcept {
+    const uint64_t override_bytes =
+        wal_lag_checkpoint_bytes_override_.load(std::memory_order_acquire);
+    if (override_bytes != 0) {
+      return override_bytes;
+    }
+    const uint64_t warn_bytes = DefaultWalRetentionWarnBytes();
+    return warn_bytes >= 2 ? warn_bytes / 2 : warn_bytes;
+  }
+  [[nodiscard]] uint64_t WalRetentionWarnCountForTest() const noexcept {
+    return wal_retention_warn_count_.load(std::memory_order_acquire);
+  }
+  // Number of checkpoints the background worker has completed successfully.
+  // Lets tests observe that the interval watchdog (T4262) and the
+  // Stop()->Start() restart (T3687) actually put the worker back to work.
+  [[nodiscard]] uint64_t WorkerCheckpointsForTest() const noexcept {
+    return worker_checkpoints_.load(std::memory_order_acquire);
+  }
 
   friend std::ostream& operator<<(std::ostream& o,
                                   const CheckpointManager& cm) {
@@ -92,6 +117,24 @@ class CheckpointManager {
   std::mutex checkpoint_mu_;
   std::mutex worker_wait_mu_;
   std::condition_variable worker_wait_cv_;
+  // WAL retention warning support (`TINYLAMB_WAL_RETENTION_WARN_BYTES`).
+  static uint64_t DefaultWalRetentionWarnBytes() noexcept;
+  void MaybeWarnWalRetention(uint64_t retained_bytes, txn_id_t oldest_txn,
+                             lsn_t oldest_first_lsn, lsn_t replay_anchor_lsn,
+                             lsn_t lowest_retained_lsn, lsn_t durable_lsn);
+  std::atomic<uint64_t> wal_retention_warn_bytes_override_{
+      std::numeric_limits<uint64_t>::max()};
+  std::atomic<int64_t> last_wal_retention_warn_ms_{0};
+  std::atomic<uint64_t> wal_retention_warn_count_{0};
+  // T4262: bytes of retained (durable, un-recycled) WAL that make the
+  // worker's periodic watchdog pass run a checkpoint without a compaction
+  // request; 0 selects the default (half the retention-warning threshold).
+  std::atomic<uint64_t> wal_lag_checkpoint_bytes_override_{0};
+  // Bumped by every RequestCompaction so the worker can tell "the request
+  // I am about to clear is still the one I consumed" from a request that
+  // arrived while the checkpoint was running.
+  uint64_t request_generation_ = 0;
+  std::atomic<uint64_t> worker_checkpoints_{0};
   std::thread checkpoint_worker_;
 };
 

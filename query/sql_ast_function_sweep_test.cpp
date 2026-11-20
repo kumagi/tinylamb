@@ -1,8 +1,8 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
 // AST-evaluator function sweep at the SQL layer: every SELECT-list function
-// call over a scanned table runs through the projection executor's AST
-// evaluator (expression/function_call_expression.cpp), complementing the
+// call over a scanned table is exercised through SqlEngine (projection AST
+// fallback / expression/function_call_expression.cpp), complementing the
 // relational-evaluator sweep in executor/expression_eval_function_sweep_test
 // .cpp.  Cases execute per-row against a fixture table and pin canonical
 // results; argument contracts mirror GoogleSQL semantics.
@@ -229,7 +229,9 @@ TEST_F(SqlAstFunctionSweepTest, ArrayAndDateFamily) {
 
 TEST_F(SqlAstFunctionSweepTest, NullArgumentsPropagatePerContract) {
   // d is NULL on row 3: functions either propagate NULL or fail cleanly.
-  const auto rows = RunLocal("SELECT ln(d), d + 1, d * 2 FROM f ORDER BY id");
+  // abs() keeps ln's argument inside its domain (GoogleSQL ln errors on
+  // x <= 0, T3885) so the NULL-propagation contract stays under test.
+  const auto rows = RunLocal("SELECT ln(abs(d)), d + 1, d * 2 FROM f ORDER BY id");
   ASSERT_EQ(rows.size(), 3U);
   EXPECT_TRUE(rows[2][0].IsNull());
   EXPECT_TRUE(rows[2][1].IsNull());

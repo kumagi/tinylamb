@@ -76,18 +76,18 @@ Status ValidateSortKeys(const Rows& rows, const Schema& schema,
 void PdqSort::Sort(std::vector<std::pair<Row, RowPosition>>& rows,
                    const Schema& schema,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
-  if (error != nullptr) {
-    const Status validation = ValidateSortKeys(
-        rows, schema, keys,
-        [](const std::pair<Row, RowPosition>& entry) -> const Row& {
-          return entry.first;
-        });
-    if (validation != Status::kSuccess) {
-      if (*error == Status::kSuccess) {
-        *error = validation;
-      }
-      return;
-    }
+  // Validation must always run: a failed key evaluation would otherwise
+  // make the comparator non-transitive and std::sort undefined.
+  Status local_error = Status::kSuccess;
+  Status* validation_error = error != nullptr ? error : &local_error;
+  const Status validation = ValidateSortKeys(
+      rows, schema, keys,
+      [](const std::pair<Row, RowPosition>& entry) -> const Row& {
+        return entry.first;
+      });
+  if (validation != Status::kSuccess) {
+    *validation_error = validation;
+    return;
   }
   std::sort(rows.begin(), rows.end(),
             [&](const std::pair<Row, RowPosition>& a,

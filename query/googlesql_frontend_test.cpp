@@ -78,12 +78,12 @@ TEST(GoogleSqlFrontendTest, ParsesAndCachesCommonStatementKinds) {
   }
 }
 
-TEST(GoogleSqlFrontendTest, CacheEvictsOldestStatementsPastLimit) {
+TEST(GoogleSqlFrontendTest, CacheEvictsSomeStatementPastLimit) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";
   }
   // The parse cache holds kMaxCachedStatements entries; feed it well beyond
-  // that so the oldest-entry eviction path runs for every statement.
+  // that so an arbitrary-entry eviction path runs for every statement
   for (int i = 0; i < 1030; ++i) {
     GoogleSqlParseResult result =
         GoogleSqlFrontend::Parse("SELECT " + std::to_string(i) + ";");
@@ -497,7 +497,10 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   // The 2 MB input parses far slower under sanitizer builds on a loaded
   // machine; this test targets EINTR retry, not the parse-round-trip budget,
   // so lift the production timeout for the process under test.
-  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "300", 1);
+  struct RestoreParseTimeoutEnv {  // NOLINT(clang-diagnostic-error,cppcoreguidelines-special-member-functions)
+    ~RestoreParseTimeoutEnv() { (void)unsetenv("TINYLAMB_PARSE_TIMEOUT_SEC"); }
+  } restore_parse_timeout_env;
+  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "300", 1);  // NOLINT(clang-diagnostic-error)
   // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
   // Without SA_RESTART the blocking read/write returns EINTR and must retry.
   struct sigaction saved = {};
@@ -518,6 +521,36 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   ASSERT_EQ(sigaction(SIGALRM, &saved, nullptr), 0);
   ASSERT_TRUE(result.ok) << result.error;
   EXPECT_NE(result.ast.find("QueryStatement"), std::string::npos);
+}
+
+// T1811: a child that exits 0 and prints nothing was reported as a
+// successful parse, so any silent exit-0 binary (broken install, wrong
+// --mode, stub) turned every statement into an "ok, empty AST" no-op.
+// Only whitespace input legitimately parses to nothing.
+TEST(GoogleSqlFrontendTest, SilentExitZeroBinaryIsNotAcceptedAsParse) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  const char* previous = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+  const std::string restore = previous == nullptr ? std::string() : previous;
+  ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_BIN", "/bin/true", 1), 0);
+  // Unique literal: the parse cache is keyed by text, and other tests in
+  // this binary may already have cached ordinary statements.
+  const GoogleSqlParseResult silent =
+      GoogleSqlFrontend::Parse("SELECT 18111811");
+  EXPECT_FALSE(silent.ok);
+  EXPECT_NE(silent.error.find("without output"), std::string::npos)
+      << silent.error;
+  // The documented empty-input success (see EmptyInputReportsSuccessWithoutAst)
+  // survives: whitespace-only input may legitimately parse to nothing.
+  const GoogleSqlParseResult blank = GoogleSqlFrontend::Parse("   \n");
+  EXPECT_TRUE(blank.ok) << blank.error;
+  EXPECT_TRUE(blank.ast.empty());
+  if (previous == nullptr) {
+    unsetenv("TINYLAMB_GOOGLESQL_BIN");
+  } else {
+    ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_BIN", restore.c_str(), 1), 0);
+  }
 }
 
 }  // namespace tinylamb

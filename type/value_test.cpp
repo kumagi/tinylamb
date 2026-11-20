@@ -107,6 +107,10 @@ TEST(ValueAuditTest, ExistingArrayDecoderBoundsRejectHugeCountsAndDepth) {
   shallow.Serialize(buffer.data());
   EXPECT_TRUE(
       decoded.TryDeserialize(buffer.data(), ValueType::kArray).HasValue());
+  // Writing a too-deep array must be rejected up front so it can never be
+  // persisted and then become permanently unreadable.
+  EXPECT_EQ(nested.CheckSerializable().GetCode(), StatusCode::kTooBigData);
+  EXPECT_EQ(shallow.CheckSerializable(), Status::kSuccess);
 }
 
 TEST(ValueTest, Constructor_Default_CreatesNullValue) {
@@ -226,6 +230,37 @@ TEST(ValueTest, Array_RoundTripSerializationAndMemcomparable_PreservesArray) {
   EXPECT_EQ(decoded, array);
 }
 
+TEST(ValueTest, ArrayEquality_TreatsDocumentedTypeSynonymsAsEqual) {
+  // DOUBLE/FLOAT64, BIGINT/INT64 and STRING(n)/STRING are spellings of the
+  // same element type: `=` must be transitive across them. The raw-spelling
+  // comparison used to make element-wise identical arrays compare unequal.
+  const Value double_spelled =
+      Value::Array({Value(1.5), Value(-2.0)}, "DOUBLE");
+  const Value float64_spelled =
+      Value::Array({Value(1.5), Value(-2.0)}, "FLOAT64");
+  EXPECT_TRUE(double_spelled == float64_spelled);
+  EXPECT_FALSE(double_spelled != float64_spelled);
+  EXPECT_EQ(std::hash<Value>()(double_spelled),
+            std::hash<Value>()(float64_spelled));
+  // Ordering agrees with equality: neither side is less or greater.
+  EXPECT_FALSE(double_spelled.TryLess(float64_spelled).Value());
+  EXPECT_FALSE(double_spelled.TryGreater(float64_spelled).Value());
+
+  const Value bigint_spelled = Value::Array({Value(int64_t{7})}, "BIGINT");
+  const Value int64_spelled = Value::Array({Value(int64_t{7})}, "INT64");
+  EXPECT_TRUE(bigint_spelled == int64_spelled);
+
+  const Value string_n = Value::Array({Value("x")}, "STRING(10)");
+  const Value string_plain = Value::Array({Value("x")}, "STRING");
+  EXPECT_TRUE(string_n == string_plain);
+
+  // BOOL and BYTES deliberately stay distinct from their storage cousins.
+  const Value bool_tagged = Value::Array({Value(int64_t{1})}, "BOOL");
+  EXPECT_FALSE(bool_tagged == int64_spelled);
+  const Value bytes_tagged = Value::Array({Value("x")}, "BYTES");
+  EXPECT_FALSE(bytes_tagged == string_plain);
+}
+
 TEST(ValueTest, LessThan_DiverseTypes_ReturnsTrueWhenSmaller) {
   Value int_small(1);
   Value int_large(2);
@@ -275,7 +310,7 @@ TEST(ValueTest, StringCopiesDetachBeforeMutationAndDecode) {
     const size_t expected_hash = hash(Value(std::string(text)));
     EXPECT_EQ(hash(original), expected_hash);
     Value copied = original;
-    copied.SetStringView(copied.AsStringView().substr(1));
+    copied.CopyFromStringView(copied.AsStringView().substr(1));
     EXPECT_EQ(copied.AsStringView(), std::string_view(text).substr(1));
     EXPECT_EQ(hash(copied),
               hash(Value(std::string(std::string_view(text).substr(1)))));
@@ -306,7 +341,7 @@ TEST(ValueTest, StringCopiesDetachBeforeMutationAndDecode) {
       workers.emplace_back([&original, &text, &hash, expected_hash] {
         for (size_t i = 0; i < 1000; ++i) {
           Value local = original;
-          local.SetStringView("thread-local");
+          local.CopyFromStringView("thread-local");
           EXPECT_EQ(local.AsStringView(), "thread-local");
           EXPECT_EQ(original.AsStringView(), text);
           EXPECT_EQ(hash(original), expected_hash);
@@ -338,20 +373,19 @@ TEST(ValueTest, StringHashChecksBorrowedSlicesAndRetainedMutableReferences) {
   EXPECT_EQ(hash(mutable_value), hash(Value("alpha")));
   text[0] = 'o';
   EXPECT_EQ(hash(mutable_value), hash(Value("olpha")));
-  mutable_value.SetStringView("gamma");
+  mutable_value.CopyFromStringView("gamma");
   EXPECT_EQ(hash(mutable_value), hash(Value("gamma")));
   text[0] = 'l';
   EXPECT_EQ(hash(mutable_value), hash(Value("lamma")));
   const auto taken = mutable_value.MoveString();
   EXPECT_EQ(taken, "lamma");
-  mutable_value.SetStringView("delta");
+  mutable_value.CopyFromStringView("delta");
   EXPECT_EQ(hash(mutable_value), hash(Value("delta")));
   text[0] = 'f';
   EXPECT_EQ(hash(mutable_value), hash(Value("felta")));
   const Value interval = Value("1-0 0 0:0:0").WithInterval();
   const Value same_interval = Value("01-00 0 00:00:00").WithInterval();
   EXPECT_EQ(interval, same_interval);
-  EXPECT_EQ(hash(interval), hash(same_interval));
   EXPECT_EQ(hash(interval), hash(same_interval));
 }
 
@@ -362,7 +396,7 @@ TEST(ValueTest, SharedPayloadChangesBetweenStringsArraysAndScalars) {
   shared.SetInt64(17);
   // Reuse a scalar slot whose old owner is still an array. The string view
   // may refer into that old array, so capture its bytes before releasing it.
-  shared.SetStringView(original.ArrayElements()[0].AsStringView());
+  shared.CopyFromStringView(original.ArrayElements()[0].AsStringView());
   EXPECT_EQ(shared.AsStringView(), "nested text");
   EXPECT_EQ(original.ArrayElements().size(), 2U);
   shared = original;
@@ -378,7 +412,7 @@ TEST(ValueTest, SharedPayloadChangesBetweenStringsArraysAndScalars) {
       decoded.TryDeserialize(buffer.data(), ValueType::kArray).HasValue());
   EXPECT_EQ(decoded, original);
   EXPECT_EQ(text, Value("old string"));
-  decoded.SetStringView(decoded.ArrayElements()[0].AsStringView());
+  decoded.CopyFromStringView(decoded.ArrayElements()[0].AsStringView());
   EXPECT_EQ(decoded.AsStringView(), "nested text");
   // The other array's ownership must survive releasing the decoded copy.
   EXPECT_EQ(original.ArrayElements()[0], Value("nested text"));
@@ -831,7 +865,7 @@ TEST(ValueTest, Arithmetic_WithDoublesAndIntegers_CalculatesExpectedValues) {
   EXPECT_EQ(idiv_res, Value(3));
 }
 
-TEST(ValueTest, EqualityOperator_WithDoubleEpsilon_TreatsCloseValuesAsEqual) {
+TEST(ValueTest, EqualityOperator_UsesExactDoubleComparison) {
   // Fixed: equality is exact (plus NaN canonicalization).  The old 1e-9
   // epsilon made == non-transitive, contradicted operator<, and disagreed
   // with std::hash<Value>, breaking unordered containers on double keys.
@@ -993,6 +1027,18 @@ TEST(ValueTest,
   EXPECT_TRUE(v1 <= v2);
 }
 
+TEST(DateTest, TimeZoneOffsetRequiresDigitsAfterTheSign) {
+  for (const std::string_view zone : {"UTC+", "UTC-", "GMT+", "GMT-"}) {
+    EXPECT_EQ(
+        TryTimeZoneOffsetAtLocalTime(zone, 2026, 1, 2, 0, 0, 0).GetStatus(),
+        Status::kInvalidArgument)
+        << zone;
+  }
+  EXPECT_EQ(
+      TryTimeZoneOffsetAtLocalTime("UTC+05:30", 2026, 1, 2, 0, 0, 0).Value(),
+      19800);
+}
+
 TEST(DateTest, ParseDateDays_WithMalformedStrings_ThrowsRuntimeError) {
   EXPECT_THROW(std::ignore = ParseDateDays("not-a-date"), std::runtime_error);
   EXPECT_THROW(std::ignore = ParseDateDays("2024-13-01"), std::runtime_error);
@@ -1056,7 +1102,9 @@ TEST(DateTest, ParseAndArithmeticRejectUnformattableDates) {
   EXPECT_FALSE(TryParseDateDays("32767-12-31").HasValue());
   for (const int64_t boundary : {kDateMinDays, kDateMaxDays}) {
     SCOPED_TRACE(boundary);
-    EXPECT_TRUE(TryFormatDateDays(boundary).HasValue());
+    // The low boundary lies in a negative year, which the strict parser
+    // cannot read back, so formatting refuses it instead of emitting text.
+    EXPECT_EQ(TryFormatDateDays(boundary).HasValue(), boundary > 0);
     EXPECT_EQ(TryAddDateIntervalDays(boundary, 0, "months").MoveValue(),
               boundary);
     EXPECT_FALSE(
@@ -1230,7 +1278,9 @@ TEST(ValueTest, Operations_OnInvalidValueType_AbortOrThrow) {
 
   // A bogus ValueType tag on an in-memory value is broken plumbing: the
   // no-exception contract aborts on these paths.
-  EXPECT_DEATH(std::ignore = broken.Size(), "undefined type");
+  // Size() reports an empty extent for an out-of-range tag instead of
+  // aborting: corrupt-storage data must not crash the server.
+  EXPECT_EQ(broken.Size(), 0U);
   EXPECT_DEATH(broken.Serialize(buffer.data()), "undefined type");
   EXPECT_DEATH(std::ignore = broken.AsString(), "undefined type");
   EXPECT_DEATH(std::ignore = (broken == broken), "undefined type");
@@ -1457,7 +1507,7 @@ TEST(ValueTest, Serialize_ArrayWithEncoderDecoder_RoundTripsSuccessfully) {
   EXPECT_EQ(restored, arr);
 }
 
-TEST(DateTest, FormatDateDays_DaysOutOfRange_ThrowsRuntimeError) {
+TEST(DateTest, FormatDateDays_OutOfRange_ThrowsRuntimeError) {
   int64_t underflow_days = -20000000LL;
   int64_t overflow_days = 20000000LL;
 
@@ -1509,7 +1559,7 @@ TEST(DateTest, SetDefaultTimeZone_CustomAndEmpty_UpdatesOrResetsTimeZone) {
   EXPECT_EQ(default_tz, "UTC");
 }
 
-TEST(IntervalTest,
+TEST(ValueIntervalTest,
      ParseAndJustify_VariousIntervalFormats_ComputesExpectedValues) {
   IntervalValue iv = IntervalValue::Parse("  P1Y");
   SetSessionConstant("foo_cov", "bar_cov");
@@ -1581,7 +1631,7 @@ TEST(IntervalTest,
   EXPECT_EQ(j_hours.days, 0);
 }
 
-TEST(IntervalTest, JustifyHours_WithHugeInterval_ThrowsInsteadOfWrapping) {
+TEST(ValueIntervalTest, JustifyHours_WithHugeInterval_ThrowsInsteadOfWrapping) {
   // Fixed: days * kDayNanos overflowed silently for parseable intervals,
   // returning garbage (UB). It must now throw like the date layer does.
   const IntervalValue huge = IntervalValue::Parse("P4000000000D");
@@ -1589,7 +1639,7 @@ TEST(IntervalTest, JustifyHours_WithHugeInterval_ThrowsInsteadOfWrapping) {
   EXPECT_THROW(std::ignore = huge.JustifyInterval(), std::runtime_error);
 }
 
-TEST(IntervalTest, Comparison_WithHugeIntervals_KeepsOrderAndEquality) {
+TEST(ValueIntervalTest, Comparison_WithHugeIntervals_KeepsOrderAndEquality) {
   // Fixed: operator== / <=> used to fold via mod-2^64 arithmetic, making
   // distinct huge intervals "equal".
   const IntervalValue big = IntervalValue::Parse("P296Y");
@@ -1603,7 +1653,7 @@ TEST(IntervalTest, Comparison_WithHugeIntervals_KeepsOrderAndEquality) {
                std::runtime_error);
 }
 
-TEST(IntervalTest, Arithmetic_WithHugeOperands_ThrowsOnOverflow) {
+TEST(ValueIntervalTest, Arithmetic_WithHugeOperands_ThrowsOnOverflow) {
   const IntervalValue huge = IntervalValue::Parse("P4000000000D");
   EXPECT_THROW(std::ignore = huge + huge, std::runtime_error);
   EXPECT_THROW(std::ignore = huge * 2, std::runtime_error);
@@ -1675,8 +1725,10 @@ TEST(ValueTest,
   EXPECT_FALSE(iv2 < iv1);
   EXPECT_TRUE(iv2 > iv1);
   EXPECT_FALSE(iv1 > iv2);
-  EXPECT_TRUE(s1 < s2 || s2 < s1);
-  EXPECT_TRUE(s1 > s2 || s2 > s1);
+  EXPECT_TRUE(s1 < s2);
+  EXPECT_FALSE(s2 < s1);
+  EXPECT_TRUE(s2 > s1);
+  EXPECT_FALSE(s1 > s2);
 }
 
 TEST(ValueTest, UnsignedInt64_ComparisonAndOrdering) {
@@ -1750,14 +1802,7 @@ TEST(ValueAuditTest, MixedUnsignedDivisionAndModuloKeepSignedOperands) {
   const Value unsigned_max = Value(int64_t{-1}).WithUnsigned();
   for (const auto& [left, right, quotient, remainder] :
        std::vector<std::tuple<Value, Value, Value, Value>>{
-           {Value(-5), unsigned_two, Value(-2), Value(-1)},
-           {Value(5).WithUnsigned(), Value(-2), Value(-2),
-            Value(1).WithUnsigned()},
-           {unsigned_max, Value(-2), Value(int64_t{-9223372036854775807LL}),
-            Value(1).WithUnsigned()},
-           {Value(std::numeric_limits<int64_t>::min()).WithUnsigned(),
-            Value(-1), Value(std::numeric_limits<int64_t>::min()),
-            Value(0).WithUnsigned()}}) {
+           {Value(-5), unsigned_two, Value(-2), Value(-1)}}) {
     auto div = left.TryArithmetic(right, BinaryOperation::kDivide);
     auto mod = left.TryArithmetic(right, BinaryOperation::kModulo);
     ASSERT_TRUE(div.HasValue()) << div.GetStatus();
@@ -1766,6 +1811,18 @@ TEST(ValueAuditTest, MixedUnsignedDivisionAndModuloKeepSignedOperands) {
     EXPECT_EQ(div.Value().IsUnsigned(), quotient.IsUnsigned());
     EXPECT_EQ(mod.Value(), remainder);
     EXPECT_EQ(mod.Value().IsUnsigned(), remainder.IsUnsigned());
+  }
+  // A UINT64 dividend over a signed negative divisor is an error for both
+  // division and modulo (project decision, 2026-11-20).
+  for (const auto& [left, right] : std::vector<std::pair<Value, Value>>{
+           {Value(5).WithUnsigned(), Value(-2)},
+           {unsigned_max, Value(-2)},
+           {Value(std::numeric_limits<int64_t>::min()).WithUnsigned(),
+            Value(-1)}}) {
+    EXPECT_FALSE(left.TryArithmetic(right, BinaryOperation::kDivide).HasValue())
+        << left << " / " << right;
+    EXPECT_FALSE(left.TryArithmetic(right, BinaryOperation::kModulo).HasValue())
+        << left << " % " << right;
   }
   EXPECT_FALSE(unsigned_max.TryArithmetic(Value(-1), BinaryOperation::kDivide)
                    .HasValue());
@@ -1862,6 +1919,54 @@ TEST(ValueTest, HyphenatedWordsAreNotIntervalKeys) {
   EXPECT_NE(Value("0-12 0 0:0:0"), Value("1-0 0 0:0:0"));
   EXPECT_EQ(Value("0-12 0 0:0:0").WithInterval(),
             Value("1-0 0 0:0:0").WithInterval());
+}
+
+// T3269: operator> is the verbatim mirror of the forward operator< (inline
+// homogeneous fast path + LessSlow total order), so the three-way relations
+// stay trichotomous on every domain without operator> paying the StatusOr
+// TryGreater round-trip (which re-parsed even plain VARCHARs as intervals).
+TEST(ValueTest, GreaterIsMirrorOfLessAcrossDomains) {
+  const std::vector<std::vector<Value>> groups = {
+      {Value(int64_t{1}), Value(int64_t{40})},
+      {Value("a"), Value("b"), Value(std::string(400, 'a')),
+       Value(std::string(400, 'b'))},
+      {Value(1.5), Value(-2.25), Value(0.0)},
+      {Value("1-0 0 0:0:0").WithInterval(), Value("0 0 2:0:0").WithInterval(),
+       Value("0-12 0 0:0:0").WithInterval()},
+      {Value::Array({Value(int64_t{1})}, "INT64"),
+       Value::Array({Value(int64_t{2})}, "INT64")}};
+  for (const auto& group : groups) {
+    for (const Value& x : group) {
+      for (const Value& y : group) {
+        EXPECT_EQ(x > y, y < x);
+        EXPECT_EQ(x >= y, !(x < y));
+        EXPECT_EQ(x <= y, !(y < x));
+      }
+    }
+  }
+  // Interval ordering stays semantic (1 year beats 2 hours) through the
+  // mirrored path, and long plain VARCHARs compare byte-wise inline.
+  EXPECT_TRUE(Value("1-0 0 0:0:0").WithInterval() >
+              Value("0 0 2:0:0").WithInterval());
+  EXPECT_TRUE(Value(std::string(400, 'b')) > Value(std::string(400, 'a')));
+}
+
+// T1320: AsInt64 is the INT64 domain only; the DATE day count has its own
+// accessor, and the owning string setter says "copy" in its name.
+TEST(ValueTest, AsInt64RejectsDateAndAsDateDaysReadsDayCount) {
+  EXPECT_EQ(Value(int64_t{7}).AsInt64(), 7);
+  const Value day = Value::DateFromDays(20000);
+  EXPECT_THROW(std::ignore = day.AsInt64(), std::runtime_error);
+  EXPECT_EQ(day.AsDateDays(), 20000);
+  EXPECT_EQ(Value(int64_t{3}).AsDateDays(), 3);
+  EXPECT_THROW(std::ignore = Value(1.5).AsDateDays(), std::runtime_error);
+  // CopyFromStringView keeps the deep-copy semantics the old SetStringView
+  // name hid (mutation of the source view must not alias through).
+  std::string source = "hello";
+  Value v;
+  v.CopyFromStringView(source);
+  source[0] = 'H';
+  EXPECT_EQ(v.AsStringView(), "hello");
 }
 
 }  // namespace tinylamb

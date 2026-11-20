@@ -49,6 +49,7 @@
 #include "plan/plan.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
+#include "query/googlesql_ast_visitor_internal.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/plan_cache.hpp"
 #include "query/sql_engine.hpp"
@@ -528,9 +529,34 @@ Executor WithPlanExplain(Executor executor, Plan plan,
 
 std::optional<ExplainRequest> ParseExplain(std::string_view sql) {
   auto trim = [](std::string_view value) {
+    // Skip leading whitespace and SQL comments so a trace header before
+    // EXPLAIN does not bypass this Prepare-level string-prefix detection.
+    for (;;) {
+      while (!value.empty() &&
+             std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.remove_prefix(1);
+      }
+      if (value.starts_with("--")) {
+        const size_t nl = value.find_first_of("\r\n");
+        if (nl == std::string_view::npos) {
+          return std::string_view{};
+        }
+        value.remove_prefix(nl + 1);
+        continue;
+      }
+      if (value.starts_with("/*")) {
+        const size_t end = value.find("*/", 2);
+        if (end == std::string_view::npos) {
+          return std::string_view{};
+        }
+        value.remove_prefix(end + 2);
+        continue;
+      }
+      break;
+    }
     while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.front()))) {
-      value.remove_prefix(1);
+           std::isspace(static_cast<unsigned char>(value.back()))) {
+      value.remove_suffix(1);
     }
     return value;
   };
@@ -557,8 +583,15 @@ std::optional<ExplainRequest> ParseExplain(std::string_view sql) {
   if (!consume(&remainder, "EXPLAIN")) {
     return std::nullopt;
   }
-  const bool analyze = consume(&remainder, "ANALYZE");
-  const bool pipeline = consume(&remainder, "PIPELINE");
+  bool analyze = consume(&remainder, "ANALYZE");
+  bool pipeline = consume(&remainder, "PIPELINE");
+  if (!analyze && !pipeline) {  // NOLINT(bugprone-branch-clone) reviewed
+                                // intentional pattern
+    // Also accept the reversed keyword order EXPLAIN PIPELINE ANALYZE.
+    analyze = consume(&remainder, "ANALYZE");
+  } else if (pipeline && !analyze) {
+    analyze = consume(&remainder, "ANALYZE");
+  }
   remainder = trim(remainder);
   if (remainder.empty()) {
     return ExplainRequest{
@@ -677,9 +710,12 @@ StatusOr<Executor> ExecuteAnalyze(Database& database, TransactionContext& ctx,
     if (refreshed != Status::kSuccess) {
       return refreshed;
     }
-    ctx.stats_.erase(table);
+    ctx.stats_.erase(AsciiToLower(table));
     ASSIGN_OR_RETURN(std::shared_ptr<TableStatistics>, stats,
                      ctx.GetStats(table));
+    // Compiled-plan validity keys on SchemaEpoch(); without a bump, every
+    // cached plan keeps replaying the pre-ANALYZE access path forever.
+    database.BumpSchemaEpoch();
     rows.emplace_back(std::vector<Value>{
         Value(std::string("ANALYZE")), Value(std::string(table)),
         Value(static_cast<int64_t>(stats->Rows()))});
@@ -751,7 +787,11 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
       }
       if (expected == ValueType::kDouble &&
           evaluated[i].type == ValueType::kInt64) {
-        evaluated[i] = Value(static_cast<double>(evaluated[i].value.int_value));
+        evaluated[i] =
+            evaluated[i].IsUnsigned()
+                ? Value(static_cast<double>(
+                      static_cast<uint64_t>(evaluated[i].value.int_value)))
+                : Value(static_cast<double>(evaluated[i].value.int_value));
         continue;
       }
       if (expected == ValueType::kDate &&
@@ -933,9 +973,15 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         proto_type = InferProtoTypeName(
             std::string_view(cell.value.varchar_value), entry.proto_path);
         Value extracted;
-        if (!TryProtoTextGetField(cell.value.varchar_value,
-                                  entry.proto_path.back(), &extracted) ||
-            !extracted.IsArray()) {
+        // T3665: read through the FULL path like the SetField side does;
+        // passing only .back() extracted a top-level field named after the
+        // leaf, so nested repeated fields (msg.a.b) were never found.
+        StatusOr<bool> found = TryProtoTextGetFieldPath(
+            cell.value.varchar_value, entry.proto_path, &extracted);
+        if (!found.HasValue()) {
+          return found.GetStatus();
+        }
+        if (!found.Value() || !extracted.IsArray()) {
           return Status(Status::kInvalidArgument,
                         "nested DML target is not a repeated "
                         "protocol field: " +
@@ -944,10 +990,24 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         array_cell = std::move(extracted);
       }
       Value& edit_cell = proto_target ? array_cell : cell;
+      // The element column's declared type must come from the array's real
+      // elements, not a hardcoded INT64: ARRAY<STRING>/<DOUBLE>/<STRUCT> all
+      // flowed into an INT64 scope and mis-resolved the element expression.
+      ValueType element_type = ValueType::kNull;
+      if (!edit_cell.IsNull()) {
+        if (edit_cell.IsArray()) {
+          for (const Value& element : edit_cell.ArrayElements()) {
+            if (!element.IsNull()) {
+              element_type = element.type;
+              break;
+            }
+          }
+        } else {
+          element_type = edit_cell.type;
+        }
+      }
       const Column element_column(ColumnName("", entry.element_name),
-                                  edit_cell.IsNull()    ? ValueType::kNull
-                                  : edit_cell.IsArray() ? ValueType::kInt64
-                                                        : edit_cell.type);
+                                  element_type);
       Schema element_schema("", {element_column});
       relational_detail::Scope outer_scope{
           .row = &new_row, .schema = &schema, .outer = nullptr};
@@ -1132,8 +1192,11 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
     }
     StatusOr<RowPosition> updated = table->Update(ctx.txn_, position, new_row);
     if (updated.GetStatus() != Status::kSuccess) {
-      return Status(Status::kInvalidArgument,
-                    "update failed on table " + std::string(schema.Name()));
+      // Preserve the storage/MVCC status code so retryable conflicts and
+      // no-space errors are distinguishable from schema errors.
+      return StatusError(updated.GetStatus().GetCode(),
+                         "update failed on table " + std::string(schema.Name()) +
+                             ": " + ToString(updated.GetStatus()));
     }
     ++modified_rows;
   }
@@ -1530,7 +1593,15 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
                          TryProtoTextSetField(payload, target.segments,
                                               assigned, proto_type));
         if (rewritten.has_value()) {
-          cell = Value(std::move(*rewritten));
+          // Mirror CAST(... AS PROTO): normalize the rewritten TEXT before it
+          // is stored, so a wire-decoded payload keeps one canonical spelling
+          // instead of being persisted as raw binary in a VARCHAR cell.
+          std::string stored = std::move(*rewritten);
+          if (auto normalized = NormalizeProtoText(stored);
+              normalized.has_value()) {
+            stored = std::move(*normalized);
+          }
+          cell = Value(std::move(stored));
         }
         continue;
       }
@@ -1563,8 +1634,11 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     StatusOr<RowPosition> updated =
         table->Update(ctx.txn_, row_position, new_row);
     if (updated.GetStatus() != Status::kSuccess) {
-      return Status(Status::kInvalidArgument,
-                    "update failed on table " + std::string(schema.Name()));
+      // Preserve the storage/MVCC status code so retryable conflicts and
+      // no-space errors are distinguishable from schema errors.
+      return StatusError(updated.GetStatus().GetCode(),
+                         "update failed on table " + std::string(schema.Name()) +
+                             ": " + ToString(updated.GetStatus()));
     }
     ++modified_rows;
   }
@@ -1787,9 +1861,13 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
   std::unordered_map<std::string, std::vector<size_t>> source_index;
   auto composite_key = [](const std::vector<Value>& values) {
     std::string key;
+    key.reserve(values.size() * 16);
     for (const Value& value : values) {
-      key += value.IsNull() ? std::string("\x01N") : value.AsString();
-      key.push_back('\x00');
+      // Use the memcomparable encoding, not AsString(): the latter renders
+      // +0.0 and -0.0 differently (MERGE ON d = 0.0 must match -0.0), and
+      // text encoding can collide across types. The canonical encoding folds
+      // -0/+0, canonicalizes NaN and includes a type tag.
+      key += value.EncodeMemcomparableFormat();
     }
     return key;
   };
@@ -2012,6 +2090,9 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
     }
     target_scope.outer = nullptr;
   }
+  // A failed page read ends the scan like EOF; MERGE must not act on a
+  // truncated target (unmatched rows would be inserted as duplicates).
+  RETURN_IF_FAIL(source.GetStatus());
 
   // WHEN NOT MATCHED [BY TARGET]: one source-driven INSERT clause.
   if (insert_clause != nullptr) {
@@ -2344,28 +2425,25 @@ StatusOr<Expression> SqlEngine::DecorateDmlWhere(TransactionContext& ctx,
     return expression;
   }
   if (expression->Type() == TypeTag::kQueryExp) {
+    const QueryExpression& query = expression->AsQueryExpression();
+    if (query.Query() && !query.Query()->WithQueries().empty()) {
+      return StatusError(
+          StatusCode::kNotImplemented,
+          "WITH clauses under subquery in DML statement are not supported");
+    }
     if (!relational_detail::ContainsOnlyUncorrelatedQueries(ctx, expression,
                                                             {})) {
       return expression;
     }
-    const QueryExpression& query = expression->AsQueryExpression();
 
     if (!query.ArrayResult() && query.Test() &&
         (query.Mode() == QuantifierMode::kAny ||
          query.Mode() == QuantifierMode::kAll)) {
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
       return FoldQuantifiedComparison(ctx, query);
     }
     if (query.Exists()) {
       // Non-correlated EXISTS: run once, fold to a constant.  A correlated
-      // inner cannot be prepared standalone and keeps the legacy route;
-      // WITH under a DML subquery stays unimplemented by contract
-      // (dml_delete.test / b/362158469), so those inners are not folded.
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
+      // inner cannot be prepared standalone and keeps the legacy route.
       auto inner = std::make_unique<SelectStatement>(*query.Query());
       NestedPrepareState nested(*this);
       StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
@@ -2385,11 +2463,7 @@ StatusOr<Expression> SqlEngine::DecorateDmlWhere(TransactionContext& ctx,
     if (!query.Test() && !query.ArrayResult()) {
       // Non-correlated scalar subquery: exactly one row folds to that
       // constant; 0/>1 rows keep the legacy route (which raises the
-      // engine's own cardinality error).  WITH inners stay unimplemented
-      // by the same DML contract as EXISTS above.
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
+      // engine's own cardinality error).
       auto inner = std::make_unique<SelectStatement>(*query.Query());
       NestedPrepareState nested(*this);
       StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
@@ -2415,11 +2489,6 @@ StatusOr<Expression> SqlEngine::DecorateDmlWhere(TransactionContext& ctx,
     if (!query.Exists() && !query.ArrayResult() && query.Test() &&
         query.Mode() == QuantifierMode::kIn &&
         query.Op() == BinaryOperation::kEquals) {
-      // WITH under a DML subquery stays unimplemented by contract
-      // (dml_delete.test / b/362158469).
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
       auto inner = std::make_unique<SelectStatement>(*query.Query());
       // The nested prepare must not steal the OUTER statement's armed
       // plan-cache candidate (the fill sites read the shared member), and
@@ -2556,7 +2625,7 @@ StatusOr<Executor> SqlEngine::ExecuteCreateTable(
       if (vtype == ValueType::kNull) {
         vtype = ValueType::kVarChar;
         for (const auto& row : rows) {
-          if (i < row.Size() && !row[i].IsNull() &&
+          if (i < row.Count() && !row[i].IsNull() &&
               row[i].type != ValueType::kNull) {
             vtype = row[i].type;
             break;
@@ -2575,7 +2644,7 @@ StatusOr<Executor> SqlEngine::ExecuteCreateTable(
                                           row[i].IsInterval();
                                  }));
       if (std::ranges::any_of(rows, [i](const Row& row) {
-            return i < row.Size() && row[i].IsUnsigned();
+            return i < row.Count() && row[i].IsUnsigned();
           })) {
         columns.back().SetUnsigned(true);
       }
@@ -2587,7 +2656,7 @@ StatusOr<Executor> SqlEngine::ExecuteCreateTable(
       // Coerce materialized values to the declared column types: the
       // SELECT output may carry narrower types (e.g. INT64 literals in
       // UNION ALL branches under a DOUBLE first row).
-      for (size_t i = 0; i < row.Size() && i < columns.size(); ++i) {
+      for (size_t i = 0; i < row.Count() && i < columns.size(); ++i) {
         Value& cell = row.values_[i];
         const ValueType target = columns[i].Type();
         if (cell.IsNull() || cell.type == target ||
@@ -2614,10 +2683,10 @@ StatusOr<Executor> SqlEngine::ExecuteCreateTable(
 }
 
 StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
-                                            const InsertStatement& insert) {
+                                            InsertStatement& insert) {
   // VALUES entries fold non-correlated subqueries like the WHERE/SET
   // paths do.
-  for (auto& value_row : const_cast<InsertStatement&>(insert).MutableValues()) {
+  for (auto& value_row : insert.MutableValues()) {
     for (Expression& value : value_row) {
       ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
       value = std::move(folded);
@@ -2634,7 +2703,13 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
     std::unordered_set<std::string> seen_columns;
     upsert_offsets.reserve(insert.Columns().size());
     for (const std::string& column : insert.Columns()) {
-      if (!seen_columns.insert(column).second) {
+      // Schema::Offset folds case for resolution, so the duplicate guard
+      // must fold too (a quoted "A" collides with an unquoted a).
+      std::string folded = column;
+      for (char& c : folded) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (!seen_columns.insert(std::move(folded)).second) {
         // A duplicate target would silently overwrite the earlier
         // value; reject it instead.
         last_error_ = "duplicate INSERT column: " + column;
@@ -2786,7 +2861,13 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
         continue;
       }
       if (expected == ValueType::kDouble && row[i].type == ValueType::kInt64) {
-        row[i] = Value(static_cast<double>(row[i].value.int_value));
+        // T3699: unsigned values store two's-complement bits in int_value;
+        // a plain cast turned >= 2^63 into a negative double (UINT64_MAX
+        // landed as -1.0). Mirror the unsigned-aware branch above.
+        row[i] = row[i].IsUnsigned()
+                     ? Value(static_cast<double>(
+                           static_cast<uint64_t>(row[i].value.int_value)))
+                     : Value(static_cast<double>(row[i].value.int_value));
         continue;
       }
       if (expected == ValueType::kDate && row[i].type == ValueType::kVarChar) {
@@ -2811,6 +2892,15 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
     size_t slot_cursor = 0;
     shape->cells.reserve(insert.Values().size());
     for (const auto& values : insert.Values()) {
+      // A one-value row into a wider table only works through the STRUCT /
+      // struct-text expansion above (VALUES ('{"a", 1}')), which the
+      // replayed shape does not repeat: the second identical-shape INSERT
+      // failed with "row column count does not match table schema".
+      if (insert.Columns().empty() && values.size() == 1 &&
+          table->GetSchema().ColumnCount() > 1) {
+        ok = false;
+        break;
+      }
       std::vector<Expression> cells;
       cells.reserve(values.size());
       for (const Expression& value : values) {
@@ -2887,7 +2977,7 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
 }
 
 StatusOr<Executor> SqlEngine::ExecuteUpdate(TransactionContext& ctx,
-                                            const UpdateStatement& update) {
+                                            UpdateStatement& update) {
   ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                    ctx.GetTable(update.TableName()));
   last_dml_table_ = update.TableName();
@@ -2896,7 +2986,7 @@ StatusOr<Executor> SqlEngine::ExecuteUpdate(TransactionContext& ctx,
     // a correlated or WITH-bearing inner keeps its legacy route.
     const Schema& update_schema = table->GetSchema();
     for (auto& [target, value] :
-         const_cast<UpdateStatement&>(update).MutableSetClause()) {
+         update.MutableSetClause()) {
       ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
       value = std::move(folded);
       // SET col = DEFAULT resolves to the column's declared default;
@@ -2953,7 +3043,7 @@ StatusOr<Executor> SqlEngine::ExecuteUpdate(TransactionContext& ctx,
     bool dotted_target = false;
     bool plain_target = false;
     for (auto& [target, expression] :
-         const_cast<UpdateStatement&>(update).MutableSetClause()) {
+         update.MutableSetClause()) {
       strip_relation_qualifier(&target);
       if (!target.schema.empty() && !target.name.empty()) {
         dotted_target = true;
@@ -3502,7 +3592,7 @@ StatusOr<Executor> SqlEngine::ExecuteCreateMaterializedView(
     if (vtype == ValueType::kNull) {
       vtype = ValueType::kVarChar;
       for (const auto& row : rows) {
-        if (i < row.Size() && !row[i].IsNull() &&
+        if (i < row.Count() && !row[i].IsNull() &&
             row[i].type != ValueType::kNull) {
           vtype = row[i].type;
           break;
@@ -3511,7 +3601,7 @@ StatusOr<Executor> SqlEngine::ExecuteCreateMaterializedView(
     }
     columns.emplace_back(col_name, vtype, Constraint());
     if (std::ranges::any_of(rows, [i](const Row& row) {
-          return i < row.Size() && row[i].IsUnsigned();
+          return i < row.Count() && row[i].IsUnsigned();
         })) {
       columns.back().SetUnsigned(true);
     }
@@ -3543,8 +3633,10 @@ StatusOr<Executor> SqlEngine::ExecuteDropMaterializedView(
       return Executor(std::make_shared<ConstantExecutor>(
           Row({Value("DROP MATERIALIZED VIEW"), Value(0)})));
     }
-    last_error_ = "materialized view " + drop.ViewName() + " does not exist";
-    return Status::kNotExists;
+    // Preserve a real catalog failure (kCorrupt/kIOError/kConflicts) instead
+    // of rewriting it into a misleading "does not exist".
+    last_error_ = std::string(definition.GetStatus().GetMessage());
+    return definition.GetStatus();
   }
   RETURN_IF_FAIL(database_->DropTable(ctx, drop.ViewName()));
   RETURN_IF_FAIL(
@@ -3577,9 +3669,9 @@ StatusOr<Executor> SqlEngine::ExecuteCreateView(
   const GoogleSqlParseResult parsed_view =
       GoogleSqlFrontend::Parse(create.QueryText());
   if (!parsed_view.ok) {
-    return StatusError(StatusCode::kInvalidArgument,
-                       "CREATE VIEW: cannot parse query body: " +
-                           parsed_view.error);
+    return StatusError(
+        StatusCode::kInvalidArgument,
+        "CREATE VIEW: cannot parse query body: " + parsed_view.error);
   }
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> view_ast =
       GoogleSqlAstParser::Parse(parsed_view.ast);
@@ -3591,6 +3683,24 @@ StatusOr<Executor> SqlEngine::ExecuteCreateView(
   if (query_node == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
                        "CREATE VIEW: query body has no Query node");
+  }
+  // Issue 2553: SQL UDFs/TVFs exist only in the defining thread's registry
+  // and are scoped to that session, but the view definition is cataloged and
+  // re-expanded for every reader.  Capturing one leaves a permanently
+  // unreadable view for every other session (and for read-worker offloads):
+  // reject the capture at creation time instead.  CREATE TEMP VIEW is
+  // exempt -- a TEMP view is a session object, exactly like the UDF it may
+  // capture.
+  if (!create.IsTemp()) {
+    if (std::optional<std::string> capture =
+            ast_visitor_detail::FirstSessionLocalUdfReference(*query_node);
+        capture.has_value()) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "CREATE VIEW: function " + *capture +
+              " is a session-local SQL UDF; a persistent view cannot "
+              "reference it");
+    }
   }
   // Check and persist under the catalog lock before publishing the session
   // definition; a conflicting CREATE must not shadow the existing object.
@@ -3604,6 +3714,29 @@ StatusOr<Executor> SqlEngine::ExecuteCreateView(
   database_->BumpSchemaEpoch();
   return Executor(std::make_shared<ConstantExecutor>(
       Row({Value("CREATE VIEW"), Value(0)})));
+}
+
+StatusOr<Executor> SqlEngine::ExecuteCreateObject(
+    TransactionContext& /*ctx*/, const CreateObjectStatement& create) {
+  // T2552: run the deferred thread_local registry write (RegisterUdf /
+  // session-constant publish) only now, at execute time -- the same
+  // contract CREATE VIEW follows.  Rebuilding the ConstantExecutor row
+  // from the visitor's result projection keeps the original CREATE's
+  // single-cell result (function: unnamed 0; constant: the name row).
+  plan_cache_fingerprint_.clear();
+  plan_cache_parameters_.clear();
+  RETURN_IF_FAIL(create.RunSideEffect());
+  std::vector<Value> cells;
+  result_column_names_.clear();
+  for (const NamedExpression& item : create.ResultProjection()) {
+    Value cell;
+    if (item.expression && item.expression->Type() == TypeTag::kConstantValue) {
+      cell = item.expression->AsConstantValue().GetValue();
+    }
+    result_column_names_.push_back(item.name);
+    cells.push_back(std::move(cell));
+  }
+  return Executor(std::make_shared<ConstantExecutor>(Row(std::move(cells))));
 }
 
 StatusOr<Executor> SqlEngine::ExecuteDropView(TransactionContext& ctx,
@@ -3653,21 +3786,26 @@ StatusOr<Executor> SqlEngine::ExecuteCreateIndex(
     }
   }
   std::vector<slot_t> keys, storing;
-  std::unordered_set<slot_t> used;
+  std::unordered_set<slot_t> used_keys, used_storing;
   const auto resolve = [&](const std::vector<std::string>& names,
-                           std::vector<slot_t>* slots) -> Status {
+                           std::vector<slot_t>* slots,
+                           std::unordered_set<slot_t>& used) -> Status {
     for (const auto& name : names) {
       const int offset = table->GetSchema().Offset(ColumnName("", name));
-      if (offset < 0 || !used.insert(static_cast<slot_t>(offset)).second) {
+      if (offset < 0) {
         return StatusError(StatusCode::kInvalidArgument,
-                           "unknown or repeated index column: " + name);
+                           "unknown index column: " + name);
+      }
+      if (!used.insert(static_cast<slot_t>(offset)).second) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "repeated index column: " + name);
       }
       slots->push_back(static_cast<slot_t>(offset));
     }
     return Status::kSuccess;
   };
-  RETURN_IF_FAIL(resolve(create.Keys(), &keys));
-  RETURN_IF_FAIL(resolve(create.Storing(), &storing));
+  RETURN_IF_FAIL(resolve(create.Keys(), &keys, used_keys));
+  RETURN_IF_FAIL(resolve(create.Storing(), &storing, used_storing));
   RETURN_IF_FAIL(database_->CreateIndex(
       ctx, create.TableName(),
       IndexSchema(
@@ -3711,7 +3849,7 @@ StatusOr<Executor> SqlEngine::ExecuteExplain(
   }
   last_statement_type_ = StatementType::kSelect;
   const auto* explain_select =
-      static_cast<const SelectStatement*>(statement.get());
+      static_cast<const SelectStatement*>(statement.get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   std::vector<std::string> explain_base_tables;
   bool explain_has_inner_join_source = false;
   for (const SelectSource& source : explain_select->Sources()) {
@@ -3760,9 +3898,20 @@ StatusOr<Executor> SqlEngine::ExecuteExplain(
   }
   if (explain.analyze) {
     OocQueryScope ooc_scope(&ooc_metrics);
+    // P440: the EXPLAIN path returns a raw Executor and never passes through
+    // FinishPrepareWithTimeout, so this drain loop used to run the full
+    // statement with neither timing nor deadline checks.  Mirror the
+    // StatementTimeoutExecutor wrapper: publish the thread-local deadline for
+    // deadline-aware operators and check the statement timeout between
+    // batches.
+    Transaction::ScopedThreadStatementDeadline deadline_guard(
+        ctx.txn_.StatementDeadlineNs());
     DataChunk chunk;
     while (prepared.Value()->NextBatch(&chunk) != 0) {
       rows += chunk.Size();
+      if (ctx.txn_.HasStatementTimeout()) {
+        RETURN_IF_FAIL(ctx.txn_.CheckStatementTimeout());
+      }
     }
     // A scan that failed mid-drain must fail the EXPLAIN ANALYZE too;
     // reporting runtime stats for a truncated execution misleads plans.

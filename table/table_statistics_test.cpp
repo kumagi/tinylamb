@@ -395,6 +395,51 @@ TEST_F(TableStatisticsTest, Correlation_UsesCanonicalNaNOrder) {
   ASSERT_SUCCESS(stats_ctx.PreCommit());
 }
 
+TEST_F(TableStatisticsTest, CompactionKeepsVarcharTagsOnLongValues) {
+  TransactionContext ctx = db_->BeginContext();
+  // Long interval-tagged VARCHARs (canonical INTERVAL text exceeds the
+  // 32-byte stored prefix) must keep their tag through CompactValue; a
+  // bare-VARCHAR truncation made boundary and MCV entries miss against
+  // tagged query values in the tag-mismatch arms of Value equality and
+  // ordering.  (Collation tags are not carried by row serialization, so
+  // the interval tag re-applied from the column flag is the tag that
+  // reaches the statistics builder.)
+  const std::string long_iv =
+      "9223372036854775807-9223372036854775807 2562047:47:16.854775807";
+  Column interval_col("iv", ValueType::kVarChar);
+  interval_col.SetInterval(true);
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, tbl, db_->CreateTable(ctx, Schema("TagCompact", {interval_col})));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_SUCCESS(
+        tbl.Insert(ctx.txn_, Row({Value(std::string(long_iv)).WithInterval()}))
+            .GetStatus());
+    ASSERT_SUCCESS(
+        tbl.Insert(ctx.txn_, Row({Value(std::string("3 day")).WithInterval()}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(ctx.PreCommit());
+  {
+    TransactionContext stat_tx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_tx, "TagCompact"));
+    ASSERT_SUCCESS(stat_tx.PreCommit());
+  }
+  TransactionContext stats_ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, stats,
+                              db_->GetStatistics(stats_ctx, "TagCompact"));
+  // The discriminator: the COMPACTED (32-byte prefix) entry must still
+  // carry the interval tag.  Before the fix it was stored as a bare
+  // VARCHAR; the short "3 day" entry passes either way.
+  bool saw_compacted_interval = false;
+  for (const auto& entry : stats.Column(0).LowestValues()) {
+    if (entry.value.IsInterval() &&
+        entry.value.value.varchar_value.size() == 32U) {
+      saw_compacted_interval = true;
+    }
+  }
+  EXPECT_TRUE(saw_compacted_interval);
+}
+
 TEST_F(TableStatisticsTest, BoundaryTrackersKeepCanonicalOrderWithNaN) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   TransactionContext ctx = db_->BeginContext();

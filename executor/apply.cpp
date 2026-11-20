@@ -29,7 +29,7 @@ ApplyExecutor::ApplyExecutor(TransactionContext& context, Schema outer_schema,
                              std::shared_ptr<const SelectStatement> inner_query,
                              std::string inner_alias, Executor inner_exec,
                              Expression predicate, JoinKind kind,
-                             Schema output_schema)
+                             Schema output_schema, Schema inner_exec_schema)
     : context_(context),
       outer_schema_(std::move(outer_schema)),
       outer_exec_(std::move(outer_exec)),
@@ -38,7 +38,20 @@ ApplyExecutor::ApplyExecutor(TransactionContext& context, Schema outer_schema,
       inner_exec_(std::move(inner_exec)),
       predicate_(std::move(predicate)),
       kind_(kind),
-      output_schema_(std::move(output_schema)) {}
+      output_schema_(std::move(output_schema)),
+      inner_exec_schema_(std::move(inner_exec_schema)) {
+  // T3668: with a compiled inner plan there is no ExecuteQuery round to
+  // learn the schema from, so seed it from the plan here -- otherwise the
+  // route predicate evaluates against a zero-width schema.
+  if (inner_query_ == nullptr && inner_exec_ != nullptr &&
+      inner_exec_schema_.ColumnCount() > 0) {
+    inner_schema_ = inner_alias_.empty()
+                        ? inner_exec_schema_
+                        : relational_detail::QualifySchema(inner_exec_schema_,
+                                                           inner_alias_);
+    combined_schema_ = outer_schema_ + inner_schema_;
+  }
+}
 
 bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
   DataChunk outer_batch;

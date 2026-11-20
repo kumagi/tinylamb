@@ -25,8 +25,8 @@ class Table;
 class Transaction;
 
 // Morsel-driven parallel index scan (ParallelIndexScan consumer): the
-// requested key range is partitioned at B+Tree leaf boundaries
-// (BPlusTree::ScanPartitionBoundaries) and workers scan one key sub-range
+// requested key range is partitioned at virtual key-count boundaries
+// (LsmIndex::ScanPartitionBoundaries) and workers scan one key sub-range
 // each, so the random heap I/O of a large index range scan overlaps across
 // workers.  Workers hand chunks off in morsel order, so the output is the
 // same key order the serial IndexScan promises and the plan's ordering

@@ -1865,7 +1865,9 @@ EncodedCol EncFrontCodeStr(const std::vector<std::string_view>& sv,
   std::vector<uint32_t> restarts;
   restarts.reserve((n + restart_every - 1) / restart_every);
   std::string prev;
-  prev.reserve(65536);
+  // The 64 KiB worst-case is rare; let the string grow to the actual shared
+  // prefix instead of allocating the maximum for every column block.
+  // prev.reserve(65536);
   bool sorted = true;
   for (uint32_t i = 0; i < n; ++i) {
     const std::string_view s = sv[i];
@@ -2105,7 +2107,7 @@ EncodedCol EncBp128I64(const std::vector<int64_t>& vals, size_t budget) {
     for (uint32_t block = 0; block < blocks; ++block) {
       const size_t start = static_cast<size_t>(block) * kBp128BlockRows;
       const size_t end = std::min(vals.size(), start + kBp128BlockRows);
-      exact += (end - start) * widths[block] / 8;
+      exact += ((end - start) * widths[block] + 7) / 8;  // AppendPackBits rounds up
     }
     if (exact > budget) {
       return {};
@@ -3820,12 +3822,18 @@ EncodedCol EncSparseI64(const std::vector<int64_t>& vals,
   if (14 + 8 + static_cast<size_t>(nnz) + 1 > budget) {
     return {};
   }
-  EncodedCol pe = EncForBA(pos, budget);
+  // Split the budget: both inner regions plus the 14-byte header must fit.
+  constexpr size_t kSparseHeaderBytes = 14;
+  const size_t pos_budget = (budget - kSparseHeaderBytes) / 2;
+  EncodedCol pe = EncForBA(pos, pos_budget);
   if (pe.buf.empty()) {
     return {};
   }
-  EncodedCol ve = EncodeInnerI64(dense, budget);
-  if (ve.buf.empty()) {
+  const size_t value_budget =
+      budget - kSparseHeaderBytes - std::min(pos_budget, pe.buf.size());
+  EncodedCol ve = EncodeInnerI64(dense, value_budget);
+  if (ve.buf.empty() ||
+      kSparseHeaderBytes + pe.buf.size() + ve.buf.size() > budget) {
     return {};
   }
   EncodedCol e;
@@ -3896,6 +3904,7 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
       continue;
     }
     f[s] = static_cast<uint32_t>(
+        // NOLINTNEXTLINE(clang-analyzer-core.UndefinedBinaryOperatorResult) intentional pattern in this code
         std::max<uint64_t>(static_cast<uint64_t>(cnt[s]) * M / nsym_total, 1));
     sum += f[s];
   }
@@ -8548,7 +8557,7 @@ EncodedCol EncodeColumnAdaptive(slot_t col_idx, const Schema& sc,
   // sort key rewards order-preserving schemes (EliasFano/Delta-*). This makes
   // the selector evaluate compositions and price *capability*, not just raw
   // size.
-  const AccessHint hint = sc.GetColumn(col_idx).GetHint();
+  const AccessHint hint = sc.GetColumn(col_idx).Hint();
   // Total-byte accounting for the footer inverted index (v13): the chunk
   // build publishes a raw postings cell for every int64 column with 2..64
   // distinct values (kMaxIdxDistinct, the >64 abort sets postings_big)

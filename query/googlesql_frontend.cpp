@@ -54,15 +54,32 @@ namespace tinylamb {
 namespace {
 
 // Everything in this anonymous namespace is only reachable when the external
-// GoogleSQL parser is wired in; guard the definitions themselves so builds
-// without TINYLAMB_GOOGLESQL_EXECUTABLE stay warning-clean.
+// GoogleSQL parser is wired in.
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && \
     (defined(TINYLAMB_OS_POSIX) || defined(TINYLAMB_OS_WINDOWS))
+
+// Child stdout and stderr share one pipe; a stderr warning can precede the
+// parser's "ERROR:" line, so a leading-only check would misclassify an error
+// as a successful AST. Look for an ERROR: at the start of any line.
+bool ContainsParserError(std::string_view output) {
+  size_t pos = 0;
+  while ((pos = output.find("ERROR:", pos)) != std::string_view::npos) {
+    if (pos == 0 || output[pos - 1] == '\n') {
+      return true;
+    }
+    pos += 6;
+  }
+  return false;
+}
 
 constexpr size_t kParseCacheShards = 16;
 constexpr size_t kMaxCachedStatements = 1024;
 constexpr size_t kMaxCachedStatementsPerShard =
     kMaxCachedStatements / kParseCacheShards;
+// Bound cache memory as well as entry count: keys are the full SQL text, so
+// a stream of near-maximum-size queries with unique suffixes can otherwise
+// pin gigabytes while staying under the count limit.
+constexpr size_t kMaxParseCacheKeyBytesPerShard = 4ULL << 20;
 // Failed parses are remembered briefly so retries of the same broken SQL do
 // not fork one parser process per attempt (§7.11).
 constexpr std::chrono::seconds kNegativeCacheTtl{1};
@@ -73,11 +90,21 @@ constexpr std::chrono::seconds kParseTimeout{5};
 size_t MaxCachedStatementsPerShard() {
   static const size_t kPerShard = []() -> size_t {
     if (const char* env = std::getenv("TINYLAMB_PARSE_CACHE_SIZE")) {
-      char* end = nullptr;
-      const unsigned long long val = std::strtoull(env, &end, 10);
-      if (val >= kParseCacheShards && end != nullptr && *end == '\0') {
-        return static_cast<size_t>(val / kParseCacheShards);
+      if (env[0] == '-' || env[0] == '+') {
+        return kMaxCachedStatementsPerShard;
       }
+      char* end = nullptr;
+      errno = 0;
+      const unsigned long long val = std::strtoull(env, &end, 10);
+      if (errno != 0 || end == env || *end != '\0') {
+        return kMaxCachedStatementsPerShard;
+      }
+      // A value below one-per-shard is a misconfiguration; applying it would
+      // floor to zero. Keep the default instead of silently disabling cache.
+      if (val < kParseCacheShards) {
+        return kMaxCachedStatementsPerShard;
+      }
+      return static_cast<size_t>(val / kParseCacheShards);
     }
     return kMaxCachedStatementsPerShard;
   }();
@@ -88,8 +115,9 @@ std::chrono::seconds NegativeCacheTtlSeconds() {
   static const std::chrono::seconds kTtl = []() {
     if (const char* env = std::getenv("TINYLAMB_NEGATIVE_CACHE_TTL_SEC")) {
       char* end = nullptr;
+      errno = 0;
       const long val = std::strtol(env, &end, 10);
-      if (val > 0 && end != nullptr && *end == '\0') {
+      if (errno == 0 && val > 0 && end != nullptr && end != env && *end == '\0') {
         return std::chrono::seconds(val);
       }
     }
@@ -104,8 +132,13 @@ std::chrono::seconds ParseTimeoutSeconds() {
   if (const char* env = std::getenv("TINYLAMB_PARSE_TIMEOUT_SEC")) {
     const std::string owned(env);
     char* end = nullptr;
+    errno = 0;
     const long value = std::strtol(owned.c_str(), &end, 10);
-    if (value > 0 && end != nullptr && *end == '\0') {
+    // Cap well below the point where adding seconds to a nanosecond
+    // steady_clock time_point would overflow its signed rep.
+    constexpr long kMaxParseTimeoutSec = 30LL * 24 * 3600;  // 30 days
+    if (errno == 0 && value > 0 && value <= kMaxParseTimeoutSec &&
+        end != nullptr && end != owned.c_str() && *end == '\0') {
       return std::chrono::seconds(value);
     }
   }
@@ -269,8 +302,22 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
             .ast = {},
             .error = "GoogleSQL parser output exceeds the size limit"};
   }
-  if (exit_code != 0 || output.starts_with("ERROR:")) {
+  if (exit_code != 0 || ContainsParserError(output)) {
     return {.ok = false, .ast = {}, .error = std::move(output)};
+  }
+  // T1811: exit 0 with zero bytes of output was accepted unconditionally,
+  // so a bogus TINYLAMB_GOOGLESQL_BIN (any silent exit-0 binary, a stub, a
+  // wrong --mode) was indistinguishable from a successful empty parse: all
+  // statements became "ok, empty AST" no-ops downstream.  Only whitespace
+  // input legitimately parses to nothing; real SQL must produce an AST.
+  if (output.empty() &&
+      std::any_of(sql.begin(), sql.end(),
+                  [](unsigned char c) { return std::isspace(c) == 0; })) {
+    return {.ok = false,
+            .ast = {},
+            .error =
+                "GoogleSQL parser exited 0 without output for non-empty "
+                "SQL"};
   }
   return {.ok = true, .ast = std::move(output), .error = {}};
 }
@@ -606,7 +653,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
       truncated.error = "GoogleSQL parser output exceeds the size limit";
       return truncated;
     }
-    if (exit_code != 0 || output.starts_with("ERROR:")) {
+    if (exit_code != 0 || ContainsParserError(output)) {
       return {.ok = false, .ast = {}, .error = std::move(output)};
     }
     return {.ok = true, .ast = std::move(output), .error = {}};
@@ -648,8 +695,20 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     truncated.error = "GoogleSQL parser output exceeds the size limit";
     return truncated;
   }
-  if (output.starts_with("ERROR:")) {
+  if (ContainsParserError(output)) {
     return {.ok = false, .ast = {}, .error = std::move(output)};
+  }
+  // T1811: see the Windows arm -- exit 0 with no output is only a valid
+  // "empty SQL" result for whitespace input; a broken binary that says
+  // nothing and succeeds must not masquerade as an empty AST.
+  if (output.empty() &&
+      std::any_of(sql.begin(), sql.end(),
+                  [](unsigned char c) { return std::isspace(c) == 0; })) {
+    return {.ok = false,
+            .ast = {},
+            .error =
+                "GoogleSQL parser exited 0 without output for non-empty "
+                "SQL"};
   }
   return {.ok = true, .ast = std::move(output), .error = {}};
 }
@@ -811,7 +870,7 @@ bool ExtractDistinctOn(std::string_view sql, size_t* out_start, size_t* out_end,
       size_t after_on = after_dist + 2;
       if (after_on < mask.size() &&
           ((std::isalnum(static_cast<unsigned char>(mask[after_on])) != 0) ||
-           mask[after_on] == '_')) {
+           mask[after_on] == '_' || mask[after_on] == '$')) {
         pos = after_on;
         continue;
       }
@@ -1515,9 +1574,11 @@ std::string NormalizeCreateTableEngine(std::string_view sql) {
         if (eq_pos < n && lower_mask[eq_pos] == '=') {
           ++eq_pos;
           std::string engine_val;
-          size_t val_end = 0;
-          if (extract_token_value(eq_pos, &engine_val, &val_end)) {
-            size_t close_pos = skip_ws(val_end);
+          // `clause_end` = end of the value token, same name as in the
+          // `using` / `engine` arms above.
+          size_t clause_end = 0;
+          if (extract_token_value(eq_pos, &engine_val, &clause_end)) {
+            size_t close_pos = skip_ws(clause_end);
             if (close_pos < n && lower_mask[close_pos] == ')') {
               std::string out(sql.substr(0, clause_start));
               out += "OPTIONS (engine = '";
@@ -1719,7 +1780,9 @@ bool frontend_detail::InjectDistinctOnKeys(std::string& ast,
 
 bool GoogleSqlFrontend::Available() {
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_POSIX)
-  return access(TINYLAMB_GOOGLESQL_EXECUTABLE, X_OK) == 0;
+  // Use the same runtime-resolved path as spawns (env override / installed
+  // binary); the compile-time default may not exist in the current tree.
+  return access(ResolveGoogleSqlExecutable().c_str(), X_OK) == 0;
 #elif defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_WINDOWS)
   std::error_code ec;
   return std::filesystem::exists(ResolveGoogleSqlExecutable(), ec);
@@ -1760,15 +1823,25 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
 
   GoogleSqlParseResult parsed = ParseViaSubprocess(sql);
   if (parsed.ok) {
-    if (shard.cache.size() >= max_per_shard) {
-      // unordered_map iteration order is unspecified, so this evicts an
-      // ARBITRARY entry, deliberately not the oldest: entries are equally
-      // likely to be re-parsed in OLTP bursts and a true LRU/FIFO list
-      // would add bookkeeping per lookup. Tests only require that the
-      // bound holds.
-      shard.cache.erase(shard.cache.begin());
+    // unordered_map iteration order is unspecified, so evict an ARBITRARY
+    // entry until both the count and key-byte bounds hold.
+    size_t cached_bytes = 0;
+    for (const auto& [key, ast] : shard.cache) {
+      cached_bytes += key.size();
     }
-    shard.cache.emplace(cache_key, parsed.ast);
+    while (shard.cache.size() >= max_per_shard ||
+           cached_bytes + cache_key.size() >
+               kMaxParseCacheKeyBytesPerShard) {
+      if (shard.cache.empty()) {
+        break;
+      }
+      auto victim = shard.cache.begin();
+      cached_bytes -= std::min(cached_bytes, victim->first.size());
+      shard.cache.erase(victim);
+    }
+    if (cache_key.size() <= kMaxParseCacheKeyBytesPerShard) {
+      shard.cache.emplace(cache_key, parsed.ast);
+    }
     shard.negative_cache.erase(cache_key);
   } else {
     // Only deterministic parser verdicts ("ERROR: ...") belong in the

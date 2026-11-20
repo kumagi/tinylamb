@@ -364,7 +364,7 @@ class FailingRows final : public ExecutorBase {
 // non-column key rather than a cast to a node type it is not.
 class ExplodingKey final : public ExpressionBase {
  public:
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kInvalid; }
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInvalid; }
   [[nodiscard]] StatusOr<Value> TryEvaluate(
       const Row& row, const Schema& schema) const override {
     const int offset = schema.Offset(ColumnName("v"));
@@ -1621,6 +1621,44 @@ TEST_F(GroupedAggregateSqlTest, TheEnginesHavingAndGroupingSetsStillWork) {
             std::vector<std::string>{"6"});
   EXPECT_EQ(SqlGroups("SELECT COUNT(*) AS n FROM sales WHERE dept_id > 100"),
             std::vector<std::string>{"0"});
+}
+
+// P48/P50 (70/72): AggregateGroupTable borrows group keys from its `index_`
+// nodes and packs accumulator states into 512-element blocks.  This pins
+// cross-block StateAt indexing (via growth and Merge adoption) and key
+// stability across rehashes -- both break on an off-by-one in the flat
+// index math or a copied-back key.
+TEST(AggregateGroupTableTest, StateArenaAndBorrowedKeysSpanBlockBoundaries) {
+  const Schema schema(
+      "t", {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
+  const Expression sum_expr = std::make_shared<AggregateExpression>(
+      AggregationType::kSum, ColumnValueExp(ColumnName("v")));
+  const std::vector<const AggregateExpression*> aggregates = {
+      &sum_expr->AsAggregateExpression()};
+
+  AggregateGroupTable lhs(&schema, &aggregates);
+  for (int64_t k = 0; k < 300; ++k) {
+    StatusOr<size_t> group = lhs.FindOrCreate(std::vector<Value>{Value(k)});
+    ASSERT_TRUE(group.HasValue());
+    ASSERT_TRUE(
+        lhs.Accumulate(group.Value(), Row({Value(k), Value(int64_t{2})})).ok());
+  }
+  AggregateGroupTable rhs(&schema, &aggregates);
+  for (int64_t k = 100; k < 700; ++k) {
+    StatusOr<size_t> group = rhs.FindOrCreate(std::vector<Value>{Value(k)});
+    ASSERT_TRUE(group.HasValue());
+    ASSERT_TRUE(
+        rhs.Accumulate(group.Value(), Row({Value(k), Value(int64_t{3})})).ok());
+  }
+  ASSERT_TRUE(lhs.Merge(rhs).ok());
+  ASSERT_EQ(lhs.size(), 700U);
+  for (size_t g = 0; g < lhs.size(); ++g) {
+    const int64_t k = lhs.Key(g)[0].AsInt64();
+    StatusOr<Row> out = lhs.Finish(g);
+    ASSERT_TRUE(out.HasValue());
+    const int64_t expected = k < 100 ? 2 : (k < 300 ? 5 : 3);
+    EXPECT_EQ(out.Value()[1].AsInt64(), expected) << "group key " << k;
+  }
 }
 
 }  // namespace tinylamb

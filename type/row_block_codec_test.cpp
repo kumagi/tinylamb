@@ -136,6 +136,7 @@ TEST(RowBlockCodecTest, RejectsHugeRowCountAndOversizedPayloadWithoutOom) {
     const std::filesystem::path dir = std::filesystem::temp_directory_path(ec) /
                                       ("row_codec_corrupt_" + RandomString());
     std::filesystem::create_directories(dir, ec);
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
     struct Guard {
       std::filesystem::path d;
       ~Guard() {

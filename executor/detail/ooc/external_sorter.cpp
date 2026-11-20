@@ -19,6 +19,89 @@ constexpr size_t kWriteBatchMaxBytes = 16ULL
 
 }  // namespace
 
+// P34/61: loser tree over the merge streams (memory.md §3.4 requirement,
+// previously a std::binary_heap over full Rows).  Leaves are stream indices
+// padded to a power of two; `losers[0]` holds the current winner and
+// `losers[1..K-1]` the parked loser of each internal match.  A pop replays
+// the consumed leaf against the losers parked on its path, costing exactly
+// log2(K) comparisons (the heap needed ~2 log2).  Players are compared via
+// a caller-supplied `key_beats(a, b)` over the streams' cached key cells
+// (already strict-total: equal keys break by lower stream index); -1 slots
+// and inactive (exhausted) streams always lose.
+struct ExternalSorter::LoserMerge {
+  size_t K{0};
+  std::vector<int> losers;
+  std::vector<uint8_t> active;
+
+  void SetActive(size_t i, bool is_active) { active[i] = is_active ? 1 : 0; }
+  // -1 (all players exhausted / never inserted) ends the merge: an
+  // exhausted leaf stays in the tree but can never be the winner.
+  [[nodiscard]] int Top() const {
+    if (losers.empty() || losers[0] < 0 ||
+        active[static_cast<size_t>(losers[0])] == 0) {
+      return -1;
+    }
+    return losers[0];
+  }
+
+  template <typename KeyBeats>
+  [[nodiscard]] bool Better(int a, int b, const KeyBeats& key_beats) const {
+    const bool a_live = a >= 0 && active[static_cast<size_t>(a)] != 0;
+    const bool b_live = b >= 0 && active[static_cast<size_t>(b)] != 0;
+    if (a_live != b_live) {
+      return a_live;
+    }
+    if (!a_live) {
+      return false;
+    }
+    return key_beats(a, b);
+  }
+
+  template <typename KeyBeats>
+  void Build(size_t num_streams, const std::vector<uint8_t>& initial_active,
+             const KeyBeats& key_beats) {
+    K = 2;
+    while (K < num_streams) {
+      K <<= 1;
+    }
+    losers.assign(K, -1);
+    active = initial_active;
+    std::vector<int> win(2 * K, -1);
+    for (size_t i = 0; i < num_streams; ++i) {
+      win[K + i] = static_cast<int>(i);
+    }
+    for (size_t node = K - 1; node >= 1; --node) {
+      const int a = win[2 * node];
+      const int b = win[(2 * node) + 1];
+      if (Better(a, b, key_beats)) {
+        win[node] = a;
+        losers[node] = b;
+      } else {
+        win[node] = b;
+        losers[node] = a;
+      }
+    }
+    losers[0] = win[1];
+  }
+
+  // Replays the path of stream `t` (its key changed or it was deactivated
+  // via SetActive) after it was the winner.
+  template <typename KeyBeats>
+  void Replay(int t, const KeyBeats& key_beats) {
+    if (t < 0) {
+      return;
+    }
+    int cur = t;
+    for (size_t node = (K + static_cast<size_t>(t)) >> 1; node >= 1;
+         node >>= 1) {
+      if (Better(losers[node], cur, key_beats)) {
+        std::swap(cur, losers[node]);
+      }
+    }
+    losers[0] = cur;
+  }
+};
+
 ExternalSorter::ExternalSorter(Options options)
     : options_(std::move(options)),
       spill_store_alive_(options_.spill_store != nullptr
@@ -71,6 +154,49 @@ int ExternalSorter::CompareRows(const Row& lhs, const Row& rhs) const noexcept {
   return 0;
 }
 
+// P34/61: identical to CompareRows but over the per-stream cached key cells
+// (same Value objects were copied, same SortKeyOrder chain).
+int ExternalSorter::CompareKeyCells(const MergeStream& lhs,
+                                    const MergeStream& rhs) const noexcept {
+  for (size_t i = 0; i < key_orders_.size(); ++i) {
+    const bool lhs_ok = lhs.key_present[i] != 0;
+    const bool rhs_ok = rhs.key_present[i] != 0;
+    if (!lhs_ok || !rhs_ok) {
+      if (lhs_ok != rhs_ok) {
+        return lhs_ok ? 1 : -1;
+      }
+      continue;
+    }
+    const int cmp = key_orders_[i].Compare(lhs.key_cells[i], rhs.key_cells[i]);
+    if (cmp != 0) {
+      return cmp;
+    }
+  }
+  return 0;
+}
+
+// P34/61: snapshot the stream's current row key columns into owned Values.
+void ExternalSorter::RefreshStreamKey(MergeStream* stream) noexcept {
+  const size_t nk = key_orders_.size();
+  stream->key_cells.resize(nk);
+  stream->key_present.assign(nk, 0);
+  if (stream->eof || stream->row_idx >= stream->block_rows.size()) {
+    return;
+  }
+  const Row& row = stream->block_rows[stream->row_idx];
+  for (size_t i = 0; i < nk; ++i) {
+    const size_t col_idx = options_.keys[i].column_index;
+    if (col_idx < row.Count()) {
+      stream->key_present[i] = 1;
+      stream->key_cells[i] = row[col_idx];
+    }
+  }
+}
+
+// Fast pre-check for the TopK heap. This duplicates SortKeyOrder::Compare
+// (collation resolution, NaN/-0 canonicalisation, NULL placement) on purpose;
+// any change to the canonical comparator must be mirrored here or rows may
+// be wrongly skipped before reaching the heap.
 bool ExternalSorter::ShouldSkipTopKChunkRow(
     const DataChunk& chunk, size_t row_idx,
     size_t sql_key_count) const noexcept {
@@ -201,11 +327,13 @@ void ExternalSorter::DropRunSegments() noexcept {
 }
 
 void ExternalSorter::Reset() noexcept {
-  final_heap_.clear();
+  final_merge_.reset();
   final_streams_.clear();
   DropRunSegments();
   run_rows_.clear();
-  run_rows_.shrink_to_fit();
+  // T3462: Reset is noexcept; shrink_to_fit's realloc could throw (and
+  // terminate).  Swap with an empty vector instead.
+  std::vector<Row>().swap(run_rows_);
   run_bytes_ = 0;
   in_limit_heap_ = false;
   in_mem_cursor_ = 0;
@@ -247,6 +375,9 @@ Status ExternalSorter::WriteSortedRun(std::vector<Row>* rows,
   size_t idx = 0;
   while (idx < rows->size()) {
     size_t batch_end = idx;
+    // Reset per batch: leaving this outside the loop makes every row after
+    // the first batch flush individually once the threshold is reached,
+    // exhausting the temporary-space budget.
     size_t batch_bytes = 0;
     while (batch_end < rows->size() && (batch_end - idx) < kWriteBatchRows &&
            batch_bytes < kWriteBatchMaxBytes) {
@@ -413,7 +544,9 @@ Status ExternalSorter::AdvanceMergeStream(MergeStream* stream) {
     if (!has_more) {
       stream->eof = true;
       stream->scratch.clear();
-      stream->scratch.shrink_to_fit();
+      // T3462: shrink_to_fit can throw bad_alloc across the Status
+      // boundary; swap-with-empty frees the capacity without allocating.
+      std::string().swap(stream->scratch);
       return Status::kSuccess;
     }
   }
@@ -453,25 +586,25 @@ Status ExternalSorter::MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
                                      size_t writer_buf_bytes,
                                      SpillSegmentId* merged_out) {
   std::vector<MergeStream> streams(inputs.size());
-  std::vector<size_t> heap;
-  heap.reserve(inputs.size());
-
-  auto heap_cmp = [this, &streams](size_t a, size_t b) {
-    // std::priority_queue / heap max-element -> return true when `a` comes
-    // *after* `b` so smallest row sits at `heap.front()`.
-    return CompareRows(streams[a].block_rows[streams[a].row_idx],
-                       streams[b].block_rows[streams[b].row_idx]) > 0;
-  };
 
   for (size_t i = 0; i < inputs.size(); ++i) {
     streams[i].reader = std::make_unique<SpillSegmentReader>(
         options_.spill_store, inputs[i], reader_buf_bytes);
     RETURN_IF_FAIL(AdvanceMergeStream(&streams[i]));
-    if (!streams[i].eof) {
-      heap.push_back(i);
-    }
+    RefreshStreamKey(&streams[i]);
   }
-  std::make_heap(heap.begin(), heap.end(), heap_cmp);
+  // P34/61: loser tree on cached key cells; equal keys break by stream
+  // index (run order), keeping the merge deterministic.
+  const auto key_beats = [this, &streams](int a, int b) {
+    const int cmp = CompareKeyCells(streams[a], streams[b]);
+    return cmp < 0 || (cmp == 0 && a < b);
+  };
+  std::vector<uint8_t> initial_active(inputs.size(), 1);
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    initial_active[i] = streams[i].eof ? 0 : 1;
+  }
+  LoserMerge tree;
+  tree.Build(inputs.size(), initial_active, key_beats);
 
   SpillSegmentWriter writer(options_.spill_store, writer_buf_bytes);
   RETURN_IF_FAIL(writer.EnsureOpen());
@@ -482,13 +615,11 @@ Status ExternalSorter::MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
   std::string write_scratch;
   size_t written = 0;
 
-  while (!heap.empty()) {
+  while (tree.Top() >= 0) {
     if (options_.limit.has_value() && written >= *options_.limit) {
       break;
     }
-    std::pop_heap(heap.begin(), heap.end(), heap_cmp);
-    const size_t idx = heap.back();
-    heap.pop_back();
+    const auto idx = static_cast<size_t>(tree.Top());
 
     Row row = std::move(streams[idx].block_rows[streams[idx].row_idx]);
     ++streams[idx].row_idx;
@@ -503,10 +634,9 @@ Status ExternalSorter::MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
     }
 
     RETURN_IF_FAIL(AdvanceMergeStream(&streams[idx]));
-    if (!streams[idx].eof) {
-      heap.push_back(idx);
-      std::push_heap(heap.begin(), heap.end(), heap_cmp);
-    }
+    RefreshStreamKey(&streams[idx]);
+    tree.SetActive(idx, !streams[idx].eof);
+    tree.Replay(static_cast<int>(idx), key_beats);
   }
 
   if (!batch.empty()) {
@@ -521,23 +651,24 @@ Status ExternalSorter::MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
 
 Status ExternalSorter::OpenFinalMergeStreams(size_t reader_buf_bytes) {
   final_streams_.clear();
-  final_heap_.clear();
+  final_merge_ = std::make_unique<LoserMerge>();
   final_streams_.resize(run_segments_.size());
 
   for (size_t i = 0; i < run_segments_.size(); ++i) {
     final_streams_[i].reader = std::make_unique<SpillSegmentReader>(
         options_.spill_store, run_segments_[i], reader_buf_bytes);
     RETURN_IF_FAIL(AdvanceMergeStream(&final_streams_[i]));
-    if (!final_streams_[i].eof) {
-      final_heap_.push_back(i);
-    }
+    RefreshStreamKey(&final_streams_[i]);
   }
-  auto heap_cmp = [this](size_t a, size_t b) {
-    return CompareRows(
-               final_streams_[a].block_rows[final_streams_[a].row_idx],
-               final_streams_[b].block_rows[final_streams_[b].row_idx]) > 0;
+  const auto key_beats = [this](int a, int b) {
+    const int cmp = CompareKeyCells(final_streams_[a], final_streams_[b]);
+    return cmp < 0 || (cmp == 0 && a < b);
   };
-  std::make_heap(final_heap_.begin(), final_heap_.end(), heap_cmp);
+  std::vector<uint8_t> initial_active(run_segments_.size(), 1);
+  for (size_t i = 0; i < run_segments_.size(); ++i) {
+    initial_active[i] = final_streams_[i].eof ? 0 : 1;
+  }
+  final_merge_->Build(run_segments_.size(), initial_active, key_beats);
   return Status::kSuccess;
 }
 
@@ -595,8 +726,8 @@ Status ExternalSorter::Finish() {
       // dropped by a sibling consumer, and a raw DropSegment would reuse a
       // recycled id.
       for (const SpillSegmentId consumed : group) {
-        SpillStore::DropSegmentIfAlive(options_.spill_store,
-                                       spill_store_alive_, consumed);
+        SpillStore::DropSegmentIfAlive(options_.spill_store, spill_store_alive_,
+                                       consumed);
       }
       next_round.push_back(merged);
     }
@@ -622,6 +753,7 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
     RETURN_IF_FAIL(Finish());
   }
   if (options_.limit.has_value() && emitted_rows_ >= *options_.limit) {
+    DropRunSegments();  // no further rows will be read
     return false;
   }
 
@@ -633,7 +765,8 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
     ++emitted_rows_;
     if (in_mem_cursor_ == run_rows_.size()) {
       run_rows_.clear();
-      run_rows_.shrink_to_fit();
+      // T3462: shrink_to_fit can throw bad_alloc across this Status path.
+      std::vector<Row>().swap(run_rows_);
       run_bytes_ = 0;
       if (grant_cache_.has_value()) {
         grant_cache_->ReleaseAll();
@@ -642,20 +775,18 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
     return true;
   }
 
-  if (final_heap_.empty()) {
+  if (final_merge_ == nullptr || final_merge_->Top() < 0) {
     final_streams_.clear();
+    final_merge_.reset();
     DropRunSegments();
     return false;
   }
 
-  auto heap_cmp = [this](size_t a, size_t b) {
-    return CompareRows(
-               final_streams_[a].block_rows[final_streams_[a].row_idx],
-               final_streams_[b].block_rows[final_streams_[b].row_idx]) > 0;
+  const auto key_beats = [this](int a, int b) {
+    const int cmp = CompareKeyCells(final_streams_[a], final_streams_[b]);
+    return cmp < 0 || (cmp == 0 && a < b);
   };
-  std::pop_heap(final_heap_.begin(), final_heap_.end(), heap_cmp);
-  const size_t idx = final_heap_.back();
-  final_heap_.pop_back();
+  const auto idx = static_cast<size_t>(final_merge_->Top());
 
   *row_out =
       std::move(final_streams_[idx].block_rows[final_streams_[idx].row_idx]);
@@ -663,12 +794,12 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
   ++emitted_rows_;
 
   RETURN_IF_FAIL(AdvanceMergeStream(&final_streams_[idx]));
-  if (!final_streams_[idx].eof) {
-    final_heap_.push_back(idx);
-    std::push_heap(final_heap_.begin(), final_heap_.end(), heap_cmp);
-  }
-  if (final_heap_.empty()) {
+  RefreshStreamKey(&final_streams_[idx]);
+  final_merge_->SetActive(idx, !final_streams_[idx].eof);
+  final_merge_->Replay(static_cast<int>(idx), key_beats);
+  if (final_merge_->Top() < 0) {
     final_streams_.clear();
+    final_merge_.reset();
     DropRunSegments();
   }
   return true;

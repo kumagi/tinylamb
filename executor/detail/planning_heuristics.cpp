@@ -467,10 +467,15 @@ std::vector<PredicateInfo> SynthesizeDisjunctEqualityPredicates(
         EqualityPairKey(binary.Left()->AsColumnValue().GetColumnName(),
                         binary.Right()->AsColumnValue().GetColumnName()));
   }
+  Schema all_schema;
+  for (const Relation& rel : relations) {
+    all_schema = all_schema + rel.schema;
+  }
   for (const PredicateInfo& predicate : analyzed) {
     if (!predicate.resolved || predicate.contains_query ||
         predicate.sources.size() < 2 ||
-        !SafeToReduceEvaluationCount(predicate.expression)) {
+        !SafeToReduceEvaluationCountWithSchema(predicate.expression,
+                                               all_schema)) {
       continue;
     }
     for (const auto& [lhs, rhs] :
@@ -807,10 +812,13 @@ void BuildJoinKeyFrequencyMaps(const Relation& right,
   maps->frequencies.clear();
   maps->int_frequencies.clear();
   static const size_t kBuildSampleTarget = [] {
-    // A/B hatch: TINYLAMB_LEGACY_ESTIMATE=1 restores the 2M-row sampling
-    // targets (finer estimates, slower planning sweeps).
+    // A/B hatch: a truthy TINYLAMB_LEGACY_ESTIMATE enables the 2M-row
+    // sampling targets; an explicit "0" must keep the small default.
     const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
-    return legacy != nullptr ? size_t{2'000'000} : size_t{2'048};
+    const bool enabled = legacy != nullptr && legacy[0] != '\0' &&
+                         std::string_view(legacy) != "0" &&
+                         std::string_view(legacy) != "false";
+    return enabled ? size_t{2'000'000} : size_t{2'048};
   }();
   static const bool build_sampling_disabled =
       std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
@@ -1167,6 +1175,10 @@ uint64_t MixPartitionHash(uint64_t h, uint64_t salt) {
 
 size_t SpillPartitionOfSalted(const std::string& key, size_t partitions,
                               uint64_t salt) {
+  // Guard the modulo: callers must supply at least one partition.
+  if (partitions == 0) {
+    return 0;
+  }
   // Platform-stable: partition assignment decides the order spilled rows come
   // back in, which must not depend on the standard library's std::hash.
   const uint64_t h = platform::StableHashBytes(key);
@@ -1175,6 +1187,10 @@ size_t SpillPartitionOfSalted(const std::string& key, size_t partitions,
 }
 
 size_t SpillPartitionOfSalted(int64_t key, size_t partitions, uint64_t salt) {
+  // Guard the modulo: callers must supply at least one partition.
+  if (partitions == 0) {
+    return 0;
+  }
   // Same platform-stability contract as the string overload: partition
   // assignment decides the order spilled rows come back in, so it must not
   // depend on the standard library's std::hash.  Encode big-endian so the
@@ -1187,10 +1203,18 @@ size_t SpillPartitionOfSalted(int64_t key, size_t partitions, uint64_t salt) {
 }
 
 size_t SpillPartitionOf(const std::string& key, size_t partitions) {
+  // Guard the modulo: callers must supply at least one partition.
+  if (partitions == 0) {
+    return 0;
+  }
   return SpillPartitionOfSalted(key, partitions, 0);
 }
 
 size_t SpillPartitionOf(int64_t key, size_t partitions) {
+  // Guard the modulo: callers must supply at least one partition.
+  if (partitions == 0) {
+    return 0;
+  }
   return SpillPartitionOfSalted(key, partitions, 0);
 }
 
@@ -1334,6 +1358,10 @@ StatusOr<Relation> HybridHashJoin(
   result.schema = left.schema + right.schema;
   const size_t right_width = right.schema.ColumnCount();
   const size_t left_width = left.schema.ColumnCount();
+  // Reusable all-NULL row templates for unmatched outer-join rows; avoid
+  // allocating a fresh vector<Value> per emitted row.
+  const Row right_null_row{std::vector<Value>(right_width)};
+  const Row left_null_row{std::vector<Value>(left_width)};
 
   auto mark_resident_match = [&](const Row& right_row) {
     if (!right_join || resident_right.empty()) {
@@ -1373,16 +1401,14 @@ StatusOr<Relation> HybridHashJoin(
       }
     }
     if (!matched && left_join) {
-      std::vector<Value> nulls(right_width);
-      result.AddRow(ConcatRows(left_row, Row(std::move(nulls))));
+      result.AddRow(ConcatRows(left_row, right_null_row));
     }
   };
 
   RETURN_IF_FAIL(left.ForEachRow([&](const Row& left_row) {
     if (probe_key_excluded(left_row)) {
       if (left_join) {
-        std::vector<Value> nulls(right_width);
-        result.AddRow(ConcatRows(left_row, Row(std::move(nulls))));
+        result.AddRow(ConcatRows(left_row, right_null_row));
       }
       return;
     }
@@ -1413,8 +1439,7 @@ StatusOr<Relation> HybridHashJoin(
       if (index < resident_matched.size() && resident_matched[index] != 0) {
         continue;
       }
-      std::vector<Value> nulls(left_width);
-      result.AddRow(Row(std::move(nulls)) + resident_right[index]);
+      result.AddRow(left_null_row + resident_right[index]);
     }
   }
   resident_right.clear();
@@ -1497,8 +1522,7 @@ StatusOr<Relation> HybridHashJoin(
           left_idx < left_matched->size()) {
         (*left_matched)[left_idx] = 1;
       } else if (!matched && emit_left_unmatched) {
-        std::vector<Value> nulls(right_width);
-        result.AddRow(ConcatRows(left_row, Row(std::move(nulls))));
+        result.AddRow(ConcatRows(left_row, right_null_row));
       }
       ++left_idx;
     }));
@@ -1507,8 +1531,7 @@ StatusOr<Relation> HybridHashJoin(
         if (part_matched[index] != 0) {
           continue;
         }
-        std::vector<Value> nulls(left_width);
-        result.AddRow(Row(std::move(nulls)) + right_rows[index]);
+        result.AddRow(left_null_row + right_rows[index]);
       }
     }
     return Status::kSuccess;
@@ -1838,7 +1861,7 @@ std::optional<std::vector<BytecodeProgram>> CompileProbeResiduals(
   for (const auto& predicate : predicates) {
     if (!predicate || ContainsQuery(predicate) ||
         ContainsParameterSlot(predicate) ||
-        !SafeToReduceEvaluationCount(predicate)) {
+        !SafeToReduceEvaluationCountWithSchema(predicate, schema)) {
       return std::nullopt;
     }
     auto program = BytecodeCompiler::CompileRowCached(
@@ -2492,7 +2515,10 @@ std::vector<ColumnarColSummary> SummarizeColumnarTable(
     if (ch.rows == 0) {
       continue;
     }
-    for (size_t c = 0; c < ncols; ++c) {
+    // T4593: projected ColumnarTables carry chunks narrower than the schema
+    // (columnar_table.cpp resize(slots.size())); index only columns this
+    // chunk actually provides, matching FinalizeColumnarJoinResult's guard.
+    for (size_t c = 0; c < ncols && c < ch.columns.size(); ++c) {
       ColumnarColSummary& sum = out[c];
       const ColumnarColumn& col = ch.columns[c];
       std::shared_ptr<const ColumnarTable> cur_owner = tbl;
@@ -2563,6 +2589,11 @@ std::vector<size_t> ComputeColumnarBuildGroups(
       bool same_gi = true;
       for (const ColumnarChunk& ch : tbl.chunks) {
         if (ch.rows == 0) {
+          continue;
+        }
+        // T4593: narrower projected chunks simply carry no evidence for
+        // these columns; skip them instead of indexing out of range.
+        if (rc >= ch.columns.size() || c >= ch.columns.size()) {
           continue;
         }
         if (ch.columns[rc].gather_index.get() !=
@@ -4786,7 +4817,10 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
       right.TotalRows() > left.TotalRows() * kFlipRatio && !left.HasSpill() &&
       std::getenv("TINYLAMB_DISABLE_ORDERED_INNER_FLIP") == nullptr) {
     const auto predicates = SplitConjuncts(source.join_condition);
-    if (std::ranges::all_of(predicates, SafeToReduceEvaluationCount)) {
+    const Schema flip_schema = left.schema + right.schema;
+    if (std::ranges::all_of(predicates, [&](const Expression& pred) {
+          return SafeToReduceEvaluationCountWithSchema(pred, flip_schema);
+        })) {
       return InnerJoin(context, std::move(left), std::move(right), predicates,
                        outer, ctes);
     }
@@ -4984,7 +5018,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     }
     if (right.HasColumnarOnly() &&
         QueryMemoryBudget::Global().CanReserve(right.TotalRows() * 128)) {
-      right.EnsureRowsMaterialized();
+      RETURN_IF_FAIL(right.EnsureRowsMaterialized());
     }
     std::vector<char> right_matched(want_right_nulls ? right.TotalRows() : 0,
                                     0);
@@ -5158,11 +5192,11 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
       return *std::move(joined_col);
     }
     if (build_side_mut->HasColumnarOnly()) {
-      build_side_mut->EnsureRowsMaterialized();
+      RETURN_IF_FAIL(build_side_mut->EnsureRowsMaterialized());
     }
     if (probe_side.HasColumnarOnly() &&
         QueryMemoryBudget::Global().CanReserve(probe_side.TotalRows() * 128)) {
-      probe_side.EnsureRowsMaterialized();
+      RETURN_IF_FAIL(probe_side.EnsureRowsMaterialized());
     }
     const bool stream_is_left = !flip;
     const bool probe_outer_emit = flip ? want_right_nulls : want_left_nulls;
@@ -5640,7 +5674,7 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
     }
     if (right.HasColumnarOnly() &&
         QueryMemoryBudget::Global().CanReserve(right.TotalRows() * 128)) {
-      right.EnsureRowsMaterialized();
+      RETURN_IF_FAIL(right.EnsureRowsMaterialized());
     }
     Row combined_scratch{std::vector<Value>{}};
     if (!right.HasSpill()) {
@@ -5771,11 +5805,11 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
       return *std::move(joined_col);
     }
     if (build_side_mut->HasColumnarOnly()) {
-      build_side_mut->EnsureRowsMaterialized();
+      RETURN_IF_FAIL(build_side_mut->EnsureRowsMaterialized());
     }
     if (probe_side.HasColumnarOnly() &&
         QueryMemoryBudget::Global().CanReserve(probe_side.TotalRows() * 128)) {
-      probe_side.EnsureRowsMaterialized();
+      RETURN_IF_FAIL(probe_side.EnsureRowsMaterialized());
     }
     // Build the hash on the smaller side and stream the bigger side: the
     // build's random bucket writes scale with the build row count while a

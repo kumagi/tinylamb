@@ -16,6 +16,7 @@
 
 #include "table/memtable/skiplist.hpp"
 
+#include "common/platform/endian.hpp"
 #include <algorithm>
 #include <cassert>
 #include <limits>
@@ -39,7 +40,7 @@ PreparedKey PrepareKey(std::string_view key) {
   if (key.size() == 9) {
     uint64_t word = 0;
     std::memcpy(&word, key.data(), sizeof(word));
-    prepared.word = __builtin_bswap64(word);
+    prepared.word = htobe64(word);
     prepared.tail = static_cast<uint8_t>(key[8]);
     prepared.fixed9 = true;
   }
@@ -104,7 +105,7 @@ void SkipList::ConstIterator::Next() {
   if (node == nullptr) {
     return;
   }
-  auto* n = static_cast<Node*>(const_cast<void*>(node));
+  const auto* n = static_cast<const Node*>(node);
   node = n->next(0);
 }
 
@@ -181,7 +182,7 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
   if (key.size() == 9) {
     uint64_t word = 0;
     std::memcpy(&word, key.data(), sizeof(word));
-    n->word0 = __builtin_bswap64(word);
+    n->word0 = htobe64(word);
     n->tail9 = static_cast<uint8_t>(key[8]);
   } else {
     n->word0 = 0;

@@ -200,21 +200,35 @@ ARRAY<STRUCT<id INT64>>[{1}, {2}]
 ==
 
 [mode=explain]
-# Absorption requires proof that evaluating the removed branch cannot fail.
-[plan_contains=AND]
-[name=boolean_absorption_keeps_unproved_branch]
+[plan_not_contains=AND]
+[name=boolean_absorption_removes_total_branch]
 SELECT id FROM rewrite_input WHERE flag OR (flag AND a = 10) ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}]
 ==
 
 [mode=explain]
-# Keep the branch until schema-aware non-throwing proof is available.
-[plan_contains=OR]
-[name=conjunctive_absorption_keeps_unproved_branch]
+[plan_not_contains=OR]
+[name=conjunctive_absorption_removes_total_branch]
 SELECT id FROM rewrite_input WHERE flag AND (flag OR a = 10) ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=AND]
+[name=boolean_absorption_keeps_potentially_raising_branch]
+SELECT id, flag OR (flag AND a / b = 10) AS f FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, f BOOL>>[{1, true}, {2, false}, {3, NULL}]
+==
+
+[mode=explain]
+[plan_contains=OR]
+[name=conjunctive_absorption_keeps_potentially_raising_branch]
+SELECT id, flag AND (flag OR a / b = 10) AS f FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, f BOOL>>[{1, true}, {2, false}, {3, NULL}]
 ==
 
 [mode=explain]

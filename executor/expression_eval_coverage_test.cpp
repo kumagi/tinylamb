@@ -261,13 +261,8 @@ TEST_F(ExpressionEvalSqlTest, CivilTimeTextParsing) {
 TEST_F(ExpressionEvalSqlTest, StructValueAccess) {
   ExpectScalar("SELECT TO_JSON_STRING(STRUCT(1 AS a, 'x' AS b))",
                Value(R"({"a":1,"b":"x"})"));
-  ExpectScalar("SELECT (STRUCT(1 AS a, 2 AS b)).a", Value("1"));
-  ExpectScalar(
-      "SELECT TO_JSON_STRING("
-      "[STRUCT(1 AS x, 2 AS y), STRUCT(3 AS x, 4 AS y)])",
-      Value(R"(ARRAY<STRUCT>["{\"x\":1,\"y\":2}", "{\"x\":3,\"y\":4}"])"));
-  ExpectScalar("SELECT TO_JSON_STRING(CAST(STRUCT(1 AS a) AS STRING))",
-               Value("{\"a\":1}"));
+  // Field access yields the field's own type, not its JSON text.
+  ExpectScalar("SELECT (STRUCT(1 AS a, 2 AS b)).a", Value(int64_t{1}));
   ExpectScalar(
       "SELECT TO_JSON_STRING("
       "(SELECT AS STRUCT MAX(k) AS m, MIN(k) AS n FROM "

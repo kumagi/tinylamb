@@ -171,8 +171,6 @@ const auto kNonStrictFunctions = std::to_array<const char* const>({
     // make_interval ignores arguments past the first two (lenient arity,
     // pinned by SqlIntervalCoverageTest), so NULLs there stay observable.
     "make_interval",
-    // regexp_extract accepts 2-4 args but reads only the first two.
-    "regexp_extract",
     "iserror",
     "nullif",
     "ifnull",
@@ -214,7 +212,9 @@ Value MakeArg(Cursor& c, bool bounded_sequence = false) {
       std::string s;
       const size_t len = c.Next() % 6;
       for (size_t i = 0; i < len; ++i) {
-        s.push_back(static_cast<char>(c.Next() % 128));
+        // Cover the full byte range: high bytes, UTF-8 continuation bytes
+        // and embedded NULs exercise byte-vs-codepoint length paths.
+        s.push_back(static_cast<char>(c.Next() % 256));
       }
       return Value(std::move(s));
     }

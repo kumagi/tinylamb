@@ -6,6 +6,9 @@
 #include <exception>
 #include <utility>
 
+#include "common/memory_budget.hpp"
+#include "common/platform/file_io.hpp"
+
 namespace tinylamb {
 namespace {
 constexpr size_t kBufferValues = 4096;
@@ -39,13 +42,31 @@ Status Rewind(std::FILE* file) {
   }
   return Status::kSuccess;
 }
+
+// Spill placement follows the engine-wide knobs -- TINYLAMB_TEMP via
+// ProcessMemoryBudget::ResolveTempDirectory(), the same directory SpillStore
+// and the rest of the OOC machinery honor -- instead of std::tmpfile()'s
+// fixed P_tmpdir.  The unlinked fd keeps tmpfile()'s auto-delete contract.
+std::FILE* OpenRunFile() {
+  const int fd = platform::OpenUnlinkedTempFile(
+      ProcessMemoryBudget::ResolveTempDirectory());
+  return platform::FdOpenStream(fd, "w+b");
+}
 }  // namespace
 
 Status SortedDistinctRuns::Add(std::span<const uint64_t> sorted) try {
   if (sorted.empty()) {
     return Status::kSuccess;
   }
-  Run run{.file = File(std::tmpfile()), .count = sorted.size()};
+  // Merge relies on 2-pointer union + adjacent-dup elimination; an unsorted
+  // input silently breaks COUNT(DISTINCT) correctness.
+  for (size_t i = 1; i < sorted.size(); ++i) {
+    if (sorted[i] < sorted[i - 1]) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SortedDistinctRuns::Add requires a sorted span");
+    }
+  }
+  Run run{.file = File(OpenRunFile()), .count = sorted.size()};
   if (!run.file || std::fwrite(sorted.data(), sizeof(uint64_t), sorted.size(),
                                run.file.get()) != sorted.size()) {
     return StatusError(StatusCode::kIOError, "distinct run write failed");
@@ -65,7 +86,7 @@ StatusOr<SortedDistinctRuns::Run> SortedDistinctRuns::Merge(const Run& left,
   }
   RETURN_IF_FAIL(Rewind(left.file.get()));
   RETURN_IF_FAIL(Rewind(right.file.get()));
-  Run output{.file = File(std::tmpfile())};
+  Run output{.file = File(OpenRunFile())};
   if (!output.file) {
     return StatusError(StatusCode::kIOError, "distinct merge create failed");
   }
@@ -154,11 +175,25 @@ Status SortedDistinctRuns::ForEach(
   if (!final) {
     return Status::kSuccess;
   }
-  RETURN_IF_FAIL(Rewind(final->file.get()));
+  // T4182: a Rewind/Next failure used to return with levels_ already
+  // cleared and the merged `final` run destroyed on the way out -- a retry
+  // then saw an EMPTY run set and "succeeded" with zero values, so the
+  // distinct value set was permanently lost. Hand the merged run back to
+  // levels_ on every failure path so ForEach stays retryable.
+  const Status rewind_st = Rewind(final->file.get());
+  if (rewind_st != Status::kSuccess) {
+    levels_.push_back(std::move(final));
+    return rewind_st;  // NOLINT(performance-no-automatic-move)
+  }
   Reader reader{.file = final->file.get(), .remaining = final->count};
   std::optional<uint64_t> previous;
   for (;;) {
-    ASSIGN_OR_RETURN(std::optional<uint64_t>, value, reader.Next());
+    StatusOr<std::optional<uint64_t>> next = reader.Next();
+    if (!next.HasValue()) {
+      levels_.push_back(std::move(final));
+      return next.GetStatus();
+    }
+    std::optional<uint64_t> value = next.MoveValue();
     if (!value) {
       break;
     }

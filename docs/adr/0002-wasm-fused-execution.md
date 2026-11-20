@@ -47,7 +47,7 @@ instanceを再利用しwarmup後に測っており、コンパイルキャッシ
 | AVX2 / SIMD128 17-bit FOR + SUM | 8 | 0.380 | 1.219 | 3.21 |
 | AVX2 / SIMD128 bloom + 2 probe + groups | 8 | 6.860 | 9.972 | 1.45 |
 
-probeのWASM 2→8 workersは3.70倍。ネイティブ比1.3倍のゲートが不成立。
+probe（bloom + 2 probe + groups）の WASM は 1→8 workers で 7.15 倍（71.413 ms → 9.985 ms）、ネイティブも 7.29 倍。8 workers 時の WASM/ネイティブ比は 1.43 倍で、ネイティブ比 1.3 倍のゲートは不成立。
 Pythonのdispatch/FFIを両者の計時に含めるため、サブmsの比率は純粋な機械語の
 比較ではない。microbenchmarkの結果をSQL高速化率へ外挿しない。
 

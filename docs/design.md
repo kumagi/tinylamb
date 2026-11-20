@@ -27,13 +27,13 @@
 |---|---|---|---|
 | D1 | 実装完了 | 2026-09-02 | WAL enqueue latch をレコード完了まで保持する |
 | D2 | 実装完了 | 2026-09-02 | redo/undoを論理的に冪等化する |
-| D3 | 実装完了 | 2026-09-02 | DestroyPage redo で FreePage 化し、free list を再構築する |
+| D3 | 旧実装（退役済み） | 2026-09-02 | DestroyPage redo で FreePage 化し、free list を再構築する（現行は BoundedFreeIdSet / rebuild-free 経路） |
 | D4 | 実装完了 | 2026-09-02 | WAL順序と外部可視化を分離し、公開前に依存LSNを耐久化する |
 | D5 | 実装完了 | 2026-09-02 | Cascades ルールを強固な前提ゲートで保護し、定期棚卸しする |
 | D6 | 実装完了 | 2026-09-02 | ルート適用、重複集合、最終結果fallbackを併用する |
 | D7 | 実装完了 | 2026-09-02 | Bytecode VM に短絡制御フローを実装する |
 | D8 | 実装完了 | 2026-09-02 | null-safe / RIGHT / FULL を含む spill 対応 hybrid join を実装する |
-| D9 | 実装完了 | 2026-09-02 | WAL レコード末尾に CRC32C を追加し、旧形式を読み取る |
+| D9 | 実装完了（旧形式互換は撤退） | 2026-11-19 更新 | WAL レコード末尾に CRC32C を追加し、現行 version 7 のみ受理する |
 | D10 | 旧方式を廃止・snapshot/WAL 復元へ置換 | 2026-11-11 更新 | PageManager が committed 状態を永続化する |
 | D11 | 旧 B+Tree 実装の記録 | 2026-09-02 | root lift-up の前提を厳密化し、subtree を再接続してから回収する |
 
@@ -138,8 +138,9 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 
 - 状態: 承認済み
 - 決定日: 2026-09-02
-- 決定: `kSystemDestroyPage` のredoは対象ページを `kFreePage` として初期化する。
-  リカバリ完了時にページ範囲を走査し、free list を再構築して再利用可能にする。
+- 決定（旧実装・退役済み）: `kSystemDestroyPage` のredoは対象ページを `kFreePage` として初期化し、
+  リカバリ完了時にページ範囲を走査して free list を再構築していた。現行コードには `kFreePage`
+  の走査も B+Tree leaf/branch redo も存在しない（page_format.md / recovery_invariants.md 参照）。
 - 理由: 壊れたページは孤立したまま保持せず、いずれ初期化されて安全に使い直される
   べきである。DROP後のクラッシュでもDBを再オープン可能にする。
 - 実装範囲: `recovery/recovery_manager.cpp`、`page/page_manager.cpp`、free list、
@@ -200,8 +201,8 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 - commit LSNの順序は、依存先のcommit LSNより前にならない。
 - `synchronous_commit` の設定は自身のcommit待機を制御できるが、ユーザーへ返す
   結果が依存するcommitの耐久化バリアを無効化しない。
-- checkpointはcommit中のtransaction status、prev LSN、依存LSNを同じ同期規約で
-  読み取る。
+- checkpointはコメント中のトランザクション状態や prev LSN を永続化しない。
+  現行の不変条件は docs/recovery_invariants.md / docs/wal_format.md を参照。
 
 ### 受け入れ条件
 
@@ -352,7 +353,9 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 - 状態: 承認済み
 - 決定日: 2026-09-02
 - 決定: WALレコード末尾にCRC32Cを追加し、形式versionを更新する。リーダーは旧形式を
-  CRCなし形式として読み取り、新規書き込みはCRC付き形式に統一する。
+  CRCなし形式として読み取る計画だったが、旧ストレージ実装の撤去に伴い
+  version 7 (CRC 付き) のみを受理する fail-closed に変更した
+  (`docs/wal_format.md`)。
 - 理由: レコード内部のビット劣化をtail以外でも検出し、破損したレコード以降を
   安全に再生しない。既存ログの読み取り互換性は維持する。
 - 実装範囲: `recovery/log_record.cpp/.hpp`、`recovery/logger.cpp`、
@@ -363,14 +366,14 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 - CRCの対象範囲は、CRCフィールド自身を除く完全なレコードバイト列で固定する。
 - magic、version、length、payload、CRCを検証してからレコードを適用する。
 - 中間レコードのCRC不一致は、その位置を有効なログ末尾として扱い、後続を再生しない。
-- 旧形式は明示的に識別してCRC検証を要求せず、新形式の欠損CRCは破損として扱う。
+- 現行 version (7) だけを受理し、旧 version と CRC 欠損はともに拒否する。
 - CRC計算結果は既存の`common/crc32c.hpp`と一致する。
 
 ### 受け入れ条件
 
 1. WAL中間の1バイトを改変し、`ValidLogEnd`が対象レコードで停止する。
 2. tail truncation、長さ破損、CRC破損を区別して処理する。
-3. 旧形式ログを読み取ってリカバリでき、新形式ログを再起動後も読み取れる。
+3. 現行形式ログを再起動後も読み取れ、旧形式ログは拒否される。
 
 ---
 

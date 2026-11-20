@@ -31,7 +31,7 @@ cd lean
 
 ### 3. VS Code / エディタで触るときのおすすめ
 
-VS Code 拡張 **`lean4` (`leanprover.lean4`)** を入れて [lean/](file:///home/kumagi/develop/tinylamb/lean) 内の `.lean` ファイルを開き、`by` ブロックの中の各行にカーソルを置くと、右側の **Lean InfoView** に「今どの仮定を持っていて、あと何を証明すればゴールか」がリアルタイム表示されます（これが新ルールの前提条件を逆算する最強の武器になります）。
+VS Code 拡張 **`lean4` (`leanprover.lean4`)** を入れて [`./TinylambOpt/`](./TinylambOpt/) 内の `.lean` ファイルを開き、`by` ブロックの中の各行にカーソルを置くと、右側の **Lean InfoView** に「今どの仮定を持っていて、あと何を証明すればゴールか」がリアルタイム表示されます（これが新ルールの前提条件を逆算する最強の武器になります）。
 
 ## ファイル構成（読む順番）
 
@@ -78,7 +78,21 @@ VS Code 拡張 **`lean4` (`leanprover.lean4`)** を入れて [lean/](file:///hom
     - 定数集合 `IN (...)` の 3 値 O(1) 判定、ASCII 1-始まり `SUBSTR` ゼロコピースライス、二値述語 `NOT` 対合正規化、事前構築 `EXISTS` 外側非 NULL ドメイン制限、融合 `AntiJoin` 集約カーネル、共有 `UNION` CTE への選言グループキー制限貫通を `sorry` ゼロで完全証明
 15. `TinylambOpt/TpchSf10Discovery.lean` — **Step 14: TPC-H SF=10（約 8,658 万行）対 DuckDB 敗北クエリ群向け新規最適化ルール 6 系統の探索と証明**
     - 過去ベンチマーク記録（`tpch-scaling-20261117`, `gate47`）および SF=10 全 22 問 `EXPLAIN` プロファイルで特定した敗北・スピル超過クエリ（Q19, Q13, Q18, Q9, Q15, Q10, Q8, Q20, Q11, Q16）のボトルネックを解消する 6 系統の書き換え定理（Kleene 3値共通連言括り出し・Join 横断 `OR` 選言包絡線＆区間 Hull プッシュダウン、`LEFT JOIN` 右側先行集約＋左 `UNIQUE NOT NULL` による内側 `GROUP BY` 完全消去、自己準結合 `HAVING SUM` 1 パス吸収、共有 CTE 最大値 `IS NOT NULL` 付き `WITH TIES` 還元＆`HAVING` 全体和 Fubini 1 パス還元、狭キー準結合付き Top-N 遅延ディメンション属性結合＆推移的等価クラス閉包、相関 `SUM` 不等号の `INNER JOIN` 相関除去＆非空非 NULL `NOT IN` の `AntiJoin` 還元）と 8 つの SQL 三値論理・NULL・空集合・多重度トラップ反例を `sorry` ゼロで完全証明
-16. `Main.lean` — 具体的な行データで反例と新ルール・C++ バグ監査・TPC-DS / ClickBench / TPC-H SF=10 探索デモを確認する実行エントリポイント
+16. `TinylambOpt/ClickBenchRound2.lean` — **Step 15: ClickBench 第2弾（CB-7..CB-12: 1億行 `.tlcs` ＆ 1,000万行 `LSTableStore` 残存敗北クエリ群）向け証明付き最適化**
+    - 高基数 `GROUP BY ... ORDER BY COUNT(*) DESC LIMIT K` に対する商ハッシュバケット上界 Exact Heavy-Hitter 刈り込み（Q34, Q35, Q17, Q19, Q13, Q15, Q16）、Markov 鳩の巣原理による `HAVING COUNT >= T` 基数上界と `LIMIT` 不要・`ORDER BY` 遅延対応 2 段集約（Q28, Q29, Q33）、アフィン線形和 `SUM(col + c)` の準同型分解（Q30）、無オーバーフロー証明付き並列 `SUM(INT64)` ＆定数ブロック `O(1)` 畳み込み（Q03, Q30）、辞書厳密頻度 `O(|D|)` 畳み込み（Q02, Q03, Q07, Q08）、ボトム元 `""` 除外による Zone-Map 非空最小値引き締め（Q26）と 7 本の SQL 意味論トラップ反例を `sorry` ゼロで完全証明
+17. `TinylambOpt/PhysicalJitFusion.lean` — TLCS の連結文字列バッファから `LIKE '%literal%'` の行選択を生成
+    - 32 レーンの先頭・末尾バイト比較で完全一致を取りこぼさないこと、ベクトルロードがバッファ内に収まること、最初の一致と行末オフセットで行の判定が確定することを証明。NULL の除外と既存の候補行との積集合をモデル化。
+18. `TinylambOpt/QuotientFusion.lean` — 降順 `COUNT(*)` Top-N の商バケット走査と厳密集約の融合
+    - バケット上界と候補グループの厳密度数を1回の走査で求める同値性、同率を保持する順位判定、無分岐の32ビットカウンタ更新、TLCS の個別ストリーム読み出しの同値性を証明。
+19. `TinylambOpt/FusedAggregateJit.lean` — LLVM の Filter → Project → SUM ループ融合
+    - フィルタ・射影を実体化した場合の度数と合計の一致、区間端点による乗算・加算の安全性、バッチをまたぐ先頭部分和、SIMD 部分和の加算再結合を証明。
+20. `TinylambOpt/FilterHashProbe.lean` — Filter → HashProbe の直接実行と選択行をまとめる経路
+    - 行順、重複キーの展開、射影の一致、およびハッシュと SIMD マスクのビット演算を証明。
+21. `TinylambOpt/TlcsBoundaryAggregate.lean` — TLCS の厳密統計による集約、上位候補のブロック除外、重複候補の絞り込み
+    - 統計で返す最小値・最大値・件数、ブロック範囲とフィンガープリントによる除外、重複候補を保持するビット演算、保存した選択行を再利用した場合の同値性を証明。
+22. `TinylambOpt/DelimitedCaptureJit.lean` — 貪欲なオプション接頭辞の展開、最初の区切りによるキャプチャ、範囲のビットパックの同値性。
+23. `TinylambOpt/SimdGroupHash.lean` — ハッシュのレーン単位同値性、UTC 時・分の読み出し、文字列フィンガープリントの境界、重複候補リプレイの位置・タグの保存。
+24. `Main.lean` — 具体的な行データで反例と新ルール・C++ バグ監査・TPC-DS / ClickBench / TPC-H SF=10 探索デモを確認する実行エントリポイント
 
 ## C++ コード側の対応コメント規約
 

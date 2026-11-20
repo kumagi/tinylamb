@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -147,7 +148,12 @@ Status CoerceRowToTypes(Row* row, const std::vector<ValueType>& common_types) {
       continue;
     }
     if (target == ValueType::kDouble && value.type == ValueType::kInt64) {
-      value = Value(static_cast<double>(value.value.int_value));
+      // UINT64 values use the signed bit pattern; promote through uint64_t
+      // or a value >= 2^63 would become a negative double.
+      value = Value(value.IsUnsigned()
+                        ? static_cast<double>(
+                              static_cast<uint64_t>(value.value.int_value))
+                        : static_cast<double>(value.value.int_value));
       continue;
     }
     if (target == ValueType::kDate && value.type == ValueType::kVarChar) {
@@ -210,9 +216,13 @@ bool SameSetRow(const Row& left, const Row& right, size_t compare_cols) {
       if (CompareForOrderBy(a, b) != 0) {
         return false;
       }
-    } else if (a.type == ValueType::kVarChar) {
+    } else if (a.type == ValueType::kVarChar && !a.IsInterval() &&
+               !b.IsInterval()) {
       // Same SQL-equality contract as the legacy SetOperationRowEqual: a
       // case-insensitive VARCHAR pair is one row, matching `=` and DISTINCT.
+      // Interval-shaped text stays byte-exact: EqualUnderCollation would fold
+      // its case, but SetRowPrefixHash hashes it without folding, so mixing
+      // the two contracts would split peers into different buckets.
       if (!EqualUnderCollation(a, b)) {
         return false;
       }
@@ -230,17 +240,10 @@ struct SetRowPrefixHash {
     for (size_t i = 0; i < compare_cols && i < row.Count(); ++i) {
       const Value& v = row[i];
       uint64_t h = 0;
-      if (v.IsNull()) {
-        h = 0x9e3779b97f4a7c15ULL;
-      } else if (v.type == ValueType::kDouble &&
-                 std::isnan(v.value.double_value)) {
-        h = 0x517cc1b727220a95ULL;
-      } else if (v.type == ValueType::kDouble && v.value.double_value == 0.0) {
-        const double pos_zero = 0.0;
-        uint64_t bits = 0;
-        std::memcpy(&bits, &pos_zero, sizeof(double));
-        h = std::hash<uint64_t>{}(bits);
-      } else if (v.type == ValueType::kVarChar && !v.IsInterval()) {
+      // NULL / NaN / -0 canonicalisation is owned by std::hash<Value>; using
+      // it directly keeps this hash in lockstep with EqualUnderCollation's
+      // equality contract instead of duplicating the constants here.
+      if (v.type == ValueType::kVarChar && !v.IsInterval()) {
         // EqualUnderCollation folds a case-insensitive VARCHAR pair, so both
         // peers must land in the same bucket. Fold every text cell: a single
         // CI tag resolves the comparison for both operands (distinct.cpp's
@@ -1283,6 +1286,15 @@ Status IncrementalSortSource::FillNextGroup(PipelineContext* ctx) {
   std::vector<std::optional<slot_t>> direct_slots(suffix_keys_.size());
   std::vector<size_t> computed_indices;
   const size_t base_cols = schema_.ColumnCount();
+  // T4854: computed suffix columns are addressed at base_cols + extra_idx
+  // inside OocSortKey::column_index (uint16); reject the wrap instead of
+  // letting a suffix key silently alias a real input column. Direct slots
+  // are schema offsets and therefore below base_cols, covered by the same
+  // bound.
+  if (base_cols + suffix_keys_.size() > std::numeric_limits<slot_t>::max()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "sort key column index out of range");
+  }
   size_t extra_idx = 0;
   for (size_t i = 0; i < suffix_keys_.size(); ++i) {
     slot_t slot = 0;
@@ -1609,8 +1621,9 @@ Status OocBitmapScanSource::Open(PipelineContext* ctx) {
   }
 
   const size_t total_budget = ctx->OperatorBudgetBytes();
-  const size_t per_sorter_budget = std::max<size_t>(
-      16384, total_budget / std::max<size_t>(1, ranges_.size()));
+  // A per-sorter 16 KiB floor would let N ranges hold 16 KiB * N.
+  const size_t per_sorter_budget =
+      total_budget / std::max<size_t>(1, ranges_.size());
 
   for (const OocIndexRange& range : ranges_) {
     const auto found = std::ranges::find_if(
@@ -1808,8 +1821,9 @@ Status OocMultiIndexCoveringSource::BuildFallbackScan(PipelineContext* ctx) {
   }
   fallback_source_ = fallback_factory_(ctx);
   if (fallback_source_ == nullptr) {
-    return StatusError(StatusCode::kUnknown,
-                       "MultiIndexCoveringScan fallback factory returned no source");
+    return StatusError(
+        StatusCode::kUnknown,
+        "MultiIndexCoveringScan fallback factory returned no source");
   }
   return Status::kSuccess;
 }
@@ -1985,6 +1999,10 @@ StatusOr<bool> OocMultiIndexCoveringSource::NextBatch(PipelineContext* ctx,
         if (slot >= heap.Count()) {
           return StatusError(StatusCode::kCorrupt,
                              "covering scan column is outside the heap row");
+        }
+        if (i >= assembled.values_.size()) {
+          return StatusError(StatusCode::kCorrupt,
+                             "covering scan slot is outside the output row");
         }
         assembled.values_[i] = heap[slot];
       }

@@ -93,11 +93,11 @@ optimizer 側は同じ契約を `PhysicalProperties::collation`（空文字が�
 
 境界キーと同じキーを持つ行数は、固定容量のヒープだけでは判断できない。そのため、全入力を保持して整列する。`offset` の後に `limit` 行を取った境界を求め、最後の行とすべての整列キーが等しい後続行を追加する。
 
-この経路は `O(N log N)` 時間と `O(N)` メモリを使う。同順位行の判定には値の等値演算を使い、`NULL` 同士、全 `NaN`、`-0.0/+0.0` はそれぞれ同じキーとして扱う。
+この経路は `O(N log N)` 時間と `O(N)` メモリを使う。同順位行の判定には `EqualUnderCollation` を使い、`NULL` 同士、全 `NaN`、`-0.0/+0.0`、および case-insensitive な文字列peer はそれぞれ同じキーとして扱う。
 
 どちらの処理でも行位置を保存し、キー式の評価に失敗した場合は最初のエラーを保持する。
 
-Top-N の浮動小数点比較には `CompareForOrderBy` を使う。`NULL` の位置は `NULLS FIRST` または `NULLS LAST` で決める。非 `NULL` 値は、昇順では `NaN`、通常値の順に並ぶ。この順序は、前節の `SortExecutor` における `NaN` の位置とは一致しない。
+Top-N の浮動小数点比較には `CompareForOrderBy` を使う。`NULL` の位置は `NULLS FIRST` または `NULLS LAST` で決める。非 `NULL` 値は、昇順では `NaN`、通常値の順に並ぶ。この順序は `SortKeyOrder` を共有する `SortExecutor` の NaN 順序と一致する。
 
 `limit = 0` の場合は、子を一行も読まず、直ちに空結果を確定する。
 
@@ -192,7 +192,7 @@ SQL は結果の列挙順を保証しない。メモリ内の処理では、第 
 
 対応区画をメモリへ読み、通常の集合演算を行って区画結果を連結する。スピル形式は行位置を保持しないため、この経路の出力位置は無効になる。
 
-`UNION ALL` は重複集合を必要としないためスピル切替の対象外だが、旧 `SetOperationExecutor` は全入力をメモリへ保持してから連結していた（既定の `PipelineLowering` 経路は `OocSetOpSink` / ステージ連結により扱う）。
+`UNION ALL` は重複集合を必要としないためスピル切替の対象外だが、旧 `SetOperationExecutor` は全入力をメモリへ保持してから連結していた（既定の `PipelineLowering` 経路は `OocSetOpInputSink`（`OocSetOpCoordinator` とステージ連結）により扱う）。
 
 ## 10. `MergeAppendExecutor`
 

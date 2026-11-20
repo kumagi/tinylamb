@@ -102,8 +102,7 @@ TEST(JsonTextValidator, AcceptsControlFreeHighBytes) {
 TEST(JsonTextValidator, BoundsNestingDepth) {
   // The validator runs on untrusted PARSE_JSON arguments; an unbounded
   // descent would crash the process instead of reporting invalid input.
-  // 255 levels stay valid, the depth cap itself (256) is the last valid
-  // level, and one past it is rejected.
+  // 255 levels stay valid, and the depth cap (256) is rejected.
   std::string deep_ok;
   for (int i = 0; i < 255; ++i) {
     deep_ok += "[";

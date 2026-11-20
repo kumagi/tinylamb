@@ -1580,7 +1580,7 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
     if (pending_) {
       while (pending_offset_ < pending_->Size() &&
              destination->Size() < max_rows) {
-        destination->Append(*pending_, pending_offset_++);
+        destination->AppendFrom(*pending_, pending_offset_++);
       }
       if (pending_offset_ == pending_->Size()) {
         pending_.reset();
@@ -1597,7 +1597,10 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
              worker_status_ != Status::kSuccess ||
              next_out_morsel_ >= morsels_.size() ||
              morsels_done_[next_out_morsel_] ||
-             !inflight_[next_out_morsel_].empty();
+             [&] {
+               auto it = inflight_.find(next_out_morsel_);
+               return it != inflight_.end() && !it->second.empty();
+             }();
     });
     if (worker_error_ != Status::kSuccess) {
       // Surface the worker failure as a sticky Status (no-exception
@@ -1657,12 +1660,12 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
       pending_ = std::move(chunk);
       pending_offset_ = 0;
       while (destination->Size() < max_rows) {
-        destination->Append(*pending_, pending_offset_++);
+        destination->AppendFrom(*pending_, pending_offset_++);
       }
       return destination->Size();
     }
     for (size_t index = 0; index < chunk.Size(); ++index) {
-      destination->Append(chunk, index);
+      destination->AppendFrom(chunk, index);
     }
   }
   return destination->Size();
@@ -1720,7 +1723,7 @@ std::optional<uint64_t> ParallelScan::TryExactUnfilteredRowCount() const {
       txn_->HasAnyPageVersionChains() || table_->RowsRewrittenInPlace()) {
     return std::nullopt;
   }
-  if (const auto tlcs = table_->GetBackingTLCSStore();
+  if (const auto tlcs = table_->GetBackingTlcsStore();
       tlcs != nullptr &&
       tlcs->LayoutGeneration() == table_->LayoutGeneration() &&
       tlcs->FirstPageId() == table_->FirstPageId()) {

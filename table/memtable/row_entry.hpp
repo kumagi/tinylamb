@@ -17,6 +17,10 @@
 #ifndef TINYLAMB_ROW_ENTRY_HPP
 #define TINYLAMB_ROW_ENTRY_HPP
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 #include "type/row.hpp"
 
 namespace tinylamb {
@@ -30,6 +34,15 @@ struct RowEntry {
   Row row;
   bool is_deleted{false};
   uint64_t version{0};
+  // Issue 2525: prior versions of the SAME key, newest-first (each entry's
+  // version is strictly lower than this one's, or 0 for an unversioned
+  // write).  Global-version mode keeps this history while a key is rewritten
+  // inside one pending generation, so Snapshot(V) can still answer for a
+  // pinned read version even when the intermediate write was never separated
+  // from its successor by a Sync().  Chains are built only in global-version
+  // mode (unversioned writes keep replacing in place) and are dropped when
+  // Sync() drains the entry: flushed runs carry the collapsed newest state.
+  std::vector<RowEntry> older_versions;
   RowEntry() = default;
   explicit RowEntry(Row r) : row(std::move(r)), is_deleted(false) {}
   RowEntry(Row r, bool del) : row(std::move(r)), is_deleted(del) {}

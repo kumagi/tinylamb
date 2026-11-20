@@ -52,6 +52,7 @@
 #include "plan/cascades.hpp"
 #include "plan/full_scan_plan.hpp"
 #include "plan/implementation_rules.hpp"
+#include "plan/limit_plan.hpp"
 #include "plan/parallel_thresholds.hpp"
 #include "plan/plan.hpp"
 #include "plan/sort_plan.hpp"
@@ -1265,8 +1266,11 @@ TEST_F(AggregateShapeTest, EachShapeEmitsItsOwnOperator) {
   std::ostringstream dump;
   hash_operator->Dump(dump, 0);
   EXPECT_NE(dump.str().find("HashAggregate"), std::string::npos) << dump.str();
-  EXPECT_NE(dump.str().find("spill=in-memory"), std::string::npos)
-      << dump.str();
+  // T1791: spilled_/groups/input_rows are measured outcomes and no longer
+  // render before a drain (plain EXPLAIN must not print a zero profile);
+  // the plan-time memory contract is what Dump guarantees here.
+  EXPECT_EQ(dump.str().find("spill="), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("budget="), std::string::npos) << dump.str();
   sort_operator->Dump(dump, 0);
   EXPECT_NE(dump.str().find("SortAggregate"), std::string::npos) << dump.str();
   EXPECT_NE(dump.str().find("run_rows=8"), std::string::npos) << dump.str();
@@ -1282,7 +1286,9 @@ TEST_F(AggregateShapeTest, EachShapeEmitsItsOwnStrategySettings) {
   // input-order check is the streaming shape's. A knob handed to the wrong
   // operator would either be ignored (a silently unparallel hash) or change an
   // answer.
-  constexpr size_t kManyRows = kParallelAggregationMinRows;
+  // Workers scale as rows / kParallelAggregationMinRows, so the threshold
+  // itself still yields one worker; use several thresholds' worth of rows.
+  constexpr size_t kManyRows = 4 * kParallelAggregationMinRows;
   class ManyRowLeafPlan final : public PlanBase {
    public:
     Executor EmitExecutor(TransactionContext& /*ctx*/) const override {
@@ -1512,6 +1518,63 @@ TEST(TopNEmitRowCountTest, ZeroLimitWithTiesEstimatesZero) {
   EXPECT_EQ(TopNPlan(input, keys, 3, 0, true).EmitRowCount(), 10U);
   EXPECT_EQ(TopNPlan(input, keys, 3, 0, false).EmitRowCount(), 3U);
   EXPECT_EQ(TopNPlan(input, keys, 0, 4, true).EmitRowCount(), 0U);
+}
+
+// T2668: keys carry NULLS placement into the order contract that
+// IsOrderedBy compares, so the render must not hide it.  Explicit
+// spellings print the clause; unspecified keys keep the historical
+// rendering (default semantics unchanged).
+TEST_F(AggregateShapeTest, SortAndTopNRenderExplicitNullsPlacement) {
+  const Plan sorted = std::make_shared<SortPlan>(
+      Leaf(),
+      std::vector<SortKey>{
+          SortKey{.expression = Name(),
+                  .ascending = true,
+                  .nulls_first = std::nullopt},
+          SortKey{.expression = K(), .ascending = false, .nulls_first = true}});
+  const std::string sort_text = sorted->ToString();
+  EXPECT_NE(sort_text.find("NULLS FIRST"), std::string::npos) << sort_text;
+  EXPECT_EQ(sort_text.find("name ASC NULLS"), std::string::npos) << sort_text;
+
+  const Plan plain = std::make_shared<SortPlan>(
+      Leaf(), std::vector<SortKey>{
+                  SortKey{.expression = Name(), .nulls_first = std::nullopt}});
+  EXPECT_EQ(plain->ToString().find("NULLS"), std::string::npos);
+
+  const Plan topn = std::make_shared<TopNPlan>(
+      Leaf(),
+      std::vector<TopNKey>{TopNKey{
+          .expression = Name(), .ascending = true, .nulls_first = false}},
+      3, 0);
+  const std::string topn_text = topn->ToString();
+  EXPECT_NE(topn_text.find("NULLS LAST"), std::string::npos) << topn_text;
+}
+
+// T2406: PlanBase::DumpChild bounds the render recursion so EXPLAIN over
+// a pathologically deep tree truncates instead of overflowing the stack.
+TEST_F(AggregateShapeTest, PlanDumpTruncatesDeepChildren) {
+  Plan deep = Leaf();
+  for (int i = 0; i < 600; ++i) {
+    deep = std::make_shared<LimitPlan>(std::move(deep), 10, 0);
+  }
+  std::ostringstream dump;
+  dump << deep;
+  const std::string text = dump.str();
+  EXPECT_NE(text.find("(truncated at depth 512)"), std::string::npos);
+  size_t limit_lines = 0;
+  for (size_t pos = text.find("Limit: 10 offset 0"); pos != std::string::npos;
+       pos = text.find("Limit: 10 offset 0", pos + 1)) {
+    ++limit_lines;
+  }
+  EXPECT_EQ(limit_lines, 256U)  // one per level up to kMaxPlanDumpDepth (512)
+      << "exactly the levels up to the cap render";
+  EXPECT_EQ(text.find("Leaf"), std::string::npos) << "deep child truncated";
+
+  std::ostringstream shallow;
+  Plan top = std::make_shared<LimitPlan>(Leaf(), 10, 0);
+  shallow << top;
+  EXPECT_EQ(shallow.str().find("truncated"), std::string::npos);
+  EXPECT_NE(shallow.str().find("Leaf"), std::string::npos);
 }
 
 }  // namespace tinylamb

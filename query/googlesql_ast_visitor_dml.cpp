@@ -769,6 +769,7 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
 // UNPIVOT subquery source. Everything that describes how this source joins
 // to its siblings must survive that replacement, otherwise a PIVOT on the
 // right operand of a JOIN silently turns the join into a cross product.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static void CarryPivotJoinContext(const SelectSource& from, SelectSource* to) {
   to->join_type = from.join_type;
   to->join_condition = from.join_condition;
@@ -777,7 +778,9 @@ static void CarryPivotJoinContext(const SelectSource& from, SelectSource* to) {
   to->is_lateral = from.is_lateral;
   to->from_nested_join = from.from_nested_join;
   to->using_columns = from.using_columns;
-  to->sample = from.sample;
+  // The TABLESAMPLE clause stays inside the pivot subquery source (which
+  // keeps the original `base`). Copying it to the outer result would sample
+  // the already-sampled rows a second time.
 }
 
 StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
@@ -806,6 +809,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
     std::string agg_alias;
     std::string func_name;
     const GoogleSqlAstNode* arg_node{nullptr};
+    bool distinct{false};
   };
   std::vector<PivotAggInfo> aggs;
   for (const GoogleSqlAstNode* pe : expr_list->Children("PivotExpression")) {
@@ -822,6 +826,9 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
       }
     }
     if (fn_call != nullptr) {
+      // `COUNT(DISTINCT x)` carries distinct=true in the AST node detail;
+      // dropping it would count duplicate inputs and produce wrong pivots.
+      info.distinct = fn_call->detail.find("distinct=true") != std::string::npos;
       if (const GoogleSqlAstNode* fn_path = fn_call->Child("PathExpression")) {
         ASSIGN_OR_RETURN(std::string, hv156707_0, (Path(*fn_path)));
         info.func_name = std::move(hv156707_0);
@@ -959,7 +966,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
       }
 
       Expression agg_expression =
-          AggregateExpressionExp(agg_type, std::move(case_expr), false);
+          AggregateExpressionExp(agg_type, std::move(case_expr), agg.distinct);
       projections.emplace_back(col_name, std::move(agg_expression));
     }
   }
@@ -1045,7 +1052,66 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
     }
 
     std::vector<NamedExpression> branch_select;
-    branch_select.emplace_back("", ColumnValueExp(ColumnName("*")));
+    // UNPIVOT converts the IN columns into value/name columns; leaving `*` in
+    // the branch would keep the original IN columns as duplicate output.
+    // Expand the base select list explicitly, skipping every IN source column.
+    std::unordered_set<std::string> in_columns;
+    std::vector<std::string> except_cols;
+    for (const GoogleSqlAstNode* other : in_items->Children("UnpivotInItem")) {
+      if (const GoogleSqlAstNode* list = other->Child("ExpressionList")) {
+        if (!list->children.empty()) {
+          auto path = Path(*list->children[0]);
+          if (path.HasValue()) {
+            if (in_columns.insert(Lower(path.Value())).second) {
+              except_cols.push_back(path.Value());
+            }
+          }
+        }
+      }
+    }
+    if (base.query != nullptr) {
+      for (const NamedExpression& named : base.query->SelectList()) {
+        if (named.expression &&
+            named.expression->Type() == TypeTag::kColumnValue &&
+            named.expression->AsColumnValue().GetColumnName().name != "*") {
+          const std::string col = Lower(
+              named.name.empty()
+                  ? named.expression->AsColumnValue().GetColumnName().name
+                  : named.name);
+          if (in_columns.contains(col)) continue;  // NOLINT(readability-braces-around-statements)
+          branch_select.emplace_back(
+              named.name,
+              ColumnValueExp(ColumnName(
+                  named.name.empty()
+                      ? named.expression->AsColumnValue().GetColumnName().name
+                      : named.name)));
+          continue;
+        }
+        if (!named.name.empty() && in_columns.contains(Lower(named.name))) {
+          continue;
+        }
+        if (!named.name.empty()) {
+          branch_select.emplace_back(named.name,
+                                     ColumnValueExp(ColumnName(named.name)));
+        } else {
+          NamedExpression star_item("", ColumnValueExp(ColumnName("*")));
+          if (!except_cols.empty()) {
+            auto mods = std::make_shared<StarModifiers>();
+            mods->except_columns = except_cols;
+            star_item.star_modifiers = std::move(mods);
+          }
+          branch_select.push_back(std::move(star_item));
+        }
+      }
+    } else {
+      NamedExpression star_item("", ColumnValueExp(ColumnName("*")));
+      if (!except_cols.empty()) {
+        auto mods = std::make_shared<StarModifiers>();
+        mods->except_columns = except_cols;
+        star_item.star_modifiers = std::move(mods);
+      }
+      branch_select.push_back(std::move(star_item));
+    }
     branch_select.emplace_back(val_col_name,
                                ColumnValueExp(ColumnName(in_col_name)));
     branch_select.emplace_back(name_col_name,
@@ -1114,6 +1180,9 @@ StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
     return ColumnTypeInfo{.type = ValueType::kVarChar, .is_unsigned = false};
   }
   const std::string& type = lower;
+  // Narrow integer spellings share the INT64 storage but keep their declared
+  // width: assignments outside the range are rejected (never truncated),
+  // matching CAST(x AS INT8) and friends.
   if (type == "int" || type == "int64" || type == "integer" ||
       type == "bigint" || type == "bool" || type == "boolean" ||
       type == "int32" || type == "int16" || type == "int8") {
@@ -1226,11 +1295,18 @@ StatusOr<ForeignKeyDef> VisitForeignKeyReference(
   return def;
 }
 
-Status ValidateCreateTableOptions(const GoogleSqlAstNode& root) {
+// Validates `CREATE TABLE ... OPTIONS (engine=...)` (the frontend rewrites
+// `ENGINE=`/`USING` into this shape) and transcribes the normalized engine
+// name into the statement (P557/596: it used to be checked and dropped, so
+// `CREATE TABLE ... ENGINE=LSTABLE` silently produced the same table as the
+// unlabeled DDL).  Returns the lower-cased engine name, or "" when no
+// engine option was given.
+StatusOr<std::string> ValidateCreateTableOptions(const GoogleSqlAstNode& root) {
   const GoogleSqlAstNode* options = root.Child("OptionsList");
   if (options == nullptr) {
-    return Status::kSuccess;
+    return std::string();
   }
+  std::string engine;
   for (const GoogleSqlAstNode* entry : options->Children("OptionsEntry")) {
     const GoogleSqlAstNode* name_node = entry->Child("Identifier");
     if (name_node == nullptr) {
@@ -1275,8 +1351,18 @@ Status ValidateCreateTableOptions(const GoogleSqlAstNode& root) {
         engine_str != "columnar" && engine_str != "default") {
       return AstStatus("GoogleSQL AST: unknown storage engine " + engine_str);
     }
+    if (!engine.empty() && engine != engine_str) {
+      std::string message =
+          "GoogleSQL AST: conflicting CREATE TABLE engine options (";
+      message += engine;
+      message += " vs ";
+      message += engine_str;
+      message += ')';
+      return AstStatus(std::move(message));
+    }
+    engine = std::move(engine_str);
   }
-  return Status::kSuccess;
+  return engine;
 }
 
 }  // namespace
@@ -1296,7 +1382,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
     return AstError<std::unique_ptr<Statement>>(
         "CREATE TABLE cannot combine IF NOT EXISTS with OR REPLACE");
   }
-  RETURN_IF_FAIL(ValidateCreateTableOptions(root));
+  ASSIGN_OR_RETURN(std::string, create_engine,
+                   (ValidateCreateTableOptions(root)));
   const GoogleSqlAstNode* elements = root.Child("TableElementList");
   if (elements != nullptr) {
     // Fail loudly on table constraints we cannot enforce. Skipping a CHECK or
@@ -1342,8 +1429,11 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
           // The type path, its parameter list (VARCHAR(10)), and the
           // attribute list are structural children; anything else is the
           // DEFAULT expression.
+          // An ARRAY/STRUCT column schema nests its element type as a
+          // child *ColumnSchema node; that is the type, not a DEFAULT.
           if (kind == "PathExpression" || kind == "TypeParameterList" ||
-              kind == "ColumnAttributeList" || kind == "Collate") {
+              kind == "ColumnAttributeList" || kind == "Collate" ||
+              kind.ends_with("ColumnSchema")) {
             continue;
           }
           // A column-level OPTIONS list is a trailing schema child, not a
@@ -1391,7 +1481,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       const GoogleSqlAstNode* attrs =
           schema != nullptr ? schema->Child("ColumnAttributeList") : nullptr;
       if (attrs != nullptr) {
-        if (attrs->Child("PrimaryKeyColumnAttribute") != nullptr) {
+        if (attrs->Child("PrimaryKeyColumnAttribute") != nullptr &&
+            attrs->detail.find("NOT ENFORCED") == std::string::npos) {
           const bool was_unsigned = columns.back().IsUnsigned();
           const uint8_t integer_bits = columns.back().IntegerBits();
           columns.back() = Column(columns.back().Name().name, col_info.type,
@@ -1504,6 +1595,9 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       target->SetInterval(is_interval);
     }
     for (const GoogleSqlAstNode* fk : elements->Children("ForeignKey")) {
+      if (fk->detail.find("NOT ENFORCED") != std::string::npos) {
+        continue;  // declarative only; matching table-level PK behaviour
+      }
       const GoogleSqlAstNode* child_list = fk->Child("ColumnList");
       const GoogleSqlAstNode* reference = fk->Child("ForeignKeyReference");
       if (child_list == nullptr || reference == nullptr) {
@@ -1537,7 +1631,7 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
         }
         if (col.GetConstraint().ctype == Constraint::kForeign) {
           return AstError<std::unique_ptr<Statement>>(
-              "GoogleSQL AST: column has two FOREIGN KEYs");
+              "GoogleSQL AST: column has two FOREIGN KEY constraints");
         }
         if (col.GetConstraint().ctype != Constraint::kNothing &&
             col.GetConstraint().ctype != Constraint::kNotNull) {
@@ -1565,9 +1659,11 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       }
     }
     ASSIGN_OR_RETURN(std::string, h_tbl, (Path(*path)));
-    return std::make_unique<CreateTableStatement>(
+    auto statement = std::make_unique<CreateTableStatement>(
         std::move(h_tbl), std::move(columns), std::move(foreign_keys),
         if_not_exists, or_replace);
+    statement->SetEngine(std::move(create_engine));
+    return statement;
   }
   const GoogleSqlAstNode* query = root.Child("Query");
   if (query != nullptr) {
@@ -1575,8 +1671,10 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
                      (VisitQuery(*query)));
     auto statement = std::move(hv214435_0);
     ASSIGN_OR_RETURN(std::string, h_tbl, (Path(*path)));
-    return std::make_unique<CreateTableStatement>(
+    auto create = std::make_unique<CreateTableStatement>(
         std::move(h_tbl), std::move(statement), if_not_exists, or_replace);
+    create->SetEngine(std::move(create_engine));
+    return create;
   }
   return AstError<std::unique_ptr<Statement>>("GoogleSQL AST: bad CREATE");
 }
@@ -1584,13 +1682,32 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
 namespace {
 
 InsertMode InsertModeFromDetail(const std::string& detail) {
-  if (detail.find("insert_mode=IGNORE") != std::string::npos) {
+  // Parse the value of the `insert_mode=` token rather than matching arbitrary
+  // substrings: a longer detail string may contain several mode-like keys.
+  constexpr std::string_view kKey = "insert_mode=";
+  const size_t pos = detail.find(kKey);
+  if (pos == std::string::npos) {
+    return InsertMode::kDefault;
+  }
+  if (pos > 0 && (std::isalnum(static_cast<unsigned char>(detail[pos - 1])) !=
+                      0 ||
+                  detail[pos - 1] == '_')) {
+    return InsertMode::kDefault;
+  }
+  size_t end = pos + kKey.size();
+  while (end < detail.size() &&
+         std::isalpha(static_cast<unsigned char>(detail[end])) != 0) {
+    ++end;
+  }
+  const std::string_view value(detail.data() + pos + kKey.size(),
+                               end - (pos + kKey.size()));
+  if (value == "IGNORE") {
     return InsertMode::kIgnore;
   }
-  if (detail.find("insert_mode=REPLACE") != std::string::npos) {
+  if (value == "REPLACE") {
     return InsertMode::kReplace;
   }
-  if (detail.find("insert_mode=UPDATE") != std::string::npos) {
+  if (value == "UPDATE") {
     return InsertMode::kUpdate;
   }
   return InsertMode::kDefault;
@@ -2061,6 +2178,8 @@ StatusOr<std::unique_ptr<Statement>> VisitAlterTable(
       }
       ASSIGN_OR_RETURN(std::string, old_name, Identifier(*identifiers[0]));
       ASSIGN_OR_RETURN(std::string, new_name, Identifier(*identifiers[1]));
+      parsed.if_exists =
+          action->detail.find("is_if_exists") != std::string::npos;
       parsed.kind = AlterTableAction::Kind::kRenameColumn;
       parsed.old_column = std::move(old_name);
       parsed.new_name = std::move(new_name);

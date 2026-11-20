@@ -37,7 +37,8 @@ ExactSetRuntimeFilter::ExactSetRuntimeFilter(
   if (skip_hash_table || keys_.empty()) {
     return;
   }
-  // Membership table at <= 50% load keeps Reject() to ~1.1 probes/key.
+  // Linear probing at <= 50% load: expected ~1.5 probes for a hit and ~2.5
+  // for a miss (the common Reject() path), even with a good hash.
   size_t slots = 16;
   while (slots < keys_.size() * 2) {
     slots <<= 1U;
@@ -90,7 +91,16 @@ MinMaxRuntimeFilter::MinMaxRuntimeFilter(int64_t lo, int64_t hi,
   // themselves.  Clamp instead: soundness must never depend on the caller
   // passing lo <= hi.
   if (hi_ < lo_) {
-    std::swap(lo_, hi_);
+    if (distinct_keys_ == 0) {
+      // No build keys: the inverted enclosure is the empty-domain sentinel,
+      // so reject every probe key (never widen it to the full INT64 range).
+      lo_ = 1;
+      hi_ = 0;  // key < 1 || 0 < key holds for every key
+    } else {
+      // Build keys exist, so rejecting everything would drop real matches:
+      // treat the bounds as merely swapped.
+      std::swap(lo_, hi_);
+    }
   }
 }
 
@@ -107,7 +117,9 @@ uint64_t BloomRuntimeFilter::Hash(int64_t key, unsigned probe) {
 }
 
 size_t BloomRuntimeFilter::BitsForKeys(size_t distinct_keys) {
-  size_t want = distinct_keys * 10;
+  size_t want = distinct_keys > std::numeric_limits<size_t>::max() / 10
+                    ? std::numeric_limits<size_t>::max()
+                    : distinct_keys * 10;
   want = std::max<size_t>(want, 512);
   constexpr uint64_t kMaxBloomBits =
       sizeof(size_t) >= 8 ? (uint64_t{1} << 34) : (uint64_t{1} << 30);
@@ -134,6 +146,7 @@ BloomRuntimeFilter::BloomRuntimeFilter(std::vector<uint64_t> bits,
   if (bit_count_ == 0 || (bit_count_ & (bit_count_ - 1)) != 0 ||
       bits_view_.size() * 64 < bit_count_) {
     bits_.clear();
+    bits_.shrink_to_fit();
     bits_view_ = {};
     bit_count_ = 0;
     nominal_bit_count_ = 0;
@@ -194,7 +207,7 @@ RuntimeFilterGroup::RuntimeFilterGroup(
         reject_all_ = true;
         break;
       case RuntimeFilterKind::kMinMax: {
-        const auto& mm = static_cast<const MinMaxRuntimeFilter&>(*part);
+        const auto& mm = static_cast<const MinMaxRuntimeFilter&>(*part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         if (!has_bounds_) {
           has_bounds_ = true;
           lo_ = mm.Lo();
@@ -206,7 +219,7 @@ RuntimeFilterGroup::RuntimeFilterGroup(
         break;
       }
       case RuntimeFilterKind::kExactSet: {
-        const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);
+        const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& keys = exact.Keys();
         if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
           exact_keys_ = &keys;
@@ -288,7 +301,7 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       continue;
     }
     if (part->Kind() == RuntimeFilterKind::kExactSet) {
-      const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);
+      const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& keys = exact.Keys();
       if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
         exact_keys_ = &keys;

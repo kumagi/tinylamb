@@ -1,9 +1,9 @@
 # tinylamb アーキテクチャ (レイヤー所有権マップ)
 
-> 現在の改善バックログは [docs/next-actions.md](docs/next-actions.md) を参照。
-> 設計判断の記録 (ADR) は [docs/review/](docs/review/) と
-> [docs/adr-proposal.md](docs/adr-proposal.md)、採用済み ADR は
-> [docs/adr/](docs/adr/)（[固定長 WAL と論理終端](docs/adr/0001-fixed-wal-logical-end.md)）。
+> 現在の改善・リファクタリング計画は [TODO.md](TODO.md) および [ooca-v2.md](ooca-v2.md) を参照。
+> 設計判断の記録 (ADR・レビュー) は [docs/design.md](docs/design.md) と [docs/review/](docs/review/)、
+> 採用済み ADR は [docs/adr/](docs/adr/)（[固定長 WAL と論理終端](docs/adr/0001-fixed-wal-logical-end.md)、
+> Out-of-Core 関連は 0003〜0012）を参照。
 
 この文書は「今どこを触っているのか」「新しい変更はどの層に属するのか」の共通言語を
 提供する。依存方向の強制は `scripts/check_layering.py` (include-lint) が行う
@@ -36,7 +36,7 @@ expression            expression/      (式 AST, bytecode, JIT)
 relational            executor/detail/ (物理中間表現, scan filter, subquery,
                                         planning heuristics, explain)
                       ※ pseudo-layer: relational_detail 名前空間。plan と
-                        executor の双方から使われる独立部品置き場 (A5 で昇格案)
+                        executor の双方から使われる独立部品置き場 (昇格案)
   ↓
 plan                  plan/            (Cascades memo, Plan ノード, rules)
   ↓
@@ -60,16 +60,16 @@ server                server/          (postgres wire protocol)
 
 | 層 | ディレクトリ | 代表ファイル | 主な責務 |
 |---|---|---|---|
-| common | `common/` | `status_or.hpp`, `log_message.hpp` | エラー型, ログ, 符号化, 共通ユーティリティ |
-| type | `type/` | `value.hpp`, `row.hpp`, `schema.hpp`, `date.hpp` | 値・行・スキーマの表現 |
-| storage | `page/` `recovery/` `transaction/` | `page_manager.hpp`, `logger.hpp`(WAL), `transaction_manager.hpp` | メモリ内RowPageブロックとLSM管理, 先書きログ, MVCC分離レベル |
-| index | `index/` | `lsm_index.hpp`, `b_plus_tree.hpp`, `index.hpp`, `index_schema.hpp` | LSM-Tree インデックス (`BPlusTree` は `LsmIndex` の互換エイリアス) |
-| table | `table/` | `table.hpp`, `full_scan_iterator.hpp`, `table_statistics.hpp`, `lstable_bridge.hpp`, `pax_chunk/pax_chunk.hpp` | 行データアクセス, PAX カラムナチャンク (`memtable/`, `sorted_run/`, `pax_chunk/`, `fragment/`, `workload/`), 統計 |
+| common | `common/` | `status_or.hpp`, `log_message.hpp`, `memory_budget.hpp`, `query_grant.hpp`, `spill/spill_store.hpp` | エラー型, ログ, 符号化, メモリ予算・スピル基盤, 共通ユーティリティ |
+| type | `type/` | `value.hpp`, `row.hpp`, `schema.hpp`, `date.hpp`, `row_block_codec.hpp` | 値・行・スキーマの表現, 行ブロック符号化 |
+| storage | `page/` `recovery/` `transaction/` | `page_manager.hpp`, `page_lsm_store.hpp`, `logger.hpp`(WAL), `transaction_manager.hpp` | RowPageブロックと退避/LSM管理, 先書きログ, MVCC分離レベルと大規模Txスピル |
+| index | `index/` | `lsm_index.hpp`, `index.hpp`, `index_schema.hpp`, `index_scan_iterator.hpp` | LSM-Tree インデックス (`BPlusTree` は `LsmIndex` の互換エイリアス) |
+| table | `table/` | `table.hpp`, `full_scan_iterator.hpp`, `table_statistics.hpp`, `lstable_bridge.hpp`, `tlcs_file.hpp`, `pax_chunk/pax_chunk.hpp` | 行データアクセス, PAX カラムナ・永続 TLCS (`memtable/`, `sorted_run/`, `pax_chunk/`, `fragment/`, `workload/`), 統計 |
 | database | `database/` | `database.hpp`, `catalog_reader.hpp`, `transaction_context.hpp` | カタログ, DDL, トランザクション文脈 |
 | expression | `expression/` | `expression.hpp`, `bytecode.hpp`, `jit.hpp` | 式評価 (AST 正本・bytecode はバッチ実行用 IR・JIT はその compiler, docs/expression_evaluation.md) |
-| relational | `executor/detail/` | `relation.hpp`, `scan_filter.hpp`, `subquery_runtime.hpp` | 物理中間表現と実行補助 |
+| relational | `executor/detail/` | `relation.hpp`, `scan_filter.hpp`, `subquery_runtime.hpp`, `ooc/`, `pipeline/` | 物理中間表現, OOC プリミティブ, パイプライン IR と OOC シンク |
 | plan | `plan/` | `optimizer.hpp`, `cascades.hpp`, `plan.hpp` | 論理→物理計画, rule sets |
-| executor | `executor/` | `hash_join.hpp`, `sort.hpp`, `data_chunk.hpp` | morsel 実行, パイプライン |
+| executor | `executor/` | `pipeline_lowering.hpp`, `columnar_tlcs_scan_executor.hpp`, `hash_join.hpp`, `sort.hpp`, `data_chunk.hpp` | パイプライン低下・morsel 実行・物理演算子 |
 | sql | `query/` | `statement.hpp`, `sql_engine.hpp`, `googlesql_frontend.hpp` | SQL frontend と statement IR |
 | server | `server/` | `postgres_server.hpp`, `postgres_protocol.hpp` | wire protocol |
 
@@ -117,17 +117,16 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
   この運用が最大の負債領域で機能しなくなる (2026-11-18: 全 7 パターンを
   実エッジへ展開済み)。
 
-## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 78 辺)
+## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 116 辺)
 
-`python3 scripts/check_layering.py` のサマリ (2026-11-11 検証):
+`python3 scripts/check_layering.py` のサマリ (2026-11-18 検証):
 
-| 区分 | エッジ | 辺数 |
-|---|---|---|
-| V1 | expression → database | 0 (解消済み) |
-| V3' | relational/executor → statement IR (query/statement.hpp) | relational→sql=21, executor→sql=6 |
-| V4 | plan → executor | 2 (plan/product_plan.cpp, plan/implementation_rules.cpp → executor/hash_join_mode.hpp) |
+```
+116 upward edge(s): common->type=6, executor->sql=6, expression->executor=2, index->table=4, plan->executor=2, plan->sql=14, relational->executor=45, relational->sql=29, table->expression=7, type->storage=1; allowlisted=116
+```
 
-無番号の許容エッジ (詳細はスクリプト内コメント参照): common→type (6),
-type→storage/row_position (1), index→table (4), table→expression (7),
-expression→executor (bytecode→data_chunk, 2),
-relational(detail)→executor 本体 (15), plan→sql (query_data/statement, 14)。
+- **主要区分:**
+  - `relational->executor=45`, `relational->sql=29`, `executor->sql=6` (V3': statement IR / relational helper 境界)
+  - `plan->sql=14`, `plan->executor=2` (`plan/product_plan.cpp`, `plan/implementation_rules.cpp` → `executor/hash_join_mode.hpp`, V4)
+  - `common->type=6`, `type->storage=1`, `index->table=4`, `table->expression=7`, `expression->executor=2`
+- **不変条件 lint:** out-of-core 契約（強制予約・全行一括回収・一括読込の許可リスト監視）は `python3 scripts/check_ooc_invariants.py` で併せて検査する（詳細は `scripts/check_layering.py` / `scripts/check_ooc_invariants.py` 参照）。

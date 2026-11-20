@@ -261,4 +261,31 @@ TEST(RegexGuardCompileTest, ZeroCopyViewMatchesReferenceAcrossEdgeCases) {
   }
 }
 
+// P464: replacement templates over 4096 bytes must still be cached -- the
+// old gate re-ran the full CompileReplacement() (nested-repetition scan +
+// std::regex + RE2) for every row of a stable large template.
+TEST(RegexGuardTest, LargeReplacementTemplateCachedUnderBudget) {
+  const std::string pattern = "^x";
+  const std::string big(5000, 'r');
+  const size_t before = ReplacementProgramFullCompilesForTest();
+  for (int call = 0; call < 8; ++call) {
+    StatusOr<std::string> out = ReplaceCheckedRegex("xabc", pattern, big);
+    ASSERT_TRUE(out.HasValue());
+    EXPECT_EQ(out.Value(), big + "abc");
+  }
+  EXPECT_EQ(ReplacementProgramFullCompilesForTest(), before + 1)
+      << "stable >4096-byte template must compile exactly once";
+
+  // Distinct large templates beyond the entry budget stay correct; the
+  // budgeted eviction just re-compiles them (one compile each).
+  for (int i = 0; i < 12; ++i) {
+    const std::string rep = std::string(500, static_cast<char>('a' + i)) + big;
+    StatusOr<std::string> out = ReplaceCheckedRegex("xabc", pattern, rep);
+    ASSERT_TRUE(out.HasValue());
+    EXPECT_EQ(out.Value(), rep + "abc");
+    EXPECT_EQ(ReplacementProgramFullCompilesForTest(),
+              before + 2 + static_cast<size_t>(i));
+  }
+}
+
 }  // namespace tinylamb

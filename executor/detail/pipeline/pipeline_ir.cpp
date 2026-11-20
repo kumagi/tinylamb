@@ -13,7 +13,8 @@ PipelineContext::PipelineContext(TransactionContext* txn_in,
     : txn(txn_in),
       spill_store(std::move(spill_options)),
       grant(std::move(grant_in)),
-      effective_dop(std::max<size_t>(1, dop_in)) {}
+      effective_dop(1),
+      permitted_dop(std::max<size_t>(1, dop_in)) {}
 
 size_t PipelineContext::OperatorBudgetBytes(size_t b_min) const noexcept {
   const size_t override_bytes =
@@ -43,6 +44,7 @@ PipelineExecutionMetrics PipelineContext::Snapshot() const noexcept {
   m.granted_bytes = grant.GrantedBytes();
   m.operator_budget_bytes = OperatorBudgetBytes();
   m.effective_dop = effective_dop;
+  m.permitted_dop = permitted_dop;
   m.ooc = ooc_metrics.Snapshot();
   return m;
 }
@@ -139,15 +141,22 @@ StatusOr<bool> LegacySource::NextBatch(PipelineContext* ctx, DataChunk* out,
     out->Reset();
     return false;
   }
-  const auto t0 = std::chrono::steady_clock::now();
+  // Timing a legacy batch costs two vDSO clock reads plus a shared atomic
+  // RMW. Make that diagnostic opt-in so ordinary queries do not pay it.
+  static const bool kTimeLegacySource =
+      std::getenv("TINYLAMB_PIPELINE_METRICS") != nullptr;
+  const bool time_it = ctx != nullptr && kTimeLegacySource;
+  const auto t0 = time_it ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
   const size_t n = exec_->NextBatch(out, max_rows);
-  const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now() - t0)
-                      .count();
-  if (ctx != nullptr && dt > 0) {
-    ctx->legacy_source_ns.fetch_add(static_cast<uint64_t>(dt),
-                                    std::memory_order_relaxed);
-    ctx->legacy_source_calls.fetch_add(1, std::memory_order_relaxed);
+  if (time_it) {
+    const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    if (dt > 0) {
+      ctx->legacy_source_ns.fetch_add(static_cast<uint64_t>(dt),
+                                      std::memory_order_relaxed);
+    }
   }
   if (exec_->GetStatus() != Status::kSuccess) {
     return exec_->GetStatus();

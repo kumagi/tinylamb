@@ -39,6 +39,7 @@
 #include "common/constants.hpp"
 #include "common/exc_shim.hpp"
 #include "common/exception_status.hpp"
+#include "common/join_hash.hpp"
 #include "common/join_kind.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
@@ -57,7 +58,6 @@ namespace {
 using PositionedRow = std::pair<Row, RowPosition>;
 
 constexpr size_t kReactiveSpillPartitions = 16;
-constexpr size_t kHybridPartitions = 32;
 constexpr size_t kParallelBuildMinRows = 4096;
 constexpr size_t kParallelProbeMinRows = size_t{1} << 15;
 
@@ -81,18 +81,20 @@ void PrefetchProbeRow(const std::vector<Row>& rows, size_t index) {
   }
 }
 
-uint64_t BSwap64(uint64_t v) { return __builtin_bswap64(v); }
-
-uint64_t MixHash(uint64_t h) {
-  h *= 0x9E3779B97F4A7C15ULL;
-  h ^= h >> 32;
-  h *= 0xBF58476D1CE4E5B9ULL;
-  h ^= h >> 29;
-  return h;
+uint64_t BSwap64(uint64_t v) {
+#if defined(__GNUC__) || defined(__clang__)
+  return __builtin_bswap64(v);
+#else
+  v = ((v >> 1) & 0x5555555555555555ULL) | ((v & 0x5555555555555555ULL) << 1);
+  v = ((v >> 2) & 0x3333333333333333ULL) | ((v & 0x3333333333333333ULL) << 2);
+  v = ((v >> 4) & 0x0F0F0F0F0F0F0F0FULL) | ((v & 0x0F0F0F0F0F0F0F0FULL) << 4);
+  return ((v >> 8) & 0x00FF00FF00FF00FFULL) |
+         ((v & 0x00FF00FF00FF00FFULL) << 8);
+#endif
 }
 
 uint64_t HashInt64Key(int64_t key) {
-  return MixHash(static_cast<uint64_t>(key));
+  return MixJoinHash(static_cast<uint64_t>(key));
 }
 
 uint64_t HashBytesKey(std::string_view key) {
@@ -101,7 +103,7 @@ uint64_t HashBytesKey(std::string_view key) {
     h ^= static_cast<unsigned char>(c);
     h *= 1099511628211ULL;
   }
-  return MixHash(h);
+  return MixJoinHash(h);
 }
 
 constexpr char kJoinNegativeIntTag = '\x7f';
@@ -136,15 +138,26 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
       break;
     }
     case ValueType::kVarChar: {
-      std::string folded;
       std::string_view s(v.value.varchar_value.data(),
                          v.value.varchar_value.size());
       // Case-insensitive VARCHAR keys must fold before encoding so that
       // 'A' and 'a' land in the same hash bucket, matching the OOC sink
       // (ooc_hash_join_sink.cpp) and the = ground truth (P372).
+      // T4632: keys without ASCII uppercase fold to themselves -- skip the
+      // copy; other CI keys fold into a thread-local scratch reused across
+      // rows instead of one heap allocation per key per row. `s` is fully
+      // consumed by this call (no recursion into this switch arm), so the
+      // scratch cannot be clobbered while referenced.
       if (v.IsCaseInsensitive()) {
-        folded = FoldCaseForCollation(s);
-        s = folded;
+        static thread_local std::string folded;
+        const bool has_upper = std::any_of(s.begin(), s.end(), [](char c) {
+          const auto uc = static_cast<unsigned char>(c);
+          return uc >= 'A' && uc <= 'Z';
+        });
+        if (has_upper) {
+          folded = FoldCaseForCollation(s);
+          s = folded;
+        }
       }
       out->push_back(static_cast<char>(ValueType::kVarChar));
       if (s.empty()) {
@@ -383,6 +396,75 @@ SideIndex BuildSideIndex(const Container& rows, const std::vector<slot_t>& cols,
   return side;
 }
 
+// Probe keys encoded once so a resident probe side can be matched against each
+// of the kReactiveSpillPartitions per-partition build indexes without
+// re-running EncodeJoinKeyInto 16 times per row.  Mode selection mirrors
+// BuildSideIndex, so the cached keys are valid for every partition index.
+struct PreparedProbeKeys {
+  enum State : uint8_t { kNoMatch = 0, kValid = 1, kNull = 2 };
+  JoinHashIndex::KeyMode mode = JoinHashIndex::KeyMode::kBytes;
+  std::vector<uint8_t> state;
+  std::vector<int64_t> int_key;
+  std::vector<uint64_t> hash;
+  std::vector<uint32_t> offset;  // size()+1 entries into `bytes` (kBytes only)
+  std::string bytes;
+
+  // Existence lookup of row `i`: 0 = no match, 1 = match, -1 = NULL key.
+  [[nodiscard]] int Lookup(const SideIndex& side, size_t i) const {
+    if (state[i] == kNull) {
+      return -1;
+    }
+    if (state[i] != kValid) {
+      return 0;
+    }
+    const std::string_view key =
+        mode == JoinHashIndex::KeyMode::kBytes
+            ? std::string_view(bytes).substr(offset[i], offset[i + 1] - offset[i])
+            : std::string_view();
+    return side.index.Find(hash[i], int_key[i], key) != JoinHashIndex::kNil ? 1
+                                                                          : 0;
+  }
+};
+
+template <typename Container>
+PreparedProbeKeys PrepareProbeKeys(const Container& rows,
+                                   const std::vector<slot_t>& cols,
+                                   std::optional<ValueType> int_mode,
+                                   const std::vector<bool>* null_safe) {
+  PreparedProbeKeys out;
+  ValueType int_type = ValueType::kInt64;
+  if (null_safe == nullptr && int_mode.has_value()) {
+    out.mode = JoinHashIndex::KeyMode::kInt64;
+    int_type = *int_mode;
+  }
+  const bool bytes_mode = out.mode == JoinHashIndex::KeyMode::kBytes;
+  out.state.assign(rows.size(), PreparedProbeKeys::kNoMatch);
+  out.int_key.assign(rows.size(), 0);
+  out.hash.assign(rows.size(), 0);
+  if (bytes_mode) {
+    out.offset.assign(rows.size() + 1, 0);
+  }
+  std::string scratch;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const KeyRef k =
+        KeyOf(RowOf(rows[i]), cols, out.mode, int_type, &scratch, null_safe);
+    if (k.valid) {
+      out.state[i] = PreparedProbeKeys::kValid;
+      out.int_key[i] = k.int_key;
+      out.hash[i] = k.hash;
+      if (bytes_mode) {
+        out.bytes.append(k.byte_key);
+      }
+    } else if (k.has_null) {
+      out.state[i] = PreparedProbeKeys::kNull;
+    }
+    if (bytes_mode) {
+      out.offset[i + 1] = static_cast<uint32_t>(out.bytes.size());
+    }
+  }
+  return out;
+}
+
 template <typename Container>
 size_t SumRowBytes(const Container& rows) {
   size_t total = 0;
@@ -472,7 +554,9 @@ size_t JoinHashIndex::Find(uint64_t hash, int64_t int_key,
   // probing walks forward and int-key mode reads slot_int_keys_ right after
   // slots_; prefetching a nearby slot is a cheap best-effort hint for the
   // next linear-probe step.
+#if defined(__GNUC__) || defined(__clang__)
   __builtin_prefetch(&slots_[(idx + 2) & mask_], 0, 1);
+#endif
   for (;;) {
     const size_t head = slots_[idx];
     if (head == kNil) [[likely]] {
@@ -491,6 +575,20 @@ size_t JoinHashIndex::ChainNext(size_t entry) const {
 
 size_t JoinHashIndex::RowIndex(size_t entry) const {
   return entries_[entry].row;
+}
+
+JoinHashIndex::Int64Slots JoinHashIndex::ViewInt64Slots() const {
+  return {.heads = slots_.data(), .keys = slot_int_keys_.data(), .mask = mask_};
+}
+
+void JoinHashIndex::PrefetchInt64(uint64_t hash) const {
+#if defined(__GNUC__) || defined(__clang__)
+  const size_t slot = hash & mask_;
+  __builtin_prefetch(&slots_[slot], 0, 1);
+  __builtin_prefetch(&slot_int_keys_[slot], 0, 1);
+#else
+  (void)hash;
+#endif
 }
 
 void JoinHashIndex::Grow() {
@@ -754,9 +852,10 @@ struct HashJoin::JoinState {
 // join whenever a side spilled instead of resurrecting the invalid mode on a
 // per-partition rebuild.
 template <typename LSide, typename RSide>
-static std::optional<ValueType> JoinIntModeAvoidingSpillLoss(
-    const LSide& left, const RSide& right,
-    const std::vector<slot_t>& left_cols,
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
+static std::optional<ValueType> JoinIntModeAvoidingSpillLoss(  // NOLINT(misc-use-anonymous-namespace)
+    const LSide& left, const RSide& right, const std::vector<slot_t>& left_cols,
     const std::vector<slot_t>& right_cols) {
   if (left.Spilled() || right.Spilled()) {
     return std::nullopt;
@@ -765,20 +864,23 @@ static std::optional<ValueType> JoinIntModeAvoidingSpillLoss(
 }
 
 HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
-                   std::vector<slot_t> right_cols, size_t worker_count)
+                   std::vector<slot_t> right_cols, size_t worker_count,
+                   size_t hybrid_partitions)
     : HashJoin(std::move(left), std::move(left_cols), std::move(right),
-               std::move(right_cols), HashJoinMode::kInMemory, worker_count) {}
+               std::move(right_cols), HashJoinMode::kInMemory, worker_count,
+               hybrid_partitions) {}
 
 HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
                    std::vector<slot_t> right_cols, HashJoinMode mode,
-                   size_t worker_count)
+                   size_t worker_count, size_t hybrid_partitions)
     : HashJoin(std::move(left), std::move(left_cols), std::move(right),
-               std::move(right_cols), mode, JoinKind::kInner, worker_count) {}
+               std::move(right_cols), mode, JoinKind::kInner, worker_count, 0,
+               0, hybrid_partitions) {}
 
 HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
                    std::vector<slot_t> right_cols, HashJoinMode mode,
                    JoinKind kind, size_t worker_count, size_t right_width,
-                   size_t left_width)
+                   size_t left_width, size_t hybrid_partitions)
     : left_(std::move(left)),
       left_cols_(std::move(left_cols)),
       right_(std::move(right)),
@@ -787,7 +889,8 @@ HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
       kind_(kind),
       right_width_(right_width),
       left_width_(left_width),
-      worker_count_(std::max<size_t>(1, worker_count)) {}
+      worker_count_(std::max<size_t>(1, worker_count)),
+      hybrid_partitions_(hybrid_partitions) {}
 
 HashJoin::~HashJoin() = default;
 
@@ -1074,6 +1177,8 @@ Status HashJoin::MaterializeMarkJoin() {
       }
     }
 
+    const PreparedProbeKeys probe_keys =
+        PrepareProbeKeys(rows, left_cols_, int_mode, NullSafeArg());
     for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
       ASSIGN_OR_RETURN(std::vector<PositionedRow>, right_part,
                        (s.right.spills[p].ReadAllPositioned()));
@@ -1086,7 +1191,7 @@ Status HashJoin::MaterializeMarkJoin() {
         if (match_state[i] == 1 || match_state[i] == -1) {
           continue;
         }
-        if (probe_lookup(rows[i], build) == 1) {
+        if (probe_keys.Lookup(build, i) == 1) {
           match_state[i] = 1;
         }
       }
@@ -1184,13 +1289,26 @@ Status HashJoin::MaterializeOuter() {
   std::string scratch;
   const std::optional<ValueType> int_mode =
       JoinIntModeType(left_rows, left_cols_, right_rows, right_cols_);
+  // Reuse one scratch row across all candidate pairs: Row::operator+ deep
+  // copies VARCHAR payloads, so allocating one per rejected candidate was
+  // charged to every pair, not just the matching ones.
+  Row combined_scratch;
   const auto pair_passes = [&](const PositionedRow& left,
                                const PositionedRow& right) -> StatusOr<bool> {
     if (!residual_predicate_) {
       return true;
     }
-    StatusOr<Value> value = residual_predicate_->TryEvaluate(
-        left.first + right.first, residual_schema_);
+    combined_scratch.values_.clear();
+    combined_scratch.values_.reserve(left.first.values_.size() +
+                                     right.first.values_.size());
+    combined_scratch.values_.insert(combined_scratch.values_.end(),
+                                    left.first.values_.begin(),
+                                    left.first.values_.end());
+    combined_scratch.values_.insert(combined_scratch.values_.end(),
+                                    right.first.values_.begin(),
+                                    right.first.values_.end());
+    StatusOr<Value> value =
+        residual_predicate_->TryEvaluate(combined_scratch, residual_schema_);
     if (!value.HasValue()) {
       return value.GetStatus();
     }
@@ -1282,6 +1400,11 @@ Status HashJoin::MaterializeOuter() {
 }
 
 Status HashJoin::MaterializeSemiAnti() {
+  // The equi-key semi/anti emit path has no residual-predicate evaluation;
+  // the plan factory currently guarantees none reaches it. Fail loudly if
+  // that gate is ever relaxed instead of silently dropping the predicate.
+  CHECK_MSG(!residual_predicate_,
+            "semi/anti join with equi keys cannot carry a residual predicate");
   state_ = std::make_unique<JoinState>();
   JoinState& s = *state_;
   RETURN_IF_FAIL(IntakeBothSides());
@@ -1571,6 +1694,8 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
         matched[i] = ProbeState::kNull;
       }
     }
+    const PreparedProbeKeys probe_keys = PrepareProbeKeys(
+        s.left.rows, left_cols_, int_mode, NullSafeArg());
     for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
       ASSIGN_OR_RETURN(std::vector<PositionedRow>, right_part,
                        (s.right.spills[p].ReadAllPositioned()));
@@ -1584,7 +1709,7 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
             matched[i] == ProbeState::kNull) {
           continue;
         }
-        const int state = probe_lookup(s.left.rows[i], side_index);
+        const int state = probe_keys.Lookup(side_index, i);
         if (state == 1) {
           matched[i] = ProbeState::kMatch;
         } else if (state < 0) {
@@ -2289,9 +2414,9 @@ bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
         }
       }
       if (runtime_filter_active_ && !s.nl_row_matched) {
-        probe_rows_rejected_.fetch_add(1);
+        ++probe_rows_rejected_;
         if (s.nl_probe_null) {
-          probe_rows_null_rejected_.fetch_add(1);
+          ++probe_rows_null_rejected_;
         }
       }
       s.nl_row_active = false;
@@ -2362,11 +2487,11 @@ bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
                            s.int_mode_type, &s.scratch, NullSafeArg());
     if (!k.valid) {
       if (runtime_filter_active_) {
-        probe_rows_rejected_.fetch_add(1);
+        ++probe_rows_rejected_;
         if (std::ranges::any_of(*s.probe_cols, [&](slot_t col) {
               return probe.first[col].IsNull();
             })) {
-          probe_rows_null_rejected_.fetch_add(1);
+          ++probe_rows_null_rejected_;
         }
       }
       continue;
@@ -2374,7 +2499,7 @@ bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
     s.cur_shard = ShardOf(k.hash);
     s.cur_entry = s.shards[s.cur_shard].Find(k.hash, k.int_key, k.byte_key);
     if (runtime_filter_active_ && s.cur_entry == JoinHashIndex::kNil) {
-      probe_rows_rejected_.fetch_add(1);
+      ++probe_rows_rejected_;
     }
   }
 }
@@ -2382,14 +2507,17 @@ bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
 Status HashJoin::MaterializeHybrid() {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
 
-  const auto partition_of = [](std::string_view key) {
-    return HashBytesKey(key) % kHybridPartitions;
+  // P1824: honor the planner-wired partition count; the local constant is a
+  // pure implementation detail.
+  const size_t partitions = HybridPartitions();
+  const auto partition_of = [partitions](std::string_view key) {
+    return HashBytesKey(key) % partitions;
   };
 
   std::vector<Row> resident_right;
   QueryMemoryCharge resident_charge;
-  std::vector<SpillFile> right_spill(kHybridPartitions);
-  std::vector<SpillFile> left_spill(kHybridPartitions);
+  std::vector<SpillFile> right_spill(partitions);
+  std::vector<SpillFile> left_spill(partitions);
   std::string key;
 
   DataChunk batch;
@@ -2459,7 +2587,7 @@ Status HashJoin::MaterializeHybrid() {
   resident_right.shrink_to_fit();
   resident_charge.ReleaseAll();
 
-  for (size_t i = 0; i < kHybridPartitions; ++i) {
+  for (size_t i = 0; i < HashJoin::kDefaultHybridPartitions; ++i) {
     if (Status st_sp = left_spill[i].FinishWriting();
         st_sp != Status::kSuccess) {
       return st_sp;
@@ -2470,7 +2598,7 @@ Status HashJoin::MaterializeHybrid() {
     }
   }
 
-  for (size_t i = 0; i < kHybridPartitions; ++i) {
+  for (size_t i = 0; i < HashJoin::kDefaultHybridPartitions; ++i) {
     if (left_spill[i].Empty() && right_spill[i].Empty()) {
       continue;
     }
@@ -2524,13 +2652,14 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
     tail = " residual: " + text;
   }
   if (kind_ == JoinKind::kSemi) {
-    o << "SemiHashJoin" << tail << ": " << ss.str() << "\n"
+    o << "SemiHashJoin" << tags.str() << tail << ": " << ss.str() << "\n"
       << Indent(static_cast<size_t>(indent) + 2);
   } else if (kind_ == JoinKind::kAnti) {
-    o << "AntiHashJoin" << tail << ": " << ss.str() << "\n"
+    o << "AntiHashJoin" << tags.str() << tail << ": " << ss.str() << "\n"
       << Indent(static_cast<size_t>(indent) + 2);
   } else if (kind_ == JoinKind::kNullAwareAnti) {
-    o << "NullAwareAntiHashJoin" << tail << ": " << ss.str() << "\n"
+    o << "NullAwareAntiHashJoin" << tags.str() << tail << ": " << ss.str()
+      << "\n"
       << Indent(static_cast<size_t>(indent) + 2);
   } else if (kind_ == JoinKind::kLeftOuter) {
     o << "LeftHashJoin" << tags.str() << tail << ": " << ss.str() << "\n"
@@ -2589,9 +2718,9 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
         << Indent(static_cast<size_t>(indent))
         << "RuntimeFilter type=exact_set keys=" << runtime_filter_keys_ << "\n"
         << Indent(static_cast<size_t>(indent))
-        << "probe_rows_rejected=" << probe_rows_rejected_.load() << "\n"
+        << "probe_rows_rejected=" << probe_rows_rejected_ << "\n"
         << Indent(static_cast<size_t>(indent))
-        << "probe_rows_null_rejected=" << probe_rows_null_rejected_.load();
+        << "probe_rows_null_rejected=" << probe_rows_null_rejected_;
     }
     if (dynamic_filter_published_ || dynamic_filter_rejected_ != 0) {
       // The dynamic filter is the join-published half of Phase 2

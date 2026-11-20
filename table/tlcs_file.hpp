@@ -261,6 +261,15 @@ class TlcsFile {
   [[nodiscard]] TlcsDictKind DictionaryKind(slot_t col) const noexcept {
     return dict_kinds_[col];
   }
+  struct IntFrequencies {
+    std::optional<int64_t> first_value;
+    std::vector<uint64_t> counts;
+  };
+  // Exact non-NULL counts indexed by dictionary code or by value minus
+  // first_value. The summary belongs to this immutable file.
+  [[nodiscard]] StatusOr<std::shared_ptr<const IntFrequencies>>
+  GetOrComputeIntFrequencies(slot_t col, const Schema& schema,
+                            bool allow_dense_range) const;
 
   [[nodiscard]] uint32_t FindBlockIndex(page_id_t pid) const noexcept;
 
@@ -277,11 +286,16 @@ class TlcsFile {
       const Schema& schema, DecodedBlock* out,
       bool materialize_dict_ints = true,
       std::vector<uint8_t>* io_scratch = nullptr) const;
+  // When varchar_rows is nonempty, only those row ordinals need VARCHAR
+  // bytes. It must be strictly increasing. Numeric columns and null bitmaps
+  // are still decoded for the full block.
   [[nodiscard]] Status DecodeBlockColumnsWithOptions(
       uint32_t block_idx, std::span<const slot_t> column_ids,
       const Schema& schema, DecodedBlock* out, bool materialize_dict_ints,
       std::vector<uint8_t>* io_scratch,
-      std::span<const uint8_t> varchar_lengths_only) const;
+      std::span<const uint8_t> varchar_lengths_only,
+      bool read_projected_streams_directly = false,
+      std::span<const uint32_t> varchar_rows = {}) const;
 
   [[nodiscard]] uint32_t DirGroupCount() const noexcept {
     return static_cast<uint32_t>(dir_groups_.size());
@@ -304,13 +318,17 @@ class TlcsFile {
     bool has_null{false};
     bool is_const_null{false};
     bool has_min_max{false};
+    bool has_nonempty_min{false};
     bool all_canonical_utc_ts{false};
     uint8_t min_len{0};
     uint8_t max_len{0};
+    uint8_t nonempty_min_len{0};
     bool min_truncated{false};
     bool max_truncated{false};
+    bool nonempty_min_truncated{false};
     std::array<char, 24> min_prefix{};
     std::array<char, 24> max_prefix{};
+    std::array<char, 24> nonempty_min_prefix{};
   };
   [[nodiscard]] Status CollectPageIds(std::vector<page_id_t>* out) const;
   [[nodiscard]] StatusOr<std::shared_ptr<const DirGroup>> GetDirGroup(
@@ -465,6 +483,8 @@ class TlcsFile {
   mutable std::list<uint32_t> encoded_cache_lru_;
   mutable std::unordered_map<uint32_t, CachedEncodedBlock> encoded_cache_map_;
   mutable size_t encoded_cache_bytes_{0};
+  mutable std::unordered_map<slot_t, std::shared_ptr<const IntFrequencies>>
+      int_frequencies_;
 
   mutable std::mutex varchar_bounds_mu_;
   mutable std::unordered_map<

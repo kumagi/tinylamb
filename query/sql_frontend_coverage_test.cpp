@@ -32,7 +32,10 @@ std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
       prepared = engine->Prepare(*ctx, sql);
     }
     if (!prepared.HasValue()) {
-      throw std::runtime_error(engine->LastError());
+      const std::string last = engine->LastError();  // NOLINT(performance-unnecessary-copy-initialization)
+      throw std::runtime_error(last.empty()
+                                   ? "Prepare failed with no diagnostic: " + sql
+                                   : last);
     }
   }
   std::vector<Row> rows;
@@ -104,8 +107,8 @@ TEST_F(SqlFrontendCoverageTest, LimitZeroStillResolvesSelectList) {
   // LIMIT 0 must not turn an otherwise-invalid projection into a success.
   ExpectError("SELECT bogus_col FROM t LIMIT 0");
   // A valid LIMIT 0 still yields no rows.
-  const auto rows = RunSql(engine_.get(), context_.get(),
-                           "SELECT k FROM t LIMIT 0");
+  const auto rows =
+      RunSql(engine_.get(), context_.get(), "SELECT k FROM t LIMIT 0");
   EXPECT_TRUE(rows.empty());
 }
 
@@ -190,7 +193,9 @@ TEST_F(SqlFrontendCoverageTest, AggregateFunctionForms) {
   ExpectScalar("SELECT STRING_AGG(s, ',') FROM t", Value("a,b,a"));
   ExpectScalar("SELECT COUNT(DISTINCT s) FROM t", Value(2));
   ExpectScalar("SELECT APPROX_TOP_SUM(k, k, 2) FROM t",
-               Value::Array({Value("{4, 4}"), Value("{3, 3}")}, "STRING"));
+               Value::Array({Value(R"({"value":4,"sum":4})"),
+                             Value(R"({"value":3,"sum":3})")},
+                            "STRING"));
 }
 
 // -------------------------------------------------------------- UNNEST -----
@@ -284,6 +289,24 @@ TEST_F(SqlFrontendCoverageTest, CaseAndPredicateForms) {
               {Row({Value(3)}), Row({Value(4)})});
 }
 
+TEST_F(SqlFrontendCoverageTest, IsTrueFamilyRejectsNonBoolOperands) {
+  // T3698: GoogleSQL errors ("No matching signature") when the operand of
+  // IS [NOT] TRUE/FALSE is not BOOL. This engine carries BOOL as INT64 --
+  // int operands stay accepted (CaseAndPredicateForms pins that) -- but
+  // STRING/FLOAT64/DATE used to sail through Truthy(): `'abc' IS FALSE`
+  // quietly evaluated FALSE.
+  ExpectError("SELECT s IS TRUE FROM t");
+  ExpectError("SELECT s IS NOT TRUE FROM t");
+  ExpectError("SELECT 'abc' IS FALSE");
+  ExpectError("SELECT 'abc' IS NOT FALSE");
+  ExpectError("SELECT f IS TRUE FROM t");
+  ExpectError("SELECT d IS FALSE FROM t");
+  // INT64 (the BOOL carrier) and NULL keep their three-valued semantics:
+  ExpectQuery("SELECT k IS FALSE FROM t WHERE k = 1", {Row({Value(0)})});
+  ExpectScalar("SELECT NULL IS NOT TRUE", Value(1));
+  ExpectScalar("SELECT NULL IS FALSE", Value(0));
+}
+
 // ------------------------------------------------------------- ordering ----
 
 TEST_F(SqlFrontendCoverageTest, OrderByNullsFirstAndLast) {
@@ -324,6 +347,45 @@ TEST_F(SqlFrontendCoverageTest, SqlUdfLifecycle) {
   ExpectQuery("CREATE FUNCTION rec(x INT64) AS (rec(x))", {Row({Value(0)})});
   ExpectError("SELECT rec(1)");
   ExpectError("SELECT no_such_function(1)");
+}
+
+TEST_F(SqlFrontendCoverageTest, UdfExpansionChainHonorsFrameDepthCap) {
+  // T2396: pins the effective expansion budget -- ExpandUdfCall's
+  // t_udf_frames stack (32 frames).  A chain of nested distinct UDFs
+  // expands and evaluates; mutual recursion -- whose per-call bodies are
+  // flat and so invisible to the expression-nesting guard -- must hit the
+  // frame cap ("SQL function recursion limit exceeded") instead of
+  // expanding forever.
+  ExpectQuery("CREATE FUNCTION base(x INT64) AS (x + 1)", {Row({Value(0)})});
+  std::string prev = "base";
+  for (int i = 1; i <= 8; ++i) {
+    const std::string name = "layer" + std::to_string(i);
+    ExpectQuery(
+        "CREATE FUNCTION " + name + "(x INT64) AS (" + prev + "(x) + 1)",  // NOLINT(performance-inefficient-string-concatenation)
+        {Row({Value(0)})});
+    prev = name;
+  }
+  ExpectScalar("SELECT " + prev + "(0)", Value(9));
+  ExpectQuery("CREATE FUNCTION ma(x INT64) AS (mb(x))", {Row({Value(0)})});
+  ExpectQuery("CREATE FUNCTION mb(x INT64) AS (ma(x))", {Row({Value(0)})});
+  ExpectError("SELECT ma(1)");
+}
+
+TEST_F(SqlFrontendCoverageTest, ExplainCreateDoesNotRegisterObjects) {
+  // T2552: registry writes for CREATE FUNCTION / CREATE CONSTANT are
+  // deferred from the AST Visit to statement execution (CreateObjectStatement
+  // + PrepareStatement dispatch), mirroring CREATE VIEW.  EXPLAIN never
+  // dispatches, so a function or constant that was only EXPLAINed stays
+  // unresolvable; a plain CREATE still registers when it executes.
+  ExpectError("EXPLAIN CREATE TEMP FUNCTION leaky() AS (1)");
+  ExpectError("SELECT leaky()");
+  ExpectError("EXPLAIN CREATE CONSTANT leaky_c = 'v'");
+  ExpectError("SELECT leaky_c");
+  ExpectQuery("CREATE TEMP FUNCTION works(x INT64) AS (x * 2)",
+              {Row({Value(0)})});
+  ExpectScalar("SELECT works(21)", Value(42));
+  ExpectQuery("CREATE CONSTANT greeting = 'hi'", {Row({Value("greeting")})});
+  ExpectScalar("SELECT greeting", Value(std::string("hi")));
 }
 
 // ------------------------------------------------------- DDL and ANALYZE ---

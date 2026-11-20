@@ -363,6 +363,7 @@ struct ProgramShape {
     kIntConst1,
     kDirectDoubleCol,
     kMulOneMinus,
+    kDoubleArith,
   };
   CaseCondKind case_cond{CaseCondKind::kNone};
   CaseValKind case_val{CaseValKind::kNone};
@@ -374,6 +375,7 @@ struct ProgramShape {
   int32_t case_val_col0{-1};
   int32_t case_val_col1{-1};
   double case_val_const{1.0};
+  std::shared_ptr<const BytecodeProgram> case_val_program;
   struct IntCaseComparison {
     int32_t left{-1};
     int32_t subtract{-1};
@@ -385,7 +387,8 @@ struct ProgramShape {
   [[nodiscard]] bool HasPairDirect() const noexcept {
     return direct_column >= 0 || extract_date_col >= 0 || mul_col0 >= 0 ||
            mul_one_minus_col0 >= 0 || profit_col0 >= 0 ||
-           (case_cond != CaseCondKind::kNone && case_val != CaseValKind::kNone);
+           (case_cond != CaseCondKind::kNone && case_val != CaseValKind::kNone &&
+            case_val != CaseValKind::kDoubleArith);
   }
 };
 

@@ -50,7 +50,9 @@ struct ScanTupleFilter {
     for (size_t i = 0; i < columns.size(); ++i) {
       const auto& column = block.columns[columns[i]];
       if (column.IsNull(row)) {
-        return true;
+        // NULL cannot match an equality key but may be an outer-join
+        // unmatched row; keep it and let the join operator decide.
+        return false;
       }
       key[i] = column.IntAt(row);
     }

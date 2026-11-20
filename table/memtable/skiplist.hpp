@@ -44,6 +44,11 @@ class SkipArena final {
   ~SkipArena() { FreeAll(); }
 
   void* Allocate(size_t bytes) {
+    // Guard the round-up itself: SIZE_MAX-14..SIZE_MAX would wrap to 0 and
+    // hand out the same pointer twice.
+    if (bytes > std::numeric_limits<size_t>::max() - 15U) {
+      return nullptr;
+    }
     bytes = (bytes + 15U) & ~size_t{15};  // 16B alignment
     if (remaining_ < bytes) {
       const size_t cap = bytes > kChunkSize ? bytes : kChunkSize;
@@ -107,6 +112,14 @@ class SkipList final {
   // per-shard mutex must be held despite the cache-friendly layout.
   [[nodiscard]] const RowEntry* Find(std::string_view key) const;
 
+  // Mutable view of the live entry (same validity rules as the const Find).
+  // MemTable uses it to STEAL an entry's value into a replacement's
+  // `older_versions` chain before Upsert overwrites the node (issue 2525).
+  [[nodiscard]] RowEntry* Find(std::string_view key) {
+    // Same-pointer cast is safe: *this is non-const here.
+    return const_cast<RowEntry*>(const_cast<const SkipList*>(this)->Find(key));
+  }
+
   [[nodiscard]] bool Contains(std::string_view key) const {
     return Find(key) != nullptr;
   }
@@ -151,7 +164,7 @@ class SkipList final {
   [[nodiscard]] int PickHeight();
   Node* NewNode(std::string_view key, RowEntry&& entry, int height);
   void InitHead();
-  // Node-key form of ComparePrepared fused with the caller's prepared key:
+  // Node-key form of CompareNodePrepared fused with the caller's PreparedKey:
   // identical result, but the fixed9 comparison reads the node's cached
   // big-endian header word (word0/tail9) instead of memcpy+bswap-ing the
   // key bytes off their own cache line on every descent step. The prepared

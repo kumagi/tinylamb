@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "expression/expression.hpp"
 #include "type/collation.hpp"
 
@@ -132,6 +133,24 @@ class PlanBase {
   virtual void Explain(std::ostream& o, int indent) const;
   [[nodiscard]] virtual std::string ToString() const = 0;
   friend std::ostream& operator<<(std::ostream& o, const PlanBase& p);
+
+ protected:
+  // T2406: every Dump implementation must route child recursion through
+  // this helper.  EXPLAIN runs unbounded-depth recursion over trees the
+  // user (or a fuzzer) can grow at will: one frame plus one Indent
+  // allocation per level used to mean a deep correlated-subquery plan
+  // crashed the observer instead of printing it.  Rendering truncates at
+  // the cap; execution is untouched.
+  static constexpr int kMaxPlanDumpDepth = 512;
+  void DumpChild(std::ostream& o, const PlanBase& child,  // NOLINT(readability-convert-member-functions-to-static)
+                 int child_indent) const {
+    if (child_indent >= kMaxPlanDumpDepth) {
+      o << Indent(static_cast<size_t>(child_indent))
+        << "... (truncated at depth " << kMaxPlanDumpDepth << ")\n";
+      return;
+    }
+    child.Dump(o, child_indent);
+  }
 
  private:
   PlanExplainInfo explain_info_{};

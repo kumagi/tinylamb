@@ -39,6 +39,7 @@ using relational_detail::AggregateAccumulator;
 using relational_detail::DecideTypedFilterCompare;
 using relational_detail::EvaluateTypedConditionalOnRow;
 using relational_detail::EvaluateTypedDoubleExprOnRow;
+using relational_detail::EvaluateTypedIntExprOnRow;
 using relational_detail::MatchTypedStringInList;
 using relational_detail::PositionalHaving;
 using relational_detail::TryCompilePositionalHaving;
@@ -49,6 +50,8 @@ using relational_detail::TryCompileTypedFilterCompare;
 using relational_detail::TypedAggregateInput;
 using relational_detail::TypedDoubleExprInput;
 using relational_detail::TypedInListCompare;
+using relational_detail::TypedIntExprInput;
+using relational_detail::TypedIntExprOp;
 
 Schema MakeScanSchema() {
   return Schema("lineitem",
@@ -594,6 +597,7 @@ TEST(TypedStreamAggregateTest, AccumulatorChunksCommitsStorageInSegments) {
     chunks.AppendGroup(aggregates, nullptr);
   }
   EXPECT_EQ(chunks.CommittedBytes(),
+            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
             relational_detail::AccumulatorChunks::kSlotsPerChunk *
                     sizeof(AggregateAccumulator) +
                 relational_detail::AccumulatorChunks::kSegmentBytes);
@@ -740,6 +744,96 @@ TEST(TypedStreamAggregateTest, SkewedGroupedSumInt64KeepsCanonicalOverflow) {
   EXPECT_EQ(canonical[1][1].AsInt64(), 5);
 
   db->DeleteAll();
+}
+
+// P596: the scalar narrow-dictionary shortcut folded AVG(INT64) as
+// `double(entry_value) * count` per dict entry, re-associating the canonical
+// row-ordered double fold (aggregate_accumulator's `total += double(v)`), so
+// the same SQL could differ in ULPs with plan shape.  The shortcut now
+// defers once the exact Σ|v| leaves the always-exact 2^53 integer band;
+// typed and canonical folds must agree bit-for-bit.
+TEST(TypedStreamAggregateTest, ScalarDictAvgMatchesRowOrderedFold) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
+  constexpr int64_t kRows = 120003;
+  constexpr int64_t kPow2_53 = int64_t{1} << 53;
+  const std::string prefix = "tsagg_avg596_" + RandomString();
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  std::vector<int64_t> ks(kRows, 1);
+  std::vector<int64_t> vs(kRows, 1);
+  vs[0] = kPow2_53;
+  vs[kRows / 2] = kPow2_53;
+  TypedStreamColumnarKvFixture::Build(db.get(), "tc", ks, vs);
+
+  TransactionContext ctx = db->BeginReadOnlyContext();
+  SqlEngine engine(*db);
+  Status status = Status::kSuccess;
+  const std::vector<Row> typed =
+      RunGroupedQuery(&engine, &ctx, "SELECT AVG(v) FROM tc", &status);
+  ASSERT_EQ(status, Status::kSuccess);
+  ASSERT_EQ(typed.size(), 1U);
+
+  ASSERT_EQ(::setenv("TINYLAMB_DISABLE_TYPED_AGG", "1", 1), 0);
+  const std::vector<Row> canonical =
+      RunGroupedQuery(&engine, &ctx, "SELECT AVG(v) FROM tc", &status);
+  ::unsetenv("TINYLAMB_DISABLE_TYPED_AGG");
+  ASSERT_EQ(status, Status::kSuccess);
+  ASSERT_EQ(canonical.size(), 1U);
+
+  EXPECT_EQ(typed[0][0].value.double_value,
+            canonical[0][0].value.double_value)
+      << "AVG must not depend on fold order (P596 re-association)";
+  db->DeleteAll();
+}
+// the scalar domain's canonical kInvalidArgument "integer overflow on
+// '<op>'" (type/value.cpp / expression/bytecode.cpp).  It previously raised
+// kIsInfinity, a code reserved for SUM-accumulation overflow
+// (executor/aggregation.cpp family).
+TEST(TypedStreamAggregateTest, TypedColumnEvalOverflowUsesCanonicalStatus) {
+  const int64_t kMax = std::numeric_limits<int64_t>::max();
+  const int64_t kMin = std::numeric_limits<int64_t>::min();
+  const Row row({Value(kMax), Value(kMin)});
+
+  TypedIntExprOp load0;
+  load0.kind = TypedIntExprOp::Kind::kLoadIntCol;
+  load0.column = 0;
+  TypedIntExprOp load1;
+  load1.kind = TypedIntExprOp::Kind::kLoadIntCol;
+  load1.column = 1;
+  TypedIntExprOp two;
+  two.kind = TypedIntExprOp::Kind::kConstant;
+  two.constant = 2;
+
+  const auto run = [](std::vector<TypedIntExprOp> ops, const Row& r) {
+    TypedIntExprInput input;
+    input.shape = TypedIntExprInput::Shape::kGeneric;
+    input.ops = std::move(ops);
+    return EvaluateTypedIntExprOnRow(input, r);
+  };
+
+  const StatusOr<Value> mul =
+      run({load0, two, {TypedIntExprOp::Kind::kMul}}, row);
+  ASSERT_FALSE(mul.HasValue());
+  EXPECT_EQ(mul.GetStatus(), Status::kInvalidArgument);
+  EXPECT_EQ(ToString(mul.GetStatus()),
+            "InvalidArgument: integer overflow on '*'");
+
+  const StatusOr<Value> add =
+      run({load0, load0, {TypedIntExprOp::Kind::kAdd}}, row);
+  ASSERT_FALSE(add.HasValue());
+  EXPECT_EQ(add.GetStatus(), Status::kInvalidArgument);
+
+  const StatusOr<Value> sub =
+      run({load0, load1, {TypedIntExprOp::Kind::kSub}}, row);
+  ASSERT_FALSE(sub.HasValue());
+  EXPECT_EQ(sub.GetStatus(), Status::kInvalidArgument);
+
+  // Sanity: in-domain programs still evaluate.
+  const StatusOr<Value> ok = run({load0, load1, {TypedIntExprOp::Kind::kSub}},
+                                 Row({Value(kMax), Value(1)}));
+  ASSERT_TRUE(ok.HasValue()) << ToString(ok.GetStatus());
+  EXPECT_EQ(ok.Value().AsInt64(), kMax - 1);
 }
 
 }  // namespace

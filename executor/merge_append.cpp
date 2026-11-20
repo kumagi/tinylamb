@@ -25,6 +25,10 @@ StatusOr<Value> CoerceTo(const Value& value, ValueType type) {
     return value;
   }
   if (type == ValueType::kDouble && value.type == ValueType::kInt64) {
+    if (value.IsUnsigned()) {
+      return Value(static_cast<double>(
+          static_cast<uint64_t>(value.value.int_value)));
+    }
     return Value(static_cast<double>(value.value.int_value));
   }
   return StatusError(StatusCode::kInvalidArgument,
@@ -76,20 +80,23 @@ StatusOr<Value> MergeAppendExecutor::KeyValue(
   return ApplyKeyCollation(value, key.collation);
 }
 
-bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
+Status MergeAppendExecutor::RefreshSortKeys(Head* head) const {
+  head->sort_keys.clear();
+  head->sort_keys.reserve(keys_.size());
   for (const SortExecutor::Key& key : keys_) {
-    StatusOr<Value> lhs = KeyValue(left, key);
-    if (!lhs.HasValue()) {
-      FailWith(lhs.GetStatus());
-      return false;
-    }
-    StatusOr<Value> rhs = KeyValue(right, key);
-    if (!rhs.HasValue()) {
-      FailWith(rhs.GetStatus());
-      return false;
-    }
+    ASSIGN_OR_RETURN(Value, value, KeyValue(*head, key));
+    head->sort_keys.push_back(std::move(value));
+  }
+  return Status::kSuccess;
+}
+
+bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
+  for (size_t ki = 0; ki < keys_.size(); ++ki) {
+    const SortExecutor::Key& key = keys_[ki];
+    const Value& lhs = left.sort_keys[ki];
+    const Value& rhs = right.sort_keys[ki];
     const int comparison =
-        MakeSortKeyOrder(key).Compare(lhs.Value(), rhs.Value());
+        MakeSortKeyOrder(key).Compare(lhs, rhs);
     if (comparison != 0) {
       return comparison < 0;
     }
@@ -127,6 +134,10 @@ Status MergeAppendExecutor::Initialize() {
     Head head;
     head.source = source;
     if (PullNextFromSource(source, &head.row, &head.position)) {
+      if (const Status st = RefreshSortKeys(&head); st != Status::kSuccess) {
+        FailWith(st);
+        return st;
+      }
       heads_.push_back(std::move(head));
     } else if (sources_[source]->GetStatus() != Status::kSuccess) {
       return sources_[source]->GetStatus();
@@ -159,19 +170,24 @@ size_t MergeAppendExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
       return destination->Size();
     }
     Head emitted = std::move(heads_[best]);
+    if (emitted.row.values_.size() != output_schema_.ColumnCount()) {
+      FailWith(StatusError(StatusCode::kInvalidArgument,
+                           "merge append row/schema width mismatch"));
+      return destination->Size();
+    }
     if (PullNextFromSource(emitted.source, &heads_[best].row,
                            &heads_[best].position)) {
+      const Status key_status = RefreshSortKeys(&heads_[best]);
+      if (key_status != Status::kSuccess) {
+        FailWith(key_status);
+        return destination->Size();
+      }
       heads_[best].source = emitted.source;
     } else {
       if (FailWithChildOf(*sources_[emitted.source])) {
         return destination->Size();
       }
       heads_.erase(heads_.begin() + static_cast<std::ptrdiff_t>(best));
-    }
-    if (emitted.row.values_.size() != output_schema_.ColumnCount()) {
-      FailWith(StatusError(StatusCode::kInvalidArgument,
-                           "merge append row/schema width mismatch"));
-      return destination->Size();
     }
     for (size_t column = 0; column < emitted.row.values_.size(); ++column) {
       StatusOr<Value> coerced = CoerceTo(
@@ -183,6 +199,7 @@ size_t MergeAppendExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
       emitted.row.values_[column] = coerced.MoveValue();
     }
     destination->Append(std::move(emitted.row), emitted.position);
+    ++emitted_rows_;
   }
   return destination->Size();
 }
@@ -193,10 +210,22 @@ void MergeAppendExecutor::Dump(std::ostream& output, int indent) const {
     if (i != 0) {
       output << ", ";
     }
-    output << keys_[i].expression->ToString()
+    output << (keys_[i].expression ? keys_[i].expression->ToString()
+                                   : std::string("?"))
            << (keys_[i].ascending ? " ASC" : " DESC");
+    if (keys_[i].nulls_first) {
+      output << " NULLS FIRST";
+    } else {
+      output << " NULLS LAST";
+    }
   }
-  output << "]\n";
+  output << "]";
+  // T1793: the key list is plan-time fact; row counts are measured and only
+  // render after a drain (Selection::DumpHeader contract).
+  if (emitted_rows_ > 0) {
+    output << " rows=" << emitted_rows_;
+  }
+  output << "\n";
   for (const Executor& source : sources_) {
     source->Dump(output, indent + 2);
   }

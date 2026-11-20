@@ -49,6 +49,12 @@ enum class LogType : uint8_t {
   kEndCheckpoint,
 };
 
+// T2115: symbolic name for dumps / DEBUG logs.  A raw uint8 left every
+// `type:13` in a WAL trace dependent on the enum ordering above; an
+// out-of-range value (corrupt record) renders "kInvalid(<n>)" instead of
+// silently aliasing some name.
+[[nodiscard]] const char* LogTypeName(LogType type);
+
 // Logical LSM & block mutation record for WAL persistence and fuzzy recovery.
 struct LogRecord {
   static constexpr uint16_t kLogRecordMagic = 0x4C53;  // "LS"

@@ -66,7 +66,15 @@ class ExpressionBase {
   ExpressionBase(ExpressionBase&&) = delete;
   ExpressionBase& operator=(const ExpressionBase&) = delete;
   ExpressionBase& operator=(ExpressionBase&&) = delete;
-  [[nodiscard]] virtual TypeTag Type() const = 0;
+  // Issue 1314: the expression NODE KIND (kBinaryExp / kColumnValue / ...),
+  // not the SQL data type of the value this expression produces -- that is
+  // ResultType()'s job (it returns a tinylamb::Type).  TypeTag deliberately
+  // encodes both domains in one enum; see the note in type/type.hpp.
+  [[nodiscard]] virtual TypeTag NodeKind() const = 0;
+  // Deprecated alias for NodeKind() kept because the dispatch idiom
+  // `expr->Type()` is used engine-wide; new code should spell NodeKind()
+  // (or ResultType() when the DATA type is wanted).
+  [[nodiscard]] TypeTag Type() const { return NodeKind(); }
   [[nodiscard]] const ColumnValue& AsColumnValue() const;
   [[nodiscard]] ColumnValue& AsColumnValue();
   [[nodiscard]] const BinaryExpression& AsBinaryExpression() const;
@@ -93,7 +101,7 @@ class ExpressionBase {
                                        const Schema& /*unused*/) const {
     throw std::runtime_error("not implemented");
   }
-  // Context-aware evaluation (improvement3.md A1): subqueries and aggregates
+  // Context-aware evaluation: subqueries and aggregates
   // are resolved through the abstract EvaluationContext instead of database
   // types.  The default keeps unmigrated node types working by ignoring the
   // context; nodes override it in the recommended migration order
@@ -105,12 +113,10 @@ class ExpressionBase {
     return Evaluate(row, schema);
   }
 
-  // No-exception evaluation contract (no-exception-rule-migration.md
-  // Phase 5).  Converted nodes override TryEvaluate and route their
-  // Evaluate through the EXC-SHIM wrapper; unconverted nodes keep the
-  // default here, which forwards to the still-throwing Evaluate.  When the
-  // last node is converted (Phase 7) the Evaluate overloads disappear and
-  // TryEvaluate becomes the pure virtual interface.
+  // No-exception evaluation contract: nodes override TryEvaluate and route
+  // their Evaluate through the EXC-SHIM wrapper; the default here forwards to
+  // the still-throwing Evaluate. TryEvaluate is the interface callers should
+  // use for Status-based error handling.
   [[nodiscard]] virtual StatusOr<Value> TryEvaluate(
       const Row& row, const Schema& schema) const {
     return Evaluate(row, schema);
@@ -133,7 +139,7 @@ class ExpressionBase {
     throw std::runtime_error("not implemented");
   }
   // Validates the expression against the schema, resolving function
-  // signatures through EvaluationContext (improvement3.md A1: the database
+  // signatures through EvaluationContext (the database
   // type stays behind the context boundary).
   virtual Status Validate(EvaluationContext& /*unused*/,
                           const Schema& /*unused*/) const {

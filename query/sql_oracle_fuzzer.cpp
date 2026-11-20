@@ -1422,7 +1422,11 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
         "SUM(CASE WHEN u = " + std::to_string(k0) + " THEN a END)";
     const std::string c1 =
         "SUM(CASE WHEN u = " + std::to_string(k1) + " THEN a END)";
-    t.piv = {"SELECT * FROM " + tab + " PIVOT(SUM(a) FOR u IN (" +
+    // PIVOT groups by every input column outside the aggregate and the FOR
+    // column, so pin the input to (u, a): only then is the oracle the single
+    // global row of conditional sums. (A bare table is rejected anyway.)
+    t.piv = {"SELECT * FROM (SELECT u, a FROM " + tab +
+                 ") PIVOT(SUM(a) FOR u IN (" +
                  std::to_string(k0) + ", " + std::to_string(k1) + "));",
              "SELECT " + c0 + ", " + c1 + " FROM " + tab + ";"};
   }
@@ -2602,6 +2606,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->unnest_ran = t.unnest.size() == 1;
     stats->xmode_ran = !t.xmode_probes.empty();
   }
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
   return report;
 }
 
@@ -2956,9 +2961,17 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
     } else if (consume("-- pqsu: ", &value)) {
       trace->pqs_u = value;
     } else if (consume("-- pqsexpected: ", &value)) {
-      trace->pqs_expected = std::stoll(value);
+      try {
+        trace->pqs_expected = std::stoll(value);
+      } catch (const std::exception&) {
+        trace->pqs_expected = 0;
+      }
     } else if (consume("-- pqspivot: ", &value)) {
-      trace->pqs_pivot_u = std::stoll(value);
+      try {
+        trace->pqs_pivot_u = std::stoll(value);
+      } catch (const std::exception&) {
+        trace->pqs_pivot_u = 0;
+      }
     } else if (consume("-- idxddl: ", &value)) {
       trace->index_ddl.push_back(value);
     } else if (consume("-- idxprobe: ", &value)) {
@@ -2970,7 +2983,11 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
     } else if (consume("-- topties: ", &value)) {
       trace->topties = value;
     } else if (consume("-- toptieslimit: ", &value)) {
-      trace->topties_limit = std::stoll(value);
+      try {
+        trace->topties_limit = std::stoll(value);
+      } catch (const std::exception&) {
+        trace->topties_limit = 0;
+      }
     } else if (consume("-- dqe: ", &value)) {
       trace->dqe.push_back(value);
     } else if (consume("-- troc: ", &value)) {

@@ -1,7 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-// Differential test for the expression evaluation engines (improvement3.md
-// A6 / S7).  The canonical semantics are the AST evaluators; every fast path
+// Differential test for the expression evaluation engines.
+// The canonical semantics are the AST evaluators; every fast path
 // must agree per docs/expression_evaluation.md:
 //   (a) AST      : Expression::Evaluate(Row, Schema)
 //   (b) Bytecode : BytecodeCompiler::Compile + EvaluateBatch
@@ -1091,7 +1091,7 @@ TEST(DifferentialTest, GenerateArrayIntegerBoundariesAgreeAcrossEngines) {
   }
 }
 
-// Former XFAIL (improvement3.md A6-1), now resolved: the relational_detail
+// Former XFAIL (a former limitation), now resolved: the relational_detail
 // interpreter used to collapse SQL three-valued logic to two-valued logic in
 // three places (AND with a NULL left operand returned FALSE, OR with a NULL
 // left operand ignored a TRUE right operand, NOT NULL returned TRUE).  Its
@@ -1146,8 +1146,8 @@ TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
   }
 }
 
-// Former XFAIL (A6 leftover), now resolved: the detail-path numeric core was
-// forwarded to the canonical EvaluateBinary, so int/int division truncates to
+// The detail-path numeric core is forwarded to the canonical EvaluateBinary,
+// so int/int division truncates to
 // INT64 and add/sub/mul overflow plus INT64_MIN % -1 raise the canonical
 // errors -- exactly like the AST evaluator.
 TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
@@ -1238,33 +1238,43 @@ TEST(DifferentialTest, AuditMixedUnsignedDivisionAndModulo) {
   const Schema schema("numbers", {Column("i", ValueType::kInt64),
                                   Column("j", ValueType::kInt64)});
   DifferentialTally tally;
+  // A negative dividend over a UINT64 divisor keeps the mathematical sign; a
+  // UINT64 dividend over a negative divisor is an error on every path
+  // (project decision, 2026-11-20).  nullopt marks "must raise".
   for (const auto& [row, quotient, remainder] :
-       std::vector<std::tuple<Row, Value, Value>>{
+       std::vector<std::tuple<Row, std::optional<Value>, std::optional<Value>>>{
            {Row({Value(-5), Value(2).WithUnsigned()}), Value(-2), Value(-1)},
-           {Row({Value(5).WithUnsigned(), Value(-2)}), Value(-2), Value(1)},
-           {Row({Value(int64_t{-1}).WithUnsigned(), Value(-2)}),
-            Value(int64_t{-9223372036854775807LL}), Value(1)}}) {
-    for (const auto& [name, expected] :
-         std::vector<std::pair<std::string, Value>>{{"div", quotient},
-                                                    {"mod", remainder}}) {
-      const auto expression =
-          FunctionCallExp(name, {ColumnValueExp("i"), ColumnValueExp("j")});
+           {Row({Value(5).WithUnsigned(), Value(-2)}), std::nullopt,
+            std::nullopt},
+           {Row({Value(int64_t{-1}).WithUnsigned(), Value(-2)}), std::nullopt,
+            std::nullopt}}) {
+    const auto check = [&](const std::string& name,
+                           const Expression& expression,
+                           const std::optional<Value>& expected) {
       const auto program = BytecodeCompiler::Compile(expression, schema);
+      const Attempt ast = EvaluateAst(expression, row, schema);
+      if (!expected.has_value()) {
+        EXPECT_EQ(ast.kind, Attempt::Kind::kThrow)
+            << name << " [" << row.ToString() << "] must raise";
+      }
       tally.Compare(
           name, row.ToString(),
-          {{"ast", EvaluateAst(expression, row, schema)},
+          {{"ast", ast},
            {"bytecode", EvaluateBytecode(program, schema, row)},
            {"relational", EvaluateDetailPath(expression, row, schema)}},
           expected);
+    };
+    for (const auto& [name, expected] :
+         std::vector<std::pair<std::string, std::optional<Value>>>{
+             {"div", quotient}, {"mod", remainder}}) {
+      check(name,
+            FunctionCallExp(name, {ColumnValueExp("i"), ColumnValueExp("j")}),
+            expected);
     }
-    const auto modulo = BinaryExpressionExp(
-        ColumnValueExp("i"), BinaryOperation::kModulo, ColumnValueExp("j"));
-    const auto program = BytecodeCompiler::Compile(modulo, schema);
-    tally.Compare("modulo", row.ToString(),
-                  {{"ast", EvaluateAst(modulo, row, schema)},
-                   {"bytecode", EvaluateBytecode(program, schema, row)},
-                   {"relational", EvaluateDetailPath(modulo, row, schema)}},
-                  remainder);
+    check("modulo",
+          BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kModulo,
+                              ColumnValueExp("j")),
+          remainder);
   }
   tally.Summarize("audit mixed unsigned arithmetic");
 }

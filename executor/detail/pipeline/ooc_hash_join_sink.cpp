@@ -4,20 +4,29 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/join_hash.hpp"
 #include "common/memory_budget.hpp"
 #include "executor/detail/ooc/chunk_codec.hpp"
 #include "executor/detail/ooc/recursive_partitioner.hpp"
 #include "executor/detail/pipeline/ooc_sinks.hpp"
 #include "executor/detail/pipeline/pipeline_ops.hpp"
+#include "executor/detail/scan_filter.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/bytecode.hpp"
+#include "expression/column_value.hpp"
+#include "expression/unary_expression.hpp"
 #include "type/collation.hpp"
 #include "type/row_block_codec.hpp"
 
@@ -29,16 +38,8 @@ constexpr size_t kGraceWriteBatchBytes = 16ULL << 10;
 constexpr uint32_t kMaxGraceDepth = 8;
 constexpr char kJoinNegativeIntTag = '\x7f';
 
-uint64_t MixHash64(uint64_t h) noexcept {
-  h *= 0x9E3779B97F4A7C15ULL;
-  h ^= h >> 32;
-  h *= 0xBF58476D1CE4E5B9ULL;
-  h ^= h >> 29;
-  return h;
-}
-
 uint64_t HashInt64Key(int64_t key) noexcept {
-  return MixHash64(static_cast<uint64_t>(key));
+  return MixJoinHash(static_cast<uint64_t>(key));
 }
 
 uint64_t HashBytesKey(std::string_view key) noexcept {
@@ -47,7 +48,7 @@ uint64_t HashBytesKey(std::string_view key) noexcept {
     h ^= static_cast<unsigned char>(c);
     h *= 1099511628211ULL;
   }
-  return MixHash64(h);
+  return MixJoinHash(h);
 }
 
 bool ContainsUnmatchableNaN(const Value& value) {
@@ -530,12 +531,11 @@ Status AppendToGraceBuckets(
 }  // namespace
 
 void OocHashJoinContext::ReleaseResidentMemory() noexcept {
-  build_rows.clear();
-  build_rows.shrink_to_fit();
-  build_positions.clear();
-  build_positions.shrink_to_fit();
-  build_matched.clear();
-  build_matched.shrink_to_fit();
+  // swap with empty containers releases capacity without an allocation:
+  // shrink_to_fit() may allocate and is not noexcept.
+  std::vector<Row>().swap(build_rows);
+  std::vector<RowPosition>().swap(build_positions);
+  std::vector<uint8_t>().swap(build_matched);
   hash_index = JoinHashIndex();
   resident_grant_cache.reset();
   resident_guard.reset();
@@ -1059,6 +1059,109 @@ StatusOr<std::shared_ptr<PipelineSource>> OocHashBuildSink::Finalize(
                                              "BuildComplete");
 }
 
+FilteredHashProbe::Mode FilteredHashProbe::ChooseMode(
+    const JoinHashIndex& index, const int64_t* filter, size_t count,
+    BinaryOperation op, int64_t constant) {
+  const auto estimate = [&](auto compare) {
+    // Read a few consecutive values from each quarter so we also see
+    // whether the predicate changes between adjacent sampled rows.
+    constexpr size_t kWindow = 16;
+    constexpr size_t kWindows = 4;
+    if (count < kWindow * kWindows) {
+      return Mode::kDirect;
+    }
+    size_t passed = 0;
+    size_t transitions = 0;
+    for (size_t w = 0; w < kWindows; ++w) {
+      const size_t base = (count * w) / kWindows;
+      bool previous = compare(filter[base], constant);
+      passed += previous;
+      for (size_t i = 1; i < kWindow; ++i) {
+        const bool current = compare(filter[base + i], constant);
+        passed += current;
+        transitions += previous != current;
+        previous = current;
+      }
+    }
+    // Two 8-byte arrays are touched by the probe. Small indexes have little
+    // to gain from prefetch, even around 50% when sparse lanes are mixed.
+    constexpr size_t kSmallSlotCount = 65536;
+    const bool small = index.ViewInt64Slots().mask < kSmallSlotCount;
+    if (passed <= (small ? 3U : 2U) ||
+        (small && passed >= 24 && passed <= 40 && transitions >= 24)) {
+      return Mode::kDirect;
+    }
+    return Mode::kCompact;
+  };
+  switch (op) {
+    case BinaryOperation::kEquals:
+      return estimate(std::equal_to<>{});
+    case BinaryOperation::kNotEquals:
+      return estimate(std::not_equal_to<>{});
+    case BinaryOperation::kLessThan:
+      return estimate(std::less<>{});
+    case BinaryOperation::kLessThanEquals:
+      return estimate(std::less_equal<>{});
+    case BinaryOperation::kGreaterThan:
+      return estimate(std::greater<>{});
+    case BinaryOperation::kGreaterThanEquals:
+      return estimate(std::greater_equal<>{});
+    default:
+      return Mode::kDirect;
+  }
+}
+
+void FilteredHashProbe::Start(Mode mode, const JitInt64Kernels& kernel,
+                              const JoinHashIndex& index, const int64_t* filter,
+                              const int64_t* keys, size_t count,
+                              int64_t constant) {
+  mode_ = mode;
+  kernel_ = &kernel;
+  index_ = &index;
+  slots_ = index.ViewInt64Slots();
+  filter_ = filter;
+  keys_ = keys;
+  count_ = count;
+  constant_ = constant;
+  next_ = 0;
+  if (mode == Mode::kDirect) {
+    direct_cursor_ = 0;
+    return;
+  }
+  mask_.resize(count);
+  kernel.Filter(filter, mask_.data(), count, constant);
+  candidates_.clear();
+  for (size_t row = 0; row < count; ++row) {
+    if (mask_[row] != 0) {
+      candidates_.push_back({row, JoinHashIndex::HashInt64(keys[row])});
+    }
+  }
+}
+
+size_t FilteredHashProbe::Next(size_t* row, size_t* accepted) {
+  if (mode_ == Mode::kDirect) {
+    return kernel_->FilterHashProbe(filter_, keys_, count_, constant_,
+                                    slots_.heads, slots_.keys, slots_.mask,
+                                    &direct_cursor_, row, accepted);
+  }
+  *accepted = 0;
+  while (next_ < candidates_.size()) {
+    constexpr size_t kLookahead = 16;
+    if (next_ + kLookahead < candidates_.size()) {
+      index_->PrefetchInt64(candidates_[next_ + kLookahead].hash);
+    }
+    const Candidate& candidate = candidates_[next_++];
+    ++*accepted;
+    const size_t head = index_->Find(candidate.hash, keys_[candidate.row], {});
+    if (head != JoinHashIndex::kNil) {
+      *row = candidate.row;
+      return head;
+    }
+  }
+  *row = count_;
+  return JoinHashIndex::kNil;
+}
+
 // --- OocAdaptiveHashProbeSource & Grace Partition Cursor ---
 
 struct OocAdaptiveHashProbeSource::GracePartitionCursor {
@@ -1464,6 +1567,7 @@ void OocAdaptiveHashProbeSource::CleanupGracePairs() noexcept {
 Status OocAdaptiveHashProbeSource::PullNextProbeChunk(PipelineContext* ctx,
                                                       DataChunk* out) {
   out->Reset();
+  filtered_probe_active_ = false;
   if (join_ctx_->semi_intake_completed &&
       join_ctx_->reduced_probe_store != nullptr) {
     while (!probe_eof_) {
@@ -1491,12 +1595,15 @@ Status OocAdaptiveHashProbeSource::PullNextProbeChunk(PipelineContext* ctx,
     bool exhausted = false;
     DataChunk cur = std::move(raw);
     DataChunk next;
-    for (const auto& op : probe_ops_) {
+    for (size_t i = 0; i < probe_ops_.size(); ++i) {
       if (cur.Empty()) {
         break;
       }
+      if (i == filtered_probe_filter_idx_ && StartFilteredProbe(cur)) {
+        break;
+      }
       next.Reset();
-      RETURN_IF_FAIL(op->Process(ctx, cur, &next, &exhausted));
+      RETURN_IF_FAIL(probe_ops_[i]->Process(ctx, cur, &next, &exhausted));
       // Swap so `next` keeps the consumed chunk's storage for the next
       // operator's `Reset` reuse path instead of moving into a husk.
       std::swap(cur, next);
@@ -1513,6 +1620,180 @@ Status OocAdaptiveHashProbeSource::PullNextProbeChunk(PipelineContext* ctx,
   return Status::kSuccess;
 }
 
+void OocAdaptiveHashProbeSource::EnableFilteredProbe() {
+  const auto& state = *join_ctx_;
+  const auto& spec = state.spec;
+  const auto& schema = spec.build_left ? spec.right_schema : spec.left_schema;
+  const auto& keys = spec.build_left ? spec.right_cols : spec.left_cols;
+  const bool exact_filter =
+      state.runtime_filter && state.runtime_filter->PartCount() == 1 &&
+      state.runtime_filter->Has(RuntimeFilterKind::kExactSet);
+  if (state.spilled || !state.finalized || spec.kind != JoinKind::kInner ||
+      state.any_null_safe || spec.residual_predicate ||
+      (state.runtime_filter && !exact_filter) ||
+      state.small_build_runtime_filter || keys.size() != 1 ||
+      keys.front() >= schema.ColumnCount() ||
+      state.key_mode != JoinHashIndex::KeyMode::kInt64 ||
+      state.int_key_type != ValueType::kInt64 || probe_ops_.empty() ||
+      !BytecodeEnabled() || schema.GetColumn(keys[0]).IsUnsigned() ||
+      schema.GetColumn(keys[0]).Type() != ValueType::kInt64) {
+    return;
+  }
+  const char* option = std::getenv("TINYLAMB_FILTER_HASH_PROBE");
+  const std::string_view mode = option != nullptr ? option : "auto";
+  if (mode == "off") {
+    return;
+  }
+  size_t filter_idx = probe_ops_.size();
+  const FilterOp* filter = nullptr;
+  std::vector<slot_t> raw_slots(schema.ColumnCount());
+  std::iota(raw_slots.begin(), raw_slots.end(), slot_t{0});
+  while (filter_idx > 0) {
+    const auto* op = probe_ops_[--filter_idx].get();
+    filter = dynamic_cast<const FilterOp*>(op);
+    if (filter != nullptr) {
+      break;
+    }
+    if (dynamic_cast<const RenameOp*>(op) != nullptr) {
+      continue;
+    }
+    const auto* project = dynamic_cast<const ProjectOp*>(op);
+    if (project == nullptr) {
+      return;
+    }
+    std::vector<slot_t> project_slots;
+    project_slots.reserve(project->Expressions().size());
+    for (const auto& item : project->Expressions()) {
+      if (!item.expression ||
+          item.expression->Type() != TypeTag::kColumnValue) {
+        return;
+      }
+      const auto offset = project->InputSchema().Offset(
+          item.expression->AsColumnValue().GetColumnName());
+      if (offset < 0) {
+        return;
+      }
+      project_slots.push_back(static_cast<slot_t>(offset));
+    }
+    for (slot_t& slot : raw_slots) {
+      if (slot >= project_slots.size()) {
+        return;
+      }
+      slot = project_slots[slot];
+    }
+  }
+  if (filter == nullptr) {
+    return;
+  }
+  const auto& input = filter->InputSchema();
+  for (size_t i = 0; i < raw_slots.size(); ++i) {
+    if (raw_slots[i] >= input.ColumnCount() ||
+        input.GetColumn(raw_slots[i]).Type() != schema.GetColumn(i).Type()) {
+      return;
+    }
+  }
+  const slot_t key = raw_slots[keys[0]];
+  const auto& raw_key = input.GetColumn(key);
+  if (raw_key.IsUnsigned() || raw_key.Type() != ValueType::kInt64) {
+    return;
+  }
+  Expression predicate = filter->Predicate();
+  if (predicate && predicate->Type() == TypeTag::kBinaryExp &&
+      predicate->AsBinaryExpression().Op() == BinaryOperation::kAnd) {
+    const auto& parts = predicate->AsBinaryExpression();
+    const auto key_not_null = [&](const Expression& expr) {
+      return expr && expr->Type() == TypeTag::kUnaryExp &&
+             expr->AsUnaryExpression().Op() == UnaryOperation::kIsNotNull &&
+             expr->AsUnaryExpression().Child() &&
+             expr->AsUnaryExpression().Child()->Type() ==
+                 TypeTag::kColumnValue &&
+             input.Offset(expr->AsUnaryExpression()
+                              .Child()
+                              ->AsColumnValue()
+                              .GetColumnName()) == key;
+    };
+    if (key_not_null(parts.Left())) {
+      predicate = parts.Right();
+    } else if (key_not_null(parts.Right())) {
+      predicate = parts.Left();
+    }
+  }
+  const auto pred =
+      relational_detail::TryCompileSimpleCompare(predicate, input);
+  if (!pred || !pred->int_payload || pred->column_payload ||
+      pred->constant.type != ValueType::kInt64 || pred->constant.IsUnsigned() ||
+      !IsComparison(pred->op) || input.GetColumn(pred->column).IsUnsigned() ||
+      input.GetColumn(pred->column).Type() != ValueType::kInt64) {
+    return;
+  }
+  filtered_probe_predicate_ = {.column = pred->column,
+                               .key = key,
+                               .operation = pred->op,
+                               .constant = pred->int_constant};
+  filtered_probe_input_ = &input;
+  filtered_probe_filter_idx_ = filter_idx;
+  filtered_probe_output_slots_ = std::move(raw_slots);
+  filtered_probe_exact_runtime_filter_ = exact_filter;
+  if (mode == "direct") {
+    forced_probe_mode_ = FilteredHashProbe::Mode::kDirect;
+  } else if (mode == "compact") {
+    forced_probe_mode_ = FilteredHashProbe::Mode::kCompact;
+  }
+}
+
+bool OocAdaptiveHashProbeSource::StartFilteredProbe(const DataChunk& batch) {
+  if (!filtered_probe_predicate_ || batch.Size() > kDefaultVectorSize) {
+    return false;
+  }
+  const auto& pred = *filtered_probe_predicate_;
+  const auto valid = [&](slot_t slot) {
+    const auto& column = batch.ColumnAt(slot);
+    const auto& zone = batch.ZoneMapAt(slot);
+    return column.Type() == ValueType::kInt64 && !column.IsUnsigned() &&
+           !column.IsHeterogeneous() && zone.Initialized() &&
+           zone.NullCount() == 0;
+  };
+  if (!batch.HasLayout(*filtered_probe_input_) || !valid(pred.column) ||
+      !valid(pred.key) ||
+      !batch.ZoneMapAt(pred.column)
+           .MayMatch(pred.operation, Value(pred.constant))) {
+    return false;
+  }
+  constexpr size_t kCompileAfterRows = 65536;
+  if (!forced_probe_mode_ && filtered_probe_rows_seen_ < kCompileAfterRows) {
+    filtered_probe_rows_seen_ += batch.Size();
+    return false;
+  }
+  const auto* filter = batch.ColumnAt(pred.column).IntegerData().data();
+  const auto* join_keys = batch.ColumnAt(pred.key).IntegerData().data();
+  const auto& index = join_ctx_->hash_index;
+  using Mode = FilteredHashProbe::Mode;
+  const Mode mode = forced_probe_mode_ ? *forced_probe_mode_
+                                       : FilteredHashProbe::ChooseMode(
+                                             index, filter, batch.Size(),
+                                             pred.operation, pred.constant);
+  auto& kernel =
+      mode == Mode::kDirect ? direct_probe_kernel_ : compact_probe_kernel_;
+  if (!kernel) {
+    kernel = mode == Mode::kDirect
+                 ? JitInt64Kernels::CompileFilterHashProbe(pred.operation)
+                 : JitInt64Kernels::CompileFilter(pred.operation);
+    if (!kernel) {
+      filtered_probe_predicate_.reset();
+      return false;
+    }
+  }
+  filtered_probe_.Start(mode, *kernel, index, filter, join_keys, batch.Size(),
+                        pred.constant);
+  filtered_probe_active_ = true;
+  if (mode == Mode::kDirect) {
+    ++direct_probe_batches_;
+  } else {
+    ++compact_probe_batches_;
+  }
+  return true;
+}
+
 Status OocAdaptiveHashProbeSource::PrepareGracePartitions(
     PipelineContext* ctx) {
   const OocHashJoinSpec& spec = join_ctx_->spec;
@@ -1520,6 +1801,7 @@ Status OocAdaptiveHashProbeSource::PrepareGracePartitions(
     // Drop all build buckets immediately: NOT IN with NULL returns 0 rows.
     for (OocBuildSpillBucket& b : join_ctx_->build_buckets) {
       if (b.segment_id != kInvalidSpillSegmentId) {
+        // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage) intentional pattern in this code
         ctx->spill_store.DropSegment(b.segment_id);
         b.segment_id = kInvalidSpillSegmentId;
       }
@@ -1891,6 +2173,8 @@ Status OocAdaptiveHashProbeSource::Open(PipelineContext* ctx) {
     probe_eof_ = true;
     join_ctx_->ReleaseResidentMemory();
     consumer_guard_.reset();
+  } else {
+    EnableFilteredProbe();
   }
   return Status::kSuccess;
 }
@@ -1986,12 +2270,45 @@ StatusOr<bool> OocAdaptiveHashProbeSource::NextBatch(PipelineContext* ctx,
         break;
       }
 
+      if (filtered_probe_active_) {
+        size_t row = 0;
+        size_t accepted = 0;
+        const size_t head = filtered_probe_.Next(&row, &accepted);
+        join_ctx_->actual_probe_rows += accepted;
+        if (filtered_probe_exact_runtime_filter_) {
+          // Both the exact filter and the resident index contain the same
+          // valid build keys. An empty lookup is also a filter rejection.
+          join_ctx_->dynamic_filter_probe_rows += accepted;
+          join_ctx_->dynamic_filter_rejected +=
+              accepted - static_cast<size_t>(head != JoinHashIndex::kNil);
+        }
+        if (head == JoinHashIndex::kNil) {
+          active_probe_row_ = active_probe_chunk_.Size();
+          continue;
+        }
+        active_probe_row_ = row + 1;
+        std::vector<Value> values;
+        values.reserve(filtered_probe_output_slots_.size());
+        for (slot_t slot : filtered_probe_output_slots_) {
+          values.push_back(active_probe_chunk_.ColumnAt(slot).ValueAt(row));
+        }
+        active_probe_state_.row = Row(std::move(values));
+        active_probe_state_.pos = active_probe_chunk_.PositionAt(row);
+        active_probe_state_.active = true;
+        active_probe_state_.matched_any = false;
+        active_probe_state_.has_non_safe_null = false;
+        active_probe_state_.next_entry = head;
+        continue;
+      }
+
       if (join_ctx_->runtime_filter != nullptr &&
           !join_ctx_->dynamic_filter_published && probe_cols.size() == 1) {
         ++join_ctx_->actual_probe_rows;
         ++join_ctx_->dynamic_filter_probe_rows;
-        const Row row_view = active_probe_chunk_.RowAt(active_probe_row_);
-        const Value& key = row_view[probe_cols[0]];
+        // Read only the single key cell; a full Row copy here would be
+        // immediately discarded (the retained copy is made below).
+        const Value& key = active_probe_chunk_.ColumnAt(probe_cols[0])
+                               .ValueAt(active_probe_row_);
         if (key.IsNull()) {
           ++join_ctx_->dynamic_filter_null_rejected;
           ++active_probe_row_;
@@ -2135,6 +2452,11 @@ void OocAdaptiveHashProbeSource::RenderTree(std::ostream& out, int indent,
         << join_ctx_->dynamic_filter_null_rejected << "\n";
   }
   if (is_dump && join_ctx_->finalized && spec.kind == JoinKind::kInner) {
+    if (direct_probe_batches_ != 0 || compact_probe_batches_ != 0) {
+      out << child_pad << "FilteredHashProbe direct_batches="
+          << direct_probe_batches_ << " compact_batches="
+          << compact_probe_batches_ << '\n';
+    }
     out << child_pad
         << "HashJoin actual_build_rows=" << join_ctx_->build_total_rows
         << " actual_probe_rows=" << join_ctx_->actual_probe_rows

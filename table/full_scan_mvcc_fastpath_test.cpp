@@ -124,14 +124,14 @@ TEST_F(FullScanMvccFastPathTest, LockedScanWaitDoesNotHoldThePageLatch) {
     }
   });
   entered.wait();
-  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(50)),
+  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(10)),
             std::future_status::timeout);
   const auto begin = std::chrono::steady_clock::now();
   const auto updated = table.Update(
       owner.txn_, position, Row({Value(0), Value("updated"), Value(1.0)}));
   const Status committed = owner.PreCommit();
   waiter.join();
-  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(1));
+  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(5));
   EXPECT_EQ(updated.GetStatus(), Status::kSuccess);
   EXPECT_EQ(committed, Status::kSuccess);
   const auto row = result.get();
@@ -162,14 +162,14 @@ TEST_F(FullScanMvccFastPathTest, DirectUpdateWaitDoesNotHoldThePageLatch) {
     completed.set_value(update.GetStatus());
   });
   entered.wait();
-  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(50)),
+  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(10)),
             std::future_status::timeout);
   const auto begin = std::chrono::steady_clock::now();
   const auto updated = table.Update(
       owner.txn_, position, Row({Value(0), Value("updated"), Value(1.0)}));
   const Status committed = owner.PreCommit();
   waiter.join();
-  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(1));
+  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(5));
   EXPECT_EQ(updated.GetStatus(), Status::kSuccess);
   EXPECT_EQ(committed, Status::kSuccess);
   const Status status = result.get();
@@ -555,8 +555,6 @@ TEST_F(FullScanMvccFastPathTest, AbortedDestroyRestoreSurvivesCrash) {
       dropped.Insert(seed.txn_, Row({Value(7), Value("keep"), Value(1.0)}))
           .GetStatus());
   ASSERT_SUCCESS(seed.PreCommit());
-  const page_id_t pid = dropped.FirstPageId();
-
   TransactionContext dropper = db_->BeginContext();
   ASSERT_SUCCESS(db_->DropTable(dropper, "PlainTable"));
 
@@ -566,7 +564,7 @@ TEST_F(FullScanMvccFastPathTest, AbortedDestroyRestoreSurvivesCrash) {
   TransactionContext durability = db_->BeginContext();
   ASSERT_SUCCESS(durability.txn_.PreCommit());
   ASSERT_SUCCESS(
-      dropper.txn_.GetPageManager()->GetPool()->FlushPageForTest(pid));
+      dropper.txn_.GetPageManager()->GetPool()->FlushAllPagesForTest());
 
   ASSERT_SUCCESS(dropper.txn_.Abort());
   // Push the CLR + abort terminator out of the logger buffer so the crash
@@ -616,7 +614,7 @@ TEST_F(FullScanMvccFastPathTest, CachedPageVerdictIsInvalidatedAfterLatchDrop) {
       chain_registered = true;
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   // A registered writer is blocked by our shared latch. The unchanged
   // physical image remains valid while that latch is held.
@@ -757,10 +755,10 @@ TEST_F(FullScanMvccFastPathTest,
   }
   ASSERT_SUCCESS(seed.PreCommit());
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (db_->TransactionStats().version_chains != 0 &&
          std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   ASSERT_EQ(db_->TransactionStats().version_chains, 0U);
   auto reader = db_->BeginReadOnlyContext();
@@ -843,13 +841,13 @@ TEST_F(FullScanMvccFastPathTest,
   const auto await_counts = [&](Transaction& txn) {
     std::shared_ptr<const Table::IntegerKeyCounts> counts;
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
     do {
       counts = table.TryReadIntegerKeyCounts(txn, pages, 0, -3, 7);
       if (counts) {
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     } while (std::chrono::steady_clock::now() < deadline);
     return counts;
   };

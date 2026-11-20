@@ -334,8 +334,13 @@ TEST_F(PipelineP3aSqlTest, ExplainAnalyzeShowsPipelineMetricsAndZeroLegacy) {
   EXPECT_NE(analyze.find("legacy_source_ms=0"), std::string::npos) << analyze;
   EXPECT_NE(analyze.find("Memory:"), std::string::npos) << analyze;
   EXPECT_NE(analyze.find("OOC:"), std::string::npos) << analyze;
-  // Tight 32 KiB op budget must spill during the >200 KiB join+sort!
-  EXPECT_EQ(analyze.find("spill_bytes=0B"), std::string::npos) << analyze;
+  // The aggregate is now pushed below the join ("Aggregate below Join"), so
+  // the join builds a handful of pre-aggregated rows and fits the 32 KiB op
+  // budget without spilling. Only the reporting contract is pinned here:
+  // the pipeline line carries its spill counter.
+  EXPECT_NE(analyze.find("Aggregate below Join"), std::string::npos)
+      << analyze;
+  EXPECT_NE(analyze.find("spill_bytes="), std::string::npos) << analyze;
 }
 
 TEST_F(PipelineP3aSqlTest, G5TempLimitFaultAndMemoryCoordinatorSharing) {
@@ -466,3 +471,12 @@ TEST_F(PipelineP3aSqlTest, SpilledDistinctKeepsTheOrderTheOptimizerRelies) {
 
 }  // namespace
 }  // namespace tinylamb
+
+// Blocking stages drive every sink with a single worker, so the reported DOP
+// must be 1 even when the grant would permit more.
+TEST(PipelineContextDopTest, ReportsTheWorkerCountActuallyUsed) {
+  tinylamb::PipelineContext ctx(nullptr, tinylamb::QueryMemoryGrant(), 4);
+  const tinylamb::PipelineExecutionMetrics m = ctx.Snapshot();
+  EXPECT_EQ(m.effective_dop, 1U);
+  EXPECT_EQ(m.permitted_dop, 4U);
+}

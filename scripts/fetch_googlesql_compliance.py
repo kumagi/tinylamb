@@ -57,10 +57,6 @@ def main() -> None:
         names.append(name)
 
     wanted = set(names)
-    for existing in out.glob("*.test"):
-        if (existing.name not in wanted and
-                not existing.name.startswith(LOCAL_PREFIXES)):
-            existing.unlink()
 
     def fetch(name: str) -> tuple[str, str | None]:
         dest = out / name
@@ -78,7 +74,13 @@ def main() -> None:
             if error:
                 errors.append((name, error))
     if errors:
+        # Keep the existing testdata intact on any transient failure: deleting
+        # first would leave neither old nor new files on a partial download.
         raise SystemExit(f"failed {len(errors)} files: {errors[:5]}")
+    for existing in out.glob("*.test"):
+        if (existing.name not in wanted and
+                not existing.name.startswith(LOCAL_PREFIXES)):
+            existing.unlink()
     print(f"wrote {len(names)} files to {out}")
 
 

@@ -2,7 +2,7 @@
 
 ## サマリー
 
-対応実装は存在しない（MetaCmdType/ShardConfig/NodeInfo/EpochManager/sealed_epoch/tinylamb_admin すべて 0 ヒット）。「旧設計の kAddNode/kRemoveNode が廃止」と書くが廃止対象自体が存在しないため、文書は純粋な設計提案。2 層分離(L1/L2)と joint consensus のクラッシュ時規則は Raft 論文と整合して明快だが、promote 判定の時間条件が §4.1 と §4.3 で食い違い、quorum 記述に式と矛盾、シャード初期作成コマンドと L2 primary 削除手順が欠落している。
+対応実装は存在しない（MetaCmdType/ShardConfig/NodeInfo/EpochManager/sealed_epoch/tinylamb_admin すべて 0 ヒット）。「旧設計の kAddNode/kRemoveNode が廃止」と書くが廃止対象自体が存在しないため、文書は純粋な設計提案。2 層分離(L1/L2)と joint consensus のクラッシュ時規則は Raft 論文と整合して明快だが、promote 判定の時間条件が §4.1 と §4.3 で食い違い、quorum 記述が式と矛盾、シャード初期作成コマンドと L2 primary 削除手順が欠落している。
 
 ## 指摘一覧
 
@@ -10,7 +10,7 @@
 - 区分: 実態との乖離
 - 対象: docs/distributed_membership.md:131-145(§5)、:143(「旧設計の kAddNode/kRemoveNode/kShardConfig を廃止」)
 - 問題: 列挙型自体がリポジトリに存在せず、廃止対象も不在。読者は既存 FSM があると誤認しやすい。
-- 根拠: grep で MetaCmdType/ShardConfig/kSealEpoch/DurabilityMode すべて 0 件。nodeid_t も common/constants.hpp:147-151 に存在しない。
+- 根拠: grep で MetaCmdType/ShardConfig/kSealEpoch/DurabilityMode すべて 0 件。nodeid_t も common/constants.hpp:238-242(lsn_t/txn_id_t/page_id_t/slot_t/bin_size_t のエイリアス群)に存在しない。
 - 提案: 冒頭に「本書は設計仕様。WP-2a/2b で新設」と注記。§5 を「新設 enum 定義」と明示。
 
 ### M-2: 運用インターフェース(tinylamb_admin)全体が未実装で §7/§8/§9 の手順が実行不可能
@@ -50,10 +50,10 @@
 
 ### M-7: quorum 記述の不整合と voters=2 窓の可用性クリフ
 - 区分: 粒度不足
-- 対象: docs/distributed_membership.md:155、:229、:248; docs/distributed_migration.md:130
-- 問題: 式 `quorum = size/2+1` に対し、§7.2 は「quorum は常時 3 を保つ」(:248)、migration M3 は「voters={n1,n2,n3}, quorum=3」(:130) と書くが voters=3 なら quorum=2。voters=2 の中間状態(1→2 promote 直後)では quorum=2(全員一致)となり、n2 の追従遅延で seal が停滞。§7.1 は voters=4/5 の中間状態を評価するが 3→2 窓を無視。
-- 根拠: distributed.md:155 の式と§7.1 d(:233)、§7.2(:248) の記述が矛盾。M3 の promote 手順も同式に反する数値を記載。
-- 提案: 「quorum は常時 3」を「voter 3 台・耐障害 1 台(=quorum は 2↔3 で変動)」に修正。M3 の quorum=3 も 2 に修正。membershhip §6.2 に voters=2 窓の評価と catch-up 制御を追記。
+- 対象: docs/distributed_membership.md:155、:229、:252; docs/distributed_migration.md:130
+- 問題: 式 `quorum = size/2+1` に対し、§7.2 は「quorum は常時 3 を保つ」(:252)、migration M3 は「voters={n1,n2,n3}, quorum=3」(:130) と書くが voters=3 なら quorum=2。voters=2 の中間状態(1→2 promote 直後)では quorum=2(全員一致)となり、n2 の追従遅延で seal が停滞。§7.1 は voters=4/5 の中間状態を評価するが 3→2 窓を無視。
+- 根拠: distributed.md:160 の式と§7.1 d(:233)、§7.2(:252) の記述が矛盾。M3 の promote 手順も同式に反する数値を記載。
+- 提案: 「quorum は常時 3」を「voter 3 台・耐障害 1 台(=quorum は 2↔3 で変動)」に修正。M3 の quorum=3 も 2 に修正。membership §6.2 に voters=2 窓の評価と catch-up 制御を追記。
 
 ### M-8: kRemoveReplica を primary に対して実行する場合の扱いが未定義
 - 区分: 粒度不足
@@ -66,7 +66,7 @@
 - 区分: 粒度不足
 - 対象: docs/distributed_membership.md:266-267、:271-274
 - 問題: 「term+1 の単独構成エントリ」と書くが、誰の term に対する +1 かで、停止漏れの旧ノードがより大きい term を持つ場合の pre-vote 攪乱(:380 E-2)を考慮していない。
-- 根拠: distributed_raft.md:120-128(§5)の共通規則と :380 の E-2 参照。文書に term の出所規定なし。
+- 根拠: docs/distributed_raft.md:120-128(§5)の共通規則と :384 の E-2 参照。文書に term の出所規定なし。
 - 提案: 「観測可能な全制御ノードの term 最大値 + 1」を手続き化し、停止漏れ検出(pre-vote 不成立)を手順に追加。
 
 ### M-10: 基線再構築 min 採用の条件と learner 報告の扱いが不明確
@@ -80,7 +80,7 @@
 - 区分: 不明瞭
 - 対象: docs/distributed_membership.md:90,105,116,235,325(「迁移」); :122-129(learner の二重使用)
 - 問題: 日本語文書に簡体字「迁移」が 5 箇所。L1(Raft)と L2(WAL 受信)の learner が同名だが実体別物(§4.3 が自認)であり、表記上の区別がない。
-- 根拠: 上記行番号の通り。distributed_raft.md:42 の Role も L1 専用。
+- 根拠: 上記行番号の通り。docs/distributed_raft.md:45 の Role も L1 専用。
 - 提案: 「迁移」→「移行」に統一。L2 の learner を文書内で一貫して区別表記(例: shard-learner)にする。
 
 ## 未検証事項

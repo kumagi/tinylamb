@@ -168,6 +168,10 @@ StatusOr<bool> FullScan::TryFoldTypedBatches(
   return true;
 }
 
+// NOTE: this is currently a test-only path. It delegates to the store
+// without re-applying max_rows_/projection/lock_rows_/MVCC gates; do not wire
+// it into production statement execution until those contracts are honoured
+// (see TryExactUnfilteredRowCount below for the full gate list).
 StatusOr<ExecResult> FullScan::ExecuteLSTableFragment(const Fragment& fragment,
                                                       Runtime runtime) const {
   if (txn_ == nullptr || table_ == nullptr) {
@@ -197,7 +201,7 @@ std::optional<uint64_t> FullScan::TryExactUnfilteredRowCount() const {
       txn_->HasAnyPageVersionChains() || table_->RowsRewrittenInPlace()) {
     return std::nullopt;
   }
-  if (const auto tlcs = table_->GetBackingTLCSStore();
+  if (const auto tlcs = table_->GetBackingTlcsStore();
       tlcs != nullptr &&
       tlcs->LayoutGeneration() == table_->LayoutGeneration() &&
       tlcs->FirstPageId() == table_->FirstPageId()) {

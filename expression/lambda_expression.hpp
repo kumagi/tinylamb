@@ -11,8 +11,9 @@
 
 namespace tinylamb {
 
-// Inline lambda argument of a higher-order function, e.g. the `e -> e = 'b'`
-// in ARRAY_FIND(arr, e -> e = 'b').  The node is opaque to generic expression
+// Inline lambda argument of a higher-order function, e.g. `e -> e = 'b'` in
+// a future ARRAY_FIND-style call. No higher-order function is implemented yet.
+// The node is opaque to generic expression
 // walkers: its parameter references are bound only while the enclosing
 // higher-order function evaluates the body per element.
 class LambdaExpression : public ExpressionBase {
@@ -20,13 +21,19 @@ class LambdaExpression : public ExpressionBase {
   LambdaExpression(std::vector<std::string> parameters, Expression body)
       : parameters_(std::move(parameters)), body_(std::move(body)) {}
 
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kLambdaExp; }
+  [[nodiscard]] TypeTag NodeKind() const override {
+    return TypeTag::kLambdaExp;
+  }
   [[nodiscard]] StatusOr<Value> TryEvaluate(
       const Row& /*row*/, const Schema& /*schema*/) const override;
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
                                const Schema& /*schema*/) const override;
   [[nodiscard]] tinylamb::Type ResultType(
       const Schema& /*unused*/) const override {
+    return {TypeTag::kInvalid};
+  }
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& /*left*/,
+                                          const Schema& /*right*/) const override {
     return {TypeTag::kInvalid};
   }
   [[nodiscard]] std::string ToString() const override;

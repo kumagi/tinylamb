@@ -20,6 +20,13 @@ const Schema& LimitPlan::GetSchema() const { return src_->GetSchema(); }
 size_t LimitPlan::AccessRowCount() const { return src_->AccessRowCount(); }
 
 size_t LimitPlan::EmitRowCount() const {
+  // T3879: limit_count_ == 0 is the engine-wide "unbounded" sentinel on the
+  // UNORDERED limit route -- LimitExecutor::NextBatch (executor/limit.cpp)
+  // and LimitedRows read it the same way, so the estimate matches what the
+  // paired executor emits. An explicit `LIMIT 0` never plans through here:
+  // SqlEngine intercepts HasLimit()&&Limit()==0 before lowering a usable
+  // executor, and the ordered route goes through TopNPlan, whose executor
+  // really does treat 0 as an empty bound (see topn_plan.cpp).
   const size_t input = src_->EmitRowCount();
   if (input <= limit_offset_) {
     return 0;
@@ -31,7 +38,7 @@ size_t LimitPlan::EmitRowCount() const {
 void LimitPlan::Dump(std::ostream& o, int indent) const {
   o << "Limit: " << limit_count_ << " offset " << limit_offset_ << "\n"
     << Indent(static_cast<size_t>(indent) + 2);
-  src_->Dump(o, indent + 2);
+  DumpChild(o, *src_, indent + 2);
 }
 
 std::string LimitPlan::ToString() const {

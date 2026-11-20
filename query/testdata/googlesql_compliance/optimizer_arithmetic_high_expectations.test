@@ -334,11 +334,11 @@ ARRAY<STRUCT<id INT64, x INT64, y INT64, z FLOAT64>>[
 ==
 
 [mode=explain]
+# Same-direction steps can fold. Mixed signs must preserve intermediate overflow.
 [plan_contains=arithmetic_input.a + 8)]
 [plan_contains=arithmetic_input.a - 8)]
-[plan_contains=arithmetic_input.a - 3)]
-[plan_contains=arithmetic_input.a - 2)]
-[plan_not_contains=+ 5]
+[plan_contains=((arithmetic_input.a + 5) - 8)]
+[plan_contains=((arithmetic_input.a - 5) + 3)]
 [name=add_subtract_constant_reassociation_on_column]
 SELECT id, (a + 5) + 3 AS x, (a - 5) - 3 AS y,
        (a + 5) - 8 AS z, (a - 5) + 3 AS w

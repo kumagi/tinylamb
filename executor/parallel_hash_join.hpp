@@ -103,6 +103,10 @@ class ConcurrentJoinHashTable {
 
   [[nodiscard]] bool IntKeyEquals(const Shard& shard, size_t entry_index,
                                   const int64_t* key_parts) const;
+  // Called under the shard mutex during build (probes run only after the
+  // build barrier). Doubles a shard's bucket array and rethreads its chains
+  // so probe cost stays O(1) per bucket as the build side grows.
+  void GrowShard(Shard& shard);
 
   std::array<Shard, kShardCount> shards_;
   size_t int_key_parts_{0};  // 0 = byte-key mode
@@ -188,6 +192,7 @@ class SharedBuildParallelHashJoin : public ExecutorBase,
 
   ConcurrentJoinHashTable shared_hash_table_;
   std::vector<std::pair<Row, RowPosition>> output_;
+  std::mutex output_mu_;  // guards output_offset_ across concurrent consumers
   size_t output_offset_{0};
   bool materialized_{false};
   // Latched by EnsureMaterialized when materialization throws, so a retried

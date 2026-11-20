@@ -37,7 +37,7 @@ std::unique_ptr<SelectStatement> ParseSelect(const std::string& sql) {
     return nullptr;
   }
   return std::unique_ptr<SelectStatement>(
-      static_cast<SelectStatement*>(statement.release()));
+      static_cast<SelectStatement*>(statement.release()));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 TEST(JoinReductionTest, NullRejectingWhereReducesLeftJoin) {

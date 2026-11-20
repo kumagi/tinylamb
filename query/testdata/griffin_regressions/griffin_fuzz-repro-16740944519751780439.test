@@ -7,9 +7,14 @@
 -- stmt: INSERT INTO tree VALUES (1, NULL, 1.0), (2, 1, 2.5), (3, 1, 2.5), (4, 2, NULL), (5, 5, 0.0);
 -- stmt: CREATE TABLE t1 (a INT64, b STRING, c DOUBLE);
 -- stmt: SELECT b, COUNT(*) FROM t1 GROUP BY b;
--- stmt: SELECT t.id FROM tree t LEFT JOIN t1 k ON t.parent = k.id WHERE k.id IS NULL;
+-- stmt: SELECT t.id FROM tree t LEFT JOIN tree k ON t.parent = k.id WHERE k.id IS NULL;
 -- stmt: SELECT t1.a, t2.d FROM t1 JOIN t2 ON t1.a = t2.d ORDER BY t1.a;
--- stmt: INSERT INTO t1 (a, b, c) VALUES (1, 'x', 1.5), (2, 'y', NULL), (NULL, 'z', 3.25);
--- stmt: SELECT c.id, p.parent FROM tree c JOIN tree p ON w.parent = p.id ORDER BY c.id;
+-- stmt: INSERT INTO tree (a, b, c) VALUES (1, 'x', 1.5), (2, 'y', NULL), (NULL, 'z', 3.25);
+-- stmt: SELECT c.id, p.id FROM t1 c JOIN t1 p ON c.parent = p.id ORDER BY c.id;
+-- stmt: CREATE TABLE gf_lst (u INT64, a INT64, b FLOAT64, s STRING) USING lstable;
+-- stmt: INSERT INTO gf_lst VALUES (1, 10, 1.5, 'x'), (2, 10, -0.5, 'yy'), (3, 20, NULL, 'x'), (4, NULL, 3.25, NULL), (5, 20, 2.0, 'yy');
+-- stmt: ANALYZE gf_lst;
+-- stmt: SELECT a, s, COUNT(*), COUNT(s), SUM(a), SUM(b), MIN(s), MAX(s) FROM gf_lst GROUP BY CUBE(a, s);
+-- stmt: SELECT a, COUNT(*) FILTER (WHERE s = 'x') AS cx, SUM(a) FILTER (WHERE b > 0) AS sb FROM gf_lst GROUP BY a HAVING COUNT(*) FILTER (WHERE s = 'x') >= 0;
 -- ran_select: true
--- failure: evaluation-path mismatch
+-- failure: evaluation-path mismatch (statements regenerated after SubstituteIdentifiers became per-identifier consistent)

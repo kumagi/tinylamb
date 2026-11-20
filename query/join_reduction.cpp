@@ -231,7 +231,7 @@ bool NeverFalse(const Expression& expression,
       // NULL is the third truth value, not FALSE, so a NULL constant never
       // evaluates FALSE. Only an explicit FALSE constant does.
       const Value& v = expression->AsConstantValue().GetValue();
-      return !(!v.IsNull() && !v.Truthy());
+      return v.IsNull() || v.Truthy();
     }
     case TypeTag::kBinaryExp: {
       const BinaryExpression& binary = expression->AsBinaryExpression();
@@ -244,6 +244,7 @@ bool NeverFalse(const Expression& expression,
           // FALSE OR NULL is NULL: one never-false side is enough.
           return NeverFalse(binary.Left(), qualifiers) ||
                  NeverFalse(binary.Right(), qualifiers);
+        // NOLINTNEXTLINE(bugprone-branch-clone) distinct intent in each branch
         case BinaryOperation::kXor:
         case BinaryOperation::kAdd:
         case BinaryOperation::kSubtract:
@@ -605,6 +606,7 @@ bool HavingRejectsNullsOnPaddedSide(
   }
 
   const std::unordered_set<std::string> synth_qual{"__unmatched_having__"};
+  // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer here
   for (const Expression& conj : SplitConjuncts(normalized_having)) {
     const Expression probe = SubstituteUnmatchedAggregates(conj);
     if (!probe) {

@@ -49,6 +49,7 @@ class BandJoin final : public ExecutorBase {
                                                                 slot_t column);
   [[nodiscard]] StatusOr<bool> PairPasses(const Row& left,
                                           const Row& right) const;
+  mutable Row pair_scratch_;  // reused residual-predicate concatenation
   [[nodiscard]] std::pair<size_t, size_t> CandidateRange(int64_t value) const;
 
   Executor left_;

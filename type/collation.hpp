@@ -65,12 +65,11 @@ enum class Collation : uint8_t {
 // COLLATE() itself resolves its spec through CollationOfSpec.
 [[nodiscard]] Collation CollationFromName(std::string_view spec);
 
-// The collator COLLATE(value, 'spec') attaches: 'binary' is binary and every
-// other spec folds, matching the resolution the expression and batch
-// evaluators have always applied. An empty spec is a degenerate collator that
-// is still explicit and non-binary (the compliance corpus distinguishes
-// COLLATE(x, '') from COLLATE(x, 'und:ci')), so it folds too.
-[[nodiscard]] Collation CollationOfSpec(std::string_view spec);
+// The collator COLLATE(value, 'spec') attaches. GoogleSQL only permits
+// 'binary' and 'und:ci'; every other spec (including the empty string and
+// typos such as 'und-cl') is unsupported and must be rejected with an error
+// rather than silently folded to case-insensitive.
+[[nodiscard]] std::optional<Collation> CollationOfSpec(std::string_view spec);
 
 // The collation that governs a comparison of two operands. GoogleSQL resolves
 // an explicit COLLATE on either side for the whole comparison, and the engine
@@ -94,6 +93,23 @@ enum class Collation : uint8_t {
 // (CanonicalDistinctValue) and the sort-key encoders.
 [[nodiscard]] std::string FoldCaseForCollation(std::string_view s);
 
+// Allocation-free sibling of FoldCaseForCollation for hash paths (T3752):
+// folds each byte through the same ASCII A-Z -> a-z map and streams the
+// result into FNV-1a, so hashing a row pays no per-cell scratch string.
+// Only deterministic dependence on the folded bytes matters for bucketing,
+// and that matches FoldCaseForCollation byte for byte.
+[[nodiscard]] inline size_t HashFoldedForCollation(
+    std::string_view s) noexcept {
+  uint64_t hash = 14695981039346656037ULL;  // FNV-1a offset basis
+  for (const char c : s) {
+    const auto uc = static_cast<unsigned char>(c);
+    hash ^= uc >= 'A' && uc <= 'Z' ? static_cast<uint64_t>(uc + ('a' - 'A'))
+                                   : static_cast<uint64_t>(uc);
+    hash *= 1099511628211ULL;  // FNV-1a prime
+  }
+  return static_cast<size_t>(hash);
+}
+
 // Applies a collation to a value: a VARCHAR under a case-insensitive
 // collation comes back folded, and the collator tag rides along so
 // downstream comparisons and LIKE validation still see it. Every other
@@ -114,6 +130,11 @@ enum class Collation : uint8_t {
 [[nodiscard]] int CompareVarCharForOrderBy(std::string_view left,
                                            std::string_view right,
                                            bool case_insensitive);
+
+// ENUM member rank for synthetic ENUM values ("TESTENUMNEGATIVE" -> 0,
+// "TESTENUM0" -> 1, ...). Returns -1 for non-ENUM strings. Used by sort-key
+// encoders so ENUM members sort by rank, not raw bytes.
+[[nodiscard]] int EnumRank(std::string_view value);
 
 // Three-way comparison of two ORDER BY operands under their resolved
 // collation. NULLs compare equal (placement is the caller's decision, see
@@ -140,7 +161,7 @@ enum class Collation : uint8_t {
 // One ORDER BY term's full ordering contract: NULL placement, direction and
 // collation. Every comparison-based sort path in the engine (TopNExecutor,
 // PdqSort, MergeAppend, the relational ORDER BY) and the byte-encoding paths
-// (SortExecutor in-memory, its external merge runs, PartialSort) resolve
+// (SortExecutor in-memory, its external merge runs, the sort executors) resolve
 // their keys through this one type, so they cannot drift apart on NULL
 // placement, direction or case folding.
 //

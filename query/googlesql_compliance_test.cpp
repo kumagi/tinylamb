@@ -58,7 +58,8 @@ std::vector<Row> Drain(SqlEngine& engine, TransactionContext& context,
   if (!prepared.HasValue()) {
     *status = prepared.GetStatus();
     if (error_msg != nullptr) {
-      *error_msg = engine.LastError();
+      *error_msg = engine.LastError().empty() ? ToString(prepared.GetStatus())
+                                              : engine.LastError();
     }
     return {};
   }
@@ -74,7 +75,8 @@ std::vector<Row> Drain(SqlEngine& engine, TransactionContext& context,
   if (const Status st = prepared.Value()->GetStatus(); st != Status::kSuccess) {
     *status = Status::kUnknown;
     if (error_msg != nullptr) {
-      *error_msg = ToString(st);
+      *error_msg =
+          engine.LastError().empty() ? ToString(st) : engine.LastError();
     }
     return {};
   }
@@ -110,6 +112,15 @@ Status CreateComplianceSecondaryIndex(Database& database,
 
 bool RowsMatch(const std::vector<Row>& actual,
                const GoogleSqlComplianceCase& test_case, std::string* detail) {
+  // A single-field "NULL" golden may denote a whole-row NULL printed for a
+  // struct/proto value whose fields the engine flattens into several row
+  // slots. That collapse is only credible when the golden itself contains
+  // multi-field rows (proving the result is multi-column); when every
+  // expected row is single-field, a multi-column all-NULL actual row is an
+  // output-shape bug and must not match.
+  const bool golden_has_multi_field_rows = std::ranges::any_of(
+      test_case.expected_rows,
+      [](const std::vector<std::string>& fields) { return fields.size() > 1; });
   auto matches_expected = [&](const Row& row,
                               const std::vector<std::string>& expected) {
     // Value-table goldens print a whole-row NULL as a single "NULL" token;
@@ -129,7 +140,7 @@ bool RowsMatch(const std::vector<Row>& actual,
       return out;
     };
     if (expected.size() == 1 && lower_trim(expected[0]) == "null" &&
-        row.values_.size() > 1) {
+        row.values_.size() > 1 && golden_has_multi_field_rows) {
       return std::ranges::all_of(row.values_,
                                  [](const Value& v) { return v.IsNull(); });
     }
@@ -149,20 +160,32 @@ bool RowsMatch(const std::vector<Row>& actual,
     return false;
   }
   if (test_case.unknown_order) {
-    std::vector<bool> used(actual.size(), false);
-    for (const auto& expected : test_case.expected_rows) {
-      bool found = false;
-      for (size_t i = 0; i < actual.size(); ++i) {
-        if (used[i]) {
+    // Multiset match via bipartite matching (Kuhn): a greedy first-fit lets
+    // an early expected row steal the only actual row a later expectation
+    // can satisfy, producing false reds on legitimately unordered output.
+    const size_t n = actual.size();
+    std::vector<int64_t> match_actual(n, -1);
+    const auto try_match = [&](auto&& self, size_t expected_idx,
+                               std::vector<char>& seen) -> bool {
+      for (size_t j = 0; j < n; ++j) {
+        if (seen[j] != 0 ||
+            !matches_expected(actual[j],
+                              test_case.expected_rows[expected_idx])) {
           continue;
         }
-        if (matches_expected(actual[i], expected)) {
-          used[i] = true;
-          found = true;
-          break;
+        seen[j] = 1;
+        if (match_actual[j] < 0 ||
+            self(self, static_cast<size_t>(match_actual[j]), seen)) {
+          match_actual[j] = static_cast<int64_t>(expected_idx);
+          return true;
         }
       }
-      if (!found) {
+      return false;
+    };
+    for (size_t e = 0; e < test_case.expected_rows.size(); ++e) {
+      std::vector<char> seen(n, 0);
+      if (!try_match(try_match, e, seen)) {
+        const auto& expected = test_case.expected_rows[e];
         std::string exp_str = "{";
         for (size_t k = 0; k < expected.size(); ++k) {
           if (k != 0) {
@@ -524,7 +547,13 @@ TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
       if (test_case.prepare_database) {
         ++prepare_count;
       }
-      EXPECT_FALSE(test_case.sql.empty()) << name << " / " << test_case.name;
+      if (test_case.sql.empty() && !test_case.prepare_database) {
+        // Empty-SQL segments are dropped unless they still carry an expected
+        // result or error; the runner fails those loudly at execution time.
+        const bool verifiable =
+            !test_case.expected_rows.empty() || test_case.expect_error;
+        EXPECT_TRUE(verifiable) << name << " / " << test_case.name;
+      }
     }
   }
   EXPECT_GE(files.size(), 200U);
@@ -558,9 +587,23 @@ bool CaseFeatureSupported(const GoogleSqlComplianceCase& test_case) {
       "ANY_STRING_TEMPLATED_ARGUMENT",  // ANY STRING templated parameters
       "WITH_ON_SUBQUERY",               // WITH clauses inside function bodies
   };
-  return std::ranges::all_of(
-      test_case.required_features,
-      [&](const std::string& feature) { return kSupported.contains(feature); });
+  if (!std::ranges::all_of(test_case.required_features,
+                           [&](const std::string& feature) {
+                             return kSupported.contains(feature);
+                           })) {
+    return false;
+  }
+  // forbidden_features gates the opposite direction: the case is only
+  // valid while the engine LACKS the listed capability. tinylamb implements
+  // none of the corpus's forbidden flags today (the DISALLOW_* primary-key
+  // switches, TIMESTAMP_NANOS, DISABLE_ARRAY_MIN_AND_MAX,
+  // DISALLOW_LEGACY_UNICODE_COLLATION); the set stays empty so landing a
+  // capability later turns the skip on automatically.
+  static const std::unordered_set<std::string> kForbiddenCapabilities;
+  return std::ranges::all_of(test_case.forbidden_features,
+                             [&](const std::string& feature) {
+                               return !kForbiddenCapabilities.contains(feature);
+                             });
 }
 
 bool IsMutatingSql(std::string_view sql) {
@@ -612,6 +655,10 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
     }
   }
 
+  // Restore the thread-local compliance flag on every exit path.
+  struct ModeReset {  // NOLINT(cppcoreguidelines-special-member-functions)
+    ~ModeReset() { SqlEngine::SetCompliancePrimaryKeyMode(false); }
+  } mode_reset;
   const std::string path_prefix = "googlesql_compliance-" + RandomString(8);
   auto database = Database::Create(path_prefix).MoveValue();
   auto context = std::make_unique<TransactionContext>(database->BeginContext());
@@ -651,16 +698,36 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   };
   std::vector<PreparedSegment> prepare_segments;
   int environment_generation = 0;
+  // A failed replay leaves the fresh database in an unknown partial state;
+  // every later case in the file would then compare against wrong data, so
+  // the first failure is reported and all remaining cases are skipped.
+  bool replay_failed = false;
   auto replay_prepared_state = [&]() {
     for (const PreparedSegment& segment : prepare_segments) {
       SqlEngine::SetCompliancePrimaryKeyMode(
           segment.first_column_is_primary_key);
       for (const std::string& stmt : segment.statements) {
         Status s_status = Status::kSuccess;
-        Drain(*engine, *context, stmt, &s_status);
+        std::string replay_error;
+        Drain(*engine, *context, stmt, &s_status, &replay_error);
+        if (s_status != Status::kSuccess) {
+          ADD_FAILURE() << GetParam()
+                        << " prepared-state replay failed: " << replay_error
+                        << "\n"
+                        << stmt;
+          replay_failed = true;
+          return;
+        }
       }
       for (const std::string& index : segment.secondary_indexes) {
-        (void)CreateComplianceSecondaryIndex(*database, *context, index);
+        const Status index_status =
+            CreateComplianceSecondaryIndex(*database, *context, index);
+        if (index_status != Status::kSuccess) {
+          ADD_FAILURE() << GetParam() << " prepared-state index replay failed: "
+                        << ToString(index_status.GetCode()) << " " << index;
+          replay_failed = true;
+          return;
+        }
       }
     }
   };
@@ -673,6 +740,11 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
     // features (SQL_GRAPH, RANGE_TYPE, ...) gate their file's setup blocks,
     // exactly like the reference driver skips unsupported feature files.
     if (!CaseFeatureSupported(test_case)) {
+      continue;
+    }
+    if (replay_failed) {
+      // A previous state rebuild failed; this case would run against a
+      // partial database, so skip it explicitly rather than report noise.
       continue;
     }
     SetDefaultTimeZone(test_case.default_time_zone.empty()
@@ -730,6 +802,23 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
     SqlEngine::SetCompliancePrimaryKeyMode(test_case.primary_key_mode ==
                                            "first_column_is_primary_key");
 
+    if (test_case.sql.empty()) {
+      // The parser keeps result-bearing segments with no SQL so malformed
+      // corpus entries cannot vanish silently.
+      ADD_FAILURE() << GetParam() << " / " << test_case.name
+                    << " has an expected result but empty SQL\n"
+                    << test_case.raw_result;
+      continue;
+    }
+    if (!test_case.unparseable_parameters.empty()) {
+      ADD_FAILURE() << GetParam() << " / " << test_case.name
+                    << " has unparseable [parameters=] item(s):";
+      for (const std::string& item : test_case.unparseable_parameters) {
+        ADD_FAILURE() << "  " << item;
+      }
+      continue;
+    }
+
     Status status = Status::kSuccess;
     std::string error_msg;
     std::vector<Row> rows;
@@ -743,8 +832,10 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
             executed == StatementType::kUpdate ||
             executed == StatementType::kDelete) {
           // The reference driver reports num_rows_modified plus the full
-          // post-statement table contents; mirror that by scanning the
-          // target table after a successful mutation.
+          // post-statement table contents. This harness currently compares
+          // only the post-statement rows (the scalar affected-row count is
+          // not captured by the compliance case parser), so it cannot detect
+          // a wrong DML row count on its own.
           rows = Drain(*engine, *context,
                        "SELECT * FROM `" + engine->LastDmlTable() + "`",
                        &status, &error_msg);
@@ -755,6 +846,13 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
         ADD_FAILURE() << GetParam() << " / " << test_case.name
                       << " threw: " << ex.what() << "\n"
                       << test_case.sql;
+      } else {
+        EXPECT_TRUE(ComplianceErrorTextMatches(test_case.error_text, ex.what(),
+                                               std::string_view{}))
+            << GetParam() << " / " << test_case.name
+            << " expected error text: " << test_case.error_text
+            << ", engine threw: " << ex.what() << "\n"
+            << test_case.sql;
       }
       continue;
     }
@@ -763,6 +861,12 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       EXPECT_NE(status, Status::kSuccess)
           << GetParam() << " / " << test_case.name
           << " expected error, engine said: " << error_msg << "\n"
+          << test_case.sql;
+      EXPECT_TRUE(ComplianceErrorTextMatches(test_case.error_text, error_msg,
+                                             ToString(status.GetCode())))
+          << GetParam() << " / " << test_case.name
+          << " expected error text: " << test_case.error_text
+          << ", engine said: " << error_msg << "\n"
           << test_case.sql;
     } else if (status != Status::kSuccess) {
       ADD_FAILURE() << GetParam() << " / " << test_case.name
@@ -792,17 +896,21 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
         const std::vector<Row> explain_rows =
             Drain(*engine, *context, prefix + test_case.sql, &explain_status,
                   &explain_error);
-        ASSERT_EQ(explain_status, Status::kSuccess)
+        EXPECT_EQ(explain_status, Status::kSuccess)
             << GetParam() << " / " << test_case.name
             << " EXPLAIN failed: " << explain_error << "\n"
             << test_case.sql;
+        if (explain_status != Status::kSuccess) {
+          continue;
+        }
         std::string plan;
         for (const Row& explain_row : explain_rows) {
           if (!explain_row.values_.empty()) {
             if (!plan.empty()) {
               plan.push_back('\n');
             }
-            plan += explain_row[0].AsString();
+            // Match the EXPLAIN text itself, including quoted SQL literals.
+            plan += explain_row[0].AsStringView();
           }
         }
         for (const std::string& fragment : test_case.plan_contains) {

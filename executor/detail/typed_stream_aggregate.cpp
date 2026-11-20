@@ -596,7 +596,11 @@ struct CompiledLSTableBlockFilter {
           disj_all_pass = true;
           break;
         }
-        Scratch::ActiveBranchSlice slice{p_begin, p_end};
+        // NOLINTNEXTLINE(modernize-use-designated-initializers) positional init
+        // is clear
+        Scratch::ActiveBranchSlice slice{  // NOLINT(modernize-use-designated-initializers)
+            // NOLINT(modernize-use-designated-initializers)
+            p_begin, p_end};  // NOLINT(modernize-use-designated-initializers)
         // BETWEEN branches otherwise dispatch two generic comparisons and
         // load the same cell/null flag twice for each surviving row.
         if (p_end == p_begin + 2) {
@@ -705,7 +709,7 @@ struct CompiledLSTableBlockFilter {
       // Unsigned subtraction represents the inclusive signed interval even
       // when it crosses zero or touches either INT64 endpoint. Compact the
       // selection without a data-dependent branch for every input row.
-      const uint64_t lo = static_cast<uint64_t>(iv->lo);
+      const auto lo = static_cast<uint64_t>(iv->lo);
       const uint64_t width = static_cast<uint64_t>(iv->hi) - lo;
       const uint32_t count = initialized_sel ? m : n;
       uint32_t out_m = 0;
@@ -717,7 +721,9 @@ struct CompiledLSTableBlockFilter {
             uint32_t nonnull = 0;
             for (uint32_t i = 0; i < out_m; ++i) {
               const uint32_t row = (*sel)[i];
-              if (!col.IsNull(row)) (*sel)[nonnull++] = row;
+              if (!col.IsNull(row)) {
+                (*sel)[nonnull++] = row;
+              }
             }
             out_m = nonnull;
           }
@@ -765,29 +771,34 @@ struct CompiledLSTableBlockFilter {
             for (uint32_t i = 0; i < count; ++i) {
               const uint32_t row = selected ? (*sel)[i] : i;
               bool hit = compare(column.Double(row), constant);
-              if constexpr (nullable) hit &= !column.IsNull(row);
+              if constexpr (nullable) {
+                hit &= !column.IsNull(row);
+              }
               (*sel)[out] = row;
               out += static_cast<uint32_t>(hit);
             }
             m = out;
           };
           if (initialized_sel) {
-            if (column.has_null)
+            if (column.has_null) {
               run.template operator()<true, true>();
-            else
+            } else {
               run.template operator()<true, false>();
+            }
           } else {
-            if (column.has_null)
+            if (column.has_null) {
               run.template operator()<false, true>();
-            else
+            } else {
               run.template operator()<false, false>();
+            }
           }
         };
         const CompiledComparePred* paired =
             predicate + 1 < ws->active_stage1.size()
                 ? ws->active_stage1[predicate + 1]
                 : nullptr;
-        if (paired && paired->is_double && paired->cmp.constant_payload &&
+        if ((paired != nullptr) && paired->is_double &&
+            paired->cmp.constant_payload &&
             paired->full_left == pred->full_left &&
             ((pred->cmp.op == BinaryOperation::kGreaterThanEquals &&
               paired->cmp.op == BinaryOperation::kLessThanEquals) ||
@@ -840,7 +851,9 @@ struct CompiledLSTableBlockFilter {
           }
         }
         initialized_sel = true;
-        if (m == 0) return 0;
+        if (m == 0) {
+          return 0;
+        }
         continue;
       }
       if (!initialized_sel) {
@@ -1142,6 +1155,12 @@ inline bool EvalDirectDoubleExpr(const TypedDoubleExprInput& expr,
   }
   std::array<double, 16> stack{};
   size_t sp = 0;
+  // Producers cap ops at 16 entries so pushes can never exceed the stack;
+  // keep that bound explicit here instead of relying on the upstream
+  // compiler invariant.
+  if (expr.ops.size() > stack.size()) {
+    return false;
+  }
   for (const TypedDoubleExprOp& op : expr.ops) {
     switch (op.kind) {
       case TypedDoubleExprOp::Kind::kLoadDoubleCol: {
@@ -1187,6 +1206,14 @@ inline bool EvalDirectIntExpr(const TypedIntExprInput& expr,
                               uint32_t r, int64_t* out, Status* err) noexcept {
   std::array<int64_t, 16> stack{};
   size_t sp = 0;
+  // Producers cap ops at 16 entries so pushes can never exceed the stack;
+  // keep that bound explicit here instead of relying on the upstream
+  // compiler invariant.
+  if (expr.ops.size() > stack.size()) {
+    *err = StatusError(StatusCode::kInvalidArgument,
+                       "typed INT expression operand stack overflow");
+    return false;
+  }
   for (const TypedIntExprOp& op : expr.ops) {
     switch (op.kind) {
       case TypedIntExprOp::Kind::kLoadIntCol: {
@@ -1261,6 +1288,12 @@ inline Value FinishDirectState(SlimAggKind kind, int64_t cnt, int64_t itot,
       return cnt == 0 ? Value() : Value(dtot / static_cast<double>(cnt));
     case SlimAggKind::kCountDistinctInt64:
     case SlimAggKind::kCountDistinctDouble:
+      if (distinct_cnt >
+          static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        *error = StatusError(StatusCode::kIsInfinity,
+                             "COUNT(DISTINCT) overflow: result exceeds INT64");
+        return {};
+      }
       return Value(static_cast<int64_t>(distinct_cnt));
     case SlimAggKind::kMinInt64:
     case SlimAggKind::kMaxInt64:
@@ -1295,7 +1328,7 @@ inline uint64_t MixStringHash64(std::string_view sv) noexcept {
   return MixScalarHash64(std::hash<std::string_view>{}(sv));
 }
 
-Relation BuildScalarDirectOutput(
+StatusOr<std::optional<Relation>> BuildScalarDirectOutputChecked(
     const TypedAggregationPlan& plan, const SelectStatement& stmt,
     const Schema& qualified_schema, const Schema& table_schema,
     const std::vector<Value>& finished_values, size_t total_scanned,
@@ -1313,6 +1346,38 @@ Relation BuildScalarDirectOutput(
   std::vector<Value> row_values;
   row_values.reserve(plan.emit_items.size());
   for (const TypedEmitItem& item : plan.emit_items) {
+    if (const auto* post_agg_ptr = item.post_agg.get()) {
+      const auto& post_agg = *post_agg_ptr;
+      std::vector<Value> post_agg_cells;
+      post_agg_cells.reserve(post_agg.slots.size());
+      bool types_match_schema = post_agg_ptr->program.has_value();
+      for (size_t si = 0; si < post_agg.slots.size(); ++si) {
+        const auto& slot = post_agg.slots[si];
+        if (slot.is_key || slot.index >= finished_values.size()) {
+          return std::optional<Relation>{};
+        }
+        Value arg = finished_values[slot.index];
+        if (types_match_schema && !arg.IsNull()) {
+          const ValueType expected = post_agg.eval_schema.GetColumn(si).Type();
+          if (expected != ValueType::kNull && arg.type != expected) {
+            types_match_schema = false;
+          }
+        }
+        post_agg_cells.push_back(std::move(arg));
+      }
+      const Row eval_row(std::move(post_agg_cells));
+      if (types_match_schema && post_agg_ptr->program.has_value()) {
+        ASSIGN_OR_RETURN(Value, evaluated,
+                         TryEvaluateRowAuto(*post_agg_ptr->program, eval_row));
+        row_values.push_back(std::move(evaluated));
+      } else {
+        ASSIGN_OR_RETURN(
+            Value, evaluated,
+            post_agg.expr->TryEvaluate(eval_row, post_agg.eval_schema));
+        row_values.push_back(std::move(evaluated));
+      }
+      continue;
+    }
     row_values.push_back(item.constant ? *item.constant
                                        : finished_values[item.index]);
   }
@@ -1344,7 +1409,23 @@ Relation BuildScalarDirectOutput(
     runtime->aggregate_updates += total_updates;
     runtime->aggregate_ms += ElapsedMs(merge_begin);
   }
-  return output;
+  return std::optional<Relation>(std::move(output));
+}
+
+Relation BuildScalarDirectOutput(
+    const TypedAggregationPlan& plan, const SelectStatement& stmt,
+    const Schema& qualified_schema, const Schema& table_schema,
+    const std::vector<Value>& finished_values, size_t total_scanned,
+    size_t total_matching, size_t total_updates, bool publish_lstable_marker,
+    const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin,
+    std::chrono::steady_clock::time_point merge_begin,
+    ExecutionRuntime* runtime) {
+  auto checked = BuildScalarDirectOutputChecked(
+      plan, stmt, qualified_schema, table_schema, finished_values,
+      total_scanned, total_matching, total_updates, publish_lstable_marker,
+      fold_cache_key, scan_begin, merge_begin, runtime);
+  return std::move(*checked.MoveValue());  // NOLINT(bugprone-unchecked-optional-access)
 }
 
 // Two-pass sharded parallel scalar COUNT(DISTINCT col) over LSTableStore.
@@ -1949,7 +2030,10 @@ std::optional<std::vector<Value>> TryScalarBlockMetaMinMax(
   return finished;
 }
 
-// O(domain <= 255) fast path for single-column narrow dictionary scalar aggs.
+// Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+//   (dict_exact_freq_filtered_count_sound, filtered_extremum_bound_unsound_bug)
+// O(|D|) exact frequency fold for single-column (filtered) or multi-column
+// (unfiltered marginal) dictionary-encoded scalar aggregates.
 StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
     const LSTableStore& store, const Schema& table_schema,
     const CompiledLSTableBlockFilter& filter,
@@ -1957,6 +2041,158 @@ StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
   if (filter.always_false || !filter.disjunctions.empty()) {
     return std::optional<std::vector<Value>>{};
   }
+  constexpr size_t kMaxShortcutDictEntries = 262'144;
+  const bool unfiltered = filter.null_preds.empty() &&
+                          filter.int_intervals.empty() &&
+                          filter.stage1_preds.empty();
+  if (unfiltered) {
+    for (const DirectAggBinding& b : bindings) {
+      if (b.is_count_star) {
+        continue;
+      }
+      if (b.int_expr != nullptr || b.double_expr != nullptr ||
+          !b.full_col.has_value()) {
+        return std::optional<std::vector<Value>>{};
+      }
+      const slot_t c = *b.full_col;
+      if (c >= store.dictionaries.size() || c >= table_schema.ColumnCount() ||
+          table_schema.GetColumn(c).IsUnsigned()) {
+        return std::optional<std::vector<Value>>{};
+      }
+      const LSTableColumnDictionary& dict = store.dictionaries[c];
+      const ValueType vt = dict.value_type;
+      if (!dict.active && dict.wide_code_bytes == 0) {
+        return std::optional<std::vector<Value>>{};
+      }
+      if (vt != ValueType::kInt64 && vt != ValueType::kDate &&
+          vt != ValueType::kVarChar) {
+        return std::optional<std::vector<Value>>{};
+      }
+      if (vt == ValueType::kVarChar &&
+          (!dict.bytewise_equality || table_schema.GetColumn(c).IsInterval() ||
+           b.kind != SlimAggKind::kCount)) {
+        return std::optional<std::vector<Value>>{};
+      }
+      const size_t ec = vt == ValueType::kVarChar ? dict.StringEntryCount()
+                                                  : dict.IntEntryCount();
+      if (ec > kMaxShortcutDictEntries || dict.code_counts.size() != ec + 1) {
+        return std::optional<std::vector<Value>>{};
+      }
+      switch (b.kind) {
+        case SlimAggKind::kCount:
+        case SlimAggKind::kSumInt64:
+        case SlimAggKind::kAvgDouble:
+        case SlimAggKind::kCountDistinctInt64:
+        case SlimAggKind::kMinInt64:
+        case SlimAggKind::kMaxInt64:
+        case SlimAggKind::kMinDate:
+        case SlimAggKind::kMaxDate:
+          break;
+        default:
+          return std::optional<std::vector<Value>>{};
+      }
+    }
+
+    std::vector<Value> finished(bindings.size());
+    for (size_t a = 0; a < bindings.size(); ++a) {
+      const DirectAggBinding& b = bindings[a];
+      if (b.is_count_star) {
+        finished[a] = Value(static_cast<int64_t>(store.total_rows));
+        continue;
+      }
+      const slot_t c = *b.full_col;
+      const LSTableColumnDictionary& dict = store.dictionaries[c];
+      const ValueType vt = dict.value_type;
+      const size_t ec = vt == ValueType::kVarChar ? dict.StringEntryCount()
+                                                  : dict.IntEntryCount();
+      int64_t cnt_acc = 0;
+      int64_t itot = 0;
+      double dtot = 0.0;
+      size_t distinct_cnt = 0;
+      platform::Int128 sum_pos = 0;
+      platform::Int128 sum_neg = 0;
+      platform::Int128 sum_run = 0;
+      // P596: exact Σ|value| when this binding is an AVG (see the arm).
+      platform::Int128 dtot_abs = 0;
+      for (size_t code = 0; code < ec; ++code) {
+        const int64_t cnt = dict.code_counts[code];
+        if (cnt <= 0) {
+          continue;
+        }
+        if (vt == ValueType::kVarChar) {
+          cnt_acc += cnt;
+          continue;
+        }
+        const int64_t iv = dict.IntEntryAt(code);
+        switch (b.kind) {
+          case SlimAggKind::kCount:
+            cnt_acc += cnt;
+            break;
+          case SlimAggKind::kSumInt64: {
+            const platform::Int128 prod =
+                static_cast<platform::Int128>(iv) * cnt;
+            sum_run += prod;
+            if (prod < 0) {
+              sum_neg += prod;
+            } else {
+              sum_pos += prod;
+            }
+            cnt_acc += cnt;
+            break;
+          }
+          case SlimAggKind::kAvgDouble: {
+            // P596: the multiply re-associates the canonical row-ordered
+            // double fold; only exact while Σ|v| <= 2^53 (checked below).
+            const platform::Int128 prod =
+                static_cast<platform::Int128>(iv) * cnt;
+            dtot_abs += prod < 0 ? -prod : prod;
+            dtot += static_cast<double>(iv) * static_cast<double>(cnt);
+            cnt_acc += cnt;
+            break;
+          }
+          case SlimAggKind::kCountDistinctInt64:
+            ++distinct_cnt;
+            break;
+          case SlimAggKind::kMinInt64:
+          case SlimAggKind::kMinDate:
+            if (cnt_acc == 0 || iv < itot) {
+              itot = iv;
+            }
+            cnt_acc += cnt;
+            break;
+          case SlimAggKind::kMaxInt64:
+          case SlimAggKind::kMaxDate:
+            if (cnt_acc == 0 || itot < iv) {
+              itot = iv;
+            }
+            cnt_acc += cnt;
+            break;
+          default:
+            return std::optional<std::vector<Value>>{};
+        }
+      }
+      if (b.kind == SlimAggKind::kSumInt64) {
+        if (sum_pos > std::numeric_limits<int64_t>::max() ||
+            sum_neg < std::numeric_limits<int64_t>::min()) {
+          return std::optional<std::vector<Value>>{};
+        }
+        itot = static_cast<int64_t>(sum_run);
+      }
+      if (b.kind == SlimAggKind::kAvgDouble &&
+          dtot_abs > static_cast<platform::Int128>(INT64_C(1) << 53)) {
+        return std::optional<std::vector<Value>>{};
+      }
+      Status err = Status::kSuccess;
+      finished[a] =
+          FinishDirectState(b.kind, cnt_acc, itot, dtot, 0, distinct_cnt, &err);
+      if (!err.ok()) {
+        return err;
+      }
+    }
+    *matching_rows_out = store.total_rows;
+    return std::optional<std::vector<Value>>(std::move(finished));
+  }
+
   std::optional<slot_t> target_col;
   for (const auto& np : filter.null_preds) {
     if (target_col && *target_col != np.full_col) {
@@ -2013,7 +2249,7 @@ StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
   const slot_t c = *target_col;
   const LSTableColumnDictionary& dict = store.dictionaries[c];
   const ValueType vt = dict.value_type;
-  if (!dict.active) {
+  if (!dict.active && dict.wide_code_bytes == 0) {
     return std::optional<std::vector<Value>>{};
   }
   if (vt != ValueType::kInt64 && vt != ValueType::kDate &&
@@ -2029,6 +2265,9 @@ StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
   if (dict.code_counts.size() != entry_count + 1) {
     return std::optional<std::vector<Value>>{};
   }
+  if (entry_count > kMaxShortcutDictEntries) {
+    return std::optional<std::vector<Value>>{};
+  }
 
   const size_t naggs = bindings.size();
   std::vector<int64_t> counts(naggs, 0);
@@ -2038,6 +2277,8 @@ StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
   std::vector<platform::Int128> sum_pos(naggs, 0);
   std::vector<platform::Int128> sum_neg(naggs, 0);
   std::vector<platform::Int128> sum_run(naggs, 0);
+  // P596: exact Σ|value| per AVG binding (see the kAvgDouble arm below).
+  std::vector<platform::Int128> dtot_abs(naggs, 0);
   size_t total_matching = 0;
 
   for (size_t code = 0; code <= entry_count; ++code) {
@@ -2129,6 +2370,14 @@ StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
         }
         counts[a] += cnt;
       } else if (kind == SlimAggKind::kAvgDouble) {
+        // P596: the canonical AVG adds double(v) row-by-row in scan order;
+        // the multiply here re-associates that accumulation, so the same SQL
+        // differs by ULPs purely with plan shape.  While the exact integer
+        // Σ|v| stays within 2^53 every intermediate is an exactly
+        // representable double and any accumulation order is bit-identical;
+        // beyond that defer to the row-ordered path (SUM arm's precedent).
+        const platform::Int128 prod = static_cast<platform::Int128>(iv) * cnt;
+        dtot_abs[a] += prod < 0 ? -prod : prod;
         dtot[a] += static_cast<double>(iv) * static_cast<double>(cnt);
         counts[a] += cnt;
       } else if (kind == SlimAggKind::kCountDistinctInt64) {
@@ -2161,6 +2410,14 @@ StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
       return std::optional<std::vector<Value>>{};
     }
     itot[a] = static_cast<int64_t>(sum_run[a]);
+  }
+  for (size_t a = 0; a < naggs; ++a) {
+    if (bindings[a].kind == SlimAggKind::kAvgDouble &&
+        dtot_abs[a] > static_cast<platform::Int128>(INT64_C(1) << 53)) {
+      // Re-association could move the double sum; the row-ordered fold is
+      // the ground truth (invariant 3), so let it answer instead.
+      return std::optional<std::vector<Value>>{};
+    }
   }
   std::vector<Value> finished(naggs);
   for (size_t a = 0; a < naggs; ++a) {
@@ -2433,7 +2690,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
   if (count_distinct_result) {
     return count_distinct_result;
   }
-  if (!direct_children || stream_runtime_filter != nullptr ||
+  if (stream_runtime_filter != nullptr ||
       stream_prebuilt_membership != nullptr ||
       (!plan.filter_programs.empty() && !plan.only_null_filter_programs) ||
       !(stmt.GroupBy().empty() || stmt.IsGroupAll()) ||
@@ -2444,8 +2701,15 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
     return std::optional<Relation>{};
   }
   for (const TypedEmitItem& item : plan.emit_items) {
-    if (item.post_agg != nullptr || item.dependent_key || item.is_key) {
+    if (item.dependent_key || item.is_key) {
       return std::optional<Relation>{};
+    }
+    if (item.post_agg != nullptr) {
+      for (const auto& sl : item.post_agg->slots) {
+        if (sl.is_key) {
+          return std::optional<Relation>{};
+        }
+      }
     }
   }
   CompiledLSTableBlockFilter filter;
@@ -2461,11 +2725,11 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
 
   if (auto meta_finished = TryScalarBlockMetaMinMax(store, filter, bindings)) {
     const auto merge_begin = std::chrono::steady_clock::now();
-    return std::optional<Relation>(BuildScalarDirectOutput(
+    return BuildScalarDirectOutputChecked(
         plan, stmt, qualified_schema, table_schema, *meta_finished,
         store.total_rows, store.total_rows, store.total_rows,
         publish_lstable_marker, fold_cache_key, scan_begin, merge_begin,
-        runtime));
+        runtime);
   }
   size_t dict_matching = 0;
   ASSIGN_OR_RETURN(std::optional<std::vector<Value>>, dict_finished,
@@ -2473,10 +2737,10 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
                                                bindings, &dict_matching));
   if (dict_finished) {
     const auto merge_begin = std::chrono::steady_clock::now();
-    return std::optional<Relation>(BuildScalarDirectOutput(
+    return BuildScalarDirectOutputChecked(
         plan, stmt, qualified_schema, table_schema, *dict_finished,
         store.total_rows, dict_matching, dict_matching, publish_lstable_marker,
-        fold_cache_key, scan_begin, merge_begin, runtime));
+        fold_cache_key, scan_begin, merge_begin, runtime);
   }
   ASSIGN_OR_RETURN(
       std::optional<Relation>, linear_sum_result,
@@ -2493,21 +2757,34 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
   // Nullable/encoded/string columns retain the ordinary block path.
   constexpr size_t kFlatBatchRows = 16384;
   std::vector<uint8_t> flat_needed = filter.referenced_full_cols;
-  for (size_t c = 0; c < agg_bind_cols.size(); ++c)
+  for (size_t c = 0; c < agg_bind_cols.size(); ++c) {
     flat_needed[c] |= agg_bind_cols[c];
+  }
   bool coalesce = store.total_rows >= 4096 && !store.blocks.empty();
   for (size_t c = 0; coalesce && c < flat_needed.size(); ++c) {
-    if (!flat_needed[c]) continue;
+    // NOLINTNEXTLINE(readability-uppercase-literal-suffix) literal suffix style
+    if (flat_needed[c] == 0u) {
+      continue;
+    }
     coalesce = c < store.integer_columns.size() &&
                store.integer_columns[c].size() == store.total_rows &&
-               !store.column_has_null[c] &&
+               // NOLINTNEXTLINE(readability-uppercase-literal-suffix) literal
+               // suffix style
+               (store.column_has_null[c] ==
+                0u) &&  // NOLINT(readability-uppercase-literal-suffix)
                (store.blocks.front().columns[c].type == ValueType::kInt64 ||
                 store.blocks.front().columns[c].type == ValueType::kDate ||
                 store.blocks.front().columns[c].type == ValueType::kDouble);
     // Preserve page-level range pruning for ordered predicate columns.
-    if (filter.referenced_full_cols[c] &&
-        c < store.column_is_monotonic.size() && store.column_is_monotonic[c])
+    // NOLINTNEXTLINE(readability-uppercase-literal-suffix) literal suffix style
+    if ((filter.referenced_full_cols[c] != 0u) &&
+        // NOLINTNEXTLINE(readability-uppercase-literal-suffix) literal suffix
+        // style
+        c < store.column_is_monotonic.size() &&
+        (store.column_is_monotonic[c] !=
+         0u)) {  // NOLINT(readability-uppercase-literal-suffix)
       coalesce = false;
+    }
   }
   std::shared_ptr<QueryMemoryCharge> flat_scratch_charge;
   if (coalesce) {
@@ -2553,20 +2830,22 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
     LSTablePageBlock flat_block;
     if (coalesce) {
       flat_block.columns.resize(flat_needed.size());
-      for (size_t c = 0; c < flat_needed.size(); ++c)
+      for (size_t c = 0; c < flat_needed.size(); ++c) {
         if (flat_needed[c])
           flat_block.columns[c].type = store.blocks.front().columns[c].type;
+      }
     }
     for (size_t bi = blk_begin; bi < blk_end; ++bi) {
       if (coalesce) {
         const size_t begin = bi * kFlatBatchRows;
         flat_block.row_count = static_cast<uint32_t>(
             std::min<uint64_t>(kFlatBatchRows, store.total_rows - begin));
-        for (size_t c = 0; c < flat_needed.size(); ++c)
+        for (size_t c = 0; c < flat_needed.size(); ++c) {
           if (flat_needed[c])
             flat_block.columns[c].int_cells =
                 std::span<const int64_t>(store.integer_columns[c])
                     .subspan(begin, flat_block.row_count);
+        }
       }
       const auto& blk = coalesce ? flat_block : store.blocks[bi];
       st.scanned_rows += blk.row_count;
@@ -3159,10 +3438,10 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
       return finish_err;
     }
   }
-  return std::optional<Relation>(BuildScalarDirectOutput(
+  return BuildScalarDirectOutputChecked(
       plan, stmt, qualified_schema, table_schema, finished_values,
       total_scanned, total_matching, total_updates, publish_lstable_marker,
-      fold_cache_key, scan_begin, merge_begin, runtime));
+      fold_cache_key, scan_begin, merge_begin, runtime);
 }
 
 StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
@@ -3178,7 +3457,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
     size_t worker_count, ExecutionRuntime* runtime, bool publish_lstable_marker,
     const std::string& fold_cache_key,
     std::chrono::steady_clock::time_point scan_begin) {
-  if (!direct_children || stream_runtime_filter != nullptr ||
+  if (stream_runtime_filter != nullptr ||
       stream_prebuilt_membership != nullptr ||
       (!plan.filter_programs.empty() && !plan.only_null_filter_programs) ||
       stmt.GroupBy().empty() || stmt.IsGroupAll() ||
@@ -3208,7 +3487,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   if (key_min <= key_max) {
     const uint64_t raw_span =
         static_cast<uint64_t>(key_max) - static_cast<uint64_t>(key_min) + 1ULL;
-    if (raw_span == 0 || raw_span > 65536ULL) {
+    if (raw_span == 0 || raw_span > 262144ULL) {
       return std::optional<Relation>{};
     }
     span = static_cast<size_t>(raw_span);
@@ -3249,12 +3528,17 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   // Defer to existing fast_dict_double_agg when no nullable columns, no
   // null_filters, no disjunctions, no min/max, no non-constant/double compares,
   // and at most 1 aggregate exist.
-  bool needs_this_path = key_nullable || !plan.filter_programs.empty() ||
-                         !plan.filter_disjunctions.empty() ||
-                         bindings.size() > 1 ||
-                         (having_expr != nullptr && positional_having.empty());
+  bool needs_this_path =
+      key_nullable || !plan.filter_programs.empty() ||
+      !plan.filter_disjunctions.empty() || bindings.size() > 1 ||
+      (having_expr != nullptr && positional_having.empty()) || span > 65536U ||
+      (store.total_rows >= 65536 && worker_count > 1 &&
+       std::ranges::any_of(plan.slim_kinds, [](SlimAggKind k) {
+         return k == SlimAggKind::kSumDouble || k == SlimAggKind::kAvgDouble;
+       }));
   for (const DirectAggBinding& b : bindings) {
-    if (IsSlimMinMaxKind(b.kind)) {
+    if (!direct_children || b.int_expr != nullptr || b.double_expr != nullptr ||
+        IsSlimMinMaxKind(b.kind)) {
       needs_this_path = true;
     }
     if (b.full_col.has_value() && store.column_has_null[*b.full_col] != 0) {
@@ -3975,8 +4259,10 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       phase_begin = std::chrono::steady_clock::now();
     }
   };
-  const auto direct_lstable_store = SnapshotColumnStore(
-      context, table, projection, qualified_schema.ColumnCount());
+  auto direct_lstable_store =
+      SnapshotColumnStore(context, table, projection,
+                          qualified_schema.ColumnCount(),
+                          /*allow_lazy_build=*/false);
   const bool int_key =
       plan.key_offsets.size() == 1 &&
       (qualified_schema.GetColumn(plan.key_offsets[0]).Type() ==
@@ -4038,6 +4324,37 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   const bool fill_cache = raw_fill_cache && !lstable_skip_cache_copy &&
                           stream_runtime_filter == nullptr &&
                           stream_prebuilt_membership == nullptr;
+  // When no resident LSTableStore covers this projection yet, try streaming
+  // compressed TlcsFile blocks directly first so large TLCS-backed tables do
+  // not pay multi-GB lazy LSTableStore deserialization before reaching the
+  // zero-copy columnar kernel.
+  bool tried_columnar_tlcs = false;
+  if (direct_lstable_store == nullptr && cached_relation == nullptr &&
+      !fill_cache && stream_runtime_filter == nullptr &&
+      stream_prebuilt_membership == nullptr) {
+    tried_columnar_tlcs = true;
+    ASSIGN_OR_RETURN(
+        std::optional<Relation>, columnar_tlcs_result,
+        TryRunColumnarTlcsAggregate(
+            context, stmt, having_expr, table, projection, qualified_schema,
+            table_schema, &plan, aggregate_expressions, {}, nullptr, runtime,
+            publish_lstable_marker, fold_cache_key, scan_begin));
+    if (columnar_tlcs_result) {
+      phase("columnar-tlcs-agg",
+            QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+            columnar_tlcs_result->rows.size());
+      return std::move(*columnar_tlcs_result);
+    }
+    direct_lstable_store =
+        SnapshotColumnStore(context, table, projection,
+                            qualified_schema.ColumnCount(),
+                            /*allow_lazy_build=*/true);
+  } else if (direct_lstable_store == nullptr) {
+    direct_lstable_store =
+        SnapshotColumnStore(context, table, projection,
+                            qualified_schema.ColumnCount(),
+                            /*allow_lazy_build=*/true);
+  }
   // A string's byte length is already available from the column's offsets.
   // Preserve the bytecode child for row/arena fallbacks and recognize only
   // this exact context-free operation for the direct column scan.
@@ -4076,10 +4393,25 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // with more than 8 aggregates must keep the generic path (or they write
   // past the array); the non-slim folds never touch the scratch and stay
   // eligible at any aggregate count.
+  if (direct_lstable_store != nullptr && cached_relation == nullptr &&
+      !fill_cache && !plan.null_filters.empty()) {
+    std::erase_if(plan.null_filters, [&](const TypedNullCompare& nf) {
+      if (nf.is_null) {
+        return false;
+      }
+      const slot_t full_c =
+          projection.empty() ? nf.column : projection[nf.column];
+      return full_c < direct_lstable_store->column_has_null.size() &&
+             direct_lstable_store->column_has_null[full_c] == 0;
+    });
+    if (plan.null_filters.empty() && plan.only_null_filter_programs) {
+      plan.filter_programs.clear();
+    }
+  }
   const bool use_direct_lstable =
       direct_lstable_store != nullptr && cached_relation == nullptr &&
-      !fill_cache && plan.filter_programs.empty() && plan.null_filters.empty() &&
-      direct_children &&
+      !fill_cache && plan.filter_programs.empty() &&
+      plan.null_filters.empty() && direct_children &&
       (!plan.slim || plan.aggregates.size() <= 8);
   if (use_direct_lstable && !having_expr && stream_runtime_filter == nullptr &&
       stream_prebuilt_membership == nullptr) {
@@ -4117,7 +4449,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     }
   }
   if (direct_lstable_store != nullptr && cached_relation == nullptr &&
-      !fill_cache && direct_children && stream_runtime_filter == nullptr &&
+      !fill_cache && stream_runtime_filter == nullptr &&
       stream_prebuilt_membership == nullptr &&
       (plan.filter_programs.empty() || plan.only_null_filter_programs)) {
     std::vector<slot_t> fast_proj_to_full(qualified_schema.ColumnCount());
@@ -4160,7 +4492,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       return std::move(*bounded_fast_result);
     }
   }
-  if (cached_relation == nullptr && !fill_cache &&
+  if (!tried_columnar_tlcs && cached_relation == nullptr && !fill_cache &&
       stream_runtime_filter == nullptr &&
       stream_prebuilt_membership == nullptr) {
     ASSIGN_OR_RETURN(
@@ -4932,9 +5264,13 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       const ValueType type = qualified_schema.GetColumn(i).Type();
       // Row-fill mirrors contain fixed-width cells only. VARCHAR requires
       // the typed decoder's byte arenas and cumulative end offsets.
+      // Interval columns are VARCHAR cells carrying an interval tag that the
+      // typed arena/batch boxing would drop (Value::IsInterval reads
+      // collation_), so keep them on the Row path that preserves the tag.
       if ((type == ValueType::kVarChar && !typed_fill_enabled) ||
           (type != ValueType::kInt64 && type != ValueType::kDate &&
-           type != ValueType::kDouble && type != ValueType::kVarChar)) {
+           type != ValueType::kDouble && type != ValueType::kVarChar) ||
+          qualified_schema.GetColumn(i).IsInterval()) {
         all_typed = false;
         break;
       }
@@ -4953,6 +5289,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
       fill_arena->null_bits.resize(fill_arena->stride);
       fill_arena->varchars.resize(varchar_count);
+      // slot_types is final; build the shared lookup cache before any
+      // concurrent reader (filter/boxing workers) touches the arena.
+      fill_arena->PrepareVarcharOrdinals();
       arena_cell_buffer.resize(fill_arena->stride);
       arena_null_buffer.resize(fill_arena->stride);
       varchar_ordinal.assign(fill_arena->stride, SIZE_MAX);
@@ -5035,14 +5374,6 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // both in the per-row fold and in the worker-order merge, so splitting is
   // unsound for it in every shape; keep the fold on one worker (COUNT/MIN/
   // MAX stay parallel-capable kinds).
-  if (plan.slim && std::ranges::any_of(
-                       plan.slim_kinds, [](SlimAggKind k) {
-                         return k == SlimAggKind::kSumDouble ||
-                                k == SlimAggKind::kAvgDouble ||
-                                k == SlimAggKind::kSumInt64;
-                       })) {
-    worker_count = 1;
-  }
   bool bounded = false;
   size_t topn_capacity = 0;
   if (!stmt.Distinct() && stmt.HasLimit() && !stmt.WithTies() &&
@@ -5061,6 +5392,33 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       positional_having.clear();
     }
   }
+  // A/B hatch: TINYLAMB_DISABLE_FLAT_GROUP_FOLD=1 restores the per-group
+  // vector-of-vector group storage.
+  static const bool flat_fold_disabled =
+      std::getenv("TINYLAMB_DISABLE_FLAT_GROUP_FOLD") != nullptr;
+  const slot_t early_mono_full_key =
+      (int_key && plan.key_offsets.size() == 1)
+          ? (projection.empty() ? plan.key_offsets[0]
+                                : projection[plan.key_offsets[0]])
+          : 0;
+  const bool early_monotonic_int_key =
+      use_direct_lstable && direct_lstable_store->total_rows >= 65536 &&
+      stream_prebuilt_membership == nullptr && int_key &&
+      plan.key_offsets.size() == 1 && !flat_fold_disabled && plan.slim &&
+      plan.order_items.empty() && plan.dependent_key_programs.empty() &&
+      !bounded && (!having_expr || !positional_having.empty()) &&
+      early_mono_full_key < direct_lstable_store->column_is_monotonic.size() &&
+      direct_lstable_store->column_is_monotonic[early_mono_full_key] != 0 &&
+      direct_lstable_store->column_has_null[early_mono_full_key] == 0;
+  if (plan.slim && std::ranges::any_of(plan.slim_kinds, [&](SlimAggKind k) {
+        if (k == SlimAggKind::kSumInt64) {
+          return true;
+        }
+        return !early_monotonic_int_key &&
+               (k == SlimAggKind::kSumDouble || k == SlimAggKind::kAvgDouble);
+      })) {
+    worker_count = 1;
+  }
   // The per-aggregate classification (array element type, SUM column-name
   // scan) is identical for every group of every worker; derive it once.
   std::vector<AggregateAccumulator::Shape> aggregate_shapes;
@@ -5069,10 +5427,6 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     aggregate_shapes.push_back(
         AggregateAccumulator::AnalyzeShape(aggregate, nullptr));
   }
-  // A/B hatch: TINYLAMB_DISABLE_FLAT_GROUP_FOLD=1 restores the per-group
-  // vector-of-vector group storage.
-  static const bool flat_fold_disabled =
-      std::getenv("TINYLAMB_DISABLE_FLAT_GROUP_FOLD") != nullptr;
   std::vector<TypedWorkerGroups> workers(worker_count);
   for (TypedWorkerGroups& local : workers) {
     local.int_key = int_key;
@@ -5282,7 +5636,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       const int64_t hi = direct_lstable_store->column_max_int[full0];
       const uint64_t span =
           static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1ULL;
-      if (span > 0 && span <= 65536ULL) {
+      if (span > 0 && span <= 262144ULL) {
         bounded_int_group_key = true;
         bounded_int_min = lo;
         bounded_int_span = static_cast<size_t>(span);
@@ -5638,14 +5992,17 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             direct_lstable_store->dictionaries[term.full_col0];
         if (dictionary.active || dictionary.wide_code_bytes != 0) {
           size_t maximum = 0;
-          for (const auto& entry : dictionary.entries) {
-            maximum = std::max(maximum, entry.size());
+          // Persistent stores expose entries through flat views only.
+          for (size_t code = 0; code < dictionary.StringEntryCount();
+               ++code) {
+            maximum = std::max(maximum, dictionary.StringEntryAt(code).size());
           }
           upper_bound = static_cast<platform::Int128>(maximum) *
                         direct_lstable_store->total_rows;
         } else {
           for (const auto& block : direct_lstable_store->blocks) {
-            upper_bound += block.columns[term.full_col0].varchar_bytes.size();
+            upper_bound +=
+                block.columns[term.full_col0].VarcharBytes().size();
           }
         }
         // Every prefix and worker subtotal is exact in both INT64 and
@@ -5940,7 +6297,6 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         if (arena != nullptr) {
           const size_t stride = arena->stride;
           std::vector<Value> fallback_row_values;
-          std::vector<int64_t> fallback_cells(stride);
           constexpr size_t kArenaPrefetchDistance = 8;
           for (size_t index = begin; index < end; ++index) {
             if (worker_errors[worker] != Status::kSuccess) {
@@ -8189,6 +8545,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               }
               std::array<double, 16> stack{};
               size_t sp = 0;
+              // Producers cap ops at 16 entries so pushes can never exceed
+              // the stack; keep that bound explicit here.
+              if (expr.ops.size() > stack.size()) {
+                return false;
+              }
               for (const TypedDoubleExprOp& op : expr.ops) {
                 switch (op.kind) {
                   case TypedDoubleExprOp::Kind::kLoadDoubleCol: {
@@ -8234,6 +8595,14 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                            Status* error) -> bool {
               std::array<int64_t, 16> stack{};
               size_t sp = 0;
+              // Producers cap ops at 16 entries so pushes can never exceed
+              // the stack; keep that bound explicit here.
+              if (expr.ops.size() > stack.size()) {
+                *error =
+                    StatusError(StatusCode::kInvalidArgument,
+                                "typed INT expression operand stack overflow");
+                return false;
+              }
               for (const TypedIntExprOp& op : expr.ops) {
                 switch (op.kind) {
                   case TypedIntExprOp::Kind::kLoadIntCol: {
@@ -9235,7 +9604,23 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             std::vector<Value> values;
             values.reserve(plan.emit_items.size());
             for (const TypedEmitItem& item : plan.emit_items) {
-              if (item.constant) {
+              if (const PostAggExpr* post_agg = item.post_agg.get()) {
+                // Composite item: evaluate it over this group's results.
+                std::vector<Value> cells;
+                cells.reserve(post_agg->slots.size());
+                for (const auto& slot : post_agg->slots) {
+                  cells.push_back(slot.is_key
+                                      ? local.GroupKey(group, slot.index)
+                                      : local_finished[slot.index]);
+                }
+                StatusOr<Value> evaluated = post_agg->expr->TryEvaluate(
+                    Row(std::move(cells)), post_agg->eval_schema);
+                if (!evaluated.HasValue()) {
+                  emit_errors[w] = evaluated.GetStatus();
+                  return;
+                }
+                values.push_back(evaluated.MoveValue());
+              } else if (item.constant) {
                 values.push_back(*item.constant);
               } else if (item.is_key) {
                 values.push_back(local.GroupKey(group, item.index));
@@ -9635,6 +10020,20 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       keyed.sequence = next_sequence;
       keyed.keys.reserve(plan.order_items.size());
       for (const TypedEmitItem& item : plan.order_items) {
+        if (const PostAggExpr* post_agg = item.post_agg.get()) {
+          std::vector<Value> cells;
+          cells.reserve(post_agg->slots.size());
+          for (const auto& slot : post_agg->slots) {
+            cells.push_back(slot.is_key ? merged.GroupKey(group, slot.index)
+                                        : finished_values[slot.index]);
+          }
+          const Row eval_row(std::move(cells));
+          ASSIGN_OR_RETURN(
+              Value, evaluated,
+              post_agg->expr->TryEvaluate(eval_row, post_agg->eval_schema));
+          keyed.keys.push_back(std::move(evaluated));
+          continue;
+        }
         if (item.dependent_key) {
           keyed.keys.push_back(dependent_keys[*item.dependent_key]);
           continue;
@@ -9656,7 +10055,22 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     std::vector<Value> values;
     values.reserve(plan.emit_items.size());
     for (const TypedEmitItem& item : plan.emit_items) {
-      if (item.dependent_key) {
+      if (const PostAggExpr* post_agg = item.post_agg.get()) {
+        // Composite select item (ROUND(SUM(x), 4), SUM(x) + 1): evaluate it
+        // over the finished aggregates / group keys. Emitting the item's
+        // default index instead returned the first raw aggregate.
+        std::vector<Value> cells;
+        cells.reserve(post_agg->slots.size());
+        for (const auto& slot : post_agg->slots) {
+          cells.push_back(slot.is_key ? merged.GroupKey(group, slot.index)
+                                      : finished_values[slot.index]);
+        }
+        const Row eval_row(std::move(cells));
+        ASSIGN_OR_RETURN(
+            Value, evaluated,
+            post_agg->expr->TryEvaluate(eval_row, post_agg->eval_schema));
+        values.push_back(std::move(evaluated));
+      } else if (item.dependent_key) {
         values.push_back(dependent_keys[*item.dependent_key]);
       } else if (item.constant) {
         values.push_back(*item.constant);

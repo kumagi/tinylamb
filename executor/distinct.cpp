@@ -93,6 +93,7 @@ size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
     Row row = input_batch_.RowAt(input_offset_);
     const RowPosition position = input_batch_.PositionAt(input_offset_);
     ++input_offset_;
+    ++input_rows_;
     if (distinct_on_.empty()) {
       const auto [it, inserted] = seen_.insert(std::move(row));
       if (inserted) {
@@ -105,7 +106,7 @@ size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
         StatusOr<Value> key = expr->TryEvaluate(row, schema_);
         if (!key.HasValue()) {
           FailWith(key.GetStatus());
-          return destination->Size();
+          return 0;  // do not emit a partial DISTINCT ON batch on error
         }
         current_keys.values_.push_back(key.MoveValue());
       }
@@ -114,11 +115,20 @@ size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
       }
     }
   }
+  emitted_rows_ += destination->Size();
   return destination->Size();
 }
 
 void DistinctExecutor::Dump(std::ostream& output, int indent) const {
-  output << "HashDistinct\n" << Indent(static_cast<size_t>(indent) + 2);
+  // T1793: the historical line was the bare node name (a "profile" without
+  // any rows).  Measured counters join only after a drain, matching the
+  // Selection::DumpHeader rows_seen_ contract.
+  output << "HashDistinct";
+  if (input_rows_ > 0 || emitted_rows_ > 0) {
+    output << " (input_rows=" << input_rows_
+           << ", output_rows=" << emitted_rows_ << ")";
+  }
+  output << "\n" << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
 }
 
@@ -136,6 +146,7 @@ size_t SortDistinctExecutor::NextBatch(DataChunk* destination,
     Row row = input_batch_.RowAt(input_offset_);
     const RowPosition position = input_batch_.PositionAt(input_offset_);
     ++input_offset_;
+    ++input_rows_;
     if (have_previous_ && DistinctEquals(previous_, row)) {
       continue;
     }
@@ -143,11 +154,18 @@ size_t SortDistinctExecutor::NextBatch(DataChunk* destination,
     have_previous_ = true;
     destination->Append(std::move(row), position);
   }
+  emitted_rows_ += destination->Size();
   return destination->Size();
 }
 
 void SortDistinctExecutor::Dump(std::ostream& output, int indent) const {
-  output << "SortDistinct\n" << Indent(static_cast<size_t>(indent) + 2);
+  // T1793: see DistinctExecutor::Dump.
+  output << "SortDistinct";
+  if (input_rows_ > 0 || emitted_rows_ > 0) {
+    output << " (input_rows=" << input_rows_
+           << ", output_rows=" << emitted_rows_ << ")";
+  }
+  output << "\n" << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
 }
 }  // namespace tinylamb

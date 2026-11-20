@@ -460,8 +460,8 @@ TEST(PipelineP3bTest, OocWindowFaultInjectionPropagatesCleanly) {
                                               /*spill_capable_plan=*/true);
   const std::vector<Row> input_copy = input;
   Status st;
-  std::vector<Row> out = ExecuteSink(out_schema, std::move(input), sink, &st,
-                                     nullptr, &txn);
+  std::vector<Row> out =
+      ExecuteSink(out_schema, std::move(input), sink, &st, nullptr, &txn);
   EXPECT_TRUE(out.empty());
   EXPECT_EQ(st.GetCode(), StatusCode::kNoSpace);
   // "Cleanly" also means the failed sink released its spill/grant resources:
@@ -470,13 +470,12 @@ TEST(PipelineP3bTest, OocWindowFaultInjectionPropagatesCleanly) {
     // The default-constructed guard only resets on destruction; clear the
     // injected limits now so the retry really runs with normal budgets.
     ProcessMemoryBudget::Global().ResetTestKnobs();
-    auto retry = std::make_shared<OocWindowSink>(
-        schema, out_schema, outputs, /*preserve_input_order=*/false,
-        /*spill_capable_plan=*/true);
+    auto retry = std::make_shared<OocWindowSink>(schema, out_schema, outputs,
+                                                 /*preserve_input_order=*/false,
+                                                 /*spill_capable_plan=*/true);
     Status retry_status;
-    std::vector<Row> retry_out =
-        ExecuteSink(out_schema, input_copy, retry, &retry_status, nullptr,
-                    &txn);
+    std::vector<Row> retry_out = ExecuteSink(out_schema, input_copy, retry,
+                                             &retry_status, nullptr, &txn);
     EXPECT_EQ(retry_status, Status::kSuccess);
     EXPECT_FALSE(retry_out.empty());
   }
@@ -726,16 +725,15 @@ TEST(PipelineP3bTest, OocMergeBandCrossJoinHandleOverflowRunsAndOuterModes) {
     EXPECT_EQ(
         out,
         (std::vector<Row>{
-            Row({Value(int64_t{1}), Value(std::string(pad)),
-                 Value(int64_t{2}), Value(std::string(pad))}),
-            Row({Value(int64_t{1}), Value(std::string(pad)),
-                 Value(int64_t{5}), Value(std::string(pad))}),
-            Row({Value(int64_t{4}), Value(std::string(pad)),
-                 Value(int64_t{5}), Value(std::string(pad))}),
+            Row({Value(int64_t{1}), Value(std::string(pad)), Value(int64_t{2}),
+                 Value(std::string(pad))}),
+            Row({Value(int64_t{1}), Value(std::string(pad)), Value(int64_t{5}),
+                 Value(std::string(pad))}),
+            Row({Value(int64_t{4}), Value(std::string(pad)), Value(int64_t{5}),
+                 Value(std::string(pad))}),
             Row({Value(int64_t{10}), Value(std::string(pad)), Value(),
                  Value()}),
-            Row({Value(), Value(), Value(int64_t{0}),
-                 Value(std::string(pad))}),
+            Row({Value(), Value(), Value(int64_t{0}), Value(std::string(pad))}),
         }));
   }
 }
@@ -980,7 +978,7 @@ TEST(PipelineP3bTest,
     std::vector<Row> rows;
     const std::string pad(128, 'D');
     rows.reserve(60);
-for (int i = 0; i < 60; ++i) {
+    for (int i = 0; i < 60; ++i) {
       rows.push_back(Row({Value(int64_t{i % 5}), Value(std::string(pad))}));
     }
     auto sink = std::make_shared<OocDistinctSink>(
@@ -1049,7 +1047,9 @@ for (int i = 0; i < 60; ++i) {
   // and UNION post-spill type widening deduplication (`1` vs `1.0` collapse).
   {
     ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
-    struct ResetGuard {
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+    // non-copyable by design
+    struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
       explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
       ~ResetGuard() {
         budget->ResetTestKnobs();
@@ -1126,7 +1126,8 @@ for (int i = 0; i < 60; ++i) {
     DataChunk lc_spill;
     lc_spill.Reserve(400);
     for (int i = 0; i < 400; ++i) {
-      lc_spill.Append(Row({Value(int64_t{(i % 2) + 1}), Value(std::string(sp))}));
+      lc_spill.Append(
+          Row({Value(int64_t{(i % 2) + 1}), Value(std::string(sp))}));
     }
     DataChunk rc;
     rc.Reserve(2);
@@ -1175,7 +1176,7 @@ TEST(PipelineP3bTest, OocBandJoinCandidatePruningMatchesEveryComparison) {
   const auto make_rows = [](const std::vector<int64_t>& keys) {
     std::vector<Row> rows;
     rows.reserve(keys.size());
-for (int64_t k : keys) {
+    for (int64_t k : keys) {
       rows.push_back(Row({Value(k)}));
     }
     return rows;
@@ -1250,6 +1251,16 @@ for (int64_t k : keys) {
         << "op=" << static_cast<int>(op);
     EXPECT_EQ(out, expected_rows) << "op=" << static_cast<int>(op);
   }
+}
+
+// T3511: a null store is a misconfiguration and must fail Open loudly at
+// the Status boundary instead of reporting success and silently yielding
+// zero rows from NextBatch.
+TEST(PipelineP3bTest, SpillableStoreSourceWithoutStoreFailsOpen) {
+  SpillableStoreSource source(nullptr);
+  const Status status = source.Open(nullptr);
+  EXPECT_NE(status, Status::kSuccess);
+  EXPECT_EQ(status.GetCode(), StatusCode::kInvalidArgument);
 }
 
 }  // namespace

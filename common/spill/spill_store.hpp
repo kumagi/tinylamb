@@ -20,9 +20,16 @@ using SpillSegmentId = uint64_t;
 inline constexpr SpillSegmentId kInvalidSpillSegmentId = 0;
 
 struct SpillStoreOptions {
-  // Optional directory for unlinked spill backing files. When empty, reads
-  // `TINYLAMB_TEMP_DIR` if set, otherwise uses OS temporary directory.
+  // Optional directory for unlinked spill backing files. When empty AND
+  // `temp_dir_set` is false, reads `TINYLAMB_TEMP_DIR` if set, otherwise
+  // uses OS temporary directory.
   std::filesystem::path temp_dir;
+  // T2066: Set to true when the caller intentionally supplied `temp_dir`.
+  // The value is then honoured verbatim — an empty string means "current
+  // working directory" instead of being silently folded into "unspecified"
+  // and re-pointed at TINYLAMB_TEMP_DIR / OS temp by a config wrapper that
+  // passed "" for a missing setting.
+  bool temp_dir_set{false};
   // Optional explicit temp limit in bytes. When 0 and `use_global_temp_limit`
   // is true, reads `ProcessMemoryBudget::Global().TempLimitBytes()`.
   size_t temp_limit_bytes{0};
@@ -87,15 +94,17 @@ class SpillStore {
 
   [[nodiscard]] StatusOr<uint64_t> SegmentSize(SpillSegmentId id) const;
 
-  // Drops every segment and truncates the backing file cleanly.
+  // Drops every segment; the backing file is truncated once no writes are in
+  // progress.
   void Clear() noexcept;
 
   [[nodiscard]] SpillStoreStats Stats() const;
   [[nodiscard]] size_t EffectiveTempLimitBytes() const noexcept;
 
   // Total blocks handed to platform::AdviseDontNeed since construction.
-  // Each completed block is advised at most once per segment lifetime
-  // (#1094); tests pin the O(1)-per-block bound on sequential reads.
+  // Read-path advises are deduplicated per segment lifetime (#1094);
+  // Append may advise a completed block once earlier. Tests pin the
+  // O(1)-per-block bound on sequential reads.
   [[nodiscard]] uint64_t AdviseDontNeedCalls() const noexcept {
     return advise_calls_.load(std::memory_order_relaxed);
   }
@@ -106,7 +115,11 @@ class SpillStore {
                                  const std::weak_ptr<const bool>& token,
                                  SpillSegmentId id) noexcept {
     if (store != nullptr && id != kInvalidSpillSegmentId) {
-      if (const auto live = token.lock()) {
+      // A live token from a *different* store must not authorize dropping a
+      // segment in this one with a coincidentally equal id.
+      const auto live = token.lock();
+      const auto& own = store->alive_token_;
+      if (live && own && live == own) {
         store->DropSegment(id);
       }
     }
@@ -217,9 +230,9 @@ class SpillSegmentWriter {
   bool finished_{false};
 };
 
-// Buffered sequential reader over one sealed `SpillStore` segment.
-// Uses at most `buffer_bytes` of read-ahead RAM and releases completed kernel
-// page-cache blocks progressively.
+// Buffered sequential reader over one `SpillStore` segment (the caller decides
+// when the segment is sealed). Uses at most `buffer_bytes` of read-ahead RAM
+// and releases completed kernel page-cache blocks progressively.
 class SpillSegmentReader {
  public:
   SpillSegmentReader(const SpillStore* store, SpillSegmentId id,
@@ -248,6 +261,8 @@ class SpillSegmentReader {
   [[nodiscard]] Status Refill();
 
   const SpillStore* store_{nullptr};
+  // Guard against outliving the store (the writer has the same token).
+  std::weak_ptr<const bool> store_alive_;
   SpillSegmentId id_{kInvalidSpillSegmentId};
   size_t buffer_capacity_{SpillStore::kBlockSize};
   uint64_t total_size_{0};

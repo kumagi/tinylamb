@@ -12,6 +12,7 @@
 
 #include "common/constants.hpp"
 #include "common/set_operation.hpp"
+#include "expression/collation.hpp"
 #include "expression/expression.hpp"
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
@@ -59,6 +60,12 @@ Schema SetOperationPlan::GenerateSchema() const {
         // Width mismatch is validated by the executor at execution time.
         break;
       }
+      if (column + 1 == first.ColumnCount() &&
+          schema.ColumnCount() > first.ColumnCount()) {
+        // The first child's width defines the output; a wider later operand
+        // must not be silently truncated when deriving types.
+        return {};
+      }
       type = CommonSetValueType(type, schema.GetColumn(column).Type());
     }
     columns.emplace_back(first.GetColumn(column).Name(), type);
@@ -91,6 +98,13 @@ size_t SetOperationPlan::EmitRowCount() const {
     return rows;
   }
   size_t rows = children_.front()->EmitRowCount();
+  if (operation_ == SetOperationKind::kExcept ||
+      operation_ == SetOperationKind::kExceptAll) {
+    // EXCEPT cannot produce more rows than its first child; a smaller right
+    // side may reduce it, but without a distinct estimate the left bound is
+    // the conservative choice.
+    return rows;
+  }
   if (operation_ == SetOperationKind::kIntersect ||
       operation_ == SetOperationKind::kIntersectAll) {
     for (const Plan& child : children_) {
@@ -124,6 +138,8 @@ bool SetOperationPlan::IsOrderedBy(
   for (size_t i = 0; i < expressions.size(); ++i) {
     if (!order_keys_[i].expression || !expressions[i] ||
         order_keys_[i].ascending != ascending[i] ||
+        order_keys_[i].collation !=
+            CollationOfExpression(expressions[i]) ||
         order_keys_[i].expression->ToString() != expressions[i]->ToString()) {
       return false;
     }
@@ -142,7 +158,7 @@ bool SetOperationPlan::IsOrderedBy(
 void SetOperationPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << ToString() << '\n';
   for (const Plan& child : children_) {
-    child->Dump(output, indent + 2);
+    DumpChild(output, *child, indent + 2);
   }
 }
 

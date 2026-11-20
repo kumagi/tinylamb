@@ -41,14 +41,15 @@ size_t SelectionPlan::EmitRowCount() const { return stats_.Rows(); }
 
 void SelectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Select: [";
-  exp_->Dump(o);
+  // NOLINTNEXTLINE(readability-braces-around-statements) single statement
+  if (exp_) exp_->Dump(o);
   o << "] (estimated rows: " << EmitRowCount() << ")\n"
     << Indent(static_cast<size_t>(indent) + 2);
-  src_->Dump(o, indent + 2);
+  DumpChild(o, *src_, indent + 2);
 }
 
 std::string SelectionPlan::ToString() const {
-  return "Select: [" + exp_->ToString() +
+  return "Select: [" + (exp_ ? exp_->ToString() : std::string("?")) +
          "] (estimated rows: " + std::to_string(EmitRowCount()) + ")";
 }
 
@@ -78,7 +79,7 @@ bool SelectionPlan::InstallParameterSlots(const std::vector<Value>& parameters,
   if (ChildAppliesPredicate()) {
     return src_->InstallParameterSlots(parameters, cursor, slots);
   }
-  return SlotizeInPlace(&exp_, parameters, cursor, slots) &&
+  return CollectParameterSlots(&exp_, slots) &&
          src_->InstallParameterSlots(parameters, cursor, slots);
 }
 

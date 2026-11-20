@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef TINYLAMB_FRAGMENT_FRAGMENT_HPP
-#define TINYLAMB_FRAGMENT_FRAGMENT_HPP
+#ifndef TINYLAMB_FRAGMENT_HPP
+#define TINYLAMB_FRAGMENT_HPP
 
 #include <cstdint>
 #include <memory>
@@ -141,11 +141,19 @@ struct Conjunct {
   // kIn: the literal set. Empty means "no literal", which is rejected.
   std::vector<int64_t> in_literals;
   // kVarcharRange: the upper bound of the half-open range. The lower bound
-  // is `bytes_literal`. An empty `bytes_literal_hi` means "unbounded above";
-  // an empty `bytes_literal` with a non-empty `bytes_literal_hi` means
-  // "unbounded below".
+  // is `bytes_literal`.
   std::string bytes_literal_hi;
-  // kIsNull: true = IS NULL, false = IS NOT NULL.
+  // T3108: the "unbounded" encoding is these flags, NOT the emptiness of
+  // the bound strings -- the empty string is a legal bound value (SQL byte
+  // order puts it below every other string), so encoding `col < ''` as an
+  // empty `bytes_literal_hi` read back as "unbounded above" and let ALL
+  // non-null rows pass a predicate that matches none. Producers set the
+  // flag of each active bound; a flag that is false makes the consumer
+  // ignore the corresponding string.
+  bool bytes_lo_set = false;
+  bool bytes_hi_set = false;
+  // kIsNull: true = IS NOT NULL, false = IS NULL (matches the consuming
+  // implementations, which apply IS NULL when negated is false).
   bool negated = false;
 };
 
@@ -387,4 +395,4 @@ struct KeyValueRows {
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_FRAGMENT_FRAGMENT_HPP
+#endif  // TINYLAMB_FRAGMENT_HPP

@@ -1,6 +1,6 @@
 # batch_nested_loop_anti
 
-- 状態: draft   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft   /   執筆基準リビジョン: `72ad60a` (2026-11-19)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の登録 `"batch_nested_loop_anti"`（パターンは `cascades::dsl::AntiJoin()`、共有ヘルパー `BatchNestedLoopFor(..., AntiJoinKind(), /*wrap_selection=*/false)` に委譲）
 
 ## 概要
@@ -119,7 +119,7 @@ return {PlanAlternative{.plan = std::move(join),
 
 等値比較を持たない非等値反結合（不等号比較や複雑な式を含む反結合）に対して、実行可能な物理実行パスを供給します。
 
-計算量は $O(|L| \times |R|)$ ですが、probe 側をブロック単位でバッファリングすることにより、内側リレーションのイテレータ走査オーバヘッドをタプル単位のループに比べて抑制します。等値キー対を持つ反結合は `anti_hash_join` や `anti_merge_join` が担当するため、探索空間の重複や競合は発生しません。
+計算量は $O(|L| \times |R|)$ ですが、probe 側をブロック単位でバッファリングすることにより、内側リレーションのイテレータ走査オーバーヘッドをタプル単位のループに比べて抑制します。等値キー対を持つ反結合は `anti_hash_join` や `anti_merge_join` が担当するため、探索空間の重複や競合は発生しません。
 
 ## 関連 Rule との相互作用
 

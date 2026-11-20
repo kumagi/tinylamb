@@ -42,7 +42,7 @@ std::unique_ptr<SelectStatement> ParseSelect(const std::string& sql) {
     return nullptr;
   }
   return std::unique_ptr<SelectStatement>(
-      static_cast<SelectStatement*>(statement.release()));
+      static_cast<SelectStatement*>(statement.release()));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 class SelectRewritesTest : public ::testing::Test {
@@ -100,6 +100,34 @@ TEST_F(SelectRewritesTest, InlineSingleUseCtesReplacesSingleReference) {
   ASSERT_NE(multi, nullptr);
   EXPECT_FALSE(InlineSingleUseCtes(multi.get()));
   EXPECT_EQ(multi->WithQueries().size(), 1U);
+}
+
+TEST_F(SelectRewritesTest, DisjunctiveSemiFilterRequiresDirectComparisons) {
+  const std::string prefix =
+      "WITH a AS (SELECT category AS ak, SUM(price) AS a_total "
+      "FROM items WHERE id = 1 GROUP BY category), "
+      "b AS (SELECT category AS bk, SUM(price) AS b_total "
+      "FROM items WHERE id = 2 GROUP BY category), "
+      "s AS (SELECT category AS sk, SUM(price) AS total "
+      "FROM items GROUP BY category) "
+      "SELECT sk, total FROM s LEFT JOIN a ON ak = sk "
+      "LEFT JOIN b ON bk = sk WHERE ";
+  auto direct = ParseSelect(prefix + "a_total > 0 OR 0 < b_total");
+  ASSERT_NE(direct, nullptr);
+  EXPECT_TRUE(
+      PushDisjunctiveNullRejectingLeftJoinSemiFilter(direct.get(), *ctx_));
+
+  const std::string sql =
+      prefix + "COALESCE(a_total, 0) > 0 OR COALESCE(b_total, 0) > 0";
+  auto computed = ParseSelect(sql);
+  ASSERT_NE(computed, nullptr);
+  EXPECT_FALSE(
+      PushDisjunctiveNullRejectingLeftJoinSemiFilter(computed.get(), *ctx_));
+  auto result = engine_->Execute(*ctx_, sql);
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+  EXPECT_EQ(result.Value().Collect(),
+            std::vector<Row>({Row({Value(10), Value(300)})}));
+  EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
 }
 
 TEST_F(SelectRewritesTest, SingleUseGroupedCtesRetainFiltersAndSharedBodies) {
@@ -753,6 +781,468 @@ TEST_F(SelectRewritesTest,
       engine_->Execute(*ctx_, "SELECT 1, COUNT(*) FROM cb_empty GROUP BY 1");
   ASSERT_TRUE(res.HasValue()) << engine_->LastError();
   EXPECT_EQ(res.Value().Collect().size(), 0U);
+}
+
+TEST_F(SelectRewritesTest, TpchSf10DiscoveryRulesAndAllSemanticTraps) {
+  for (const char* sql : {
+           "CREATE TABLE tpch_n (n_key INT64 PRIMARY KEY, n_name STRING);",
+           "CREATE TABLE tpch_c (c_key INT64 PRIMARY KEY, c_nkey INT64, "
+           "c_name STRING, c_addr STRING, c_comment STRING);",
+           "CREATE TABLE tpch_c_nullable (c_key INT64, c_name STRING);",
+           "CREATE TABLE tpch_o (o_key INT64 PRIMARY KEY, o_ckey INT64, "
+           "o_total FLOAT64, o_comment STRING);",
+           "CREATE TABLE tpch_p (p_key INT64 PRIMARY KEY, p_brand STRING, "
+           "p_size INT64, p_name STRING);",
+           "CREATE TABLE tpch_s (s_key INT64 PRIMARY KEY, s_nkey INT64, "
+           "s_name STRING);",
+           "CREATE TABLE tpch_ps (ps_pkey INT64, ps_skey INT64, "
+           "ps_avail INT64, ps_cost FLOAT64);",
+           "CREATE TABLE tpch_l (l_okey INT64, l_pkey INT64, l_skey INT64, "
+           "l_qty FLOAT64, l_price FLOAT64, l_disc FLOAT64, "
+           "l_flag STRING, l_mode STRING);",
+           "INSERT INTO tpch_n VALUES (1, 'PERU'), (2, 'JAPAN');",
+           // Note: customer 3 references non-existent nation 999 (Trap 5 FK
+           // test)
+           "INSERT INTO tpch_c VALUES "
+           "(10, 1, 'Cust10', 'Addr10', 'Com10'), "
+           "(20, 2, 'Cust20', 'Addr20', 'Com20'), "
+           "(30, 1, 'Cust30', 'Addr30', 'Com30'), "
+           "(40, 999, 'OrphanNationCust', 'Addr40', 'Com40');",
+           // Trap 2a table: duplicate NULLs + duplicate non-null keys
+           "INSERT INTO tpch_c_nullable VALUES "
+           "(NULL, 'n1'), (NULL, 'n2'), (10, 'd1'), (10, 'd2'), (30, 'u1');",
+           // Note: order 900 has orphan o_ckey=999 (not in tpch_c) with huge
+           // revenue, and order 400 belongs to Cust40 (orphan nation 999)!
+           "INSERT INTO tpch_o VALUES "
+           "(100, 10, 500.0, 'normal order'), "
+           "(101, 10, 300.0, 'unusual special packages here'), "
+           "(200, 20, 400.0, 'fast delivery'), "
+           "(400, 40, 8000.0, 'orphan nation order'), "
+           "(900, 999, 9000.0, 'orphan customer order'), "
+           "(901, NULL, 100.0, 'null custkey order');",
+           "INSERT INTO tpch_p VALUES "
+           "(1, 'Brand#53', 3, 'tan_alpha'), "
+           "(2, 'Brand#41', 8, 'tan_beta'), "
+           "(3, 'Brand#99', 20, 'other_gamma');",
+           "INSERT INTO tpch_s VALUES "
+           "(1, 1, 'Supp1'), (2, 1, 'Supp2'), (3, 2, 'Supp3');",
+           "INSERT INTO tpch_ps VALUES "
+           "(1, 1, 50, 10.0), (2, 2, 10, 20.0), (1, 2, 5, 15.0);",
+           "INSERT INTO tpch_l VALUES "
+           "(100, 1, 1, 8.0, 100.0, 0.10, 'R', 'AIR'), "
+           "(100, 1, 1, 250.0, 200.0, 0.05, 'N', 'AIR'), "
+           "(200, 2, 2, 18.0, 150.0, 0.00, 'R', 'AIR REG'), "
+           "(400, 1, 1, 50.0, 5000.0, 0.00, 'R', 'AIR'), "
+           "(900, 1, 1, 60.0, 9000.0, 0.00, 'R', 'AIR');",
+       }) {
+    auto r = engine_->Execute(*ctx_, sql);
+    ASSERT_TRUE(r.HasValue()) << engine_->LastError();
+    r.Value().Drain();
+  }
+
+  auto run_rows = [&](bool fallback, const std::string& sql) {
+    engine_->SetForceRelationalFallback(fallback);
+    auto r = engine_->Execute(*ctx_, sql);
+    EXPECT_TRUE(r.HasValue())
+        << "SQL: " << sql << "\nErr: " << engine_->LastError();
+    std::vector<Row> out;
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(row);
+        row = Row();
+      }
+    }
+    engine_->SetForceRelationalFallback(false);
+    return out;
+  };
+
+  // --------------------------------------------------------------------------
+  // TPCH-1: Common conjunct factoring + per-table disjunctive envelope + hull
+  // --------------------------------------------------------------------------
+  const std::string q19_sql =
+      "SELECT SUM(l_price * (1.0 - l_disc)) FROM tpch_l, tpch_p "
+      "WHERE p_key = l_pkey AND ("
+      "  (p_key = l_pkey AND p_brand = 'Brand#53' AND l_qty >= 5 AND l_qty <= "
+      "5 + 10 "
+      "   AND p_size BETWEEN 1 AND 5 AND l_mode IN ('AIR', 'AIR REG')) "
+      "  OR "
+      "  (p_key = l_pkey AND p_brand = 'Brand#41' AND l_qty >= 15 AND l_qty <= "
+      "15 + 10 "
+      "   AND p_size BETWEEN 1 AND 10 AND l_mode IN ('AIR', 'AIR REG'))"
+      ")";
+  {
+    auto parsed = ParseSelect(q19_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(FactorAndEnvelopeDisjunctiveWhere(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, q19_sql), run_rows(true, q19_sql));
+
+  // Trap 1 (`envelope_missing_branch_pred_drops_rows_bug`): Branch 2 has NO
+  // `tpch_p` predicate, so synthesizing a `tpch_p` envelope from Branch 1 alone
+  // would drop `Brand#99` rows matching Branch 2!
+  const std::string trap1_sql =
+      "SELECT COUNT(*) FROM tpch_l, tpch_p "
+      "WHERE p_key = l_pkey AND ("
+      "  (p_brand = 'Brand#53' AND l_qty = 8.0) "
+      "  OR "
+      "  (l_qty >= 18.0)"
+      ")";
+  EXPECT_EQ(run_rows(false, trap1_sql), run_rows(true, trap1_sql));
+
+  // --------------------------------------------------------------------------
+  // TPCH-2: Left-Join Right Pre-Aggregation & Traps 2a / 2b
+  // --------------------------------------------------------------------------
+  const std::string q13_sql =
+      "SELECT c_count, COUNT(*) AS custdist FROM ("
+      "  SELECT c_key, COUNT(o_key) AS c_count FROM tpch_c "
+      "  LEFT OUTER JOIN tpch_o ON c_key = o_ckey "
+      "    AND o_comment NOT LIKE '%unusual%packages%' "
+      "  GROUP BY c_key"
+      ") c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC";
+  EXPECT_EQ(run_rows(false, q13_sql), run_rows(true, q13_sql));
+
+  // Trap 2a (`nullable_unique_left_elides_groupby_bug`): duplicate NULLs and
+  // duplicate keys on left MUST NOT elide GROUP BY!
+  const std::string trap2a_sql =
+      "SELECT c_key, COUNT(o_key) AS c_count FROM tpch_c_nullable "
+      "LEFT OUTER JOIN tpch_o ON c_key = o_ckey "
+      "  AND o_comment NOT LIKE '%unusual%packages%' "
+      "GROUP BY c_key ORDER BY c_key";
+  EXPECT_EQ(run_rows(false, trap2a_sql), run_rows(true, trap2a_sql));
+
+  // Trap 2b (`left_join_count_nonstrict_expr_bug`): COUNT(*) and
+  // COUNT(COALESCE(o_key, 0)) return 1 (not 0) on unmatched left rows!
+  const std::string trap2b_star_sql =
+      "SELECT c_key, COUNT(*) AS c_count FROM tpch_c "
+      "LEFT OUTER JOIN tpch_o ON c_key = o_ckey GROUP BY c_key ORDER BY c_key";
+  const std::string trap2b_coal_sql =
+      "SELECT c_key, COUNT(COALESCE(o_key, 0)) AS c_count FROM tpch_c "
+      "LEFT OUTER JOIN tpch_o ON c_key = o_ckey GROUP BY c_key ORDER BY c_key";
+  {
+    auto p1 = ParseSelect(trap2b_star_sql);
+    auto p2 = ParseSelect(trap2b_coal_sql);
+    ASSERT_NE(p1, nullptr);
+    ASSERT_NE(p2, nullptr);
+    EXPECT_FALSE(PreaggregateLeftJoinRightCounts(p1.get(), *ctx_));
+    EXPECT_FALSE(PreaggregateLeftJoinRightCounts(p2.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, trap2b_star_sql), run_rows(true, trap2b_star_sql));
+  EXPECT_EQ(run_rows(false, trap2b_coal_sql), run_rows(true, trap2b_coal_sql));
+
+  // --------------------------------------------------------------------------
+  // TPCH-3: Self-Semijoin HAVING Aggregate Absorption & Trap 3
+  // --------------------------------------------------------------------------
+  const std::string q18_sql =
+      "SELECT c_name, c_key, o_key, o_total, SUM(l_qty) "
+      "FROM tpch_c, tpch_o, tpch_l "
+      "WHERE o_key IN (SELECT l_okey FROM tpch_l GROUP BY l_okey "
+      "                HAVING SUM(l_qty) > 200.0) "
+      "  AND c_key = o_ckey AND o_key = l_okey "
+      "GROUP BY c_name, c_key, o_key, o_total ORDER BY o_total DESC LIMIT 10";
+  {
+    auto parsed = ParseSelect(q18_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(AbsorbSelfSemijoinHavingAggregate(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, q18_sql), run_rows(true, q18_sql));
+
+  // Trap 3 (`self_semijoin_mismatched_where_bug`): outer WHERE filters
+  // `l_flag = 'R'` (qty=8 for o_key=100) while subquery HAVING sums ALL flags
+  // (8 + 250 = 258 > 200)! Must NOT merge WHERE into HAVING subquery!
+  const std::string trap3_sql =
+      "SELECT c_name, o_key, SUM(l_qty) "
+      "FROM tpch_c, tpch_o, tpch_l "
+      "WHERE o_key IN (SELECT l_okey FROM tpch_l GROUP BY l_okey "
+      "                HAVING SUM(l_qty) > 200.0) "
+      "  AND c_key = o_ckey AND o_key = l_okey AND l_flag = 'R' "
+      "GROUP BY c_name, o_key ORDER BY o_key";
+  {
+    auto parsed = ParseSelect(trap3_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_FALSE(AbsorbSelfSemijoinHavingAggregate(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, trap3_sql), run_rows(true, trap3_sql));
+  ASSERT_EQ(run_rows(false, trap3_sql).size(), 1U);
+  EXPECT_DOUBLE_EQ(run_rows(false, trap3_sql)[0][2].value.double_value, 8.0);
+
+  // --------------------------------------------------------------------------
+  // TPCH-4a: CTE Argmax Subquery -> Non-Null WITH TIES & Trap 4a + NaN guard
+  // --------------------------------------------------------------------------
+  // Add a tied revenue row for supplier 2 so both Supp1 and Supp2 tie at max!
+  {
+    auto ins = engine_->Execute(
+        *ctx_,
+        "INSERT INTO tpch_l VALUES (200, 2, 2, 1.0, 130.0, 0.0, 'R', 'AIR');");
+    ASSERT_TRUE(ins.HasValue());
+    ins.Value().Drain();
+  }
+  // Supp1 revenue: 100*0.9 + 200*0.95 + 5000 + 9000 = 14280; let's filter
+  // `l_okey <= 200` where Supp1 = 280.0 and Supp2 = 150 + 130 = 280.0 (TIE!).
+  const std::string q15_ties_sql =
+      "WITH revenue AS ("
+      "  SELECT l_skey AS supplier_no, SUM(l_price * (1.0 - l_disc)) AS "
+      "total_rev "
+      "  FROM tpch_l WHERE l_okey <= 200 GROUP BY l_skey"
+      ") "
+      "SELECT s_key, s_name, total_rev FROM tpch_s, revenue "
+      "WHERE s_key = supplier_no "
+      "  AND total_rev = (SELECT MAX(total_rev) FROM revenue) "
+      "ORDER BY s_key";
+  {
+    auto parsed = ParseSelect(q15_ties_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(RewriteCteArgmaxSubqueryToTopTies(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, q15_ties_sql), run_rows(true, q15_ties_sql));
+  EXPECT_EQ(run_rows(false, q15_ties_sql).size(), 2U);
+
+  // Trap 4a (`argmax_with_ties_without_is_not_null_bug`): all-NULL CTE column
+  // MUST return 0 rows, not NULL ties!
+  const std::string trap4a_all_null_sql =
+      "WITH revenue AS ("
+      "  SELECT s_key AS supplier_no, CAST(NULL AS FLOAT64) AS total_rev "
+      "  FROM tpch_s"
+      ") "
+      "SELECT s_key FROM tpch_s, revenue "
+      "WHERE s_key = supplier_no "
+      "  AND total_rev = (SELECT MAX(total_rev) FROM revenue)";
+  EXPECT_EQ(run_rows(false, trap4a_all_null_sql),
+            run_rows(true, trap4a_all_null_sql));
+  EXPECT_TRUE(run_rows(false, trap4a_all_null_sql).empty());
+
+  // GoogleSQL NaN poisoning guard: when one CTE row has `NaN`, `MAX` is `NaN`
+  // and `total_rev = NaN` is FALSE for every row -> 0 rows!
+  const std::string trap4a_nan_sql =
+      "WITH revenue AS ("
+      "  SELECT s_key AS supplier_no, "
+      "         CASE WHEN s_key = 1 THEN CAST('NaN' AS FLOAT64) ELSE 100.0 END "
+      "           AS total_rev "
+      "  FROM tpch_s"
+      ") "
+      "SELECT s_key FROM tpch_s, revenue "
+      "WHERE s_key = supplier_no "
+      "  AND total_rev = (SELECT MAX(total_rev) FROM revenue)";
+  EXPECT_EQ(run_rows(false, trap4a_nan_sql), run_rows(true, trap4a_nan_sql));
+  EXPECT_TRUE(run_rows(false, trap4a_nan_sql).empty());
+
+  // --------------------------------------------------------------------------
+  // TPCH-5: Late Unique-Dim Wide Attributes After Top-N & Trap 5 (Orphan FK)
+  // --------------------------------------------------------------------------
+  // Notice: o_key=900 (rev=9000, orphan o_ckey=999) and o_key=400 (rev=5000,
+  // Cust40 with orphan c_nkey=999) MUST NOT steal `LIMIT 2` slots from valid
+  // Cust20 (rev=280) and Cust10 (rev=90)!
+  const std::string q10_trap5_sql =
+      "SELECT c_key, c_name, SUM(l_price * (1.0 - l_disc)) AS revenue, "
+      "       n_name, c_addr, c_comment "
+      "FROM tpch_c, tpch_o, tpch_l, tpch_n "
+      "WHERE c_key = o_ckey AND l_okey = o_key AND l_flag = 'R' "
+      "  AND c_nkey = n_key "
+      "GROUP BY c_key, c_name, n_name, c_addr, c_comment "
+      "ORDER BY revenue DESC LIMIT 2";
+  {
+    auto parsed = ParseSelect(q10_trap5_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(DeferUniqueDimensionAttributesAfterTopN(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, q10_trap5_sql), run_rows(true, q10_trap5_sql));
+  ASSERT_EQ(run_rows(false, q10_trap5_sql).size(), 2U);
+  EXPECT_EQ(run_rows(false, q10_trap5_sql)[0][0], Value(int64_t{20}));
+  EXPECT_EQ(run_rows(false, q10_trap5_sql)[1][0], Value(int64_t{10}));
+
+  // TPCH-5b: Transitive equijoin closure synthesis
+  const std::string q9_sql =
+      "SELECT n_name, SUM(l_price - ps_cost * l_qty) "
+      "FROM tpch_p, tpch_s, tpch_l, tpch_ps, tpch_n "
+      "WHERE s_key = l_skey AND ps_skey = l_skey "
+      "  AND ps_pkey = l_pkey AND p_key = l_pkey AND s_nkey = n_key "
+      "GROUP BY n_name ORDER BY n_name";
+  {
+    auto parsed = ParseSelect(q9_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(SynthesizeTransitiveEquijoins(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, q9_sql), run_rows(true, q9_sql));
+
+  // --------------------------------------------------------------------------
+  // TPCH-6a: Correlated `> SUM` Decorrelation & Trap 6a (Kim's COUNT bug)
+  // --------------------------------------------------------------------------
+  // Note `(ps_pkey=1, ps_skey=2)` has `ps_avail=5` and 0 rows in `tpch_l`:
+  // - For `0.5 * SUM(l_qty)`: `5 > NULL` is UNKNOWN -> rejected!
+  // - For `COUNT(l_qty)` (Trap 6a): `5 > 0` is TRUE -> Supp2 MUST be included!
+  const std::string corr_sum_top_sql =
+      "SELECT s_name FROM tpch_s, tpch_n, tpch_ps, tpch_p "
+      "WHERE s_key = ps_skey AND ps_pkey = p_key AND p_name LIKE 'tan%' "
+      "  AND ps_avail > ("
+      "    SELECT 0.5 * SUM(l_qty) FROM tpch_l "
+      "    WHERE l_pkey = ps_pkey AND l_skey = ps_skey AND l_okey >= 100"
+      "  ) AND s_nkey = n_key AND n_name = 'PERU' ORDER BY s_name";
+  {
+    auto parsed = ParseSelect(corr_sum_top_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(DecorrelateCorrelatedSumComparisons(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, corr_sum_top_sql),
+            run_rows(true, corr_sum_top_sql));
+
+  const std::string trap6a_count_top_sql =
+      "SELECT s_name FROM tpch_s, tpch_n, tpch_ps, tpch_p "
+      "WHERE s_key = ps_skey AND ps_pkey = p_key AND p_name LIKE 'tan%' "
+      "  AND ps_avail > ("
+      "    SELECT COUNT(l_qty) FROM tpch_l "
+      "    WHERE l_pkey = ps_pkey AND l_skey = ps_skey AND l_okey >= 9999"
+      "  ) AND s_nkey = n_key AND n_name = 'PERU' ORDER BY s_name";
+  {
+    auto parsed = ParseSelect(trap6a_count_top_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_FALSE(DecorrelateCorrelatedSumComparisons(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, trap6a_count_top_sql),
+            run_rows(true, trap6a_count_top_sql));
+  EXPECT_EQ(run_rows(false, trap6a_count_top_sql).size(), 3U);
+
+  // Inside a `WHERE ... IN (SELECT ...)` semi-join, outer domain filters
+  // (`n_name = 'PERU'`) live outside the `IN` subquery, so `TPCH-6a` leaves the
+  // `IN` subquery to `subquery_runtime` while preserving exact answers.
+  const std::string q20_sql =
+      "SELECT s_name FROM tpch_s, tpch_n "
+      "WHERE s_key IN ("
+      "  SELECT ps_skey FROM tpch_ps, tpch_p "
+      "  WHERE ps_pkey = p_key AND p_name LIKE 'tan%' "
+      "    AND ps_avail > ("
+      "      SELECT 0.5 * SUM(l_qty) FROM tpch_l "
+      "      WHERE l_pkey = ps_pkey AND l_skey = ps_skey AND l_okey >= 100"
+      "    )"
+      ") AND s_nkey = n_key AND n_name = 'PERU' ORDER BY s_name";
+  {
+    auto parsed = ParseSelect(q20_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_FALSE(DecorrelateCorrelatedSumComparisons(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, q20_sql), run_rows(true, q20_sql));
+}
+
+TEST_F(SelectRewritesTest, ClickBenchRound2AffineLinearSumsAndTraps) {
+  for (const char* sql : {
+           "CREATE TABLE cb_affine (grp INT64, v INT64, w INT64);",
+           "INSERT INTO cb_affine VALUES "
+           "(1, 10, 100), (1, NULL, 200), (1, 20, 300), "
+           "(2, NULL, NULL), (2, NULL, 50);",
+           "CREATE TABLE cb_affine_ovf (v INT64);",
+           "INSERT INTO cb_affine_ovf VALUES (9223372036854775807), (0);",
+       }) {
+    auto r = engine_->Execute(*ctx_, sql);
+    ASSERT_TRUE(r.HasValue()) << engine_->LastError();
+    r.Value().Drain();
+  }
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginReadOnlyContext());
+
+  auto run_rows = [&](bool fallback, const std::string& sql,
+                      std::vector<std::string>* col_names = nullptr) {
+    engine_->SetForceRelationalFallback(fallback);
+    auto r = engine_->Execute(*ctx_, sql);
+    EXPECT_TRUE(r.HasValue())
+        << "SQL: " << sql << "\nErr: " << engine_->LastError();
+    if (col_names != nullptr) {
+      *col_names = engine_->ResultColumnNames();
+    }
+    std::vector<Row> out;
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(row);
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+    }
+    engine_->SetForceRelationalFallback(false);
+    return out;
+  };
+
+  // 1. CB-9 (`affine_sum_homomorphism_sound`) on PAX `LSTableStore`:
+  //    Multiple `SUM(v ± c)` + `SUM(c + v)` share a single `SUM(v)` +
+  //    `COUNT(v)` while preserving NULL ignoring (`v = NULL` does not add `c`)
+  //    and output column names.
+  const std::string q30_shape_sql =
+      "SELECT SUM(v + 1), SUM(v + 2), SUM(v - 5), SUM(10 + v) AS s4, "
+      "SUM(w + 3) FROM cb_affine";
+  {
+    auto parsed = ParseSelect(q30_shape_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(RewriteAffineLinearSums(parsed.get(), *ctx_));
+  }
+  std::vector<std::string> fast_names;
+  std::vector<std::string> ref_names;
+  const auto fast_q30 = run_rows(false, q30_shape_sql, &fast_names);
+  const auto ref_q30 = run_rows(true, q30_shape_sql, &ref_names);
+  ASSERT_EQ(fast_q30.size(), 1U);
+  // v has non-null (10, 20): SUM(v)=30, COUNT(v)=2 -> 32, 34, 20, 50;
+  // w has non-null (100, 200, 300, 50): SUM(w)=650, COUNT(w)=4 -> 662.
+  EXPECT_EQ(fast_q30[0][0], Value(int64_t{32}));
+  EXPECT_EQ(fast_q30[0][1], Value(int64_t{34}));
+  EXPECT_EQ(fast_q30[0][2], Value(int64_t{20}));
+  EXPECT_EQ(fast_q30[0][3], Value(int64_t{50}));
+  EXPECT_EQ(fast_q30[0][4], Value(int64_t{662}));
+  EXPECT_EQ(fast_q30, ref_q30);
+  EXPECT_EQ(fast_names, ref_names);
+
+  // 2. Trap `affine_sum_coalesce_empty_bug`:
+  //    Empty / filtered-empty / all-NULL groups MUST produce `NULL` (never 0!).
+  const std::string empty_filter_sql =
+      "SELECT SUM(v + 1), SUM(v - 2) FROM cb_affine WHERE grp = 999";
+  const auto fast_empty = run_rows(false, empty_filter_sql);
+  ASSERT_EQ(fast_empty.size(), 1U);
+  EXPECT_TRUE(fast_empty[0][0].IsNull());
+  EXPECT_TRUE(fast_empty[0][1].IsNull());
+  EXPECT_EQ(fast_empty, run_rows(true, empty_filter_sql));
+
+  const std::string all_null_grouped_sql =
+      "SELECT grp, SUM(v + 3), SUM(w - 10) FROM cb_affine "
+      "GROUP BY grp ORDER BY grp ASC";
+  const auto fast_grp = run_rows(false, all_null_grouped_sql);
+  ASSERT_EQ(fast_grp.size(), 2U);
+  EXPECT_EQ(fast_grp[0][1], Value(int64_t{36}));
+  EXPECT_TRUE(fast_grp[1][1].IsNull()) << "All-NULL grp=2 must stay NULL";
+  EXPECT_EQ(fast_grp[1][2], Value(int64_t{40}));
+  EXPECT_EQ(fast_grp, run_rows(true, all_null_grouped_sql));
+
+  // 3. Trap `affine_sum_overflow_masked_bug`:
+  //    When `v + 1` can overflow `INT64_MAX`, `RewriteAffineLinearSums` MUST
+  //    decline so per-row checked evaluation still raises overflow!
+  const std::string ovf_sql = "SELECT SUM(v + 1) FROM cb_affine_ovf";
+  {
+    auto parsed = ParseSelect(ovf_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_FALSE(RewriteAffineLinearSums(parsed.get(), *ctx_));
+  }
+  {
+    auto prep = engine_->Prepare(*ctx_, ovf_sql);
+    if (prep.HasValue()) {
+      Row row;
+      while (prep.Value()->Next(&row, nullptr)) {
+      }
+      EXPECT_NE(prep.Value()->GetStatus(), Status::kSuccess);
+    }
+  }
+
+  // 4. Compact `cb_affine` to `.tlcs` and verify `.tlcs` `DirGroup` bounds
+  //    certify `RewriteAffineLinearSums` identically.
+  ctx_.reset();
+  {
+    TransactionContext cctx = db_->BeginContext();
+    ASSERT_EQ(db_->CompactTableToTlcs(cctx, "cb_affine"), Status::kSuccess);
+    ASSERT_EQ(cctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginReadOnlyContext());
+  {
+    auto parsed = ParseSelect(q30_shape_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(RewriteAffineLinearSums(parsed.get(), *ctx_));
+  }
+  EXPECT_EQ(run_rows(false, q30_shape_sql), ref_q30);
+  EXPECT_EQ(run_rows(false, empty_filter_sql), fast_empty);
+  EXPECT_EQ(run_rows(false, all_null_grouped_sql), fast_grp);
 }
 
 }  // namespace

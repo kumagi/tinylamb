@@ -132,7 +132,7 @@ TEST(TlcsFileTest, MultiBlockResidentCompactionZoneMapsAndProjection) {
     ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "items"));
 
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "items"));
-    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTLCSStore();
+    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(tlcs, nullptr);
     EXPECT_FALSE(tlcs->IsPaged());
     EXPECT_EQ(tlcs->TotalRows(), static_cast<uint64_t>(kRows));
@@ -206,7 +206,7 @@ TEST(TlcsFileTest, ForcedPagedModeCheckpointReopenAndMvccMutations) {
     TransactionContext ctx = db->BeginContext();
     ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "orders"));
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "orders"));
-    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTLCSStore();
+    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(tlcs, nullptr);
     EXPECT_TRUE(tlcs->IsPaged());
     EXPECT_EQ(tbl.GetLSTableStore(), nullptr);
@@ -224,10 +224,26 @@ TEST(TlcsFileTest, ForcedPagedModeCheckpointReopenAndMvccMutations) {
   {
     TransactionContext ctx = db->BeginReadOnlyContext();
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "orders"));
-    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTLCSStore();
+    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(tlcs, nullptr);
     EXPECT_TRUE(tlcs->IsPaged());
     EXPECT_EQ(tbl.GetLSTableStore(), nullptr);
+
+    // The non-projected VARCHAR column lies between these two file streams.
+    const std::array<slot_t, 2> projection = {2, 0};
+    TlcsFile::DecodedBlock coalesced;
+    TlcsFile::DecodedBlock projected;
+    ASSERT_SUCCESS(
+        tlcs->DecodeBlockColumns(0, projection, schema, &coalesced));
+    ASSERT_SUCCESS(tlcs->DecodeBlockColumnsWithOptions(
+        0, projection, schema, &projected, true, nullptr, {},
+        /*read_projected_streams_directly=*/true));
+    ASSERT_EQ(projected.row_count, coalesced.row_count);
+    ASSERT_EQ(projected.column_ids, coalesced.column_ids);
+    for (size_t col = 0; col < projection.size(); ++col) {
+      EXPECT_EQ(projected.columns[col].int_cells,
+                coalesced.columns[col].int_cells);
+    }
 
     std::vector<Row> rows = ScanAllRows(ctx.txn_, tbl);
     ASSERT_EQ(rows.size(), static_cast<size_t>(kInitialRows));
@@ -343,7 +359,7 @@ TEST(TlcsFileTest, EncodedImageCacheServesRepeatStubReads) {
     TransactionContext ctx = db->BeginContext();
     ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "cache_probe"));
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "cache_probe"));
-    tlcs = tbl.GetBackingTLCSStore();
+    tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(tlcs, nullptr);
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
@@ -427,7 +443,7 @@ TEST(TlcsFileTest, StubRecompactionSkipsEncodedImageCache) {
     TransactionContext ctx = db->BeginContext();
     ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "recompact_items"));
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "recompact_items"));
-    first_tlcs = tbl.GetBackingTLCSStore();
+    first_tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(first_tlcs, nullptr);
     ASSERT_EQ(first_tlcs->BlockCount(), 2U);
     // A small real-page tail keeps the next compaction from early-outing on
@@ -455,7 +471,7 @@ TEST(TlcsFileTest, StubRecompactionSkipsEncodedImageCache) {
   {
     TransactionContext ctx = db->BeginReadOnlyContext();
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "recompact_items"));
-    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTLCSStore();
+    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(tlcs, nullptr);
     int64_t seen = 0;
     ASSERT_SUCCESS(
@@ -526,7 +542,7 @@ TEST(TlcsFileTest, PagedStubBatchDecodeZoneMapsProjectionRuntimeFilterAndTail) {
   {
     TransactionContext ctx = db->BeginReadOnlyContext();
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "batch_items"));
-    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTLCSStore();
+    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(tlcs, nullptr);
     EXPECT_TRUE(tlcs->IsPaged());
     EXPECT_EQ(tbl.GetLSTableStore(), nullptr);
@@ -1033,7 +1049,9 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
   bu64(0);        // aux_size
   const uint32_t body_crc = Crc32C(body.data(), body.size());
 
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
   const uint64_t group_offsets[2] = {72, 72 + 8 + body.size()};
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
   const uint64_t pids[2] = {50000, 10000};
   std::vector<uint8_t> dir;
   const auto du8 = [&](uint8_t v) { dir.push_back(v); };
@@ -1178,7 +1196,7 @@ TEST(TlcsFileTest, PagedDirectoryModeAndReclaimDropResidentAndEagerCaches) {
     TransactionContext ctx = db->BeginContext();
     ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "reclaim_tbl"));
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "reclaim_tbl"));
-    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTLCSStore();
+    std::shared_ptr<const TlcsFile> tlcs = tbl.GetBackingTlcsStore();
     ASSERT_NE(tlcs, nullptr);
     EXPECT_FALSE(tlcs->IsPaged());
     EXPECT_FALSE(tlcs->IsPagedDirectory());
@@ -1352,6 +1370,15 @@ TEST(TlcsFileTest, NarrowDictMetadataAndLengthsOnlyDecode) {
     EXPECT_EQ(blk.columns[1].VarcharLength(r), expected_wide.size());
   }
 
+  const std::array<uint32_t, 2> selected = {219, 220};
+  ASSERT_SUCCESS(tlcs->DecodeBlockColumnsWithOptions(
+      0, proj, schema, &blk, /*materialize_dict_ints=*/true, &io, {}, false,
+      selected));
+  EXPECT_EQ(blk.columns[1].VarcharAt(219), "wide_payload_219_extra");
+  EXPECT_EQ(blk.columns[1].VarcharAt(220), "wide_payload_220_extra");
+  EXPECT_EQ(blk.columns[1].varchar_bytes.size(), 44U);
+  EXPECT_TRUE(blk.columns[0].IsNull(220));
+
   db->DeleteAll();
 }
 
@@ -1518,7 +1545,7 @@ TEST(TlcsFileTest,
   {
     TransactionContext ctx = db->BeginReadOnlyContext();
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "orders_idx"));
-    ASSERT_NE(tbl.GetBackingTLCSStore(), nullptr);
+    ASSERT_NE(tbl.GetBackingTlcsStore(), nullptr);
     Iterator pk_it = tbl.BeginIndexScan(ctx.txn_, tbl.GetIndex(0),
                                         Value(int64_t{50}), Value(int64_t{60}));
     std::vector<int64_t> seen_ids;
@@ -1624,6 +1651,127 @@ TEST(TlcsFileTest,
     EXPECT_FALSE(check_10.IsValid());
   }
 
+  db->DeleteAll();
+}
+
+// P356/426: TLCS compaction must not flatten MVCC version chains a pinned
+// snapshot still needs.  Old behaviour: ReplaceTableChainWithColumnarStubs
+// demoted the chain regardless of registered version chains (an idle
+// multi-statement reader holds no lease and does not block quiescence), so
+// the pinned reader's next read served the CURRENT TLCS image -- rows
+// "became newer" behind the snapshot.  New behaviour: compaction declines
+// with kConflicts while any chain is registered, and the pinned reader keeps
+// answering from the heap.
+TEST(TlcsFileTest, CompactionYieldsToPinnedVersionChains) {
+  const std::string prefix = "tlcs_pin_" + RandomString();
+  Schema schema("pinned", {Column("k", ValueType::kInt64),
+                           Column("v", ValueType::kInt64)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  {
+    TransactionContext setup = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(setup, schema));
+    for (int64_t i = 0; i < 200; ++i) {
+      ASSERT_TRUE(
+          tbl.Insert(setup.txn_, Row({Value(i), Value(i * 10)})).HasValue());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  TransactionContext reader = db->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, rtbl, db->GetTable(reader, "pinned"));
+  RowPosition first_pos;
+  {
+    Iterator it = rtbl.BeginFullScan(reader.txn_);
+    ASSERT_TRUE(it.IsValid());
+    first_pos = it.Position();
+    ASSERT_EQ((*it)[1], Value(int64_t{0}));
+  }
+  {
+    TransactionContext writer = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, wtbl, db->GetTable(writer, "pinned"));
+    ASSIGN_OR_ASSERT_FAIL(
+        RowPosition, np,
+        wtbl.Update(writer.txn_, first_pos,
+                    Row({Value(int64_t{0}), Value(int64_t{999})})));
+    (void)np;
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+
+  TransactionContext probe = db->BeginContext();
+  ASSERT_TRUE(probe.txn_.HasPageVersionChains(first_pos.page_id))
+      << "writer committed while a reader snapshot pins the old version";
+
+  // Pre-compaction the pinned snapshot already answers the old image.
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, old_image,
+                              rtbl.Read(reader.txn_, first_pos));
+  ASSERT_EQ(old_image, (Row{Value(int64_t{0}), Value(int64_t{0})}));
+
+  // The compaction attempt declines instead of flattening that history.
+  {
+    TransactionContext compactor = db->BeginContext();
+    EXPECT_EQ(db->CompactTableToTlcs(compactor, "pinned"), Status::kConflicts);
+  }
+
+  // And the pinned reader still sees the old image (old code: 999 after the
+  // compaction flattened the page into a stub).
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, still_old,
+                              rtbl.Read(reader.txn_, first_pos));
+  ASSERT_EQ(still_old, (Row{Value(int64_t{0}), Value(int64_t{0})}));
+
+  db->DeleteAll();
+}
+
+// Issue 356/426 read-side branch: an index scan whose transaction is not
+// entitled to a physical read must hydrate stub-resolved rows and answer
+// them -- not serve the flattened current image.  (During b35 development
+// this branch self-deadlocked: ResolveRow kept its shared PageRef latched
+// while EnsurePageHydratedIfStub took the exclusive latch on the same page;
+// SqlOocFuzzer.SeededSessionsShard10 hung deterministically.  This pin
+// guards the latch order.)
+TEST(TlcsFileTest, IndexScanOnStubHydratesForNonReadTransaction) {
+  const std::string prefix = "tlcs_idx_hydrate_" + RandomString();
+  Schema schema("stub_idx", {Column("k", ValueType::kInt64),
+                             Column("v", ValueType::kInt64)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  {
+    TransactionContext setup = db->BeginContext();
+    ASSERT_TRUE(db->CreateTable(setup, schema).HasValue());
+    ASSERT_SUCCESS(db->CreateIndex(
+        setup, "stub_idx", IndexSchema("idx_k", {0}, {}, IndexMode::kUnique)));
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(setup, "stub_idx"));
+    for (int64_t i = 0; i < 200; ++i) {
+      ASSERT_TRUE(
+          tbl.Insert(setup.txn_, Row({Value(i), Value(i * 10)})).HasValue());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "stub_idx"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    // A plain (non-read-only) transaction is not entitled to physical stub
+    // reads, so every resolved row walks the hydrate branch.
+    TransactionContext rw = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(rw, "stub_idx"));
+    ASSERT_NE(tbl.GetBackingTlcsStore(), nullptr);
+    Iterator it = tbl.BeginIndexScan(rw.txn_, tbl.GetIndex(0),
+                                     Value(int64_t{50}), Value(int64_t{60}));
+    std::vector<int64_t> seen;
+    while (it.IsValid()) {
+      ASSERT_SUCCESS(it.GetStatus());
+      const Row r = *it;
+      ASSERT_TRUE(r.IsValid());
+      seen.push_back(r[0].value.int_value);
+      ASSERT_EQ(r[1].value.int_value, r[0].value.int_value * 10);
+      ++it;
+    }
+    ASSERT_SUCCESS(it.GetStatus());
+    EXPECT_EQ(seen.size(), 11U);
+    EXPECT_EQ(seen.front(), 50);
+    EXPECT_EQ(seen.back(), 60);
+  }
   db->DeleteAll();
 }
 

@@ -45,9 +45,11 @@ class Schema {
   Schema(std::string_view schema_name, std::vector<Column> columns,
          uint16_t key_column_index = 0, uint64_t schema_version = 0);
   [[nodiscard]] slot_t ColumnCount() const {
-    return static_cast<slot_t>(columns_.size());
+    return static_cast<slot_t>(std::min<size_t>(
+        columns_.size(), std::numeric_limits<slot_t>::max()));
   }
   [[nodiscard]] std::string_view Name() const { return name_; }
+  void SetName(std::string name) { name_ = std::move(name); }
   [[nodiscard]] std::uint64_t LookupIdentity() const { return identity_; }
   [[nodiscard]] const Column& GetColumn(size_t idx) const {
     return columns_[idx];
@@ -55,7 +57,11 @@ class Schema {
   [[nodiscard]] std::unordered_set<ColumnName> ColumnSet() const;
   [[nodiscard]] int Offset(const ColumnName& name) const;
   void SetColumnHint(size_t idx, AccessHint h) {
-    assert(idx < columns_.size());
+    // assert() vanishes under NDEBUG; keep a real bounds check so a bad
+    // catalog/file-derived index cannot write past columns_ in release.
+    if (idx >= columns_.size()) {
+      return;
+    }
     columns_[idx].SetHint(h);
   }
   [[nodiscard]] uint16_t KeyColumnIndex() const { return key_column_index_; }

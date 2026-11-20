@@ -27,9 +27,8 @@ namespace tinylamb {
 
 class EvaluationContext;
 
-// Core binary semantics with StatusOr propagation
-// (no-exception-rule-migration Phase 5); EvaluateBinary is its deprecated
-// EXC-SHIM wrapper kept for planner/executor const-folding callers.
+// Core binary semantics with StatusOr propagation. EvaluateBinary is the
+// throwing wrapper kept for planner/executor const-folding callers.
 [[nodiscard]] StatusOr<Value> TryEvaluateBinary(BinaryOperation operation,
                                                 const Value& left,
                                                 const Value& right);
@@ -52,7 +51,9 @@ class BinaryExpression : public ExpressionBase {
  public:
   BinaryExpression(Expression left, BinaryOperation op, Expression right)
       : left_(std::move(left)), right_(std::move(right)), op_(op) {}
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kBinaryExp; }
+  [[nodiscard]] TypeTag NodeKind() const override {
+    return TypeTag::kBinaryExp;
+  }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,

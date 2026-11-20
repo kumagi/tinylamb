@@ -61,6 +61,7 @@ Status TopNExecutor::Materialize() {
     DataChunk chunk;
     while (source_->NextBatch(&chunk) != 0) {
       for (size_t i = 0; i < chunk.Size(); ++i) {
+        ++input_rows_;
         Candidate candidate{.row = chunk.RowAt(i),
                             .position = chunk.PositionAt(i),
                             .keys = {},
@@ -91,7 +92,9 @@ Status TopNExecutor::Materialize() {
       if (boundary != 0 && boundary <= rows_.size()) {
         const Candidate& last = rows_[boundary - 1];
         while (output_end_ < rows_.size()) {
-          bool tied = true;
+          // With no ordering keys there is no tie boundary: every row would
+          // compare equal, so extending would emit all rows and ignore LIMIT.
+          bool tied = !last.keys.empty();
           for (size_t i = 0; i < last.keys.size(); ++i) {
             // Peers must collapse exactly the way the ordering groups them,
             // so a case-insensitive key treats 'a' and 'A' as the same tie
@@ -229,13 +232,19 @@ Status TopNExecutor::Materialize() {
         for (size_t w = 0; w < workers; ++w) {
           partials.emplace_back(block_precedes);
         }
-        std::vector<size_t> prefixes(store->blocks.size() + 1, 0);
+        // prefixes[0] must stay 0 but every later entry is written below
+        // before it is read, so avoid value-initializing the whole array.
+        std::vector<size_t> prefixes;
+        prefixes.reserve(store->blocks.size() + 1);
+        prefixes.push_back(0);
         for (size_t b = 0; b < store->blocks.size(); ++b) {
+          size_t next = 0;
           if (__builtin_add_overflow(prefixes[b], store->blocks[b].row_count,
-                                     &prefixes[b + 1])) {
+                                     &next)) {
             return StatusError(StatusCode::kTooBigData,
                                "TopN row count overflow");
           }
+          prefixes.push_back(next);
         }
         std::vector<size_t> counts(workers, 0);
         auto fold = scan->TryFoldLSTableBlocks(

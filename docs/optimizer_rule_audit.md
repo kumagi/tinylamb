@@ -7,7 +7,7 @@
 削除した演算子の enum・DSL・専用テスト・旧ルール解説も除去しています。
 既存の未コミット変更とは別に監査開始時のファイルを保存して比較しました。
 
-2026-11-11 更新: 以下の現在一覧を作業ツリーの登録順に再生成しました。論理 86、物理 46、式 71 登録です。冒頭の削減数は 2026-10-02 当時の記録です。
+2026-11-19 更新: 以下の現在一覧を作業ツリーの登録順に再生成しました。論理 95、物理 46、式 71 登録です。冒頭の削減数は 2026-10-02 当時の記録です。
 
 ## 判定と修正
 
@@ -160,8 +160,10 @@ non-null/NULL 件数、NDV、typed histogram の範囲を読んで結合行数�
 - `check_layering.py`: 成功。65 個の既存 allowlist 辺のみ、追加なし。
 - 登録一覧はソースと順序まで照合し、撤去した論理 38 登録すべてに
   判定理由があることと、文字列登録がソースに残らないことを確認しました。
-- SQL の `AggregateUnionRewriteIsReachableFromSqlOr` は、OR の UNION ALL 化で
-  `aggregate_union_transpose` が実際に到達することと COUNT/SUM の結果を検証します。
+- OR の UNION ALL 化は non-throwing 証明が必要なため、典型 SQL では述語保持を
+  検証します(`CascadesRulesCoverageTest.AggregateOverOrPreservesPredicateEvaluation`)。
+  `aggregate_union_transpose` の到達自体は人工形状
+  (`CascadesTest.AggregateUnionTranspose`)で検証します。
   `CountNonNullColumnRewritesToCountStar` は選択された COUNT(*) と、
   観測 NULL がゼロでも nullable 列は変換しないことを検証します。
 - ASan/UBSan のシード付き実行: `--seed=2026100201 --threads=4 --duration=600`、
@@ -269,6 +271,15 @@ stack trace を有効にしておらず、発生箇所・原因を特定でき�
 84. `cast_pushdown_on_comparison`
 85. `extract_year_sargable`
 86. `comparison_self_predicates`
+87. `distinct_idempotent_aggregate_elimination`
+88. `inner_join_to_semijoin_idempotent_aggs`
+89. `having_extremum_bound_pushdown`
+90. `outer_to_inner_join_on_null_rejecting_having`
+91. `eager_aggregation_over_join`
+92. `disjoint_union_group_by_bypass`
+93. `outer_to_anti_join_through_inner_join`
+94. `self_join_agg_to_window`
+95. `eager_distinct_fact_keys_before_join`
 
 ### 物理
 

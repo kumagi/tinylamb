@@ -117,7 +117,11 @@ IncrementalSortExecutor::IncrementalSortExecutor(
 }
 
 bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
-  return std::ranges::all_of(prefix_keys_, [&](const auto& key) {
+  // Evaluate every key: an error in a later key must not be hidden by an
+  // earlier unequal key short-circuiting the comparison (the AST is the
+  // semantic reference and evaluates all keys).
+  bool equal = true;
+  for (const auto& key : prefix_keys_) {
     StatusOr<Value> va_or = key.expression->TryEvaluate(a, schema_);
     StatusOr<Value> vb_or = key.expression->TryEvaluate(b, schema_);
     if (!va_or.HasValue() || !vb_or.HasValue()) {
@@ -126,12 +130,11 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
       }
       return false;
     }
-    // Peers must collapse exactly the way the ordering groups them, so a
-    // case-insensitive prefix key treats 'a' and 'A' as the same run instead
-    // of splitting the boundary row. A binary prefix key keeps Value's
-    // equality (NaN, -0.0 and interval equivalence).
-    return EqualUnderCollation(va_or.Value(), vb_or.Value());
-  });
+    if (!EqualUnderCollation(va_or.Value(), vb_or.Value())) {
+      equal = false;
+    }
+  }
+  return equal;
 }
 
 bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {

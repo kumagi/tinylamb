@@ -42,7 +42,7 @@ inline constexpr size_t kColumnarChunkRows = 2048;
 struct ChunkStringArena {
   static constexpr size_t kDefaultSlabBytes = 16384;
   struct Slab {
-    std::unique_ptr<char[]> data;
+    std::unique_ptr<char[]> data;  // NOLINT(modernize-avoid-c-arrays) dynamic slab size
     size_t capacity{0};
   };
   std::deque<Slab> slabs;
@@ -57,6 +57,7 @@ struct ChunkStringArena {
   ChunkStringArena& operator=(ChunkStringArena&&) noexcept = default;
   ChunkStringArena(const ChunkStringArena&) = delete;
   ChunkStringArena& operator=(const ChunkStringArena&) = delete;
+  ~ChunkStringArena() = default;
 
   [[nodiscard]] std::string_view Store(std::string_view text) {
     if (text.empty()) {
@@ -69,6 +70,7 @@ struct ChunkStringArena {
       return {dst, text.size()};
     }
     const size_t cap = std::max(kDefaultSlabBytes, text.size());
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays) dynamically sized slab
     slabs.push_back(Slab{.data = std::make_unique_for_overwrite<char[]>(cap),
                          .capacity = cap});
     allocated_bytes += cap;
@@ -845,7 +847,7 @@ struct ColumnarColumn {
           dst->SetDouble(const_double);
           break;
         case ValueType::kVarChar:
-          dst->SetStringView(const_string);
+          dst->CopyFromStringView(const_string);
           if (is_interval) {
             dst->SetInterval();
           }
@@ -865,7 +867,7 @@ struct ColumnarColumn {
       }
       switch (type) {
         case ValueType::kVarChar:
-          dst->SetStringView(dict->StringEntryAt(code));
+          dst->CopyFromStringView(dict->StringEntryAt(code));
           if (is_interval) {
             dst->SetInterval();
           }
@@ -930,7 +932,7 @@ struct ColumnarColumn {
         dst->SetDouble(doubles[r]);
         break;
       case ValueType::kVarChar: {
-        dst->SetStringView(strings[r]);
+        dst->CopyFromStringView(strings[r]);
         if (is_interval) {
           dst->SetInterval();
         }
@@ -1307,6 +1309,7 @@ struct CompiledColumnarProjection {
   enum class Kind : uint8_t {
     kPassThrough,
     kConstant,
+    kNullCoalesce,
     kBytecode,
     kSubstring,
     kFallback
@@ -1314,6 +1317,7 @@ struct CompiledColumnarProjection {
   struct Item {
     Kind kind{Kind::kFallback};
     slot_t src_col{0};
+    slot_t alt_col{0};
     Value constant;
     std::optional<BytecodeProgram> bytecode;
     int64_t substr_start{1};
@@ -1330,7 +1334,7 @@ struct CompiledColumnarProjection {
 };
 
 // Evaluates a context-free CompiledColumnarProjection over `input`, returning
-// std::nullopt if any chunk requires contextful AST fallback (`kUnsupported`)
+// std::nullopt if any chunk requires contextual AST fallback (`kUnsupported`)
 // or setting `*error` on SQL evaluation error.
 [[nodiscard]] StatusOr<std::optional<std::shared_ptr<ColumnarTable>>>
 TryProjectColumnarTable(const CompiledColumnarProjection& plan,

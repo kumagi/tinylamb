@@ -65,8 +65,8 @@ Namespace `relational_detail`. Promotion to a real layer is an open item.
 - `pipeline/` (`pipeline_ir`, `pipeline_ops`, `ooc_sinks`, `ooc_*_sink.cpp`,
   `ooc_join_cte_sources.cpp`) — P3a/P3b push-breaker pipeline IR, scheduler,
   and OOC spillable sinks/sources (`OocSortSink`, `OocDistinctSink`,
-  `OocHashJoinSink`, `OocGroupAggSink`, `OocWindowSink`, `OocSetOpSink`,
-  `OocIncrementalSortSink`, `OocMergeJoinSource`, `OocBandJoinSource`,
+  `OocHashBuildSink`, `OocGroupAggSink`, `OocWindowSink`, `OocSetOpInputSink`,
+  `IncrementalSortSource`, `OocMergeJoinSource`, `OocBandJoinSource`,
   `OocRecursiveCteSource`, `OocApplySource`, etc.).
 - `columnar_table.{hpp,cpp}`, `columnar_tlcs_fast_path.{hpp,cpp}`,
   `fused_grouped_join*`, `typed_stream_aggregate*` — columnar intermediate

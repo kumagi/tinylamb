@@ -13,7 +13,7 @@ Status: accepted（2026-11-16、方針のみ）
   コミット済みの状態（`committed_packed_`）を別々に持つ可変長の構造である。
 - 常駐量は既にバイト数で数えている（`resident_bytes_`、`Page::accounted_bytes_`）。
 - 退避は FIFO ＋参照ビットで動いている（`eviction_fifo_` と `Page::TakeReferenced()`）。
-- 扱う単位の大きさが揃っていない（ページ 32 KiB、TLCS のブロック、LSM のランのブロック）。
+- 扱う単位の大きさが揃っていない（可変長の `RowPage`、TLCS のブロック、LSM のランのブロック）。固定長フレームを前提にできないのはこのため。
 - `s3-fifo.md`（削除済み）は、既に無いファイル（`page/page_pool.cpp`、
   `common/vm_cache_impl.cpp`、`index/lsm_detail/cache.hpp`）を前提にした別方向の計画
   （mmap の安定アドレス空間）である。

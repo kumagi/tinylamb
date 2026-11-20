@@ -491,6 +491,10 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
         value.type == ValueType::kInt64) {
       value.SetUnsigned();
     }
+    if (slot != RowDecodePlan::kNoSlot && plan.has_interval &&
+        plan.slot_interval[slot] != 0 && !value.IsNull()) {
+      value.SetInterval();
+    }
   }
   for (; i < count; ++i) {
     const size_t slot = slots[i];
@@ -533,6 +537,10 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
         value.type == ValueType::kInt64) {
       value.SetUnsigned();
     }
+    if (slot != RowDecodePlan::kNoSlot && plan.has_interval &&
+        plan.slot_interval[slot] != 0 && !value.IsNull()) {
+      value.SetInterval();
+    }
   }
   return static_cast<size_t>(src - original_offset);
 }
@@ -571,6 +579,11 @@ StatusOr<std::optional<int64_t>> Row::TryPeekInteger(const char* src,
       // the peek without constructing a Value (row decode ran this per row).
       int64_t key = 0;
       DeserializeInteger(src, &key);
+      // UINT64 images are stored as raw int64 bits; a 2^63+ value must peek
+      // as a large positive magnitude, not a negative number.
+      if (sc.GetColumn(i).IsUnsigned()) {
+        return static_cast<int64_t>(static_cast<uint64_t>(key));
+      }
       return key;
     }
     if (is_null) {

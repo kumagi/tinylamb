@@ -121,9 +121,15 @@ class OpWatchdog {
       const std::string report = "op ran longer than " +
                                  std::to_string(static_cast<int>(timeout_)) +
                                  " s (hang or livelock): " + op.substr(0, 400);
-      std::ofstream(TracePath(seed_))
-          << SerializeOocTest(seed_, trace_, FailureHeader(signature, report));
-      std::cerr << "failing seed=" << seed_ << " (trace written to "
+      {
+        std::ofstream out(TracePath(seed_));
+        out << SerializeOocTest(seed_, trace_,
+                                FailureHeader(signature, report));
+        if (!out) {
+          std::cerr << "failed to write trace " << TracePath(seed_) << "\n";
+        }
+      }
+      std::cerr << "failing seed=" << seed_ << " (trace attempted at "
                 << TracePath(seed_) << ")\n"
                 << report << "\n"
                 << std::flush;
@@ -165,8 +171,14 @@ OocStats RunSeeds(uint64_t first, uint64_t count, int flavor,
     const std::string report =
         RunOocSession(nullptr, 0, seed, options, &stats, &trace);
     if (!report.empty()) {
-      std::ofstream(TracePath(seed)) << SerializeOocTest(
-          seed, trace, FailureHeader(OocFailureSignature(report), report));
+      {
+        std::ofstream out(TracePath(seed));
+        out << SerializeOocTest(
+            seed, trace, FailureHeader(OocFailureSignature(report), report));
+        if (!out) {
+          ADD_FAILURE() << "failed to write trace " << TracePath(seed);
+        }
+      }
       ADD_FAILURE() << "failing seed=" << seed << " (trace written to "
                     << TracePath(seed) << ")\n"
                     << report;
@@ -183,7 +195,13 @@ void RunShard(uint64_t shard) {
     if (shard != 0) {
       GTEST_SKIP() << "single-seed run handled by shard 0";
     }
-    RunSeeds(std::strtoull(only, nullptr, 10), 1, -1);
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(only, &end, 10);
+    if (errno != 0 || end == only || *end != '\0') {
+      GTEST_SKIP() << "invalid TINYLAMB_OOC_FUZZ_ONLY_SEED";
+    }
+    RunSeeds(parsed, 1, -1);
     return;
   }
   bool any_pool_capped = false;

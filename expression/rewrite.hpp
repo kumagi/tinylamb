@@ -149,9 +149,8 @@ class ExpressionRewriter {
   // would be unsound. Without a schema the rules behave exactly as before.
   void set_schema(const Schema* schema) { schema_ = schema; }
 
-  // Core rewriting with StatusOr propagation
-  // (no-exception-rule-migration Phase 5); Rewrite/RewriteOnce are the
-  // deprecated EXC-SHIM wrappers.
+  // Core rewriting with StatusOr propagation. Rewrite/RewriteOnce are the
+  // throwing wrappers.
   [[nodiscard]] StatusOr<Expression> TryRewrite(
       const Expression& expression) const;
   [[nodiscard]] StatusOr<Expression> TryRewriteOnce(
@@ -228,10 +227,29 @@ enum class Volatility : uint8_t {
 [[nodiscard]] Volatility GetFunctionVolatility(std::string_view func_name);
 
 // True when the expression can be evaluated more times without changing
-// results: immutable scalar tree, no volatile functions, and no subquery
-// or aggregate subtrees. Rewrites that duplicate an expression (x + x ->
-// x * 2, predicate fan-out into several FILTER clauses) must gate on this.
+// results: immutable, non-throwing scalar tree, no volatile functions, and no
+// subquery or aggregate subtrees. A deterministic expression that can still
+// raise (1/0, CAST('abc' AS INT64)) is NOT safe: duplicating or fanning it out
+// changes which branch raises first. Rewrites that duplicate an expression
+// (x + x -> x * 2, predicate fan-out into several FILTER clauses) must gate
+// on this.
+class ScopedActiveRewriteSchema {
+ public:
+  explicit ScopedActiveRewriteSchema(const Schema* schema);
+  ~ScopedActiveRewriteSchema();
+  ScopedActiveRewriteSchema(const ScopedActiveRewriteSchema&) = delete;
+  ScopedActiveRewriteSchema& operator=(const ScopedActiveRewriteSchema&) =
+      delete;
+  ScopedActiveRewriteSchema(ScopedActiveRewriteSchema&&) = delete;
+  ScopedActiveRewriteSchema& operator=(ScopedActiveRewriteSchema&&) = delete;
+
+ private:
+  const Schema* saved_;
+};
+
 [[nodiscard]] bool SafeToReduceEvaluationCount(const Expression& expression);
+[[nodiscard]] bool SafeToReduceEvaluationCountWithSchema(
+    const Expression& expression, const Schema& schema);
 // True when any reachable function call is volatile (rand / random / uuid /
 // generate_uuid / newid): a rewrite that changes how often such a call runs
 // also changes its result.  Stable calls (now / current_timestamp / ...) are

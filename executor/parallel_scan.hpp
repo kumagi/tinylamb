@@ -26,9 +26,9 @@ namespace tinylamb {
 class Transaction;
 struct LSTableStore;
 
-// Morsel-driven scan: workers own morsels by static rotation (worker w takes
-// morsels w, w+W, w+2W, ...) and hand decoded chunks to the consumer in
-// morsel order, preserving the table's clustered scan order.
+// Morsel-driven scan: workers claim morsels dynamically from a shared cursor
+// and hand decoded chunks to a morsel-ordered assembler, preserving the
+// table's clustered scan order.
 class ParallelScan final : public ExecutorBase {
  public:
   // Non-copyable by design: instances are owned by smart pointers and

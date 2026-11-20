@@ -251,15 +251,20 @@ TEST(IncrementalSortPlanExtraTest, IsOrderedByNullsFirstAndDump) {
   EXPECT_TRUE(plan.IsOrderedBy({ColumnValueExp("a"), ColumnValueExp("b")},
                                {true, false}, {true}));
 
-  const std::string expected =
-      "IncrementalSort presorted=" + ColumnValueExp("a")->ToString();
+  // ToString lists both key groups with their directions.
+  const std::string expected = "IncrementalSort presorted=" +
+                               ColumnValueExp("a")->ToString() +
+                               " ASC sorting=" +
+                               ColumnValueExp("b")->ToString() + " DESC";
   EXPECT_EQ(plan.ToString(), expected);
   std::string dump = DumpToString(plan);
   EXPECT_NE(dump.find(expected), std::string::npos);
 
-  // No prefix keys: ToString keeps the bare name.
+  // No prefix keys: only the sorting group is listed.
   IncrementalSortPlan bare(child, {}, suffix);
-  EXPECT_EQ(bare.ToString(), "IncrementalSort");
+  EXPECT_EQ(bare.ToString(),
+            "IncrementalSort sorting=" + ColumnValueExp("b")->ToString() +
+                " DESC");
 }
 
 TEST(GroupByPlanExtraTest, DumpAndCardinalityCaps) {

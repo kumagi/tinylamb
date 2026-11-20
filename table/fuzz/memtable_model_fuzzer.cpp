@@ -72,9 +72,14 @@ int FuzzMemtableModelOneInput(const uint8_t* data, size_t size) {
   if (size < 32) {
     return 0;
   }
+  // T4246: the LCG only saw data[0..7], so mutations past byte 8 could not
+  // change the Put/Delete/Lookup/Sync op sequence the model oracle drives.
+  // Fold the whole input (FNV-1a) to restore that headroom.
   Lcg rng([&] {
-    uint64_t s = 0;
-    std::memcpy(&s, data, 8);
+    uint64_t s = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; ++i) {
+      s = (s ^ data[i]) * 1099511628211ULL;
+    }
     return s;
   }());
 

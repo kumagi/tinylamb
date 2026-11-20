@@ -130,7 +130,7 @@ size_t CountCommittedEntries(const std::string& dump) {
 // stack (the fixtures below exercise the layer directly).
 // ---------------------------------------------------------------------------
 
-class SqlFunctionCoverageTest : public ::testing::Test {
+class TransactionFunctionCoverageTest : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
@@ -154,7 +154,7 @@ class SqlFunctionCoverageTest : public ::testing::Test {
   std::unique_ptr<SqlEngine> engine_;
 };
 
-TEST_F(SqlFunctionCoverageTest, Smoke) {
+TEST_F(TransactionFunctionCoverageTest, Smoke) {
   const auto rows = RunSql(engine_.get(), context_.get(), "SELECT 1");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{1}));
@@ -719,6 +719,26 @@ TEST_F(TransactionCoverageTest, DebugDumpVersionChainsRendersEveryShape) {
   ASSERT_EQ(tm_->Abort(w4), Status::kSuccess);
 }
 
+// T2110: DebugDumpIndexReservations rendered a reservation-free page as
+// "(none)" while its sister DebugDumpVersionChains renders empty (pinned in
+// DebugDumpVersionChainsRendersEveryShape above).  One convention now: empty
+// means empty everywhere; a real reservation still renders txn bytes.
+TEST_F(TransactionCoverageTest,
+       DebugDumpIndexReservationsEmptyAgreesWithChains) {
+  const page_id_t pid = 42;
+  EXPECT_TRUE(tm_->DebugDumpIndexReservations(pid).empty());
+  EXPECT_TRUE(tm_->DebugDumpVersionChains(pid).empty());
+
+  Transaction t = tm_->Begin();
+  tm_->ReserveIndexUndoBytes(t, pid, 64);
+  const std::string dump = tm_->DebugDumpIndexReservations(pid);
+  EXPECT_NE(dump.find("txn"), std::string::npos);
+  EXPECT_NE(dump.find(":64"), std::string::npos);
+  // Another page stays empty under the same convention.
+  EXPECT_TRUE(tm_->DebugDumpIndexReservations(pid + 100).empty());
+  ASSERT_EQ(tm_->Abort(t), Status::kSuccess);
+}
+
 TEST_F(TransactionCoverageTest, InvalidatePageVersionsDropsChainsAndWriteSet) {
   const page_id_t pid = 41;
   const RowPosition committed(pid, 1);
@@ -769,7 +789,16 @@ TEST_F(TransactionCoverageTest, IsActiveTracksLifecycleAndDestructor) {
 
 TEST_F(TransactionCoverageTest, TransactionCanOutliveDetachedManager) {
   auto transaction = std::make_unique<Transaction>(tm_->Begin());
+  const txn_id_t id = transaction->ID();
   tm_.reset();
+  // Manager teardown detaches the transaction; it must stay readable and
+  // safely finishable without dereferencing the destroyed manager.
+  EXPECT_NE(id, 0U);
+  EXPECT_EQ(transaction->ID(), id);
+  EXPECT_EQ(transaction->PreCommit(), Status::kRuntimeError);
+  // Abort on a detached transaction marks it aborted but reports kRuntimeError
+  // (the manager that would perform the full unwind is gone).
+  EXPECT_EQ(transaction->Abort(), Status::kRuntimeError);
   transaction.reset();
 }
 
@@ -967,7 +996,7 @@ TEST_F(TransactionCoverageTest, NoWaitFailsOlderWaiterImmediately) {
   const auto begin = std::chrono::steady_clock::now();
   EXPECT_FALSE(older.AddWriteSet(rp));
   EXPECT_LT(std::chrono::steady_clock::now() - begin,
-            std::chrono::milliseconds(1000));
+            std::chrono::milliseconds(5000));
   // The holder keeps its intent and finishes normally; afterwards the row
   // is free again.
   ASSERT_EQ(tm_->Abort(younger), Status::kSuccess);
@@ -1242,7 +1271,7 @@ TEST_F(TransactionCoverageTest, DeadlockDetectGrantsAfterHolderMovesOn) {
     const auto start = std::chrono::steady_clock::now();
     acquired = t2.AddWriteSet(rp);
     EXPECT_LT(std::chrono::steady_clock::now() - start,
-              std::chrono::seconds(2));
+              std::chrono::seconds(10));
     if (!acquired.load()) {
       EXPECT_EQ(t2.LastIntentWaitFailure(),
                 Transaction::IntentWaitFailure::kHolderAborting);

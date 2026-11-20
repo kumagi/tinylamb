@@ -173,7 +173,8 @@ TEST_F(ExecutorTest, SortDumpAndSmallInput) {
   ASSERT_FALSE(sort.Next(&row, nullptr));
   std::stringstream ss;
   sort.Dump(ss, 0);
-  EXPECT_NE(ss.str().find("ParallelSort"), std::string::npos);
+  // "ParallelSort" only with >1 worker; a 1-worker sort dumps as "Sort (".
+  EXPECT_NE(ss.str().find("Sort ("), std::string::npos) << ss.str();
 }
 
 TEST_F(ExecutorTest, HashJoinNextBatchAndDump) {
@@ -1367,29 +1368,28 @@ TEST_F(ExecutorTest, RelationalCorrelatedNestedQueryCacheIncludesDependencies) {
 }
 
 TEST_F(ExecutorTest, RelationalHybridHashJoinSpillsUnderBudget) {
-  CreateWideTable(*rs_, "WideJoin", 200);
-  ScopedQueryMemory memory(65536);  // 200 x ~236B rows cannot all stay resident
+  CreateWideTable(*rs_, "WideJoinLeft", 200);
+  CreateWideTable(*rs_, "WideJoinRight", 200);
+  ScopedQueryMemory memory(65536);
   // The EXISTS marker forces the relational engine (Phase 8 routes plain
-  // aliased joins to the cost-based optimizer); it is semantically neutral.
-  const auto rows = RelationalRun(
-      *rs_,
-      "SELECT a.key FROM WideJoin AS a JOIN WideJoin AS b ON a.key = b.key "
-      "WHERE EXISTS (SELECT 1 FROM WideJoin);");
+  // aliased joins to the cost-based optimizer). Read both payloads to keep
+  // the wide joins and prevent key-only join elimination.
+  constexpr std::string_view sql =
+      "SELECT a.key, a.name, b.name FROM WideJoinLeft AS a "
+      "JOIN WideJoinRight AS b ON a.key = b.key "
+      "WHERE EXISTS (SELECT 1 FROM WideJoinLeft);";
+  const auto rows = RelationalRun(*rs_, sql);
   ASSERT_EQ(rows.size(), 200U);
   std::unordered_set<int64_t> keys;
   for (const Row& row : rows) {
     EXPECT_TRUE(keys.insert(row[0].value.int_value).second);
+    ASSERT_EQ(row.Count(), 3U);
+    EXPECT_EQ(row[1], row[2]);
   }
   EXPECT_EQ(keys.size(), 200U);
   EXPECT_TRUE(keys.contains(0));
   EXPECT_TRUE(keys.contains(199));
-  const std::string plan = RelationalExplain(*rs_,
-                                             "SELECT a.key FROM WideJoin AS a "
-                                             "JOIN WideJoin AS b ON a.key = "
-                                             "b.key "
-                                             "WHERE EXISTS (SELECT 1 FROM "
-                                             "WideJoin);",
-                                             /*analyze=*/true);
+  const std::string plan = RelationalExplain(*rs_, sql, /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
 }
@@ -1425,7 +1425,9 @@ TEST_F(ExecutorTest, RelationalHybridHashLeftJoinSpillsUnderBudget) {
 // D8 (docs/design.md) acceptance: hybrid hash join with spill, compared
 // against the same query with no memory budget.  Covers null-safe equality,
 // RIGHT OUTER and FULL OUTER, and mixed resident/spill inputs.  A budget of
-// 64KiB forces the 200-row wide tables to spill so every partition path
+// A 64KiB budget puts the 200-row wide tables under spill pressure so the
+// partition handling code runs; these tests assert result equivalence, not
+// the spill count itself (the sibling test above pins the spill marker).
 // (resident build, spilled build, unmatched spill rows) is exercised.
 
 TEST_F(ExecutorTest, RelationalNullSafeInnerJoinSpillMatchesUnbudgeted) {
@@ -1441,7 +1443,7 @@ TEST_F(ExecutorTest, RelationalNullSafeInnerJoinSpillMatchesUnbudgeted) {
   }
   EXPECT_FALSE(reference.empty());
   {
-    ScopedQueryMemory memory(65536);  // 64KiB forces spill
+    ScopedQueryMemory memory(65536);  // 64KiB: spill pressure, results asserted
     const auto spilled = KeyPairCounts(RelationalRun(*rs_, sql));
     EXPECT_EQ(spilled, reference);
   }

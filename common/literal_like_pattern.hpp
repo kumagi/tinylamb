@@ -6,7 +6,7 @@
 
 namespace tinylamb {
 // A borrowed, non-escaping byte LIKE pattern with a single literal and
-// optional edge '%'. The caller handles SQL NULL/collation and keeps the
+// optional leading/trailing '%' (both may be present: Kind::kContains). The caller handles SQL NULL/collation and keeps the
 // original pattern alive. Interior wildcards retain the general evaluator.
 struct LiteralLikePattern {
   enum class Kind { kExact, kPrefix, kSuffix, kContains };
@@ -14,12 +14,14 @@ struct LiteralLikePattern {
   std::string_view literal;
 
   static std::optional<LiteralLikePattern> Compile(std::string_view pattern) {
+    // Strip all consecutive wildcards at each end; %%abc%% is the same
+    // pattern as %abc% and must still be treated as a pure substring match.
     const bool leading = pattern.starts_with('%');
-    if (leading) {
+    while (pattern.starts_with('%')) {
       pattern.remove_prefix(1);
     }
     const bool trailing = pattern.ends_with('%');
-    if (trailing) {
+    while (pattern.ends_with('%')) {
       pattern.remove_suffix(1);
     }
     if (pattern.find_first_of("%_") != std::string_view::npos) {

@@ -106,11 +106,9 @@ A single conjunct that is itself `guard AND risky` still follows the
 strict AST short-circuit order — tolerance applies *between* top-level
 conjuncts, not inside one.
 
-Regression pins: `query_test.cpp` `WhereConjunctReorderSuppressesSiblingError`
-(sibling FALSE suppresses div-by-zero across both textual orders), the
-division-by-zero propagation case (no rejecting sibling → error), and the
-fuzzer-side `CheckGuard` oracle in `sql_oracle_fuzzer.cpp` which permutes
-guarded conjuncts and compares against a commutative 3VL mirror.
+Regression pins: `query/query_test_part3.cpp` `WhereConjunctReorderSuppressesSiblingError`
+(sibling FALSE suppresses div-by-zero across both textual orders) and the
+division-by-zero propagation case (no rejecting sibling → error).
 
 ## JIT as a bytecode compiler
 

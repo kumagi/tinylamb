@@ -1,0 +1,12 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795044434050
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: UPDATE affected # rows, mirror expects # :: op 6 `upd t1 all 0 0 1 0 vadd -11 0 none 0 0`: UPDATE affected 0 rows, mirror expects 64: UPDATE t1 SET v = v + -11;
+create t1 1 69 1677
+ins_bulk t1 1 64 911
+commit
+index t1 ix0 uk
+upd t1 all 0 0 1 0 vadd -45 0 none 0 0
+abort
+upd t1 all 0 0 1 0 vadd -11 0 none 0 0
+check full t1

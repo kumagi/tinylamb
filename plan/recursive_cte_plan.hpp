@@ -46,7 +46,6 @@ class RecursiveCtePlan final : public PlanBase {
     return (child_ ? child_->EmitRowCount() : 1) * 10;
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
-  [[nodiscard]] const Plan& RecursiveChild() const { return recursive_child_; }
   [[nodiscard]] const std::string& CteName() const { return cte_name_; }
   [[nodiscard]] const std::shared_ptr<const SelectStatement>& Body() const {
     return body_;

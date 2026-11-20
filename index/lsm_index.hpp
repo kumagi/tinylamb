@@ -48,9 +48,13 @@ class LsmIndexIterator {
     valid_ = false;
     entries_.clear();
     idx_ = 0;
+    status_ = Status::kSuccess;
+    stable_leaf_cache_ = false;
   }
 
   void EnableStableLeafCache() { stable_leaf_cache_ = true; }
+  void DisableStableLeafCache() { stable_leaf_cache_ = false; }
+  [[nodiscard]] bool StableLeafCacheEnabled() const { return stable_leaf_cache_; }
   [[nodiscard]] bool EnsureLeafCache() const {
     return valid_ && idx_ < entries_.size();
   }
@@ -90,6 +94,10 @@ class LsmIndex {
 
   bool operator==(const LsmIndex& rhs) const = default;
   [[nodiscard]] page_id_t Root() const { return root_; }
+
+  // Read the committed baseline plus this transaction's own staged writes.
+  [[nodiscard]] StatusOr<std::string> ReadVisible(Transaction& txn,
+                                                  std::string_view key) const;
 
   Status Insert(Transaction& txn, std::string_view key, std::string_view value,
                 page_id_t* hint_leaf = nullptr) const;

@@ -1,13 +1,13 @@
 [default required_features=ENABLE_MEASURES]
 [prepare_database]
-# TODO: b/350555383 - Remove PlaceHolderTable once we support creating Measures
+# TODO: b/350555383 - Remove PlaceholderTable once we support creating Measures
 # in compliance tests.
 # The use of PlaceholderTable is a workaround for creating tables with Measures
 # in compliance tests. There is currently no way to create measures via SQL or
 # DDL. As a result, compliance testing for measures requires pre-loading the
 # catalog with tables containing measures. This is done in the
 # `SQLTestBase::StepCreateDatabase()` method, which is only run when there is a
-# non-empty test database. So we create PlaceHolderTable to ensure the test
+# non-empty test database. So we create PlaceholderTable to ensure the test
 # database is non-empty.
 CREATE TABLE PlaceholderTable AS SELECT 1 AS key;
 --

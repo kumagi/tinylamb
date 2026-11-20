@@ -3,9 +3,13 @@
 #ifndef TINYLAMB_FUZZ_SCOPED_DB_HPP
 #define TINYLAMB_FUZZ_SCOPED_DB_HPP
 
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -37,14 +41,27 @@ inline void InstallFuzzSigtrapBridge() {
   static const bool kInstalled = []() {
     struct sigaction sa{};
     sa.sa_handler = [](int /*sig*/) {
-      std::cerr << "\n[fuzz-sigtrap] caught SIGTRAP (__builtin_trap / bounds); "
-                   "forwarding to SIGABRT for libFuzzer\n"
-                << std::flush;
+      // T4841: std::cerr is NOT async-signal-safe -- its lock may be held
+      // by another thread mid-write when the trap lands, deadlocking the
+      // bridge before libFuzzer can record the crash. Use write(2).
+      static constexpr char kMsg[] =  // NOLINT(modernize-avoid-c-arrays)
+          "\n[fuzz-sigtrap] caught SIGTRAP (__builtin_trap / bounds); "
+          "forwarding to SIGABRT for libFuzzer\n";
+      const ssize_t written = ::write(2, kMsg, sizeof(kMsg) - 1);
+      (void)written;
       std::abort();
     };
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_NODEFER;
-    sigaction(SIGTRAP, &sa, nullptr);
+    if (::sigaction(SIGTRAP, &sa, nullptr) != 0) {
+      // Install failure must not pass silently: the SIGTRAP contract above
+      // would be a lie, so fail loudly at harness startup instead.
+      static constexpr char kFail[] =  // NOLINT(modernize-avoid-c-arrays)
+          "[fuzz-sigtrap] sigaction(SIGTRAP) failed; aborting\n";
+      const ssize_t written = ::write(2, kFail, sizeof(kFail) - 1);
+      (void)written;
+      std::abort();
+    }
     return true;
   }();
   (void)kInstalled;
@@ -79,6 +96,17 @@ class ScopedDb {
       db_->DeleteAll();
     }
     db_.reset();
+    // A failed Create/CrashAndReopen leaves db_ null but can still strand
+    // files; remove them by name so the next iteration starts clean.
+    RemoveDbFiles();
+  }
+
+  void RemoveDbFiles() {
+    std::error_code ec;
+    for (const char* suffix : {".db", ".log", ".log.meta", ".log.meta.tmp",
+                              ".last_checkpoint"}) {
+      std::filesystem::remove(name_ + suffix, ec);
+    }
   }
 
   void Reset() { db_.reset(); }
@@ -93,6 +121,10 @@ class ScopedDb {
     if (created.HasValue()) {
       created.Value()->DeleteAll();
     }
+    // A partially failed Create can strand files even when the retry above
+    // returns an error; always sweep by name so the next iteration starts
+    // clean (same contract as the destructor).
+    RemoveDbFiles();
   }
 
   // Emulates a crash mid-session: discard every unflushed pool image and
@@ -198,9 +230,14 @@ inline bool ApplyIndexSpec(Database& db, TransactionContext& ctx,
     size_t p = 0;
     while (p < list.size()) {
       const size_t comma = list.find(',', p);
-      cols.emplace_back(list.substr(p, comma == std::string_view::npos
-                                           ? std::string_view::npos
-                                           : comma - p));
+      std::string col(list.substr(p, comma == std::string_view::npos
+                                         ? std::string_view::npos
+                                         : comma - p));
+      const size_t start = col.find_first_not_of(" \t\r\n");
+      const size_t end = col.find_last_not_of(" \t\r\n");
+      col = start == std::string::npos ? std::string()
+                                       : col.substr(start, end - start + 1);
+      cols.push_back(std::move(col));
       if (comma == std::string_view::npos) {
         break;
       }
@@ -299,10 +336,22 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
                             const std::string& filename,
                             const std::string& test_text,
                             std::string_view report, std::string_view verify) {
-  auto write_pair = [&](const std::string& base_path) {
+  // A finding whose serialized trace replays clean is most likely flaky;
+  // do not persist it as a regression (it would be a permanently green test)
+  // and do not abort the worker over a non-reproducing failure.
+  if (verify.find("flaky") != std::string_view::npos) {
+    std::cerr << "[" << tag << "] skipping flaky finding (replay holds): "
+              << filename << "\n"
+              << std::flush;
+    return;
+  }
+  auto write_pair = [&](const std::string& base_path) -> bool {
+    bool ok = true;
     {
       std::ofstream file(base_path);
       file << test_text;
+      file.flush();
+      ok = file.good();
     }
     std::string report_path = base_path;
     if (report_path.ends_with(".test")) {
@@ -313,17 +362,33 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
     rfile << "[" << tag << "] seed=" << seed << "\n"
           << report << "regression test written to " << base_path
           << (verify.empty() ? "" : "\n" + std::string(verify)) << "\n";
+    rfile.flush();
+    return ok && rfile.good();
   };
 
-  write_pair(filename);
+  if (!write_pair(filename)) {
+    std::cerr << "[" << tag << "] WARNING: failed to write regression test to "
+              << filename << "\n"
+              << std::flush;
+  }
   if (const char* dir = std::getenv("TINYLAMB_FUZZ_FINDINGS_DIR");
       dir != nullptr && dir[0] != '\0') {
     std::string target = dir;
     if (!target.ends_with('/')) {
       target.push_back('/');
     }
+    // Create the directory on demand: a supervisor-set findings dir that does
+    // not exist yet must not silently swallow the remote copy.
+    std::error_code mkerr;
+    std::filesystem::create_directories(target, mkerr);
     target += filename;
-    write_pair(target);
+    if (!write_pair(target)) {
+      std::cerr << "[" << tag << "] WARNING: failed to write finding copy to "
+                << target << " (TINYLAMB_FUZZ_FINDINGS_DIR=" << dir
+                << ", mkdir error: " << mkerr.message()
+                << "); only the local copy may exist\n"
+                << std::flush;
+    }
   }
 
   std::cerr << "[" << tag << "] seed=" << seed << "\n"

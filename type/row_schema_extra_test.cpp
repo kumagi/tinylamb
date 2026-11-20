@@ -72,7 +72,10 @@ TEST(RowSchemaExtraTest, ExtractBuildsAnOrderedProjection) {
   EXPECT_EQ(picked.values_[1], Value(1));
   // Repeating an index duplicates the column; an empty list yields an empty
   // row rather than a failure.
-  EXPECT_EQ(row.Extract({2, 2}).values_[0], Value(2.5));
+  const Row repeated = row.Extract({2, 2});
+  ASSERT_EQ(repeated.values_.size(), 2U);
+  EXPECT_EQ(repeated.values_[0], Value(2.5));
+  EXPECT_EQ(repeated.values_[1], Value(2.5));
   EXPECT_TRUE(row.Extract({}).values_.empty());
 }
 

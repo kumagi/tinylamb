@@ -70,9 +70,12 @@ BitmapHeapScan::BitmapHeapScan(Transaction& txn, const Table& table,
       where_conjuncts_(SplitConjuncts(where_)),
       schema_(std::move(schema)),
       bitmap_operation_(std::move(bitmap_operation)) {
-  std::sort(positions_.begin(), positions_.end(), RowPositionComparator{});
-  positions_.erase(std::unique(positions_.begin(), positions_.end()),
-                   positions_.end());
+  // T3765: no sort/unique here.  Every producer hands this constructor a
+  // sorted, duplicate-free vector -- BitmapIndexScan::ScanPositions() sorts
+  // and dedups before returning, and BitmapAnd/BitmapOr are
+  // set_intersection/set_union over such vectors (closed under sorted+
+  // unique).  The old second std::sort doubled the O(N log N) comparator
+  // traffic on multi-million-position bitmap scans for zero effect.
 }
 
 size_t BitmapHeapScan::NextBatch(DataChunk* destination, size_t max_rows) {

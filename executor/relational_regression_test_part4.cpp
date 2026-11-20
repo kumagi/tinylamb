@@ -64,6 +64,7 @@ TEST_F(RelationalRegressionTest,
           ctx, statement, scope, {{"d", input}}, false, nullptr, &scalar);
       ASSERT_TRUE(result.has_value());
       ASSERT_TRUE(scalar.has_value());
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
       const Value& actual = *scalar;
       AggregateAccumulator reference(aggregate.get(), &input->schema);
       for (const auto& value : groups[k]) { ASSERT_SUCCESS(reference.Add(value));
@@ -80,6 +81,101 @@ TEST_F(RelationalRegressionTest,
   }
   ctx.set_execution_runtime(nullptr);
   ctx.Abort();
+}
+
+TEST_F(RelationalRegressionTest, PackedProbeCountGroupsKeepSignedKeysAndNulls) {
+  using namespace relational_detail;
+  const Schema fact_schema("f",
+                           {Column(ColumnName("f", "k"), ValueType::kInt64),
+                            Column(ColumnName("f", "g"), ValueType::kInt64)});
+  const auto probe_key = ColumnValueExp(ColumnName("f", "k"));
+  const auto probe_group = ColumnValueExp(ColumnName("f", "g"));
+  const auto build_key = ColumnValueExp(ColumnName("d", "k"));
+  const auto build_group = ColumnValueExp(ColumnName("d", "tag"));
+  const auto count = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, ColumnValueExp("*"));
+  Relation dimension;
+  dimension.schema =
+      Schema("d", {Column(ColumnName("d", "k"), ValueType::kInt64),
+                   Column(ColumnName("d", "tag"), ValueType::kInt64)});
+  dimension.rows = {Row({Value(1), Value(10)}), Row({Value(2), Value(20)})};
+  for (bool bounded : {true, false}) {
+    const std::string table = bounded ? "PackedCount" : "WideCount";
+    RelationalRun(*rs_, "CREATE TABLE " + table + "(k INT64,g INT64)");
+    const Value first =
+        bounded ? Value(std::numeric_limits<int32_t>::min()) : Value();
+    const Value second =
+        bounded ? Value(std::numeric_limits<int32_t>::max())
+                : Value(int64_t{1} + std::numeric_limits<int32_t>::max());
+    {
+      auto setup = rs_->BeginContext();
+      ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
+                            setup.GetTable(table));
+      for (int i = 0; i < 4096; ++i) {
+        ASSERT_SUCCESS(
+            fact->Insert(setup.txn_,
+                         Row({Value((i % 2) + 1), i % 4 < 2 ? first : second}))
+                .GetStatus());
+      }
+      ASSERT_SUCCESS(
+          fact->Insert(setup.txn_, Row({Value(1), Value(3)}))
+              .GetStatus());
+      ASSERT_SUCCESS(setup.PreCommit());
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (rs_->TransactionStats().version_chains != 0) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto ctx = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact, ctx.GetTable(table));
+    DeferredLSTableProbe deferred;
+    deferred.store = GetOrBuildLSTableStore(ctx.txn_, *fact, true);
+    ASSERT_NE(deferred.store, nullptr);
+    deferred.projection = {0, 1};
+    deferred.local_preds_covered_by_peeks = true;
+    Relation probe;
+    probe.schema = fact_schema;
+    GroupedJoinFusionSpec fusion;
+    fusion.eligible = true;
+    fusion.select_items = {probe_group, build_group, count};
+    fusion.select_names = {"g", "tag", "n"};
+    fusion.group_keys = {probe_group, build_group};
+    fusion.aggregates = {count.get()};
+    fusion.count_star = {true};
+    fusion.having = BinaryExpressionExp(count, BinaryOperation::kGreaterThan,
+                                        ConstantValueExp(Value(4)));
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget budget(&active, 4);
+    const auto equality =
+        BinaryExpressionExp(probe_key, BinaryOperation::kEquals, build_key);
+    for (const bool residual : {false, true}) {
+      if (residual && !bounded) {
+        break;
+      }
+      std::vector<Expression> predicates{equality};
+      if (residual) {
+        predicates.push_back(BinaryExpressionExp(
+            probe_group, BinaryOperation::kNotEquals, build_group));
+      }
+      auto per_run_fusion = fusion;
+      ASSIGN_OR_ASSERT_FAIL(
+          std::optional<Relation>, result,
+          TryFusedGroupedJoin(ctx, probe, dimension, predicates,
+                              JoinType::kInner, nullptr, {}, &per_run_fusion,
+                              &deferred));
+      ASSERT_TRUE(result.has_value());
+      EXPECT_EQ(result->rows.size(), 4U);
+      for (const Value& key : {first, second}) {
+        for (int tag : {10, 20}) {
+          EXPECT_NE(std::ranges::find(result->rows,
+                                      Row({key, Value(tag), Value(1024)})),
+                    result->rows.end());
+        }
+      }
+    }
+  }
 }
 
 TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
@@ -172,6 +268,7 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
     deferred_left.schema = left.schema;
     for (int mode : {0, 1, 2}) {
       const bool direct_scan = mode != 0;
+      // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
       struct RestoreColumnarLimit {
         size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
         ~RestoreColumnarLimit() {
@@ -207,7 +304,9 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
         if (i % 17 == 0 || i == 42 || (direct_scan && i % 13 == 0)) { continue;
 }
         EXPECT_EQ(
+            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
             actual.at((i + probe_begin) * 4 + key_bias),
+            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
             Row({Value((i + probe_begin) * 4 + key_bias),
                  Value((i + probe_begin) % 7),
                  nullable && i % 11 == 0 ? Value()
@@ -234,6 +333,7 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
       size_t rows = 0;
       ASSERT_SUCCESS(output->ForEachRow([&](const Row& row) {
         ++rows;
+        // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
         const int64_t i = (row[0].value.int_value - key_bias) / 4 - probe_begin;
         EXPECT_EQ(row[2], Value(i == 1 ? 50.0 : 25.0));
       }));
@@ -256,6 +356,7 @@ TEST_F(RelationalRegressionTest,
                           ctx.GetTable("MembershipProbe"));
     for (int64_t k = 0; k < 33; ++k) {
       ASSERT_SUCCESS(
+          // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
           probe->Insert(ctx.txn_, Row({Value(k * 1800000 - 28800000)}))
               .GetStatus());
 }
@@ -266,10 +367,11 @@ TEST_F(RelationalRegressionTest,
       for (int64_t k = 0; k < 33; ++k) {
         for (int64_t repeat = 0; repeat < 1024; ++repeat) {
           const int64_t a = k % 5 == 0 && repeat == 1023 ? 1 : (k % 3) - 1;
-          const bool is_null = (nullable != 0u) && k % 7 == 0;
+          const bool is_null = (nullable != 0U) && k % 7 == 0;
           ASSERT_SUCCESS(
               build
                   ->Insert(ctx.txn_,
+                           // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
                            Row({Value(k * 1800000 - 28800000),
                                 is_null ? Value() : Value(a), Value(0)}))
                   .GetStatus());
@@ -306,7 +408,7 @@ TEST_F(RelationalRegressionTest,
         for (bool found : matches[nullable][op]) { expected += static_cast<int64_t>(found);
 }
         const std::string table =
-            (nullable != 0u) ? "MembershipNullable" : "MembershipFlat";
+            (nullable != 0U) ? "MembershipNullable" : "MembershipFlat";
         const std::string body = "EXISTS (SELECT 1 FROM " + table +
                                  " b WHERE b.k=p.k AND b.a " + operators[op] +
                                  " b.b)";
@@ -511,6 +613,7 @@ TEST_F(RelationalRegressionTest, GroupedJoinUsesProjectedFactStore) {
     for (int64_t i = 0; i < 33000; ++i) {
       ASSERT_SUCCESS(
           fact->Insert(ctx.txn_, Row({i % 37 == 0 ? Value() : Value(i % 31),
+                                      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
                                       i % 19 == 0 ? Value() : Value(i % 7 - 2),
                                       Value(std::string(64, 'x'))}))
               .GetStatus());
@@ -657,9 +760,12 @@ TEST_F(RelationalRegressionTest, CorrelationDomainReadsGatheredKeyOnly) {
     const auto filter = CorrelationDomainFilter(source, 1, ColumnName("o", "k"),
                                                 {1, 0}, runtime);
     ASSERT_TRUE(filter.has_value());
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
     EXPECT_EQ(filter->column, 0);
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
     EXPECT_EQ(filter->type, type);
     for (int64_t k = -10; k <= 10; ++k) {
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
       EXPECT_EQ(!filter->group->Reject(k), k == -3 || k == 2);
     }
     // A new domain must not retain keys from the previous gathered image.
@@ -668,7 +774,9 @@ TEST_F(RelationalRegressionTest, CorrelationDomainReadsGatheredKeyOnly) {
     const auto replacement = CorrelationDomainFilter(
         source, 1, ColumnName("o", "k"), {1, 0}, runtime);
     ASSERT_TRUE(replacement.has_value());
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
     EXPECT_FALSE(replacement->group->Reject(7));
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
     EXPECT_TRUE(replacement->group->Reject(2));
   }
 }
@@ -903,9 +1011,11 @@ TEST_F(RelationalRegressionTest, ScalarFloatingFiltersKeepAllComparisons) {
         const std::string lower = name + ">=" + std::to_string(lo);
         const std::string upper = name + "<=" + std::to_string(hi);
         const std::string sql =
+            // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
             "SELECT SUM(k*k+1),COUNT(*),SUM(" + name + "*" + name +
             ") FROM FloatSelection WHERE k BETWEEN 3 "
             "AND 9 AND " +
+            // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
             (reversed ? upper + " AND " + lower : lower + " AND " + upper);
         EXPECT_EQ(
             RelationalRun(*rs_, sql),
@@ -971,8 +1081,11 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
         continue;
 }
       const double v = row[2].value.double_value;
-      if ((v < 0 || v > 1) && (v < 4 || v > 6)) { continue;
-}
+      // SQL comparisons with NaN are false, so NaN fails both BETWEENs; the
+      // negated form `(v < 0 || v > 1) && ...` would wrongly admit it.
+      if (!((v >= 0 && v <= 1) || (v >= 4 && v <= 6))) {  // NOLINT(readability-simplify-boolean-expr): NaN must fail both ranges
+        continue;
+      }
       ++count;
       sum += v;
       distinct.insert(v);
@@ -990,6 +1103,7 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
     ASSERT_NE(pos, std::string::npos);
     reversed.replace(pos, std::string("v BETWEEN 0 AND 1").size(),
                      "(v <= 1 AND v >= 0)");
+    // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
     EXPECT_EQ(RelationalRun(*rs_, branch + " UNION ALL " + reversed),
               std::vector<Row>({expected, expected}));
   }
@@ -1155,6 +1269,7 @@ TEST_F(RelationalRegressionTest, IndexedRuntimeFilterKeepsRunsAndResiduals) {
     ASSERT_TRUE(secondary.runtime_filter->has_dense_bits());
     predicates.prebuilt_membership.push_back(secondary);
     for (bool allow_index : {false, true}) {
+      // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
       struct RestoreLimit {
         size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
         ~RestoreLimit() {
@@ -3452,8 +3567,9 @@ TEST_F(RelationalRegressionTest, GroupOutputPushPreservesOuterFanoutAndNulls) {
   for (size_t workers : {1U, 4U}) {
     std::atomic<size_t> active{1};
     ScopedQueryParallelismBudget budget(&active, workers);
-    EXPECT_EQ(RelationalRun(*rs_, sql), expected);
-    EXPECT_NE(ExplainAnalyze(*rs_, sql).find("pushed_group_joins=1"),
+    EXPECT_EQ(RelationalRun(*rs_, sql, /*force_relational=*/true), expected);
+    EXPECT_NE(ExplainAnalyze(*rs_, sql, /*force_relational=*/true)
+                  .find("pushed_group_joins=1"),
               std::string::npos);
   }
   EXPECT_EQ(RelationalRun(*rs_, prefix + select +
@@ -3487,14 +3603,16 @@ TEST_F(RelationalRegressionTest, GroupOutputPushChainsBuildsAndKeepsErrors) {
     expected.emplace_back(
         std::vector<Value>{Value(k), Value(20), Value(20), Value(20)});
   }
-  EXPECT_EQ(RelationalRun(*rs_, sql), expected);
-  EXPECT_NE(ExplainAnalyze(*rs_, sql).find("pushed_group_joins=1"),
+  EXPECT_EQ(RelationalRun(*rs_, sql, /*force_relational=*/true), expected);
+  EXPECT_NE(ExplainAnalyze(*rs_, sql, /*force_relational=*/true)
+                .find("pushed_group_joins=1"),
             std::string::npos);
   // A throwing WHERE stays on the general path; a rejecting right-side
   // conjunct must not license erasing its arithmetic.
   const std::string arithmetic = prefix + tail + "WHERE a.v/(b.v-20)>0";
   auto context = rs_->BeginContext();
   SqlEngine engine(*rs_);
+  engine.SetForceRelationalFallback(true);
   auto executed = engine.Execute(context, arithmetic);
   if (executed.HasValue()) {
     executed.Value().Drain();
@@ -3713,23 +3831,26 @@ TEST_F(RelationalRegressionTest, PredicateTransferPrunesPreservedGroupInputs) {
   for (size_t workers : {1U, 4U}) {
     std::atomic<size_t> active{1};
     ScopedQueryParallelismBudget budget(&active, workers);
-    EXPECT_EQ(RelationalRun(*rs_, sql), expected);
-    const auto explain = ExplainAnalyze(*rs_, sql);
+    EXPECT_EQ(RelationalRun(*rs_, sql, /*force_relational=*/true), expected);
+    const auto explain = ExplainAnalyze(*rs_, sql, /*force_relational=*/true);
     EXPECT_GE(counter(explain, "transfer_scan_tested="), 6144U) << explain;
     EXPECT_GT(counter(explain, "transfer_scan_rejected="), 6000U) << explain;
     EXPECT_EQ(counter(explain, "transfer_seed_rows="), 6144U) << explain;
   }
   // Without a null-rejecting WHERE, unmatched LEFT rows must be kept.
-  EXPECT_EQ(RelationalRun(*rs_, prefix + tail).size(), 2049U);
   EXPECT_EQ(
-      counter(ExplainAnalyze(*rs_, prefix + tail), "transfer_scan_tested="),
+      RelationalRun(*rs_, prefix + tail, /*force_relational=*/true).size(),
+      2049U);
+  EXPECT_EQ(
+      counter(ExplainAnalyze(*rs_, prefix + tail, /*force_relational=*/true),
+              "transfer_scan_tested="),
       0U);
   // The key domain is query-local; subsequent writes cannot reuse old bits.
   RelationalRun(*rs_, "INSERT INTO TransferC VALUES(19,5,1,9)");
-  EXPECT_EQ(RelationalRun(*rs_, sql).size(), 4U);
+  EXPECT_EQ(RelationalRun(*rs_, sql, /*force_relational=*/true).size(), 4U);
   RelationalRun(*rs_, "DELETE FROM TransferB");
   RelationalRun(*rs_, "DELETE FROM TransferC");
-  EXPECT_TRUE(RelationalRun(*rs_, sql).empty());
+  EXPECT_TRUE(RelationalRun(*rs_, sql, /*force_relational=*/true).empty());
 }
 
 TEST_F(RelationalRegressionTest, PredicateTransferKeepsRejectedGroupErrors) {
@@ -3811,10 +3932,10 @@ TEST_F(RelationalRegressionTest, PredicateTransferKeepsCompleteFloatingGroups) {
       "f.k=d.k GROUP BY f.k) "
       "SELECT a.k,a.g,a.v FROM a LEFT JOIN b ON a.k=b.k WHERE "
       "COALESCE(b.v,0)>0 ORDER BY a.g";
-  EXPECT_EQ(RelationalRun(*rs_, sql),
+  EXPECT_EQ(RelationalRun(*rs_, sql, /*force_relational=*/true),
             std::vector<Row>({Row({Value(1), Value(1), Value(1.0)}),
                               Row({Value(1), Value(2), Value(3.25)})}));
-  const auto explain = ExplainAnalyze(*rs_, sql);
+  const auto explain = ExplainAnalyze(*rs_, sql, /*force_relational=*/true);
   EXPECT_EQ(explain.find("transfer_scan_tested=0,"), std::string::npos)
       << explain;
 }
@@ -4017,23 +4138,27 @@ TEST_F(RelationalRegressionTest,
 
   RelationalRun(*rs_, "CREATE TABLE FgjInfFact(k INT64,v DOUBLE)");
   RelationalRun(*rs_, "INSERT INTO FgjInfFact VALUES (20,1e308),(20,1e308)");
-  for (const char* q : {
-           "SELECT d.k,AVG(f.v) FROM FgjInfFact f JOIN FgjDim d ON f.k=d.k "
-           "GROUP BY d.k",
-           "SELECT d.k,SUM(f.v) FROM FgjInfFact f JOIN FgjDim d ON f.k=d.k "
-           "GROUP BY d.k",
-       }) {
-    auto context = rs_->BeginContext();
-    SqlEngine engine(*rs_);
-    auto res = engine.Execute(context, q);
-    if (res.HasValue()) {
-      res.Value().Drain();
-      EXPECT_EQ(res.Value().GetStatus(), Status::kIsInfinity) << q;
-    } else {
-      EXPECT_EQ(res.GetStatus(), Status::kIsInfinity) << q;
-    }
-    context.Abort();
+  const auto avg_overflow = RelationalRun(
+      *rs_,
+      "SELECT d.k,AVG(f.v) FROM FgjInfFact f JOIN FgjDim d ON f.k=d.k "
+      "GROUP BY d.k");
+  ASSERT_EQ(avg_overflow.size(), 1U);
+  EXPECT_EQ(avg_overflow[0],
+            (Row({Value(20), Value(std::numeric_limits<double>::infinity())})));
+
+  auto context = rs_->BeginContext();
+  SqlEngine engine(*rs_);
+  auto sum_overflow = engine.Execute(
+      context,
+      "SELECT d.k,SUM(f.v) FROM FgjInfFact f JOIN FgjDim d ON f.k=d.k "
+      "GROUP BY d.k");
+  if (sum_overflow.HasValue()) {
+    sum_overflow.Value().Drain();
+    EXPECT_EQ(sum_overflow.Value().GetStatus(), Status::kIsInfinity);
+  } else {
+    EXPECT_EQ(sum_overflow.GetStatus(), Status::kIsInfinity);
   }
+  context.Abort();
 }
 
 }  // namespace

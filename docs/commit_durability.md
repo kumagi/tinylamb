@@ -28,7 +28,7 @@
   恒久化を待つ（グループコミット、既定 1ms 間隔）。
 - **`synchronous_commit = false`**: 自身の commit の fsync は待たない。
   ただし **D4 の依存 LSN バリアは無効化されない**。設定が制御するのは
-  自身のコミット待機だけである。
+  自身の commit 待機だけである。
 
 | Mode | 自身の commit | 観測した依存 commit |
 |------|--------------|--------------------|
@@ -58,11 +58,11 @@
 - 受け入れテスト: `DurabilityBarrierTest.*`
   (transaction/transaction_extra_test.cpp)。
 
-## サーバの遅延応答
+## サーバーの遅延応答
 
 `PrepareCommitForDurableReply()` は公開までを行い、own commit（sync on時）と
 観測依存の最大LSNを返す。通常の `PreCommit()` の同期動作は変えない。
-単文のworker経路はSQLワーカを解放し、耐久化coordinatorが
+単文のworker経路はSQLワーカーを解放し、耐久化coordinatorが
 `Database::WaitForCommitDurable(target)` の成功後に応答全体をepollへ渡す。
 送信時の固定費を減らすため、前の出力が残っていない接続の4KiB以下の応答は、
 この耐久化判定後にworkerからnonblockingで送信できる。sendとcloseを共有mutexで
@@ -84,7 +84,7 @@ DurableLSN以下になるまでversion chainを消さない。依存を失って
 複文DML／トランザクション制御Queryとevent-loop専用TEMP/UDF経路は同期commitを継続する。
 SELECTだけの複文は、同じread-only snapshotの応答全体をcoordinatorへ渡せる。
 
-`Database::DurableWALLSN()` はLoggerがfdatasync成功後に公開した実際のDurableLSNを読む。
+`Database::DurableWalLSN()` はLoggerがfdatasync成功後に公開した実際のDurableLSNを読む。
 own／観測依存のtargetがその境界以下なら、応答はqueueを経由せずに返せる。
 1回の同期はcoordinatorが要求したtargetより先のWALまで耐久化することがあるため、
 要求値のcacheではなく実際の証明済み境界を使う。BufferedLSNやwrite完了は
@@ -93,7 +93,7 @@ own／観測依存のtargetがその境界以下なら、応答はqueueを経由
 ## 変更のないコンテキスト
 
 更新可能なコンテキストでも、WAL記録、write set、索引変更、recycled allocationの
-すべてが空ならown commit記録は不要である。WITHなどの保守的なサーバ経路でも
+すべてが空ならown commit記録は不要である。WITHなどの保守的なサーバー経路でも
 読取だけならWALを書かずに終える。版の観測依存はread-only経路と同じく必ず待つ。
 ログを直接書かない埋込みテストのversion writeもwrite setがあれば従来通りcommitする。
 

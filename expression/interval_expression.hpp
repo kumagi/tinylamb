@@ -29,7 +29,9 @@ class IntervalExpression : public ExpressionBase {
     }
     text_ = value_.ToString();
   }
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kIntervalExp; }
+  [[nodiscard]] TypeTag NodeKind() const override {
+    return TypeTag::kIntervalExp;
+  }
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
                                const Schema& /*schema*/) const override;
   [[nodiscard]] StatusOr<Value> TryEvaluate(

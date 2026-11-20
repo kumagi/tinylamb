@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -60,6 +61,7 @@
 #include "common/constants.hpp"
 #include "common/digest.hpp"
 #include "common/math_utils.hpp"
+#include "common/platform/int128_conversion.hpp"
 #include "common/platform/time_format.hpp"
 #include "common/regex_guard.hpp"
 #include "common/string_util.hpp"
@@ -100,6 +102,9 @@ struct CivilTime {
 bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   if (s.empty()) {
     return false;
+  }
+  if (s.find('\0') != std::string_view::npos) {
+    return false;  // c_str() would truncate at an embedded NUL
   }
   const std::string input(s);
   int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
@@ -233,13 +238,17 @@ CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
 }
 
 StatusOr<int> ParseTimeZoneOffset(std::string_view zone,
-                                  const CivilTime* ct = nullptr) {
+                                  const CivilTime* ct = nullptr,
+                                  bool at_utc = false) {
+  // Pass the real year through: the tz database carries the full historical
+  // transition table (wartime DST, pre-1966 US standard time, LMT), so a
+  // pre-epoch civil time must not be re-dated to 1970.
   return TryTimeZoneOffsetAtLocalTime(
-      zone, ct != nullptr ? std::max(ct->year, 1970) : 2000,
+      zone, ct != nullptr ? ct->year : 2000,
       ct != nullptr ? static_cast<unsigned>(ct->month) : 1,
       ct != nullptr ? static_cast<unsigned>(ct->day) : 1,
       ct != nullptr ? ct->hour : 0, ct != nullptr ? ct->minute : 0,
-      ct != nullptr ? ct->second : 0);
+      ct != nullptr ? ct->second : 0, at_utc);
 }
 
 // Shifts a civil time by `delta_seconds` (day/month/year carries included).
@@ -257,8 +266,8 @@ CivilTime ShiftCivilTimeSeconds(const CivilTime& ct, int64_t delta_seconds) {
     day_secs += 86400;
     --out_days;
   }
-  const std::chrono::year_month_day out_ymd{std::chrono::sys_days{
-      std::chrono::days{static_cast<int>(out_days)}}};
+  const std::chrono::year_month_day out_ymd{
+      std::chrono::sys_days{std::chrono::days{static_cast<int>(out_days)}}};
   CivilTime out = ct;
   out.year = int(out_ymd.year());
   out.month = static_cast<int>(static_cast<unsigned>(out_ymd.month()));
@@ -289,9 +298,9 @@ StatusOr<CivilTime> TryValueToCivilTime(const Value& val) {
   }
   const std::string_view s(val.value.varchar_value);
   if (!ParseCivilTime(s, &ct)) {
-    return StatusError(StatusCode::kInvalidArgument,
-                       "invalid DATE, DATETIME or TIMESTAMP value: " +
-                           std::string(s));
+    return StatusError(
+        StatusCode::kInvalidArgument,
+        "invalid DATE, DATETIME or TIMESTAMP value: " + std::string(s));
   }
   if (s.size() > 10) {
     for (size_t i = 10; i < s.size(); ++i) {
@@ -349,6 +358,35 @@ std::string FormatTimeZoneOffset(int tz_offset_sec) {
   return std::string{buf.data()};
 }
 
+// True when `fmt` can only produce empty output through platform::FormatTime:
+// the format is empty or consists solely of zone-name directives
+// (%Z/%EZ/%OZ), which expand to nothing for the zone-less struct tm these
+// call sites pass. Every other directive or literal yields output, so a zero
+// return there means strftime itself failed (e.g. buffer too small).
+bool FormatTimeYieldsEmpty(std::string_view fmt) {
+  for (size_t i = 0; i < fmt.size();) {
+    if (fmt[i] != '%') {
+      return false;
+    }
+    if (i + 1 >= fmt.size()) {
+      return false;  // A trailing '%' survives as a literal.
+    }
+    const char spec = fmt[i + 1];
+    if (spec == 'E' || spec == 'O') {
+      if (i + 2 >= fmt.size() || fmt[i + 2] != 'Z') {
+        return false;
+      }
+      i += 3;
+      continue;
+    }
+    if (spec != 'Z') {
+      return false;
+    }
+    i += 2;
+  }
+  return true;
+}
+
 StatusOr<Value> AddOrSubInterval(const std::string& func_name,
                                  const Value& date,
                                  const IntervalExpression& interval) {
@@ -396,17 +434,21 @@ StatusOr<Value> TryProtoTextScalar(std::string_view raw) {
   if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
     return Value(std::string(raw.substr(1, raw.size() - 2)));
   }
-  std::string token(raw);
-  try {
-    return Value(static_cast<int64_t>(std::stoll(token)));
-  } catch (const std::exception& error) {
-    (void)error;
+  // Parse directly from the string_view; only an unparseable token needs an
+  // owning copy for the returned string value.
+  int64_t as_int = 0;
+  const char* const begin = raw.data();
+  const char* const end = raw.data() + raw.size();
+  auto [ip, iec] = std::from_chars(begin, end, as_int);
+  if (iec == std::errc() && ip == end) {
+    return Value(as_int);
   }
-  try {
-    return Value(std::stod(token));
-  } catch (...) {
-    return Value(std::move(token));
+  double as_double = 0.0;
+  auto [dp, dec] = std::from_chars(begin, end, as_double);
+  if (dec == std::errc() && dp == end) {
+    return Value(as_double);
   }
+  return Value(std::string(raw));
 }
 
 // Minimal proto text-format field extraction: repeated `field: value`
@@ -621,6 +663,50 @@ void AppendUtf8(std::string* output, uint32_t code_point) {
   }
 }
 
+// T2234/T2238: shared code-point split used by TO_CODE_POINTS and
+// EDIT_DISTANCE. Valid UTF-8 decodes to real code points; bytes that are not
+// part of a valid sequence pass through one byte at a time, which is exactly
+// the BYTES interpretation GoogleSQL gives TO_CODE_POINTS(bytes) (the engine
+// represents BYTES as raw varchar text, so the fallback keeps
+// CODE_POINTS_TO_BYTES round-trips working while valid STRING inputs still
+// yield Unicode code points).
+std::vector<uint32_t> CodePointsOf(std::string_view value) {
+  std::vector<uint32_t> out;
+  size_t offset = 0;
+  while (offset < value.size()) {
+    const auto decoded = DecodeUtf8(value, offset);
+    if (decoded.has_value()) {
+      out.push_back(decoded->code_point);
+      offset += decoded->length;
+    } else {
+      out.push_back(static_cast<unsigned char>(value[offset]));
+      ++offset;
+    }
+  }
+  return out;
+}
+
+// T2238: Levenshtein distance over code points (GoogleSQL EDIT_DISTANCE
+// counts characters, not bytes).
+int64_t LevenshteinCodePoints(std::string_view left, std::string_view right) {
+  const std::vector<uint32_t> a = CodePointsOf(left);
+  const std::vector<uint32_t> b = CodePointsOf(right);
+  std::vector<int64_t> prev(b.size() + 1);
+  std::vector<int64_t> cur(b.size() + 1);
+  for (size_t j = 0; j <= b.size(); ++j) {
+    prev[j] = static_cast<int64_t>(j);
+  }
+  for (size_t i = 1; i <= a.size(); ++i) {
+    cur[0] = static_cast<int64_t>(i);
+    for (size_t j = 1; j <= b.size(); ++j) {
+      const int64_t substitution = prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1);
+      cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, substitution});
+    }
+    prev.swap(cur);
+  }
+  return prev[b.size()];
+}
+
 const std::locale& UnicodeLocale() {
   static const std::locale locale = [] {
     for (const char* name : {"C.UTF-8", "C.utf8", "en_US.UTF-8"}) {
@@ -716,26 +802,54 @@ std::string ConvertUnicodeCase(std::string_view value, UnicodeCaseMode mode,
 std::string FormatFloatingForPrintfImpl(double value, char specifier,
                                         int precision) {
   if (precision < 0) {
-    // printf/GoogleSQL default precision is 6 significant decimals for every
-    // float specifier.  %f with precision 6 renders identically to the old
-    // std::to_string shortcut; %e/%g now get their real default form
+    // printf/GoogleSQL default precision is 6: fractional decimal places for
+    // %f (matching the old std::to_string shortcut), significant digits for
+    // %e/%g.
     // (scientific / shortest-of-fixed-scientific) instead of fixed notation.
     precision = 6;
   }
-  std::ostringstream output;
-  output.imbue(std::locale::classic());
-  if (specifier == 'f' || specifier == 'F') {
-    output << std::fixed << std::setprecision(precision);
-  } else if (specifier == 'e' || specifier == 'E') {
-    output << std::scientific << std::setprecision(precision);
-  } else {
-    output << std::defaultfloat << std::setprecision(std::max(precision, 1));
+  // P945: C-locale snprintf instead of a per-call ostringstream + imbue.
+  // With std::locale::classic() the iostream defaultfloat/scientific/fixed
+  // renderings are the printf %g/%e/%f conversions (including inf/nan
+  // spellings, which C renders as inf/nan and the uppercase specifiers as
+  // INF/NAN), so the output text is byte-identical while the hot FORMAT
+  // path no longer pays a stream construction and locale install per
+  // specifier.
+  char conversion = specifier;
+  int prec = precision;
+  if (conversion != 'f' && conversion != 'F' && conversion != 'e' &&
+      conversion != 'E') {
+    // %g semantics: at least one significant digit.
+    prec = std::max(precision, 1);
+    conversion = (specifier == 'G') ? 'G' : 'g';
   }
-  if (specifier == 'E' || specifier == 'G' || specifier == 'F') {
-    output << std::uppercase;
+  const auto format_value = [=](char* buffer, size_t size) {
+    switch (conversion) {
+      case 'f':
+        return std::snprintf(buffer, size, "%.*f", prec, value);
+      case 'F':
+        return std::snprintf(buffer, size, "%.*F", prec, value);
+      case 'e':
+        return std::snprintf(buffer, size, "%.*e", prec, value);
+      case 'E':
+        return std::snprintf(buffer, size, "%.*E", prec, value);
+      case 'G':
+        return std::snprintf(buffer, size, "%.*G", prec, value);
+      default:
+        return std::snprintf(buffer, size, "%.*g", prec, value);
+    }
+  };
+  std::array<char, 512> small{};
+  int written = format_value(small.data(), small.size());
+  if (written < 0) {
+    return {};
   }
-  output << value;
-  return output.str();
+  if (static_cast<size_t>(written) < small.size()) {
+    return {small.data(), static_cast<size_t>(written)};
+  }
+  std::vector<char> big(static_cast<size_t>(written) + 1);
+  format_value(big.data(), big.size());
+  return {big.data(), static_cast<size_t>(written)};
 }
 
 // printf places '0' padding after a leading sign and radix prefix, never
@@ -743,15 +857,14 @@ std::string FormatFloatingForPrintfImpl(double value, char specifier,
 // "0x00ff". Return the offset at which zero padding must be inserted.
 size_t ZeroPadStart(const std::string& text) {
   size_t i = 0;
-  if (i < text.size() &&
-      (text[i] == '-' || text[i] == '+' || text[i] == ' ')) {
+  if (i < text.size() && (text[i] == '-' || text[i] == '+' || text[i] == ' ')) {
     ++i;
   }
   if (i + 1 < text.size() && text[i] == '0' &&
       (text[i + 1] == 'x' || text[i + 1] == 'X')) {
     i += 2;
   }
-  return i;
+  return i;  // octal alternate form (%#o) also has a leading '0' prefix
 }
 
 // FORMAT(fmt, ...): GoogleSQL printf-style rendering.  Ported from the
@@ -964,7 +1077,11 @@ StatusOr<Value> FormatFunction(const std::string& name,
             formatted_item = std::to_string(arg.value.int_value);
           }
         } else if (arg.type == ValueType::kDouble) {
-          formatted_item = std::to_string(arg.value.double_value);
+          // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized buffer
+          char buf[64];
+          const auto res =
+              std::to_chars(buf, buf + sizeof(buf), arg.value.double_value);
+          formatted_item.assign(buf, res.ptr);
         } else {
           formatted_item = arg.AsString();
         }
@@ -979,6 +1096,11 @@ StatusOr<Value> FormatFunction(const std::string& name,
         if (arg.IsNull()) {
           formatted_item = "NULL";
         } else if (arg.type == ValueType::kInt64) {
+          if (!arg.IsUnsigned() && arg.value.int_value < 0 &&
+              (spec == 'x' || spec == 'X' || spec == 'o' || spec == 'u')) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "FORMAT: negative INT64 for unsigned specifier");
+          }
           if (spec == 'x') {
             std::array<char, 32> buf{};
             // NOLINTNEXTLINE(cert-err33-c)
@@ -1052,19 +1174,21 @@ StatusOr<Value> FormatFunction(const std::string& name,
       if (precision >= 0 &&
           (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' ||
            spec == 'X' || spec == 'o') &&
-          formatted_item != "NULL" &&
-          formatted_item.size() < static_cast<size_t>(precision)) {
+          formatted_item != "NULL") {
+        // Integer precision is the minimum number of *digits*: the sign or
+        // 0x prefix does not count (printf: %.4d of -5 is "-0005").
         const size_t pad_begin = ZeroPadStart(formatted_item);
-        formatted_item.insert(
-            pad_begin, static_cast<size_t>(precision) - formatted_item.size(),
-            '0');
+        const size_t digits = formatted_item.size() - pad_begin;
+        if (std::cmp_less(digits, precision)) {
+          formatted_item.insert(
+              pad_begin, static_cast<size_t>(precision) - digits, '0');
+        }
       }
       // Sign ('+' / ' ') and grouping ('\'') flags apply to numeric
       // specifiers only; irrelevant flags are ignored for %s/%t/%T.  They
       // act on the rendered digits before field-width padding.
-      const bool int_spec =
-          spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' ||
-          spec == 'X' || spec == 'o';
+      const bool int_spec = spec == 'd' || spec == 'i' || spec == 'u' ||
+                            spec == 'x' || spec == 'X' || spec == 'o';
       const bool float_spec = spec == 'f' || spec == 'F' || spec == 'e' ||
                               spec == 'E' || spec == 'g' || spec == 'G';
       if (formatted_item != "NULL" && !formatted_item.empty()) {
@@ -1079,7 +1203,7 @@ StatusOr<Value> FormatFunction(const std::string& name,
           const size_t digits = formatted_item.size() - digit_begin;
           if (digits > 3) {
             std::string grouped;
-            grouped.reserve(digits + digits / 3);
+            grouped.reserve(digits + (digits / 3));
             for (size_t k = 0; k < digits; ++k) {
               if (k != 0 && (digits - k) % 3 == 0) {
                 grouped.push_back(',');
@@ -1092,8 +1216,7 @@ StatusOr<Value> FormatFunction(const std::string& name,
         if ((plus_flag || space_flag) &&
             (spec == 'd' || spec == 'i' || spec == 'u' || float_spec) &&
             formatted_item[0] != '-' && formatted_item[0] != '+') {
-          formatted_item.insert(formatted_item.begin(),
-                                plus_flag ? '+' : ' ');
+          formatted_item.insert(formatted_item.begin(), plus_flag ? '+' : ' ');
         }
       }
       // printf semantics: '-' flag or a negative (dynamic) width means
@@ -1197,6 +1320,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
               : static_cast<uint64_t>(-digits);
       for (uint64_t i = 0; i < trunc_digits; ++i) {
         if (scale > std::numeric_limits<int64_t>::max() / 10) {
+          // 10^(-digits) does not fit in INT64 (digits <= -19). The true
+          // quotient is 0 or +/-1: +/-1 only when |v| >= 5e18 for -digits==19
+          // (for larger -digits the half-threshold exceeds INT64_MAX, so the
+          // quotient is always 0). A +/-1 quotient makes the final q*scale
+          // overflow, which downstream reports as an error; silently folding
+          // it to 0 contradicted that same error surface.
+          const uint64_t magnitude = v < 0 ? static_cast<uint64_t>(-(v + 1)) + 1
+                                           : static_cast<uint64_t>(v);
+          if (trunc_digits == 19 && magnitude >= 5'000'000'000'000'000'000ULL) {
+            return StatusError(StatusCode::kIsInfinity,
+                               "integer overflow in ROUND");
+          }
           return Value(int64_t{0});
         }
         scale *= 10;
@@ -1239,9 +1374,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return SaturatingDoubleToInt64(v.value.double_value);
     }
     if (v.type == ValueType::kVarChar) {
-      try {
-        return std::stoll(std::string(v.value.varchar_value));
-      } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
+      // from_chars parses directly from the string_view: no per-row heap
+      // copy, and requiring end-of-token keeps '2junk' from reading as 2.
+      const std::string_view text = v.value.varchar_value;
+      int64_t parsed = 0;
+      const auto [end, ec] =
+          std::from_chars(text.data(), text.data() + text.size(), parsed);
+      if (ec == std::errc() && end == text.data() + text.size()) {
+        return parsed;
       }
     }
     return def;
@@ -1250,8 +1390,15 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     std::vector<size_t> offsets;
     offsets.reserve(s.size() + 1);
     for (size_t i = 0; i < s.size();) {
-      offsets.push_back(i);
       const auto c = static_cast<unsigned char>(s[i]);
+      if ((c & 0xC0) == 0x80) {
+        // Orphan continuation byte: LENGTH/CHAR_LENGTH skip these, so they
+        // must not count as a character here either.  Keep utf8_len and the
+        // SUBSTR/LPAD/RIGHT offsets consistent with LENGTH.
+        i += 1;
+        continue;
+      }
+      offsets.push_back(i);
       if ((c & 0xE0) == 0xC0) {
         i += static_cast<size_t>((i + 1 < s.size()) ? 2 : 1);
       } else if ((c & 0xF0) == 0xE0) {
@@ -1364,11 +1511,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return left.b == right.b ? left.a < right.a : left.b < right.b;
     });
     std::string result;
+    bool first = true;
     for (const Pair& pair : pairs) {
-      if (!result.empty()) {
+      if (!first) {
         result += separator;
       }
-      result += pair.a + "," + pair.b;
+      first = false;
+      result.append(pair.a).append(1, ',').append(pair.b);
     }
     return Value(std::move(result));
   }
@@ -1505,6 +1654,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(uniform(rng));
   }
   if (name_view == "coalesce") {
+    if (values.empty()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "COALESCE requires at least one argument");
+    }
     for (const auto& val : values) {
       if (!val.IsNull()) {
         return val;
@@ -1516,10 +1669,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // every scalar the scope-based relational evaluator supports
   // (executor/detail/expression_eval.cpp), or a plan-shape change that routes
   // the predicate through this evaluator turns a working query into "not yet
-  // executable". Semantics mirror the relational path exactly: NULLIF uses
-  // Value::operator== (NULL == NULL is true, cross-type is false, so a NULL
-  // first argument still yields NULL); GREATEST/LEAST propagate NULL and
-  // promote mixed INT64/DOUBLE numerically.
+  // executable". Semantics mirror the relational path exactly: NULLIF
+  // returns the first argument when either side is NULL and otherwise
+  // compares with TryEvaluateBinary(kEquals), so mismatched-type pairs
+  // propagate that error rather than silently comparing false;
+  // GREATEST/LEAST return NULL if any argument is NULL and NaN if any is
+  // NaN (before the comparison loop); the remaining values are promoted
+  // numerically when INT64 and DOUBLE are mixed.
   if (name_view == "nullif") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -1612,16 +1768,33 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return best;
   }
   if (name_view == "concat") {
-    std::string result;
+    if (values.empty()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CONCAT requires at least one argument");
+    }
+    size_t total_bytes = 0;
     for (const auto& value : values) {
       if (value.IsNull()) {
         return Value();
       }
-      if (value.type != ValueType::kVarChar) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "CONCAT currently requires string arguments");
+      total_bytes += value.type == ValueType::kVarChar
+                         ? value.value.varchar_value.size()
+                         : value.AsString().size();
+    }
+    std::string result;
+    result.reserve(total_bytes);
+    for (const auto& value : values) {
+      if (value.IsNull()) {
+        return Value();
       }
-      result.append(value.value.varchar_value);
+      // GoogleSQL implicitly casts scalar arguments to STRING. This mirrors
+      // the batch evaluator (executor/detail/function_eval.cpp) so the same
+      // expression succeeds in a projection and in INSERT ... VALUES.
+      if (value.type != ValueType::kVarChar) {
+        result.append(value.AsString());
+      } else {
+        result.append(value.value.varchar_value);
+      }
     }
     return Value(std::move(result));
   }
@@ -1633,6 +1806,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
+    if (values[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "UPPER requires a STRING argument");
+    }
     return Value(UnicodeUpper(raw_str(values[0])));
   }
   if (name_view == "lower") {
@@ -1642,6 +1819,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     if (values[0].IsNull()) {
       return Value();
+    }
+    if (values[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOWER requires a STRING argument");
     }
     return Value(UnicodeLower(raw_str(values[0])));
   }
@@ -1657,8 +1838,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    return values[0].WithCollation(
-        static_cast<uint8_t>(CollationOfSpec(raw_str(values[1]))));
+    const std::optional<Collation> spec = CollationOfSpec(raw_str(values[1]));
+    if (!spec.has_value()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "COLLATE unsupported collation spec: " +
+                             std::string(raw_str(values[1])));
+    }
+    return values[0].WithCollation(static_cast<uint8_t>(*spec));
   }
   if (name_view == "bit_count") {
     if (values.size() != 1) {
@@ -1812,7 +1998,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         }
         uint64_t scale = 1;
         // Negate in unsigned space: -digits overflows for INT64_MIN.
-        const uint64_t trunc_digits = uint64_t{0} - static_cast<uint64_t>(digits);
+        const uint64_t trunc_digits =
+            uint64_t{0} - static_cast<uint64_t>(digits);
         for (uint64_t i = 0; i < trunc_digits; ++i) {
           if (scale > std::numeric_limits<uint64_t>::max() / 10) {
             return Value(int64_t{0}).WithUnsigned();
@@ -1894,6 +2081,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].type == ValueType::kInt64 &&
         values[1].type == ValueType::kInt64) {
       if (values[0].IsUnsigned() || values[1].IsUnsigned()) {
+        if (!values[1].IsUnsigned() && values[1].value.int_value < 0) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "MOD with a negative divisor and UINT64 is invalid");
+        }
         const auto r = static_cast<uint64_t>(values[1].value.int_value);
         if (r == 0) {
           return StatusError(StatusCode::kIsInfinity,
@@ -1973,7 +2165,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "Floating point error in function: POW");
     }
-    if (l == 0.0 && r < 0.0 && !std::isinf(r)) {
+    if (l == 0.0 && r < 0.0) {
       return StatusError(StatusCode::kIsInfinity, "division by zero in POW");
     }
     const double res = std::pow(l, r);
@@ -2018,6 +2210,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "LN"));
+    if (v <= 0.0) {
+      // T3885: mirror of the engine-side LN guard (AST is the ground
+      // truth): GoogleSQL LN errors on x <= 0, SAFE_LN returns NULL.
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LN of non-positive number");
+    }
     return Value(std::log(v));
   }
   if (name_view == "log" || name_view == "log10") {
@@ -2037,6 +2235,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value(std::log(v));
     }
     ASSIGN_OR_RETURN(double, base, to_numeric_double(values[1], "LOG base"));
+    // log(1) is zero, so base==1 would divide by zero and surface as ±inf
+    // instead of the GoogleSQL domain error.
+    if (base == 1.0) {
+      // log(x)/log(1) divides by zero.  For a non-finite x the reference
+      // engine yields NaN (compliance goldens: LOG(-inf, 1)); a finite x is
+      // a domain error.
+      if (!std::isfinite(v)) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOG base must not be 1");
+    }
     if (v == 1.0 && std::isinf(base)) {
       return Value(std::numeric_limits<double>::quiet_NaN());
     }
@@ -2204,6 +2414,60 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(res);
   }
+  // T2245: GoogleSQL reciprocal trig functions. Singularities raise the
+  // engine's standard division-by-zero error (SAFE.* wrapping is a separate
+  // unimplemented feature, so corpus safe_function.test cases stay skipped).
+  if (name_view == "csc" || name_view == "sec" || name_view == "cot") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         std::string(name_view) + " requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v,
+                     to_numeric_double(values[0], std::string(name_view)));
+    if (name_view == "csc") {
+      const double s = std::sin(v);
+      if (s == 0.0) {
+        return StatusError(StatusCode::kIsInfinity, "division by zero");
+      }
+      return Value(1.0 / s);
+    }
+    if (name_view == "sec") {
+      const double c = std::cos(v);
+      if (c == 0.0) {
+        return StatusError(StatusCode::kIsInfinity, "division by zero");
+      }
+      return Value(1.0 / c);
+    }
+    const double s = std::sin(v);
+    if (s == 0.0) {
+      return StatusError(StatusCode::kIsInfinity, "division by zero");
+    }
+    return Value(std::cos(v) / s);
+  }
+  if (name_view == "sech" || name_view == "csch" || name_view == "coth") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         std::string(name_view) + " requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v,
+                     to_numeric_double(values[0], std::string(name_view)));
+    const double h = name_view == "sech" ? std::cosh(v) : std::sinh(v);
+    if (std::isinf(h) && !std::isinf(v)) {
+      return StatusError(
+          StatusCode::kIsInfinity,
+          "Floating point overflow in function: " + std::string(name_view));
+    }
+    if (h == 0.0) {
+      return StatusError(StatusCode::kIsInfinity, "division by zero");
+    }
+    return Value(name_view == "coth" ? std::cosh(v) / h : 1.0 / h);
+  }
   if (name_view == "tanh") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -2226,6 +2490,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].type == ValueType::kInt64 &&
         values[1].type == ValueType::kInt64) {
       if (values[0].IsUnsigned() || values[1].IsUnsigned()) {
+        if (!values[1].IsUnsigned() && values[1].value.int_value < 0) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "DIV with a negative divisor and UINT64 is invalid");
+        }
         const auto r = static_cast<uint64_t>(values[1].value.int_value);
         if (r == 0) {
           return StatusError(StatusCode::kIsInfinity,
@@ -2270,7 +2539,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return name_view == "safe_divide" ? Value() : Value(l / r);
     }
     const double res = l / r;
-    if (name_view == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
+    // SAFE_DIVIDE suppresses the errors DIVIDE raises: division by zero and
+    // overflow of finite operands (1e308 / 1e-308). A non-finite input keeps
+    // its IEEE result (SAFE_DIVIDE(0, NaN) is NaN), matching GoogleSQL.
+    if (name_view == "safe_divide" && !std::isfinite(res) &&
+        std::isfinite(l) && std::isfinite(r)) {
       return Value();
     }
     return Value(res);
@@ -2294,9 +2567,17 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const int64_t start = values[1].value.int_value;
     if (values.size() == 3) {
       const int64_t len = values[2].value.int_value;
-      if (len < 0) {
+      if (!values[2].IsUnsigned() && len < 0) {
         return StatusError(StatusCode::kInvalidArgument,
                            "SUBSTR length cannot be negative");
+      }
+      if (values[2].IsUnsigned() &&
+          static_cast<uint64_t>(len) >
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        // A huge unsigned length covers the whole remaining string.
+        const size_t from = std::min<size_t>(
+            input.size(), static_cast<size_t>(std::max<int64_t>(start, 0)));
+        return Value(input.substr(from));
       }
       if (len == 0) {
         return Value(std::string());
@@ -2383,22 +2664,22 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     const std::string input = raw_str(values[0]);
-    if (name_view == "char_length" || name_view == "character_length") {
-      // SQL CHAR_LENGTH counts CHARACTER CODE POINTS; the relational
-      // evaluator (expression_eval.cpp utf8_len) and the compliance golden
-      // (CHAR_LENGTH("€") = 1) already do.  Byte-counting here made the
-      // result depend on which evaluator the plan happened to pick.
-      size_t code_points = 0;
-      for (char i : input) {
-        const auto byte = static_cast<unsigned char>(i);
-        if ((byte & 0xC0) != 0x80) {  // skip UTF-8 continuation bytes
-          ++code_points;
-        }
-      }
-      return Value(static_cast<int64_t>(code_points));
+    if (name_view == "octet_length" || name_view == "byte_length") {
+      // BYTE_LENGTH/OCTET_LENGTH count raw bytes.
+      return Value(static_cast<int64_t>(input.size()));
     }
-    // length / octet_length / byte_length stay byte-oriented.
-    return Value(static_cast<int64_t>(input.size()));
+    // GoogleSQL LENGTH/CHAR_LENGTH/CHARACTER_LENGTH count characters (code
+    // points): the compliance golden has LENGTH("€") = 1 and
+    // CHAR_LENGTH("€") = 1. Every byte that is not a UTF-8 continuation byte
+    // is one character, so malformed input skips orphan continuation bytes.
+    size_t code_points = 0;
+    for (char i : input) {
+      const auto byte = static_cast<unsigned char>(i);
+      if ((byte & 0xC0) != 0x80) {  // skip UTF-8 continuation bytes
+        ++code_points;
+      }
+    }
+    return Value(static_cast<int64_t>(code_points));
   }
   if (name_view == "strpos") {
     if (values.size() != 2) {
@@ -2413,7 +2694,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (needle.empty()) {
       return Value(int64_t{1});
     }
-    const size_t pos = hay.find(needle);
+    size_t pos = hay.find(needle);
+    // STRPOS counts code points, so only a match starting at a code-point
+    // boundary is meaningful; skip matches at UTF-8 continuation bytes.
+    while (pos != std::string::npos && pos > 0 &&
+           (static_cast<unsigned char>(hay[pos]) & 0xC0) == 0x80) {
+      pos = hay.find(needle, pos + 1);
+    }
     if (pos == std::string::npos) {
       return Value(int64_t{0});
     }
@@ -2440,15 +2727,20 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const std::string target = raw_str(values[1]);
     const int64_t position = values.size() >= 3 ? to_i64(values[2], 1) : 1;
     const int64_t occurrence = values.size() == 4 ? to_i64(values[3], 1) : 1;
+    // Match REGEXP_INSTR's argument contract: a zero/negative position or
+    // occurrence is an invalid argument, not a "no match" result.
     if (position == 0 || occurrence <= 0) {
-      return Value(int64_t{0});
+      return StatusError(StatusCode::kInvalidArgument,
+                         "position and occurrence must be positive");
     }
     const auto s_offsets = utf8_offsets(source);
     const size_t s_cps = s_offsets.size() > 1 ? s_offsets.size() - 1 : 0;
     const auto t_offsets = utf8_offsets(target);
     const size_t t_cps = t_offsets.size() > 1 ? t_offsets.size() - 1 : 0;
     if (t_cps == 0) {
-      if (position > 0 && static_cast<size_t>(position) <= s_cps + 1) {
+      // An empty target matches once at `position`; later occurrences do not
+      // exist. The old code ignored `occurrence` here.
+      if (occurrence == 1 && static_cast<size_t>(position) <= s_cps + 1) {
         return Value(position);
       }
       return Value(int64_t{0});
@@ -2517,6 +2809,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value(utf8_substr(s, 0, static_cast<size_t>(target_len)));
     }
     const size_t pad_cps = utf8_len(pad);
+    if (pad_cps == 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Pattern in LPAD/RPAD contains no characters");
+    }
     const size_t needed = static_cast<size_t>(target_len) - total_cps;
     std::string pad_str;
     for (size_t i = 0; i < needed / pad_cps; ++i) {
@@ -2524,6 +2820,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     if (needed % pad_cps != 0) {
       pad_str += utf8_substr(pad, 0, needed % pad_cps);
+    }
+    // The 1MB cap is in bytes (REPEAT parity): pad code points can expand
+    // to ~4x that in UTF-8, so check the real output size.
+    if (s.size() + pad_str.size() > 1000000) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Output of LPAD/RPAD exceeds max allowed output size of 1MB");
     }
     return Value(name_view == "lpad" ? pad_str + s : s + pad_str);
   }
@@ -2538,7 +2841,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string cutset =
         values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
-    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
                                             /*trailing=*/true)));
@@ -2554,7 +2857,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string cutset =
         values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
-    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
                                             /*trailing=*/false)));
@@ -2570,7 +2873,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string cutset =
         values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
-    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/false,
                                             /*trailing=*/true)));
@@ -2596,6 +2899,57 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::move(s));
   }
+  if (name_view == "contains_substr") {
+    // T2237: CONTAINS_SUBSTR(expression, search[, json_scope]) — case
+    // insensitive containment across a STRING or the STRING leaves of an
+    // ARRAY (STRUCTs have no representation in the engine's Value tier).
+    // GoogleSQL layers NFKC normalization on top; the engine has no NFKC
+    // anywhere (LOWER behaves the same way), so the fold here is
+    // UnicodeCaseFold only. json_scope is accepted and validated but has no
+    // JSON-path semantics to change.
+    if (values.size() < 2 || values.size() > 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CONTAINS_SUBSTR requires 2 or 3 arguments");
+    }
+    for (size_t i = 0; i < values.size() && i < 3; ++i) {
+      if (values[i].IsNull()) {
+        return Value();
+      }
+    }
+    if (values.size() == 3) {
+      std::string scope = raw_str(values[2]);
+      for (char& ch : scope) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+      }
+      if (scope != "JSON_VALUE" && scope != "JSON_KEYS") {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Invalid json_scope argument to CONTAINS_SUBSTR: " +
+                               raw_str(values[2]));
+      }
+    }
+    if (values[1].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CONTAINS_SUBSTR search value must be STRING");
+    }
+    const std::string needle = UnicodeCaseFold(raw_str(values[1]));
+    // Recursive so nested ARRAY<ARRAY<STRING>> leaves are searched too.
+    std::function<bool(const Value&)> walk =
+        [&needle, &walk, &raw_str](const Value& v) -> bool {
+      if (v.IsNull()) {
+        return false;  // NULL elements never match (GoogleSQL semantics)
+      }
+      if (v.type == ValueType::kArray) {
+        for (const Value& element : v.ArrayElements()) {  // NOLINT(readability-use-anyofallof)
+          if (walk(element)) {
+            return true;
+          }
+        }
+        return false;
+      }
+      return UnicodeCaseFold(raw_str(v)).find(needle) != std::string::npos;
+    };
+    return Value(walk(values[0]));
+  }
   if (name_view == "starts_with") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -2603,6 +2957,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     if (values[0].IsNull() || values[1].IsNull()) {
       return Value();
+    }
+    for (const auto& value : values) {
+      if (value.type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "STARTS_WITH requires STRING arguments");
+      }
     }
     return Value(raw_str(values[0]).starts_with(raw_str(values[1])));
   }
@@ -2614,6 +2974,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull() || values[1].IsNull()) {
       return Value();
     }
+    for (const auto& value : values) {
+      if (value.type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ENDS_WITH requires STRING arguments");
+      }
+    }
     return Value(raw_str(values[0]).ends_with(raw_str(values[1])));
   }
 
@@ -2624,6 +2990,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     if (values[0].IsNull()) {
       return Value();
+    }
+    if (values[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REVERSE requires a STRING argument");
     }
     const std::string s = raw_str(values[0]);
     const auto offsets = utf8_offsets(s);
@@ -2664,6 +3034,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "ARRAY_TO_STRING requires an array");
     }
     const std::string delimiter = raw_str(values[1]);
+    if (values.size() == 3 && values[2].IsNull()) {
+      return Value();  // explicit NULL null_text -> NULL result
+    }
     const bool has_null_text = values.size() == 3 && !values[2].IsNull();
     const std::string null_text =
         has_null_text ? raw_str(values[2]) : std::string();
@@ -2834,11 +3207,43 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
+    if (values[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ASCII requires a STRING argument");
+    }
     const std::string s = raw_str(values[0]);
     if (s.empty()) {
       return Value(int64_t{0});
     }
-    return Value(static_cast<int64_t>(static_cast<unsigned char>(s[0])));
+    // GoogleSQL ASCII/UNICODE both return the first Unicode code point, not
+    // the first byte: decoding a lead byte (0xC3 for 'é') gave 195 instead of
+    // 233. Use the same UTF-8 walk as the UNICODE arm below.
+    const auto offsets = utf8_offsets(s);
+    if (offsets.size() < 2) {
+      return Value(int64_t{0});
+    }
+    const size_t char_start = offsets[0];
+    const size_t first_len = offsets[1] - char_start;
+    uint32_t code = 0;
+    if (first_len == 1) {
+      code = static_cast<unsigned char>(s[char_start]);
+    } else if (first_len == 2) {
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[char_start]) & 0x1F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 1]) & 0x3F));
+    } else if (first_len == 3) {
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[char_start]) & 0x0F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 2]) & 0x3F));
+    } else if (first_len == 4) {
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[char_start]) & 0x07) << 18) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 2]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 3]) & 0x3F));
+    }
+    return Value(static_cast<int64_t>(code));
   }
 
   if (name_view == "unicode") {
@@ -2849,30 +3254,40 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
+    if (values[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "UNICODE requires a STRING argument");
+    }
     const std::string s = raw_str(values[0]);
     if (s.empty()) {
       return Value(int64_t{0});
     }
     const auto offsets = utf8_offsets(s);
-    const size_t first_len = offsets[1];
+    // utf8_offsets skips orphan continuation bytes, so the first character
+    // can start past byte 0 and an all-orphan string has no characters.
+    if (offsets.size() < 2) {
+      return Value(int64_t{0});
+    }
+    const size_t char_start = offsets[0];
+    const size_t first_len = offsets[1] - char_start;
     uint32_t code = 0;
     if (first_len == 1) {
-      code = static_cast<unsigned char>(s[0]);
+      code = static_cast<unsigned char>(s[char_start]);
     } else if (first_len == 2) {
       code = static_cast<uint32_t>(
-          ((static_cast<unsigned char>(s[0]) & 0x1F) << 6) |
-          (static_cast<unsigned char>(s[1]) & 0x3F));
+          ((static_cast<unsigned char>(s[char_start]) & 0x1F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 1]) & 0x3F));
     } else if (first_len == 3) {
       code = static_cast<uint32_t>(
-          ((static_cast<unsigned char>(s[0]) & 0x0F) << 12) |
-          ((static_cast<unsigned char>(s[1]) & 0x3F) << 6) |
-          (static_cast<unsigned char>(s[2]) & 0x3F));
+          ((static_cast<unsigned char>(s[char_start]) & 0x0F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 2]) & 0x3F));
     } else if (first_len == 4) {
       code = static_cast<uint32_t>(
-          ((static_cast<unsigned char>(s[0]) & 0x07) << 18) |
-          ((static_cast<unsigned char>(s[1]) & 0x3F) << 12) |
-          ((static_cast<unsigned char>(s[2]) & 0x3F) << 6) |
-          (static_cast<unsigned char>(s[3]) & 0x3F));
+          ((static_cast<unsigned char>(s[char_start]) & 0x07) << 18) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 2]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 3]) & 0x3F));
     }
     return Value(static_cast<int64_t>(code));
   }
@@ -2912,6 +3327,62 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
+  // T2234: inverse of CODE_POINTS_TO_STRING/BYTES (GoogleSQL standard).
+  if (name_view == "to_code_points") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TO_CODE_POINTS requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    if (values[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TO_CODE_POINTS requires a STRING or BYTES argument");
+    }
+    std::vector<Value> elements;
+    for (const uint32_t cp : CodePointsOf(values[0].value.varchar_value)) {
+      elements.push_back(Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
+    }
+    return Value::Array(std::move(elements), "INT64");
+  }
+  // T2238: EDIT_DISTANCE(value1, value2[, max_distance]). A distance above
+  // max_distance reports max_distance + 1 per the GoogleSQL spec; the named
+  // form (max_distance => n) still depends on visitor named-argument support
+  // (tracked separately), positional spelling is what lands here.
+  if (name_view == "edit_distance") {
+    if (values.size() < 2 || values.size() > 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EDIT_DISTANCE requires 2 or 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() == 3 && values[2].IsNull())) {
+      return Value();
+    }
+    if (values[0].type != ValueType::kVarChar ||
+        values[1].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EDIT_DISTANCE requires STRING arguments");
+    }
+    int64_t max_distance = -1;
+    if (values.size() == 3) {
+      if (values[2].type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "EDIT_DISTANCE max_distance must be an integer");
+      }
+      max_distance = values[2].value.int_value;
+      if (max_distance < 0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "EDIT_DISTANCE max_distance cannot be negative");
+      }
+    }
+    const int64_t distance = LevenshteinCodePoints(
+        values[0].value.varchar_value, values[1].value.varchar_value);
+    if (max_distance >= 0 && distance > max_distance) {
+      return Value(max_distance + 1);
+    }
+    return Value(distance);
+  }
   if (name_view == "code_points_to_string") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -3292,73 +3763,16 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         (values.size() == 5 && values[4].IsNull())) {
       return Value();
     }
-    const std::string s = raw_str(values[0]);
-    const std::string pat = raw_str(values[1]);
-    if (pat.empty()) {
-      return Value(int64_t{0});
-    }
-    const int64_t pos_arg = values.size() >= 3 ? to_i64(values[2], 1) : 1;
-    const int64_t occ_arg = values.size() >= 4 ? to_i64(values[3], 1) : 1;
-    const int64_t return_pos = values.size() == 5 ? to_i64(values[4], 0) : 0;
-    if (pos_arg <= 0 || occ_arg <= 0) {
-      return StatusError(
-          StatusCode::kInvalidArgument,
-          "REGEXP_INSTR position and occurrence must be positive");
-    }
-    const bool byte_mode = name_view == "byte_regexp_instr";
-    const auto offsets = utf8_offsets(s);
-    const size_t total_cps = offsets.size() - 1;
-    if (static_cast<size_t>(pos_arg) > (byte_mode ? s.size() : total_cps) + 1) {
-      return Value(int64_t{0});
-    }
-    const size_t byte_start = byte_mode
-                                  ? static_cast<size_t>(pos_arg - 1)
-                                  : offsets[static_cast<size_t>(pos_arg - 1)];
-    try {
-      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      std::string search_str = s.substr(byte_start);
-      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
-      std::sregex_iterator end;
-      int64_t current_occ = 1;
-      while (it != end) {
-        if (current_occ == occ_arg) {
-          const auto& match = *it;
-          const bool has_capture = match.size() > 1 && match[1].matched;
-          const size_t target_start =
-              has_capture && return_pos == 0
-                  ? byte_start + static_cast<size_t>(match.position(1))
-                  : byte_start + static_cast<size_t>(match.position());
-          const size_t target_end = byte_start +
-                                    static_cast<size_t>(match.position()) +
-                                    static_cast<size_t>(match.length());
-          if (byte_mode) {
-            return Value(static_cast<int64_t>(
-                return_pos == 1 ? target_end : target_start + 1));
-          }
-          size_t match_cp_start = 1;
-          size_t match_cp_end = 1;
-          for (size_t i = 0; i + 1 < offsets.size(); ++i) {
-            if (offsets[i] <= target_start && target_start < offsets[i + 1]) {
-              match_cp_start = i + 1;
-            }
-            if (offsets[i] < target_end && target_end <= offsets[i + 1]) {
-              match_cp_end = i + 1;
-            }
-          }
-          if (target_end >= s.size()) {
-            match_cp_end = total_cps;
-          }
-          return Value(static_cast<int64_t>(return_pos == 1 ? match_cp_end
-                                                            : match_cp_start));
-        }
-        ++current_occ;
-        ++it;
-      }
-      return Value(int64_t{0});
-    } catch (...) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "invalid regular expression: " + pat);
-    }
+    const int64_t position = values.size() >= 3 ? to_i64(values[2], 1) : 1;
+    const int64_t occurrence = values.size() >= 4 ? to_i64(values[3], 1) : 1;
+    const int64_t occurrence_position =
+        values.size() == 5 ? to_i64(values[4], 0) : 0;
+    ASSIGN_OR_RETURN(
+        int64_t, match,
+        CheckedRegexPosition(raw_str(values[0]), raw_str(values[1]), position,
+                             occurrence, occurrence_position,
+                             name_view == "byte_regexp_instr"));
+    return Value(match);
   }
 
   if (name_view == "regexp_extract_all" ||
@@ -3398,26 +3812,175 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
   }
 
-  if (name_view == "regexp_extract") {
+  if (name_view == "regexp_extract" || name_view == "regexp_substr") {
+    // T2235: REGEXP_SUBSTR is the GoogleSQL synonym of REGEXP_EXTRACT.
     if (values.size() < 2 || values.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_EXTRACT requires 2 to 4 arguments");
     }
-    if (values[0].IsNull() || values[1].IsNull()) {
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() >= 3 && values[2].IsNull()) ||
+        (values.size() == 4 && values[3].IsNull())) {
       return Value();
     }
     const std::string s = raw_str(values[0]);
     const std::string pat = raw_str(values[1]);
+    const int64_t pos_arg = values.size() >= 3 ? to_i64(values[2], 1) : 1;
+    const int64_t occ_arg = values.size() == 4 ? to_i64(values[3], 1) : 1;
+    if (pos_arg <= 0 || occ_arg <= 0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "REGEXP_EXTRACT position and occurrence must be positive");
+    }
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    if (static_cast<uint64_t>(pos_arg) > total_cps + 1) {
+      return Value();
+    }
+    const size_t byte_start = offsets[static_cast<size_t>(pos_arg - 1)];
     try {
       ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      std::smatch match;
-      if (std::regex_search(s, match, re)) {
-        if (match.size() > 1) {
-          return Value(match[1].str());
+      const std::string search_str = s.substr(byte_start);
+      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
+      std::sregex_iterator end;
+      for (int64_t current_occ = 1; it != end; ++it, ++current_occ) {
+        if (current_occ == occ_arg) {
+          if (it->size() > 1) {
+            // GoogleSQL: a capture group that did not participate in the
+            // match is NULL, not an empty string.
+            if (!(*it)[1].matched) {
+              return Value();
+            }
+            return Value(it->str(1));
+          }
+          return Value(it->str(0));
         }
-        return Value(match[0].str());
       }
       return Value();
+    } catch (...) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid regular expression: " + pat);
+    }
+  }
+
+  if (name_view == "regexp_extract_groups") {
+    // T2236: REGEXP_EXTRACT_GROUPS(value, regexp[, position[, occurrence]])
+    // returns one entry PER MATCH with all capture groups. GoogleSQL shapes
+    // each entry as a STRUCT over the named groups; the engine's Value tier
+    // has no STRUCT, so entries are positional ARRAY<STRING> in named-group
+    // declaration order (NULL cells for groups that did not participate).
+    // Occurrence 0 (the default) means "all matches", unlike the singular
+    // REGEXP_EXTRACT. (?P<name>...) and (?<name>...) spellings are accepted;
+    // a pattern without named groups is an error, like GoogleSQL.
+    if (values.size() < 2 || values.size() > 4) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_EXTRACT_GROUPS requires 2 to 4 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() >= 3 && values[2].IsNull()) ||
+        (values.size() == 4 && values[3].IsNull())) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string pat = raw_str(values[1]);
+    const int64_t pos_arg = values.size() >= 3 ? to_i64(values[2], 1) : 1;
+    const int64_t occ_arg = values.size() == 4 ? to_i64(values[3], 0) : 0;
+    if (pos_arg <= 0 || occ_arg < 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_EXTRACT_GROUPS position must be positive and "
+                         "occurrence non-negative");
+    }
+    // Rewrite named-group syntax to plain groups, remembering each named
+    // group's 1-based submatch index (group_counter mirrors what std::regex
+    // will number, so character classes and non-capturing groups are skipped).
+    std::string plain;
+    std::vector<size_t> named_index;
+    {
+      size_t group_counter = 0;
+      bool in_class = false;
+      for (size_t i = 0; i < pat.size();) {
+        if (pat[i] == '\\' && i + 1 < pat.size()) {
+          plain += pat.substr(i, 2);
+          i += 2;
+          continue;
+        }
+        if (pat[i] == '[') {
+          in_class = true;
+          plain += pat[i++];
+          continue;
+        }
+        if (in_class) {
+          if (pat[i] == ']') {
+            in_class = false;
+          }
+          plain += pat[i++];
+          continue;
+        }
+        if (pat[i] == '(') {
+          const bool re_named = pat.compare(i, 4, "(?P<") == 0;
+          const bool ecma_named = !re_named && pat.compare(i, 3, "(?<") == 0 &&
+                                  pat.size() > i + 3 && pat[i + 3] != '=' &&
+                                  pat[i + 3] != '!';
+          if (re_named || ecma_named) {
+            const size_t lt = re_named ? i + 4 : i + 3;
+            const size_t gt = pat.find('>', lt);
+            if (gt == std::string::npos) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "invalid regular expression: " + pat);
+            }
+            ++group_counter;
+            named_index.push_back(group_counter);
+            plain += '(';
+            i = gt + 1;
+            continue;
+          }
+          if (pat.size() > i + 1 && pat[i + 1] == '?') {
+            plain += pat[i++];  // non-capturing / assertion, not a group
+            continue;
+          }
+          ++group_counter;
+        }
+        plain += pat[i++];
+      }
+    }
+    if (named_index.empty()) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "REGEXP_EXTRACT_GROUPS requires at least one named capture group");
+    }
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    if (static_cast<uint64_t>(pos_arg) > total_cps + 1) {
+      return Value::Array({}, "ARRAY<STRING>");
+    }
+    const size_t byte_start = offsets[static_cast<size_t>(pos_arg - 1)];
+    try {
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(plain));
+      const std::string search_str = s.substr(byte_start);
+      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
+      std::sregex_iterator end;
+      std::vector<Value> out;
+      int64_t current_occ = 0;
+      for (; it != end; ++it) {
+        ++current_occ;
+        if (occ_arg != 0 && current_occ != occ_arg) {
+          continue;
+        }
+        std::vector<Value> entry;
+        entry.reserve(named_index.size());
+        for (const size_t gi : named_index) {
+          if (gi < it->size() && (*it)[gi].matched) {
+            entry.push_back(Value(it->str(gi)));  // NOLINT(modernize-use-emplace)
+          } else {
+            entry.push_back(Value());  // NOLINT(modernize-use-emplace)
+          }
+        }
+        out.push_back(Value::Array(std::move(entry), "STRING"));
+        if (occ_arg != 0) {
+          break;
+        }
+      }
+      return Value::Array(std::move(out), "ARRAY<STRING>");
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
                          "invalid regular expression: " + pat);
@@ -3484,8 +4047,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // An UNSIGNED shift count is a huge positive number, not a negative
     // offset: counts >= 64 yield 0 just like the signed path.
     if (values[1].IsUnsigned()) {
-      const uint64_t shift =
-          static_cast<uint64_t>(values[1].value.int_value);
+      const auto shift = static_cast<uint64_t>(values[1].value.int_value);
       if (shift >= 64) {
         return with_u(Value(static_cast<int64_t>(0)));
       }
@@ -3727,9 +4289,16 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
     platform::GmTime(static_cast<int64_t>(now), &utc);
-    std::ostringstream output;
-    output << std::put_time(&utc, "%Y-%m-%d %H:%M:%S") << "+00";
-    return Value(output.str());
+    // T3754: strftime into a stack buffer instead of a per-call
+    // std::ostringstream + std::put_time (stream buffer allocation and
+    // ctype facet lookup per row); mirrors the T1476 batch evaluator arm.
+    std::array<char, 32> buffer{};
+    if (std::strftime(buffer.data(), buffer.size(), "%Y-%m-%d %H:%M:%S",
+                      &utc) == 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "timestamp formatting failed");
+    }
+    return Value(std::string(buffer.data()) + "+00");
   }
   if (name_view == "user" || name_view == "session_user" ||
       name_view == "current_user") {
@@ -3737,11 +4306,17 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "USER takes no arguments");
     }
-    const char* os_user = std::getenv("USER");
-    if (os_user == nullptr || *os_user == '\0') {
-      os_user = std::getenv("LOGNAME");
-    }
-    return Value(std::string(os_user != nullptr ? os_user : "tinylamb"));
+    // The OS user is constant for the process; resolve it once instead of
+    // scanning the environment and allocating a string on every row.
+    static const std::string kUser = [] {
+      const char* os_user = std::getenv("USER");
+      if (os_user == nullptr || *os_user == '\0') {
+        os_user = std::getenv("LOGNAME");
+      }
+      return os_user != nullptr ? std::string(os_user)
+                                : std::string("tinylamb");
+    }();
+    return Value(std::string(kUser));
   }
   if (name_view == "current_datetime") {
     if (values.size() > 1) {
@@ -3751,16 +4326,32 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values.size() == 1 && values[0].IsNull()) {
       return Value();
     }
-    ASSIGN_OR_RETURN(int, tz_offset_sec,
-                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
+    // Resolve the zone's offset at the CURRENT instant, not at the helper's
+    // default 2000-01-01: a DST-observing zone would otherwise apply standard
+    // time all summer and shift the rendered "now" by an hour.
+    const time_t utc_now = time(nullptr);
+    struct tm utc_tm = {};
+    platform::GmTime(static_cast<int64_t>(utc_now), &utc_tm);
+    const CivilTime utc_ct{.year = utc_tm.tm_year + 1900,
+                           .month = utc_tm.tm_mon + 1,
+                           .day = utc_tm.tm_mday,
+                           .hour = utc_tm.tm_hour,
+                           .minute = utc_tm.tm_min,
+                           .second = utc_tm.tm_sec,
+                           .subsecond_nanos = 0};
+    int tz_offset_sec = 0;
     if (values.size() == 1 && !values[0].IsNull()) {
-      std::string tz_str = raw_str(values[0]);
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
-        tz_offset_sec = parsed_offset;
-      }
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(raw_str(values[0]), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
+    } else {
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
     }
-    time_t now = time(nullptr) + tz_offset_sec;
+    time_t now = utc_now + tz_offset_sec;
     struct tm t = {};
     platform::GmTime(static_cast<int64_t>(now), &t);
     CivilTime current{.year = t.tm_year + 1900,
@@ -3780,16 +4371,30 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values.size() == 1 && values[0].IsNull()) {
       return Value();
     }
-    ASSIGN_OR_RETURN(int, tz_offset_sec,
-                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
+    // Resolve the zone offset at the current instant (see current_datetime).
+    const time_t utc_now = time(nullptr);
+    struct tm utc_tm = {};
+    platform::GmTime(static_cast<int64_t>(utc_now), &utc_tm);
+    const CivilTime utc_ct{.year = utc_tm.tm_year + 1900,
+                           .month = utc_tm.tm_mon + 1,
+                           .day = utc_tm.tm_mday,
+                           .hour = utc_tm.tm_hour,
+                           .minute = utc_tm.tm_min,
+                           .second = utc_tm.tm_sec,
+                           .subsecond_nanos = 0};
+    int tz_offset_sec = 0;
     if (values.size() == 1 && !values[0].IsNull()) {
-      std::string tz_str = raw_str(values[0]);
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
-        tz_offset_sec = parsed_offset;
-      }
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(raw_str(values[0]), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
+    } else {
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
     }
-    time_t now = time(nullptr) + tz_offset_sec;
+    time_t now = utc_now + tz_offset_sec;
     struct tm t = {};
     platform::GmTime(static_cast<int64_t>(now), &t);
     std::chrono::year_month_day ymd{
@@ -3810,7 +4415,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values.size() == 2) {
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(values[0])));
       std::string tz_str = raw_str(values[1]);
-      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
+      // T4097: the two-argument form renders a TIMESTAMP instant in a zone,
+      // exactly like FORMAT_TIMESTAMP's at_utc arm: TryValueToCivilTime
+      // returns the UTC reading, so the zone's offset must be resolved AT
+      // that instant, not as though the UTC fields were local wall time --
+      // the two straddle DST transitions and can differ by an hour.
+      ASSIGN_OR_RETURN(int, tz_offset_sec,
+                       (ParseTimeZoneOffset(tz_str, &ct, /*at_utc=*/true)));
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
       int rem_mins = (tz_offset_sec % 3600) / 60;
       if (rem_mins != 0) {
@@ -3850,14 +4461,25 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       }
       std::string tz_str = raw_str(values[2]);
       {
+        // FORMAT_TIMESTAMP renders an instant: `ct` is the UTC reading, so
+        // the zone's offset must be resolved AT that instant (at_utc), not
+        // as though the UTC fields were local wall time — the two differ by
+        // up to a day and can straddle a DST transition. DATETIME/DATE args
+        // are civil fields and keep the local-time reading.
         ASSIGN_OR_RETURN(int, parsed_offset,
-                         (ParseTimeZoneOffset(tz_str, &ct)));
+                         (ParseTimeZoneOffset(
+                             tz_str, &ct, name_view == "format_timestamp")));
         tz_offset_sec = parsed_offset;
       }
-    } else if (name_view == "format_timestamp") {
-      // DATETIME is zone-independent: never apply the mutable default zone
-      // to a 2-argument FORMAT_DATETIME. TIMESTAMP defaults to UTC.
-      tz_offset_sec = 0;
+    } else if (name_view == "format_datetime" ||
+               name_view == "format_timestamp") {
+      {
+        ASSIGN_OR_RETURN(
+            int, parsed_offset,
+            (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct,
+                                 name_view == "format_timestamp")));
+        tz_offset_sec = parsed_offset;
+      }
     }
     ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
     int rem_mins = (tz_offset_sec % 3600) / 60;
@@ -3885,7 +4507,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // %z/%Z render from the struct (UTC here), never the host's zone.
     const size_t formatted =
         platform::FormatTime(buf.data(), buf.size(), fmt.c_str(), &tm);
-    if (formatted == 0) {
+    // strftime's 0 means both "expansion failed" and "legitimately empty
+    // output" (e.g. FORMAT_TIMESTAMP('', ts)); only the former is an error.
+    if (formatted == 0 && !FormatTimeYieldsEmpty(fmt)) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TIMESTAMP format produced no output: " + fmt);
     }
@@ -3903,26 +4527,59 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     std::string fmt = raw_str(values[0]);
-    std::string input = raw_str(values[1]);
-    ASSIGN_OR_RETURN(int, tz_offset_sec,
-                     (ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr)));
-    if (values.size() == 3) {
-      std::string tz_str = raw_str(values[2]);
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
-        tz_offset_sec = parsed_offset;
+    // T3929: "%Ez" is a glibc-only alias of "%z"; the portable fallback
+    // parser in common/platform/time_format.cpp does not interpret it, so
+    // tm_gmtoff would silently stay 0 there and the third-argument zone
+    // would be overridden only on glibc builds.  Fold "%Ez" into "%z"
+    // before parsing to make the input-offset precedence uniform.
+    {
+      std::string normalized;
+      normalized.reserve(fmt.size());
+      for (size_t i = 0; i < fmt.size(); ++i) {
+        if (fmt[i] != '%') {
+          normalized += fmt[i];
+          continue;
+        }
+        if (i + 1 < fmt.size() && fmt[i + 1] == '%') {
+          normalized += "%%";
+          ++i;
+          continue;
+        }
+        if (i + 2 < fmt.size() && fmt[i + 1] == 'E' && fmt[i + 2] == 'z') {
+          normalized += "%z";
+          i += 2;
+          continue;
+        }
+        normalized += fmt[i];
       }
+      fmt = std::move(normalized);
     }
+    std::string input = raw_str(values[1]);
     struct tm tm = {};
-    tm.tm_year = 100;
+    tm.tm_year = 70;  // BigQuery: unspecified fields start at 1970-01-01.
     tm.tm_mon = 0;
     tm.tm_mday = 1;
     const char* parsed_end =
         platform::ParseTime(input.c_str(), fmt.c_str(), &tm);
-    if (parsed_end == nullptr) {
+    // Every input byte must have a matching format element; trailing garbage
+    // is an error, not a silently accepted parse (matches PARSE_DATE).
+    if (parsed_end == nullptr || *parsed_end != '\0') {
       return StatusError(StatusCode::kInvalidArgument,
                          "PARSE_TIMESTAMP failed for: " + input);
     }
+    // A "%z" specifier (and its "%Ez" alias, already folded above by
+    // T3929) records the input's own offset in tm_gmtoff; use it instead
+    // of the default/third-argument zone, matching the TIMESTAMP literal
+    // route and GoogleSQL.
+    auto has_unescaped = [&](std::string_view spec) {
+      for (size_t i = 0; i + spec.size() <= fmt.size(); ++i) {
+        if (fmt.compare(i, spec.size(), spec) == 0 &&
+            (i == 0 || fmt[i - 1] != '%')) {
+          return true;
+        }
+      }
+      return false;
+    };
     CivilTime ct;
     ct.year = tm.tm_year + 1900;
     ct.month = tm.tm_mon + 1;
@@ -3930,8 +4587,36 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ct.hour = tm.tm_hour;
     ct.minute = tm.tm_min;
     ct.second = tm.tm_sec;
+    // Resolve the zone offset AT the parsed civil time. Passing nullptr made
+    // ParseTimeZoneOffset assume 2000-01-01, so a DST-observing zone applied
+    // standard time to a summer date and UTC conversion was off by an hour.
+    int tz_offset_sec = 0;
+    if (has_unescaped("%z")) {
+      tz_offset_sec = static_cast<int>(platform::TmGmtoff(&tm));
+    } else if (values.size() == 3) {
+      ASSIGN_OR_RETURN(int, parsed_zone_offset,
+                       (ParseTimeZoneOffset(raw_str(values[2]), &ct)));
+      tz_offset_sec = parsed_zone_offset;
+    } else {
+      ASSIGN_OR_RETURN(int, parsed_zone_offset,
+                       (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
+      tz_offset_sec = parsed_zone_offset;
+    }
     ct = ShiftCivilTimeHours(ct, -tz_offset_sec / 3600);
     int rem_mins = (tz_offset_sec % 3600) / 60;
+    const int rem_secs = tz_offset_sec % 60;
+    if (rem_secs != 0) {
+      int total_s = ct.second - rem_secs;
+      if (total_s < 0) {
+        ct.second = total_s + 60;
+        --ct.minute;
+      } else if (total_s >= 60) {
+        ct.second = total_s - 60;
+        ++ct.minute;
+      } else {
+        ct.second = total_s;
+      }
+    }
     if (rem_mins != 0) {
       int total_m = ct.minute - rem_mins;
       if (total_m >= 60) {
@@ -3947,6 +4632,44 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(FormatCivilTime(ct) + "+00");
   }
 
+  // T2241: PARSE_DATETIME(format, datetime_string).  Shares the strptime
+  // machinery and the 1970-01-01 field defaults of PARSE_TIMESTAMP above,
+  // but a DATETIME is a civil time with no zone: there is no third zone
+  // argument, no offset is resolved or shifted, and the result is the
+  // canonical zone-less FormatCivilTime rendering (the CURRENT_DATETIME /
+  // DATETIME(...) spelling) rather than the "+00" TIMESTAMP form.
+  if (name_view == "parse_datetime") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "PARSE_DATETIME requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    std::string fmt = raw_str(values[0]);
+    std::string input = raw_str(values[1]);
+    struct tm tm = {};
+    tm.tm_year = 70;  // BigQuery: unspecified fields start at 1970-01-01.
+    tm.tm_mon = 0;
+    tm.tm_mday = 1;
+    const char* parsed_end =
+        platform::ParseTime(input.c_str(), fmt.c_str(), &tm);
+    // Every input byte must have a matching format element; trailing
+    // garbage is an error (matches PARSE_DATE / PARSE_TIMESTAMP).
+    if (parsed_end == nullptr || *parsed_end != '\0') {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "PARSE_DATETIME failed for: " + input);
+    }
+    CivilTime ct;
+    ct.year = tm.tm_year + 1900;
+    ct.month = tm.tm_mon + 1;
+    ct.day = tm.tm_mday;
+    ct.hour = tm.tm_hour;
+    ct.minute = tm.tm_min;
+    ct.second = tm.tm_sec;
+    return Value(FormatCivilTime(ct));
+  }
+
   // Deferred STRUCT(...) construction: arguments alternate field name and
   // value; encoding is shared with the relational interpreter.
   if (name_view == "__struct_json__") {
@@ -3955,6 +4678,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       triple_form = values[i].IsNull() || values[i].type == ValueType::kInt64;
     }
     const size_t stride = triple_form ? 3 : 2;
+    if (values.size() % stride != 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "struct constructor arity");
+    }
     std::vector<std::pair<std::string, Value>> fields;
     fields.reserve(values.size() / stride);
     for (size_t i = 0; i + 1 < values.size(); i += stride) {
@@ -4116,14 +4843,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    const std::optional<__int128> nanos =
+    const std::optional<platform::Int128> nanos =
         ParseTimestampTextNanos(raw_str(values[0]));
     if (!nanos.has_value()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "invalid TIMESTAMP: " + raw_str(values[0]));
     }
-    auto floor_div = [](__int128 a, __int128 b) -> int64_t {
-      const __int128 q = a / b;
+    auto floor_div = [](platform::Int128 a, platform::Int128 b) -> int64_t {
+      const platform::Int128 q = a / b;
       return static_cast<int64_t>(((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1
                                                                          : q);
     };
@@ -4152,8 +4879,15 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (arg.IsNull()) {
       return Value();
     }
-    if (arg.type != ValueType::kDouble) {
+    if (arg.type == ValueType::kInt64) {
+      // INT64 coerces to FLOAT64 (GoogleSQL: IS_INF(1) is FALSE), and an
+      // integer is never infinite or NaN; matches the relational evaluator.
       return Value(int64_t{0});
+    }
+    if (arg.type != ValueType::kDouble) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          std::string(name_view) + " requires a FLOAT64 argument");
     }
     const double v = arg.value.double_value;
     if (name_view == "is_inf") {
@@ -4260,9 +4994,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // `INTERVAL <column> DAY`); the result is the encoded interval text that
   // generate_date_array and interval arithmetic consume.
   if (name_view == "make_interval") {
-    if (values.size() < 2) {
+    if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
-                         "make_interval requires at least 2 arguments");
+                         "make_interval requires 2 arguments");
     }
     if (values[0].IsNull() || values[1].IsNull()) {
       return Value();
@@ -4346,16 +5080,17 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                                  "GENERATE_ARRAY generated too many elements");
             }
           } else {
-            const __int128 diff = descending ? (static_cast<__int128>(current) -
-                                                static_cast<__int128>(stop))
-                                             : (static_cast<__int128>(stop) -
-                                                static_cast<__int128>(current));
-            const __int128 abs_stride = descending
-                                            ? -static_cast<__int128>(stride)
-                                            : static_cast<__int128>(stride);
+            const platform::Int128 diff =
+                descending ? (static_cast<platform::Int128>(current) -
+                              static_cast<platform::Int128>(stop))
+                           : (static_cast<platform::Int128>(stop) -
+                              static_cast<platform::Int128>(current));
+            const platform::Int128 abs_stride =
+                descending ? -static_cast<platform::Int128>(stride)
+                           : static_cast<platform::Int128>(stride);
             if (abs_stride > 0 &&
                 diff / abs_stride >=
-                    static_cast<__int128>(kMaxGeneratedElements)) {
+                    static_cast<platform::Int128>(kMaxGeneratedElements)) {
               return StatusError(StatusCode::kInvalidArgument,
                                  "GENERATE_ARRAY generated too many elements");
             }
@@ -4470,6 +5205,67 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "GENERATE_SERIES requires numeric arguments");
     }
     if (integral) {
+      constexpr size_t kMaxGeneratedElements = 1'000'000;
+      bool saw_uint = false;
+      for (const Value& v : values) {
+        if (v.IsUnsigned()) {
+          saw_uint = true;
+        }
+      }
+      // UINT64 bounds must keep their unsigned bit pattern; reinterpreting
+      // them as int64 produced [-1] for 2^64-1 (the sister GENERATE_ARRAY
+      // already handles this). Mirror that arm exactly, including exact
+      // uint64 stepping and the UINT64 element type.
+      if (saw_uint) {
+        for (size_t i = 0; i < 2; ++i) {
+          if (!values[i].IsUnsigned() && values[i].value.int_value < 0) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "GENERATE_SERIES UINT64 bounds must be nonnegative");
+          }
+        }
+        const uint64_t begin =  // NOLINT(modernize-use-auto)
+            static_cast<uint64_t>(values[0].value.int_value);
+        const uint64_t end =  // NOLINT(modernize-use-auto)
+            static_cast<uint64_t>(           // NOLINT(modernize-use-auto)
+                values[1].value.int_value);  // NOLINT(modernize-use-auto)
+        const uint64_t step =                // NOLINT(modernize-use-auto)
+            static_cast<uint64_t>(           // NOLINT(modernize-use-auto)
+                values.size() == 3 ? values[2].value.int_value : int64_t{1});
+        if (step == 0) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "GENERATE_SERIES step must be non-zero");
+        }
+        if (begin > end) {
+          return Value::Array({}, "UINT64");
+        }
+        if ((end - begin) / step >= kMaxGeneratedElements) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "GENERATE_SERIES generated too many elements");
+        }
+        std::vector<Value> elements;
+        for (uint64_t current = begin;;) {
+          if (elements.size() == kMaxGeneratedElements) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "GENERATE_SERIES generated too many elements");
+          }
+          Value element(static_cast<int64_t>(current));
+          element.SetUnsigned();
+          elements.push_back(std::move(element));
+          if (current == end) {
+            break;
+          }
+          uint64_t next = 0;
+          if (__builtin_add_overflow(current, step, &next)) {
+            break;
+          }
+          current = next;
+          if (current > end) {
+            break;
+          }
+        }
+        return Value::Array(std::move(elements), "UINT64");
+      }
       // Keep integer stepping exact near INT64 boundaries (the double loop
       // loses precision well below them).
       const int64_t begin = values[0].value.int_value;
@@ -4483,15 +5279,16 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
         return Value::Array({}, "INT64");
       }
-      constexpr size_t kMaxGeneratedElements = 1'000'000;
-      const __int128 diff =
-          step > 0
-              ? (static_cast<__int128>(end) - static_cast<__int128>(begin))
-              : (static_cast<__int128>(begin) - static_cast<__int128>(end));
-      const __int128 abs_step =
-          step > 0 ? static_cast<__int128>(step) : -static_cast<__int128>(step);
-      if (abs_step > 0 &&
-          diff / abs_step >= static_cast<__int128>(kMaxGeneratedElements)) {
+      const platform::Int128 diff =
+          step > 0 ? (static_cast<platform::Int128>(end) -
+                      static_cast<platform::Int128>(begin))
+                   : (static_cast<platform::Int128>(begin) -
+                      static_cast<platform::Int128>(end));
+      const platform::Int128 abs_step =
+          step > 0 ? static_cast<platform::Int128>(step)
+                   : -static_cast<platform::Int128>(step);
+      if (abs_step > 0 && diff / abs_step >= static_cast<platform::Int128>(
+                                                 kMaxGeneratedElements)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "GENERATE_SERIES generated too many elements");
       }
@@ -4517,9 +5314,16 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value::Array(std::move(elements), "INT64");
     }
     const auto number = [](const Value& value) {
-      return value.type == ValueType::kDouble
-                 ? value.value.double_value
-                 : static_cast<double>(value.value.int_value);
+      if (value.type == ValueType::kDouble) {
+        return value.value.double_value;
+      }
+      // An unsigned INT64 shares the signed bit pattern; read it as uint64
+      // so UINT64_MAX becomes ~1.8e19 rather than -1.0.
+      if (value.IsUnsigned()) {
+        return static_cast<double>(
+            static_cast<uint64_t>(value.value.int_value));
+      }
+      return static_cast<double>(value.value.int_value);
     };
     const double begin = number(values[0]);
     const double end = number(values[1]);
@@ -4660,6 +5464,122 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       }
     }
     return Value::Array(std::move(elements), "DATE");
+  }
+
+  // T2242: GENERATE_TIMESTAMP_ARRAY(start, end, step) — the TIMESTAMP
+  // sibling of GENERATE_DATE_ARRAY. The engine represents TIMESTAMP as
+  // normalized text, so this loop iterates in epoch microseconds and
+  // formats each element back into the canonical "+00" spelling. GoogleSQL
+  // restricts the step to DAY-or-smaller units (MONTH/YEAR belongs to the
+  // date array); a bare date string counts as UTC midnight.
+  if (name_view == "generate_timestamp_array") {
+    if (values.size() < 2 || values.size() > 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_TIMESTAMP_ARRAY requires 2 or 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() == 3 && values[2].IsNull())) {
+      return Value();
+    }
+    constexpr int64_t kDayMicros = int64_t{86400} * 1000000;
+    auto to_micros = [](const Value& v) -> StatusOr<int64_t> {
+      if (v.type == ValueType::kDate) {
+        return v.DateDays() * kDayMicros;
+      }
+      if (v.type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "TIMESTAMP value required");
+      }
+      const std::string raw(v.value.varchar_value);
+      if (raw.size() == 10) {
+        auto days = TryParseDateDays(raw);
+        if (days.HasValue()) {
+          return days.Value() * kDayMicros;
+        }
+      }
+      const std::optional<platform::Int128> nanos =
+          ParseTimestampTextNanos(raw);
+      if (!nanos.has_value()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid TIMESTAMP: " + raw);
+      }
+      const platform::Int128 q = *nanos / 1000;
+      const platform::Int128 r = *nanos % 1000;
+      // Floor toward -inf like the unix_* family so pre-epoch values match.
+      return static_cast<int64_t>(r != 0 && *nanos < 0 ? q - 1 : q);
+    };
+    ASSIGN_OR_RETURN(int64_t, start_us, to_micros(values[0]));
+    ASSIGN_OR_RETURN(int64_t, end_us, to_micros(values[1]));
+    const auto day_guard = [](int64_t us) {
+      const int64_t days =
+          us >= 0 ? us / kDayMicros : -((-us + kDayMicros - 1) / kDayMicros);
+      return days < -11000000 || days > 11000000;
+    };
+    if (day_guard(start_us) || day_guard(end_us)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TIMESTAMP value out of range");
+    }
+    int64_t step_us = kDayMicros;  // INTERVAL DAY(1) default, date-array parity
+    if (values.size() == 3) {
+      const Value& step = values[2];
+      if (step.type == ValueType::kInt64) {
+        step_us = step.value.int_value * kDayMicros;
+      } else {
+        const std::string text = raw_str(step);
+        ASSIGN_OR_RETURN(IntervalValue, parsed,
+                         text.empty() ? StatusOr<IntervalValue>{IntervalValue{}}
+                                      : IntervalValue::TryParse(text));
+        if (parsed.months != 0) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "unsupported GENERATE_TIMESTAMP_ARRAY step unit: the step must "
+              "be DAY or smaller");
+        }
+        step_us = parsed.days * kDayMicros + parsed.nanos / 1000;  // NOLINT(readability-math-missing-parentheses)
+      }
+    }
+    if (step_us == 0) {
+      return StatusError(StatusCode::kIsInfinity, "Sequence step cannot be 0.");
+    }
+    std::vector<Value> elements;
+    constexpr size_t kMaxGeneratedTimestamps = 1'000'000;
+    if (step_us > 0 ? start_us <= end_us : start_us >= end_us) {
+      int64_t t = start_us;
+      while (step_us > 0 ? t <= end_us : t >= end_us) {
+        if (elements.size() == kMaxGeneratedTimestamps) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "GENERATE_TIMESTAMP_ARRAY generated too many "
+                             "elements");
+        }
+        int64_t secs = t / 1000000;
+        int64_t frac = t % 1000000;
+        if (frac < 0) {
+          frac += 1000000;
+          secs -= 1;
+        }
+        std::tm utc{};
+        platform::GmTime(secs, &utc);
+        std::array<char, 32> buffer{};
+        if (std::strftime(buffer.data(), buffer.size(), "%Y-%m-%d %H:%M:%S",
+                          &utc) == 0) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "TIMESTAMP value out of range");
+        }
+        std::string text(buffer.data());
+        if (frac != 0) {
+          std::array<char, 12> digits{};
+          std::snprintf(digits.data(), digits.size(), ".%06lld",  // NOLINT(cert-err33-c)
+                        static_cast<long long>(frac));
+          text += digits.data();
+        }
+        text += "+00";
+        elements.push_back(Value(std::move(text)));  // NOLINT(modernize-use-emplace)
+        if (__builtin_add_overflow(t, step_us, &t)) {
+          break;
+        }
+      }
+    }
+    return Value::Array(std::move(elements), "TIMESTAMP");
   }
 
   // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
@@ -5090,10 +6010,23 @@ StatusOr<std::string> TryEncodeStructMemberJson(const Value& value) {
                      "cannot encode struct member");
 }
 
-StatusOr<Value> TryStructSetField(const Value& json, const std::string& path,
-                                  const Value& new_value) {
+namespace {
+// T2398: the dot-path descent recurses once per segment of a user-supplied
+// path, so cap the depth (the proto-path route gets the same bound in
+// TryProtoTextSetField, T2399) and surface overlong paths as a plain error
+// instead of unbounded stack growth.
+constexpr size_t kMaxStructPathDepth = 64;
+
+StatusOr<Value> TryStructSetFieldDepth(const Value& json,
+                                       const std::string& path,
+                                       const Value& new_value, size_t depth) {
   if (json.IsNull()) {
     return json;
+  }
+  if (depth >= kMaxStructPathDepth) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "struct field path exceeds " +
+                           std::to_string(kMaxStructPathDepth) + " segments");
   }
   if (json.type != ValueType::kVarChar) {
     return StatusError(StatusCode::kInvalidArgument,
@@ -5131,8 +6064,9 @@ StatusOr<Value> TryStructSetField(const Value& json, const std::string& path,
           return StatusError(StatusCode::kInvalidArgument,
                              "invalid nested STRUCT member JSON");
         }
-        ASSIGN_OR_RETURN(Value, sub,
-                         TryStructSetField(nested, rest, new_value));
+        ASSIGN_OR_RETURN(
+            Value, sub,
+            TryStructSetFieldDepth(nested, rest, new_value, depth + 1));
         ASSIGN_OR_RETURN(std::string, encoded_sub,
                          TryEncodeStructMemberJson(sub));
         rebuilt += encoded_sub;
@@ -5151,9 +6085,9 @@ StatusOr<Value> TryStructSetField(const Value& json, const std::string& path,
                        TryEncodeStructMemberJson(new_value));
       rebuilt += encoded_new;
     } else {
-      ASSIGN_OR_RETURN(
-          Value, sub,
-          TryStructSetField(Value(std::string("{}")), rest, new_value));
+      ASSIGN_OR_RETURN(Value, sub,
+                       TryStructSetFieldDepth(Value(std::string("{}")), rest,
+                                              new_value, depth + 1));
       ASSIGN_OR_RETURN(std::string, encoded_sub,
                        TryEncodeStructMemberJson(sub));
       rebuilt += encoded_sub;
@@ -5162,9 +6096,15 @@ StatusOr<Value> TryStructSetField(const Value& json, const std::string& path,
   rebuilt += "}";
   return Value(std::move(rebuilt));
 }
+}  // namespace
 
-// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp); the
-// query/executor callers switch to the Try* forms in Phase 6/7.
+StatusOr<Value> TryStructSetField(const Value& json, const std::string& path,
+                                  const Value& new_value) {
+  return TryStructSetFieldDepth(json, path, new_value, 0);
+}
+
+// EXC-SHIM: throwing wrappers (common/exc_shim.hpp) retained for callers that
+// still use them; query/executor layers prefer the Try* forms.
 Value StructSetField(const Value& json, const std::string& path,
                      const Value& new_value) {
   return ExcShimUnwrap(TryStructSetField(json, path, new_value),
@@ -5637,7 +6577,8 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
-      func_name_ == "json_keys" || func_name_.ends_with("_array")) {
+      func_name_ == "regexp_extract_groups" || func_name_ == "json_keys" ||
+      func_name_ == "to_code_points" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "json_array_length" || func_name_ == "lax_int64" ||
@@ -5661,22 +6602,27 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       func_name_ == "repeat" || func_name_ == "reverse" ||
       func_name_ == "split_substr" || func_name_ == "byte_substr" ||
       func_name_ == "byte_reverse" || func_name_ == "code_points_to_string" ||
-      func_name_ == "code_points_to_bytes" || func_name_ == "octet_length" ||
-      func_name_ == "left" || func_name_ == "right" || func_name_ == "lpad" ||
-      func_name_ == "rpad" || func_name_ == "initcap" || func_name_ == "chr" ||
+      func_name_ == "code_points_to_bytes" || func_name_ == "left" ||
+      func_name_ == "right" || func_name_ == "lpad" || func_name_ == "rpad" ||
+      func_name_ == "initcap" || func_name_ == "chr" ||
       func_name_ == "soundex" || func_name_ == "translate" ||
-      func_name_ == "regexp_extract" || func_name_ == "regexp_replace" ||
-      func_name_.starts_with("json_") || func_name_ == "to_json_string") {
+      func_name_ == "regexp_extract" || func_name_ == "regexp_substr" ||
+      func_name_ == "regexp_replace" || func_name_.starts_with("json_") ||
+      func_name_ == "to_json_string") {
     return {TypeTag::kVarChar};
   }
 
   if (func_name_ == "length" || func_name_ == "char_length" ||
       func_name_ == "character_length" || func_name_ == "byte_length" ||
-      func_name_ == "strpos" || func_name_ == "instr" ||
-      func_name_ == "starts_with" || func_name_ == "ends_with" ||
+      func_name_ == "octet_length" || func_name_ == "bit_count" ||
+      func_name_ == "edit_distance" || func_name_ == "strpos" ||
+      func_name_ == "instr" || func_name_ == "starts_with" ||
+      func_name_ == "contains_substr" || func_name_ == "ends_with" ||
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
       func_name_ == "regexp_instr" || func_name_ == "div" ||
+      func_name_ == "array_length" || func_name_ == "farm_fingerprint" ||
+      func_name_ == "is_nan" || func_name_ == "is_inf" ||
       func_name_.starts_with("extract_") || func_name_ == "__bit_and" ||
       func_name_ == "__bit_or" || func_name_ == "__bit_xor" ||
       func_name_ == "__shift_left" || func_name_ == "__shift_right" ||
@@ -5712,6 +6658,8 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       func_name_ == "sin" || func_name_ == "tan" || func_name_ == "acos" ||
       func_name_ == "asin" || func_name_ == "atan" || func_name_ == "atan2" ||
       func_name_ == "cosh" || func_name_ == "sinh" || func_name_ == "tanh" ||
+      func_name_ == "csc" || func_name_ == "sec" || func_name_ == "cot" ||
+      func_name_ == "sech" || func_name_ == "csch" || func_name_ == "coth" ||
       func_name_ == "radians" || func_name_ == "degrees" ||
       func_name_ == "pi" || func_name_ == "ieee_divide" ||
       func_name_ == "safe_divide") {
@@ -5720,6 +6668,19 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     return args_.empty() ? tinylamb::Type(TypeTag::kInvalid)
                          : args_[0]->ResultType(schema);
+  }
+  // Match the runtime value types of these builtins.
+  if (func_name_ == "rand" || func_name_ == "pi") {
+    return {TypeTag::kDouble};
+  }
+  if (func_name_ == "current_date") {
+    return {TypeTag::kDate};
+  }
+  if (func_name_.starts_with("unix_")) {
+    return {TypeTag::kBigInt};
+  }
+  if (func_name_ == "generate_series") {
+    return {TypeTag::kArray};
   }
   return {TypeTag::kVarChar};
 }
@@ -5777,7 +6738,8 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
-      func_name_ == "json_keys" || func_name_.ends_with("_array")) {
+      func_name_ == "regexp_extract_groups" || func_name_ == "json_keys" ||
+      func_name_ == "to_code_points" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "json_array_length" || func_name_ == "lax_int64" ||
@@ -5801,22 +6763,27 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       func_name_ == "repeat" || func_name_ == "reverse" ||
       func_name_ == "split_substr" || func_name_ == "byte_substr" ||
       func_name_ == "byte_reverse" || func_name_ == "code_points_to_string" ||
-      func_name_ == "code_points_to_bytes" || func_name_ == "octet_length" ||
-      func_name_ == "left" || func_name_ == "right" || func_name_ == "lpad" ||
-      func_name_ == "rpad" || func_name_ == "initcap" || func_name_ == "chr" ||
+      func_name_ == "code_points_to_bytes" || func_name_ == "left" ||
+      func_name_ == "right" || func_name_ == "lpad" || func_name_ == "rpad" ||
+      func_name_ == "initcap" || func_name_ == "chr" ||
       func_name_ == "soundex" || func_name_ == "translate" ||
-      func_name_ == "regexp_extract" || func_name_ == "regexp_replace" ||
-      func_name_.starts_with("json_") || func_name_ == "to_json_string") {
+      func_name_ == "regexp_extract" || func_name_ == "regexp_substr" ||
+      func_name_ == "regexp_replace" || func_name_.starts_with("json_") ||
+      func_name_ == "to_json_string") {
     return {TypeTag::kVarChar};
   }
 
   if (func_name_ == "length" || func_name_ == "char_length" ||
       func_name_ == "character_length" || func_name_ == "byte_length" ||
-      func_name_ == "strpos" || func_name_ == "instr" ||
-      func_name_ == "starts_with" || func_name_ == "ends_with" ||
+      func_name_ == "octet_length" || func_name_ == "bit_count" ||
+      func_name_ == "edit_distance" || func_name_ == "strpos" ||
+      func_name_ == "instr" || func_name_ == "starts_with" ||
+      func_name_ == "contains_substr" || func_name_ == "ends_with" ||
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
       func_name_ == "regexp_instr" || func_name_ == "div" ||
+      func_name_ == "array_length" || func_name_ == "farm_fingerprint" ||
+      func_name_ == "is_nan" || func_name_ == "is_inf" ||
       func_name_.starts_with("extract_") || func_name_ == "__bit_and" ||
       func_name_ == "__bit_or" || func_name_ == "__bit_xor" ||
       func_name_ == "__shift_left" || func_name_ == "__shift_right" ||
@@ -5852,6 +6819,8 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       func_name_ == "sin" || func_name_ == "tan" || func_name_ == "acos" ||
       func_name_ == "asin" || func_name_ == "atan" || func_name_ == "atan2" ||
       func_name_ == "cosh" || func_name_ == "sinh" || func_name_ == "tanh" ||
+      func_name_ == "csc" || func_name_ == "sec" || func_name_ == "cot" ||
+      func_name_ == "sech" || func_name_ == "csch" || func_name_ == "coth" ||
       func_name_ == "radians" || func_name_ == "degrees" ||
       func_name_ == "pi" || func_name_ == "ieee_divide" ||
       func_name_ == "safe_divide") {
@@ -5860,6 +6829,19 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     return args_.empty() ? tinylamb::Type(TypeTag::kInvalid)
                          : args_[0]->ResultType(left, right);
+  }
+  // Keep both ResultType overloads in sync.
+  if (func_name_ == "rand" || func_name_ == "pi") {
+    return {TypeTag::kDouble};
+  }
+  if (func_name_ == "current_date") {
+    return {TypeTag::kDate};
+  }
+  if (func_name_.starts_with("unix_")) {
+    return {TypeTag::kBigInt};
+  }
+  if (func_name_ == "generate_series") {
+    return {TypeTag::kArray};
   }
   return {TypeTag::kVarChar};
 }
@@ -5873,8 +6855,8 @@ Status FunctionCallExpression::Validate(EvaluationContext& context,
     }
   }
   // Function registration goes through the abstract context; the production
-  // implementation forwards to Database::GetOrAddFunction (improvement3.md
-  // A1).  Type check is still TODO.
+  // implementation forwards to Database::GetOrAddFunction. Type check is
+  // still TODO.
   return context.GetOrAddFunction(func_name_, static_cast<int>(args_.size()));
 }
 

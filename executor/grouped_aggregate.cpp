@@ -132,7 +132,9 @@ ValueType KeyColumnType(const NamedExpression& key, const Schema& input) {
   try {
     return ValueTypeOfTag(key.expression->ResultType(input).GetType());
   } catch (...) {
-    return ValueType::kVarChar;
+    // Use the same fallback type as ResultColumnType so a failed type
+    // resolution cannot make key and aggregate columns disagree.
+    return ValueType::kInt64;
   }
 }
 
@@ -149,13 +151,11 @@ ValueType ResultColumnType(const NamedExpression& aggregate,
     }
   }
   const auto& expression = aggregate.expression->AsAggregateExpression();
-  switch (expression.GetType()) {
-    case AggregationType::kAvg:
-      return ValueType::kDouble;
-    case AggregationType::kCount:
-      return ValueType::kInt64;
-    default:
-      break;
+  // P461/501: canonical result-kind table shared with
+  // AggregateExpression::ResultType and the pipeline lowering.
+  if (const auto kind = CanonicalAggregateResultKind(expression.GetType());
+      kind.has_value()) {
+    return *kind;
   }
   if (!expression.Child()) {
     return ValueType::kInt64;
@@ -239,10 +239,21 @@ bool SameGroup(const std::vector<SortKeyOrder>& orders, const Row& left,
 
 // ===================================================== AggregateGroupTable ===
 
-void AggregateGroupTable::AddGroup(Row key) {
-  keys_.push_back(std::move(key));
+relational_detail::AggregateAccumulator& AggregateGroupTable::StateAt(
+    size_t flat) {
+  return (*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
+}
+
+const relational_detail::AggregateAccumulator& AggregateGroupTable::StateAt(
+    size_t flat) const {
+  return (*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
+}
+
+void AggregateGroupTable::AppendGroupStates() {
   for (const AggregateExpression* aggregate : *aggregates_) {
-    states_.emplace_back(aggregate, input_schema_);
+    // nullptr aggregates keep a state slot so StateFor's flat
+    // (group * count + index) mapping holds for every index.
+    EmplaceState(aggregate, input_schema_);
   }
 }
 
@@ -256,18 +267,19 @@ StatusOr<size_t> AggregateGroupTable::FindOrCreate(
     return found->second;
   }
   const size_t group = keys_.size();
-  index_.emplace(Row(canonical_key), group);
-  keys_.emplace_back(canonical_key);
-  for (const AggregateExpression* aggregate : *aggregates_) {
-    states_.emplace_back(aggregate, input_schema_);
-  }
+  // P50: `keys_` borrows the node's key (stable across rehash) instead of
+  // holding a second Row copy.
+  const auto node = index_.emplace(Row(canonical_key), group).first;
+  keys_.push_back(&node->first);
+  AppendGroupStates();
   return group;
 }
 
 StatusOr<size_t> AggregateGroupTable::FindOrCreate(Row key) {
-  auto [iterator, inserted] = index_.emplace(key, keys_.size());
+  auto [iterator, inserted] = index_.emplace(std::move(key), keys_.size());
   if (inserted) {
-    AddGroup(std::move(key));
+    keys_.push_back(&iterator->first);
+    AppendGroupStates();
   }
   return iterator->second;
 }
@@ -330,7 +342,7 @@ Status AggregateGroupTable::Accumulate(size_t group, const Row& row) {
 }
 
 StatusOr<Row> AggregateGroupTable::Finish(size_t group) const {
-  const Row& key = keys_[group];
+  const Row& key = *keys_[group];
   std::vector<Value> values;
   values.reserve(key.values_.size() + aggregates_->size());
   for (const Value& value : key.values_) {
@@ -342,7 +354,7 @@ StatusOr<Row> AggregateGroupTable::Finish(size_t group) const {
       continue;
     }
     const relational_detail::AggregateAccumulator& state =
-        states_[(group * aggregates_->size()) + i];
+        StateAt((group * aggregates_->size()) + i);
     ASSIGN_OR_RETURN(Value, finished, state.TryFinish());
     values.push_back(std::move(finished));
   }
@@ -351,18 +363,19 @@ StatusOr<Row> AggregateGroupTable::Finish(size_t group) const {
 
 Status AggregateGroupTable::Merge(const AggregateGroupTable& other) {
   for (size_t group = 0; group < other.keys_.size(); ++group) {
-    auto [iterator, inserted] =
-        index_.emplace(other.keys_[group], keys_.size());
+    const Row& other_key = *other.keys_[group];
+    auto [iterator, inserted] = index_.emplace(other_key, keys_.size());
     if (inserted) {
-      AddGroup(other.keys_[group]);
+      keys_.push_back(&iterator->first);
+      AppendGroupStates();
     }
     const size_t target = iterator->second;
     for (size_t i = 0; i < aggregates_->size(); ++i) {
       if ((*aggregates_)[i] == nullptr) {
         continue;
       }
-      RETURN_IF_FAIL(StateFor(target, i).Merge(
-          other.states_[(group * other.aggregates_->size()) + i]));
+      RETURN_IF_FAIL(StateFor(target, i).Merge(other.StateAt(
+          (group * other.aggregates_->size()) + i)));
     }
   }
   return Status::kSuccess;
@@ -532,11 +545,11 @@ Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
     std::vector<Value> scratch;
     scratch.reserve(key_offsets_.size());
     for (const std::optional<slot_t>& offset : key_offsets_) {
-      // Key offsets resolved at construction are always engaged here; an
-      // expression without a positional form never reaches this row path.
-      assert(offset.has_value());
+      if (!offset.has_value()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "group key has no positional offset");
+      }
       scratch.push_back(
-          // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
           relational_detail::CanonicalDistinctValue(image[*offset]));
     }
     ASSIGN_OR_RETURN(size_t, group, table->FindOrCreate(scratch));
@@ -545,10 +558,14 @@ Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
         continue;
       }
       const std::optional<slot_t>& value_offset = aggregate_offsets_[i];
-      assert(value_offset.has_value());
-      const Value value =
-          // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-          aggregate_count_star_[i] ? Value(1) : image[*value_offset];
+      if (!aggregate_count_star_[i] && !value_offset.has_value()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "aggregate argument has no positional offset");
+      }
+      const Value value = aggregate_count_star_[i]
+                              ? Value(1)
+                              // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+                              : image[*value_offset];
       RETURN_IF_FAIL(table->StateFor(group, i).Add(value));
     }
   }
@@ -737,15 +754,27 @@ Status HashAggregateExecutor::BuildParallel() {
 }
 
 void HashAggregateExecutor::Dump(std::ostream& o, int indent) const {
-  o << "HashAggregate (groups=" << output_rows_.size()
-    << ", input_rows=" << input_rows_
-    << ", budget=" << options_.memory_budget_bytes << "B";
+  // T1791: groups/input_rows/spill are measured counters.  Plain EXPLAIN
+  // calls Dump before this operator has consumed anything (Explain
+  // delegates to Dump), so unconditional counters turned the plan line into
+  // a false profile of zeros -- the same contract Selection::DumpHeader
+  // enforces with `rows_seen_ > 0`.  Plan-time facts (budget, workers)
+  // always render; after any drain the full historical line is byte-equal.
+  o << "HashAggregate (";
+  const bool measured = input_rows_ > 0 || !output_rows_.empty();
+  if (measured) {
+    o << "groups=" << output_rows_.size() << ", input_rows=" << input_rows_
+      << ", ";
+  }
+  o << "budget=" << options_.memory_budget_bytes << "B";
   if (options_.worker_count > 1) {
     o << ", workers=" << options_.worker_count;
   }
-  o << ", spill=" << (spilled_ ? "partitioned" : "in-memory");
-  if (spilled_) {
-    o << ", partitions=" << spill_partitions_;
+  if (measured) {
+    o << ", spill=" << (spilled_ ? "partitioned" : "in-memory");
+    if (spilled_) {
+      o << ", partitions=" << spill_partitions_;
+    }
   }
   o << ")\n";
   child_->Dump(o, indent + 2);

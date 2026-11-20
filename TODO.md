@@ -16,6 +16,69 @@
 
 ---
 
+## 実装進捗（2026-11-13、ClickBench 1/10 着手）
+
+- S0の最初の測定を `benchmark/wasm_spike/` に追加。Wasmtime 50.0.1、
+  shared memory64、4 GiB超の同一入力、3カーネル、1/2/8 workers、SIMD128対AVX2。
+  probe＋集約の8 workersはnative 6.979 ms / WASM 9.985 msで、1.3倍以内のゲートは未達。
+  [ADR 0002](docs/adr/0002-wasm-fused-execution.md) に結果・制限・残る検証を書く。
+  S0全体、S1〜S10は未完了。生成物は共通C++からのコンパイルで、手書きWATの評価は残る。
+- 公式hits_0〜9の実1000万行を新規ロードし、同じ入力のDuckDB・ClickHouseを用意。
+  変更前DuckDB比較は43/43一致、tinylamb 10598.984 ms / DuckDB 1546.860 ms、7/43勝利。
+  この値はwarmup 1＋3回の診断値で、測定中に別CPU群でビルド・小規模テストを実行している。
+- WASMと独立な仕事量削減: TopNが必要なキー・フィルタ列だけをキャッシュし、
+  上位候補だけsnapshotを通して復元する。通常scanへのfallbackでは全出力列を検証する。
+  全面刷新やDuckDB/ClickHouseへの性能勝利を達成したという意味ではない。
+- 最終1000万行・8スレッド・warmup 1＋7回: 両比較で43/43一致。
+  Tinylamb 5664.964 / DuckDB 1521.916 ms（5/43勝）、
+  Tinylamb 5802.035 / ClickHouse 1042.593 ms（9/43勝）。目標未達。
+  `build/benchmarks/clickbench-tenth-20261113/report-final/` に図と全クエリ結果を保存。
+  全体ctest 3983件で失敗0・既存skip 3、ASan/UBSan Executor 231件、
+  SQL oracle 1024シード、ハーネス18件、layering成功。
+- 続く並列プロファイルで、Q33の部分集約後の直列再ハッシュが約1325 msを
+  占めると判明。数値キーを先に分配し、担当ごとの集約＋TopNへ変更した。
+  複合辞書キーの直列再ハッシュも除去し、辞書述語の準備を並列化した。
+  狭い列キャッシュによる整数等値の不在判定を通常scanにも接続した。
+  全43クエリ合計は1スレッド11320.884→7618.326 ms、
+  8スレッド5585.338→2796.160 ms。変更前は3回、変更後は7回の中央値。
+  Q33は8スレッド2132.517→120.769 ms（17.66倍）、Q32は9.71倍。
+  変更後の全1/2/4/8スレッドで43/43一致。8スレッドの比較先は
+  DuckDB 1521.614 ms（7/43勝）、別実行ではTinylamb 2790.978 /
+  ClickHouse 1045.136 ms（11/43勝）。圧勝・全クエリ勝利は未達。
+  `build/benchmarks/clickbench-parallel-20261113/report/` にスケーリング・
+  全43件の変更前後・perfの根拠、`report-comparison/` に比較先との図を保存。
+  Q29の一般的な文字列グループ化は約1.1秒のまま。WASM未統合、S0〜S10の
+  完了を意味しない。今回のctestは3987件で失敗0・既存skip 3、
+  ASan/UBSanはExecutor 232件＋関連回帰20件、TSanは対象5件、
+  SQL oracleは1024シード成功。Python 18件とlayeringも成功。
+  コマンド・時間・ログは同ディレクトリの `validation-summary.json` に記録。
+
+- LLVM生成IRへホストCPU対応O3を追加し、IR・機械語の保存と最適化無効時のA/Bを整備。
+  個別カーネルはAOTとほぼ同速。filter→projection→sumの別ループは未融合で、
+  1000万要素の診断はsplit JIT/native 6.790 ms / fused AOT 0.763 ms。
+  この8.90倍は診断用AOTループの差であり、融合SQL JITの実装成果ではない。
+- 辞書変換と部分集約の融合、DISTINCTの並列マージ、担当別TopN、派生キーの
+  並列評価、統計カウンタのfalse sharing解消を実施。8物理コア・warmup 1＋7回で
+  全43件一致、Tinylamb 915.571 / ClickHouse 1043.667 ms（合計1.140倍、16/43勝）。
+  直前の完成実装2790.978 msから約3.05倍。全クエリ勝利・圧勝は未達。
+  初回の列ストア・辞書頻度・一意性メタデータ構築は測定外、SQL結果キャッシュなし。
+  根拠は[計測記録](docs/jit_profile.md)、生データは
+  `build/benchmarks/clickbench-jit-20261113/candidate7-clickhouse-8t/`。
+  S0〜S10の全面刷新完了を意味しない。
+
+- 追加最適化: 選択的COUNTを担当分配へ切り替え、不要な配列初期化を除去。
+  整数辞書にも厳密な頻度・初出位置を保持し、COUNT DISTINCTへ再利用した。
+  8コア主測定はTinylamb 742.468 / ClickHouse 1038.330 ms、
+  反転再測定は740.689 / 1034.845 ms。ともに約1.40倍で全43件一致。
+  個別21/43勝（反転22/43勝）、主測定の速度比幾何平均は1.454倍。
+  同じバイナリのDuckDB比較は8コア735.071 / 1501.914 ms、
+  1コア3272.270 / 8621.261 msで、いずれも全43件一致。
+  生データは `build/benchmarks/clickbench-jit-20261113/candidate9-*/`、
+  最終検証は同ディレクトリの `final-validation.json`。SQL全体の融合JIT/WASMは未実装。
+
+  最終検証はctest 3,991件で失敗0・既存skip 3、SQL oracle 1,024反復成功。
+  ASan/UBSan 266件、TSan 5件、Python 18件、layeringも成功（2026-11-14 JST）。
+
 ## 1. 現状（2026-11-13 にコードを読んだ結果）
 
 | 領域 | 現状 | 刷新での扱い |
@@ -207,7 +270,7 @@ Tier 1 の differential oracle。演算子本体は既存の `DataChunk` カー�
 
    | 置き場 | 内容 | 層 |
    |---|---|---|
-   | `common/wasm/` | WASM バイナリ書き出し（`ModuleBuilder`）、エンジンの薄いラッパ | common |
+   | `common/wasm/` | WASM バイナリ書き出し（`ModuleBuilder`）、エンジンの薄いラッパー | common |
    | `expression/wasm_lowering.*` | bytecode → WASM（`jit.cpp` の後継） | expression |
    | `executor/detail/pipeline/` | Pipeline IR、`PipelineBuilder`、EXPLAIN | relational |
    | `executor/codegen/` | 演算子テンプレート、インライナ、特殊化、ループ版分け | executor |
@@ -334,6 +397,87 @@ void HashJoinPlan::EmitPipelines(PipelineBuilder& b) const {
 **受け入れ**: `TINYLAMB_EXEC_ENGINE=pipeline TINYLAMB_EXEC_TIER=0` で ctest 全件と TPC-DS 99/99 一致。
 SF=1 合計の 2 → 8 スレッドの伸びが 1.6 倍以上（旧 P1 のゲート）。合計時間が `legacy` より悪化しない。
 `legacy_source_ms` の比率をクエリごとに報告できる。
+
+### S2.1 — JOIN の push 化を先に検証する（2026-11-14 の追加監査）
+
+詳細・再測定・DuckDB の optimizer 切り替え実験は
+[`docs/jit_profile.md`](docs/jit_profile.md#2026-11-14-join-push-audit) に記録。
+未チェックの項目は未実装。既存の融合経路やマイクロベンチを完了扱いにしない。
+
+- [x] 最初の接続として、既存の raw grouped fusion の出力を最大 1024 行の借用バッチで
+      数値 HashBuild / LEFT probe 列へ直接渡す経路を実装した。
+      `GroupedOutputSink` / `GroupedNumericHash` と `TryPushGroupedCteJoins`。
+      単一利用の grouped CTE / derived table、2–4 入力、signed INT64 等価キー、
+      数値 payload、限定した全域 WHERE が対象。右側は所有権付き数値 tuple、
+      左側は全件保持せずに probe し、WHERE 通過行を既存の finish 処理へ渡す。
+      重複の全組み合わせ・NULL 補完・メモリ予約拒否時の旧経路を維持する。
+      `EXPLAIN ANALYZE` の `pushed_group_rows` / `pushed_group_joins` で使用を確認できる。
+      **バッチはまだ `Value` cells を使い、scan / anti / grouping 入力も既存経路。
+      Pipeline IR / scheduler / typed chunk view の完成ではない。**
+
+次の接続点は **大きい側を読み始める前**。一般の
+`SharedBuildParallelHashJoin` は両入力を `RowAt` で全件保持してから build 側を選ぶため、
+この方式を新経路へ流用しない。Q78 の前半では date 側と returns 側を先に構築し、
+fact の scan → date filter/probe → anti probe → group update をつなぐ。
+既存の `DeferredLSTableProbe` の scan 内 probe は接続候補だが、
+グループごとに fact の代表行を丸ごと保持する処理も同時に外す必要がある。
+必要な group key / 出力列だけを所有し、借用 scan バッファの寿命を越えるポインタを残さない。
+
+runtime filter は既に一部の通常 JOIN から scan へ渡せるが、単一 INT64/DATE キーが中心。
+Q78 の複合キー Bloom は `ReduceUnmatchedOuterProbes` の別処理で、集約結果の実体化後に働く。
+`GroupedNumericHash` の確定キーから scan 用の複合キー Bloom を構築する経路を追加した。
+さらに preserved fact のキー列だけを先読みし、右側の scan にも逆向きに伝播する。
+対象は単一利用 grouped LEFT-chain の直接 group key。集約・述語が例外を隠さず、
+フィルタが group 全体を保つことを実際の immutable scan bounds で証明できる場合のみ。
+`transfer_seed_rows` / `transfer_scan_tested` / `transfer_scan_rejected` で先読みと削減を分けて計測。
+任意の JOIN グラフを巡回する一般的な predicate transfer planner は未実装。
+INNER/SEMI の Bloom 不一致は除外、LEFT は NULL 補完、ANTI は結果へ残すという違いを守る。
+複数 nullable 側の domain の和集合で捨てる場合は、全不一致を拒否する WHERE の証明が必要。
+GROUP BY より前へ伝播させる場合は group の完全性に加え、捨てる group の SUM overflow 等を
+隠さない証明も必要であり、出力段の Bloom をそのまま scan に移すだけでは正しくない。
+
+当初の監査では Q78 は 1 / 8 コアで Tinylamb 387.442 / 208.636 ms、DuckDB 112.522 / 33.650 ms。
+こちらは終盤の LEFT JOIN 入力を 492,986 → 14,010 行に減らしても遅い。
+DuckDB に CTE を実体化させても大差なく、ANTI JOIN をこちらと同じ向きにすると
+むしろ DuckDB が速くなる。この結果から、実体化するデータ表現とパイプラインの境界を変える方針で上の接続を進めた。
+WASM 選定・コンパイルキャッシュ完成をこの実験の依存条件にしない。
+
+- [ ] S5 の `HashBuildSink` / `ProbeOp` / `GroupAggSink` の **native Tier 0** を
+      S2 へ先行して実装する。`Row` を渡す callback 化だけでは合格にしない。
+      worker は 1 モーセルの scan → filter → probe 列 → sink を同じタスクで進める。
+      演算子ごとのスレッド・全件キュー・barrier を置かない。
+- [ ] `DataChunk` に参照と selection を保持する入力 view を用意する。
+      probe 側列は view、build 側の必要列だけ gather し、結果の全行を `Row` 化しない。
+      チャンク寿命・文字列所有者・非同期再開時の pin を契約に含める。
+      build 側はキー＋必要 payload の固定幅 tuple / 可変長 arena を保持する。
+- [ ] `HashBuild` をワーカー別 intake → combine → finalize とし、依存する probe は
+      finalize 後に解禁する。大きな finalize は分割並列化し、小さい表のタスク分割費用も測る。
+      build 側を選ぶために両入力を先に全件 `Row` 化する現在の方式を持ち込まない。
+- [ ] Q78 の 3 本の scan → date probe → anti probe → aggregate と、
+      aggregate scan → LEFT probe → LEFT probe → filter → TopN を実経路へ接続する。
+      build 側 aggregate scan はそのまま次の HashBuildSink へ送る。
+      単一利用 CTE は途中 `Relation` を作らず接続、共有 CTE は所有権付き chunk collection。
+      集約完了という意味上必要な barrier は残す。
+- [ ] `RelationalExecutor` 内の Q78 全体が旧 `ExecuteQuery` へ戻っていないことを確認する。
+      `Plan` の物理実装は `executor/relational_factory.cpp` 側に置き、layering allowlist を増やさない。
+- [ ] 1 対多の出力には再開 cursor を持つ。チャンクが満ちたら下流へ渡し、
+      同じ probe 行の残りを再開する。入力サイズや fanout に比例する出力 vector を持たない。
+- [ ] Q51 は次段階。FULL JOIN の matched 状態を build 行単位で持ち、全 probe 完了後に
+      未一致 build 行を source として流す。window は分割・sort が必要な別 sink / source とし、
+      JOIN と一緒に無条件で streaming 化できるとは扱わない。
+- [ ] `EXPLAIN PIPELINE` に source / operator / sink、build 依存、DOP、
+      materialization の理由を表示。ANALYZE では行数、copy/gather bytes、`Row` boxing 数、
+      retained bytes、phase wall / task CPU、待ち時間、legacy fallback を別々に報告する。
+      WASM の WAT / native assembly 表示は、この IR / module ID に後から結び付ける。
+
+**最初の合格条件:** Q78 の native Tier 0 を 1 / 8 コア・warmup 1＋7 回で旧経路と比較し、
+全回答を照合する。対象 pipeline 内の非 spill `Row` boxing は 0、probe 出力の保持量は
+worker 数×chunk 容量に制限する（ハッシュ表・集約状態をこの上限から除くが別途計上する）。
+集約結果の一括 `Relation` と JOIN 出力全件 vector がなくなったことをカウンタで示す。
+速度目標はまず現行約 209 ms の半分以下、次に DuckDB 標準約 34–36 ms を下回ること。
+これらは目標であり達成予測ではない。最適化を切り替えた DuckDB 約 24 ms も併記する。
+NULL / duplicate / residual / empty build / cancellation / spill / allocation error、
+符号・型・collation の意味論、oracle と sanitizer を通し、最後に TPC-DS 99 問を再測定する。
 
 ### S3 — WASM 実行基盤
 
@@ -620,9 +764,9 @@ S2 は WASM を一切含まないが、スケジューラとシンク契約と�
 2026-11-12。細かい定数いじりの前に、JIT / SIMD / マルチコアを活かし切る
 実行系の構造を直す。旧ルート `TODO.md`（製品比較チェックリスト等）は git
 履歴と [`BenchmarkHistory.md`](BenchmarkHistory.md) /
-[`docs/`](docs/) レポートに残る。細部の演算子欠落リストは引き続き
-[`docs/executor_todo.md`](docs/executor_todo.md) /
-[`docs/todo.md`](docs/todo.md)。**本ファイルが「今やる構造改革」の正本。**
+[`docs/`](docs/) レポートに残る（旧 `docs/todo.md` / `docs/executor_todo.md` は削除・本ファイルと [`ooca-v2.md`](ooca-v2.md) に統合済み）。**本ファイルが構造改革・パイプライン化計画の正本。**
+
+> **2026-11-17 補足**: パイプライン低下と OOC シンク群（[`executor/pipeline_lowering.hpp`](executor/pipeline_lowering.hpp)、[`query/grouped_pipeline_lowering.hpp`](query/grouped_pipeline_lowering.hpp)、[`executor/detail/pipeline/`](executor/detail/pipeline/)）が実装され、現在の `SqlEngine` は既定でパイプライン経路（`TINYLAMB_EXEC_ENGINE != legacy`）を実行する。下表の S2/P3/P4 の一部項目および S3 以降の WASM 関連チェックリストは策定時（2026-11-13〜14）の作業分割・目標履歴として保持している。
 
 意味論の契約は変えない: AST `Expression::Evaluate` が正本、bytecode が
 バッチ IR、JIT はその compiler
@@ -714,7 +858,7 @@ SF=1・8コアで Tinylamb が時間を要した上位（両順序中央値の�
 | 集約 | 部分表 → 直列寄り merge；ROLLUP は grouping-set 展開で再スキャン相当 | Q67 仕事量 4.65× |
 | JIT | INT64 比較 / 線形投影 / SUM のみ、昇格 ~2000万行（[`docs/jit_profile.md`](docs/jit_profile.md)）。並列 agg は JIT 非対応 | SF=1 ではほぼ効かない |
 | SIMD | 比較カーネル中心（[`executor/simd_comparison.hpp`](executor/simd_comparison.hpp)） | hash / 加算 / CAST はスカラー寄り |
-| バッチ契約 | `DataChunk` と行経路が併存（[`docs/executor_todo.md`](docs/executor_todo.md) P3） | カーネル横断最適化が難しい |
+| バッチ契約 | `DataChunk` と行経路が併存 | カーネル横断最適化が難しい |
 | 結合削減 | `PreferDynamicFilter` / semi-reduction はあるが、scan 貫通と anti 並列が薄い | Q72/Q78 |
 
 ```mermaid
@@ -867,8 +1011,7 @@ EXPLAIN ANALYZE に `execute_ms` / `boundary_ms` / `build_input_ms` /
 [`executor/relational_factory.cpp`](executor/relational_factory.cpp)、
 [`executor/parallel_scan.cpp`](executor/parallel_scan.cpp)、
 [`executor/parallel_hash_join.cpp`](executor/parallel_hash_join.cpp)、
-[`executor/parallel_aggregation.cpp`](executor/parallel_aggregation.cpp)、
-[`docs/executor_todo.md`](docs/executor_todo.md) P3（morsel DOP / Exchange）。
+[`executor/parallel_aggregation.cpp`](executor/parallel_aggregation.cpp)。
 
 - [ ] クエリ単位の **共有 worker プール**（演算子ごとの都度 thread 起動をやめる）
 - [ ] 同一予算の下で scan / hash-join probe / hash-agg が morsel を奪い合わずに進む
@@ -934,8 +1077,7 @@ scan 側 runtime filter 受け口。
 
 着手点: [`executor/data_chunk.hpp`](executor/data_chunk.hpp)、
 [`executor/selection_vector.hpp`](executor/selection_vector.hpp)、
-[`executor/executor_base.hpp`](executor/executor_base.hpp)、
-[`docs/todo.md`](docs/todo.md)「全 operator の DataChunk 入出力」。
+[`executor/executor_base.hpp`](executor/executor_base.hpp)（「全 operator の DataChunk 入出力」方針）。
 
 - [ ] 演算子内部は **DataChunk のみ**；`Next(Row*)` は外側 sink アダプタに限定
       （[`executor/AGENTS.md`](executor/AGENTS.md) の方針を負債箇所まで完遂）
@@ -1018,5 +1160,5 @@ P4 後の方が大きい。
 - 式: [`docs/expression_evaluation.md`](docs/expression_evaluation.md)、
   [`docs/jit_profile.md`](docs/jit_profile.md)
 - 実行器: [`executor/AGENTS.md`](executor/AGENTS.md)、
-  [`docs/executor_todo.md`](docs/executor_todo.md)
+  [`docs/executor/00-index.md`](docs/executor/00-index.md)
 - 全体層: [`ARCHITECTURE.md`](ARCHITECTURE.md)、[`AGENTS.md`](AGENTS.md)

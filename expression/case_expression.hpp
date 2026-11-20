@@ -34,7 +34,7 @@ class CaseExpression : public ExpressionBase {
       : when_clauses_(std::move(when_clauses)),
         else_clause_(std::move(else_clause)),
         from_if_(from_if) {}
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kCaseExp; }
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kCaseExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,

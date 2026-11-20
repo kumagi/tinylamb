@@ -1,5 +1,8 @@
 # tinylamb 分散アーキテクチャ設計(改訂版)
 
+> **ステータス: 未実装の将来設計 (design archive)** — 現行のシングルノード版には本計画の分散/Raft/シャード構成コードは含まれません。
+> §0 の「確認済みの既存資産」は 2026-08 時点の記述であり、現行コードではページ/ストレージ・WAL・実行エンジンがさらに更新されています。
+
 この文書は分散版 tinylamb の**親設計書**である。実装は複数のエージェントが並行して
 行うことを想定しており、用語・不変条件・プロトコル手順を厳密に記述する。
 本書だけでも全体像と不変条件は把握できるが、次の 3 冊の詳細仕様を子文書として持つ:
@@ -20,12 +23,13 @@
 - 既存の単一ノード tinylamb(ARIES 風 WAL、Strict 2PL + MVCC、epoll 製 PostgreSQL
   ワイヤサーバ)を土台にする。**ネットワーク関連のコードは現在ワイヤサーバしか
   存在しない**。配送・制御の通信基盤は本計画で新設する。
-- 確認済みの既存資産(2026-08 時点、ファイル:行は現行コード対応):
-  - `recovery/logger.hpp:33` — 単一ログファイルへの `Logger`。`AddLog`(LSN は
-    ファイル先頭からのバイトオフセット)、`WaitForDurable(lsn)`(group commit 待ち)、
+- 確認済みの既存資産(2026-08 時点の設計アンカー; 現行コードは更新済み):
+  - `recovery/logger.hpp` — セグメント系列 `<db>.log.<index>` への `Logger`。
+    `AddLog`(LSN は WAL 全体のバイトオフセット、セグメント先頭ではない)、
+    `WaitForDurable(lsn)`(group commit 待ち)、
     `DurableLSN()/BufferedLSN()`。fsync は最大 10ms バッチ。
-  - `recovery/log_record.hpp:31` — `LogType` 32 種。txn 毎の `prev_lsn` 逆連鎖。
-    レコードは `kWalRecordVersion`(:49)と CRC32C チェックサム・長さ枠を持つ
+  - `recovery/log_record.hpp` — `LogType` 17 種。txn 毎の `prev_lsn` 逆連鎖。
+    レコードは `kCurrentVersion`(=7)と CRC32C チェックサム・長さ枠を持つ
     (D9、docs/wal_format.md 参照)。複製では §5.2 のヘッダ拡張を再利用する。
   - `recovery/recovery_manager.hpp` — `RecoverFrom(checkpoint_lsn, tm)` /
     `SinglePageRecovery`
@@ -37,8 +41,9 @@
   - `transaction/transaction_manager.cpp:57` — `PreCommit` は
     ①`CommitVersions`(MVCC 可視化、:59)→ ②kCommit 記録(:62)→ ③`WaitForDurable`
     の順。**可視化がログ追記より前**である点は §5.4 で再構成する。
-    また `Abort` は終端に `kCommit` **型**のレコードを書く(:97)。undo は online CLR
-    完了済みのため物理的には無害だが、複製・回復の意味論で明示的に扱う(§5.4)。
+    また `Abort` は終端に `kAbort` **型**のレコードを書く(transaction_manager.cpp:748、
+    wal_format.md:66)。undo は online CLR 完了済みのため物理的には無害だが、
+    複製・回復の意味論で明示的に扱う(§5.4)。
   - `transaction/transaction_manager.cpp:184` — snapshot 取得(Begin)と
     commit_timestamp 出版(CommitVersions)は同一 `transaction_table_lock` で
     原子化。この規律は §5.6 で保持する。
@@ -48,9 +53,9 @@
     コミットの durability 待ちは epoll スレッド上で同期(`WaitForDurable`)。
     seal 待ち化には callback 完了への改修が要る(§9)。
 - コンパイル規約・スタイルはリポジトリ従来通り(Apache 2.0 ヘッダ、clang-format、
-  コメント最小限)。CMake は `add_simple_test`(CMakeLists.txt:382)と
+  コメント最小限)。CMake は `add_simple_test`(CMakeLists.txt:876)と
   `tinylamb::*` エイリアスの慣例に従う。fuzzer ターゲットは
-  `TINYLAMB_ENABLE_FUZZ=ON`(CMakeLists.txt:772)でビルドできる(§12)。
+  `TINYLAMB_ENABLE_FUZZ=ON`(CMakeLists.txt:20)でビルドできる(§12)。
 
 ## 1. 設計の核心(要約)
 
@@ -278,13 +283,13 @@ void FinalizeCommit(Transaction&);  // seal 待ち解放後に呼ぶ:
 - **ack 済みコミットの消失は許されない**(I-2)。crash 時に sealed 未満だった txn は
   ack 前なのでクライアントには不定(rollback 相当)と見なせる。
 - 読み取り専用 txn は seal 待ち不要。
-- **Abort の扱い**: Abort(transaction_manager.cpp:75-100)は online CLR で物理
-  undo した後、終端として `kCommit` **型**のレコードを書く(現行の性質)。
+- **Abort の扱い**: Abort は online CLR で物理 undo した後、終端として
+  `kAbort` **型**のレコードを書く(transaction_manager.cpp:748、現行の性質)。
   分散版でもこの形式を維持する(フォーマット変更を避ける)。abort のレコード群は
   seal を待たず複製される(best effort)。あるエポック境界で未 seal 末尾が破棄
   されても、「その位置でクラッシュした」状態と等しいため、既存の ARIES 回復が
-  そのまま正しさを担う(§7)。回復側は「kCommit 型終端 = 物理 undo 済みの
-  確定」として扱う(現行と同一)。
+  そのまま正しさを担う(§7)。回復側は「kCommit 型終端 = 確定コミット」、
+  「kAbort 型終端 = 物理 undo 済みの abort」として区別して扱う(現行と同一)。
 - レイテンシ見積: 平均 epoch 間隔/2 + seal RTT。既定 5ms 間隔なら p50 ~3ms。
 
 ### 5.5 レプリケーション(shipper/receiver)
@@ -386,7 +391,7 @@ Analysis:
   (b) checkpoint レコード(kBeginCheckpoint/kEndCheckpoint)から DPT/ATT 復元
   (c) watermark 超過のレコード(unsealed tail)は無視リストに入れる
   (d) ホームストリームの kCommit 型終端から committed 集合を構成
-      (abort の終端も kCommit 型であるため物理状態は同一、§5.4)
+      (abort の終端は kAbort 型で、committed 集合には入らない、§5.4)
 REDO:
   epoch 昇順に、各ストリームの watermark までのレコードを適用。
   同一 epoch 内でのストリーム間順序は不要(ページ所有権分割により同一ページを
@@ -399,8 +404,9 @@ UNDO:
 - 追加不変条件 **I-9** の検証アサートを REDO に置く。
 - 「エポック粒度の末尾破棄」は「そのバイト位置でのクラッシュ」と等価である。
   既存 ARIES は任意ログ位置のクラッシュを扱うため、新たな回復論理は不要である。
-- Phase 0 で **master record(`<dbname>.last_checkpoint`)を読んで走査開始点を
-  短縮する修正**を含める(現状は常に 0 から。WAL 無限増大の対処の前提、§8)。
+- Phase 0 では、現行の replay anchor (`recovery_manager.cpp` の
+  `scan_start = max(anchor_lsn, log_start)`) を分散版の checkpoint にも
+  接続する。旧 `.last_checkpoint` master record は退役済みで新規実装ではない。
 
 ## 8. チェックポイントと WAL サイズ
 
@@ -409,9 +415,10 @@ UNDO:
   追加する(現行 DPT は `pair<page_id_t, lsn_t>`)。
 - checkpoint 中も書き込みは止めない(既存設計)。fuzzy checkpoint の境界は
   kBeginCheckpoint/kEndCheckpoint レコードで従来通り決まる。
-- **現状 WAL 切り詰めは存在しない**(recovery が全走査するため切り詰められない)。
-  Phase 0 の master record 修正の後、Phase 5 で「checkpoint LSN までの切り詰め」
-  を導入する。それまで base backup は「WAL 全量コピー + 冪等 REDO」で成立する
+- 現行版には `Logger::RecycleUpTo()` によるセグメント・リサイクルが既に存在し、
+  checkpoint が replay anchor 以下のセグメントを回収する。Phase 5 ではこれを
+  分散 epoch の sealed 境界へ接続する(新規の「切り詰め」機構ではない)。
+  それまで base backup は「保持 WAL コピー + 冪等 REDO」で成立する
   (`distributed_migration.md` §M3 の根拠)。
 
 ## 9. 既存コードへの変更指示

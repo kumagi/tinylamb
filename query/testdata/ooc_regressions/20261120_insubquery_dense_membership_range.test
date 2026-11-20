@@ -1,0 +1,14 @@
+-- sql_ooc_fuzzer regression
+-- FlatIntSet::ContainsAnyInRange (dense mode) answered false for ranges
+-- wider than 8 bitmap words, so the IN-subquery probe scan skipped whole
+-- LSTable blocks (seed 14, 91 rows expected, 73 returned).
+-- seed: 14
+-- profile: pool=131072 columnar=1048576 opmem=0 spill=0 temp=0 route=1
+create t1 1 7 1 2 11 1
+create t2 2 137 1 7 11 1
+ins_bulk t1 1 5078 555
+ins_bulk t2 1 71 786
+ins_bulk t2 634 897 308
+sweep mem 8 :: upd t2 range 234 335 4 1 vadd 14 0 padapp 0 0
+reopen
+q ord=0 heavy=0 take=-1 nv=1 vs=370850632 ex=1 snap=0 :: SELECT a.k AS c1, a.v AS c2, a.t AS c3 FROM t2 a WHERE a.k IN (SELECT b.k FROM t1 b WHERE MOD(b.k, 3) = 0) AND MOD(a.k, 9) = 6

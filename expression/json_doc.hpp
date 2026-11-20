@@ -59,12 +59,22 @@ struct JVal {
       case kBool:
         return b ? "true" : "false";
       case kNum: {
+        // GoogleSQL keeps the document's original numeric token (up to 76
+        // significant digits). Re-rendering through `double` would round it
+        // and can even overflow INT64 (9223372036854775807 -> 9.22e18), so
+        // prefer the preserved spelling whenever we have one.
+        if (!raw.empty()) {
+          return std::string(raw);
+        }
         if (!std::isfinite(num)) {
           // JSON has no spelling for +-inf; keep the document's own text
           // (e.g. 1e999) rather than inventing a value.
           return raw.empty() ? std::string("null") : std::string(raw);
         }
         if (std::floor(num) == num && std::abs(num) < 1e15) {
+          if (num == 0.0 && std::signbit(num)) {
+            return std::string("-0");  // NOLINT(modernize-return-braced-init-list)
+          }
           return std::to_string(static_cast<int64_t>(num));
         }
         // Shortest round-trip form: std::to_string's fixed six decimals
@@ -217,7 +227,12 @@ inline JVal ParseJsonSimple(std::string_view& s, size_t depth) {
   JVal v;
   // Bound recursion: a hostile nest of '[' or '{' would otherwise blow the
   // stack (Bug 68, mirrored in expression_eval.cpp's parse_j).
-  constexpr size_t kMaxJsonDepth = 512;
+  // T2407: the strict validator (json_text.hpp kMaxDepth) documents its
+  // bound as "shallow enough that the per-level frame cannot exhaust an
+  // 8 MiB stack" at 256; parsing 512 here let the lenient parser recurse
+  // twice as deep as the budget the sibling component proved safe -- the
+  // same input now ends at the same level everywhere.
+  constexpr size_t kMaxJsonDepth = 256;
   if (depth > kMaxJsonDepth) {
     return v;
   }
@@ -534,9 +549,14 @@ inline OpStatus ResolveMutationTarget(JVal& root,
         if (!create_intermediates) {
           return OpStatus::kMissing;
         }
-        // Create the missing intermediate as an empty object and descend.
-        cur->obj.emplace_back(segment.key,
-                              std::make_shared<JVal>(JVal{.type = JVal::kObj}));
+        // Create the missing intermediate with the kind the next segment
+        // needs: an array index requires an array parent, not an object.
+        const bool next_is_index =
+            (i + 1 < segments.size()) && segments[i + 1].is_index;
+        cur->obj.emplace_back(
+            segment.key,
+            std::make_shared<JVal>(
+                JVal{.type = next_is_index ? JVal::kArr : JVal::kObj}));
         cur = cur->obj.back().second.get();
         *parent = cur;
         *slot = nullptr;
@@ -739,7 +759,7 @@ inline std::optional<bool> ParseBoolText(std::string_view text) {
 }  // namespace lax
 
 // LAX_INT64: numbers truncate toward zero, numeric strings parse, booleans
-// become 1/0, everything else (including unparseable input) yields NULL.
+// become 1/0, everything else (including unparsable input) yields NULL.
 inline Value LaxToInt64(const JVal& v) {
   switch (v.type) {
     case JVal::kNum: {
@@ -994,9 +1014,11 @@ inline StatusOr<Value> Evaluate(std::string_view func_name,
         case OpStatus::kOutOfBounds:
           return invalid_argument("JSON array index out of bounds");
         case OpStatus::kExists:
-          return invalid_argument("JSON path already exists");
         case OpStatus::kMissing:
-          return invalid_argument("JSON path does not exist");
+          // GoogleSQL: JSON_INSERT on an existing path and JSON_REPLACE on a
+          // missing path are no-ops (the value is returned unchanged), not
+          // errors. Continue with the remaining path/value pairs.
+          break;
       }
     }
     return Value(root->canonical());

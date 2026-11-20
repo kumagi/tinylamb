@@ -57,6 +57,12 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     // or RHS of a binary DOUBLE expression.
     size_t trailing_column{0};
     BinaryOperation binary_op{BinaryOperation::kMultiply};
+    // T3950: schema slot of a kColumnValue child, precomputed for aggregates
+    // routed to the generic path.  The generic loop used to call
+    // input_schema_.Offset() per row per aggregate -- O(rows x columns x
+    // name length) for a loop invariant.  -1 when the child is not a plain
+    // column reference.
+    int generic_column{-1};
   };
 
   // Partial states are default-built, moved between shards, and merged by

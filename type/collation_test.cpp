@@ -205,6 +205,28 @@ TEST(CollationTest, CompareWithCollationIsATotalOrder) {
       EXPECT_EQ(ab == 0, CompareWithCollation(b, a) == 0);
     }
   }
+  // Total order also requires transitivity -- within one collation.  The
+  // collation is resolved per pair, so a set that mixes a case-insensitive
+  // value with binary ones is not a single ordering domain ("B" == ci "b"
+  // and ci "b" > "a" while "B" < "a"); SQL never compares such a set under
+  // one ORDER BY key, so only the binary-collation values are chained here.
+  std::vector<Value> binary_values;
+  for (const Value& v : values) {
+    if (CollationOf(v) != Collation::kCaseInsensitive) {
+      binary_values.push_back(v);
+    }
+  }
+  for (const Value& a : binary_values) {
+    for (const Value& b : binary_values) {
+      if (CompareWithCollation(a, b) > 0) { continue;
+}
+      for (const Value& c : binary_values) {
+        if (CompareWithCollation(b, c) > 0) { continue;
+}
+        EXPECT_LE(CompareWithCollation(a, c), 0);
+      }
+    }
+  }
 }
 
 TEST(CollationTest, EqualUnderCollationKeepsValueEqualitySemantics) {

@@ -61,6 +61,11 @@ std::vector<std::vector<uint8_t>> MakeRowCodecSeeds() {
   for (uint8_t seed_byte = 0; seed_byte < 16; ++seed_byte) {
     for (uint8_t mode = 0; mode < 4; ++mode) {
       for (const auto& payload : payloads) {
+        // A 2-byte {seed, mode=0} input hits no fuzzer branch at all;
+        // skip it so the corpus only contains meaningful cases.
+        if (mode == 0 && payload.empty()) {
+          continue;
+        }
         std::vector<uint8_t> seed{seed_byte, mode};
         seed.insert(seed.end(), payload.begin(), payload.end());
         seeds.push_back(std::move(seed));
@@ -134,7 +139,12 @@ TEST(PaxStorageFuzzerTest, LsmMergeSeeds) {
   for (int nruns = 1; nruns <= 4; ++nruns) {
     for (int variant = 0; variant < 6; ++variant) {
       std::vector<uint8_t> seed;
-      seed.push_back(static_cast<uint8_t>(nruns - 1));
+      // T4271: the fuzzer reads the 0x10 bit of data[0] as
+      // "reverse-run-merge path"; nruns-1 (0..3) never set it, so the
+      // deterministic corpus never exercised that path. Alternate it by
+      // variant (the reverse of one run is a no-op, keep those plain).
+      seed.push_back(
+          static_cast<uint8_t>((nruns - 1) | ((variant & 1) ? 0x10 : 0)));  // NOLINT(readability-implicit-bool-conversion)
       seed.push_back(static_cast<uint8_t>(variant));
       for (int r = 0; r < nruns; ++r) {
         const int n_keys = 1 + static_cast<int>(rng.Below(16));
@@ -210,9 +220,9 @@ TEST(PaxStorageFuzzerTest, ChunkFooterSeeds) {
         std::vector<uint8_t> seed;
         seed.push_back(shape);
         seed.push_back(target);
-        seed.push_back(static_cast<uint8_t>(
-            (static_cast<uint32_t>(resign) & 0x1U) |
-            ((static_cast<uint32_t>(shape) & 0x3U) << 1)));
+        seed.push_back(
+            static_cast<uint8_t>((static_cast<uint32_t>(resign) & 0x1U) |
+                                 ((static_cast<uint32_t>(shape) & 0x3U) << 1)));
         seed.push_back(static_cast<uint8_t>(1U + rng.Below(6)));
         for (int k = 0; k < 4; ++k) {
           const uint32_t roll = rng.Next();
@@ -230,6 +240,73 @@ TEST(PaxStorageFuzzerTest, ChunkFooterSeeds) {
   }
 }
 
+// P340: when the kPostings fold failed to parse, control fell into the
+// generic per-row loop, which cannot decode the self-length-less Rice
+// stream under the region_end == nullptr convention -- every row degraded
+// to 0 and the corrupt region answered a plausible `0 OP lit` count.  The
+// fold must now surface kCorrupt, and a valid region must still answer the
+// exact row-mirror count.
+TEST(PaxStorageFuzzerTest, PostingsCountFoldRejectsUndecodableParam) {
+  const Schema sc = MakeStorageSchema();
+  PaxChunk chunk;
+  bool encoded = false;
+  for (uint8_t shape : {0, 2, 4, 6}) {
+    setenv("TINYLAMB_FORCE_SCHEME", "POSTINGS", 1);
+    auto built =
+        PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc);
+    unsetenv("TINYLAMB_FORCE_SCHEME");
+    ASSERT_TRUE(built.HasValue());
+    chunk = built.MoveValue();
+    const auto& enc = chunk.GetFooter().encodings;
+    if (enc.size() > 4 &&
+        enc[4] == static_cast<uint8_t>(PaxChunk::Scheme::kPostings)) {
+      encoded = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(encoded);
+
+  size_t footer_off = 0;
+  size_t footer_size = 0;
+  ASSERT_TRUE(WireLayout(chunk.Data(), &footer_off, &footer_size));
+  const PaxChunk::Footer& f = chunk.GetFooter();
+  ASSERT_GT(f.column_offsets.size(), 5U);
+  ASSERT_FALSE(f.row_counts.empty());
+  const std::vector<char>& b = chunk.Data();
+  const size_t data_end = b.size() - footer_size - 4;
+  const size_t off = f.column_offsets[4];
+  const size_t succ = f.column_offsets[5];
+  ASSERT_GT(succ, off);
+  ASSERT_LE(succ, data_end);
+  const auto n = static_cast<uint32_t>(f.row_counts[0]);
+  const auto param = static_cast<uint32_t>((static_cast<uint8_t>(b[off]) << 8) |
+                                           static_cast<uint8_t>(b[off + 1]));
+
+  const auto good = PaxChunk::ByteSliceNullAwareCount(
+      b.data() + off, PaxChunk::Scheme::kPostings, param, n, nullptr,
+      PaxChunk::CompareOp::kEq, /*lit=*/2);
+  ASSERT_TRUE(good.HasValue());
+  uint32_t mirror = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const auto row = chunk.ReadRow(i, sc);
+    ASSERT_TRUE(row.HasValue());
+    const Value& v = row.Value()[4];
+    if (!v.IsNull() && v.value.int_value == 2) {
+      ++mirror;
+    }
+  }
+  EXPECT_EQ(good.Value(), mirror);
+
+  // param != header d: PostingsRegionCountSum's parse declines; the old
+  // fallback would have answered the (plausible but wrong) all-rows-zero
+  // count instead of reporting corruption.
+  const auto bad = PaxChunk::ByteSliceNullAwareCount(
+      b.data() + off, PaxChunk::Scheme::kPostings, param + 1, n, nullptr,
+      PaxChunk::CompareOp::kEq, /*lit=*/2);
+  ASSERT_FALSE(bad.HasValue());
+  EXPECT_EQ(bad.GetStatus().GetCode(), StatusCode::kCorrupt);
+}
+
 TEST(PaxStorageFuzzerTest, RegionSchemeSeeds) {
   Rng rng(0xC0FFEE01U);
   for (uint8_t kase = 0; kase < kSchemeCaseCount; ++kase) {
@@ -237,9 +314,9 @@ TEST(PaxStorageFuzzerTest, RegionSchemeSeeds) {
       std::vector<uint8_t> seed;
       seed.push_back(kase);
       seed.push_back(static_cast<uint8_t>(rng.Below(5)));
-      seed.push_back(static_cast<uint8_t>(
-          (static_cast<uint32_t>(resign) & 0x1U) |
-          ((static_cast<uint32_t>(kase) & 0x3U) << 1)));
+      seed.push_back(
+          static_cast<uint8_t>((static_cast<uint32_t>(resign) & 0x1U) |
+                               ((static_cast<uint32_t>(kase) & 0x3U) << 1)));
       seed.push_back(static_cast<uint8_t>(1U + rng.Below(6)));
       for (int k = 0; k < 4; ++k) {
         const uint32_t roll = rng.Next();
@@ -264,9 +341,9 @@ TEST(PaxStorageFuzzerTest, NullmapVarcharSeeds) {
         std::vector<uint8_t> seed;
         seed.push_back(kase);
         seed.push_back(shape);
-        seed.push_back(static_cast<uint8_t>(
-            (static_cast<uint32_t>(resign) & 0x1U) |
-            ((static_cast<uint32_t>(shape) & 0x3U) << 1)));
+        seed.push_back(
+            static_cast<uint8_t>((static_cast<uint32_t>(resign) & 0x1U) |
+                                 ((static_cast<uint32_t>(shape) & 0x3U) << 1)));
         seed.push_back(static_cast<uint8_t>(1U + rng.Below(6)));
         for (int k = 0; k < 4; ++k) {
           const uint32_t roll = rng.Next();

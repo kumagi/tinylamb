@@ -23,6 +23,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "gtest/gtest.h"
+#include "query/statement.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -265,10 +266,8 @@ TEST(ParameterSlotTest, SamePrintedExpressionKeepsDistinctSubqueriesDistinct) {
   // Two nodes backed by different SelectStatement instances must not compare
   // equal under SamePrintedExpression, even when wrapped in unary/binary
   // containers.
-  std::shared_ptr<SelectStatement> q1(
-      reinterpret_cast<SelectStatement*>(0x1000), [](SelectStatement*) {});
-  std::shared_ptr<SelectStatement> q2(
-      reinterpret_cast<SelectStatement*>(0x2000), [](SelectStatement*) {});
+  std::shared_ptr<SelectStatement> q1 = std::make_shared<SelectStatement>();
+  std::shared_ptr<SelectStatement> q2 = std::make_shared<SelectStatement>();
   Expression e1 = QueryExpressionExp(q1, nullptr, true, false);
   Expression e2 = QueryExpressionExp(q2, nullptr, true, false);
   Expression e1_dup = QueryExpressionExp(q1, nullptr, true, false);

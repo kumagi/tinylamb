@@ -16,8 +16,8 @@ the server CMake target is not restricted to Linux.
   read-worker pool (`PostgresServerOptions`: `port 54321`, `max_connections
   1024`, `max_message 16 MiB`,   `idle_timeout 3600s`, `force_recovery` for torn
   WAL tails). Executes **`Q` (Simple Query) only** — `Parse/Bind/Describe/
-  Execute` (extended protocol) are rejected with an ErrorResponse +
-  ReadyForQuery, while `Sync` is tolerated as a no-op that only answers
+  Execute` (extended protocol) are rejected with an ErrorResponse only;
+  while `Sync` is tolerated as a no-op that only answers
   ReadyForQuery and `Flush` is a silent no-op. Read-only Query messages may
   be offloaded to the shared worker pool; ordinary INSERT/UPDATE/DELETE and
   BEGIN/COMMIT/ROLLBACK messages also use that pool, with one in-flight task
@@ -40,8 +40,11 @@ the server CMake target is not restricted to Linux.
   `read_worker_threads` / `--read-workers` names configure this shared pool.
   Sessions that created a TEMP view or SQL
   UDF stay on the event-loop thread (the frontend registries are
-  thread-local). DoS caps: pre-auth input 1024 B, queued output 64 MiB,
-  oversized results abort with an error past 1M rows.
+  thread-local). DoS caps: pre-auth input 10,004 B, queued output 4 MiB,
+  there is no hard 1M-row result cap; large results are governed by query memory grants. `StatusCode::kMemoryLimitExceeded`
+  maps to PostgreSQL SQLSTATE `53200` (`out_of_memory`), and `kNoSpace` maps to
+  `53100` (`disk_full`). `read_worker_threads == 0` defaults to
+  `hardware_concurrency()` (capped at 16).
 
 Catalog changes stay on epoll and fail with SQLSTATE 55006 while a foreign
 transaction block or worker task/completion/cleanup is outstanding. There is
@@ -55,7 +58,12 @@ commit messages are queued behind them.
 Simple-Query multi-statement + streaming responses. Do not claim full
 protocol compatibility — extended-protocol support does not exist.
 `Execute`/`Prepare` on `SqlEngine` is the only DB entry; no direct storage
-calls from here.
+calls from here. One registered exception: `--force`/`force_recovery` sets
+the process-static `RecoveryManager::SetTornTailTruncationAllowed(true)`
+(recovery/ header included by both `postgres_server.cpp` and
+`postgres_server_main.cpp`) — that flag cannot travel through a SQL
+statement, so don't infer from the contract that the server never names a
+storage-layer symbol.
 
 Test: `./build/postgres_server_test`, `postgres_protocol_test`,
 `postgres_server_extra_test`.

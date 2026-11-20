@@ -76,26 +76,36 @@ TEST(IntervalTest, PlusMinusNegateMultiply) {
 // --------------------------------------------------------------- justify ---
 
 TEST(IntervalTest, JustifyHours) {
+  // GoogleSQL normalizes hours to [-23,23] and carries whole days (the
+  // canonical interval.test pins JUSTIFY_HOURS(1-2 35 49:5) -> 1-2 37 1:5).
+  EXPECT_EQ(Iv(0, 1, 49LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
+            Iv(0, 3, 1LL * 3600LL * 1000000000LL));
+  EXPECT_EQ(Iv(0, 1, -49LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
+            Iv(0, -1, -1LL * 3600LL * 1000000000LL));
+  EXPECT_EQ(Iv(0, 0, 7).TryJustifyHours().MoveValue(), Iv(0, 0, 7));
+  EXPECT_EQ(Iv(1, 2, 7).TryJustifyHours().MoveValue(), Iv(1, 2, 7));
+  // The compliance golden's months + carry case: 1-2 35 49:5:6.789 ->
+  // 1-2 37 1:5:6.789 (months ride along while the time overflow lands in
+  // days; folding months into the nanos total would erase them).
   EXPECT_EQ(
-      Iv(1, 2, 36LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
-      Iv(1, 3, 12LL * 3600LL * 1000000000LL));
-  EXPECT_EQ(
-      Iv(0, 1, -12LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
-      Iv(0, 0, 12LL * 3600LL * 1000000000LL));
-  EXPECT_EQ(Iv(2, 1, 7).TryJustifyHours().MoveValue(), Iv(2, 1, 7));
-  // days * day-nanos overflow is rejected.
-  EXPECT_FALSE(Iv(0, 4000000000, 0).TryJustifyHours().HasValue());
-  EXPECT_EQ(Iv(1, 2, 3).JustifyHours(), Iv(1, 2, 3));
+      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+      Iv(14, 35, (49LL * 3600 + 5LL * 60 + 6) * 1000000000LL + 789000000LL)
+          .TryJustifyHours()
+          .MoveValue(),
+      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+      Iv(14, 37, (1LL * 3600 + 5LL * 60 + 6) * 1000000000LL + 789000000LL));
 }
 
 TEST(IntervalTest, JustifyDays) {
-  EXPECT_EQ(Iv(1, 45, 5).TryJustifyDays().MoveValue(), Iv(2, 15, 5));
+  // GoogleSQL normalizes days to [-29,29] and carries whole months (30 days):
+  // interval.test pins JUSTIFY_DAYS(1-2 35) -> 1-3 5.
+  EXPECT_EQ(Iv(14, 35, 5).TryJustifyDays().MoveValue(), Iv(15, 5, 5));
   EXPECT_EQ(Iv(0, -31, -7).TryJustifyDays().MoveValue(), Iv(-1, -1, -7));
   EXPECT_EQ(Iv(0, 29, 0).TryJustifyDays().MoveValue(), Iv(0, 29, 0));
+  EXPECT_EQ(Iv(0, 370, 0).TryJustifyDays().MoveValue(), Iv(12, 10, 0));
   // months * 30 overflow is rejected.
   EXPECT_FALSE(Iv(INT64_MAX, 0, 0).TryJustifyDays().HasValue());
   EXPECT_THROW((void)Iv(INT64_MAX, 0, 0).JustifyDays(), std::runtime_error);
-  EXPECT_EQ(Iv(1, 45, 5).JustifyDays(), Iv(2, 15, 5));
 }
 
 TEST(IntervalTest, JustifyInterval) {
@@ -112,8 +122,9 @@ TEST(IntervalTest, JustifyInterval) {
 
 TEST(IntervalTest, JustifyPreservesMinimumInt64Components) {
   constexpr int64_t min = INT64_MIN;
-  EXPECT_EQ(Iv(7, 0, min).TryJustifyHours().MoveValue(),
-            Iv(7, min / kDayNanos, min % kDayNanos));
+  // Signed division/remainder normalize INT64_MIN nanos into days without UB.
+  EXPECT_EQ(Iv(0, 0, min).TryJustifyHours().MoveValue(),
+            Iv(0, min / kDayNanos, min % kDayNanos));
   EXPECT_EQ(Iv(0, min, 7).TryJustifyDays().MoveValue(),
             Iv(min / 30, min % 30, 7));
   EXPECT_EQ(
@@ -318,6 +329,16 @@ TEST(IntervalTest, SessionConstants) {
   EXPECT_EQ(GetSessionConstant("interval_test_constant"), "updated");
   EXPECT_EQ(GetSessionConstant("never_set"), "");
   EXPECT_FALSE(HasSessionConstant("never_set"));
+  // The string registry folds case like the typed SessionConstantExpressions
+  // ledger, and ClearSessionConstants() -- wired into ClearSessionRegistries
+  // at session boundaries -- is the only teardown, so a later session on this
+  // thread must not inherit another session's constants.
+  SetSessionConstant("MixedCase_Const", "42");
+  EXPECT_TRUE(HasSessionConstant("mixedcase_const"));
+  EXPECT_EQ(GetSessionConstant("MIXEDCASE_CONST"), "42");
+  ClearSessionConstants();
+  EXPECT_FALSE(HasSessionConstant("interval_test_constant"));
+  EXPECT_FALSE(HasSessionConstant("mixedcase_const"));
 }
 
 TEST(IntervalTest, AuditQualifiedTimeRejectsOverflow) {

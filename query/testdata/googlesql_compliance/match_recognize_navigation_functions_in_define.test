@@ -150,7 +150,7 @@ SELECT * FROM t1 MATCH_RECOGNIZE(
 )
 ORDER BY rowid
 --
-ERROR: generic::out_of_range: The offset to the function LAG must not be null
+ERROR: generic::out_of_range: The offset to the function LAG must not be NULL
 ==
 
 [name=next_with_null_offset]
@@ -165,7 +165,7 @@ SELECT * FROM t1 MATCH_RECOGNIZE(
 )
 ORDER BY rowid
 --
-ERROR: generic::out_of_range: The offset to the function LEAD must not be null
+ERROR: generic::out_of_range: The offset to the function LEAD must not be NULL
 ==
 
 [name=prev_and_next_with_zero_offset_are_noop]

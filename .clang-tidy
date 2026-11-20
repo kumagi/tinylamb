@@ -45,5 +45,4 @@ Checks: '-*,
   -readability-isolate-declaration,
   -readability-magic-numbers,
   -readability-redundant-member-init,
-  -cppcoreguidelines-pro-type-static-cast-downcast,
 '

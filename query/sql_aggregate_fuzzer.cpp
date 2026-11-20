@@ -14,6 +14,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "common/platform/extended_float.hpp"
@@ -21,6 +22,7 @@
 #include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
+#include "common/unwind_guard.hpp"
 #include "database/database.hpp"
 #include "executor/query_memory.hpp"
 #include "query/fuzz_scoped_db.hpp"
@@ -487,12 +489,24 @@ std::vector<MRow> FilteredRows(const AggSpec& spec,
 
 // FilteredRows plus the inner ORDER BY u [DESC] / LIMIT n modifiers.  Rows
 // arrive in ascending u order, so DESC is a reversal; LIMIT then counts
-// ordered rows (NULLs included) before aggregate-specific null handling.
+// ordered rows.  STRING_AGG ignores NULL inputs *before* LIMIT (reference
+// GoogleSQL: STRING_AGG(s ORDER BY u DESC LIMIT 3) over d,c,NULL,a is
+// "d,c,a"). ARRAY_AGG keeps NULL elements, and DISTINCT counts each value
+// once before LIMIT.
 std::vector<MRow> PreparedRows(const AggSpec& spec,
                                const std::vector<MRow>& input) {
   std::vector<MRow> rows = FilteredRows(spec, input);
+  if (spec.kind == AggSpec::Kind::kStringAgg) {
+    std::erase_if(rows, [](const MRow& r) { return r.s == kNullRepr; });
+  }
   if (spec.order_desc) {
     std::reverse(rows.begin(), rows.end());
+  }
+  if (spec.kind == AggSpec::Kind::kArrayAgg && spec.distinct) {
+    std::unordered_set<int64_t> seen;
+    std::erase_if(rows, [&](const MRow& row) {
+      return !seen.insert(CellOf(row, spec.col)).second;
+    });
   }
   if (spec.inner_limit > 0 &&
       rows.size() > static_cast<size_t>(spec.inner_limit)) {
@@ -740,9 +754,8 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       return any ? FmtInt(acc ? 1 : 0) : std::string("NULL");
     }
     case AggSpec::Kind::kStringAgg: {
-      // PreparedRows applied ORDER BY u [DESC] then LIMIT (counting rows,
-      // NULLs included); NULL elements are skipped at emit time.  Empty
-      // input yields NULL.
+      // PreparedRows dropped NULL elements, then applied ORDER BY u [DESC]
+      // and LIMIT.  Empty input yields NULL.
       int emitted = 0;
       std::string out;
       for (const MRow& r : rows) {
@@ -760,27 +773,10 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       return {"|\"" + out + "\"|"};
     }
     case AggSpec::Kind::kArrayAgg: {
-      // NULL elements are kept; DISTINCT collapses them to one.
-      // PreparedRows applied ORDER BY u [DESC] then LIMIT (counting ordered
-      // rows before NULL/dedup handling).
       int emitted = 0;
       std::string out;
-      std::vector<int64_t> seen;
-      bool saw_null = false;
       for (const MRow& r : rows) {
         const int64_t v = CellOf(r, spec.col);
-        if (spec.distinct) {
-          if (v == kNullRepr) {
-            if (saw_null) {
-              continue;
-            }
-            saw_null = true;
-          } else if (std::find(seen.begin(), seen.end(), v) != seen.end()) {
-            continue;
-          } else {
-            seen.push_back(v);
-          }
-        }
         out += (emitted++ == 0 ? "" : ", ");
         out += (v == kNullRepr ? "NULL" : std::to_string(v));
       }
@@ -927,24 +923,20 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   for (const std::string& sql : t.setup) {
     StatusOr<QueryResult> result = engine.Execute(ctx, sql);
     if (!result.HasValue()) {
-      if (verbose) {
-        std::cerr << "[agg_fuzz][skip-setup] " << sql << "\n";
-      }
-      return "";
+      return "[AGG FUZZ SETUP ERROR] " + sql + ": " +
+             result.GetStatus().GetMessage();
     }
     // QueryResults are lazy: drain or the INSERT never happens.
     result.Value().Drain();
     if (result.Value().GetStatus() != Status::kSuccess) {
-      if (verbose) {
-        std::cerr << "[agg_fuzz][skip-setup-status] " << sql << "\n";
-      }
-      return "";
+      return "[AGG FUZZ SETUP ERROR] " + sql + ": " +
+             result.Value().GetStatus().GetMessage();
     }
   }
   // Commit setup so read-only queries can trigger lazy LSTableStore creation
   // (`GetOrBuildLSTableStore` requires an empty uncommitted WriteSet).
-  if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    return "";
+  if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+    return "[AGG FUZZ SETUP ERROR] PreCommit: " + std::string(pre.GetMessage());
   }
   ctx = db.BeginContext();
 
@@ -1097,7 +1089,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       }
       if (g.Chance(30)) {
         // STRING_AGG ordered by u for determinism, with optional explicit
-        // delimiter and inner LIMIT (which counts rows, NULLs included).
+        // delimiter and inner LIMIT (which counts non-NULL elements).
         AggSpec sa;
         sa.kind = AggSpec::Kind::kStringAgg;
         sa.col = 2;
@@ -1161,8 +1153,8 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
                           vcol, kVarKind[static_cast<size_t>(pick)]});
         }
       }
-      // Inline WHERE (GoogleSQL `AGG(arg WHERE cond)`), HAVING MIN/MAX,
-      // and inner ORDER BY u/LIMIT modifiers.  Grammar order is
+      // Inline WHERE (GoogleSQL `AGG(arg WHERE cond)`) and HAVING MIN/MAX.
+      // STRING_AGG and ARRAY_AGG supply any ORDER BY and LIMIT. Grammar order is
       // `AGG(arg [WHERE c] [HAVING {MIN|MAX} e] [ORDER BY ...] [LIMIT n])`,
       // so all insert at the same anchor: before ORDER BY/LIMIT when
       // `where_pos` marks one, else before the closing paren.
@@ -1187,19 +1179,6 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           const std::string text = std::string(" HAVING ") +
                                    (spec.having_min ? "MIN " : "MAX ") +
                                    ColName(spec.having_col);
-          spec.sql.insert(pos, text);
-          pos += text.size();
-        }
-        // STRING_AGG/ARRAY_AGG already carry ORDER BY/LIMIT in `sql`.
-        if (spec.kind != AggSpec::Kind::kStringAgg &&
-            spec.kind != AggSpec::Kind::kArrayAgg && g.Chance(15)) {
-          spec.order_desc = g.Chance(30);
-          std::string text =
-              spec.order_desc ? " ORDER BY u DESC" : " ORDER BY u";
-          if (g.Chance(60)) {
-            spec.inner_limit = g.Pick(1, 3);
-            text += " LIMIT " + std::to_string(spec.inner_limit);
-          }
           spec.sql.insert(pos, text);
         }
       }
@@ -2115,10 +2094,16 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       r.Value().Drain();
     }
     if (nan_ok) {
-      if (auto r = engine.Execute(ctx, "ANALYZE t_nan_lst;"); r.HasValue()) {
-        r.Value().Drain();
+      auto analyze = engine.Execute(ctx, "ANALYZE t_nan_lst;");
+      if (!analyze.HasValue()) {
+        nan_ok = false;
+      } else {
+        analyze.Value().Drain();
+        if (analyze.Value().GetStatus() != Status::kSuccess) {
+          nan_ok = false;
+        }
       }
-      if (ctx.txn_.PreCommit() == Status::kSuccess) {
+      if (nan_ok && ctx.txn_.PreCommit() == Status::kSuccess) {
         ctx = db.BeginContext();
         const std::array<std::pair<std::string, std::string>, 4> nan_probes = {{
             {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " + c_lit +
@@ -2181,7 +2166,8 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
   }
   ScopedDb db_owner("sql_aggregate_replay");
   if (!db_owner) {
-    return "";  // resource pressure: replay skipped, not a mismatch
+    // Empty means "regression fixed"; a skip must be visible to the caller.
+    return "replay skipped: cannot create database (resource pressure)";
   }
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
@@ -2197,7 +2183,9 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
       return "setup stream-error: " + sql;
     }
   }
-  (void)ctx.txn_.PreCommit();
+  if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+    return "replay setup PreCommit failed: " + std::string(pre.GetMessage());
+  }
   ctx = db.BeginContext();
   auto check_all = [&](const char* tag) -> std::string {
     for (const AggQueryExpect& q : trace.queries) {
@@ -2247,6 +2235,15 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
   const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
+  // Restore on every exit path (including exceptions) so the override cannot
+  // leak into later fuzz iterations or tests in the same process.
+  UnwindGuard route_restore([&] {
+    if (prev_route != nullptr) {
+      platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+    } else {
+      platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+    }
+  });
   std::string rep = check_all("[AGGREGATE-CASCADES REPLAY MISMATCH]");
   if (rep.empty() && trace.setup.size() > 4) {
     ScopedQueryMemory low_mem(512);
@@ -2319,7 +2316,15 @@ bool ParseAggregateTest(std::string_view text, uint64_t* seed, AggTrace* trace,
     };
     std::string value;
     if (consume("-- seed: ", &value)) {
-      *seed = std::stoull(value);
+      try {
+        size_t used = 0;
+        *seed = std::stoull(value, &used);
+        if (used != value.size()) {
+          return false;
+        }
+      } catch (const std::exception&) {
+        return false;
+      }
     } else if (consume("-- setup: ", &value)) {
       trace->setup.push_back(value);
     } else if (consume("-- query: ", &value)) {

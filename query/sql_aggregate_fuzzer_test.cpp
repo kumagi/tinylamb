@@ -74,15 +74,21 @@ void RunSeededAggregateRange(uint32_t begin_seed, uint32_t end_seed) {
 TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirrorShard0) {
   uint32_t end_seed = 24;
   if (const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS")) {
-    end_seed = static_cast<uint32_t>(std::strtoul(scale, nullptr, 10));
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(scale, &end, 10);
+    if (errno == 0 && end != scale && *end == '\0' && parsed > 0 &&
+        parsed <= std::numeric_limits<uint32_t>::max()) {
+      end_seed = static_cast<uint32_t>(parsed);
+    }
   }
   RunSeededAggregateRange(0, end_seed);
 }
 
 TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirrorShard1) {
-  if (std::getenv("TINYLAMB_FUZZ_ITERS") != nullptr) {
-    return;
-  }
+  // Keep the fixed 24..48 range even when shard0's env override is set;
+
+  // skipping it silently used to drop those regression seeds entirely.
   RunSeededAggregateRange(24, 48);
 }
 
@@ -129,7 +135,12 @@ TEST(SqlAggregateFuzzer, ReplayCommittedRegressionFiles) {
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }
-  for (const std::string& path : ListTestFiles(dir)) {
+  const std::vector<std::string> paths = ListTestFiles(dir);
+  // T3944: an existing-but-empty directory (checkout miss, wrong path) must
+  // not report success while replaying zero guards; mirrors the ooc /
+  // griffin / join regression replays.
+  EXPECT_FALSE(paths.empty()) << "no .test files in " << dir;
+  for (const std::string& path : paths) {
     std::ifstream file(path);
     std::string text((std::istreambuf_iterator<char>(file)),
                      std::istreambuf_iterator<char>());

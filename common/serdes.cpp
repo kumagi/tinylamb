@@ -35,6 +35,13 @@ size_t SerializeStringView(char* pos, std::string_view bin) {
   // corrupt the serialized image (length prefix vs payload mismatch).
   // Callers guarantee sizes upstream (page-size / kTooBigData checks), so an
   // oversize string here is an invariant violation, not a runtime error.
+  // T3512: the upstream guard is Value/Row size validation in type/value.cpp
+  // (kTooBigData: "string too long to serialize"), which rejects >64KiB
+  // strings with a recoverable Status long before any page/WAL encoder runs
+  // -- e.g. INSERT of a 100k-char STRING fails as TooBigData, never aborts.
+  // DeserializeStringView's lenient 0-return is the counterpart for
+  // UNTRUSTED on-disk bytes; this function only sees in-process validated
+  // sizes, so the abort here stays a tripwire (same discipline as T4253).
   if (bin.size() > std::numeric_limits<bin_size_t>::max()) {
     LOG(FATAL) << "string too long to serialize: " << bin.size();
     abort();

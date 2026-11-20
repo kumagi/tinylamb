@@ -10,6 +10,14 @@
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <stdlib.h>
 
+#include <algorithm>
+#include <csignal>
+#include <string>
+
+// getrlimit/setrlimit below are POSIX APIs.
+// NOLINTNEXTLINE(modernize-deprecated-headers)
+#include <sys/resource.h>
+
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
@@ -253,8 +261,12 @@ TEST(SpillFileTest, Destructor_WhenSpillFileDestroyed_RemovesUnderlyingFile) {
 TEST(SpillFileTest, TempDirectory_WhenEnvSet_HonorsEnvPath) {
   const std::filesystem::path tmp =
       std::filesystem::temp_directory_path() / "tinylamb_spill_test_env";
-  std::filesystem::remove_all(tmp);
-  std::filesystem::create_directories(tmp);
+  const char* previous_temp = std::getenv("TINYLAMB_TEMP");
+  const std::string saved_temp = previous_temp != nullptr ? previous_temp : "";
+  std::error_code ec;
+  std::filesystem::remove_all(tmp, ec);
+  std::filesystem::create_directories(tmp, ec);
+  ASSERT_FALSE(ec) << ec.message();
   setenv("TINYLAMB_TEMP", tmp.c_str(), 1);
   EXPECT_EQ(SpillFile::TempDirectory(), tmp);
   {
@@ -264,8 +276,12 @@ TEST(SpillFileTest, TempDirectory_WhenEnvSet_HonorsEnvPath) {
     EXPECT_EQ(spill.Path().parent_path(), tmp);
     EXPECT_TRUE(std::filesystem::exists(spill.Path()));
   }
-  unsetenv("TINYLAMB_TEMP");
-  std::filesystem::remove_all(tmp);
+  if (previous_temp != nullptr) {
+    setenv("TINYLAMB_TEMP", saved_temp.c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_TEMP");
+  }
+  std::filesystem::remove_all(tmp, ec);
   EXPECT_FALSE(std::filesystem::exists(tmp));
 }
 
@@ -305,6 +321,56 @@ TEST(SpillFileTest, RowReaderStreamsRowsAndTracksFileBytes) {
   EXPECT_EQ(expected, kRows);
   EXPECT_FALSE(reader.IsOpen());
   EXPECT_EQ(reader.Remaining(), 0ULL);
+}
+
+// Issue 5033: capacity failures (ENOSPC/EDQUOT on a full spill filesystem,
+// or EFBIG under RLIMIT_FSIZE) used to collapse into the bare
+// "spill write failed: <path>" text with no cause.  The status now embeds
+// errno and maps space exhaustion to kNoSpace with an actionable hint.
+TEST(SpillFileTest, WriteCapacityFailureReportsErrnoOrNoSpace) {
+  struct RlimitGuard {
+    rlimit old{};
+    RlimitGuard() = default;
+    RlimitGuard(const RlimitGuard&) = delete;
+    RlimitGuard& operator=(const RlimitGuard&) = delete;
+    RlimitGuard(RlimitGuard&&) = delete;
+    RlimitGuard& operator=(RlimitGuard&&) = delete;
+    ~RlimitGuard() { (void)setrlimit(RLIMIT_FSIZE, &old); }
+  } guard;
+  ASSERT_EQ(getrlimit(RLIMIT_FSIZE, &guard.old), 0);
+  rlimit lim = guard.old;
+  lim.rlim_cur = std::min<rlim_t>(1 << 20, lim.rlim_max);
+  ASSERT_EQ(setrlimit(RLIMIT_FSIZE, &lim), 0);
+  // Without this, the first write past the cap raises SIGXFSZ and the
+  // default disposition kills the process before errno can be observed;
+  // ignoring it makes write(2) fail with EFBIG, exactly like a full disk.
+  void (*previous_xfsz)(int) = std::signal(SIGXFSZ, SIG_IGN);
+  struct SignalGuard {
+    void (*previous)(int);
+    explicit SignalGuard(void (*handler)(int)) : previous(handler) {}
+    SignalGuard(const SignalGuard&) = delete;
+    SignalGuard& operator=(const SignalGuard&) = delete;
+    SignalGuard(SignalGuard&&) = delete;
+    SignalGuard& operator=(SignalGuard&&) = delete;
+    ~SignalGuard() { (void)std::signal(SIGXFSZ, previous); }
+  } signal_guard{previous_xfsz};
+
+  SpillFile spill;
+  const std::string blob(4096, 'x');
+  Status failure = Status::kSuccess;
+  bool failed = false;
+  for (int i = 0; i < 4096 && !failed; ++i) {
+    failure = spill.Append(Row({Value(i), Value(std::string(blob))}));
+    failed = failure != Status::kSuccess;
+  }
+  ASSERT_TRUE(failed) << "RLIMIT_FSIZE cap never tripped";
+  const std::string text = ToString(failure);
+  EXPECT_TRUE(failure.GetCode() == StatusCode::kNoSpace ||
+              failure.GetCode() == StatusCode::kIOError)
+      << text;
+  // The whole point: the cause is visible in the text, whatever it was.
+  EXPECT_NE(text.find("errno="), std::string::npos) << text;
+  EXPECT_NE(text.find("tinylamb-spill-"), std::string::npos) << text;
 }
 
 }  // namespace tinylamb

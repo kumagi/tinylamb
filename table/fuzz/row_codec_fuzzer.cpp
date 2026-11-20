@@ -79,8 +79,10 @@ RowDecodePlan BuildDecodePlan(const Schema& sc,
   plan.stored_types.resize(sc.ColumnCount());
   plan.stored_slot.assign(sc.ColumnCount(), RowDecodePlan::kNoSlot);
   plan.slot_unsigned.assign(proj.size(), 0);
+  plan.slot_interval.assign(proj.size(), 0);
   plan.all_fixed = true;
   plan.has_unsigned = false;
+  plan.has_interval = false;
   for (slot_t i = 0; i < sc.ColumnCount(); ++i) {
     const Column& col = sc.GetColumn(i);
     plan.stored_types[i] = col.Type();
@@ -95,6 +97,10 @@ RowDecodePlan BuildDecodePlan(const Schema& sc,
     if (sc.GetColumn(col_idx).IsUnsigned()) {
       plan.slot_unsigned[k] = 1;
       plan.has_unsigned = true;
+    }
+    if (sc.GetColumn(col_idx).IsInterval()) {
+      plan.slot_interval[k] = 1;
+      plan.has_interval = true;
     }
   }
   return plan;
@@ -185,10 +191,13 @@ int FuzzRowCodecOneInput(const uint8_t* data, size_t size) {
                                  size - 2);
       Row out;
       out.DecodeMemcomparableFormatBounded(src);
-      // If the bytes were accepted, the decoder must have produced a
-      // well-formed row, not silently swallowed a corrupt frame.
-      if (out.Count() != sc.ColumnCount()) {
-        CodecFail("DecodeMemcomparableFormatBounded column count mismatch");
+      // The memcomparable form is self-describing and schema-free: arbitrary
+      // accepted bytes are a valid encoding of *some* row (a lone 0x00 is one
+      // NULL), so the schema's column count is no oracle here. What must hold
+      // is that every decoded value consumed at least one input byte.
+      if (out.Count() > src.size()) {
+        CodecFail("DecodeMemcomparableFormatBounded produced more values "
+                  "than input bytes");
       }
     } catch (const std::runtime_error&) {
       ++rejections;

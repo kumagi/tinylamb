@@ -76,6 +76,17 @@ class Table {
   StatusOr<RowPosition> Update(Transaction& txn, const RowPosition& pos,
                                const Row& row);
 
+  // P652/689: variant accepting a before-image the caller already read, so
+  // the executor's UPDATE apply phase does not pay a second per-row decode
+  // roundtrip.  An empty `original_row` (zero columns; a real slot never
+  // deserializes to zero columns, `Table::Read` errors instead) means "the
+  // caller does not have one" and falls back to the regular before-image
+  // read.  Freshness contract equals the internal read's: it is advisory
+  // for index maintenance / failure restore, and the write-intent
+  // reservation still enforces first-updater-wins.
+  StatusOr<RowPosition> Update(Transaction& txn, const RowPosition& pos,
+                               const Row& row, Row original_row);
+
   Status Delete(Transaction& txn, RowPosition pos);
 
   StatusOr<Row> Read(Transaction& txn, RowPosition pos) const;
@@ -166,14 +177,24 @@ class Table {
   [[nodiscard]] std::unordered_map<slot_t, size_t> AvailableKeyIndex() const;
 
   [[nodiscard]] const Schema& GetSchema() const { return schema_; }
+  // P1311: the `Set*`/`Reject*` mutators are non-const -- they reconfigure
+  // the shared incarnation state (every Table view of the same incarnation
+  // observes the change), so the cv-qualifier must not claim otherwise.
+  // Logically const cache warmers (lazy LSTable/TLCS builds on a
+  // `const Table&`) use the `Refill*`/`Note*` variants, which name the
+  // shared-state write instead of hiding it behind `const`.
   [[nodiscard]] std::shared_ptr<const LSTableStore> GetLSTableStore() const;
-  void SetLSTableStore(std::shared_ptr<const LSTableStore> store) const;
+  void SetLSTableStore(std::shared_ptr<const LSTableStore> store);
+  void RefillLSTableStore(std::shared_ptr<const LSTableStore> store) const;
   [[nodiscard]] std::shared_ptr<const LSTableStore> GetProjectedLSTableStore()
       const;
   void SetProjectedLSTableStore(
+      std::shared_ptr<const LSTableStore> store);
+  void RefillProjectedLSTableStore(
       std::shared_ptr<const LSTableStore> store) const;
-  [[nodiscard]] std::shared_ptr<const TlcsFile> GetBackingTLCSStore() const;
-  void SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const;
+  [[nodiscard]] std::shared_ptr<const TlcsFile> GetBackingTlcsStore() const;
+  void SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store);
+  void RefillBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const;
   [[nodiscard]] uint64_t BackingColumnarRowCount() const;
   Status EnsurePageHydratedIfStub(Transaction& txn, page_id_t pid) const;
   [[nodiscard]] bool LSTableCapacityRejected(uint64_t generation) const {
@@ -182,6 +203,9 @@ class Table {
                generation;
   }
   void RejectLSTableCapacity(uint64_t generation) const {
+    NoteLSTableCapacityRejected(generation);
+  }
+  void NoteLSTableCapacityRejected(uint64_t generation) const {
     if (incarnation_state_ != nullptr) {
       incarnation_state_->RejectLSTableCapacity(generation);
     }
@@ -228,17 +252,17 @@ class Table {
   [[nodiscard]] std::shared_ptr<const IntegerKeyCounts> ReadIntegerKeyCounts(
       Transaction& txn, const std::vector<ScanMorsel>& morsels, slot_t column,
       int64_t minimum, size_t span, bool cached_pages_only) const;
-  // |hint_leaf| threads an LSM page-id hint so consecutive index
-  // operations on the same tree (e.g. the delete+insert pair of one UPDATE)
-  // skip the root-to-leaf walk when the remembered leaf still covers the
-  // key. nullptr keeps the plain always-descend behavior.
   [[nodiscard]] Status CheckRowConstraints(const Row& row) const;
   Status LinkReservedTableTail(Transaction& txn, PageRef& predecessor,
                                PageRef& successor) const;
   [[nodiscard]] StatusOr<Row> ReadLatest(Transaction& txn,
                                          RowPosition pos) const;
   [[nodiscard]] StatusOr<Row> ReadFromStub(RowPosition pos) const;
-  Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
+  Status   // |hint_leaf| threads a BPlusTree landing-leaf cursor so consecutive index
+  // operations on the same tree (e.g. the delete+insert pair of one UPDATE)
+  // skip the root-to-leaf walk when the remembered leaf still covers the
+  // key. nullptr keeps the plain always-descend behavior.
+IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
                      const RowPosition& pos,
                      page_id_t* hint_leaf = nullptr) const;
   // Gate-held RMW bodies; see the escalation loops in IndexInsert/IndexDelete
@@ -260,7 +284,6 @@ class Table {
   friend class Database;
   friend class FullScanIterator;
   friend class IndexScanIterator;
-  friend class TableInterface;
 
   void SetIncarnationState(std::shared_ptr<TableIncarnation> state) {
     incarnation_state_ = std::move(state);

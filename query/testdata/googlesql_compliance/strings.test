@@ -639,7 +639,7 @@ SELECT REGEXP_INSTR("abcabc", "a(b)c", 2, 1, 1),
        REGEXP_INSTR("-2020-jack-class1", "", 2),
        REGEXP_INSTR("abcdef", "ac.*e.")
 --
-ARRAY<STRUCT<INT64, INT64, INT64, INT64>>[{7, 5, 0, 0}]
+ARRAY<STRUCT<INT64, INT64, INT64, INT64>>[{6, 5, 0, 0}]
 ==
 
 [name=strings_function_regexp_extract]

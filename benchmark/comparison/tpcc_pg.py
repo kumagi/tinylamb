@@ -62,7 +62,7 @@ def main():
     for s in sockets: s.bind(('127.0.0.1', 0))
     ports = [s.getsockname()[1] for s in sockets]
     for s in sockets: s.close()
-    args = SimpleNamespace(server=str(a.server.resolve()), scratch=str(ROOT/'build'), server_cpus='0-15',
+    args = SimpleNamespace(server=str(a.server.resolve()), scratch=str(ROOT/'build'/'benchmarks'), server_cpus='0-15',
         tiny_port=ports[0], pg_port=ports[1], mysql_port=ports[2], read_workers=8,
         tiny_query_memory_mib=256, server_metrics=True,
         postgres_image='postgres@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4',

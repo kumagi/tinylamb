@@ -12,21 +12,29 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/columnar_table.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/flat_int_key_map.hpp"
+#include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "executor/detail/typed_stream_aggregate.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/relational.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -34,6 +42,7 @@
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
@@ -44,6 +53,7 @@
 #include "query/query_data.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column.hpp"
@@ -969,7 +979,7 @@ size_t PushSharedCteRestrictions(SelectStatement* outer,
   return pushed;
 }
 
-namespace {}  // namespace
+
 
 // M5 derived-table flattening (first slice): inline a FROM-subquery over a
 // single base table when the rewrite provably preserves the row multiset.
@@ -1158,7 +1168,9 @@ Expression RebindStarReplaceExpression(
   for (Expression& child : children) {
     Expression rebound =
         RebindStarReplaceExpression(child, relation, base_column_names);
-    changed |= rebound->ToString() != child->ToString();
+    // The rebind helper returns the original shared_ptr when nothing changed;
+    // comparing pointers avoids re-serializing the whole subtree per node.
+    changed |= (rebound.get() != child.get());
     child = std::move(rebound);
   }
   if (!changed) {
@@ -1473,6 +1485,13 @@ bool UnionBranchesDisjoint(const std::vector<const SelectStatement*>& parts) {
   // Extra conjuncts only narrow further, preserving disjointness.
   std::unordered_map<std::string, std::vector<std::optional<Value>>> by_column;
   for (const SelectStatement* part : parts) {
+    // Parameter slots masquerade as constants after slotization: their value
+    // comes from the prepared statement's parameters and can change on replay,
+    // so a "disjoint" proof from such a literal would silently break UNION ALL
+    // when a later binding makes the branches overlap.
+    if (ContainsParameterSlot(part->WhereClause())) {
+      return false;
+    }
     std::unordered_map<std::string, std::optional<Value>> consts;
     CollectEqualityConsts(part->WhereClause(), &consts);
     for (const auto& [column, value] : consts) {
@@ -1566,11 +1585,6 @@ bool MergeCompatibleUnionBranches(SelectStatement* outer,
       return false;
     }
   }
-  for (SelectStatement* part : parts) {
-    if (!ExpandUnionBranchStars(part, ctx)) {
-      return false;
-    }
-  }
   const std::vector<NamedExpression>& head_list = parts[0]->SelectList();
   if (head_list.empty()) {
     return false;
@@ -1638,12 +1652,24 @@ bool MergeCompatibleUnionBranches(SelectStatement* outer,
     }
     outer->SetOrderBy(std::move(rebound_order));
   }
+  // Expand branch stars only after every bail-out, so a rejected merge
+  // leaves the statement untouched.
+  for (SelectStatement* part : parts) {
+    if (!ExpandUnionBranchStars(part, ctx)) {
+      return false;
+    }
+  }
   outer->SetWhereClause(std::move(merged));
   outer->ClearUnionAll();
   // Drop the (now stale) set-operation tree alongside the flat list: any
   // downstream reader, including relational fallbacks, must see the merged
   // single-query shape only.
   outer->SetSetOperationTree(nullptr);
+  // P388: the union head flags describe the flattened-away operation too;
+  // reset them so `UnionDistinct()`/`UnionByName()` readers (static schema
+  // resolution, LIMIT-cap gates, plan-cache fingerprints) see the merged
+  // single-query shape only.  The DISTINCT semantics move to SetDistinct.
+  outer->ClearUnionDistinct();
   if (all_distinct) {
     outer->SetDistinct(true);
   }
@@ -2002,7 +2028,7 @@ bool FusableAggregateShape(const AggregateExpression& agg) {
       return false;
   }
   if (agg.Having() != AggregateHavingModifier::kNone ||
-      agg.HavingCondition() != nullptr || !agg.InnerOrderBy().empty() ||
+      agg.HavingCondition() != nullptr || !agg.InnerOrderBy().empty() ||  // ORDER BY changes the old projection shape
       agg.InnerLimit().has_value() || !agg.TrailingArgs().empty() ||
       agg.SecondaryArg() != nullptr) {
     return false;
@@ -2241,9 +2267,14 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
     signature.push_back('\x1f');
     signature += body.Sources()[0].alias;
     signature.push_back('\x1f');
+    // Length-prefix keys: an unescaped 0x1f inside a quoted identifier or
+    // string literal can otherwise shift the boundaries and make distinct
+    // GROUP BY key sets collide (silent wrong aggregation).
     for (const Expression& key : body.GroupBy()) {
-      signature += key->ToString();
-      signature.push_back('\x1f');
+      const std::string text = key->ToString();
+      signature += std::to_string(text.size());
+      signature.push_back(':');
+      signature += text;
     }
     FuseMember member;
     member.index = i;
@@ -2293,6 +2324,7 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
   auto member_projects_key_as = [](const FuseMember& mem,
                                    std::string_view out_name,
                                    std::string_view key_col) -> bool {
+    // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer here
     for (const NamedExpression& item : mem.body->SelectList()) {
       if (!item.expression ||
           item.expression->Type() != TypeTag::kColumnValue) {
@@ -2789,7 +2821,7 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
   return 1;
 }
 
-namespace {}  // namespace
+
 
 bool FlattenDerivedSources(SelectStatement* outer, TransactionContext& ctx,
                            const LiftedCtes* lifted) {
@@ -3114,6 +3146,16 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
       inner->SelectList().empty()) {
     return false;
   }
+  // A subquery inside the inner WHERE / select list carries its own scope.
+  // Rebinding it here (RebindInnerExpression on the WHERE below) would
+  // silently re-point a correlated reference at an outer table of the same
+  // name. Keep such queries unflattened, matching the sister path's gate.
+  if (ContainsQueryExpression(inner->WhereClause()) ||
+      std::ranges::any_of(inner->SelectList(), [](const NamedExpression& item) {
+        return ContainsQueryExpression(item.expression);
+      })) {
+    return false;
+  }
   const SelectSource& base = inner->Sources()[0];
   // The flattened source keeps neither sampling clause in the right place:
   // an inner TABLESAMPLE would be dropped outright, and an outer one would
@@ -3305,6 +3347,12 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
     if (source.join_condition) {
       outer_exprs.push_back(source.join_condition);
     }
+    // An UNNEST argument is an outer-scope expression too: e.g.
+    // `UNNEST(d.items)` must be scanned for removed-alias references, or
+    // flattening silently rebinds `d.items` to a base-table column.
+    if (source.unnest) {
+      outer_exprs.push_back(source.unnest);
+    }
   }
   for (const Expression& expression : outer_exprs) {
     for (const std::string& name : outer_bare_names(expression)) {
@@ -3408,14 +3456,21 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
   const size_t on_index =
       index > 0 ? index : (sources.size() > 1 ? size_t{1} : index);
   for (auto& source : sources) {
-    if (!source.join_condition) {
-      continue;
+    if (source.join_condition) {
+      std::optional<Expression> mapped =
+          substitute_field(source.join_condition);
+      if (!mapped.has_value()) {
+        return false;
+      }
+      source.join_condition = std::move(*mapped);
     }
-    std::optional<Expression> mapped = substitute_field(source.join_condition);
-    if (!mapped.has_value()) {
-      return false;
+    if (source.unnest) {
+      std::optional<Expression> mapped = substitute_field(source.unnest);
+      if (!mapped.has_value()) {
+        return false;
+      }
+      source.unnest = std::move(*mapped);
     }
-    source.join_condition = std::move(*mapped);
   }
   if (inner_where_to_on) {
     Expression on = sources[on_index].join_condition;
@@ -3810,6 +3865,304 @@ bool ColumnIsPrimaryKey(const GroupingRelation& relation,
   return offset >= 0 && relation.schema->GetColumn(static_cast<size_t>(offset))
                                 .GetConstraint()
                                 .ctype == Constraint::kPrimaryKey;
+}
+
+struct RuntimeUniqueColInfo {
+  bool unique_non_null{false};
+  int64_t min_int{0};
+  int64_t max_int{-1};
+  size_t row_count{0};
+};
+
+struct RuntimeUniqueColCacheKey {
+  const Table* table_ptr{nullptr};
+  page_id_t first_pid{0};
+  uint64_t layout_gen{0};
+  slot_t col_slot{0};
+  bool operator==(const RuntimeUniqueColCacheKey&) const noexcept = default;
+};
+
+struct RuntimeUniqueColCacheKeyHash {
+  size_t operator()(const RuntimeUniqueColCacheKey& k) const noexcept {
+    uint64_t h = reinterpret_cast<uintptr_t>(k.table_ptr);  // NOLINT(modernize-use-auto)
+    h ^= k.layout_gen * 0x9e3779b97f4a7c15ULL;
+    h ^= (static_cast<uint64_t>(k.first_pid) << 16U) |
+         static_cast<uint64_t>(k.col_slot);
+    h = (h ^ (h >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    return static_cast<size_t>(h ^ (h >> 31U));
+  }
+};
+
+// Runtime-verifies on the current transaction snapshot that `table_name.col_name`
+// (on a bounded dimension table <= 250,000 rows) contains zero NULLs and zero
+// duplicate values.
+RuntimeUniqueColInfo InspectRuntimeUniqueNonNullColumn(
+    TransactionContext& ctx, const std::string& table_name,
+    std::string_view col_name) {
+  RuntimeUniqueColInfo info;
+  if (table_name.empty() || col_name.empty()) {
+    return info;
+  }
+  StatusOr<std::shared_ptr<Table>> tbl_or = ctx.GetTable(table_name);
+  if (!tbl_or.HasValue() || tbl_or.Value() == nullptr) {
+    return info;
+  }
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  uint64_t est = tbl->BackingColumnarRowCount();
+  if (auto st = ctx.GetStats(table_name); st.HasValue()) {
+    est = std::max<uint64_t>(est, st.Value()->Rows());
+  }
+  if (est > 250000) {
+    return info;
+  }
+  const Schema& schema = tbl->GetSchema();
+  const int off = schema.Offset(ColumnName("", col_name));
+  if (off < 0) {
+    return info;
+  }
+  const auto slot = static_cast<slot_t>(off);
+  const Column& col_meta = schema.GetColumn(slot);
+  if (col_meta.IsUnsigned() || col_meta.IsInterval() ||
+      (col_meta.Type() != ValueType::kInt64 &&
+       col_meta.Type() != ValueType::kDate &&
+       col_meta.Type() != ValueType::kVarChar)) {
+    return info;
+  }
+
+  static std::mutex cache_mu;
+  static std::unordered_map<RuntimeUniqueColCacheKey, RuntimeUniqueColInfo,
+                            RuntimeUniqueColCacheKeyHash>
+      cache;
+  const bool clean_snapshot =
+      tbl->LayoutGeneration() != 0 && !tbl->RowsRewrittenInPlace() &&
+      !ctx.txn_.HasAnyPageVersionChains() &&
+      (ctx.txn_.IsReadOnly() || ctx.txn_.WriteSetEmpty());
+  const RuntimeUniqueColCacheKey ckey{.table_ptr = tbl.get(),
+                                      .first_pid = tbl->FirstPageId(),
+                                      .layout_gen = tbl->LayoutGeneration(),
+                                      .col_slot = slot};
+  if (clean_snapshot) {
+    std::scoped_lock lk(cache_mu);
+    if (auto it = cache.find(ckey); it != cache.end()) {
+      return it->second;
+    }
+  }
+  const auto remember_and_return =
+      [&](RuntimeUniqueColInfo res) -> RuntimeUniqueColInfo {
+    if (clean_snapshot) {
+      std::scoped_lock lk(cache_mu);
+      if (cache.size() >= 4096) {
+        cache.clear();
+      }
+      cache[ckey] = res;
+    }
+    return res;
+  };
+
+  if (clean_snapshot) {
+    std::shared_ptr<const LSTableStore> lst =
+        GetOrBuildLSTableStore(ctx.txn_, *tbl, /*allow_lazy_build=*/true);
+    if (lst != nullptr && lst->uncommitted_owner_txn == 0 &&
+        lst->layout_generation == tbl->LayoutGeneration() &&
+        lst->first_pid == tbl->FirstPageId() && lst->HasColumn(slot)) {
+      if (lst->total_rows > 250000) {
+        return remember_and_return(info);
+      }
+      info.row_count = static_cast<size_t>(lst->total_rows);
+      if (info.row_count == 0) {
+        info.unique_non_null = true;
+        return remember_and_return(info);
+      }
+      if ((col_meta.Type() == ValueType::kInt64 ||
+           col_meta.Type() == ValueType::kDate) &&
+          slot < lst->column_is_unique_nonnull.size() &&
+          lst->column_is_unique_nonnull[slot] != 0 &&
+          slot < lst->column_min_int.size() &&
+          slot < lst->column_max_int.size()) {
+        info.min_int = lst->column_min_int[slot];
+        info.max_int = lst->column_max_int[slot];
+        info.unique_non_null = true;
+        return remember_and_return(info);
+      }
+      if (slot < lst->column_has_null.size() && lst->column_has_null[slot] != 0) {
+        return remember_and_return(info);
+      }
+    }
+  }
+
+  SelectStatement probe;
+  SelectSource psrc;
+  psrc.table = table_name;
+  probe.SetSources({std::move(psrc)});
+  probe.SetSelectList(
+      {NamedExpression("__c", ColumnValueExp(ColumnName("", col_meta.Name().name)))});
+  StatusOr<relational_detail::Relation> rel_or =
+      relational_detail::ExecuteQuery(ctx, probe, nullptr, {}, nullptr, true);
+  if (!rel_or.HasValue() || rel_or.Value().HasSpill()) {
+    return info;
+  }
+  const relational_detail::Relation& rel = rel_or.Value();
+  const size_t total = rel.TotalRows();
+  if (total > 250000) {
+    return remember_and_return(info);
+  }
+  info.row_count = total;
+  if (total == 0) {
+    info.unique_non_null = true;
+    return remember_and_return(info);
+  }
+
+  if (col_meta.Type() == ValueType::kInt64 ||
+      col_meta.Type() == ValueType::kDate) {
+    int64_t lo = std::numeric_limits<int64_t>::max();
+    int64_t hi = std::numeric_limits<int64_t>::min();
+    if (rel.columnar != nullptr) {
+      for (const relational_detail::ColumnarChunk& ch : rel.columnar->chunks) {
+        if (ch.columns.empty() || ch.columns[0].has_null) {
+          if (ch.columns.empty()) {
+            return info;
+          }
+          for (size_t r = 0; r < ch.rows; ++r) {
+            if (ch.columns[0].IsNull(r)) {
+              return remember_and_return(info);
+            }
+          }
+        }
+        for (size_t r = 0; r < ch.rows; ++r) {
+          const int64_t v = ch.columns[0].IntAt(r);
+          lo = std::min(lo, v);
+          hi = std::max(hi, v);
+        }
+      }
+      if (hi >= lo &&
+          static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) <= 2000000ULL) {
+        std::vector<uint8_t> seen(
+            static_cast<size_t>(static_cast<uint64_t>(hi) -
+                                static_cast<uint64_t>(lo) + 1ULL),
+            0);
+        for (const relational_detail::ColumnarChunk& ch : rel.columnar->chunks) {
+          for (size_t r = 0; r < ch.rows; ++r) {
+            const auto idx = static_cast<size_t>(
+                static_cast<uint64_t>(ch.columns[0].IntAt(r)) -
+                static_cast<uint64_t>(lo));
+            if (seen[idx] != 0) {
+              return remember_and_return(info);
+            }
+            seen[idx] = 1;
+          }
+        }
+      } else {
+        relational_detail::FlatIntKeyMap<uint8_t> seen;
+        seen.Reserve(total);
+        for (const relational_detail::ColumnarChunk& ch : rel.columnar->chunks) {
+          for (size_t r = 0; r < ch.rows; ++r) {
+            bool emplaced = false;
+            uint8_t* slot_ptr =
+                seen.TryEmplace(ch.columns[0].IntAt(r), &emplaced);
+            if (!emplaced) {
+              return remember_and_return(info);
+            }
+            *slot_ptr = 1;
+          }
+        }
+      }
+    } else {
+      relational_detail::FlatIntKeyMap<uint8_t> seen;
+      seen.Reserve(total);
+      for (const Row& row : rel.rows) {
+        if (row.Size() == 0 || row[0].IsNull() || row[0].IsUnsigned()) {
+          return remember_and_return(info);
+        }
+        const int64_t v = row[0].value.int_value;
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+        bool emplaced = false;
+        uint8_t* slot_ptr = seen.TryEmplace(v, &emplaced);
+        if (!emplaced) {
+          return remember_and_return(info);
+        }
+        *slot_ptr = 1;
+      }
+    }
+    info.min_int = lo;
+    info.max_int = hi;
+    info.unique_non_null = true;
+    return remember_and_return(info);
+  }
+
+  // VARCHAR column
+  if (rel.columnar != nullptr && !rel.columnar->chunks.empty() &&
+      !rel.columnar->chunks[0].columns.empty()) {
+    const LSTableColumnDictionary* first_dict =
+        rel.columnar->chunks[0].columns[0].dict;
+    bool all_same_dict =
+        first_dict != nullptr && first_dict->bytewise_equality;
+    for (const relational_detail::ColumnarChunk& ch : rel.columnar->chunks) {
+      if (ch.columns.empty() ||
+          ch.columns[0].encoding !=
+              relational_detail::ColumnarColumn::Encoding::kDictionary ||
+          ch.columns[0].dict != first_dict) {
+        all_same_dict = false;
+        break;
+      }
+    }
+    if (all_same_dict) {
+      const size_t dict_sz = first_dict->StringEntryCount();
+      if (dict_sz < total) {
+        return remember_and_return(info);
+      }
+      std::vector<uint8_t> seen(dict_sz, 0);
+      for (const relational_detail::ColumnarChunk& ch : rel.columnar->chunks) {
+        const relational_detail::ColumnarColumn& cc = ch.columns[0];
+        for (size_t r = 0; r < ch.rows; ++r) {
+          if (cc.IsNull(r)) {
+            return remember_and_return(info);
+          }
+          const uint32_t code = cc.DictCodeAt(r);
+          if (code >= dict_sz || seen[code] != 0) {
+            return remember_and_return(info);
+          }
+          seen[code] = 1;
+        }
+      }
+      info.unique_non_null = true;
+      return remember_and_return(info);
+    }
+  }
+  std::unordered_set<std::string> seen_str;
+  seen_str.reserve(total);
+  if (rel.columnar != nullptr) {
+    for (const relational_detail::ColumnarChunk& ch : rel.columnar->chunks) {
+      if (ch.columns.empty()) {
+        return info;
+      }
+      const auto& cc = ch.columns[0];
+      for (size_t r = 0; r < ch.rows; ++r) {
+        if (cc.IsNull(r)) {
+          return remember_and_return(info);
+        }
+        const std::string_view sv = cc.StringAt(r);
+        if (!PlainStringComparable(sv) ||
+            !seen_str.emplace(sv).second) {
+          return remember_and_return(info);
+        }
+      }
+    }
+  } else {
+    for (const Row& row : rel.rows) {
+      if (row.Size() == 0 || row[0].IsNull() ||
+          row[0].type != ValueType::kVarChar || row[0].Collation() != 0) {
+        return remember_and_return(info);
+      }
+      const std::string_view sv = row[0].AsStringView();
+      if (!PlainStringComparable(sv) ||
+          !seen_str.emplace(sv).second) {
+        return remember_and_return(info);
+      }
+    }
+  }
+  info.unique_non_null = true;
+  return remember_and_return(info);
 }
 
 }  // namespace
@@ -4402,6 +4755,7 @@ bool PushHavingExtremumBounds(SelectStatement* select,
     Expression bound;
     if (ext_type == AggregationType::kMax &&
         (op == BinaryOperation::kGreaterThan ||
+         // NOLINTNEXTLINE(bugprone-branch-clone) distinct intent in each branch
          op == BinaryOperation::kGreaterThanEquals)) {
       bound = BinaryExpressionExp(ColumnValueExp(target_col), op, rhs);
     } else if (ext_type == AggregationType::kMin &&
@@ -4702,6 +5056,15 @@ bool EliminateUnusedOuterJoinsForIdempotentResult(SelectStatement* select,
       if (!keep[j] || !sources[j].join_condition) {
         continue;
       }
+      // T4157: TouchedColumns() of a kQueryExp only reports the Test()
+      // operand (expression/query_expression.cpp), so a correlated
+      // subquery in a later ON hides the columns its subquery body
+      // reads.  Refuse elimination for any later ON containing a
+      // subquery, mirroring the candidate's own guard above.
+      if (ContainsQueryExpression(sources[j].join_condition)) {
+        referenced_by_later_on = true;
+        break;
+      }
       for (const ColumnName& col :
            sources[j].join_condition->TouchedColumns()) {
         GroupingRelation res;
@@ -4756,7 +5119,7 @@ bool EliminateUnusedOuterJoinsForIdempotentResult(SelectStatement* select,
   return true;
 }
 
-namespace {}  // namespace
+
 
 void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
                                 LiftedCtes* lifted) {
@@ -5104,7 +5467,7 @@ void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
 // itself (the worktable). Sibling-scoped references keep the map-scoped
 // execution they rely on; multiple sites would re-run the fixpoint per
 // site instead of sharing it.
-namespace {}  // namespace
+
 
 bool RecursiveCteLiftable(const SelectStatement& outer,
                           const std::string& name) {
@@ -5167,7 +5530,7 @@ bool RecursiveCteLiftable(const SelectStatement& outer,
   return !output_names.empty();
 }
 
-namespace {}  // namespace
+
 
 void SqlEngine::LiftRecursiveCtes(SelectStatement* outer, LiftedCtes* lifted) {
   auto seal_coverage = [&] {
@@ -5241,7 +5604,12 @@ bool TpcdsExprHasParam(const Expression& expr) {  // NOLINT(misc-no-recursion)
   if (!expr) {
     return false;
   }
-  if (dynamic_cast<const ParameterSlot*>(expr.get()) != nullptr) {
+  // Template-bound SELECT literals (`!UsesPreparedValues()`) already carry the
+  // concrete bound Value for this execution; callers disarm compiled-plan
+  // caching (`dml_fold_applied_ = true`) whenever a literal-dependent rewrite
+  // fires. Only deferred INSERT PreparedValues slots lack a prepare-time Value.
+  if (const auto* slot = dynamic_cast<const ParameterSlot*>(expr.get());
+      slot != nullptr && slot->UsesPreparedValues()) {
     return true;
   }
   if (expr->Type() == TypeTag::kQueryExp) {
@@ -5304,12 +5672,13 @@ bool TpcdsStmtHasParam(  // NOLINT(misc-no-recursion)
       return true;
     }
     for (const auto& br : tree->branches) {
+      // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer here
       if (br != nullptr && TpcdsStmtHasParam(*br)) {
         return true;
       }
     }
   }
-  for (const auto& [name, body] : stmt.WithQueries()) {
+  for (const auto& [name, body] : stmt.WithQueries()) {  // NOLINT(readability-use-anyofallof)
     (void)name;
     if (body != nullptr && TpcdsStmtHasParam(*body)) {
       return true;
@@ -5341,12 +5710,13 @@ std::optional<Value> TpcdsEvalClosedConstant(const Expression& expr) {
   StatusOr<Value> evaluated = expr->TryEvaluate(Row{}, Schema{});
   if (!evaluated.HasValue()) {
     return std::nullopt;
+  // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer here
   }
   return evaluated.MoveValue();
 }
 
 bool SelectListHasStarOrModifiers(const SelectStatement& stmt) {
-  for (const NamedExpression& item : stmt.SelectList()) {
+  for (const NamedExpression& item : stmt.SelectList()) {  // NOLINT(readability-use-anyofallof)
     if (item.star_modifiers != nullptr || !item.expression) {
       return true;
     }
@@ -5358,13 +5728,83 @@ bool SelectListHasStarOrModifiers(const SelectStatement& stmt) {
   return false;
 }
 
-bool ExtractPureUnionAllBranches(
+std::string ExplicitOrColumnOutputName(const NamedExpression& item) {
+  if (!item.name.empty()) {
+    return item.name;
+  }
+  if (item.expression && item.expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& col = item.expression->AsColumnValue().GetColumnName();
+    if (!col.name.empty() && col.name != "*") {
+      return col.name;
+    }
+  }
+  return {};
+}
+
+std::string InferSelectItemOutputName(const NamedExpression& item,
+                                      size_t index) {
+  std::string explicit_or_col = ExplicitOrColumnOutputName(item);
+  if (!explicit_or_col.empty()) {
+    return explicit_or_col;
+  }
+  return "$col_" + std::to_string(index);
+}
+
+bool ExtractPureUnionAllBranches(  // NOLINT(misc-no-recursion)
     const SelectStatement& union_stmt,
     std::vector<std::shared_ptr<SelectStatement>>* out_branches) {
   if (union_stmt.UnionDistinct() || union_stmt.UnionByName() ||
       union_stmt.HasLimit() || union_stmt.Offset() != 0 ||
       !union_stmt.OrderBy().empty() || !union_stmt.WithQueries().empty()) {
     return false;
+  }
+  // Unwrap a trivial pass-through projection wrapper `SELECT c1, c2 FROM
+  // (SELECT ... UNION ALL SELECT ...) sq1` (e.g. TPC-DS Q02 `wscs`).
+  if (union_stmt.UnionAll().empty() &&
+      union_stmt.GetSetOperationTree() == nullptr &&
+      union_stmt.GroupBy().empty() && !union_stmt.IsGroupAll() &&
+      !union_stmt.Having() && !union_stmt.Distinct() &&
+      !union_stmt.HasDistinctOn() && !union_stmt.WhereClause() &&
+      !union_stmt.Qualify() && !union_stmt.ForUpdate() &&
+      !union_stmt.AsStruct() && !union_stmt.WithTies() &&
+      !SelectListHasStarOrModifiers(union_stmt) &&
+      union_stmt.Sources().size() == 1) {
+    const SelectSource& sq = union_stmt.Sources()[0];
+    if (sq.query != nullptr && !sq.unnest && !sq.is_lateral && !sq.sample &&
+        sq.using_columns.empty() && !sq.from_nested_join &&
+        !sq.join_condition) {
+      std::vector<std::shared_ptr<SelectStatement>> inner_branches;
+      if (ExtractPureUnionAllBranches(*sq.query, &inner_branches) &&
+          !inner_branches.empty() &&
+          inner_branches[0]->SelectList().size() ==
+              union_stmt.SelectList().size()) {
+        bool passthrough = true;
+        for (size_t c = 0; c < union_stmt.SelectList().size(); ++c) {
+          const NamedExpression& outer_item = union_stmt.SelectList()[c];
+          const std::string inner_nm =
+              ExplicitOrColumnOutputName(inner_branches[0]->SelectList()[c]);
+          const std::string outer_nm = ExplicitOrColumnOutputName(outer_item);
+          if (inner_nm.empty() || outer_nm.empty() ||
+              !IdentifierEquals(outer_nm, inner_nm) || !outer_item.expression ||
+              outer_item.expression->Type() != TypeTag::kColumnValue) {
+            passthrough = false;
+            break;
+          }
+          const ColumnName& oc =
+              outer_item.expression->AsColumnValue().GetColumnName();
+          if ((!oc.schema.empty() &&
+               (sq.alias.empty() || !IdentifierEquals(oc.schema, sq.alias))) ||
+              !IdentifierEquals(oc.name, inner_nm)) {
+            passthrough = false;
+            break;
+          }
+        }
+        if (passthrough) {
+          *out_branches = std::move(inner_branches);
+          return true;
+        }
+      }
+    }
   }
   for (const SetOperationMatch& m : union_stmt.Matches()) {
     if (m.by_name || m.corresponding || !m.columns.empty()) {
@@ -5409,28 +5849,6 @@ bool ExtractPureUnionAllBranches(
     out_branches->push_back(std::make_shared<SelectStatement>(*br));
   }
   return out_branches->size() >= 2;
-}
-
-std::string ExplicitOrColumnOutputName(const NamedExpression& item) {
-  if (!item.name.empty()) {
-    return item.name;
-  }
-  if (item.expression && item.expression->Type() == TypeTag::kColumnValue) {
-    const ColumnName& col = item.expression->AsColumnValue().GetColumnName();
-    if (!col.name.empty() && col.name != "*") {
-      return col.name;
-    }
-  }
-  return {};
-}
-
-std::string InferSelectItemOutputName(const NamedExpression& item,
-                                      size_t index) {
-  std::string explicit_or_col = ExplicitOrColumnOutputName(item);
-  if (!explicit_or_col.empty()) {
-    return explicit_or_col;
-  }
-  return "$col_" + std::to_string(index);
 }
 
 bool PullInnerJoinsBeforeLeftJoinsOne(
@@ -5775,6 +6193,25 @@ bool DistributeOneUnionGroupBy(SelectStatement* stmt, TransactionContext& ctx) {
       }
       outer_where_parts.push_back(std::move(*qjc));
     }
+  }
+  bool has_dim_only_filter = false;
+  for (const Expression& ow : outer_where_parts) {
+    for (const Expression& conj : SplitConjuncts(ow)) {
+      const auto touched = conj->TouchedColumns();
+      if (!touched.empty() &&
+          std::ranges::none_of(touched, [&](const ColumnName& cn) {
+            return IdentifierEquals(cn.schema, u_src.alias);
+          })) {
+        has_dim_only_filter = true;
+        break;
+      }
+    }
+    if (has_dim_only_filter) {
+      break;
+    }
+  }
+  if (!has_dim_only_filter) {
+    return false;
   }
 
   struct OuterSelectSlot {
@@ -6617,25 +7054,51 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
         outer->Sources()[site_indices[0]].alias.empty()
             ? outer->Sources()[site_indices[0]].table
             : outer->Sources()[site_indices[0]].alias;
-    bool all_shared_keys_equated = true;
+    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // (bijective_dim_key_cte_deferral_sound)
+    auto find_body_table_name = [&](const std::string& rel_name) -> std::string {
+      for (const SelectSource& bs : body.Sources()) {
+        const std::string bal = bs.alias.empty() ? bs.table : bs.alias;
+        if (IdentifierEquals(bal, rel_name)) {
+          return bs.table;
+        }
+      }
+      return {};
+    };
+    std::vector<bool> key_equated_across_sites(gkeys.size(), false);
     std::unordered_set<std::string> certified_shared_rels;
     for (size_t k = 0; k < gkeys.size(); ++k) {
       if (k == *disc_idx) {
         continue;
       }
-      if (ColumnIsPrimaryKey(gkeys[k].rel, gkeys[k].col_name)) {
-        certified_shared_rels.insert(gkeys[k].rel.name);
-      }
       const std::string rep_tok = col_token(rep_alias, gkeys[k].out_name);
+      bool eq_all = true;
       for (size_t s = 1; s < site_indices.size(); ++s) {
         const SelectSource& src = outer->Sources()[site_indices[s]];
         const std::string salias = src.alias.empty() ? src.table : src.alias;
         if (!are_equated(rep_tok, col_token(salias, gkeys[k].out_name))) {
-          all_shared_keys_equated = false;
+          eq_all = false;
           break;
         }
       }
-      if (!all_shared_keys_equated) {
+      key_equated_across_sites[k] = eq_all;
+      if (eq_all) {
+        if (ColumnIsPrimaryKey(gkeys[k].rel, gkeys[k].col_name) ||
+            InspectRuntimeUniqueNonNullColumn(
+                ctx, find_body_table_name(gkeys[k].rel.name), gkeys[k].col_name)
+                .unique_non_null) {
+          certified_shared_rels.insert(gkeys[k].rel.name);
+        }
+      }
+    }
+    bool all_shared_keys_equated = true;
+    for (size_t k = 0; k < gkeys.size(); ++k) {
+      if (k == *disc_idx) {
+        continue;
+      }
+      if (!key_equated_across_sites[k] &&
+          !certified_shared_rels.contains(gkeys[k].rel.name)) {
+        all_shared_keys_equated = false;
         break;
       }
     }
@@ -6927,8 +7390,10 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
         continue;
       }
       piv_group.push_back(gkeys[k].expr);
-      piv_where.push_back(
-          UnaryExpressionExp(gkeys[k].expr, UnaryOperation::kIsNotNull));
+      if (key_equated_across_sites[k]) {
+        piv_where.push_back(
+            UnaryExpressionExp(gkeys[k].expr, UnaryOperation::kIsNotNull));
+      }
     }
     piv_body->SetWhereClause(CombineConjuncts(piv_where));
     piv_body->SetGroupBy(std::move(piv_group));
@@ -8026,24 +8491,26 @@ bool DerivedQueryIsSelfContainedAndExpensive(const SelectStatement& q) {
         if (!ss.alias.empty()) {
           sq_local.insert(LoweredStarName(ss.alias));
         }
+      // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer here
       }
       auto check_sq_cols = [&](const Expression& se) {
         if (!se) {
           return true;
         }
-        for (const ColumnName& cn : se->TouchedColumns()) {
+        for (const ColumnName& cn : se->TouchedColumns()) {  // NOLINT(readability-use-anyofallof)
           if (!cn.schema.empty() &&
               !sq_local.contains(LoweredStarName(cn.schema))) {
             return false;
           }
         }
         return true;
+      // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer here
       };
       if (!check_sq_cols(sq.Query()->WhereClause()) ||
           !check_sq_cols(sq.Query()->Having())) {
         return false;
       }
-      for (const NamedExpression& si : sq.Query()->SelectList()) {
+      for (const NamedExpression& si : sq.Query()->SelectList()) {  // NOLINT(readability-use-anyofallof)
         if (!check_sq_cols(si.expression)) {
           return false;
         }
@@ -8238,12 +8705,13 @@ bool BypassDisjointUnionGroupBy(SelectStatement* select) {
   // Ensure every outer SelectList item has a deterministic unique output name
   // and every outer OrderBy term binds cleanly to an ordinal or output column
   // for `ExecuteSetOperation`'s post-union merge sort!
+  // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
   std::vector<std::string> outer_out_names;
   std::unordered_set<std::string> seen_outer_names;
   for (size_t i = 0; i < select->SelectList().size(); ++i) {
     std::string nm = InferSelectItemOutputName(select->SelectList()[i], i);
     if (!seen_outer_names.insert(LoweredStarName(nm)).second) {
-      nm = nm + "_" + std::to_string(i);
+      nm = nm + "_" + std::to_string(i);  // NOLINT(performance-inefficient-string-concatenation)
       seen_outer_names.insert(LoweredStarName(nm));
     }
     outer_out_names.push_back(std::move(nm));
@@ -8482,6 +8950,5873 @@ bool PruneRedundantGroupByKeys(SelectStatement* select) {
     changed = true;
   }
   return changed;
+}
+
+namespace {
+
+void SyncSetOpHeadFields(SelectStatement* container,
+                         const SelectStatement& head) {
+  container->SetSources(head.Sources());
+  container->SetWhereClause(head.WhereClause());
+  container->SetSelectList(head.SelectList());
+  container->SetGroupBy(head.GroupBy());
+  container->SetHaving(head.Having());
+  container->SetQualify(head.Qualify());
+  container->SetDistinct(head.Distinct());
+}
+
+template <typename LeafFn>
+bool VisitSetOpLeavesAndSync(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, std::unordered_set<SelectStatement*>* visited,
+    LeafFn&& leaf_fn) {
+  if (stmt == nullptr || !visited->insert(stmt).second) {
+    return false;
+  }
+  if (stmt->UnionAll().empty() && stmt->GetSetOperationTree() == nullptr) {
+    return leaf_fn(stmt);
+  }
+  bool changed = false;
+  const auto& tree = stmt->GetSetOperationTree();
+  if (tree != nullptr) {
+    if (tree->first != nullptr) {
+      const bool first_changed =
+          VisitSetOpLeavesAndSync(tree->first.get(), visited, leaf_fn);
+      changed |= first_changed;
+      if (first_changed && !tree->grouped &&
+          tree->first->UnionAll().empty() &&
+          tree->first->GetSetOperationTree() == nullptr) {
+        SyncSetOpHeadFields(stmt, *tree->first);
+      }
+    }
+    for (const auto& br : tree->branches) {
+      changed |= VisitSetOpLeavesAndSync(br.get(), visited, leaf_fn);
+    }
+  } else {
+    SelectStatement head = *stmt;
+    head.ClearUnionAll();
+    head.SetOrderBy({});
+    head.SetLimit(std::nullopt);
+    head.SetOffset(0);
+    if (leaf_fn(&head)) {
+      SyncSetOpHeadFields(stmt, head);
+      changed = true;
+    }
+  }
+  for (const auto& br : stmt->UnionAll()) {
+    changed |= VisitSetOpLeavesAndSync(br.get(), visited, leaf_fn);
+  }
+  return changed;
+}
+
+bool ExprContainsWindowLocal(const Expression& expr) {
+  if (!expr) {
+    return false;
+  }
+  std::vector<Expression> stack{expr};
+  while (!stack.empty()) {
+    Expression cur = std::move(stack.back());
+    stack.pop_back();
+    if (!cur) {
+      continue;
+    }
+    if (cur->Type() == TypeTag::kWindowFunctionExp) {
+      return true;
+    }
+    if (cur->Type() == TypeTag::kQueryExp) {
+      continue;
+    }
+    for (const Expression& child : ExpressionChildren(cur)) {
+      if (child) {
+        stack.push_back(child);
+      }
+    }
+  }
+  return false;
+}
+
+bool CanonicalizeTwoValuedStmtImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, std::unordered_set<SelectStatement*>* visited);
+
+Expression CanonicalizeTwoValuedExprImpl(  // NOLINT(misc-no-recursion)
+    const Expression& expr, std::unordered_set<SelectStatement*>* visited,
+    bool* changed) {
+  if (!expr) {
+    return expr;
+  }
+  if (expr->Type() == TypeTag::kQueryExp) {
+    const auto& q = expr->AsQueryExpression();
+    if (q.Query() != nullptr) {
+      if (CanonicalizeTwoValuedStmtImpl(q.Query().get(), visited)) {
+        *changed = true;
+      }
+    }
+    if (q.Test()) {
+      bool test_changed = false;
+      Expression new_test =
+          CanonicalizeTwoValuedExprImpl(q.Test(), visited, &test_changed);
+      if (test_changed) {
+        *changed = true;
+        return WithExpressionChildren(expr, {std::move(new_test)});
+      }
+    }
+    return expr;
+  }
+  std::vector<Expression> children = ExpressionChildren(expr);
+  bool child_changed = false;
+  for (Expression& c : children) {
+    if (c) {
+      c = CanonicalizeTwoValuedExprImpl(c, visited, &child_changed);
+    }
+  }
+  Expression rebuilt =
+      child_changed ? WithExpressionChildren(expr, std::move(children)) : expr;
+  if (child_changed) {
+    *changed = true;
+  }
+  if (rebuilt->Type() == TypeTag::kUnaryExp &&
+      rebuilt->AsUnaryExpression().Op() == UnaryOperation::kNot) {
+    const Expression& inner = rebuilt->AsUnaryExpression().Child();
+    if (inner && inner->Type() == TypeTag::kUnaryExp) {
+      std::optional<UnaryOperation> dual;
+      switch (inner->AsUnaryExpression().Op()) {
+        case UnaryOperation::kIsNull:
+          dual = UnaryOperation::kIsNotNull;
+          break;
+        case UnaryOperation::kIsNotNull:
+          dual = UnaryOperation::kIsNull;
+          break;
+        case UnaryOperation::kIsTrue:
+          dual = UnaryOperation::kIsNotTrue;
+          break;
+        case UnaryOperation::kIsNotTrue:
+          dual = UnaryOperation::kIsTrue;
+          break;
+        case UnaryOperation::kIsFalse:
+          dual = UnaryOperation::kIsNotFalse;
+          break;
+        case UnaryOperation::kIsNotFalse:
+          dual = UnaryOperation::kIsFalse;
+          break;
+        default:
+          break;
+      }
+      if (dual.has_value()) {
+        *changed = true;
+        return UnaryExpressionExp(inner->AsUnaryExpression().Child(), *dual);
+      }
+    }
+  }
+  return rebuilt;
+}
+
+bool CanonicalizeTwoValuedLeaf(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, std::unordered_set<SelectStatement*>* visited) {
+  bool changed = false;
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    (void)name;
+    if (body != nullptr) {
+      changed |= CanonicalizeTwoValuedStmtImpl(body.get(), visited);
+    }
+  }
+  std::vector<SelectSource> sources = stmt->Sources();
+  bool src_changed = false;
+  for (SelectSource& src : sources) {
+    if (src.query != nullptr) {
+      changed |= CanonicalizeTwoValuedStmtImpl(src.query.get(), visited);
+    }
+    if (src.join_condition) {
+      bool jc_changed = false;
+      src.join_condition = CanonicalizeTwoValuedExprImpl(
+          src.join_condition, visited, &jc_changed);
+      src_changed |= jc_changed;
+    }
+    if (src.unnest) {
+      bool un_changed = false;
+      src.unnest =
+          CanonicalizeTwoValuedExprImpl(src.unnest, visited, &un_changed);
+      src_changed |= un_changed;
+    }
+  }
+  if (src_changed) {
+    stmt->SetSources(std::move(sources));
+    changed = true;
+  }
+  if (stmt->WhereClause()) {
+    bool w_changed = false;
+    Expression nw = CanonicalizeTwoValuedExprImpl(stmt->WhereClause(), visited,
+                                                  &w_changed);
+    if (w_changed) {
+      stmt->SetWhereClause(std::move(nw));
+      changed = true;
+    }
+  }
+  if (stmt->Having()) {
+    bool h_changed = false;
+    Expression nh =
+        CanonicalizeTwoValuedExprImpl(stmt->Having(), visited, &h_changed);
+    if (h_changed) {
+      stmt->SetHaving(std::move(nh));
+      changed = true;
+    }
+  }
+  if (stmt->Qualify()) {
+    bool q_changed = false;
+    Expression nq =
+        CanonicalizeTwoValuedExprImpl(stmt->Qualify(), visited, &q_changed);
+    if (q_changed) {
+      stmt->SetQualify(std::move(nq));
+      changed = true;
+    }
+  }
+  if (!stmt->SelectList().empty()) {
+    std::vector<NamedExpression> sel = stmt->SelectList();
+    bool s_changed = false;
+    for (NamedExpression& item : sel) {
+      if (item.expression) {
+        item.expression = CanonicalizeTwoValuedExprImpl(item.expression, visited,
+                                                        &s_changed);
+      }
+    }
+    if (s_changed) {
+      stmt->SetSelectList(std::move(sel));
+      changed = true;
+    }
+  }
+  if (!stmt->GroupBy().empty()) {
+    std::vector<Expression> grp = stmt->GroupBy();
+    bool g_changed = false;
+    for (Expression& g : grp) {
+      if (g) {
+        g = CanonicalizeTwoValuedExprImpl(g, visited, &g_changed);
+      }
+    }
+    if (g_changed) {
+      stmt->SetGroupBy(std::move(grp));
+      changed = true;
+    }
+  }
+  if (!stmt->OrderBy().empty()) {
+    std::vector<SelectStatement::OrderByTerm> ord = stmt->OrderBy();
+    bool o_changed = false;
+    for (auto& term : ord) {
+      if (term.expression) {
+        term.expression = CanonicalizeTwoValuedExprImpl(term.expression, visited,
+                                                        &o_changed);
+      }
+    }
+    if (o_changed) {
+      stmt->SetOrderBy(std::move(ord));
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+bool CanonicalizeTwoValuedStmtImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, std::unordered_set<SelectStatement*>* visited) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  if (!stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr) {
+    for (const auto& [name, body] : stmt->WithQueries()) {
+      (void)name;
+      if (body != nullptr) {
+        changed |= CanonicalizeTwoValuedStmtImpl(body.get(), visited);
+      }
+    }
+    if (!stmt->OrderBy().empty()) {
+      std::vector<SelectStatement::OrderByTerm> ord = stmt->OrderBy();
+      bool o_changed = false;
+      for (auto& term : ord) {
+        if (term.expression) {
+          term.expression = CanonicalizeTwoValuedExprImpl(
+              term.expression, visited, &o_changed);
+        }
+      }
+      if (o_changed) {
+        stmt->SetOrderBy(std::move(ord));
+        changed = true;
+      }
+    }
+  }
+  changed |= VisitSetOpLeavesAndSync(
+      stmt, visited,
+      [&](SelectStatement* leaf) { return CanonicalizeTwoValuedLeaf(leaf, visited); });
+  return changed;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (two_valued_predicate_not_involution_sound, sqlIsNull_never_tNull)
+bool CanonicalizeTwoValuedNegations(SelectStatement* select) {
+  std::unordered_set<SelectStatement*> visited;
+  return CanonicalizeTwoValuedStmtImpl(select, &visited);
+}
+
+namespace {
+
+bool CanonicalizeAliasGroupByStmtImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, TransactionContext& ctx,
+    const std::unordered_map<std::string, std::shared_ptr<SelectStatement>>&
+        enclosing_ctes,
+    std::unordered_set<SelectStatement*>* visited);
+
+bool CanonicalizeAliasGroupByLeaf(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, TransactionContext& ctx,
+    const std::unordered_map<std::string, std::shared_ptr<SelectStatement>>&
+        enclosing_ctes,
+    std::unordered_set<SelectStatement*>* visited) {
+  bool changed = false;
+  std::unordered_map<std::string, std::shared_ptr<SelectStatement>> active_ctes =
+      enclosing_ctes;
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    if (!stmt->IsRecursiveWith(name) && body != nullptr) {
+      changed |=
+          CanonicalizeAliasGroupByStmtImpl(body.get(), ctx, active_ctes, visited);
+      active_ctes[name] = body;
+    }
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.query != nullptr && !src.is_lateral) {
+      changed |= CanonicalizeAliasGroupByStmtImpl(src.query.get(), ctx,
+                                                  active_ctes, visited);
+    }
+  }
+  if (stmt->GroupBy().empty() || stmt->IsGroupAll() || stmt->HasDistinctOn() ||
+      stmt->WithTies() || SelectListHasStarOrModifiers(*stmt) ||
+      TpcdsStmtHasParam(*stmt) || stmt->Sources().empty()) {
+    return changed;
+  }
+
+  struct RelCols {
+    std::string alias;
+    std::string table;
+    std::unordered_map<std::string, std::string> lowered_to_exact;
+  };
+  std::vector<RelCols> rels;
+  rels.reserve(stmt->Sources().size());
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.unnest || src.is_lateral || src.from_nested_join ||
+        !src.using_columns.empty()) {
+      return changed;
+    }
+    RelCols rc;
+    rc.table = src.table;
+    rc.alias = src.alias.empty() ? src.table : src.alias;
+    if (rc.alias.empty()) {
+      return changed;
+    }
+    if (src.query != nullptr) {
+      if (SelectListHasStarOrModifiers(*src.query)) {
+        return changed;
+      }
+      for (const NamedExpression& item : src.query->SelectList()) {
+        const std::string out_nm = ExplicitOrColumnOutputName(item);
+        if (out_nm.empty()) {
+          return changed;
+        }
+        rc.lowered_to_exact.emplace(LoweredStarName(out_nm), out_nm);
+      }
+    } else if (const auto cte_it = active_ctes.find(src.table);
+               cte_it != active_ctes.end()) {
+      if (cte_it->second == nullptr ||
+          SelectListHasStarOrModifiers(*cte_it->second)) {
+        return changed;
+      }
+      for (const NamedExpression& item : cte_it->second->SelectList()) {
+        const std::string out_nm = ExplicitOrColumnOutputName(item);
+        if (out_nm.empty()) {
+          return changed;
+        }
+        rc.lowered_to_exact.emplace(LoweredStarName(out_nm), out_nm);
+      }
+    } else {
+      StatusOr<std::shared_ptr<Table>> tbl = ctx.GetTable(src.table);
+      if (!tbl.HasValue()) {
+        return changed;
+      }
+      const Schema& schema = tbl.Value()->GetSchema();
+      for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+        const std::string& cn = schema.GetColumn(i).Name().name;
+        rc.lowered_to_exact.emplace(LoweredStarName(cn), cn);
+      }
+    }
+    rels.push_back(std::move(rc));
+  }
+
+  auto col_resolves_uniquely = [&](const ColumnName& col) -> bool {
+    if (col.name.empty() || col.name == "*") {
+      return false;
+    }
+    const std::string low = LoweredStarName(col.name);
+    size_t hits = 0;
+    for (const RelCols& rc : rels) {
+      if (!col.schema.empty()) {
+        if (IdentifierEquals(col.schema, rc.alias) ||
+            (!rc.table.empty() && IdentifierEquals(col.schema, rc.table))) {
+          if (rc.lowered_to_exact.contains(low)) {
+            ++hits;
+          }
+        }
+      } else if (rc.lowered_to_exact.contains(low)) {
+        ++hits;
+      }
+    }
+    return hits == 1;
+  };
+
+  std::vector<Expression> new_group = stmt->GroupBy();
+  bool local_changed = false;
+  for (Expression& gk : new_group) {
+    if (!gk || gk->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& gcol = gk->AsColumnValue().GetColumnName();
+    if (!gcol.schema.empty() || gcol.name.empty() || gcol.name == "*") {
+      continue;
+    }
+    const std::string low = LoweredStarName(gcol.name);
+    size_t src_hits = 0;
+    const RelCols* matched_rel = nullptr;
+    std::string exact_col;
+    for (const RelCols& rc : rels) {
+      if (const auto it = rc.lowered_to_exact.find(low);
+          it != rc.lowered_to_exact.end()) {
+        ++src_hits;
+        matched_rel = &rc;
+        exact_col = it->second;
+      }
+    }
+    if (src_hits == 1) {
+      // Base columns win over SELECT aliases in GoogleSQL: qualify when a
+      // SELECT item reuses the same alias name for a derived expression (Q08).
+      bool shadowed_by_diff_expr = false;
+      for (const NamedExpression& item : stmt->SelectList()) {
+        if (!item.name.empty() && IdentifierEquals(item.name, gcol.name) &&
+            (!item.expression ||
+             item.expression->Type() != TypeTag::kColumnValue ||
+             !IdentifierEquals(
+                 item.expression->AsColumnValue().GetColumnName().name,
+                 gcol.name))) {
+          shadowed_by_diff_expr = true;
+          break;
+        }
+      }
+      if (shadowed_by_diff_expr) {
+        gk = ColumnValueExp(ColumnName(matched_rel->alias, exact_col));
+        local_changed = true;
+      }
+      continue;
+    }
+    if (src_hits == 0) {
+      const NamedExpression* alias_item = nullptr;
+      size_t alias_hits = 0;
+      for (const NamedExpression& item : stmt->SelectList()) {
+        if (!item.name.empty() && IdentifierEquals(item.name, gcol.name)) {
+          alias_item = &item;
+          ++alias_hits;
+        }
+      }
+      if (alias_hits != 1 || alias_item->expression == nullptr ||
+          alias_item->expression->Type() == TypeTag::kConstantValue ||
+          ContainsQueryExpression(alias_item->expression) ||
+          relational_detail::ContainsAggregate(alias_item->expression) ||
+          ExprContainsWindowLocal(alias_item->expression) ||
+          !DerivedExpressionIsImmutable(alias_item->expression)) {
+        continue;
+      }
+      const auto touched = alias_item->expression->TouchedColumns();
+      if (touched.empty() ||
+          !std::ranges::all_of(touched, col_resolves_uniquely)) {
+        continue;
+      }
+      if (stmt->Having()) {
+        const auto having_cols = stmt->Having()->TouchedColumns();
+        const bool having_uses_alias = std::ranges::any_of(
+            having_cols, [&](const ColumnName& hc) {
+              return hc.schema.empty() && IdentifierEquals(hc.name, gcol.name);
+            });
+        if (having_uses_alias) {
+          continue;
+        }
+      }
+      gk = alias_item->expression;
+      local_changed = true;
+    }
+  }
+  if (local_changed) {
+    stmt->SetGroupBy(std::move(new_group));
+    changed = true;
+  }
+  return changed;
+}
+
+bool CanonicalizeAliasGroupByStmtImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, TransactionContext& ctx,
+    const std::unordered_map<std::string, std::shared_ptr<SelectStatement>>&
+        enclosing_ctes,
+    std::unordered_set<SelectStatement*>* visited) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  std::unordered_map<std::string, std::shared_ptr<SelectStatement>> active_ctes =
+      enclosing_ctes;
+  if (!stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr) {
+    for (const auto& [name, body] : stmt->WithQueries()) {
+      if (!stmt->IsRecursiveWith(name) && body != nullptr) {
+        changed |= CanonicalizeAliasGroupByStmtImpl(body.get(), ctx, active_ctes,
+                                                    visited);
+        active_ctes[name] = body;
+      }
+    }
+  }
+  changed |= VisitSetOpLeavesAndSync(stmt, visited, [&](SelectStatement* leaf) {
+    return CanonicalizeAliasGroupByLeaf(leaf, ctx, active_ctes, visited);
+  });
+  return changed;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (select_alias_group_by_canonicalization_sound)
+bool CanonicalizeSelectAliasGroupBy(SelectStatement* select,
+                                    TransactionContext& ctx) {
+  std::unordered_set<SelectStatement*> visited;
+  return CanonicalizeAliasGroupByStmtImpl(select, ctx, {}, &visited);
+}
+
+namespace {
+
+bool ExprHasGroupContextMod(const Expression& expr) {
+  if (!expr) {
+    return false;
+  }
+  std::vector<Expression> stack{expr};
+  while (!stack.empty()) {
+    Expression cur = std::move(stack.back());
+    stack.pop_back();
+    if (!cur) {
+      continue;
+    }
+    if (cur->Type() == TypeTag::kWindowFunctionExp) {
+      return true;
+    }
+    if (cur->Type() == TypeTag::kAggregateExp) {
+      const auto& agg = cur->AsAggregateExpression();
+      if (agg.NeedsGroupContext() || !agg.InnerGroupBy().empty()) {
+        return true;
+      }
+    }
+    if (cur->Type() == TypeTag::kQueryExp) {
+      continue;
+    }
+    for (const Expression& child : ExpressionChildren(cur)) {
+      if (child) {
+        stack.push_back(child);
+      }
+    }
+  }
+  return false;
+}
+
+bool ValidateGroupedCteTarget(
+    SelectStatement* grouped_stmt,
+    std::unordered_map<std::string, ColumnName>* out_to_group_col) {
+  if (grouped_stmt == nullptr || grouped_stmt->GroupBy().empty() ||
+      grouped_stmt->IsGroupAll() || grouped_stmt->Distinct() ||
+      grouped_stmt->HasDistinctOn() || grouped_stmt->HasLimit() ||
+      grouped_stmt->Offset() != 0 || grouped_stmt->Qualify() ||
+      grouped_stmt->WithTies() || !grouped_stmt->UnionAll().empty() ||
+      grouped_stmt->GetSetOperationTree() != nullptr ||
+      !grouped_stmt->WithQueries().empty() ||
+      relational_detail::HasWindowFunctions(*grouped_stmt) ||
+      SelectListHasStarOrModifiers(*grouped_stmt) ||
+      TpcdsStmtHasParam(*grouped_stmt) ||
+      ExprHasGroupContextMod(grouped_stmt->Having())) {
+    return false;
+  }
+  for (const NamedExpression& item : grouped_stmt->SelectList()) {
+    if (ExprHasGroupContextMod(item.expression)) {
+      return false;
+    }
+  }
+  for (size_t idx = 0; idx < grouped_stmt->SelectList().size(); ++idx) {
+    const NamedExpression& item = grouped_stmt->SelectList()[idx];
+    if (!item.expression || item.expression->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& sc = item.expression->AsColumnValue().GetColumnName();
+    for (const Expression& gk : grouped_stmt->GroupBy()) {
+      if (!gk || gk->Type() != TypeTag::kColumnValue) {
+        continue;
+      }
+      const ColumnName& gc = gk->AsColumnValue().GetColumnName();
+      if (IdentifierEquals(sc.name, gc.name) &&
+          (sc.schema.empty() || gc.schema.empty() ||
+           IdentifierEquals(sc.schema, gc.schema))) {
+        const std::string out_nm = InferSelectItemOutputName(item, idx);
+        const ColumnName chosen = !gc.schema.empty() ? gc : sc;
+        out_to_group_col->emplace(LoweredStarName(out_nm), chosen);
+        break;
+      }
+    }
+  }
+  return !out_to_group_col->empty();
+}
+
+Expression MakeValueDomainPredicate(const ColumnName& col,
+                                    const std::vector<Value>& vals) {
+  if (vals.size() == 1) {
+    return BinaryExpressionExp(ColumnValueExp(col), BinaryOperation::kEquals,
+                               ConstantValueExp(vals[0]));
+  }
+  if (!vals.empty() && !vals[0].IsNull() && !vals[0].IsUnsigned() &&
+      (vals[0].type == ValueType::kInt64 || vals[0].type == ValueType::kDate)) {
+    bool all_same_int = true;
+    int64_t lo = vals[0].value.int_value;
+    int64_t hi = vals[0].value.int_value;
+    std::vector<int64_t> uniq;
+    uniq.reserve(vals.size());
+    for (const Value& v : vals) {
+      if (v.IsNull() || v.IsUnsigned() || v.type != vals[0].type) {
+        all_same_int = false;
+        break;
+      }
+      lo = std::min(lo, v.value.int_value);
+      hi = std::max(hi, v.value.int_value);
+      if (std::ranges::find(uniq, v.value.int_value) == uniq.end()) {
+        uniq.push_back(v.value.int_value);
+      }
+    }
+    if (all_same_int && !uniq.empty()) {
+      Value lo_val = vals[0];
+      lo_val.value.int_value = lo;
+      Value hi_val = vals[0];
+      hi_val.value.int_value = hi;
+      Expression hull = BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(col),
+                              BinaryOperation::kGreaterThanEquals,
+                              ConstantValueExp(lo_val)),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp(col),
+                              BinaryOperation::kLessThanEquals,
+                              ConstantValueExp(hi_val)));
+      if (hi >= lo &&
+          static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1ULL ==
+              uniq.size()) {
+        return hull;
+      }
+      std::vector<Expression> list;
+      list.reserve(vals.size());
+      for (const Value& v : vals) {
+        list.push_back(ConstantValueExp(v));
+      }
+      return BinaryExpressionExp(
+          std::move(hull), BinaryOperation::kAnd,
+          InExpressionExp(ColumnValueExp(col), std::move(list)));
+    }
+  }
+  std::vector<Expression> list;
+  list.reserve(vals.size());
+  for (const Value& v : vals) {
+    list.push_back(ConstantValueExp(v));
+  }
+  return InExpressionExp(ColumnValueExp(col), std::move(list));
+}
+
+void PushPredicateIntoUnionQueryIfSafe(SelectStatement* u_stmt,
+                                       std::string_view target_out_col,
+                                       const std::vector<Value>& domain_vals,
+                                       std::optional<std::pair<Value, Value>>
+                                           closed_range,
+                                       TransactionContext& ctx) {
+  if (u_stmt == nullptr) {
+    return;
+  }
+  std::string cur_col(target_out_col);
+  while (u_stmt != nullptr && u_stmt->UnionAll().empty() &&
+         u_stmt->GetSetOperationTree() == nullptr &&
+         u_stmt->Sources().size() == 1 && u_stmt->Sources()[0].query != nullptr &&
+         !u_stmt->Sources()[0].unnest && !u_stmt->Sources()[0].is_lateral &&
+         !u_stmt->Sources()[0].sample &&
+         u_stmt->Sources()[0].using_columns.empty() &&
+         !u_stmt->Sources()[0].from_nested_join &&
+         !u_stmt->Sources()[0].join_condition && !u_stmt->WhereClause() &&
+         u_stmt->GroupBy().empty() && !u_stmt->IsGroupAll() &&
+         !u_stmt->Having() && !u_stmt->Distinct() && !u_stmt->HasDistinctOn() &&
+         !u_stmt->HasLimit() && u_stmt->Offset() == 0 && !u_stmt->Qualify() &&
+         u_stmt->WithQueries().empty() && !SelectListHasStarOrModifiers(*u_stmt)) {
+    const std::string sub_al = u_stmt->Sources()[0].alias;
+    std::string mapped_inner;
+    for (size_t idx = 0; idx < u_stmt->SelectList().size(); ++idx) {
+      const NamedExpression& item = u_stmt->SelectList()[idx];
+      if (!IdentifierEquals(InferSelectItemOutputName(item, idx), cur_col)) {
+        continue;
+      }
+      if (!item.expression || item.expression->Type() != TypeTag::kColumnValue) {
+        return;
+      }
+      const ColumnName& cn = item.expression->AsColumnValue().GetColumnName();
+      if (!cn.schema.empty() && !sub_al.empty() &&
+          !IdentifierEquals(cn.schema, sub_al)) {
+        return;
+      }
+      mapped_inner = cn.name;
+      break;
+    }
+    if (mapped_inner.empty()) {
+      return;
+    }
+    cur_col = std::move(mapped_inner);
+    u_stmt = u_stmt->Sources()[0].query.get();
+  }
+  if (u_stmt == nullptr ||
+      (u_stmt->UnionAll().empty() && u_stmt->GetSetOperationTree() == nullptr) ||
+      u_stmt->UnionByName() || u_stmt->HasLimit() || u_stmt->Offset() != 0 ||
+      !u_stmt->OrderBy().empty() || !u_stmt->WithQueries().empty()) {
+    return;
+  }
+  for (const SetOperationMatch& m : u_stmt->Matches()) {
+    if (m.by_name || m.corresponding || !m.columns.empty()) {
+      return;
+    }
+  }
+  for (SetOperationKind k : u_stmt->SetOperationKinds()) {
+    if (k != SetOperationKind::kUnionAll && k != SetOperationKind::kUnion) {
+      return;
+    }
+  }
+  if (const auto& tree = u_stmt->GetSetOperationTree(); tree != nullptr) {
+    for (SetOperationKind k : tree->kinds) {
+      if (k != SetOperationKind::kUnionAll && k != SetOperationKind::kUnion) {
+        return;
+      }
+    }
+  }
+
+  std::vector<SelectStatement*> leaves;
+  std::unordered_set<SelectStatement*> seen;
+  auto collect_leaves = [&](auto& self, SelectStatement* s) -> bool {
+    while (s != nullptr && s->UnionAll().empty() &&
+           s->GetSetOperationTree() == nullptr && s->Sources().size() == 1 &&
+           s->Sources()[0].query != nullptr && !s->Sources()[0].unnest &&
+           !s->Sources()[0].is_lateral && !s->Sources()[0].sample &&
+           s->Sources()[0].using_columns.empty() &&
+           !s->Sources()[0].from_nested_join &&
+           !s->Sources()[0].join_condition && !s->WhereClause() &&
+           s->GroupBy().empty() && !s->IsGroupAll() && !s->Having() &&
+           !s->Distinct() && !s->HasDistinctOn() && !s->HasLimit() &&
+           s->Offset() == 0 && !s->Qualify() && s->WithQueries().empty() &&
+           s->SelectList().size() == 1 && s->SelectList()[0].expression &&
+           s->SelectList()[0].expression->Type() == TypeTag::kColumnValue &&
+           s->SelectList()[0].expression->AsColumnValue().GetColumnName().name ==
+               "*") {
+      s = s->Sources()[0].query.get();
+    }
+    if (s == nullptr) {
+      return false;
+    }
+    if (!seen.insert(s).second) {
+      return true;
+    }
+    if (s->UnionAll().empty() && s->GetSetOperationTree() == nullptr) {
+      leaves.push_back(s);
+      return true;
+    }
+    if (const auto& tree = s->GetSetOperationTree(); tree != nullptr) {
+      for (SetOperationKind k : tree->kinds) {
+        if (k != SetOperationKind::kUnionAll && k != SetOperationKind::kUnion) {
+          return false;
+        }
+      }
+      if (!self(self, tree->first.get())) {
+        return false;
+      }
+      for (const auto& br : tree->branches) {
+        if (!self(self, br.get())) {
+          return false;
+        }
+      }
+    } else {
+      for (SetOperationKind k : s->SetOperationKinds()) {
+        if (k != SetOperationKind::kUnionAll && k != SetOperationKind::kUnion) {
+          return false;
+        }
+      }
+      leaves.push_back(s);
+    }
+    for (const auto& br : s->UnionAll()) {
+      if (!self(self, br.get())) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!collect_leaves(collect_leaves, u_stmt) || leaves.empty()) {
+    return;
+  }
+
+  std::optional<size_t> col_idx;
+  for (size_t c = 0; c < leaves[0]->SelectList().size(); ++c) {
+    const std::string out_nm =
+        ExplicitOrColumnOutputName(leaves[0]->SelectList()[c]);
+    if (!out_nm.empty() && IdentifierEquals(out_nm, cur_col)) {
+      if (col_idx.has_value()) {
+        return;
+      }
+      col_idx = c;
+    }
+  }
+  if (!col_idx.has_value()) {
+    return;
+  }
+
+  std::vector<ColumnName> branch_cols;
+  branch_cols.reserve(leaves.size());
+  for (SelectStatement* br : leaves) {
+    if (!br->GroupBy().empty() || br->IsGroupAll() || br->Having() ||
+        br->HasLimit() || br->Offset() != 0 || br->Qualify() ||
+        br->WithTies() || !br->WithQueries().empty() ||
+        relational_detail::HasWindowFunctions(*br) ||
+        SelectListHasStarOrModifiers(*br) ||
+        *col_idx >= br->SelectList().size()) {
+      return;
+    }
+    const Expression& bexpr = br->SelectList()[*col_idx].expression;
+    if (!bexpr || bexpr->Type() != TypeTag::kColumnValue) {
+      return;
+    }
+    const ColumnName& bcol = bexpr->AsColumnValue().GetColumnName();
+    if (bcol.name.empty() || bcol.name == "*") {
+      return;
+    }
+    size_t hits = 0;
+    ColumnName resolved_bcol = bcol;
+    for (const SelectSource& bs : br->Sources()) {
+      if (bs.table.empty() || bs.query != nullptr || bs.unnest ||
+          bs.is_lateral) {
+        return;
+      }
+      StatusOr<std::shared_ptr<Table>> btbl = ctx.GetTable(bs.table);
+      if (!btbl.HasValue()) {
+        return;
+      }
+      const std::string balias = bs.alias.empty() ? bs.table : bs.alias;
+      if (!bcol.schema.empty() && !IdentifierEquals(bcol.schema, balias) &&
+          !IdentifierEquals(bcol.schema, bs.table)) {
+        continue;
+      }
+      const Schema& bschema = btbl.Value()->GetSchema();
+      for (size_t i = 0; i < bschema.ColumnCount(); ++i) {
+        if (IdentifierEquals(bschema.GetColumn(i).Name().name, bcol.name)) {
+          if (bs.join_type != JoinType::kCross &&
+              bs.join_type != JoinType::kInner) {
+            return;
+          }
+          ++hits;
+          resolved_bcol = ColumnName(balias, bschema.GetColumn(i).Name().name);
+          break;
+        }
+      }
+    }
+    if (hits != 1) {
+      return;
+    }
+    branch_cols.push_back(std::move(resolved_bcol));
+  }
+
+  for (size_t i = 0; i < leaves.size(); ++i) {
+    Expression pred =
+        closed_range.has_value()
+            ? BinaryExpressionExp(
+                  BinaryExpressionExp(ColumnValueExp(branch_cols[i]),
+                                      BinaryOperation::kGreaterThanEquals,
+                                      ConstantValueExp(closed_range->first)),
+                  BinaryOperation::kAnd,
+                  BinaryExpressionExp(ColumnValueExp(branch_cols[i]),
+                                      BinaryOperation::kLessThanEquals,
+                                      ConstantValueExp(closed_range->second)))
+            : MakeValueDomainPredicate(branch_cols[i], domain_vals);
+    leaves[i]->SetWhereClause(
+        leaves[i]->WhereClause()
+            ? BinaryExpressionExp(leaves[i]->WhereClause(),
+                                  BinaryOperation::kAnd, std::move(pred))
+            : std::move(pred));
+  }
+  const auto& tree = u_stmt->GetSetOperationTree();
+  if (tree != nullptr && !tree->grouped && tree->first != nullptr &&
+      tree->first->UnionAll().empty() &&
+      tree->first->GetSetOperationTree() == nullptr) {
+    SyncSetOpHeadFields(u_stmt, *tree->first);
+  }
+}
+
+void PushDomainIntoUnionDerivedIfSafe(SelectStatement* outer_with,
+                                      SelectStatement* grouped_stmt,
+                                      const ColumnName& gk_col,
+                                      const std::vector<Value>& domain_vals,
+                                      TransactionContext& ctx) {
+  auto resolve_single_use_union_target =
+      [&](const SelectSource& src) -> SelectStatement* {
+    if (src.query != nullptr) {
+      return src.query.get();
+    }
+    if (outer_with == nullptr || src.table.empty() ||
+        outer_with->IsRecursiveWith(src.table) ||
+        outer_with->RecursiveDepthOf(src.table) != nullptr) {
+      return nullptr;
+    }
+    const auto wit = outer_with->WithQueries().find(src.table);
+    if (wit == outer_with->WithQueries().end() || wit->second == nullptr ||
+        CountNestedCteReferences(*outer_with, src.table, true, true) != 1) {
+      return nullptr;
+    }
+    return wit->second.get();
+  };
+
+  if (grouped_stmt->Sources().size() == 1) {
+    const SelectSource& u_src = grouped_stmt->Sources()[0];
+    SelectStatement* u_target = resolve_single_use_union_target(u_src);
+    const std::string ualias = u_src.alias.empty() ? u_src.table : u_src.alias;
+    if (u_target == nullptr || u_src.unnest || u_src.is_lateral ||
+        u_src.sample || !u_src.using_columns.empty() ||
+        u_src.from_nested_join || u_src.join_condition) {
+      return;
+    }
+    if (!gk_col.schema.empty() && !ualias.empty() &&
+        !IdentifierEquals(gk_col.schema, ualias) &&
+        (u_src.table.empty() || !IdentifierEquals(gk_col.schema, u_src.table))) {
+      return;
+    }
+    PushPredicateIntoUnionQueryIfSafe(u_target, gk_col.name, domain_vals,
+                                      std::nullopt, ctx);
+    return;
+  }
+  if (grouped_stmt->Sources().size() != 2) {
+    return;
+  }
+  // 2-source grouped CTE `FROM union_sub u, dim d WHERE d.pk = u.fk AND d.gk IN (...)`
+  // (e.g. TPC-DS Q02 `wswscs`): derive `[min_pk, max_pk]` on `d` and push the
+  // SARGable range filter into `u`'s UNION branches.
+  size_t u_si = 2;
+  size_t d_si = 2;
+  SelectStatement* u_target = nullptr;
+  for (size_t si = 0; si < 2; ++si) {
+    const SelectSource& s = grouped_stmt->Sources()[si];
+    if (s.unnest || s.is_lateral || s.sample || !s.using_columns.empty() ||
+        s.from_nested_join ||
+        (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+      return;
+    }
+    if (SelectStatement* cand = resolve_single_use_union_target(s);
+        cand != nullptr && u_si >= 2) {
+      u_si = si;
+      u_target = cand;
+    } else if (!s.table.empty() &&
+               (outer_with == nullptr ||
+                !outer_with->WithQueries().contains(s.table))) {
+      d_si = si;
+    }
+  }
+  if (u_si >= 2 || d_si >= 2 || u_target == nullptr) {
+    return;
+  }
+  const SelectSource& u_src = grouped_stmt->Sources()[u_si];
+  const SelectSource& d_src = grouped_stmt->Sources()[d_si];
+  StatusOr<std::shared_ptr<Table>> dtbl_or = ctx.GetTable(d_src.table);
+  if (!dtbl_or.HasValue() || dtbl_or.Value() == nullptr ||
+      dtbl_or.Value()->BackingColumnarRowCount() > 100000) {
+    return;
+  }
+  const Schema& dschema = dtbl_or.Value()->GetSchema();
+  const std::string dalias = d_src.alias.empty() ? d_src.table : d_src.alias;
+  const std::string ualias = u_src.alias.empty() ? u_src.table : u_src.alias;
+  if ((!gk_col.schema.empty() && !IdentifierEquals(gk_col.schema, dalias) &&
+       !IdentifierEquals(gk_col.schema, d_src.table)) ||
+      dschema.Offset(ColumnName("", gk_col.name)) < 0) {
+    return;
+  }
+  std::vector<Expression> all_conjs = SplitConjuncts(grouped_stmt->WhereClause());
+  for (const SelectSource& gs : grouped_stmt->Sources()) {
+    if (gs.join_condition) {
+      for (Expression& jc : SplitConjuncts(gs.join_condition)) {
+        all_conjs.push_back(std::move(jc));
+      }
+    }
+  }
+  std::string dim_pk_col;
+  std::string union_fk_col;
+  for (const Expression& conj : all_conjs) {
+    if (!conj || conj->Type() != TypeTag::kBinaryExp ||
+        conj->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+      continue;
+    }
+    const Expression& l = conj->AsBinaryExpression().Left();
+    const Expression& r = conj->AsBinaryExpression().Right();
+    if (!l || !r || l->Type() != TypeTag::kColumnValue ||
+        r->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& lc = l->AsColumnValue().GetColumnName();
+    const ColumnName& rc = r->AsColumnValue().GetColumnName();
+    auto is_dim_int_col = [&](const ColumnName& cn, std::string* out) -> bool {
+      if (!cn.schema.empty() && !IdentifierEquals(cn.schema, dalias) &&
+          !IdentifierEquals(cn.schema, d_src.table)) {
+        return false;
+      }
+      const int off = dschema.Offset(ColumnName("", cn.name));
+      if (off < 0) {
+        return false;
+      }
+      const Column& cm = dschema.GetColumn(static_cast<size_t>(off));
+      if (cm.IsUnsigned() ||
+          (cm.Type() != ValueType::kInt64 && cm.Type() != ValueType::kDate)) {
+        return false;
+      }
+      *out = cm.Name().name;
+      return true;
+    };
+    auto is_union_col = [&](const ColumnName& cn, std::string* out) -> bool {
+      if (!cn.schema.empty() && !ualias.empty() &&
+          !IdentifierEquals(cn.schema, ualias) &&
+          (u_src.table.empty() || !IdentifierEquals(cn.schema, u_src.table))) {
+        return false;
+      }
+      if (cn.schema.empty() && dschema.Offset(ColumnName("", cn.name)) >= 0) {
+        return false;
+      }
+      *out = cn.name;
+      return !out->empty();
+    };
+    std::string d_cand;
+    std::string u_cand;
+    if (is_dim_int_col(lc, &d_cand) && is_union_col(rc, &u_cand)) {
+      dim_pk_col = std::move(d_cand);
+      union_fk_col = std::move(u_cand);
+      break;
+    }
+    if (is_dim_int_col(rc, &d_cand) && is_union_col(lc, &u_cand)) {
+      dim_pk_col = std::move(d_cand);
+      union_fk_col = std::move(u_cand);
+      break;
+    }
+  }
+  if (dim_pk_col.empty() || union_fk_col.empty()) {
+    return;
+  }
+  SelectStatement d_bounds;
+  SelectSource dscan;
+  dscan.table = d_src.table;
+  dscan.alias = dalias;
+  d_bounds.SetSources({std::move(dscan)});
+  d_bounds.SetWhereClause(
+      MakeValueDomainPredicate(ColumnName(dalias, gk_col.name), domain_vals));
+  const Expression pk_exp = ColumnValueExp(ColumnName(dalias, dim_pk_col));
+  d_bounds.SetSelectList({
+      NamedExpression("__lo",
+                      AggregateExpressionExp(AggregationType::kMin, pk_exp, false)),
+      NamedExpression("__hi",
+                      AggregateExpressionExp(AggregationType::kMax, pk_exp, false)),
+  });
+  StatusOr<relational_detail::Relation> brel =
+      relational_detail::ExecuteQuery(ctx, d_bounds, nullptr, {}, nullptr, false);
+  if (brel.HasValue() && brel.Value().HasColumnarOnly()) {
+    (void)brel.Value().EnsureRowsMaterialized();
+  }
+  if (!brel.HasValue() || brel.Value().HasSpill() ||
+      brel.Value().rows.size() != 1 || brel.Value().rows[0].Size() != 2 ||
+      brel.Value().rows[0][0].IsNull() || brel.Value().rows[0][1].IsNull()) {
+    return;
+  }
+  PushPredicateIntoUnionQueryIfSafe(
+      u_target, union_fk_col, {},
+      std::pair{brel.Value().rows[0][0], brel.Value().rows[0][1]}, ctx);
+}
+
+bool CollectSharedGroupedCteSitesInConsumer(  // NOLINT(misc-no-recursion)
+    SelectStatement* consumer, const std::string& name,
+    std::vector<SharedCteSite>* sites) {
+  if (consumer == nullptr || !consumer->UnionAll().empty() ||
+      consumer->GetSetOperationTree() != nullptr) {
+    return false;
+  }
+  size_t non_src_refs = 0;
+  CountNestedCteReferencesInExpression(consumer->WhereClause(), name,
+                                       &non_src_refs);
+  for (const NamedExpression& item : consumer->SelectList()) {
+    CountNestedCteReferencesInExpression(item.expression, name, &non_src_refs);
+  }
+  for (const Expression& gk : consumer->GroupBy()) {
+    CountNestedCteReferencesInExpression(gk, name, &non_src_refs);
+  }
+  CountNestedCteReferencesInExpression(consumer->Having(), name, &non_src_refs);
+  CountNestedCteReferencesInExpression(consumer->Qualify(), name,
+                                       &non_src_refs);
+  for (const auto& ot : consumer->OrderBy()) {
+    CountNestedCteReferencesInExpression(ot.expression, name, &non_src_refs);
+  }
+  if (non_src_refs != 0) {
+    return false;
+  }
+  for (const SelectSource& source : consumer->Sources()) {
+    size_t cond_refs = 0;
+    CountNestedCteReferencesInExpression(source.join_condition, name,
+                                         &cond_refs);
+    CountNestedCteReferencesInExpression(source.unnest, name, &cond_refs);
+    if (cond_refs != 0) {
+      return false;
+    }
+    if (source.query != nullptr) {
+      if (CountNestedCteReferences(*source.query, name, true, true) == 0) {
+        continue;
+      }
+      if (source.unnest || source.is_lateral || source.sample.has_value() ||
+          !source.using_columns.empty() || source.from_nested_join ||
+          source.query->WithQueries().contains(name) ||
+          (source.join_type != JoinType::kCross &&
+           source.join_type != JoinType::kInner)) {
+        return false;
+      }
+      if (!CollectSharedGroupedCteSitesInConsumer(source.query.get(), name,
+                                                  sites)) {
+        return false;
+      }
+      continue;
+    }
+    if (source.table != name) {
+      continue;
+    }
+    if (source.unnest || source.is_lateral || source.sample.has_value() ||
+        (source.join_type != JoinType::kCross &&
+         source.join_type != JoinType::kInner)) {
+      return false;
+    }
+    sites->push_back(
+        SharedCteSite{.consumer = consumer,
+                      .alias = source.alias.empty() ? name : source.alias});
+  }
+  return true;
+}
+
+bool CollectSharedGroupedCteSites(SelectStatement* outer,
+                                  const std::string& name,
+                                  std::vector<SharedCteSite>* sites) {
+  if (!CollectSharedGroupedCteSitesInConsumer(outer, name, sites)) {
+    return false;
+  }
+  for (const auto& [entry, body] : outer->WithQueries()) {  // NOLINT(readability-use-anyofallof)
+    if (entry == name || body == nullptr) {
+      continue;
+    }
+    if (CountNestedCteReferences(*body, name, true, true) == 0) {
+      continue;
+    }
+    if (body->WithQueries().contains(name) ||
+        !CollectSharedGroupedCteSitesInConsumer(body.get(), name, sites)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (shared_grouped_union_distinct_cte_disjunctive_pushdown_sound)
+bool PushSharedGroupedCteKeyRestrictions(SelectStatement* outer,
+                                         TransactionContext& ctx) {
+  if (outer == nullptr || outer->WithQueries().empty() ||
+      TpcdsStmtHasParam(*outer)) {
+    return false;
+  }
+  bool any_pushed = false;
+  std::vector<std::string> cte_names = outer->WithQueryOrder();
+  for (const std::string& name : cte_names) {
+    if (outer->IsRecursiveWith(name) ||
+        outer->RecursiveDepthOf(name) != nullptr) {
+      continue;
+    }
+    const auto cte_it = outer->WithQueries().find(name);
+    if (cte_it == outer->WithQueries().end() || cte_it->second == nullptr) {
+      continue;
+    }
+    SelectStatement& body = *cte_it->second;
+    if (TpcdsStmtHasParam(body) || !body.WithQueries().empty()) {
+      continue;
+    }
+
+    std::vector<SharedCteSite> sites;
+    if (!CollectSharedGroupedCteSites(outer, name, &sites) || sites.size() < 2) {
+      continue;
+    }
+    bool consumers_safe = true;
+    for (const SharedCteSite& site : sites) {
+      if (!site.consumer->UnionAll().empty() ||
+          site.consumer->GetSetOperationTree() != nullptr ||
+          TpcdsStmtHasParam(*site.consumer)) {
+        consumers_safe = false;
+        break;
+      }
+      for (const SelectSource& cs : site.consumer->Sources()) {
+        if (cs.join_type == JoinType::kRight ||
+            cs.join_type == JoinType::kFull) {
+          consumers_safe = false;
+          break;
+        }
+      }
+      if (!consumers_safe) {
+        break;
+      }
+    }
+    if (!consumers_safe) {
+      continue;
+    }
+
+    SelectStatement* grouped_target = nullptr;
+    std::unordered_map<std::string, ColumnName> cte_out_to_group_col;
+    if (!body.GroupBy().empty()) {
+      if (ValidateGroupedCteTarget(&body, &cte_out_to_group_col)) {
+        grouped_target = &body;
+      }
+    } else if (!body.Having() && !body.Distinct() && !body.HasDistinctOn() &&
+               !body.HasLimit() && body.Offset() == 0 && !body.Qualify() &&
+               !body.WithTies() && body.UnionAll().empty() &&
+               body.GetSetOperationTree() == nullptr &&
+               !relational_detail::HasWindowFunctions(body) &&
+               !SelectListHasStarOrModifiers(body) &&
+               body.Sources().size() == 1 &&
+               (!body.WhereClause() ||
+                (!ContainsQueryExpression(body.WhereClause()) &&
+                 !relational_detail::ContainsAggregate(body.WhereClause()) &&
+                 DerivedExpressionIsImmutable(body.WhereClause())))) {
+      const SelectSource& s0 = body.Sources()[0];
+      const bool clean_select = std::ranges::all_of(
+          body.SelectList(), [](const NamedExpression& item) {
+            return item.expression != nullptr &&
+                   !ContainsQueryExpression(item.expression) &&
+                   !relational_detail::ContainsAggregate(item.expression) &&
+                   DerivedExpressionIsImmutable(item.expression);
+          });
+      if (clean_select && s0.query != nullptr && !s0.alias.empty() &&
+          !s0.unnest && !s0.is_lateral && !s0.sample &&
+          s0.using_columns.empty() && !s0.from_nested_join &&
+          !s0.join_condition) {
+        std::unordered_map<std::string, ColumnName> inner_map;
+        if (ValidateGroupedCteTarget(s0.query.get(), &inner_map)) {
+          for (size_t idx = 0; idx < body.SelectList().size(); ++idx) {
+            const NamedExpression& item = body.SelectList()[idx];
+            if (item.expression->Type() != TypeTag::kColumnValue) {
+              continue;
+            }
+            const ColumnName& col =
+                item.expression->AsColumnValue().GetColumnName();
+            if (!col.schema.empty() &&
+                !IdentifierEquals(col.schema, s0.alias)) {
+              continue;
+            }
+            if (const auto it = inner_map.find(LoweredStarName(col.name));
+                it != inner_map.end()) {
+              cte_out_to_group_col.emplace(
+                  LoweredStarName(InferSelectItemOutputName(item, idx)),
+                  it->second);
+            }
+          }
+          if (!cte_out_to_group_col.empty()) {
+            grouped_target = s0.query.get();
+          }
+        }
+      }
+    }
+    if (grouped_target == nullptr || cte_out_to_group_col.empty()) {
+      continue;
+    }
+
+    std::vector<std::string> candidate_keys;
+    candidate_keys.reserve(cte_out_to_group_col.size());
+    for (const auto& [k, v] : cte_out_to_group_col) {
+      (void)v;
+      candidate_keys.push_back(k);
+    }
+    std::ranges::sort(candidate_keys);
+
+    for (const std::string& out_low : candidate_keys) {
+      const ColumnName& gk_col = cte_out_to_group_col.at(out_low);
+      std::vector<Value> union_vals;
+      bool all_sites_bound = true;
+
+      auto matches_site_col = [&](const Expression& e,
+                                  const SharedCteSite& site) -> bool {
+        if (!e || e->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        const ColumnName& cn = e->AsColumnValue().GetColumnName();
+        if (!IdentifierEquals(cn.name, out_low)) {
+          return false;
+        }
+        if (!cn.schema.empty()) {
+          return IdentifierEquals(cn.schema, site.alias);
+        }
+        return site.consumer->Sources().size() == 1;
+      };
+
+      for (const SharedCteSite& site : sites) {
+        std::vector<Value> site_vals;
+        for (const Expression& conj :
+             SplitConjuncts(site.consumer->WhereClause())) {
+          if (!conj) {
+            continue;
+          }
+          if (conj->Type() == TypeTag::kBinaryExp &&
+              conj->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+            const Expression& lhs = conj->AsBinaryExpression().Left();
+            const Expression& rhs = conj->AsBinaryExpression().Right();
+            std::optional<Value> cv;
+            if (matches_site_col(lhs, site)) {
+              cv = TpcdsEvalClosedConstant(rhs);
+            } else if (matches_site_col(rhs, site)) {
+              cv = TpcdsEvalClosedConstant(lhs);
+            }
+            if (cv.has_value() && IsSafeDisjointTagValue(*cv)) {
+              site_vals.push_back(std::move(*cv));
+              break;
+            }
+          } else if (conj->Type() == TypeTag::kInExp) {
+            const auto& in_exp = conj->AsInExpression();
+            if (matches_site_col(in_exp.child_, site) &&
+                !in_exp.list_.empty() && in_exp.list_.size() <= 32) {
+              std::vector<Value> parsed;
+              bool ok = true;
+              for (const Expression& item_e : in_exp.list_) {
+                std::optional<Value> cv = TpcdsEvalClosedConstant(item_e);
+                if (!cv.has_value() || !IsSafeDisjointTagValue(*cv) ||
+                    (!parsed.empty() && cv->type != parsed.front().type)) {
+                  ok = false;
+                  break;
+                }
+                parsed.push_back(std::move(*cv));
+              }
+              if (ok && !parsed.empty()) {
+                site_vals = std::move(parsed);
+                break;
+              }
+            }
+          }
+        }
+        if (site_vals.empty() && site.consumer->Sources().size() == 2) {
+          // Extract domain from an inner-joined selective dimension table
+          // (e.g. TPC-DS Q02 `FROM wswscs, date_dim WHERE d_week_seq = ... AND d_year = 2001`).
+          size_t dim_si = 2;
+          for (size_t si = 0; si < 2; ++si) {
+            const SelectSource& s = site.consumer->Sources()[si];
+            const std::string al = s.alias.empty() ? s.table : s.alias;
+            if (!IdentifierEquals(al, site.alias) && !s.table.empty() &&
+                s.query == nullptr && !s.unnest && !s.is_lateral && !s.sample &&
+                s.using_columns.empty() && !s.from_nested_join &&
+                (s.join_type == JoinType::kCross ||
+                 s.join_type == JoinType::kInner)) {
+              dim_si = si;
+            }
+          }
+          if (dim_si < 2) {
+            const SelectSource& dsrc = site.consumer->Sources()[dim_si];
+            StatusOr<std::shared_ptr<Table>> dtbl_or = ctx.GetTable(dsrc.table);
+            if (dtbl_or.HasValue() && dtbl_or.Value() != nullptr &&
+                dtbl_or.Value()->BackingColumnarRowCount() <= 100000) {
+              const Schema& dschema = dtbl_or.Value()->GetSchema();
+              const std::string dalias =
+                  dsrc.alias.empty() ? dsrc.table : dsrc.alias;
+              std::string matched_dim_col;
+              std::vector<Expression> dim_local_preds;
+              std::vector<Expression> site_conjs =
+                  SplitConjuncts(site.consumer->WhereClause());
+              for (const SelectSource& cs : site.consumer->Sources()) {
+                if (cs.join_condition) {
+                  for (Expression& jc : SplitConjuncts(cs.join_condition)) {
+                    site_conjs.push_back(std::move(jc));
+                  }
+                }
+              }
+              for (const Expression& conj : site_conjs) {
+                if (!conj || ContainsQueryExpression(conj) ||
+                    relational_detail::ContainsAggregate(conj) ||
+                    !DerivedExpressionIsImmutable(conj)) {
+                  continue;
+                }
+                if (conj->Type() == TypeTag::kBinaryExp &&
+                    conj->AsBinaryExpression().Op() ==
+                        BinaryOperation::kEquals) {
+                  const Expression& l = conj->AsBinaryExpression().Left();
+                  const Expression& r = conj->AsBinaryExpression().Right();
+                  auto extract_dcol =
+                      [&](const Expression& side) -> std::string {
+                    if (!side || side->Type() != TypeTag::kColumnValue) {
+                      return {};
+                    }
+                    const ColumnName& cn =
+                        side->AsColumnValue().GetColumnName();
+                    if (!cn.schema.empty() &&
+                        !IdentifierEquals(cn.schema, dalias) &&
+                        !IdentifierEquals(cn.schema, dsrc.table)) {
+                      return {};
+                    }
+                    const int doff = dschema.Offset(ColumnName("", cn.name));
+                    return doff >= 0
+                               ? dschema.GetColumn(static_cast<size_t>(doff))
+                                     .Name()
+                                     .name
+                               : std::string{};
+                  };
+                  if (matches_site_col(l, site)) {
+                    std::string dc = extract_dcol(r);
+                    if (!dc.empty()) {
+                      matched_dim_col = std::move(dc);
+                      continue;
+                    }
+                  } else if (matches_site_col(r, site)) {
+                    std::string dc = extract_dcol(l);
+                    if (!dc.empty()) {
+                      matched_dim_col = std::move(dc);
+                      continue;
+                    }
+                  }
+                }
+                bool only_dim = true;
+                bool any_dim = false;
+                for (const ColumnName& cn : conj->TouchedColumns()) {
+                  if (!cn.schema.empty()) {
+                    if (IdentifierEquals(cn.schema, dalias) ||
+                        IdentifierEquals(cn.schema, dsrc.table)) {
+                      any_dim = true;
+                    } else {
+                      only_dim = false;
+                      break;
+                    }
+                  } else if (dschema.Offset(ColumnName("", cn.name)) >= 0 &&
+                             !IdentifierEquals(cn.name, out_low)) {
+                    any_dim = true;
+                  } else {
+                    only_dim = false;
+                    break;
+                  }
+                }
+                if (only_dim && any_dim) {
+                  dim_local_preds.push_back(conj);
+                }
+              }
+              if (!matched_dim_col.empty() && !dim_local_preds.empty()) {
+                SelectStatement dquery;
+                SelectSource dscan;
+                dscan.table = dsrc.table;
+                dscan.alias = dalias;
+                dquery.SetSources({std::move(dscan)});
+                dquery.SetWhereClause(CombineConjuncts(dim_local_preds));
+                dquery.SetDistinct(true);
+                dquery.SetSelectList({NamedExpression(
+                    "__dk",
+                    ColumnValueExp(ColumnName(dalias, matched_dim_col)))});
+                StatusOr<relational_detail::Relation> drel_or =
+                    relational_detail::ExecuteQuery(ctx, dquery, nullptr, {},
+                                                    nullptr, false);
+                if (drel_or.HasValue() && drel_or.Value().HasColumnarOnly()) {
+                  (void)drel_or.Value().EnsureRowsMaterialized();
+                }
+                if (drel_or.HasValue() && !drel_or.Value().HasSpill() &&
+                    drel_or.Value().TotalRows() > 0 &&
+                    drel_or.Value().TotalRows() <= 128) {
+                  std::vector<Value> extracted;
+                  bool ext_ok = true;
+                  for (const Row& r : drel_or.Value().rows) {
+                    if (r.Size() != 1 || r[0].IsNull()) {
+                      continue;
+                    }
+                    if (!IsSafeDisjointTagValue(r[0]) ||
+                        (!extracted.empty() &&
+                         r[0].type != extracted.front().type)) {
+                      ext_ok = false;
+                      break;
+                    }
+                    extracted.push_back(r[0]);
+                  }
+                  if (ext_ok && !extracted.empty()) {
+                    site_vals = std::move(extracted);
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (site_vals.empty()) {
+          all_sites_bound = false;
+          break;
+        }
+        for (const Value& sv : site_vals) {
+          if (!union_vals.empty() && sv.type != union_vals.front().type) {
+            all_sites_bound = false;
+            break;
+          }
+          const bool dup = std::ranges::any_of(
+              union_vals, [&](const Value& u) { return u == sv; });
+          if (!dup) {
+            union_vals.push_back(sv);
+          }
+        }
+        if (!all_sites_bound || union_vals.size() > 256) {
+          all_sites_bound = false;
+          break;
+        }
+      }
+      if (!all_sites_bound || union_vals.empty()) {
+        continue;
+      }
+
+      // Verify `gk_col` resolves to a non-null-supplying source of
+      // `grouped_target`.
+      bool gk_safe_in_target = false;
+      size_t gk_hits = 0;
+      ColumnName resolved_gk_col = gk_col;
+      for (const SelectSource& gs : grouped_target->Sources()) {
+        if (gs.unnest || gs.is_lateral || gs.from_nested_join ||
+            !gs.using_columns.empty()) {
+          gk_hits = 2;
+          break;
+        }
+        const std::string galias = gs.alias.empty() ? gs.table : gs.alias;
+        if (!gk_col.schema.empty() && !IdentifierEquals(gk_col.schema, galias) &&
+            (gs.table.empty() || !IdentifierEquals(gk_col.schema, gs.table))) {
+          continue;
+        }
+        bool has_col = false;
+        std::string matched_col_name = gk_col.name;
+        if (gs.query != nullptr) {
+          const SelectStatement* qhead = gs.query.get();
+          if (qhead->SelectList().empty() &&
+              qhead->GetSetOperationTree() != nullptr &&
+              qhead->GetSetOperationTree()->first != nullptr) {
+            qhead = qhead->GetSetOperationTree()->first.get();
+          }
+          for (const NamedExpression& si : qhead->SelectList()) {
+            const std::string nm = ExplicitOrColumnOutputName(si);
+            if (!nm.empty() && IdentifierEquals(nm, gk_col.name)) {
+              has_col = true;
+              matched_col_name = nm;
+              break;
+            }
+          }
+        } else if (!gs.table.empty()) {
+          if (const auto gcte_it = outer->WithQueries().find(gs.table);
+              gcte_it != outer->WithQueries().end()) {
+            if (outer->IsRecursiveWith(gs.table) || gcte_it->second == nullptr) {
+              gk_hits = 2;
+              break;
+            }
+            const SelectStatement* qhead = gcte_it->second.get();
+            if (qhead->SelectList().empty() &&
+                qhead->GetSetOperationTree() != nullptr &&
+                qhead->GetSetOperationTree()->first != nullptr) {
+              qhead = qhead->GetSetOperationTree()->first.get();
+            }
+            for (const NamedExpression& si : qhead->SelectList()) {
+              const std::string nm = ExplicitOrColumnOutputName(si);
+              if (!nm.empty() && IdentifierEquals(nm, gk_col.name)) {
+                has_col = true;
+                matched_col_name = nm;
+                break;
+              }
+            }
+          } else {
+            StatusOr<std::shared_ptr<Table>> gtbl = ctx.GetTable(gs.table);
+            if (!gtbl.HasValue()) {
+              gk_hits = 2;
+              break;
+            }
+            const Schema& gschema = gtbl.Value()->GetSchema();
+            for (size_t i = 0; i < gschema.ColumnCount(); ++i) {
+              if (IdentifierEquals(gschema.GetColumn(i).Name().name,
+                                   gk_col.name)) {
+                has_col = true;
+                matched_col_name = gschema.GetColumn(i).Name().name;
+                break;
+              }
+            }
+          }
+        }
+        if (has_col) {
+          if (gs.join_type != JoinType::kCross &&
+              gs.join_type != JoinType::kInner) {
+            gk_hits = 2;
+            break;
+          }
+          ++gk_hits;
+          gk_safe_in_target = true;
+          resolved_gk_col = ColumnName(galias, matched_col_name);
+        }
+      }
+      if (!gk_safe_in_target || gk_hits != 1) {
+        continue;
+      }
+
+      Expression domain_pred =
+          MakeValueDomainPredicate(resolved_gk_col, union_vals);
+      grouped_target->SetWhereClause(
+          grouped_target->WhereClause()
+              ? BinaryExpressionExp(grouped_target->WhereClause(),
+                                    BinaryOperation::kAnd,
+                                    std::move(domain_pred))
+              : std::move(domain_pred));
+      PushDomainIntoUnionDerivedIfSafe(outer, grouped_target, resolved_gk_col,
+                                       union_vals, ctx);
+      any_pushed = true;
+    }
+  }
+  return any_pushed;
+}
+
+namespace {
+
+bool RewriteOneDistinctBranchSurrogateKeys(SelectStatement* br,
+                                           TransactionContext& ctx) {
+  if (br == nullptr || !br->Distinct() || br->HasDistinctOn() ||
+      !br->GroupBy().empty() || br->IsGroupAll() || br->Having() ||
+      br->Qualify() || br->HasLimit() || br->Offset() != 0 ||
+      !br->OrderBy().empty() || br->WithTies() || br->ForUpdate() ||
+      br->AsStruct() || !br->WithQueries().empty() ||
+      !br->UnionAll().empty() || br->GetSetOperationTree() != nullptr ||
+      relational_detail::HasWindowFunctions(*br) ||
+      SelectListHasStarOrModifiers(*br) || TpcdsStmtHasParam(*br) ||
+      br->Sources().size() < 2 || br->SelectList().empty()) {
+    return false;
+  }
+
+  std::vector<std::shared_ptr<Table>> holders;
+  std::vector<GroupingRelation> rels;
+  std::vector<size_t> est_rows;
+  std::unordered_set<std::string> seen_aliases;
+  holders.reserve(br->Sources().size());
+  rels.reserve(br->Sources().size());
+  est_rows.reserve(br->Sources().size());
+
+  for (const SelectSource& s : br->Sources()) {
+    if (s.table.empty() || s.query != nullptr || s.unnest || s.is_lateral ||
+        s.sample || !s.using_columns.empty() || s.from_nested_join ||
+        (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+      return false;
+    }
+    StatusOr<std::shared_ptr<Table>> tbl = ctx.GetTable(s.table);
+    if (!tbl.HasValue()) {
+      return false;
+    }
+    const std::string alias = s.alias.empty() ? s.table : s.alias;
+    if (!seen_aliases.insert(LoweredStarName(alias)).second) {
+      return false;
+    }
+    size_t rows = 0;
+    if (StatusOr<std::shared_ptr<TableStatistics>> st = ctx.GetStats(s.table);
+        st.HasValue() && st.Value() != nullptr) {
+      rows = st.Value()->Rows();
+    }
+    holders.push_back(tbl.MoveValue());
+    rels.push_back({.name = alias, .schema = &holders.back()->GetSchema()});
+    est_rows.push_back(rows);
+  }
+
+  struct ResolvedCol {
+    size_t rel_idx{0};
+    std::string alias;
+    std::string exact_col;
+    ValueType type{ValueType::kNull};
+    bool has_collation{false};
+  };
+  auto resolve_col = [&](const ColumnName& col) -> std::optional<ResolvedCol> {
+    if (col.name.empty() || col.name == "*") {
+      return std::nullopt;
+    }
+    std::optional<ResolvedCol> found;
+    for (size_t r = 0; r < rels.size(); ++r) {
+      const SelectSource& src = br->Sources()[r];
+      if (!col.schema.empty() && !IdentifierEquals(col.schema, rels[r].name) &&
+          !IdentifierEquals(col.schema, src.table)) {
+        continue;
+      }
+      const Schema& schema = *rels[r].schema;
+      for (size_t c = 0; c < schema.ColumnCount(); ++c) {
+        const Column& sc = schema.GetColumn(c);
+        if (IdentifierEquals(sc.Name().name, col.name)) {
+          if (found.has_value()) {
+            return std::nullopt;
+          }
+          found = ResolvedCol{
+              .rel_idx = r,
+              .alias = rels[r].name,
+              .exact_col = sc.Name().name,
+              .type = sc.Type(),
+              .has_collation = sc.IsUnsigned() || sc.IsInterval(),
+          };
+          break;
+        }
+      }
+    }
+    return found;
+  };
+
+  auto qualify_expr = [&](auto& self,
+                          const Expression& expr) -> std::optional<Expression> {
+    if (!expr) {
+      return expr;
+    }
+    if (expr->Type() == TypeTag::kQueryExp ||
+        expr->Type() == TypeTag::kWindowFunctionExp ||
+        expr->Type() == TypeTag::kAggregateExp) {
+      return std::nullopt;
+    }
+    if (expr->Type() == TypeTag::kColumnValue) {
+      std::optional<ResolvedCol> rc =
+          resolve_col(expr->AsColumnValue().GetColumnName());
+      if (!rc.has_value()) {
+        return std::nullopt;
+      }
+      return ColumnValueExp(ColumnName(rc->alias, rc->exact_col));
+    }
+    std::vector<Expression> kids = ExpressionChildren(expr);
+    for (Expression& k : kids) {
+      std::optional<Expression> qk = self(self, k);
+      if (!qk.has_value()) {
+        return std::nullopt;
+      }
+      k = std::move(*qk);
+    }
+    return WithExpressionChildren(expr, std::move(kids));
+  };
+
+  struct SelectSlot {
+    std::string out_name;
+    ResolvedCol col;
+  };
+  std::vector<SelectSlot> slots;
+  slots.reserve(br->SelectList().size());
+  for (size_t i = 0; i < br->SelectList().size(); ++i) {
+    const NamedExpression& item = br->SelectList()[i];
+    if (!item.expression || item.expression->Type() != TypeTag::kColumnValue) {
+      return false;
+    }
+    std::optional<ResolvedCol> rc =
+        resolve_col(item.expression->AsColumnValue().GetColumnName());
+    if (!rc.has_value()) {
+      return false;
+    }
+    slots.push_back(SelectSlot{
+        .out_name = InferSelectItemOutputName(item, i),
+        .col = std::move(*rc),
+    });
+  }
+
+  std::vector<Expression> all_conjuncts;
+  auto add_pred = [&](const Expression& pred) -> bool {
+    if (!pred) {
+      return true;
+    }
+    if (ContainsQueryExpression(pred) ||
+        relational_detail::ContainsAggregate(pred) ||
+        !DerivedExpressionIsImmutable(pred)) {
+      return false;
+    }
+    for (const Expression& c : SplitConjuncts(pred)) {
+      std::optional<Expression> qc = qualify_expr(qualify_expr, c);
+      if (!qc.has_value()) {
+        return false;
+      }
+      all_conjuncts.push_back(std::move(*qc));
+    }
+    return true;
+  };
+  if (!add_pred(br->WhereClause())) {
+    return false;
+  }
+  for (const SelectSource& s : br->Sources()) {
+    if (!add_pred(s.join_condition)) {
+      return false;
+    }
+  }
+  if (all_conjuncts.empty()) {
+    return false;
+  }
+
+  for (size_t dim_idx = 0; dim_idx < rels.size(); ++dim_idx) {
+    if (est_rows[dim_idx] < 10000) {
+      continue;
+    }
+    size_t max_core_rows = 0;
+    for (size_t i = 0; i < rels.size(); ++i) {
+      if (i != dim_idx) {
+        max_core_rows = std::max(max_core_rows, est_rows[i]);
+      }
+    }
+    if (max_core_rows < 50000) {
+      continue;
+    }
+
+    size_t dim_varchar_slots = 0;
+    bool core_slots_fixed_scalar = true;
+    for (const SelectSlot& sl : slots) {
+      if (sl.col.rel_idx == dim_idx) {
+        if (sl.col.type == ValueType::kVarChar) {
+          ++dim_varchar_slots;
+        }
+      } else if (sl.col.type == ValueType::kVarChar ||
+                 sl.col.type == ValueType::kArray || sl.col.has_collation) {
+        core_slots_fixed_scalar = false;
+        break;
+      }
+    }
+    if (dim_varchar_slots == 0 || !core_slots_fixed_scalar) {
+      continue;
+    }
+
+    std::vector<Expression> core_conjuncts;
+    std::optional<ResolvedCol> core_fk;
+    std::optional<ResolvedCol> dim_pk;
+    size_t dim_conjunct_count = 0;
+    bool ok = true;
+    for (const Expression& conj : all_conjuncts) {
+      const auto touched = conj->TouchedColumns();
+      const bool touches_dim = std::ranges::any_of(
+          touched, [&](const ColumnName& cn) {
+            return IdentifierEquals(cn.schema, rels[dim_idx].name);
+          });
+      if (!touches_dim) {
+        core_conjuncts.push_back(conj);
+        continue;
+      }
+      ++dim_conjunct_count;
+      if (dim_conjunct_count > 1 || conj->Type() != TypeTag::kBinaryExp ||
+          conj->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+        ok = false;
+        break;
+      }
+      const Expression& lhs = conj->AsBinaryExpression().Left();
+      const Expression& rhs = conj->AsBinaryExpression().Right();
+      if (!lhs || !rhs || lhs->Type() != TypeTag::kColumnValue ||
+          rhs->Type() != TypeTag::kColumnValue) {
+        ok = false;
+        break;
+      }
+      std::optional<ResolvedCol> lrc =
+          resolve_col(lhs->AsColumnValue().GetColumnName());
+      std::optional<ResolvedCol> rrc =
+          resolve_col(rhs->AsColumnValue().GetColumnName());
+      if (!lrc.has_value() || !rrc.has_value()) {
+        ok = false;
+        break;
+      }
+      if (lrc->rel_idx == dim_idx && rrc->rel_idx != dim_idx) {
+        dim_pk = std::move(*lrc);
+        core_fk = std::move(*rrc);
+      } else if (rrc->rel_idx == dim_idx && lrc->rel_idx != dim_idx) {
+        core_fk = std::move(*lrc);
+        dim_pk = std::move(*rrc);
+      } else {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok || dim_conjunct_count != 1 || !core_fk.has_value() ||
+        !dim_pk.has_value() || core_fk->type != dim_pk->type ||
+        (core_fk->type != ValueType::kInt64 &&
+         core_fk->type != ValueType::kDate) ||
+        core_fk->has_collation || dim_pk->has_collation) {
+      continue;
+    }
+
+    std::vector<SelectSource> pre_sources;
+    pre_sources.reserve(br->Sources().size() - 1);
+    for (size_t i = 0; i < br->Sources().size(); ++i) {
+      if (i == dim_idx) {
+        continue;
+      }
+      SelectSource cs = br->Sources()[i];
+      if (cs.alias.empty()) {
+        cs.alias = cs.table;
+      }
+      cs.join_type = JoinType::kCross;
+      cs.join_condition = nullptr;
+      pre_sources.push_back(std::move(cs));
+    }
+
+    // `core_fk = dim_pk` rejects NULL `core_fk`; filtering NULL `core_fk`
+    // before GROUP BY avoids hashing unmatched NULL foreign keys.
+    core_conjuncts.push_back(UnaryExpressionExp(
+        ColumnValueExp(ColumnName(core_fk->alias, core_fk->exact_col)),
+        UnaryOperation::kIsNotNull));
+
+    std::vector<ColumnName> pre_key_cols;
+    auto ensure_pre_key = [&](const ColumnName& cn) -> size_t {
+      for (size_t k = 0; k < pre_key_cols.size(); ++k) {
+        if (IdentifierEquals(pre_key_cols[k].schema, cn.schema) &&
+            IdentifierEquals(pre_key_cols[k].name, cn.name)) {
+          return k;
+        }
+      }
+      const size_t idx = pre_key_cols.size();
+      pre_key_cols.push_back(cn);
+      return idx;
+    };
+    const size_t fk_slot =
+        ensure_pre_key(ColumnName(core_fk->alias, core_fk->exact_col));
+    std::vector<size_t> slot_pre_idx(slots.size(), 0);
+    for (size_t s = 0; s < slots.size(); ++s) {
+      if (slots[s].col.rel_idx != dim_idx) {
+        slot_pre_idx[s] = ensure_pre_key(
+            ColumnName(slots[s].col.alias, slots[s].col.exact_col));
+      }
+    }
+
+    std::vector<NamedExpression> pre_select;
+    std::vector<Expression> pre_group;
+    pre_select.reserve(pre_key_cols.size());
+    pre_group.reserve(pre_key_cols.size());
+    for (size_t k = 0; k < pre_key_cols.size(); ++k) {
+      pre_select.emplace_back("__k" + std::to_string(k),
+                              ColumnValueExp(pre_key_cols[k]));
+      pre_group.push_back(ColumnValueExp(pre_key_cols[k]));
+    }
+
+    auto pre_stmt = std::make_shared<SelectStatement>();
+    pre_stmt->SetSources(std::move(pre_sources));
+    pre_stmt->SetWhereClause(CombineConjuncts(core_conjuncts));
+    pre_stmt->SetGroupBy(std::move(pre_group));
+    pre_stmt->SetSelectList(std::move(pre_select));
+
+    SelectSource pre_src("", "__tpcds_sk_pre", std::move(pre_stmt),
+                         JoinType::kCross, nullptr);
+    SelectSource dim_src = br->Sources()[dim_idx];
+    if (dim_src.alias.empty()) {
+      dim_src.alias = dim_src.table;
+    }
+    dim_src.join_type = JoinType::kCross;
+    dim_src.join_condition = nullptr;
+
+    std::vector<NamedExpression> outer_select;
+    outer_select.reserve(slots.size());
+    for (size_t s = 0; s < slots.size(); ++s) {
+      if (slots[s].col.rel_idx == dim_idx) {
+        outer_select.emplace_back(
+            slots[s].out_name,
+            ColumnValueExp(ColumnName(dim_src.alias, slots[s].col.exact_col)));
+      } else {
+        outer_select.emplace_back(
+            slots[s].out_name,
+            ColumnValueExp(ColumnName(
+                "__tpcds_sk_pre", "__k" + std::to_string(slot_pre_idx[s]))));
+      }
+    }
+
+    br->SetSources({std::move(pre_src), std::move(dim_src)});
+    br->SetWhereClause(BinaryExpressionExp(
+        ColumnValueExp(
+            ColumnName("__tpcds_sk_pre", "__k" + std::to_string(fk_slot))),
+        BinaryOperation::kEquals,
+        ColumnValueExp(ColumnName(dim_pk->alias, dim_pk->exact_col))));
+    br->SetSelectList(std::move(outer_select));
+    br->SetDistinct(true);
+    return true;
+  }
+  return false;
+}
+
+bool PushDistinctSurrogateKeysImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, TransactionContext& ctx,
+    std::unordered_set<SelectStatement*>* visited) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    if (!stmt->IsRecursiveWith(name) && body != nullptr) {
+      changed |= PushDistinctSurrogateKeysImpl(body.get(), ctx, visited);
+    }
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.query != nullptr && !src.is_lateral) {
+      changed |= PushDistinctSurrogateKeysImpl(src.query.get(), ctx, visited);
+    }
+  }
+  if (!stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr) {
+    changed |= VisitSetOpLeavesAndSync(stmt, visited, [&](SelectStatement* br) {
+      return RewriteOneDistinctBranchSurrogateKeys(br, ctx);
+    });
+  }
+  return changed;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (eager_distinct_surrogate_keys_setop_sound,
+//    except_below_non_injective_dim_unsound)
+bool PushDistinctSurrogateKeysBeforeDimJoins(SelectStatement* outer,
+                                             TransactionContext& ctx) {
+  std::unordered_set<SelectStatement*> visited;
+  return PushDistinctSurrogateKeysImpl(outer, ctx, &visited);
+}
+
+namespace {
+
+template <typename Fn>
+Expression ReplaceSubExpressions(  // NOLINT(misc-no-recursion)
+    const Expression& expr, Fn&& fn) {
+  if (!expr) {
+    return expr;
+  }
+  if (std::optional<Expression> direct = fn(expr); direct.has_value()) {
+    return std::move(*direct);
+  }
+  std::vector<Expression> children = ExpressionChildren(expr);
+  bool changed = false;
+  for (Expression& child : children) {
+    Expression next = ReplaceSubExpressions(child, fn);
+    if (next.get() != child.get()) {
+      changed = true;
+    }
+    child = std::move(next);
+  }
+  Expression rebuilt =
+      changed ? WithExpressionChildren(expr, std::move(children)) : expr;
+  if (rebuilt && rebuilt->Type() == TypeTag::kAggregateExp) {
+    const auto& agg = rebuilt->AsAggregateExpression();
+    if (agg.WhereFilter()) {
+      Expression next_filter = ReplaceSubExpressions(agg.WhereFilter(), fn);
+      if (next_filter.get() != agg.WhereFilter().get()) {
+        auto fresh = std::make_shared<AggregateExpression>(
+            agg.GetType(), agg.Child(), agg.Distinct());
+        fresh->SetIgnoreNulls(agg.IgnoreNulls());
+        if (agg.Having() != AggregateHavingModifier::kNone ||
+            agg.HavingCondition()) {
+          fresh->SetHaving(agg.Having(), agg.HavingCondition());
+        }
+        if (!agg.InnerOrderBy().empty()) {
+          fresh->SetInnerOrderBy(agg.InnerOrderBy());
+        }
+        if (agg.InnerLimit().has_value()) {
+          fresh->SetInnerLimit(agg.InnerLimit());
+        }
+        if (agg.SecondaryArg()) {
+          fresh->SetSecondaryArg(agg.SecondaryArg());
+        }
+        if (!agg.TrailingArgs().empty()) {
+          fresh->SetTrailingArgs(agg.TrailingArgs());
+        }
+        fresh->SetWhereFilter(std::move(next_filter));
+        if (!agg.ArrayElementSqlType().empty()) {
+          fresh->SetArrayElementSqlType(agg.ArrayElementSqlType());
+        }
+        if (agg.HasInnerGroupBy()) {
+          fresh->SetInnerGroupBy(agg.InnerGroupBy());
+        }
+        rebuilt = std::move(fresh);
+      }
+    }
+  }
+  return rebuilt;
+}
+
+// Unwraps `(SELECT expr AS c1, ..., * FROM base_tbl)` inside FROM so
+// downstream grouped/PK rewrites see the base table directly (e.g. Q23 `sq1`).
+bool UnwrapStarPlusComputedBaseSubqueries(SelectStatement* stmt,
+                                          TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->Sources().empty() ||
+      SelectListHasStarOrModifiers(*stmt) || TpcdsStmtHasParam(*stmt)) {
+    return false;
+  }
+  bool any = false;
+  for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+    SelectSource src = stmt->Sources()[si];
+    if (src.query == nullptr || src.alias.empty() || src.unnest ||
+        src.is_lateral || src.sample || !src.using_columns.empty() ||
+        src.from_nested_join ||
+        (src.join_type != JoinType::kCross &&
+         src.join_type != JoinType::kInner)) {
+      continue;
+    }
+    const SelectStatement& sq = *src.query;
+    if (sq.Sources().size() != 1 || sq.WhereClause() || !sq.GroupBy().empty() ||
+        sq.IsGroupAll() || sq.Having() || sq.Distinct() || sq.HasDistinctOn() ||
+        sq.HasLimit() || sq.Offset() != 0 || sq.Qualify() ||
+        !sq.OrderBy().empty() || !sq.WithQueries().empty() ||
+        !sq.UnionAll().empty() || sq.GetSetOperationTree() != nullptr ||
+        relational_detail::HasWindowFunctions(sq) || sq.SelectList().size() < 2) {
+      continue;
+    }
+    const SelectSource& bsrc = sq.Sources()[0];
+    if (bsrc.table.empty() || bsrc.query != nullptr || bsrc.unnest ||
+        bsrc.is_lateral || bsrc.sample || !bsrc.using_columns.empty() ||
+        bsrc.from_nested_join) {
+      continue;
+    }
+    StatusOr<std::shared_ptr<Table>> btbl = ctx.GetTable(bsrc.table);
+    if (!btbl.HasValue() || btbl.Value() == nullptr) {
+      continue;
+    }
+    const Schema& bschema = btbl.Value()->GetSchema();
+    const std::string balias = bsrc.alias.empty() ? bsrc.table : bsrc.alias;
+    const NamedExpression& last_it = sq.SelectList().back();
+    if (!last_it.expression || last_it.expression->Type() != TypeTag::kColumnValue ||
+        last_it.expression->AsColumnValue().GetColumnName().name != "*") {
+      continue;
+    }
+    std::unordered_map<std::string, Expression> computed_map;
+    bool ok = true;
+    for (size_t i = 0; i + 1 < sq.SelectList().size(); ++i) {
+      const NamedExpression& ci = sq.SelectList()[i];
+      if (ci.name.empty() || !ci.expression ||
+          ContainsQueryExpression(ci.expression) ||
+          relational_detail::ContainsAggregate(ci.expression) ||
+          !DerivedExpressionIsImmutable(ci.expression) ||
+          bschema.Offset(ColumnName("", ci.name)) >= 0) {
+        ok = false;
+        break;
+      }
+      Expression rebound = ReplaceSubExpressions(
+          ci.expression, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            const ColumnName& cn = node->AsColumnValue().GetColumnName();
+            if (!cn.schema.empty() && !IdentifierEquals(cn.schema, balias) &&
+                !IdentifierEquals(cn.schema, bsrc.table)) {
+              ok = false;
+              return std::nullopt;
+            }
+            const int boff = bschema.Offset(ColumnName("", cn.name));
+            if (boff < 0) {
+              ok = false;
+              return std::nullopt;
+            }
+            return ColumnValueExp(ColumnName(
+                src.alias, bschema.GetColumn(static_cast<size_t>(boff)).Name().name));
+          });
+      if (!ok ||
+          !computed_map.emplace(LoweredStarName(ci.name), std::move(rebound)).second) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok || computed_map.empty()) {
+      continue;
+    }
+    auto subst = [&](const Expression& expr) -> Expression {
+      if (!expr) { return expr;
+}
+      return ReplaceSubExpressions(
+          expr, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            const ColumnName& cn = node->AsColumnValue().GetColumnName();
+            if (!cn.schema.empty() && !IdentifierEquals(cn.schema, src.alias)) {
+              return std::nullopt;
+            }
+            const auto it = computed_map.find(LoweredStarName(cn.name));
+            return it != computed_map.end() ? std::optional<Expression>(it->second)
+                                            : std::nullopt;
+          });
+    };
+    std::vector<NamedExpression> new_sel;
+    new_sel.reserve(stmt->SelectList().size());
+    for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+      new_sel.emplace_back(InferSelectItemOutputName(stmt->SelectList()[i], i),
+                           subst(stmt->SelectList()[i].expression));
+    }
+    std::vector<Expression> new_grp;
+    new_grp.reserve(stmt->GroupBy().size());
+    for (const Expression& g : stmt->GroupBy()) {
+      new_grp.push_back(subst(g));
+    }
+    std::vector<SelectStatement::OrderByTerm> new_ord = stmt->OrderBy();
+    for (auto& t : new_ord) {
+      t.expression = subst(t.expression);
+    }
+    std::vector<SelectSource> new_srcs = stmt->Sources();
+    for (SelectSource& s : new_srcs) {
+      if (s.join_condition) {
+        s.join_condition = subst(s.join_condition);
+      }
+    }
+    new_srcs[si].table = bsrc.table;
+    new_srcs[si].query = nullptr;
+    stmt->SetSources(std::move(new_srcs));
+    stmt->SetSelectList(std::move(new_sel));
+    stmt->SetGroupBy(std::move(new_grp));
+    stmt->SetOrderBy(std::move(new_ord));
+    if (stmt->WhereClause()) { stmt->SetWhereClause(subst(stmt->WhereClause()));
+}
+    if (stmt->Having()) { stmt->SetHaving(subst(stmt->Having()));
+}
+    if (stmt->Qualify()) { stmt->SetQualify(subst(stmt->Qualify()));
+}
+    any = true;
+  }
+  return any;
+}
+
+bool DeferOneUniqueDimJoinPastGroupBy(SelectStatement* stmt,
+                                      TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->GroupBy().empty() || stmt->IsGroupAll() ||
+      stmt->Distinct() || stmt->HasDistinctOn() || stmt->Qualify() ||
+      stmt->HasLimit() || stmt->Offset() != 0 || !stmt->OrderBy().empty() ||
+      stmt->WithTies() || stmt->ForUpdate() || stmt->AsStruct() ||
+      !stmt->WithQueries().empty() || !stmt->UnionAll().empty() ||
+      stmt->GetSetOperationTree() != nullptr ||
+      relational_detail::HasWindowFunctions(*stmt) ||
+      relational_detail::StatementContainsVolatileFunction(*stmt) ||
+      SelectListHasStarOrModifiers(*stmt) || TpcdsStmtHasParam(*stmt) ||
+      stmt->Sources().size() < 2) {
+    return false;
+  }
+  (void)UnwrapStarPlusComputedBaseSubqueries(stmt, ctx);
+
+  struct RelMeta {
+    std::string table_name;
+    std::string alias;
+    std::shared_ptr<Table> table;
+    const Schema* schema{nullptr};
+    uint64_t est_rows{0};
+  };
+  std::vector<RelMeta> rels(stmt->Sources().size());
+  std::unordered_set<std::string> seen_aliases;
+  uint64_t max_est = 0;
+  for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+    const SelectSource& s = stmt->Sources()[si];
+    if (s.table.empty() || s.query != nullptr || s.unnest || s.is_lateral ||
+        s.sample || !s.using_columns.empty() || s.from_nested_join ||
+        (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+      return false;
+    }
+    StatusOr<std::shared_ptr<Table>> tbl = ctx.GetTable(s.table);
+    if (!tbl.HasValue() || tbl.Value() == nullptr) {
+      return false;
+    }
+    const std::string al = s.alias.empty() ? s.table : s.alias;
+    if (!seen_aliases.insert(LoweredStarName(al)).second) {
+      return false;
+    }
+    uint64_t est = tbl.Value()->BackingColumnarRowCount();
+    if (auto st = ctx.GetStats(s.table); st.HasValue()) {
+      est = std::max<uint64_t>(est, st.Value()->Rows());
+    }
+    max_est = std::max(max_est, est);
+    rels[si] = RelMeta{.table_name = s.table,
+                       .alias = al,
+                       .table = tbl.Value(),
+                       .schema = &tbl.Value()->GetSchema(),
+                       .est_rows = est};
+  }
+
+  auto resolve_col =
+      [&](const ColumnName& cn) -> std::optional<std::pair<size_t, size_t>> {
+    if (cn.name.empty() || cn.name == "*") {
+      return std::nullopt;
+    }
+    if (!cn.schema.empty()) {
+      for (size_t si = 0; si < rels.size(); ++si) {
+        if (IdentifierEquals(cn.schema, rels[si].alias) ||
+            (stmt->Sources()[si].alias.empty() &&
+             IdentifierEquals(cn.schema, rels[si].table_name))) {
+          const int off = rels[si].schema->Offset(ColumnName("", cn.name));
+          if (off >= 0) {
+            return std::pair{si, static_cast<size_t>(off)};
+          }
+        }
+      }
+      return std::nullopt;
+    }
+    std::optional<std::pair<size_t, size_t>> hit;
+    for (size_t si = 0; si < rels.size(); ++si) {
+      const int off = rels[si].schema->Offset(ColumnName("", cn.name));
+      if (off >= 0) {
+        if (hit.has_value()) {
+          return std::nullopt;
+        }
+        hit = std::pair{si, static_cast<size_t>(off)};
+      }
+    }
+    return hit;
+  };
+
+  auto expr_sources = [&](const Expression& expr, std::unordered_set<size_t>* out) {
+    if (!expr) {
+      return true;
+    }
+    if (ContainsQueryExpression(expr)) {
+      return false;
+    }
+    for (const ColumnName& cn : expr->TouchedColumns()) {
+      auto r = resolve_col(cn);
+      if (!r.has_value()) {
+        return false;
+      }
+      out->insert(r->first);
+    }
+    return true;
+  };
+
+  std::vector<Expression> all_preds = SplitConjuncts(stmt->WhereClause());
+  for (size_t si = 1; si < stmt->Sources().size(); ++si) {
+    if (stmt->Sources()[si].join_condition) {
+      for (Expression& c : SplitConjuncts(stmt->Sources()[si].join_condition)) {
+        all_preds.push_back(std::move(c));
+      }
+    }
+  }
+
+  for (size_t dim_si = 0; dim_si < rels.size(); ++dim_si) {
+    if (rels[dim_si].est_rows > 250000 || rels[dim_si].est_rows * 2 >= max_est) {
+      continue;
+    }
+    // Tiny PK lookup tables (<= 64 rows, e.g. warehouse/store/call_center) inside
+    // a >=3-source join execute directly as L1-resident DeferredLSTablePkLookup
+    // dictionaries inside FusedGroupedJoin (enabling split_key_gid + def_cell=1),
+    // whereas deferring them past GROUP BY adds a post-aggregate join and breaks
+    // single-probe-key packing. Keep deferral for 2-source -> 1-table reduction.
+    if (rels.size() >= 3 && rels[dim_si].est_rows <= 64) {
+      continue;
+    }
+    // Check predicates touching dim_si: must be ONLY one `fk_col = dim.pk_col`
+    // plus optional non-throwing local `dim.col IS NOT NULL` guards.
+    size_t dim_preds = 0;
+    size_t pk_slot = 0;
+    std::pair<size_t, size_t> fk_ref{0, 0};
+    std::vector<Expression> core_preds;
+    std::vector<Expression> dim_local_preds;
+    bool pred_ok = true;
+    for (const Expression& pr : all_preds) {
+      std::unordered_set<size_t> ps;
+      if (!expr_sources(pr, &ps)) {
+        pred_ok = false;
+        break;
+      }
+      if (!ps.contains(dim_si)) {
+        core_preds.push_back(pr);
+        continue;
+      }
+      if (ps.size() == 1 && pr->Type() == TypeTag::kUnaryExp &&
+          pr->AsUnaryExpression().Op() == UnaryOperation::kIsNotNull &&
+          pr->AsUnaryExpression().Child() &&
+          pr->AsUnaryExpression().Child()->Type() == TypeTag::kColumnValue) {
+        auto dr = resolve_col(
+            pr->AsUnaryExpression().Child()->AsColumnValue().GetColumnName());
+        if (!dr.has_value() || dr->first != dim_si) {
+          pred_ok = false;
+          break;
+        }
+        dim_local_preds.push_back(UnaryExpressionExp(
+            ColumnValueExp(ColumnName(
+                rels[dim_si].alias,
+                rels[dim_si].schema->GetColumn(dr->second).Name().name)),
+            UnaryOperation::kIsNotNull));
+        continue;
+      }
+      ++dim_preds;
+      if (dim_preds > 1 || pr->Type() != TypeTag::kBinaryExp ||
+          pr->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+        pred_ok = false;
+        break;
+      }
+      const Expression& l = pr->AsBinaryExpression().Left();
+      const Expression& r = pr->AsBinaryExpression().Right();
+      if (!l || !r || l->Type() != TypeTag::kColumnValue ||
+          r->Type() != TypeTag::kColumnValue) {
+        pred_ok = false;
+        break;
+      }
+      auto lr = resolve_col(l->AsColumnValue().GetColumnName());
+      auto rr = resolve_col(r->AsColumnValue().GetColumnName());
+      if (!lr.has_value() || !rr.has_value() ||
+          (lr->first == dim_si) == (rr->first == dim_si)) {
+        pred_ok = false;
+        break;
+      }
+      const auto dim_r = (lr->first == dim_si) ? *lr : *rr;
+      const auto oth_r = (lr->first == dim_si) ? *rr : *lr;
+      const Column& pkc = rels[dim_si].schema->GetColumn(dim_r.second);
+      const Column& fkc = rels[oth_r.first].schema->GetColumn(oth_r.second);
+      if (pkc.Type() != ValueType::kInt64 || pkc.IsUnsigned() ||
+          fkc.Type() != ValueType::kInt64 || fkc.IsUnsigned()) {
+        pred_ok = false;
+        break;
+      }
+      pk_slot = dim_r.second;
+      fk_ref = oth_r;
+    }
+    if (!pred_ok || dim_preds != 1) {
+      continue;
+    }
+    if (!dim_local_preds.empty() && stmt->Having() &&
+        !DerivedExpressionIsImmutable(stmt->Having())) {
+      continue;
+    }
+
+    // Check GroupBy: at least one unique dim key `dim.uk_col` AND at least one
+    // extra dim attribute/expr in GroupBy or SelectList that benefits from
+    // deferral, while non-dim GroupBy items are pure ColumnValues.
+    bool has_unique_dim_gkey = false;
+    size_t dim_referenced_cols = 0;
+    std::vector<std::pair<size_t, size_t>> retained_non_dim_gkeys;
+    bool gkeys_ok = true;
+    for (const Expression& gk : stmt->GroupBy()) {
+      std::unordered_set<size_t> gs;
+      if (!gk || !DerivedExpressionIsImmutable(gk) || !expr_sources(gk, &gs)) {
+        gkeys_ok = false;
+        break;
+      }
+      if (gs.contains(dim_si)) {
+        if (gs.size() != 1) {
+          gkeys_ok = false;
+          break;
+        }
+        ++dim_referenced_cols;
+        if (!has_unique_dim_gkey && gk->Type() == TypeTag::kColumnValue) {
+          auto gr = resolve_col(gk->AsColumnValue().GetColumnName());
+          if (gr.has_value() && gr->first == dim_si) {
+            const std::string& uk_name =
+                rels[dim_si].schema->GetColumn(gr->second).Name().name;
+            if (InspectRuntimeUniqueNonNullColumn(ctx, rels[dim_si].table_name,
+                                                  uk_name)
+                    .unique_non_null) {
+              has_unique_dim_gkey = true;
+            }
+          }
+        }
+      } else {
+        if (gk->Type() != TypeTag::kColumnValue) {
+          gkeys_ok = false;
+          break;
+        }
+        auto gr = resolve_col(gk->AsColumnValue().GetColumnName());
+        if (!gr.has_value()) {
+          gkeys_ok = false;
+          break;
+        }
+        if (std::ranges::find(retained_non_dim_gkeys, *gr) ==
+            retained_non_dim_gkeys.end()) {
+          retained_non_dim_gkeys.push_back(*gr);
+        }
+      }
+    }
+    if (!gkeys_ok || !has_unique_dim_gkey) {
+      continue;
+    }
+    // Also verify `pk_slot` is unique non-null on `dim_si`.
+    const std::string& pk_name =
+        rels[dim_si].schema->GetColumn(pk_slot).Name().name;
+    if (!InspectRuntimeUniqueNonNullColumn(ctx, rels[dim_si].table_name, pk_name)
+             .unique_non_null) {
+      continue;
+    }
+
+    // Check Having and SelectList: no AggregateExpression may touch `dim_si`,
+    // and Having may not touch `dim_si` outside aggregates either.
+    std::vector<const AggregateExpression*> aggs;
+    std::unordered_set<std::string> seen_agg_str;
+    std::unordered_map<std::string, size_t> agg_to_idx;
+    bool exprs_ok = true;
+    auto check_and_collect = [&](auto& self, const Expression& e,
+                                 bool allow_dim_scalar) -> bool {
+      if (!e) {
+        return true;
+      }
+      if (e->Type() == TypeTag::kQueryExp ||
+          e->Type() == TypeTag::kWindowFunctionExp) {
+        return false;
+      }
+      if (e->Type() == TypeTag::kAggregateExp) {  // NOLINT(readability-simplify-boolean-expr)
+        const auto& agg = e->AsAggregateExpression();
+        if (agg.Distinct() || agg.NeedsGroupContext() || agg.HasWhereFilter() ||
+            !agg.InnerGroupBy().empty() || !agg.InnerOrderBy().empty() ||
+            agg.InnerLimit().has_value() ||
+            agg.Having() != AggregateHavingModifier::kNone) {
+          return false;
+        }
+        if (agg.Child() && !(agg.Child()->Type() == TypeTag::kColumnValue &&  // NOLINT(readability-simplify-boolean-expr)
+                             agg.Child()->AsColumnValue().GetColumnName().name ==
+                                 "*")) {
+          std::unordered_set<size_t> cs;
+          if (!expr_sources(agg.Child(), &cs) || cs.contains(dim_si)) {
+            return false;
+          }
+        }
+        const std::string key = e->ToString();
+        if (seen_agg_str.insert(key).second) {
+          agg_to_idx.emplace(key, aggs.size());
+          aggs.push_back(&agg);
+        }
+        return true;
+      }
+      if (e->Type() == TypeTag::kColumnValue) {
+        auto r = resolve_col(e->AsColumnValue().GetColumnName());
+        if (!r.has_value()) {
+          return false;
+        }
+        if (r->first == dim_si) {
+          ++dim_referenced_cols;
+          return allow_dim_scalar;
+        }
+        return *r == fk_ref ||
+               std::ranges::find(retained_non_dim_gkeys, *r) !=
+                   retained_non_dim_gkeys.end();
+      }
+      for (const Expression& ch : ExpressionChildren(e)) {
+        if (!self(self, ch, allow_dim_scalar)) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    if (stmt->Having() &&
+        !check_and_collect(check_and_collect, stmt->Having(),
+                           /*allow_dim_scalar=*/false)) {
+      exprs_ok = false;
+    }
+    for (const NamedExpression& it : stmt->SelectList()) {
+      if (!exprs_ok || !check_and_collect(check_and_collect, it.expression,
+                                          /*allow_dim_scalar=*/true)) {
+        exprs_ok = false;
+        break;
+      }
+    }
+    if (!exprs_ok || dim_referenced_cols < 2) {
+      continue;
+    }
+    // Build inner pre-grouped subquery `__tpcds_dim_pre`.
+    std::vector<SelectSource> pre_sources;
+    pre_sources.reserve(stmt->Sources().size() - 1);
+    for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+      if (si == dim_si) { continue;
+}
+      SelectSource cp = stmt->Sources()[si];
+      cp.alias = rels[si].alias;
+      cp.join_type = JoinType::kCross;
+      cp.join_condition = nullptr;
+      pre_sources.push_back(std::move(cp));
+    }
+    auto qualify_core_expr = [&](const Expression& e) -> Expression {
+      if (!e) { return e;
+}
+      return ReplaceSubExpressions(
+          e, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            const ColumnName& cn = node->AsColumnValue().GetColumnName();
+            if (cn.name == "*") { return std::nullopt;
+}
+            auto r = resolve_col(cn);
+            if (!r.has_value()) { return std::nullopt;
+}
+            return ColumnValueExp(ColumnName(
+                rels[r->first].alias,
+                rels[r->first].schema->GetColumn(r->second).Name().name));
+          });
+    };
+
+    const Expression fk_col_expr = ColumnValueExp(ColumnName(
+        rels[fk_ref.first].alias,
+        rels[fk_ref.first].schema->GetColumn(fk_ref.second).Name().name));
+    std::vector<Expression> pre_where;
+    pre_where.reserve(core_preds.size() + 1);
+    for (const Expression& cp : core_preds) {
+      pre_where.push_back(qualify_core_expr(cp));
+    }
+    pre_where.push_back(
+        UnaryExpressionExp(fk_col_expr, UnaryOperation::kIsNotNull));
+
+    std::vector<NamedExpression> pre_select;
+    std::vector<Expression> pre_group;
+    pre_select.emplace_back("__fk", fk_col_expr);
+    pre_group.push_back(fk_col_expr);
+    std::vector<size_t> gk_pre_slot(retained_non_dim_gkeys.size(), 0);
+    for (size_t gi = 0; gi < retained_non_dim_gkeys.size(); ++gi) {
+      if (retained_non_dim_gkeys[gi] == fk_ref) {
+        gk_pre_slot[gi] = 0;
+        continue;
+      }
+      const size_t sl = pre_select.size();
+      gk_pre_slot[gi] = sl;
+      const Expression ge = ColumnValueExp(ColumnName(
+          rels[retained_non_dim_gkeys[gi].first].alias,
+          rels[retained_non_dim_gkeys[gi].first]
+              .schema->GetColumn(retained_non_dim_gkeys[gi].second)
+              .Name()
+              .name));
+      pre_select.emplace_back("__gk" + std::to_string(sl), ge);
+      pre_group.push_back(ge);
+    }
+    for (size_t ai = 0; ai < aggs.size(); ++ai) {
+      const AggregateExpression& a = *aggs[ai];
+      Expression qual_child =
+          (a.Child() && a.Child()->Type() == TypeTag::kColumnValue &&
+           a.Child()->AsColumnValue().GetColumnName().name == "*")
+              ? a.Child()
+              : qualify_core_expr(a.Child());
+      pre_select.emplace_back(
+          "__agg" + std::to_string(ai),
+          AggregateExpressionExp(a.GetType(), std::move(qual_child), false));
+    }
+
+    auto pre_stmt = std::make_shared<SelectStatement>();
+    pre_stmt->SetSources(std::move(pre_sources));
+    pre_stmt->SetWhereClause(CombineConjuncts(pre_where));
+    pre_stmt->SetGroupBy(std::move(pre_group));
+    if (stmt->Having()) {
+      pre_stmt->SetHaving(qualify_core_expr(stmt->Having()));
+    }
+    pre_stmt->SetSelectList(std::move(pre_select));
+
+    const std::string pre_alias = "__tpcds_dim_pre";
+    SelectSource pre_src("", pre_alias, std::move(pre_stmt), JoinType::kCross,
+                         nullptr);
+    SelectSource dim_src = stmt->Sources()[dim_si];
+    dim_src.alias = rels[dim_si].alias;
+    dim_src.join_type = JoinType::kCross;
+    dim_src.join_condition = nullptr;
+
+    auto rewrite_outer_expr = [&](const Expression& e) -> Expression {
+      if (!e) { return e;
+}
+      return ReplaceSubExpressions(
+          e, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node) { return std::nullopt;
+}
+            if (node->Type() == TypeTag::kAggregateExp) {
+              const auto it = agg_to_idx.find(node->ToString());
+              if (it != agg_to_idx.end()) {
+                return ColumnValueExp(
+                    ColumnName(pre_alias, "__agg" + std::to_string(it->second)));
+              }
+              return std::nullopt;
+            }
+            if (node->Type() == TypeTag::kColumnValue) {
+              auto r = resolve_col(node->AsColumnValue().GetColumnName());
+              if (!r.has_value()) { return std::nullopt;
+}
+              if (r->first == dim_si) {
+                return ColumnValueExp(ColumnName(
+                    rels[dim_si].alias,
+                    rels[dim_si].schema->GetColumn(r->second).Name().name));
+              }
+              if (*r == fk_ref) {
+                return ColumnValueExp(ColumnName(pre_alias, "__fk"));
+              }
+              for (size_t gi = 0; gi < retained_non_dim_gkeys.size(); ++gi) {
+                if (retained_non_dim_gkeys[gi] == *r) {
+                  const size_t sl = gk_pre_slot[gi];
+                  return ColumnValueExp(ColumnName(
+                      pre_alias,
+                      sl == 0 ? "__fk" : ("__gk" + std::to_string(sl))));
+                }
+              }
+            }
+            return std::nullopt;
+          });
+    };
+
+    std::vector<NamedExpression> out_sel;
+    out_sel.reserve(stmt->SelectList().size());
+    for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+      out_sel.emplace_back(InferSelectItemOutputName(stmt->SelectList()[i], i),
+                           rewrite_outer_expr(stmt->SelectList()[i].expression));
+    }
+
+    std::vector<Expression> outer_where;
+    outer_where.reserve(1 + dim_local_preds.size());
+    outer_where.push_back(BinaryExpressionExp(
+        ColumnValueExp(ColumnName(pre_alias, "__fk")), BinaryOperation::kEquals,
+        ColumnValueExp(ColumnName(rels[dim_si].alias, pk_name))));
+    for (Expression& dlp : dim_local_preds) {
+      outer_where.push_back(std::move(dlp));
+    }
+    stmt->SetSources({std::move(pre_src), std::move(dim_src)});
+    stmt->SetWhereClause(CombineConjuncts(outer_where));
+    stmt->SetGroupBy({});
+    stmt->SetHaving(nullptr);
+    stmt->SetSelectList(std::move(out_sel));
+    return true;
+  }
+  return false;
+}
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (rollup_sum_homomorphic_arbitrary_expr_sound)
+// Preserves identical FROM+WHERE input shape across ROLLUP / GROUPING SETS
+// UNION ALL branches (including DOUBLE aggregates such as Q67) so the executor
+// scans and joins the base tables once instead of per-branch.
+bool HasSharedScanUnionAllBranches(const SelectStatement& stmt) {
+  if (stmt.UnionAll().size() < 2 || stmt.GetSetOperationTree() != nullptr) {
+    return false;
+  }
+  auto shareable_part = [](const SelectStatement& part) {
+    return !part.GroupBy().empty() && !part.Distinct() &&
+           !part.HasDistinctOn() && !part.Having() && !part.Qualify() &&
+           !relational_detail::StatementContainsVolatileFunction(part);
+  };
+  if (!shareable_part(stmt)) {
+    return false;
+  }
+  auto input_shape = [](const SelectStatement& part) {
+    SelectStatement shape(part);
+    shape.SetSelectList({});
+    shape.SetGroupBy({});
+    shape.SetGroupAll(false);
+    shape.SetHaving(nullptr);
+    shape.SetOrderBy({});
+    shape.SetLimit(std::nullopt);
+    shape.SetOffset(0);
+    shape.SetWithTies(false);
+    shape.ClearUnionAll();
+    shape.SetSetOperationTree(nullptr);
+    shape.ClearWithQueries();
+    return std::string(shape.Fingerprint());
+  };
+  const std::string head_shape = input_shape(stmt);
+  for (size_t i = 0; i < stmt.UnionAll().size(); ++i) {
+    if (stmt.UnionAll()[i] == nullptr) {
+      return false;
+    }
+    const SelectStatement& part = *stmt.UnionAll()[i];
+    const auto match = stmt.MatchFor(i);
+    if (!shareable_part(part) || part.HasLimit() || part.Offset() != 0 ||
+        !part.OrderBy().empty() || !part.WithQueries().empty() ||
+        !part.UnionAll().empty() || match.by_name || match.corresponding ||
+        !match.columns.empty() ||
+        (i < stmt.SetOperationKinds().size() &&
+         stmt.SetOperationKinds()[i] != SetOperationKind::kUnionAll) ||
+        input_shape(part) != head_shape) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool DeferUniqueDimJoinPastGroupByImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, TransactionContext& ctx,
+    std::unordered_set<SelectStatement*>* visited) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    if (!stmt->IsRecursiveWith(name) && body != nullptr) {
+      changed |= DeferUniqueDimJoinPastGroupByImpl(body.get(), ctx, visited);
+    }
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.query != nullptr && !src.is_lateral) {
+      changed |= DeferUniqueDimJoinPastGroupByImpl(src.query.get(), ctx, visited);
+    }
+  }
+  if (!stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr) {
+    if (!stmt->UnionAll().empty() &&
+        (relational_detail::CanUseExactIntegerGroupingSets(ctx, *stmt) ||
+         HasSharedScanUnionAllBranches(*stmt))) {
+      return changed;
+    }
+    changed |= VisitSetOpLeavesAndSync(stmt, visited, [&](SelectStatement* br) {
+      return DeferOneUniqueDimJoinPastGroupBy(br, ctx);
+    });
+  } else {
+    changed |= DeferOneUniqueDimJoinPastGroupBy(stmt, ctx);
+  }
+  return changed;
+}
+
+bool SubqueryMayReferenceDimSource(  // NOLINT(misc-no-recursion)
+    const SelectStatement& q, std::string_view dim_alias,
+    std::string_view dim_table, const Schema& dim_schema);
+
+bool ExprMayReferenceDimInsideSubquery(  // NOLINT(misc-no-recursion)
+    const Expression& e, std::string_view dim_alias, std::string_view dim_table,
+    const Schema& dim_schema) {
+  if (!e) {
+    return false;
+  }
+  if (e->Type() == TypeTag::kQueryExp) {
+    const auto& q = e->AsQueryExpression();
+    if (q.Test() && ExprMayReferenceDimInsideSubquery(q.Test(), dim_alias,
+                                                      dim_table, dim_schema)) {
+      return true;
+    }
+    return q.Query() != nullptr &&
+           SubqueryMayReferenceDimSource(*q.Query(), dim_alias, dim_table,
+                                         dim_schema);
+  }
+  if (e->Type() == TypeTag::kColumnValue) {
+    const ColumnName& cn = e->AsColumnValue().GetColumnName();
+    if (cn.name == "*") {
+      return !cn.schema.empty() &&
+             (IdentifierEquals(cn.schema, dim_alias) ||
+              (!dim_table.empty() && IdentifierEquals(cn.schema, dim_table)));  // NOLINT(readability-use-anyofallof)
+    }
+    if (!cn.schema.empty()) {
+      return IdentifierEquals(cn.schema, dim_alias) ||
+             (!dim_table.empty() && IdentifierEquals(cn.schema, dim_table));
+    }
+    return dim_schema.Offset(ColumnName("", cn.name)) >= 0;
+  }
+  for (const Expression& ch : ExpressionChildren(e)) {  // NOLINT(readability-use-anyofallof)
+    if (ExprMayReferenceDimInsideSubquery(ch, dim_alias, dim_table,
+                                          dim_schema)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SubqueryMayReferenceDimSource(  // NOLINT(misc-no-recursion)
+    const SelectStatement& q, std::string_view dim_alias,
+    std::string_view dim_table, const Schema& dim_schema) {
+  for (const auto& [name, body] : q.WithQueries()) {
+    (void)name;
+    if (body != nullptr &&
+        SubqueryMayReferenceDimSource(*body, dim_alias, dim_table,
+                                      dim_schema)) {
+      return true;
+    }
+  }
+  for (const SelectSource& s : q.Sources()) {
+    if (s.query != nullptr &&
+        SubqueryMayReferenceDimSource(*s.query, dim_alias, dim_table,
+                                      dim_schema)) {
+      return true;
+    }
+    if (ExprMayReferenceDimInsideSubquery(s.join_condition, dim_alias,
+                                          dim_table, dim_schema) ||
+        ExprMayReferenceDimInsideSubquery(s.unnest, dim_alias, dim_table,
+                                          dim_schema)) {
+      return true;
+    }
+  }
+  if (ExprMayReferenceDimInsideSubquery(q.WhereClause(), dim_alias, dim_table,
+                                        dim_schema) ||
+      ExprMayReferenceDimInsideSubquery(q.Having(), dim_alias, dim_table,
+                                        dim_schema) ||
+      ExprMayReferenceDimInsideSubquery(q.Qualify(), dim_alias, dim_table,
+                                        dim_schema)) {
+    return true;
+  }
+  for (const NamedExpression& it : q.SelectList()) {
+    if (ExprMayReferenceDimInsideSubquery(it.expression, dim_alias, dim_table,
+                                          dim_schema)) {
+      return true;
+    }
+  }
+  for (const Expression& g : q.GroupBy()) {
+    if (ExprMayReferenceDimInsideSubquery(g, dim_alias, dim_table,
+                                          dim_schema)) {
+      return true;
+    }
+  }
+  for (const auto& ot : q.OrderBy()) {
+    if (ExprMayReferenceDimInsideSubquery(ot.expression, dim_alias, dim_table,
+                                          dim_schema)) {
+      return true;
+    }
+  }
+  for (const auto& br : q.UnionAll()) {
+    if (br != nullptr &&
+        SubqueryMayReferenceDimSource(*br, dim_alias, dim_table, dim_schema)) {
+      return true;
+    }
+  }
+  if (const auto& tree = q.GetSetOperationTree(); tree != nullptr) {
+    if (tree->first != nullptr &&
+        SubqueryMayReferenceDimSource(*tree->first, dim_alias, dim_table,
+                                      dim_schema)) {
+      return true;
+    }
+    for (const auto& br : tree->branches) {
+      if (br != nullptr &&
+          SubqueryMayReferenceDimSource(*br, dim_alias, dim_table,
+                                        dim_schema)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool EliminateUnreferencedPkInOneSelect(
+    SelectStatement* stmt,
+    const std::unordered_map<std::string, const SelectStatement*>& visible_ctes,
+    TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->Sources().size() < 2 || stmt->ForUpdate() ||
+      stmt->AsStruct() || SelectListHasStarOrModifiers(*stmt) ||
+      TpcdsStmtHasParam(*stmt) || !stmt->UnionAll().empty() ||
+      stmt->GetSetOperationTree() != nullptr) {
+    return false;
+  }
+  bool any_eliminated = false;
+  for (size_t iter = 0; iter < 4 && stmt->Sources().size() >= 2; ++iter) {
+    struct SrcInfo {
+      std::string table;
+      std::string alias;
+      std::shared_ptr<Table> tbl;
+      Schema schema;
+      bool is_base{false};
+      uint64_t est_rows{0};
+    };
+    std::vector<SrcInfo> srcs(stmt->Sources().size());
+    std::unordered_set<std::string> seen_al;
+    bool srcs_ok = true;
+    auto populate_query_schema = [&](const SelectStatement& q,
+                                     Schema* out_schema) -> bool {
+      const SelectStatement* qhead = &q;
+      if (qhead->SelectList().empty() &&
+          qhead->GetSetOperationTree() != nullptr &&
+          qhead->GetSetOperationTree()->first != nullptr) {
+        qhead = qhead->GetSetOperationTree()->first.get();
+      }
+      if (qhead->SelectList().empty() || SelectListHasStarOrModifiers(*qhead)) {
+        return false;
+      }
+      std::vector<Column> cols;
+      cols.reserve(qhead->SelectList().size());
+      for (size_t ci = 0; ci < qhead->SelectList().size(); ++ci) {
+        cols.emplace_back(
+            InferSelectItemOutputName(qhead->SelectList()[ci], ci),
+            ValueType::kNull);
+      }
+      *out_schema = Schema("", std::move(cols));
+      return true;
+    };
+    for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+      const SelectSource& s = stmt->Sources()[si];
+      if (s.unnest || s.is_lateral || s.sample || !s.using_columns.empty() ||
+          s.from_nested_join ||
+          (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+        srcs_ok = false;
+        break;
+      }
+      const std::string al = s.alias.empty() ? s.table : s.alias;
+      if (al.empty() || !seen_al.insert(LoweredStarName(al)).second) {
+        srcs_ok = false;
+        break;
+      }
+      srcs[si].table = s.table;
+      srcs[si].alias = al;
+      if (s.query != nullptr) {
+        if (!populate_query_schema(*s.query, &srcs[si].schema)) {
+          srcs_ok = false;
+          break;
+        }
+      } else if (const auto cte_it = visible_ctes.find(LoweredStarName(s.table));
+                 cte_it != visible_ctes.end()) {
+        if (cte_it->second == nullptr ||
+            !populate_query_schema(*cte_it->second, &srcs[si].schema)) {
+          srcs_ok = false;
+          break;
+        }
+      } else {
+        StatusOr<std::shared_ptr<Table>> t = ctx.GetTable(s.table);
+        if (!t.HasValue() || t.Value() == nullptr) {
+          srcs_ok = false;
+          break;
+        }
+        srcs[si].tbl = t.Value();
+        srcs[si].schema = t.Value()->GetSchema();
+        srcs[si].is_base = true;
+        uint64_t est = t.Value()->BackingColumnarRowCount();
+        if (auto st = ctx.GetStats(s.table); st.HasValue()) {
+          est = std::max<uint64_t>(est, st.Value()->Rows());
+        }
+        srcs[si].est_rows = est;
+      }
+    }
+    if (!srcs_ok) {
+      break;
+    }
+
+    auto resolve_col =
+        [&](const ColumnName& cn) -> std::optional<std::pair<size_t, size_t>> {
+      if (cn.name.empty() || cn.name == "*") { return std::nullopt;
+}
+      if (!cn.schema.empty()) {
+        for (size_t si = 0; si < srcs.size(); ++si) {
+          if (IdentifierEquals(cn.schema, srcs[si].alias) ||
+              (stmt->Sources()[si].alias.empty() &&
+               !srcs[si].table.empty() &&
+               IdentifierEquals(cn.schema, srcs[si].table))) {
+            const int off = srcs[si].schema.Offset(ColumnName("", cn.name));
+            if (off >= 0) { return std::pair{si, static_cast<size_t>(off)};
+}
+          }
+        }
+        return std::nullopt;
+      }
+      std::optional<std::pair<size_t, size_t>> hit;
+      for (size_t si = 0; si < srcs.size(); ++si) {
+        const int off = srcs[si].schema.Offset(ColumnName("", cn.name));
+        if (off >= 0) {
+          if (hit.has_value()) { return std::nullopt;
+}
+          hit = std::pair{si, static_cast<size_t>(off)};
+        }
+      }
+      return hit;
+    };
+
+    std::vector<Expression> all_preds = SplitConjuncts(stmt->WhereClause());
+    for (size_t si = 1; si < stmt->Sources().size(); ++si) {
+      if (stmt->Sources()[si].join_condition) {
+        for (Expression& c : SplitConjuncts(stmt->Sources()[si].join_condition)) {
+          all_preds.push_back(std::move(c));
+        }
+      }
+    }
+
+    bool dropped_one = false;
+    for (size_t dim_si = 0; dim_si < srcs.size(); ++dim_si) {
+      if (!srcs[dim_si].is_base || srcs[dim_si].est_rows > 250000) {
+        continue;
+      }
+      size_t dim_pred_cnt = 0;
+      size_t pk_slot = 0;
+      Expression fk_col_expr;
+      std::vector<Expression> other_preds;
+      bool preds_ok = true;
+      for (const Expression& pr : all_preds) {
+        if (!pr) { continue;
+}
+        bool touches_dim = false;
+        if (ContainsQueryExpression(pr)) {
+          // Conservatively block if correlated to dim_si.
+          for (const ColumnName& cn : pr->TouchedColumns()) {
+            auto r = resolve_col(cn);
+            if (!r.has_value() || r->first == dim_si) {
+              preds_ok = false;
+              break;
+            }
+          }
+          if (!preds_ok ||
+              ExprMayReferenceDimInsideSubquery(
+                  pr, srcs[dim_si].alias,
+                  stmt->Sources()[dim_si].alias.empty() ? srcs[dim_si].table
+                                                        : std::string_view{},
+                  srcs[dim_si].schema)) {
+            preds_ok = false;
+            break;
+          }
+          other_preds.push_back(pr);
+          continue;
+        }
+        for (const ColumnName& cn : pr->TouchedColumns()) {
+          auto r = resolve_col(cn);
+          if (!r.has_value()) {
+            preds_ok = false;
+            break;
+          }
+          if (r->first == dim_si) {
+            touches_dim = true;
+          }
+        }
+        if (!preds_ok) { break;
+}
+        if (!touches_dim) {
+          other_preds.push_back(pr);
+          continue;
+        }
+        ++dim_pred_cnt;
+        if (dim_pred_cnt > 1 || pr->Type() != TypeTag::kBinaryExp ||
+            pr->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+          preds_ok = false;
+          break;
+        }
+        const Expression& l = pr->AsBinaryExpression().Left();
+        const Expression& r = pr->AsBinaryExpression().Right();
+        if (!l || !r || l->Type() != TypeTag::kColumnValue ||
+            r->Type() != TypeTag::kColumnValue) {
+          preds_ok = false;
+          break;
+        }
+        auto lr = resolve_col(l->AsColumnValue().GetColumnName());
+        auto rr = resolve_col(r->AsColumnValue().GetColumnName());
+        if (!lr.has_value() || !rr.has_value() ||
+            (lr->first == dim_si) == (rr->first == dim_si)) {
+          preds_ok = false;
+          break;
+        }
+        const auto dim_r = (lr->first == dim_si) ? *lr : *rr;
+        const auto oth_r = (lr->first == dim_si) ? *rr : *lr;
+        if (!srcs[oth_r.first].is_base) {
+          preds_ok = false;
+          break;
+        }
+        const Column& pkc = srcs[dim_si].schema.GetColumn(dim_r.second);
+        const Column& fkc = srcs[oth_r.first].schema.GetColumn(oth_r.second);
+        if (pkc.Type() != ValueType::kInt64 || pkc.IsUnsigned() ||
+            fkc.Type() != ValueType::kInt64 || fkc.IsUnsigned()) {
+          preds_ok = false;
+          break;
+        }
+        pk_slot = dim_r.second;
+        fk_col_expr = ColumnValueExp(
+            ColumnName(srcs[oth_r.first].alias, fkc.Name().name));
+      }
+      if (!preds_ok || dim_pred_cnt != 1 || !fk_col_expr) {
+        continue;
+      }
+
+      // Check that every reference to `dim_si` in SelectList/GroupBy/Having/
+      // OrderBy/Qualify is ONLY `dim_si.pk_slot` (which equals `fk_col_expr`
+      // bit-for-bit on INT64!).
+      bool only_pk_refs = true;
+      auto check_expr = [&](auto& self, const Expression& e) -> bool {
+        if (!e) { return true;
+}
+        if (e->Type() == TypeTag::kQueryExp) {
+          const auto& q = e->AsQueryExpression();
+          if (q.Test() && !self(self, q.Test())) {
+            return false;
+          }
+          return q.Query() != nullptr &&
+                 !SubqueryMayReferenceDimSource(
+                     *q.Query(), srcs[dim_si].alias,
+                     stmt->Sources()[dim_si].alias.empty()
+                         ? srcs[dim_si].table
+                         : std::string_view{},
+                     srcs[dim_si].schema);
+        }
+        if (e->Type() == TypeTag::kColumnValue) {
+          const ColumnName& cn = e->AsColumnValue().GetColumnName();
+          if (cn.name == "*") { return true;
+}
+          auto r = resolve_col(cn);
+          if (!r.has_value()) { return false;
+}
+          if (r->first == dim_si) {
+            return r->second == pk_slot;
+          }
+          return true;
+        }
+        for (const Expression& ch : ExpressionChildren(e)) {
+          if (!self(self, ch)) { return false;
+}
+        }
+        return true;
+      };
+      for (const NamedExpression& it : stmt->SelectList()) {
+        if (!check_expr(check_expr, it.expression)) {
+          only_pk_refs = false;
+          break;
+        }
+      }
+      for (const Expression& g : stmt->GroupBy()) {
+        if (!only_pk_refs || !check_expr(check_expr, g)) {
+          only_pk_refs = false;
+          break;
+        }
+      }
+      if (!only_pk_refs || !check_expr(check_expr, stmt->Having()) ||
+          !check_expr(check_expr, stmt->Qualify())) {
+        continue;
+      }
+      for (const auto& ot : stmt->OrderBy()) {
+        if (!check_expr(check_expr, ot.expression)) {
+          only_pk_refs = false;
+          break;
+        }
+      }
+      if (!only_pk_refs) {
+        continue;
+      }
+
+      const std::string& pk_name = srcs[dim_si].schema.GetColumn(pk_slot).Name().name;
+      const RuntimeUniqueColInfo uinfo =
+          InspectRuntimeUniqueNonNullColumn(ctx, srcs[dim_si].table, pk_name);
+      if (!uinfo.unique_non_null) {
+        continue;
+      }
+      if (uinfo.row_count > 0 &&
+          (uinfo.max_int < uinfo.min_int ||
+           static_cast<uint64_t>(uinfo.max_int) -
+                   static_cast<uint64_t>(uinfo.min_int) + 1ULL !=
+               uinfo.row_count)) {
+        continue;
+      }
+
+      auto subst_pk = [&](const Expression& e) -> Expression {
+        if (!e) { return e;
+}
+        return ReplaceSubExpressions(
+            e, [&](const Expression& node) -> std::optional<Expression> {
+              if (!node || node->Type() != TypeTag::kColumnValue) {
+                return std::nullopt;
+              }
+              const ColumnName& cn = node->AsColumnValue().GetColumnName();
+              if (cn.name == "*") { return std::nullopt;
+}
+              auto r = resolve_col(cn);
+              if (r.has_value() && r->first == dim_si && r->second == pk_slot) {
+                return fk_col_expr;
+              }
+              return std::nullopt;
+            });
+      };
+
+      std::vector<NamedExpression> new_sel;
+      new_sel.reserve(stmt->SelectList().size());
+      for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+        new_sel.emplace_back(InferSelectItemOutputName(stmt->SelectList()[i], i),
+                             subst_pk(stmt->SelectList()[i].expression));
+      }
+      std::vector<Expression> new_grp;
+      new_grp.reserve(stmt->GroupBy().size());
+      for (const Expression& g : stmt->GroupBy()) {
+        new_grp.push_back(subst_pk(g));
+      }
+      std::vector<SelectStatement::OrderByTerm> new_ord = stmt->OrderBy();
+      for (auto& ot : new_ord) {
+        ot.expression = subst_pk(ot.expression);
+      }
+
+      std::vector<SelectSource> new_sources;
+      new_sources.reserve(stmt->Sources().size() - 1);
+      for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+        if (si == dim_si) { continue;
+}
+        SelectSource cp = stmt->Sources()[si];
+        if (cp.alias.empty() && !cp.table.empty()) {
+          cp.alias = cp.table;
+        }
+        cp.join_type = JoinType::kCross;
+        cp.join_condition = nullptr;
+        new_sources.push_back(std::move(cp));
+      }
+
+      if (uinfo.row_count == 0) {
+        other_preds.push_back(BinaryExpressionExp(
+            ConstantValueExp(Value(int64_t{0})), BinaryOperation::kEquals,
+            ConstantValueExp(Value(int64_t{1}))));
+      } else {
+        other_preds.push_back(BinaryExpressionExp(
+            fk_col_expr, BinaryOperation::kGreaterThanEquals,
+            ConstantValueExp(Value(uinfo.min_int))));
+        other_preds.push_back(BinaryExpressionExp(
+            fk_col_expr, BinaryOperation::kLessThanEquals,
+            ConstantValueExp(Value(uinfo.max_int))));
+      }
+
+      stmt->SetSources(std::move(new_sources));
+      stmt->SetWhereClause(CombineConjuncts(other_preds));
+      stmt->SetSelectList(std::move(new_sel));
+      stmt->SetGroupBy(std::move(new_grp));
+      stmt->SetOrderBy(std::move(new_ord));
+      if (stmt->Having()) { stmt->SetHaving(subst_pk(stmt->Having()));
+}
+      if (stmt->Qualify()) { stmt->SetQualify(subst_pk(stmt->Qualify()));
+}
+      any_eliminated = true;
+      dropped_one = true;
+      break;
+    }
+    if (!dropped_one) {
+      break;
+    }
+  }
+  return any_eliminated;
+}
+
+bool EliminateUnreferencedPkImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt,
+    std::unordered_map<std::string, const SelectStatement*> visible_ctes,
+    TransactionContext& ctx, std::unordered_set<SelectStatement*>* visited) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  for (const std::string& name : stmt->WithQueryOrder()) {
+    const auto it = stmt->WithQueries().find(name);
+    const SelectStatement* body_ptr =
+        (it != stmt->WithQueries().end()) ? it->second.get() : nullptr;
+    if (!stmt->IsRecursiveWith(name) && body_ptr != nullptr) {
+      changed |= EliminateUnreferencedPkImpl(it->second.get(), visible_ctes,
+                                             ctx, visited);
+      visible_ctes[LoweredStarName(name)] = body_ptr;
+    } else {
+      visible_ctes[LoweredStarName(name)] = nullptr;
+    }
+  }
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    (void)body;
+    if (!visible_ctes.contains(LoweredStarName(name))) {
+      visible_ctes[LoweredStarName(name)] = nullptr;
+    }
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.query != nullptr && !src.is_lateral) {
+      changed |= EliminateUnreferencedPkImpl(src.query.get(), visible_ctes, ctx,
+                                             visited);
+    }
+  }
+  if (!stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr) {
+    if (!stmt->UnionAll().empty() &&
+        (relational_detail::CanUseExactIntegerGroupingSets(ctx, *stmt) ||
+         HasSharedScanUnionAllBranches(*stmt))) {
+      return changed;
+    }
+    changed |= VisitSetOpLeavesAndSync(stmt, visited, [&](SelectStatement* br) {
+      return EliminateUnreferencedPkInOneSelect(br, visible_ctes, ctx);
+    });
+  } else {
+    changed |= EliminateUnreferencedPkInOneSelect(stmt, visible_ctes, ctx);
+  }
+  return changed;
+}
+
+bool DistributeDistinctUnionDimJoinsOneSelect(
+    SelectStatement* stmt, const std::unordered_set<std::string>& cte_names,
+    TransactionContext& ctx) {
+  if (stmt == nullptr || !stmt->Distinct() || stmt->HasDistinctOn() ||
+      !stmt->GroupBy().empty() || stmt->IsGroupAll() || stmt->Having() ||
+      stmt->Qualify() || stmt->HasLimit() || stmt->Offset() != 0 ||
+      !stmt->OrderBy().empty() || stmt->WithTies() || stmt->ForUpdate() ||
+      stmt->AsStruct() || !stmt->WithQueries().empty() ||
+      !stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr ||
+      relational_detail::HasWindowFunctions(*stmt) ||
+      SelectListHasStarOrModifiers(*stmt) || TpcdsStmtHasParam(*stmt) ||
+      stmt->Sources().size() < 3) {
+    return false;
+  }
+
+  std::optional<size_t> u_idx;
+  std::vector<std::shared_ptr<SelectStatement>> u_branches;
+  for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+    const SelectSource& s = stmt->Sources()[si];
+    if (s.unnest || s.is_lateral || s.sample || !s.using_columns.empty() ||
+        s.from_nested_join ||
+        (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+      return false;
+    }
+    if (s.query != nullptr) {
+      if (u_idx.has_value() || s.alias.empty() ||
+          !ExtractPureUnionAllBranches(*s.query, &u_branches) ||
+          u_branches.size() < 2) {
+        return false;
+      }
+      u_idx = si;
+    } else if (s.table.empty() || cte_names.contains(LoweredStarName(s.table))) {
+      return false;
+    }
+  }
+  if (!u_idx.has_value()) {
+    return false;
+  }
+
+  const SelectSource& u_src = stmt->Sources()[*u_idx];
+  const std::string u_alias = u_src.alias;
+  const size_t arity = u_branches[0]->SelectList().size();
+  if (arity == 0 || SelectListHasStarOrModifiers(*u_branches[0])) {
+    return false;
+  }
+  std::vector<std::string> u_col_names;
+  std::unordered_set<std::string> seen_ucols;  // NOLINT(modernize-loop-convert)
+  for (size_t c = 0; c < arity; ++c) {
+    std::string nm = ExplicitOrColumnOutputName(u_branches[0]->SelectList()[c]);
+    if (nm.empty() || !seen_ucols.insert(LoweredStarName(nm)).second) {
+      return false;
+    }
+    u_col_names.push_back(std::move(nm));
+  }
+  for (size_t b = 0; b < u_branches.size(); ++b) {  // NOLINT(modernize-loop-convert)
+    const SelectStatement& br = *u_branches[b];
+    if (br.SelectList().size() != arity || SelectListHasStarOrModifiers(br) ||
+        !br.GroupBy().empty() || br.IsGroupAll() || br.Having() ||
+        br.Distinct() || br.HasLimit() || br.Offset() != 0 ||
+        !br.WithQueries().empty() ||
+        relational_detail::HasWindowFunctions(br)) {
+      return false;
+    }
+  }
+
+  struct OuterRel {
+    std::string table;
+    std::string alias;
+    Schema schema;  // NOLINT(performance-inefficient-vector-operation)
+    uint64_t est_rows{0};
+  };
+  std::vector<OuterRel> rels(stmt->Sources().size());
+  for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+    if (si == *u_idx) {
+      std::vector<Column> cols;
+      for (const std::string& nm : u_col_names) {
+        cols.emplace_back(nm, ValueType::kNull);  // NOLINT(performance-inefficient-vector-operation)
+      }
+      rels[si] = {.table = "", .alias = u_alias, .schema = Schema("", std::move(cols))};
+      continue;
+    }
+    const SelectSource& s = stmt->Sources()[si];
+    StatusOr<std::shared_ptr<Table>> tbl = ctx.GetTable(s.table);
+    if (!tbl.HasValue() || tbl.Value() == nullptr) {
+      return false;
+    }
+    uint64_t est = tbl.Value()->BackingColumnarRowCount();
+    if (auto st = ctx.GetStats(s.table); st.HasValue()) {
+      est = std::max<uint64_t>(est, st.Value()->Rows());
+    }
+    rels[si] = {.table = s.table,
+                .alias = s.alias.empty() ? s.table : s.alias,
+                .schema = tbl.Value()->GetSchema(),
+                .est_rows = est};
+  }
+
+  auto resolve_col =
+      [&](const ColumnName& cn) -> std::optional<std::pair<size_t, size_t>> {
+    if (cn.name.empty() || cn.name == "*") { return std::nullopt;
+}
+    if (!cn.schema.empty()) {
+      for (size_t si = 0; si < rels.size(); ++si) {
+        if (IdentifierEquals(cn.schema, rels[si].alias) ||
+            (stmt->Sources()[si].alias.empty() && !rels[si].table.empty() &&
+             IdentifierEquals(cn.schema, rels[si].table))) {
+          const int off = rels[si].schema.Offset(ColumnName("", cn.name));
+          if (off >= 0) { return std::pair{si, static_cast<size_t>(off)};
+}
+        }
+      }
+      return std::nullopt;
+    }
+    std::optional<std::pair<size_t, size_t>> hit;
+    for (size_t si = 0; si < rels.size(); ++si) {
+      const int off = rels[si].schema.Offset(ColumnName("", cn.name));
+      if (off >= 0) {
+        if (hit.has_value()) { return std::nullopt;
+}
+        hit = std::pair{si, static_cast<size_t>(off)};
+      }
+    }
+    return hit;
+  };
+
+  // Identify sources referenced in `SelectList`.
+  std::unordered_set<size_t> select_srcs;
+  for (const NamedExpression& it : stmt->SelectList()) {
+    if (!it.expression || ContainsQueryExpression(it.expression) ||
+        relational_detail::ContainsAggregate(it.expression)) {
+      return false;
+    }
+    for (const ColumnName& cn : it.expression->TouchedColumns()) {
+      auto r = resolve_col(cn);
+      if (!r.has_value()) { return false;
+}
+      select_srcs.insert(r->first);
+    }
+  }
+  if (select_srcs.contains(*u_idx)) {
+    return false;
+  }
+
+  std::vector<Expression> all_preds = SplitConjuncts(stmt->WhereClause());
+  for (size_t si = 1; si < stmt->Sources().size(); ++si) {
+    if (stmt->Sources()[si].join_condition) {
+      for (Expression& c : SplitConjuncts(stmt->Sources()[si].join_condition)) {
+        all_preds.push_back(std::move(c));
+      }
+    }
+  }
+
+  // Pushable dimensions: small base tables not in `select_srcs`, with >= 1
+  // local filter predicate, whose cross-predicates ONLY connect to `*u_idx`.
+  std::vector<bool> has_local_pred(rels.size(), false);
+  std::vector<bool> touches_keep(rels.size(), false);
+  for (const Expression& pr : all_preds) {
+    if (!pr || ContainsQueryExpression(pr) ||
+        !DerivedExpressionIsImmutable(pr)) {
+      return false;
+    }
+    std::unordered_set<size_t> ps;
+    for (const ColumnName& cn : pr->TouchedColumns()) {
+      auto r = resolve_col(cn);
+      if (!r.has_value()) { return false;
+}
+      ps.insert(r->first);
+    }
+    if (ps.size() == 1) {
+      has_local_pred[*ps.begin()] = true;
+    } else {
+      for (size_t a : ps) {
+        for (size_t b : ps) {
+          if (a != b && a != *u_idx && select_srcs.contains(b)) {
+            touches_keep[a] = true;
+          }
+        }
+      }
+    }
+  }
+
+  std::unordered_set<size_t> push_set;
+  for (size_t si = 0; si < rels.size(); ++si) {
+    if (si != *u_idx && !select_srcs.contains(si) && has_local_pred[si] &&
+        !touches_keep[si] && rels[si].est_rows <= 100000) {
+      push_set.insert(si);
+    }
+  }
+  if (push_set.empty()) {
+    return false;
+  }
+  // Verify no push_set table joins to a non-push_set non-u_idx table.
+  std::vector<Expression> pushed_preds;
+  std::vector<Expression> kept_preds;
+  std::vector<size_t> bridge_u_cols;
+  for (const Expression& pr : all_preds) {
+    std::unordered_set<size_t> ps;
+    std::vector<size_t> u_cols_in_pr;
+    for (const ColumnName& cn : pr->TouchedColumns()) {
+      auto r = resolve_col(cn);
+      ps.insert(r->first);
+      if (r->first == *u_idx) {
+        u_cols_in_pr.push_back(r->second);
+      }
+    }
+    bool any_push = false;
+    bool any_keep = false;
+    for (size_t s : ps) {
+      if (push_set.contains(s)) { any_push = true;
+      } else if (s != *u_idx) { any_keep = true;
+}
+    }
+    if (any_push && any_keep) {
+      return false;
+    }
+    if (any_push || (ps.size() == 1 && ps.contains(*u_idx))) {
+      pushed_preds.push_back(pr);
+    } else {
+      kept_preds.push_back(pr);
+      for (size_t uc : u_cols_in_pr) {
+        if (std::ranges::find(bridge_u_cols, uc) == bridge_u_cols.end()) {
+          bridge_u_cols.push_back(uc);
+        }
+      }
+    }
+  }
+  if (bridge_u_cols.empty() || bridge_u_cols.size() > 2) {
+    return false;
+  }
+
+  // Rewrite each branch of `u_branches` as a wrapped derived query joining
+  // `push_set` and grouping on `bridge_u_cols`, combined via UNION DISTINCT.
+  std::vector<std::shared_ptr<SelectStatement>> new_branches;
+  new_branches.reserve(u_branches.size());
+  for (size_t bi = 0; bi < u_branches.size(); ++bi) {
+    const std::string sub_u_alias = "__tpcds_ubr_" + std::to_string(bi);
+    auto br_copy = std::make_shared<SelectStatement>(*u_branches[bi]);
+    std::vector<SelectSource> br_srcs;
+    br_srcs.emplace_back("", sub_u_alias, std::move(br_copy), JoinType::kCross,
+                         nullptr);
+    for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+      if (!push_set.contains(si)) { continue;
+}
+      SelectSource ps = stmt->Sources()[si];
+      ps.alias = rels[si].alias;
+      ps.join_type = JoinType::kCross;
+      ps.join_condition = nullptr;
+      br_srcs.push_back(std::move(ps));
+    }
+    auto rebind_pushed = [&](const Expression& e) -> Expression {
+      return ReplaceSubExpressions(
+          e, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            auto r = resolve_col(node->AsColumnValue().GetColumnName());
+            if (!r.has_value()) { return std::nullopt;
+}
+            if (r->first == *u_idx) {
+              return ColumnValueExp(
+                  ColumnName(sub_u_alias, u_col_names[r->second]));
+            }
+            return ColumnValueExp(ColumnName(
+                rels[r->first].alias,
+                rels[r->first].schema.GetColumn(r->second).Name().name));
+          });
+    };
+    std::vector<Expression> br_where;
+    br_where.reserve(pushed_preds.size());
+    for (const Expression& pp : pushed_preds) {
+      br_where.push_back(rebind_pushed(pp));
+    }
+    std::vector<NamedExpression> br_sel;
+    std::vector<Expression> br_grp;
+    for (size_t uc : bridge_u_cols) {
+      Expression ce = ColumnValueExp(ColumnName(sub_u_alias, u_col_names[uc]));
+      br_sel.emplace_back(u_col_names[uc], ce);
+      br_grp.push_back(ce);
+    }
+    auto wrapped = std::make_shared<SelectStatement>();
+    wrapped->SetSources(std::move(br_srcs));
+    wrapped->SetWhereClause(CombineConjuncts(br_where));
+    wrapped->SetGroupBy(std::move(br_grp));
+    wrapped->SetSelectList(std::move(br_sel));
+    new_branches.push_back(std::move(wrapped));
+  }
+
+  auto union_stmt = std::make_shared<SelectStatement>(*new_branches[0]);
+  for (size_t bi = 1; bi < new_branches.size(); ++bi) {
+    union_stmt->AddSetOperation(SetOperationKind::kUnion, new_branches[bi]);
+  }
+
+  auto qualify_kept = [&](const Expression& e) -> Expression {
+    return ReplaceSubExpressions(
+        e, [&](const Expression& node) -> std::optional<Expression> {
+          if (!node || node->Type() != TypeTag::kColumnValue) {
+            return std::nullopt;
+          }
+          auto r = resolve_col(node->AsColumnValue().GetColumnName());
+          if (!r.has_value()) { return std::nullopt;
+}
+          if (r->first == *u_idx) {
+            return ColumnValueExp(ColumnName(u_alias, u_col_names[r->second]));
+          }
+          return ColumnValueExp(ColumnName(
+              rels[r->first].alias,
+              rels[r->first].schema.GetColumn(r->second).Name().name));
+        });
+  };
+
+  std::vector<SelectSource> new_outer_srcs;
+  new_outer_srcs.emplace_back("", u_alias, std::move(union_stmt),
+                              JoinType::kCross, nullptr);
+  for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+    if (si == *u_idx || push_set.contains(si)) { continue;
+}
+    SelectSource ks = stmt->Sources()[si];  // NOLINT(performance-inefficient-vector-operation)
+    ks.alias = rels[si].alias;
+    ks.join_type = JoinType::kCross;
+    ks.join_condition = nullptr;
+    new_outer_srcs.push_back(std::move(ks));  // NOLINT(performance-inefficient-vector-operation)
+  }
+  std::vector<Expression> new_outer_where;
+  for (const Expression& kp : kept_preds) {
+    new_outer_where.push_back(qualify_kept(kp));  // NOLINT(performance-inefficient-vector-operation)
+  }
+  std::vector<NamedExpression> new_outer_sel;
+  for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+    new_outer_sel.emplace_back(  // NOLINT(performance-inefficient-vector-operation)
+        InferSelectItemOutputName(stmt->SelectList()[i], i),
+        qualify_kept(stmt->SelectList()[i].expression));
+  }
+  stmt->SetSources(std::move(new_outer_srcs));
+  stmt->SetWhereClause(CombineConjuncts(new_outer_where));
+  stmt->SetSelectList(std::move(new_outer_sel));
+  return true;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (bijective_dim_key_cte_deferral_sound)
+bool DeferUniqueDimJoinPastGroupBy(SelectStatement* outer,
+                                   TransactionContext& ctx) {
+  std::unordered_set<SelectStatement*> visited;
+  return DeferUniqueDimJoinPastGroupByImpl(outer, ctx, &visited);
+}
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (unreferenced_unique_pk_inner_join_to_semi_sound)
+bool EliminateUnreferencedUniquePkInnerJoins(SelectStatement* outer,
+                                             TransactionContext& ctx) {
+  std::unordered_set<SelectStatement*> visited;
+  return EliminateUnreferencedPkImpl(outer, {}, ctx, &visited);
+}
+
+namespace {
+
+bool IsGuaranteedSingletonScalarAggQuery(const SelectStatement& q,
+                                         std::string* out_col_name) {
+  if (!q.GroupBy().empty() || q.IsGroupAll() || q.Having() || q.Qualify() ||
+      q.Distinct() || q.HasDistinctOn() || q.HasLimit() || q.Offset() != 0 ||
+      q.WithTies() || q.ForUpdate() || q.AsStruct() || !q.OrderBy().empty() ||
+      !q.UnionAll().empty() || q.GetSetOperationTree() != nullptr ||
+      !q.WithQueries().empty() || q.Sources().empty() ||
+      q.SelectList().size() != 1 || SelectListHasStarOrModifiers(q) ||
+      TpcdsStmtHasParam(q) || relational_detail::HasWindowFunctions(q)) {
+    return false;
+  }
+  const Expression& se = q.SelectList()[0].expression;
+  if (!se || se->Type() != TypeTag::kAggregateExp) {
+    return false;
+  }
+  const auto& agg = se->AsAggregateExpression();
+  if ((agg.GetType() != AggregationType::kMin &&
+       agg.GetType() != AggregationType::kMax &&
+       agg.GetType() != AggregationType::kSum &&
+       agg.GetType() != AggregationType::kAvg &&
+       agg.GetType() != AggregationType::kCount) ||
+      agg.NeedsGroupContext() || !agg.InnerGroupBy().empty() ||
+      agg.WhereFilter() || agg.Having() != AggregateHavingModifier::kNone ||
+      agg.HavingCondition() || !agg.InnerOrderBy().empty() ||
+      agg.SecondaryArg() || !agg.TrailingArgs().empty() ||
+      (agg.Child() != nullptr && !DerivedExpressionIsImmutable(agg.Child()))) {
+    return false;
+  }
+  std::string col = InferSelectItemOutputName(q.SelectList()[0], 0);
+  if (col.empty()) {
+    return false;
+  }
+  if (out_col_name != nullptr) {
+    *out_col_name = std::move(col);
+  }
+  return true;
+}
+
+bool EliminateSingletonScalarCrossJoinInOneSelect(
+    SelectStatement* stmt,
+    const std::unordered_map<std::string, const SelectStatement*>& visible_ctes,
+    const std::unordered_set<std::string>& top_level_singleton_ctes,
+    TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->Sources().size() < 2 ||
+      stmt->GroupBy().empty() || stmt->IsGroupAll() || stmt->ForUpdate() ||
+      stmt->AsStruct() || SelectListHasStarOrModifiers(*stmt) ||
+      TpcdsStmtHasParam(*stmt) || !stmt->UnionAll().empty() ||
+      stmt->GetSetOperationTree() != nullptr ||
+      relational_detail::HasWindowFunctions(*stmt)) {
+    return false;
+  }
+
+  bool any_changed = false;
+  for (size_t iter = 0; iter < 4 && stmt->Sources().size() >= 2; ++iter) {
+    struct SrcEntry {
+      std::string table;
+      std::string alias;
+      Schema schema;
+      std::shared_ptr<SelectStatement> scalar_subquery;
+    };
+    std::vector<SrcEntry> srcs(stmt->Sources().size());
+    std::unordered_set<std::string> seen_al;
+    bool srcs_ok = true;
+    auto populate_query_schema = [&](const SelectStatement& q,
+                                     Schema* out_schema) -> bool {
+      const SelectStatement* qhead = &q;
+      if (qhead->SelectList().empty() &&
+          qhead->GetSetOperationTree() != nullptr &&
+          qhead->GetSetOperationTree()->first != nullptr) {
+        qhead = qhead->GetSetOperationTree()->first.get();
+      }
+      if (qhead->SelectList().empty() || SelectListHasStarOrModifiers(*qhead)) {
+        return false;
+      }
+      std::vector<Column> cols;
+      cols.reserve(qhead->SelectList().size());
+      for (size_t ci = 0; ci < qhead->SelectList().size(); ++ci) {
+        cols.emplace_back(
+            InferSelectItemOutputName(qhead->SelectList()[ci], ci),
+            ValueType::kNull);
+      }
+      *out_schema = Schema("", std::move(cols));
+      return true;
+    };
+
+    for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+      const SelectSource& s = stmt->Sources()[si];
+      if (s.unnest || s.is_lateral || s.sample || !s.using_columns.empty() ||
+          s.from_nested_join ||
+          (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+        srcs_ok = false;
+        break;
+      }
+      const std::string al = s.alias.empty() ? s.table : s.alias;
+      if (al.empty() || !seen_al.insert(LoweredStarName(al)).second) {
+        srcs_ok = false;
+        break;
+      }
+      srcs[si].table = s.table;
+      srcs[si].alias = al;
+      if (s.query != nullptr) {
+        if (!populate_query_schema(*s.query, &srcs[si].schema)) {
+          srcs_ok = false;
+          break;
+        }
+        std::string sc_col;
+        if (!s.join_condition &&
+            IsGuaranteedSingletonScalarAggQuery(*s.query, &sc_col) &&
+            relational_detail::StatementUsesOnlyScopes(ctx, *s.query, {}, {})) {
+          srcs[si].scalar_subquery = s.query;
+        }
+      } else if (const auto cte_it = visible_ctes.find(LoweredStarName(s.table));
+                 cte_it != visible_ctes.end()) {
+        if (cte_it->second == nullptr ||
+            !populate_query_schema(*cte_it->second, &srcs[si].schema)) {
+          srcs_ok = false;
+          break;
+        }
+        if (!s.join_condition &&
+            top_level_singleton_ctes.contains(LoweredStarName(s.table)) &&
+            srcs[si].schema.ColumnCount() == 1) {
+          const std::string col_nm = srcs[si].schema.GetColumn(0).Name().name;
+          auto sq = std::make_shared<SelectStatement>();
+          SelectSource csrc;
+          csrc.table = s.table;
+          csrc.alias = s.table;
+          sq->SetSources({std::move(csrc)});
+          sq->SetSelectList({NamedExpression(
+              col_nm, ColumnValueExp(ColumnName(s.table, col_nm)))});
+          srcs[si].scalar_subquery = std::move(sq);
+        }
+      } else {
+        StatusOr<std::shared_ptr<Table>> t = ctx.GetTable(s.table);
+        if (!t.HasValue() || t.Value() == nullptr) {
+          srcs_ok = false;
+          break;
+        }
+        srcs[si].schema = t.Value()->GetSchema();
+      }
+    }
+    if (!srcs_ok) {
+      break;
+    }
+
+    auto resolve_col =
+        [&](const ColumnName& cn) -> std::optional<std::pair<size_t, size_t>> {
+      if (cn.name.empty() || cn.name == "*") {
+        return std::nullopt;
+      }
+      if (!cn.schema.empty()) {
+        for (size_t si = 0; si < srcs.size(); ++si) {
+          if (IdentifierEquals(cn.schema, srcs[si].alias) ||
+              (stmt->Sources()[si].alias.empty() && !srcs[si].table.empty() &&
+               IdentifierEquals(cn.schema, srcs[si].table))) {
+            const int off = srcs[si].schema.Offset(ColumnName("", cn.name));
+            if (off >= 0) {
+              return std::pair{si, static_cast<size_t>(off)};
+            }
+          }
+        }
+        return std::nullopt;
+      }
+      std::optional<std::pair<size_t, size_t>> hit;
+      for (size_t si = 0; si < srcs.size(); ++si) {
+        const int off = srcs[si].schema.Offset(ColumnName("", cn.name));
+        if (off >= 0) {
+          if (hit.has_value()) {
+            return std::nullopt;
+          }
+          hit = std::pair{si, static_cast<size_t>(off)};
+        }
+      }
+      return hit;
+    };
+
+    std::vector<Expression> all_preds = SplitConjuncts(stmt->WhereClause());
+    for (size_t si = 1; si < stmt->Sources().size(); ++si) {
+      if (stmt->Sources()[si].join_condition) {
+        for (Expression& c : SplitConjuncts(stmt->Sources()[si].join_condition)) {
+          all_preds.push_back(std::move(c));
+        }
+      }
+    }
+
+    bool dropped = false;
+    for (size_t sc_si = 0; sc_si < srcs.size(); ++sc_si) {
+      if (srcs[sc_si].scalar_subquery == nullptr ||
+          srcs[sc_si].schema.ColumnCount() != 1) {
+        continue;
+      }
+      const std::string_view sc_table =
+          stmt->Sources()[sc_si].alias.empty() ? srcs[sc_si].table
+                                               : std::string_view{};
+
+      auto expr_touches_sc = [&](const Expression& e) -> bool {
+        if (!e) {
+          return false;
+        }
+        for (const ColumnName& cn : e->TouchedColumns()) {
+          auto r = resolve_col(cn);
+          if (!r.has_value() || r->first == sc_si) {
+            return true;
+          }
+        }
+        return ContainsQueryExpression(e) &&
+               ExprMayReferenceDimInsideSubquery(e, srcs[sc_si].alias, sc_table,
+                                                 srcs[sc_si].schema);
+      };
+
+      bool used_in_where_or_grp = false;
+      for (const Expression& pr : all_preds) {
+        if (expr_touches_sc(pr)) {
+          used_in_where_or_grp = true;
+          break;
+        }
+      }
+      for (const Expression& gk : stmt->GroupBy()) {
+        if (used_in_where_or_grp || expr_touches_sc(gk)) {
+          used_in_where_or_grp = true;
+          break;
+        }
+      }
+      if (used_in_where_or_grp || expr_touches_sc(stmt->Qualify())) {
+        continue;
+      }
+
+      auto is_idem_sc_agg = [&](const Expression& node) -> bool {
+        if (!node || node->Type() != TypeTag::kAggregateExp) {
+          return false;
+        }
+        const auto& agg = node->AsAggregateExpression();
+        if ((agg.GetType() != AggregationType::kMin &&
+             agg.GetType() != AggregationType::kMax) ||
+            agg.WhereFilter() ||
+            agg.Having() != AggregateHavingModifier::kNone ||
+            !agg.InnerOrderBy().empty() || agg.SecondaryArg() ||
+            !agg.TrailingArgs().empty() || !agg.Child() ||
+            agg.Child()->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        auto r = resolve_col(agg.Child()->AsColumnValue().GetColumnName());
+        return r.has_value() && r->first == sc_si && r->second == 0;
+      };
+
+      auto validate_expr = [&](auto& self, const Expression& e) -> bool {
+        if (!e) {
+          return true;
+        }
+        if (is_idem_sc_agg(e)) {
+          return true;
+        }
+        if (e->Type() == TypeTag::kQueryExp) {
+          const auto& q = e->AsQueryExpression();
+          if (q.Test() && !self(self, q.Test())) {
+            return false;
+          }
+          return q.Query() != nullptr &&
+                 !SubqueryMayReferenceDimSource(*q.Query(), srcs[sc_si].alias,
+                                                sc_table, srcs[sc_si].schema);
+        }
+        if (e->Type() == TypeTag::kColumnValue) {
+          const ColumnName& cn = e->AsColumnValue().GetColumnName();
+          if (cn.name == "*") {
+            return false;
+          }
+          auto r = resolve_col(cn);
+          return r.has_value() && r->first != sc_si;
+        }
+        if (e->Type() == TypeTag::kAggregateExp) {
+          const auto& agg = e->AsAggregateExpression();
+          if ((agg.WhereFilter() && !self(self, agg.WhereFilter())) ||
+              (agg.HavingCondition() && !self(self, agg.HavingCondition())) ||
+              (agg.SecondaryArg() && !self(self, agg.SecondaryArg()))) {
+            return false;
+          }
+          for (const Expression& ta : agg.TrailingArgs()) {
+            if (!self(self, ta)) {
+              return false;
+            }
+          }
+          for (const auto& io : agg.InnerOrderBy()) {
+            if (!self(self, io.expression)) {
+              return false;
+            }
+          }
+          for (const Expression& ig : agg.InnerGroupBy()) {
+            if (!self(self, ig)) {
+              return false;
+            }
+          }
+        }
+        for (const Expression& ch : ExpressionChildren(e)) {
+          if (!self(self, ch)) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      bool refs_ok = true;
+      for (const NamedExpression& it : stmt->SelectList()) {
+        if (!validate_expr(validate_expr, it.expression)) {
+          refs_ok = false;
+          break;
+        }
+      }
+      if (!refs_ok || !validate_expr(validate_expr, stmt->Having())) {
+        continue;
+      }
+      for (const auto& ot : stmt->OrderBy()) {
+        if (!validate_expr(validate_expr, ot.expression)) {
+          refs_ok = false;
+          break;
+        }
+      }
+      if (!refs_ok) {
+        continue;
+      }
+
+      Expression replacement = QueryExpressionExp(srcs[sc_si].scalar_subquery);
+      auto rewrite_expr = [&](const Expression& e) -> Expression {
+        if (!e) {
+          return e;
+        }
+        return ReplaceSubExpressions(
+            e, [&](const Expression& node) -> std::optional<Expression> {
+              if (is_idem_sc_agg(node)) {
+                return replacement;
+              }
+              return std::nullopt;
+            });
+      };
+
+      std::vector<NamedExpression> new_sel;
+      new_sel.reserve(stmt->SelectList().size());
+      for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+        new_sel.emplace_back(
+            InferSelectItemOutputName(stmt->SelectList()[i], i),
+            rewrite_expr(stmt->SelectList()[i].expression));
+      }
+      std::vector<SelectStatement::OrderByTerm> new_ord = stmt->OrderBy();
+      for (auto& ot : new_ord) {
+        ot.expression = rewrite_expr(ot.expression);
+      }
+      std::vector<SelectSource> new_sources;
+      new_sources.reserve(stmt->Sources().size() - 1);
+      for (size_t si = 0; si < stmt->Sources().size(); ++si) {
+        if (si == sc_si) {
+          continue;
+        }
+        new_sources.push_back(stmt->Sources()[si]);
+      }
+      if (!new_sources.empty()) {
+        new_sources[0].join_type = JoinType::kCross;
+      }
+      stmt->SetSources(std::move(new_sources));
+      stmt->SetSelectList(std::move(new_sel));
+      stmt->SetOrderBy(std::move(new_ord));
+      if (stmt->Having()) {
+        stmt->SetHaving(rewrite_expr(stmt->Having()));
+      }
+      any_changed = true;
+      dropped = true;
+      break;
+    }
+    if (!dropped) {
+      break;
+    }
+  }
+  return any_changed;
+}
+
+bool EliminateSingletonScalarCrossJoinsImpl(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt,
+    std::unordered_map<std::string, const SelectStatement*> visible_ctes,
+    std::unordered_set<std::string> top_level_singleton_ctes,
+    bool is_top_level, TransactionContext& ctx,
+    std::unordered_set<SelectStatement*>* visited) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  for (const std::string& name : stmt->WithQueryOrder()) {
+    const auto it = stmt->WithQueries().find(name);
+    const SelectStatement* body_ptr =
+        (it != stmt->WithQueries().end()) ? it->second.get() : nullptr;
+    const std::string low = LoweredStarName(name);
+    if (!stmt->IsRecursiveWith(name) && body_ptr != nullptr) {
+      changed |= EliminateSingletonScalarCrossJoinsImpl(
+          it->second.get(), visible_ctes, top_level_singleton_ctes, false, ctx,
+          visited);
+      visible_ctes[low] = body_ptr;
+      std::string sc_col;
+      if (is_top_level && IsGuaranteedSingletonScalarAggQuery(*body_ptr, &sc_col)) {
+        top_level_singleton_ctes.insert(low);
+      } else {
+        top_level_singleton_ctes.erase(low);
+      }
+    } else {
+      visible_ctes[low] = nullptr;
+      top_level_singleton_ctes.erase(low);
+    }
+  }
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    (void)body;
+    const std::string low = LoweredStarName(name);
+    if (!visible_ctes.contains(low)) {
+      visible_ctes[low] = nullptr;
+      top_level_singleton_ctes.erase(low);
+    }
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.query != nullptr && !src.is_lateral) {
+      changed |= EliminateSingletonScalarCrossJoinsImpl(
+          src.query.get(), visible_ctes, top_level_singleton_ctes, false, ctx,
+          visited);
+    }
+  }
+  if (!stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr) {
+    if (!stmt->UnionAll().empty() &&
+        (relational_detail::CanUseExactIntegerGroupingSets(ctx, *stmt) ||
+         HasSharedScanUnionAllBranches(*stmt))) {
+      return changed;
+    }
+    changed |= VisitSetOpLeavesAndSync(stmt, visited, [&](SelectStatement* br) {
+      return EliminateSingletonScalarCrossJoinInOneSelect(
+          br, visible_ctes, top_level_singleton_ctes, ctx);
+    });
+  } else {
+    changed |= EliminateSingletonScalarCrossJoinInOneSelect(
+        stmt, visible_ctes, top_level_singleton_ctes, ctx);
+  }
+  return changed;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (singleton_scalar_cross_join_elim_sound,
+//    trap_singleton_cross_join_sum_not_idempotent)
+bool EliminateSingletonScalarCrossJoins(SelectStatement* outer,
+                                        TransactionContext& ctx) {
+  std::unordered_set<SelectStatement*> visited;
+  return EliminateSingletonScalarCrossJoinsImpl(outer, {}, {}, true, ctx,
+                                                &visited);
+}
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (distinct_union_all_dim_distribution_sound)
+bool DistributeDistinctUnionDimJoins(SelectStatement* outer,
+                                     TransactionContext& ctx) {
+  if (outer == nullptr) {
+    return false;
+  }
+  std::unordered_set<std::string> cte_names;
+  for (const auto& [name, body] : outer->WithQueries()) {
+    (void)body;
+    cte_names.insert(LoweredStarName(name));
+  }
+  bool changed = false;
+  for (const auto& [name, body] : outer->WithQueries()) {
+    if (!outer->IsRecursiveWith(name) && body != nullptr) {
+      changed |=
+          DistributeDistinctUnionDimJoinsOneSelect(body.get(), cte_names, ctx);
+    }
+  }
+  changed |= DistributeDistinctUnionDimJoinsOneSelect(outer, cte_names, ctx);
+  return changed;
+}
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (adjacent_rank_self_join_to_lag_lead_sound)
+bool RewriteAdjacentRankSelfJoinToLagLead(SelectStatement* outer) {
+  if (outer == nullptr || outer->WithQueries().size() < 2 ||
+      TpcdsStmtHasParam(*outer)) {
+    return false;
+  }
+  bool any_changed = false;
+  const std::vector<std::string> order = outer->WithQueryOrder();
+  for (const std::string& v2_name : order) {
+    if (outer->IsRecursiveWith(v2_name)) { continue;
+}
+    const auto v2_it = outer->WithQueries().find(v2_name);
+    if (v2_it == outer->WithQueries().end() || v2_it->second == nullptr) {
+      continue;
+    }
+    SelectStatement& v2 = *v2_it->second;
+    if (v2.Sources().size() != 3 || !v2.GroupBy().empty() || v2.IsGroupAll() ||
+        v2.Having() || v2.Distinct() || v2.HasDistinctOn() || v2.HasLimit() ||
+        v2.Offset() != 0 || v2.Qualify() || !v2.OrderBy().empty() ||
+        !v2.WithQueries().empty() || !v2.UnionAll().empty() ||
+        v2.GetSetOperationTree() != nullptr ||
+        relational_detail::HasWindowFunctions(v2) ||
+        SelectListHasStarOrModifiers(v2) || !v2.WhereClause()) {
+      continue;
+    }
+    const std::string v1_name = v2.Sources()[0].table;
+    if (v1_name.empty() || outer->IsRecursiveWith(v1_name) ||
+        IdentifierEquals(v1_name, v2_name)) {
+      continue;
+    }
+    const auto v1_it = outer->WithQueries().find(v1_name);
+    if (v1_it == outer->WithQueries().end() || v1_it->second == nullptr) {
+      continue;
+    }
+    // `v1` must be referenced ONLY inside `v2` (3 times).
+    std::unordered_map<std::string, size_t> total_v1_refs;
+    CountCteReferencesInStatement(*outer, {v1_name}, &total_v1_refs);
+    if (total_v1_refs[v1_name] != 3) {
+      continue;
+    }
+    std::array<std::string, 3> aliases;
+    bool srcs_ok = true;
+    for (size_t i = 0; i < 3; ++i) {
+      const SelectSource& s = v2.Sources()[i];
+      if (!IdentifierEquals(s.table, v1_name) || s.query != nullptr ||
+          s.unnest || s.is_lateral || s.sample || !s.using_columns.empty() ||
+          s.from_nested_join ||
+          (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+        srcs_ok = false;
+        break;
+      }
+      aliases[i] = s.alias.empty() ? s.table : s.alias;
+      for (size_t j = 0; j < i; ++j) {
+        if (IdentifierEquals(aliases[i], aliases[j])) {
+          srcs_ok = false;
+        }
+      }
+    }
+    if (!srcs_ok) {
+      continue;
+    }
+
+    SelectStatement& v1 = *v1_it->second;
+    if (v1.GroupBy().empty() || v1.IsGroupAll() || v1.Distinct() ||
+        v1.HasDistinctOn() || v1.HasLimit() || v1.Offset() != 0 ||
+        v1.Qualify() || !v1.OrderBy().empty() || !v1.WithQueries().empty() ||
+        !v1.UnionAll().empty() || v1.GetSetOperationTree() != nullptr ||
+        SelectListHasStarOrModifiers(v1) || TpcdsStmtHasParam(v1)) {
+      continue;
+    }
+
+    // Locate the `RANK()` / `ROW_NUMBER()` / `DENSE_RANK()` column in `v1`.
+    std::unordered_map<std::string, size_t> v1_out_map;
+    std::optional<size_t> rn_idx;
+    const WindowFunctionCallExpression* rn_win = nullptr;
+    for (size_t i = 0; i < v1.SelectList().size(); ++i) {
+      const std::string nm = InferSelectItemOutputName(v1.SelectList()[i], i);
+      if (nm.empty() || !v1_out_map.emplace(LoweredStarName(nm), i).second) {
+        rn_idx.reset();
+        v1_out_map.clear();
+        break;
+      }
+      const Expression& e = v1.SelectList()[i].expression;
+      if (e && e->Type() == TypeTag::kWindowFunctionExp) {
+        const auto& wf = e->AsWindowFunctionCallExpression();
+        if ((IdentifierEquals(wf.function, "rank") ||
+             IdentifierEquals(wf.function, "row_number") ||
+             IdentifierEquals(wf.function, "dense_rank")) &&
+            wf.args.empty() && !wf.where_filter && !wf.distinct &&
+            wf.inner_order_by.empty() && !wf.inner_limit.has_value() &&
+            !wf.has_frame && !wf.partition_by.empty() &&
+            !wf.order_by.empty()) {
+          rn_idx = i;
+          rn_win = &wf;
+        }
+      }
+    }
+    if (!rn_idx.has_value() || rn_win == nullptr || v1_out_map.empty()) {
+      continue;
+    }
+    const std::string rn_out_name =
+        InferSelectItemOutputName(v1.SelectList()[*rn_idx], *rn_idx);
+
+    // Verify `rn_win->partition_by` U `rn_win->order_by` covers ALL of
+    // `v1.GroupBy()` (guaranteeing 0 ties per partition!).
+    std::unordered_set<std::string> po_exprs;
+    std::vector<std::string> part_out_names;
+    bool po_ok = true;
+    for (const Expression& pe : rn_win->partition_by) {
+      if (!pe || pe->Type() != TypeTag::kColumnValue) {
+        po_ok = false;
+        break;
+      }
+      po_exprs.insert(pe->ToString());
+      std::string found_out;
+      for (size_t i = 0; i < v1.SelectList().size(); ++i) {
+        if (v1.SelectList()[i].expression &&
+            v1.SelectList()[i].expression->ToString() == pe->ToString()) {
+          found_out = InferSelectItemOutputName(v1.SelectList()[i], i);
+          break;
+        }
+      }
+      if (found_out.empty()) {
+        po_ok = false;
+        break;
+      }
+      part_out_names.push_back(std::move(found_out));
+    }
+    for (const WindowOrderTerm& ot : rn_win->order_by) {
+      if (!ot.expression || ot.expression->Type() != TypeTag::kColumnValue) {
+        po_ok = false;
+        break;
+      }
+      po_exprs.insert(ot.expression->ToString());
+    }
+    if (!po_ok) {
+      continue;
+    }
+    for (const Expression& gk : v1.GroupBy()) {
+      if (!gk || !po_exprs.contains(gk->ToString())) {
+        po_ok = false;
+        break;
+      }
+    }
+    if (!po_ok) {
+      continue;
+    }
+
+    // Try every permutation of (center_idx, lag_idx, lead_idx) of `{0,1,2}`
+    // (usually `(0, 1, 2)` for `(v1, v1_lag, v1_lead)`).
+    std::vector<Expression> v2_conjs = SplitConjuncts(v2.WhereClause());
+    for (size_t si = 1; si < 3; ++si) {
+      if (v2.Sources()[si].join_condition) {
+        for (Expression& jc : SplitConjuncts(v2.Sources()[si].join_condition)) {
+          v2_conjs.push_back(std::move(jc));
+        }
+      }
+    }
+
+    auto match_col_of = [&](const Expression& e, size_t src_i,
+                            std::string* col_out) -> bool {
+      if (!e || e->Type() != TypeTag::kColumnValue) { return false;
+}
+      const ColumnName& cn = e->AsColumnValue().GetColumnName();
+      if (!IdentifierEquals(cn.schema, aliases[src_i])) { return false;
+}
+      *col_out = cn.name;
+      return true;
+    };
+
+    // Check `(center = 0, lag = 1, lead = 2)`:
+    const size_t c_i = 0;
+    const size_t lg_i = 1;
+    const size_t ld_i = 2;
+    std::unordered_set<std::string> eq_lg_cols;
+    std::unordered_set<std::string> eq_ld_cols;
+    bool has_lag_rn = false;
+    bool has_lead_rn = false;
+    bool conjs_ok = true;
+    for (const Expression& cj : v2_conjs) {
+      if (!cj || cj->Type() != TypeTag::kBinaryExp ||
+          cj->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+        conjs_ok = false;
+        break;
+      }
+      const Expression& l = cj->AsBinaryExpression().Left();
+      const Expression& r = cj->AsBinaryExpression().Right();
+      std::string lc;
+      std::string rc;
+      if (match_col_of(l, c_i, &lc) && match_col_of(r, lg_i, &rc) &&
+          IdentifierEquals(lc, rc)) {
+        eq_lg_cols.insert(LoweredStarName(lc));
+        continue;
+      }
+      if (match_col_of(r, c_i, &lc) && match_col_of(l, lg_i, &rc) &&
+          IdentifierEquals(lc, rc)) {
+        eq_lg_cols.insert(LoweredStarName(lc));
+        continue;
+      }
+      if (match_col_of(l, c_i, &lc) && match_col_of(r, ld_i, &rc) &&
+          IdentifierEquals(lc, rc)) {
+        eq_ld_cols.insert(LoweredStarName(lc));
+        continue;
+      }
+      if (match_col_of(r, c_i, &lc) && match_col_of(l, ld_i, &rc) &&
+          IdentifierEquals(lc, rc)) {
+        eq_ld_cols.insert(LoweredStarName(lc));
+        continue;
+      }
+      // Match `v1.rn = v1_lag.rn + 1` or `v1.rn = v1_lead.rn - 1`.
+      auto check_rn_offset = [&](const Expression& lhs_c,
+                                 const Expression& rhs_bin) -> bool {
+        std::string c_rn;
+        if (!match_col_of(lhs_c, c_i, &c_rn) ||
+            !IdentifierEquals(c_rn, rn_out_name) || !rhs_bin ||
+            rhs_bin->Type() != TypeTag::kBinaryExp) {
+          return false;
+        }
+        const auto& b = rhs_bin->AsBinaryExpression();
+        if ((b.Op() != BinaryOperation::kAdd &&
+             b.Op() != BinaryOperation::kSubtract) ||
+            !b.Right() || b.Right()->Type() != TypeTag::kConstantValue) {
+          return false;
+        }
+        const Value& kv = b.Right()->AsConstantValue().GetValue();
+        if (kv.IsNull() || kv.type != ValueType::kInt64 ||
+            kv.value.int_value != 1) {
+          return false;
+        }
+        std::string o_rn;
+        if (b.Op() == BinaryOperation::kAdd &&
+            match_col_of(b.Left(), lg_i, &o_rn) &&
+            IdentifierEquals(o_rn, rn_out_name)) {
+          has_lag_rn = true;
+          return true;
+        }
+        if (b.Op() == BinaryOperation::kSubtract &&
+            match_col_of(b.Left(), ld_i, &o_rn) &&
+            IdentifierEquals(o_rn, rn_out_name)) {
+          has_lead_rn = true;
+          return true;
+        }
+        return false;
+      };
+      if (check_rn_offset(l, r) || check_rn_offset(r, l)) {
+        continue;
+      }
+      conjs_ok = false;
+      break;
+    }
+    if (!conjs_ok || !has_lag_rn || !has_lead_rn ||
+        eq_lg_cols.size() != part_out_names.size() ||
+        eq_ld_cols.size() != part_out_names.size()) {
+      continue;
+    }
+    bool exact_part_match = true;
+    for (const std::string& pnm : part_out_names) {
+      const std::string plow = LoweredStarName(pnm);
+      if (!eq_lg_cols.contains(plow) || !eq_ld_cols.contains(plow)) {
+        exact_part_match = false;
+        break;
+      }
+    }
+    if (!exact_part_match) {
+      continue;
+    }
+
+    // Inspect `v2.SelectList()`: center refs allowed, plus lag/lead refs to
+    // pure aggregate/column items of `v1`.
+    std::unordered_map<std::string, std::string> lag_col_to_win;
+    std::unordered_map<std::string, std::string> lead_col_to_win;
+    bool rn_used_in_v2 = false;
+    bool v2_sel_ok = true;
+    size_t synth_seq = 0;
+    std::vector<NamedExpression> extra_v1_wins;
+
+    auto make_offset_win = [&](std::string fn_name,
+                               Expression arg) -> Expression {
+      auto w = std::make_shared<WindowFunctionCallExpression>();
+      w->function = std::move(fn_name);
+      w->args = {std::move(arg), ConstantValueExp(Value(int64_t{1}))};
+      w->partition_by = rn_win->partition_by;
+      w->order_by = rn_win->order_by;
+      return w;
+    };
+
+    auto ensure_neighbor_win = [&](const std::string& v1_col, bool is_lag,
+                                   std::string* out_win_name) -> bool {
+      auto& map = is_lag ? lag_col_to_win : lead_col_to_win;
+      const std::string clow = LoweredStarName(v1_col);
+      if (const auto it = map.find(clow); it != map.end()) {
+        *out_win_name = it->second;
+        return true;
+      }
+      const auto vit = v1_out_map.find(clow);
+      if (vit == v1_out_map.end()) {
+        return false;
+      }
+      const Expression& v1_expr = v1.SelectList()[vit->second].expression;
+      auto expr_is_pure_group_output = [&](auto& self,
+                                           const Expression& node) -> bool {
+        if (!node) {
+          return true;
+        }
+        if (node->Type() == TypeTag::kQueryExp ||
+            node->Type() == TypeTag::kWindowFunctionExp ||
+            TpcdsExprHasParam(node)) {
+          return false;
+        }
+        if (node->Type() == TypeTag::kFunctionCallExp &&
+            GetFunctionVolatility(
+                node->AsFunctionCallExpression().FuncName()) !=
+                Volatility::kImmutable) {
+          return false;
+        }
+        if (node->Type() == TypeTag::kAggregateExp) {
+          const auto& agg = node->AsAggregateExpression();
+          if (agg.NeedsGroupContext() || !agg.InnerGroupBy().empty() ||
+              agg.WhereFilter() ||
+              agg.Having() != AggregateHavingModifier::kNone ||
+              agg.HavingCondition() || !agg.InnerOrderBy().empty() ||
+              agg.SecondaryArg() || !agg.TrailingArgs().empty()) {
+            return false;
+          }
+        }
+        for (const Expression& ch : ExpressionChildren(node)) {
+          if (!self(self, ch)) {
+            return false;
+          }
+        }
+        return true;
+      };
+      if (!v1_expr || !expr_is_pure_group_output(expr_is_pure_group_output,
+                                                 v1_expr)) {
+        return false;
+      }
+      const std::string wname =
+          (is_lag ? "__tpcds_lag_" : "__tpcds_lead_") +
+          std::to_string(synth_seq++);
+      extra_v1_wins.emplace_back(
+          wname, make_offset_win(is_lag ? "LAG" : "LEAD", v1_expr));
+      map.emplace(clow, wname);
+      *out_win_name = wname;
+      return true;
+    };
+
+    std::vector<NamedExpression> new_v2_sel;
+    new_v2_sel.reserve(v2.SelectList().size());
+    for (size_t i = 0; i < v2.SelectList().size(); ++i) {
+      std::string out_nm = InferSelectItemOutputName(v2.SelectList()[i], i);
+      Expression rewritten = ReplaceSubExpressions(
+          v2.SelectList()[i].expression,
+          [&](const Expression& node) -> std::optional<Expression> {
+            if (!node) { return std::nullopt;
+}
+            if (node->Type() == TypeTag::kQueryExp) {
+              v2_sel_ok = false;
+              return std::nullopt;
+            }
+            if (node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            const ColumnName& cn = node->AsColumnValue().GetColumnName();
+            if (cn.schema.empty()) {
+              v2_sel_ok = false;
+              return std::nullopt;
+            }
+            if (IdentifierEquals(cn.schema, aliases[c_i])) {
+              if (IdentifierEquals(cn.name, rn_out_name)) {
+                rn_used_in_v2 = true;
+              }
+              return std::nullopt;
+            }
+            if (IdentifierEquals(cn.schema, aliases[lg_i])) {
+              std::string wn;
+              if (!ensure_neighbor_win(cn.name, /*is_lag=*/true, &wn)) {
+                v2_sel_ok = false;
+                return std::nullopt;
+              }
+              return ColumnValueExp(ColumnName(aliases[c_i], wn));
+            }
+            if (IdentifierEquals(cn.schema, aliases[ld_i])) {
+              std::string wn;
+              if (!ensure_neighbor_win(cn.name, /*is_lag=*/false, &wn)) {
+                v2_sel_ok = false;
+                return std::nullopt;
+              }
+              return ColumnValueExp(ColumnName(aliases[c_i], wn));
+            }
+            v2_sel_ok = false;
+            return std::nullopt;
+          });
+      if (!v2_sel_ok) {
+        break;
+      }
+      new_v2_sel.emplace_back(std::move(out_nm), std::move(rewritten));
+    }
+    if (!v2_sel_ok) {
+      continue;
+    }
+
+    const std::string has_lag_col = "__tpcds_has_lag";
+    const std::string has_lead_col = "__tpcds_has_lead";
+    extra_v1_wins.emplace_back(
+        has_lag_col,
+        make_offset_win("LAG", ConstantValueExp(Value(int64_t{1}))));
+    extra_v1_wins.emplace_back(
+        has_lead_col,
+        make_offset_win("LEAD", ConstantValueExp(Value(int64_t{1}))));
+
+    std::vector<NamedExpression> new_v1_sel;
+    new_v1_sel.reserve(v1.SelectList().size() + extra_v1_wins.size());
+    for (size_t i = 0; i < v1.SelectList().size(); ++i) {
+      if (i == *rn_idx && !rn_used_in_v2) {
+        continue;
+      }
+      new_v1_sel.push_back(v1.SelectList()[i]);
+    }
+    for (NamedExpression& ew : extra_v1_wins) {
+      new_v1_sel.push_back(std::move(ew));
+    }
+    v1.SetSelectList(std::move(new_v1_sel));
+
+    SelectSource center_src = v2.Sources()[c_i];
+    center_src.alias = aliases[c_i];
+    center_src.join_type = JoinType::kCross;
+    center_src.join_condition = nullptr;
+    std::vector<Expression> new_v2_where;
+    new_v2_where.reserve(part_out_names.size() + 2);
+    for (const std::string& pnm : part_out_names) {
+      new_v2_where.push_back(UnaryExpressionExp(
+          ColumnValueExp(ColumnName(aliases[c_i], pnm)),
+          UnaryOperation::kIsNotNull));
+    }
+    new_v2_where.push_back(UnaryExpressionExp(
+        ColumnValueExp(ColumnName(aliases[c_i], has_lag_col)),
+        UnaryOperation::kIsNotNull));
+    new_v2_where.push_back(UnaryExpressionExp(
+        ColumnValueExp(ColumnName(aliases[c_i], has_lead_col)),
+        UnaryOperation::kIsNotNull));
+
+    v2.SetSources({std::move(center_src)});
+    v2.SetWhereClause(CombineConjuncts(new_v2_where));
+    v2.SetSelectList(std::move(new_v2_sel));
+    any_changed = true;
+  }
+  return any_changed;
+}
+
+namespace {
+
+bool FoldSingletonRankInStatement(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, std::unordered_set<SelectStatement*>* visited) {
+  if (stmt == nullptr || !visited->insert(stmt).second) {
+    return false;
+  }
+  bool changed = false;
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    if (!stmt->IsRecursiveWith(name) && body != nullptr) {
+      changed |= FoldSingletonRankInStatement(body.get(), visited);
+    }
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.query != nullptr) {
+      changed |= FoldSingletonRankInStatement(src.query.get(), visited);
+    }
+  }
+  for (const auto& br : stmt->UnionAll()) {
+    if (br != nullptr) {
+      changed |= FoldSingletonRankInStatement(br.get(), visited);
+    }
+  }
+  if (const auto& tree = stmt->GetSetOperationTree(); tree != nullptr) {
+    if (tree->first != nullptr) {
+      changed |= FoldSingletonRankInStatement(tree->first.get(), visited);
+    }
+    for (const auto& br : tree->branches) {
+      if (br != nullptr) {
+        changed |= FoldSingletonRankInStatement(br.get(), visited);
+      }
+    }
+  }
+
+  auto fold_subqueries_in_expr = [&](auto& self, const Expression& e) -> void {
+    if (!e) { return;
+}
+    if (e->Type() == TypeTag::kQueryExp) {
+      const auto& q = e->AsQueryExpression();
+      if (q.Query() != nullptr) {
+        changed |= FoldSingletonRankInStatement(q.Query().get(), visited);
+      }
+      self(self, q.Test());
+      return;
+    }
+    for (const Expression& ch : ExpressionChildren(e)) {
+      self(self, ch);
+    }
+  };
+  fold_subqueries_in_expr(fold_subqueries_in_expr, stmt->WhereClause());
+  fold_subqueries_in_expr(fold_subqueries_in_expr, stmt->Having());
+  fold_subqueries_in_expr(fold_subqueries_in_expr, stmt->Qualify());
+
+  // Check if `stmt` is a plain single-grouping-set GROUP BY query whose
+  // `GroupBy()` keys are all covered by a `RANK()`/`DENSE_RANK()`/`ROW_NUMBER()`
+  // window's `partition_by`.
+  if (!stmt->GroupBy().empty() && !stmt->IsGroupAll() &&
+      stmt->UnionAll().empty() && stmt->GetSetOperationTree() == nullptr) {
+    auto norm_col = [](const Expression& e) -> std::string {
+      if (!e || e->Type() != TypeTag::kColumnValue) { return {};
+}
+      const ColumnName& cn = e->AsColumnValue().GetColumnName();
+      return LoweredStarName(cn.name);
+    };
+    std::vector<std::string> gb_names;
+    bool gb_simple = true;
+    for (const Expression& g : stmt->GroupBy()) {
+      std::string nm = norm_col(g);
+      if (nm.empty()) {
+        gb_simple = false;
+        break;
+      }
+      gb_names.push_back(std::move(nm));
+    }
+    if (gb_simple) {
+      bool any_folded_here = false;
+      std::vector<NamedExpression> new_sel;
+      new_sel.reserve(stmt->SelectList().size());
+      for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+        std::string out_nm = InferSelectItemOutputName(stmt->SelectList()[i], i);
+        Expression replaced = ReplaceSubExpressions(
+            stmt->SelectList()[i].expression,
+            [&](const Expression& node) -> std::optional<Expression> {
+              if (!node || node->Type() != TypeTag::kWindowFunctionExp) {
+                return std::nullopt;
+              }
+              const auto& wf = node->AsWindowFunctionCallExpression();
+              if ((!IdentifierEquals(wf.function, "rank") &&
+                   !IdentifierEquals(wf.function, "dense_rank") &&
+                   !IdentifierEquals(wf.function, "row_number")) ||
+                  !wf.args.empty() || wf.where_filter || wf.distinct ||
+                  !wf.inner_order_by.empty() || wf.inner_limit.has_value() ||
+                  wf.has_frame || wf.partition_by.empty()) {
+                return std::nullopt;
+              }
+              std::unordered_set<std::string> pnames;
+              for (const Expression& pe : wf.partition_by) {
+                std::string pn = norm_col(pe);
+                if (!pn.empty()) {
+                  pnames.insert(std::move(pn));
+                }
+              }
+              for (const std::string& gn : gb_names) {
+                if (!pnames.contains(gn)) {
+                  return std::nullopt;
+                }
+              }
+              any_folded_here = true;
+              return ConstantValueExp(Value(int64_t{1}));
+            });
+        new_sel.emplace_back(std::move(out_nm), std::move(replaced));
+      }
+      if (any_folded_here) {
+        stmt->SetSelectList(std::move(new_sel));
+        changed = true;
+      }
+    }
+  }
+
+  // Also absorb `col IN (SELECT col FROM (SELECT col, 1 AS ranking FROM <same>
+  // GROUP BY col) WHERE ranking <= K)` (where 1 <= K is TRUE and <same> matches
+  // `stmt`'s own base tables + non-subquery predicates) into `col IS NOT NULL`.
+  if (stmt->WhereClause() && !stmt->Sources().empty()) {
+    auto canonical_base_sig = [](const SelectStatement& s,
+                                 const Expression* skip_conj,
+                                 std::string* sig_out) -> bool {
+      std::unordered_map<std::string, std::string> alias_to_tbl;
+      std::vector<std::string> tbl_multiset;
+      for (const SelectSource& src : s.Sources()) {
+        if (src.table.empty() || src.query != nullptr || src.unnest ||
+            src.is_lateral || src.sample || !src.using_columns.empty() ||
+            src.from_nested_join || src.join_condition ||
+            (src.join_type != JoinType::kCross &&
+             src.join_type != JoinType::kInner)) {
+          return false;
+        }
+        const std::string tlow = LoweredStarName(src.table);
+        tbl_multiset.push_back(tlow);
+        alias_to_tbl.emplace(LoweredStarName(src.alias.empty() ? src.table : src.alias),
+                             tlow);
+      }
+      std::ranges::sort(tbl_multiset);
+      // Reject self-joins of the same base table so alias stripping is exact.
+      for (size_t i = 1; i < tbl_multiset.size(); ++i) {
+        if (tbl_multiset[i] == tbl_multiset[i - 1]) {
+          return false;
+        }
+      }
+      std::vector<std::string> norm_preds;
+      for (const Expression& c : SplitConjuncts(s.WhereClause())) {
+        if (skip_conj != nullptr && c.get() == skip_conj->get()) {
+          continue;
+        }
+        if (!c || ContainsQueryExpression(c) ||
+            !DerivedExpressionIsImmutable(c)) {
+          return false;
+        }
+        Expression stripped = ReplaceSubExpressions(
+            c, [&](const Expression& node) -> std::optional<Expression> {
+              if (!node || node->Type() != TypeTag::kColumnValue) {
+                return std::nullopt;
+              }
+              const ColumnName& cn = node->AsColumnValue().GetColumnName();
+              return ColumnValueExp(ColumnName("", LoweredStarName(cn.name)));
+            });
+        // Canonicalize commutative `a = b` order.
+        if (stripped->Type() == TypeTag::kBinaryExp &&
+            stripped->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+          std::string ls = stripped->AsBinaryExpression().Left()->ToString();
+          std::string rs = stripped->AsBinaryExpression().Right()->ToString();
+          if (rs < ls) {
+            stripped = BinaryExpressionExp(stripped->AsBinaryExpression().Right(),
+                                           BinaryOperation::kEquals,
+                                           stripped->AsBinaryExpression().Left());
+          }
+        }
+        norm_preds.push_back(stripped->ToString());
+      }
+      std::ranges::sort(norm_preds);
+      std::string sig;
+      for (const std::string& t : tbl_multiset) {
+        sig += t + ",";
+      }
+      sig += "|";
+      for (const std::string& p : norm_preds) {
+        sig += p + "&";
+      }
+      *sig_out = std::move(sig);
+      return true;
+    };
+
+    std::vector<Expression> conjs = SplitConjuncts(stmt->WhereClause());
+    bool where_changed = false;
+    for (Expression& cj : conjs) {
+      if (!cj || cj->Type() != TypeTag::kQueryExp) { continue;
+}
+      const auto& qexp = cj->AsQueryExpression();
+      if (qexp.Exists() || qexp.Negated() || qexp.ArrayResult() ||
+          !qexp.Test() || qexp.Test()->Type() != TypeTag::kColumnValue ||
+          qexp.Query() == nullptr) {
+        continue;
+      }
+      const std::string outer_col_low =
+          LoweredStarName(qexp.Test()->AsColumnValue().GetColumnName().name);
+      const SelectStatement* cur_sq = qexp.Query().get();
+      // Unwrap `SELECT s_state FROM (<inner>) tmp1 WHERE ranking <= 5` when
+      // `ranking` in `<inner>` is ConstantValue(1) and `1 <= 5` folds to true!
+      if (cur_sq->Sources().size() == 1 && cur_sq->Sources()[0].query != nullptr &&
+          cur_sq->GroupBy().empty() && !cur_sq->Having() &&
+          !cur_sq->HasLimit() && cur_sq->Offset() == 0 &&
+          cur_sq->UnionAll().empty() &&
+          cur_sq->GetSetOperationTree() == nullptr &&
+          cur_sq->SelectList().size() == 1 &&
+          cur_sq->SelectList()[0].expression &&
+          cur_sq->SelectList()[0].expression->Type() == TypeTag::kColumnValue) {
+        const SelectStatement& inner_sq = *cur_sq->Sources()[0].query;
+        const std::string proj_nm =
+            cur_sq->SelectList()[0].expression->AsColumnValue().GetColumnName().name;
+        std::unordered_map<std::string, Expression> const_cols;
+        std::string inner_key_col;
+        for (size_t i = 0; i < inner_sq.SelectList().size(); ++i) {
+          const std::string inm =
+              InferSelectItemOutputName(inner_sq.SelectList()[i], i);
+          const Expression& ie = inner_sq.SelectList()[i].expression;
+          if (IdentifierEquals(inm, proj_nm) && ie &&
+              ie->Type() == TypeTag::kColumnValue) {
+            inner_key_col =
+                LoweredStarName(ie->AsColumnValue().GetColumnName().name);
+          } else if (ie && ie->Type() == TypeTag::kConstantValue) {
+            const_cols.emplace(LoweredStarName(inm), ie);
+          }
+        }
+        bool wrapper_true = !cur_sq->WhereClause();
+        if (cur_sq->WhereClause() && !const_cols.empty()) {
+          Expression subst_w = ReplaceSubExpressions(
+              cur_sq->WhereClause(),
+              [&](const Expression& node) -> std::optional<Expression> {
+                if (!node || node->Type() != TypeTag::kColumnValue) {
+                  return std::nullopt;
+                }
+                const auto it = const_cols.find(
+                    LoweredStarName(node->AsColumnValue().GetColumnName().name));
+                return it != const_cols.end()
+                           ? std::optional<Expression>(it->second)
+                           : std::nullopt;
+              });
+          if (std::optional<Value> wv = TpcdsEvalClosedConstant(subst_w);
+              wv.has_value() && !wv->IsNull() && wv->type == ValueType::kInt64 &&
+              wv->value.int_value != 0) {
+            wrapper_true = true;
+          }
+        }
+        if (wrapper_true && inner_key_col == outer_col_low &&
+            inner_sq.GroupBy().size() == 1 && !inner_sq.Having() &&
+            !inner_sq.HasLimit() && inner_sq.Offset() == 0 &&
+            inner_sq.UnionAll().empty() &&
+            inner_sq.GetSetOperationTree() == nullptr &&
+            inner_sq.GroupBy()[0] &&
+            inner_sq.GroupBy()[0]->Type() == TypeTag::kColumnValue &&
+            LoweredStarName(
+                inner_sq.GroupBy()[0]->AsColumnValue().GetColumnName().name) ==
+                outer_col_low) {
+          std::string outer_sig;
+          std::string inner_sig;
+          if (canonical_base_sig(*stmt, &cj, &outer_sig) &&
+              canonical_base_sig(inner_sq, nullptr, &inner_sig) &&
+              outer_sig == inner_sig) {
+            cj = UnaryExpressionExp(qexp.Test(), UnaryOperation::kIsNotNull);
+            where_changed = true;
+          }
+        }
+      }
+    }
+    if (where_changed) {
+      stmt->SetWhereClause(CombineConjuncts(conjs));
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (singleton_partition_rank_const_one_sound)
+bool FoldSingletonPartitionRankToOne(SelectStatement* outer) {
+  std::unordered_set<SelectStatement*> visited;
+  return FoldSingletonRankInStatement(outer, &visited);
+}
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (multi_join_shared_unique_dim_deferral_sound,
+//    trap_non_unique_uk_dim_collapse_unsound)
+bool CollapseSharedUniqueDimAcrossJoinedSubqueries(SelectStatement* outer,
+                                                   TransactionContext& ctx) {
+  if (outer == nullptr || !outer->UnionAll().empty() ||
+      outer->GetSetOperationTree() != nullptr || outer->ForUpdate() ||
+      outer->AsStruct() || SelectListHasStarOrModifiers(*outer) ||
+      TpcdsStmtHasParam(*outer) || outer->Sources().size() < 2) {
+    return false;
+  }
+  for (const SelectSource& s : outer->Sources()) {
+    if ((s.join_type != JoinType::kCross && s.join_type != JoinType::kInner) ||
+        s.is_lateral || s.unnest || s.sample || s.from_nested_join ||
+        !s.using_columns.empty()) {
+      return false;
+    }
+  }
+
+  struct DeferredDimSite {
+    size_t src_idx{0};
+    std::string outer_alias;
+    std::string pre_alias;
+    std::string fk_pre_col;
+    std::string dim_table;
+    std::string dim_alias;
+    std::string pk_col;
+    std::shared_ptr<Table> dim_tbl;
+    // Lowered outer output col name -> actual dim schema col name.
+    std::unordered_map<std::string, std::string> out_to_dim_col;
+  };
+
+  std::vector<DeferredDimSite> sites;
+  for (size_t si = 0; si < outer->Sources().size(); ++si) {
+    const SelectSource& src = outer->Sources()[si];
+    if (src.query == nullptr || src.alias.empty()) {
+      continue;
+    }
+    const SelectStatement& dq = *src.query;
+    if (!dq.WithQueries().empty() || !dq.UnionAll().empty() ||
+        dq.GetSetOperationTree() != nullptr || !dq.GroupBy().empty() ||
+        dq.IsGroupAll() || dq.Having() || dq.Distinct() || dq.HasDistinctOn() ||
+        dq.Qualify() || dq.HasLimit() || dq.Offset() != 0 ||
+        !dq.OrderBy().empty() || dq.WithTies() || dq.Sources().size() != 2 ||
+        SelectListHasStarOrModifiers(dq)) {
+      continue;
+    }
+    const SelectSource& pre_src = dq.Sources()[0];
+    const SelectSource& dim_src = dq.Sources()[1];
+    if (pre_src.query == nullptr || pre_src.alias.empty() ||
+        pre_src.is_lateral || pre_src.unnest || pre_src.sample ||
+        pre_src.join_condition || dim_src.table.empty() ||
+        dim_src.query != nullptr || dim_src.is_lateral || dim_src.unnest ||
+        dim_src.sample || dim_src.join_condition ||
+        (dim_src.join_type != JoinType::kCross &&
+         dim_src.join_type != JoinType::kInner) ||
+        outer->WithQueries().contains(dim_src.table)) {
+      continue;
+    }
+    StatusOr<std::shared_ptr<Table>> dim_tbl_or = ctx.GetTable(dim_src.table);
+    if (!dim_tbl_or.HasValue() || dim_tbl_or.Value() == nullptr) {
+      continue;
+    }
+    std::shared_ptr<Table> dim_tbl = dim_tbl_or.MoveValue();
+    const Schema& dim_schema = dim_tbl->GetSchema();
+    const std::string dim_alias =
+        dim_src.alias.empty() ? dim_src.table : dim_src.alias;
+    const std::vector<Expression> dq_conjs = SplitConjuncts(dq.WhereClause());
+    if (dq_conjs.size() != 1 || !dq_conjs[0] ||
+        dq_conjs[0]->Type() != TypeTag::kBinaryExp ||
+        dq_conjs[0]->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+      continue;
+    }
+    const BinaryExpression& eq = dq_conjs[0]->AsBinaryExpression();
+    if (!eq.Left() || !eq.Right() ||
+        eq.Left()->Type() != TypeTag::kColumnValue ||
+        eq.Right()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& lc = eq.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& rc = eq.Right()->AsColumnValue().GetColumnName();
+    std::string fk_pre_col;
+    std::string pk_col;
+    if (IdentifierEquals(lc.schema, pre_src.alias) &&
+        IdentifierEquals(rc.schema, dim_alias)) {
+      fk_pre_col = lc.name;
+      pk_col = rc.name;
+    } else if (IdentifierEquals(rc.schema, pre_src.alias) &&
+               IdentifierEquals(lc.schema, dim_alias)) {
+      fk_pre_col = rc.name;
+      pk_col = lc.name;
+    } else {
+      continue;
+    }
+    const int pk_off = dim_schema.Offset(ColumnName("", pk_col));
+    if (pk_off < 0) {
+      continue;
+    }
+    const std::string actual_pk =
+        dim_schema.GetColumn(static_cast<size_t>(pk_off)).Name().name;
+    const GroupingRelation dim_grel{.name = dim_alias, .schema = &dim_schema};
+    if (!ColumnIsPrimaryKey(dim_grel, actual_pk) &&
+        !InspectRuntimeUniqueNonNullColumn(ctx, dim_src.table, actual_pk)
+             .unique_non_null) {
+      continue;
+    }
+    // Verify `fk_pre_col` is projected by `pre_src.query`.
+    bool fk_found = false;
+    for (size_t i = 0; i < pre_src.query->SelectList().size(); ++i) {
+      if (IdentifierEquals(
+              InferSelectItemOutputName(pre_src.query->SelectList()[i], i),
+              fk_pre_col)) {
+        fk_found = true;
+        break;
+      }
+    }
+    if (!fk_found) {
+      continue;
+    }
+    std::unordered_map<std::string, std::string> out_to_dim;
+    bool items_ok = true;
+    std::unordered_set<std::string> seen_out;
+    for (size_t i = 0; i < dq.SelectList().size(); ++i) {
+      const NamedExpression& it = dq.SelectList()[i];
+      const std::string out_nm = InferSelectItemOutputName(it, i);
+      if (out_nm.empty() || !seen_out.insert(LoweredStarName(out_nm)).second ||
+          !it.expression || it.expression->Type() != TypeTag::kColumnValue) {
+        items_ok = false;
+        break;
+      }
+      const ColumnName& cn = it.expression->AsColumnValue().GetColumnName();
+      if (IdentifierEquals(cn.schema, dim_alias)) {
+        const int doff = dim_schema.Offset(ColumnName("", cn.name));
+        if (doff < 0) {
+          items_ok = false;
+          break;
+        }
+        out_to_dim.emplace(
+            LoweredStarName(out_nm),
+            dim_schema.GetColumn(static_cast<size_t>(doff)).Name().name);
+      } else if (!IdentifierEquals(cn.schema, pre_src.alias)) {
+        items_ok = false;
+        break;
+      }
+    }
+    if (!items_ok || out_to_dim.empty()) {
+      continue;
+    }
+    sites.push_back(DeferredDimSite{.src_idx = si,
+                                    .outer_alias = src.alias,
+                                    .pre_alias = pre_src.alias,
+                                    .fk_pre_col = fk_pre_col,
+                                    .dim_table = dim_src.table,
+                                    .dim_alias = dim_alias,
+                                    .pk_col = actual_pk,
+                                    .dim_tbl = std::move(dim_tbl),
+                                    .out_to_dim_col = std::move(out_to_dim)});
+  }
+  if (sites.size() < 2) {
+    return false;
+  }
+
+  // Build transitive column-equality graph over outer WHERE + INNER ON.
+  auto col_token = [](std::string_view schema, std::string_view col) {
+    return LoweredStarName(schema) + "." + LoweredStarName(col);
+  };
+  std::vector<Expression> outer_conjs = SplitConjuncts(outer->WhereClause());
+  for (const SelectSource& s : outer->Sources()) {
+    if (s.join_condition) {
+      for (const Expression& c : SplitConjuncts(s.join_condition)) {
+        outer_conjs.push_back(c);
+      }
+    }
+  }
+  std::unordered_map<std::string, std::vector<std::string>> eq_adj;
+  for (const Expression& conj : outer_conjs) {
+    if (!conj || conj->Type() != TypeTag::kBinaryExp ||
+        conj->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+      continue;
+    }
+    const auto& bin = conj->AsBinaryExpression();
+    if (!bin.Left() || !bin.Right() ||
+        bin.Left()->Type() != TypeTag::kColumnValue ||
+        bin.Right()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& lc = bin.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& rc = bin.Right()->AsColumnValue().GetColumnName();
+    if (lc.schema.empty() || rc.schema.empty()) {
+      continue;
+    }
+    const std::string lt = col_token(lc.schema, lc.name);
+    const std::string rt = col_token(rc.schema, rc.name);
+    eq_adj[lt].push_back(rt);
+    eq_adj[rt].push_back(lt);
+  }
+  auto are_equated = [&](const std::string& a, const std::string& b) {
+    if (a == b) {
+      return true;
+    }
+    std::unordered_set<std::string> visited{a};
+    std::vector<std::string> queue{a};
+    while (!queue.empty()) {
+      std::string cur = std::move(queue.back());
+      queue.pop_back();
+      const auto it = eq_adj.find(cur);
+      if (it == eq_adj.end()) {
+        continue;
+      }
+      for (const std::string& nxt : it->second) {
+        if (nxt == b) {
+          return true;
+        }
+        if (visited.insert(nxt).second) {
+          queue.push_back(nxt);
+        }
+      }
+    }
+    return false;
+  };
+
+  // Group sites by `(dim_table, pk_col)`.
+  std::map<std::pair<std::string, std::string>, std::vector<size_t>> groups;
+  for (size_t i = 0; i < sites.size(); ++i) {
+    groups[{LoweredStarName(sites[i].dim_table),
+            LoweredStarName(sites[i].pk_col)}]
+        .push_back(i);
+  }
+
+  for (const auto& [gkey, gidxs] : groups) {
+    (void)gkey;
+    if (gidxs.size() < 2) {
+      continue;
+    }
+    const DeferredDimSite& s0 = sites[gidxs[0]];
+    const Schema& dim_schema = s0.dim_tbl->GetSchema();
+    const GroupingRelation dim_grel{.name = s0.dim_alias, .schema = &dim_schema};
+
+    // Find a certified unique non-null column `uk_col` of `dim_table` on which
+    // ALL `gidxs` are transitively equated in `outer`.
+    bool certified_uk_equated = false;
+    for (size_t ci = 0; ci < dim_schema.ColumnCount(); ++ci) {
+      const std::string& cand_uk = dim_schema.GetColumn(ci).Name().name;
+      // Quick check: every site must project `cand_uk` first before paying
+      // `InspectRuntimeUniqueNonNullColumn`.
+      std::vector<std::string> site_uk_tokens;
+      site_uk_tokens.reserve(gidxs.size());
+      bool all_project_cand = true;
+      for (const size_t gi : gidxs) {
+        std::string found_out;
+        for (const auto& [out_low, dim_col] : sites[gi].out_to_dim_col) {
+          if (IdentifierEquals(dim_col, cand_uk)) {
+            found_out = out_low;
+            break;
+          }
+        }
+        if (found_out.empty()) {
+          all_project_cand = false;
+          break;
+        }
+        site_uk_tokens.push_back(col_token(sites[gi].outer_alias, found_out));
+      }
+      if (!all_project_cand) {
+        continue;
+      }
+      bool all_eq = true;
+      for (size_t j = 1; j < site_uk_tokens.size(); ++j) {
+        if (!are_equated(site_uk_tokens[0], site_uk_tokens[j])) {
+          all_eq = false;
+          break;
+        }
+      }
+      if (!all_eq) {
+        continue;
+      }
+      if (ColumnIsPrimaryKey(dim_grel, cand_uk) ||
+          InspectRuntimeUniqueNonNullColumn(ctx, s0.dim_table, cand_uk)
+              .unique_non_null) {
+        certified_uk_equated = true;
+        break;
+      }
+    }
+    if (!certified_uk_equated) {
+      continue;
+    }
+
+    // Mint a fresh outer alias for the single shared dimension join.
+    std::unordered_set<std::string> used_outer_names;
+    for (const SelectSource& s : outer->Sources()) {
+      if (!s.alias.empty()) {
+        used_outer_names.insert(LoweredStarName(s.alias));
+      }
+      if (!s.table.empty()) {
+        used_outer_names.insert(LoweredStarName(s.table));
+      }
+    }
+    std::string shared_dim_alias =
+        "__tpcds_shared_dim_" + LoweredStarName(s0.dim_table);
+    size_t suffix = 1;
+    while (used_outer_names.contains(LoweredStarName(shared_dim_alias))) {
+      shared_dim_alias = "__tpcds_shared_dim_" + LoweredStarName(s0.dim_table) +
+                         "_" + std::to_string(suffix++);
+    }
+
+    // Map `(outer_site_alias.out_col) -> shared_dim_alias.dim_col`, and rewrite
+    // each site's derived query to drop `dim_src` and expose `__shared_fk`.
+    std::unordered_map<std::string, Expression> qualified_dim_map;
+    std::unordered_set<std::string> collapsed_site_aliases;
+    std::vector<SelectSource> new_outer_sources = outer->Sources();
+    std::vector<std::pair<std::string, std::string>> site_fk_cols;
+    site_fk_cols.reserve(gidxs.size());
+
+    for (const size_t gi : gidxs) {
+      const DeferredDimSite& site = sites[gi];
+      collapsed_site_aliases.insert(LoweredStarName(site.outer_alias));
+      for (const auto& [out_low, dim_col] : site.out_to_dim_col) {
+        qualified_dim_map.emplace(
+            col_token(site.outer_alias, out_low),
+            ColumnValueExp(ColumnName(shared_dim_alias, dim_col)));
+      }
+      const SelectStatement& old_dq = *new_outer_sources[site.src_idx].query;
+      std::vector<NamedExpression> stripped_sel;
+      std::unordered_set<std::string> existing_names;
+      std::string fk_out_name;
+      for (size_t i = 0; i < old_dq.SelectList().size(); ++i) {
+        const NamedExpression& it = old_dq.SelectList()[i];
+        const std::string out_nm = InferSelectItemOutputName(it, i);
+        const ColumnName& cn = it.expression->AsColumnValue().GetColumnName();
+        if (IdentifierEquals(cn.schema, site.pre_alias)) {
+          stripped_sel.emplace_back(out_nm, it.expression);
+          existing_names.insert(LoweredStarName(out_nm));
+          if (fk_out_name.empty() &&
+              IdentifierEquals(cn.name, site.fk_pre_col)) {
+            fk_out_name = out_nm;
+          }
+        }
+      }
+      if (fk_out_name.empty()) {
+        fk_out_name = "__shared_fk";
+        size_t fk_suf = 1;
+        while (existing_names.contains(LoweredStarName(fk_out_name))) {
+          fk_out_name = "__shared_fk_" + std::to_string(fk_suf++);
+        }
+        stripped_sel.emplace_back(
+            fk_out_name,
+            ColumnValueExp(ColumnName(site.pre_alias, site.fk_pre_col)));
+      }
+      auto stripped_dq = std::make_shared<SelectStatement>();
+      stripped_dq->SetSources({old_dq.Sources()[0]});
+      stripped_dq->SetSelectList(std::move(stripped_sel));
+      new_outer_sources[site.src_idx].query = std::move(stripped_dq);
+      site_fk_cols.emplace_back(site.outer_alias, fk_out_name);
+    }
+
+    // Abort if any outer expression references an unqualified column that could
+    // have come from a collapsed site's stripped dimension outputs.
+    bool unqualified_conflict = false;
+    auto rewrite_expr = [&](const Expression& e) -> Expression {
+      if (!e) {
+        return e;
+      }
+      return ReplaceSubExpressions(
+          e, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            const ColumnName& cn = node->AsColumnValue().GetColumnName();
+            if (cn.schema.empty()) {
+              for (const size_t gi : gidxs) {
+                if (sites[gi].out_to_dim_col.contains(LoweredStarName(cn.name))) {
+                  unqualified_conflict = true;
+                  break;
+                }
+              }
+              return std::nullopt;
+            }
+            const auto it =
+                qualified_dim_map.find(col_token(cn.schema, cn.name));
+            if (it != qualified_dim_map.end()) {
+              return it->second;
+            }
+            return std::nullopt;
+          });
+    };
+
+    std::vector<NamedExpression> new_sel;
+    new_sel.reserve(outer->SelectList().size());
+    for (const NamedExpression& it : outer->SelectList()) {
+      new_sel.emplace_back(it.name, rewrite_expr(it.expression));
+    }
+    for (SelectSource& s : new_outer_sources) {
+      if (s.join_condition) {
+        s.join_condition = rewrite_expr(s.join_condition);
+      }
+    }
+    Expression new_where = rewrite_expr(outer->WhereClause());
+    std::vector<Expression> new_group;
+    new_group.reserve(outer->GroupBy().size());
+    for (const Expression& g : outer->GroupBy()) {
+      new_group.push_back(rewrite_expr(g));
+    }
+    Expression new_having = rewrite_expr(outer->Having());
+    Expression new_qualify = rewrite_expr(outer->Qualify());
+    std::vector<SelectStatement::OrderByTerm> new_order = outer->OrderBy();
+    for (auto& ot : new_order) {
+      ot.expression = rewrite_expr(ot.expression);
+    }
+    if (unqualified_conflict) {
+      continue;
+    }
+
+    // Drop redundant `shared_dim.col = shared_dim.col` conjuncts on certified
+    // unique non-null columns, and append `__fk` equijoins + shared dim PK join.
+    std::vector<Expression> final_where;
+    for (const Expression& c : SplitConjuncts(new_where)) {
+      if (c && c->Type() == TypeTag::kBinaryExp &&
+          c->AsBinaryExpression().Op() == BinaryOperation::kEquals &&
+          c->AsBinaryExpression().Left() && c->AsBinaryExpression().Right() &&
+          c->AsBinaryExpression().Left()->Type() == TypeTag::kColumnValue &&
+          c->AsBinaryExpression().Right()->Type() == TypeTag::kColumnValue) {
+        const ColumnName& l =
+            c->AsBinaryExpression().Left()->AsColumnValue().GetColumnName();
+        const ColumnName& r =
+            c->AsBinaryExpression().Right()->AsColumnValue().GetColumnName();
+        if (IdentifierEquals(l.schema, shared_dim_alias) &&
+            IdentifierEquals(r.schema, shared_dim_alias) &&
+            IdentifierEquals(l.name, r.name) &&
+            (ColumnIsPrimaryKey(dim_grel, l.name) ||
+             InspectRuntimeUniqueNonNullColumn(ctx, s0.dim_table, l.name)
+                 .unique_non_null)) {
+          continue;
+        }
+      }
+      final_where.push_back(c);
+    }
+    const Expression rep_fk =
+        ColumnValueExp(ColumnName(site_fk_cols[0].first, site_fk_cols[0].second));
+    for (size_t j = 1; j < site_fk_cols.size(); ++j) {
+      final_where.push_back(BinaryExpressionExp(
+          rep_fk, BinaryOperation::kEquals,
+          ColumnValueExp(
+              ColumnName(site_fk_cols[j].first, site_fk_cols[j].second))));
+    }
+    final_where.push_back(BinaryExpressionExp(
+        rep_fk, BinaryOperation::kEquals,
+        ColumnValueExp(ColumnName(shared_dim_alias, s0.pk_col))));
+
+    new_outer_sources.emplace_back(s0.dim_table, shared_dim_alias, nullptr,
+                                   JoinType::kCross, nullptr);
+    outer->SetSources(std::move(new_outer_sources));
+    outer->SetSelectList(std::move(new_sel));
+    outer->SetWhereClause(CombineConjuncts(final_where));
+    outer->SetGroupBy(std::move(new_group));
+    outer->SetHaving(std::move(new_having));
+    outer->SetQualify(std::move(new_qualify));
+    outer->SetOrderBy(std::move(new_order));
+    return true;
+  }
+  return false;
+}
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (left_join_disjunctive_null_rejecting_semi_filter_sound,
+//    trap_left_join_non_strict_predicate_semi_unsound,
+//    packed_int32_pair_bijection_sound)
+bool PushDisjunctiveNullRejectingLeftJoinSemiFilter(SelectStatement* outer,
+                                                    TransactionContext& ctx) {
+  if (outer == nullptr || outer->WithQueries().empty() ||
+      !outer->UnionAll().empty() || outer->GetSetOperationTree() != nullptr ||
+      outer->ForUpdate() || outer->AsStruct() ||
+      SelectListHasStarOrModifiers(*outer) || TpcdsStmtHasParam(*outer) ||
+      outer->Sources().size() < 2 || !outer->WhereClause()) {
+    return false;
+  }
+  const SelectSource& s0 = outer->Sources()[0];
+  if (s0.table.empty() || s0.query != nullptr || s0.unnest || s0.sample ||
+      s0.is_lateral || outer->IsRecursiveWith(s0.table) ||
+      !outer->WithQueries().contains(s0.table)) {
+    return false;
+  }
+  const std::string s0_alias = s0.alias.empty() ? s0.table : s0.alias;
+  SelectStatement* s0_body = outer->WithQueries().at(s0.table).get();
+  std::unordered_map<std::string, ColumnName> s0_out_to_gk;
+  if (s0_body == nullptr || s0_body->Sources().empty() ||
+      !ValidateGroupedCteTarget(s0_body, &s0_out_to_gk) ||
+      relational_detail::StatementContainsVolatileFunction(*s0_body)) {
+    return false;
+  }
+  for (const SelectSource& bs : s0_body->Sources()) {
+    if (bs.join_type == JoinType::kRight || bs.join_type == JoinType::kFull) {
+      return false;
+    }
+  }
+  const SelectSource& fact_src = s0_body->Sources()[0];
+  if (fact_src.table.empty() || fact_src.query != nullptr || fact_src.unnest ||
+      fact_src.sample || fact_src.is_lateral ||
+      outer->WithQueries().contains(fact_src.table)) {
+    return false;
+  }
+  StatusOr<std::shared_ptr<Table>> fact_tbl_or = ctx.GetTable(fact_src.table);
+  if (!fact_tbl_or.HasValue() || fact_tbl_or.Value() == nullptr) {
+    return false;
+  }
+  const Schema& fact_schema = fact_tbl_or.Value()->GetSchema();
+  const std::string fact_alias =
+      fact_src.alias.empty() ? fact_src.table : fact_src.alias;
+
+  // Ensure none of the other sources in `s0_body` share `fact_schema` column
+  // names ambiguously when resolving unqualified `s0_out_to_gk` columns.
+  std::unordered_set<std::string> other_s0_cols;
+  for (size_t bi = 1; bi < s0_body->Sources().size(); ++bi) {
+    const SelectSource& bs = s0_body->Sources()[bi];
+    if (bs.table.empty() || bs.query != nullptr ||
+        outer->WithQueries().contains(bs.table)) {
+      return false;
+    }
+    StatusOr<std::shared_ptr<Table>> btbl = ctx.GetTable(bs.table);
+    if (!btbl.HasValue() || btbl.Value() == nullptr) {
+      return false;
+    }
+    for (size_t ci = 0; ci < btbl.Value()->GetSchema().ColumnCount(); ++ci) {
+      other_s0_cols.insert(
+          LoweredStarName(btbl.Value()->GetSchema().GetColumn(ci).Name().name));
+    }
+  }
+
+  // Count CTE references across `*outer`; require `s0.table` and all `LEFT JOIN`
+  // CTEs to be single-use before this rewrite.
+  std::unordered_set<std::string> all_cte_names;
+  for (const auto& [nm, body] : outer->WithQueries()) {
+    (void)body;
+    all_cte_names.insert(nm);
+  }
+  std::unordered_map<std::string, size_t> cte_ref_counts;
+  CountCteReferencesInStatement(*outer, all_cte_names, &cte_ref_counts);
+  if (cte_ref_counts[s0.table] != 1) {
+    return false;
+  }
+
+  const std::vector<std::string>& w_order = outer->WithQueryOrder();
+  const auto s0_ord_it = std::ranges::find(w_order, s0.table);
+  if (s0_ord_it == w_order.end()) {
+    return false;
+  }
+  const size_t s0_ord = static_cast<size_t>(s0_ord_it - w_order.begin());
+
+  struct RightLeftJoinCte {
+    size_t src_idx{0};
+    std::string cte_name;
+    std::string alias;
+    SelectStatement* body{nullptr};
+    std::unordered_map<std::string, ValueType> col_types;
+    std::unordered_map<std::string, std::string> out_actual_name;
+    std::unordered_map<std::string, ColumnName> out_to_gk;
+    // `(r_out_low, s0_out_low)` equijoin pairs from `ON`.
+    std::vector<std::pair<std::string, std::string>> eq_pairs;
+  };
+
+  std::unordered_map<std::string, std::string> s0_out_actual;
+  std::unordered_map<std::string, ValueType> s0_col_types;
+  for (size_t i = 0; i < s0_body->SelectList().size(); ++i) {
+    const std::string nm =
+        InferSelectItemOutputName(s0_body->SelectList()[i], i);
+    s0_out_actual.emplace(LoweredStarName(nm), nm);
+  }
+  for (const auto& [out_low, gk] : s0_out_to_gk) {
+    if (gk.schema.empty() || IdentifierEquals(gk.schema, fact_alias)) {
+      const int foff = fact_schema.Offset(ColumnName("", gk.name));
+      if (foff >= 0 && !other_s0_cols.contains(LoweredStarName(gk.name))) {
+        s0_col_types.emplace(
+            out_low, fact_schema.GetColumn(static_cast<size_t>(foff)).Type());
+      }
+    }
+  }
+
+  std::unordered_set<std::string> seen_outer_aliases{LoweredStarName(s0_alias)};
+  std::vector<RightLeftJoinCte> right_ctes;
+  for (size_t si = 1; si < outer->Sources().size(); ++si) {
+    const SelectSource& rs = outer->Sources()[si];
+    if (rs.join_type != JoinType::kLeft || rs.table.empty() ||
+        rs.query != nullptr || rs.unnest || rs.sample || rs.is_lateral ||
+        !rs.using_columns.empty() || rs.from_nested_join ||
+        !rs.join_condition || outer->IsRecursiveWith(rs.table) ||
+        !outer->WithQueries().contains(rs.table)) {
+      return false;
+    }
+    const std::string ralias = rs.alias.empty() ? rs.table : rs.alias;
+    if (!seen_outer_aliases.insert(LoweredStarName(ralias)).second) {
+      return false;
+    }
+    SelectStatement* rbody = outer->WithQueries().at(rs.table).get();
+    if (rbody == nullptr ||
+        relational_detail::StatementContainsVolatileFunction(*rbody)) {
+      return false;
+    }
+    RightLeftJoinCte rinfo;
+    rinfo.src_idx = si;
+    rinfo.cte_name = rs.table;
+    rinfo.alias = ralias;
+    rinfo.body = rbody;
+    (void)ValidateGroupedCteTarget(rbody, &rinfo.out_to_gk);
+    for (size_t i = 0; i < rbody->SelectList().size(); ++i) {
+      const std::string nm =
+          InferSelectItemOutputName(rbody->SelectList()[i], i);
+      rinfo.out_actual_name.emplace(LoweredStarName(nm), nm);
+    }
+    // Parse `rs.join_condition`: require pure conjunction of `r_col = s0_col`.
+    const std::vector<Expression> on_conjs = SplitConjuncts(rs.join_condition);
+    if (on_conjs.empty()) {
+      return false;
+    }
+    bool on_ok = true;
+    for (const Expression& oc : on_conjs) {
+      if (!oc || oc->Type() != TypeTag::kBinaryExp ||
+          oc->AsBinaryExpression().Op() != BinaryOperation::kEquals ||
+          !oc->AsBinaryExpression().Left() ||
+          !oc->AsBinaryExpression().Right() ||
+          oc->AsBinaryExpression().Left()->Type() != TypeTag::kColumnValue ||
+          oc->AsBinaryExpression().Right()->Type() != TypeTag::kColumnValue) {
+        on_ok = false;
+        break;
+      }
+      const ColumnName& lc =
+          oc->AsBinaryExpression().Left()->AsColumnValue().GetColumnName();
+      const ColumnName& rc =
+          oc->AsBinaryExpression().Right()->AsColumnValue().GetColumnName();
+      auto belongs_to_r = [&](const ColumnName& cn) {
+        if (!cn.schema.empty()) {
+          return IdentifierEquals(cn.schema, ralias);
+        }
+        return rinfo.out_actual_name.contains(LoweredStarName(cn.name)) &&
+               !s0_out_actual.contains(LoweredStarName(cn.name));
+      };
+      auto belongs_to_s0 = [&](const ColumnName& cn) {
+        if (!cn.schema.empty()) {
+          return IdentifierEquals(cn.schema, s0_alias);
+        }
+        return s0_out_actual.contains(LoweredStarName(cn.name)) &&
+               !rinfo.out_actual_name.contains(LoweredStarName(cn.name));
+      };
+      if (belongs_to_r(lc) && belongs_to_s0(rc)) {
+        rinfo.eq_pairs.emplace_back(LoweredStarName(lc.name),
+                                    LoweredStarName(rc.name));
+      } else if (belongs_to_r(rc) && belongs_to_s0(lc)) {
+        rinfo.eq_pairs.emplace_back(LoweredStarName(rc.name),
+                                    LoweredStarName(lc.name));
+      } else {
+        on_ok = false;
+        break;
+      }
+    }
+    if (!on_ok || rinfo.eq_pairs.empty()) {
+      return false;
+    }
+    right_ctes.push_back(std::move(rinfo));
+  }
+
+  auto resolve_unique_outer_owner =
+      [&](const ColumnName& cn, int* owner_out, std::string* col_low_out) {
+        *col_low_out = LoweredStarName(cn.name);
+        if (!cn.schema.empty()) {
+          if (IdentifierEquals(cn.schema, s0_alias) &&
+              s0_out_actual.contains(*col_low_out)) {
+            *owner_out = 0;
+            return true;
+          }
+          for (size_t i = 0; i < right_ctes.size(); ++i) {
+            if (IdentifierEquals(cn.schema, right_ctes[i].alias) &&
+                right_ctes[i].out_actual_name.contains(*col_low_out)) {
+              *owner_out = static_cast<int>(i + 1);
+              return true;
+            }
+          }
+          return false;
+        }
+        int hits = 0;
+        int last = -1;
+        if (s0_out_actual.contains(*col_low_out)) {
+          ++hits;
+          last = 0;
+        }
+        for (size_t i = 0; i < right_ctes.size(); ++i) {
+          if (right_ctes[i].out_actual_name.contains(*col_low_out)) {
+            ++hits;
+            last = static_cast<int>(i + 1);
+          }
+        }
+        if (hits != 1) {
+          return false;
+        }
+        *owner_out = last;
+        return true;
+      };
+
+  // Collect `s0.<gk_out> = const_val` equalities from `outer->WhereClause()`.
+  const std::vector<Expression> outer_conjs =
+      SplitConjuncts(outer->WhereClause());
+  std::unordered_map<std::string, Value> pinned_s0_consts;
+  for (const Expression& conj : outer_conjs) {
+    if (!conj || conj->Type() != TypeTag::kBinaryExp ||
+        conj->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+      continue;
+    }
+    const auto& bin = conj->AsBinaryExpression();
+    auto check_const = [&](const Expression& cside, const Expression& vside) {
+      if (!cside || cside->Type() != TypeTag::kColumnValue) {
+        return;
+      }
+      int owner = -1;
+      std::string clow;
+      if (!resolve_unique_outer_owner(cside->AsColumnValue().GetColumnName(),
+                                      &owner, &clow) ||
+          owner != 0 || !s0_out_to_gk.contains(clow)) {
+        return;
+      }
+      std::optional<Value> cv = TpcdsEvalClosedConstant(vside);
+      if (cv.has_value() && IsSafeDisjointTagValue(*cv)) {
+        pinned_s0_consts.emplace(clow, *cv);
+      }
+    };
+    check_const(bin.Left(), bin.Right());
+    check_const(bin.Right(), bin.Left());
+  }
+
+  // Flatten top-level `OR` branches of a candidate disjunctive conjunct.
+  auto split_or = [](auto&& self, const Expression& e,
+                     std::vector<Expression>* out) -> void {
+    if (e && e->Type() == TypeTag::kBinaryExp &&
+        e->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+      self(self, e->AsBinaryExpression().Left(), out);
+      self(self, e->AsBinaryExpression().Right(), out);
+      return;
+    }
+    out->push_back(e);
+  };
+
+  for (const Expression& conj : outer_conjs) {
+    std::vector<Expression> or_branches;
+    split_or(split_or, conj, &or_branches);
+    if (or_branches.size() < 2) {
+      continue;
+    }
+    std::vector<Expression> exists_branches;
+    std::unordered_set<size_t> used_r_indices;
+    bool disj_ok = true;
+
+    for (const Expression& br : or_branches) {
+      // This pushdown adds a correlated probe to the fact scan. Require a
+      // column-to-literal comparison so the EXISTS build can compile its
+      // local filter. A computed operand such as COALESCE(qty, 0) would
+      // otherwise send the whole disjunction through per-row subqueries.
+      if (!br || br->Type() != TypeTag::kBinaryExp) {
+        disj_ok = false;
+        break;
+      }
+      const auto& comparison = br->AsBinaryExpression();
+      const auto column_and_literal = [](const Expression& column,
+                                         const Expression& literal) {
+        return column && column->Type() == TypeTag::kColumnValue && literal &&
+               literal->Type() == TypeTag::kConstantValue;
+      };
+      if (!IsComparison(comparison.Op()) ||
+          (!column_and_literal(comparison.Left(), comparison.Right()) &&
+           !column_and_literal(comparison.Right(), comparison.Left()))) {
+        disj_ok = false;
+        break;
+      }
+      // Every column in `br` must belong to ONE right CTE `r_owner` (`>= 1`).
+      int r_owner = -1;
+      bool cols_ok = true;
+      Expression null_subst = ReplaceSubExpressions(
+          br, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            int owner = -1;
+            std::string clow;
+            if (!resolve_unique_outer_owner(
+                    node->AsColumnValue().GetColumnName(), &owner, &clow) ||
+                owner < 1) {
+              cols_ok = false;
+              return std::nullopt;
+            }
+            if (r_owner < 0) {
+              r_owner = owner;
+            } else if (r_owner != owner) {
+              cols_ok = false;
+              return std::nullopt;
+            }
+            return ConstantValueExp(Value());
+          });
+      if (!cols_ok || r_owner < 1) {
+        disj_ok = false;
+        break;
+      }
+      // Mechanical Theorem 29 check (`evalBool p_i nullRow != some true`):
+      // evaluate `br` on all-NULL right columns via ground-truth AST evaluator!
+      std::optional<Value> on_null = TpcdsEvalClosedConstant(null_subst);
+      if (!on_null.has_value() || on_null->Truthy()) {
+        disj_ok = false;
+        break;
+      }
+
+      const auto ri_idx = static_cast<size_t>(r_owner - 1);
+      const RightLeftJoinCte& rcte = right_ctes[ri_idx];
+      const auto r_ord_it = std::ranges::find(w_order, rcte.cte_name);
+      if (r_ord_it == w_order.end() ||
+          std::cmp_greater_equal(r_ord_it - w_order.begin(), s0_ord) ||
+          cte_ref_counts[rcte.cte_name] != 1) {
+        disj_ok = false;
+        break;
+      }
+      for (const SelectSource& rbs : rcte.body->Sources()) {
+        if (rbs.join_type == JoinType::kRight ||
+            rbs.join_type == JoinType::kFull) {
+          disj_ok = false;
+          break;
+        }
+      }
+      if (!disj_ok) {
+        break;
+      }
+
+      // Build `EXISTS (SELECT 1 FROM <rcte.cte_name> AS __semi_r WHERE ...)`.
+      const std::string semi_alias = "__semi_r";
+      std::vector<Expression> sub_where;
+      size_t correlated_fact_keys = 0;
+      for (const auto& [r_col_low, s0_col_low] : rcte.eq_pairs) {
+        const auto r_act_it = rcte.out_actual_name.find(r_col_low);
+        if (r_act_it == rcte.out_actual_name.end()) {
+          disj_ok = false;
+          break;
+        }
+        const Expression r_col_exp =
+            ColumnValueExp(ColumnName(semi_alias, r_act_it->second));
+        if (const auto pin_it = pinned_s0_consts.find(s0_col_low);
+            pin_it != pinned_s0_consts.end()) {
+          sub_where.push_back(BinaryExpressionExp(
+              r_col_exp, BinaryOperation::kEquals,
+              ConstantValueExp(pin_it->second)));
+          continue;
+        }
+        const auto gk_it = s0_out_to_gk.find(s0_col_low);
+        const auto vt_it = s0_col_types.find(s0_col_low);
+        if (gk_it == s0_out_to_gk.end() || vt_it == s0_col_types.end() ||
+            (vt_it->second != ValueType::kInt64 &&
+             vt_it->second != ValueType::kDate)) {
+          disj_ok = false;
+          break;
+        }
+        const int foff = fact_schema.Offset(ColumnName("", gk_it->second.name));
+        if (foff < 0 ||
+            fact_schema.GetColumn(static_cast<size_t>(foff)).IsUnsigned()) {
+          disj_ok = false;
+          break;
+        }
+        const std::string actual_fact_col =
+            fact_schema.GetColumn(static_cast<size_t>(foff)).Name().name;
+        sub_where.push_back(BinaryExpressionExp(
+            r_col_exp, BinaryOperation::kEquals,
+            ColumnValueExp(ColumnName(fact_alias, actual_fact_col))));
+        ++correlated_fact_keys;
+      }
+      if (!disj_ok || correlated_fact_keys == 0 || correlated_fact_keys > 2) {
+        disj_ok = false;
+        break;
+      }
+
+      Expression qual_br = ReplaceSubExpressions(
+          br, [&](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kColumnValue) {
+              return std::nullopt;
+            }
+            const ColumnName& cn = node->AsColumnValue().GetColumnName();
+            const auto r_act_it =
+                rcte.out_actual_name.find(LoweredStarName(cn.name));
+            if (r_act_it == rcte.out_actual_name.end()) {
+              return std::nullopt;
+            }
+            return ColumnValueExp(ColumnName(semi_alias, r_act_it->second));
+          });
+      sub_where.push_back(std::move(qual_br));
+
+      auto sub_stmt = std::make_shared<SelectStatement>();
+      sub_stmt->SetSources({SelectSource(rcte.cte_name, semi_alias, nullptr,
+                                         JoinType::kCross, nullptr)});
+      sub_stmt->SetSelectList(
+          {NamedExpression("", ConstantValueExp(Value(int64_t{1})))});
+      sub_stmt->SetWhereClause(CombineConjuncts(sub_where));
+      exists_branches.push_back(
+          QueryExpressionExp(std::move(sub_stmt), nullptr, true, false));
+      used_r_indices.insert(ri_idx);
+    }
+
+    if (!disj_ok || exists_branches.size() != or_branches.size()) {
+      continue;
+    }
+
+    // Push `pinned_s0_consts` into `s0_body` and into each single-use right CTE
+    // equated on that key so the materialized CTEs only aggregate the active
+    // year/slice!
+    for (const auto& [s0_col_low, cval] : pinned_s0_consts) {
+      const ColumnName& s0_gk = s0_out_to_gk.at(s0_col_low);
+      Expression s0_eq = BinaryExpressionExp(
+          ColumnValueExp(s0_gk), BinaryOperation::kEquals,
+          ConstantValueExp(cval));
+      s0_body->SetWhereClause(
+          s0_body->WhereClause()
+              ? BinaryExpressionExp(s0_body->WhereClause(),
+                                    BinaryOperation::kAnd, std::move(s0_eq))
+              : std::move(s0_eq));
+      for (RightLeftJoinCte& rcte : right_ctes) {
+        if (cte_ref_counts[rcte.cte_name] != 1) {
+          continue;
+        }
+        bool r_no_right_full = true;
+        for (const SelectSource& rbs : rcte.body->Sources()) {
+          if (rbs.join_type == JoinType::kRight ||
+              rbs.join_type == JoinType::kFull) {
+            r_no_right_full = false;
+            break;
+          }
+        }
+        if (!r_no_right_full) {
+          continue;
+        }
+        for (const auto& [r_col_low, mapped_s0_low] : rcte.eq_pairs) {
+          if (mapped_s0_low == s0_col_low) {
+            if (const auto rgk_it = rcte.out_to_gk.find(r_col_low);
+                rgk_it != rcte.out_to_gk.end()) {
+              Expression req = BinaryExpressionExp(
+                  ColumnValueExp(rgk_it->second), BinaryOperation::kEquals,
+                  ConstantValueExp(cval));
+              rcte.body->SetWhereClause(
+                  rcte.body->WhereClause()
+                      ? BinaryExpressionExp(rcte.body->WhereClause(),
+                                            BinaryOperation::kAnd,
+                                            std::move(req))
+                      : std::move(req));
+            }
+          }
+        }
+      }
+    }
+
+    Expression semi_or = exists_branches[0];
+    for (size_t i = 1; i < exists_branches.size(); ++i) {
+      semi_or = BinaryExpressionExp(std::move(semi_or), BinaryOperation::kOr,
+                                    std::move(exists_branches[i]));
+    }
+
+    // Wrap `s0_body->Sources()[0]` (`fact_src`) as a filtered single-table
+    // derived source so `ScanBaseTable` evaluates `semi_or` directly on
+    // `LSTableStore` via packed `(int32, int32)` `PrebuiltMembershipPredicate`
+    // before `LEFT JOIN` and `GROUP BY`!
+    auto fact_sub = std::make_shared<SelectStatement>();
+    fact_sub->SetSources({SelectSource(fact_src.table, fact_alias, nullptr,
+                                       JoinType::kCross, nullptr)});
+    std::vector<NamedExpression> fact_sel;
+    fact_sel.reserve(fact_schema.ColumnCount());
+    for (size_t ci = 0; ci < fact_schema.ColumnCount(); ++ci) {
+      const std::string& cnm = fact_schema.GetColumn(ci).Name().name;
+      fact_sel.emplace_back(cnm, ColumnValueExp(ColumnName(fact_alias, cnm)));
+    }
+    fact_sub->SetSelectList(std::move(fact_sel));
+    fact_sub->SetWhereClause(std::move(semi_or));
+
+    std::vector<SelectSource> new_s0_sources = s0_body->Sources();
+    new_s0_sources[0] = SelectSource("", fact_alias, std::move(fact_sub),
+                                     JoinType::kCross, nullptr);
+    s0_body->SetSources(std::move(new_s0_sources));
+    return true;
+  }
+  return false;
 }
 
 }  // namespace tinylamb

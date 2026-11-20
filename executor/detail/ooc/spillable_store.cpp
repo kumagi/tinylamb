@@ -110,7 +110,8 @@ Status SpillableStore::TransitionToSpill() {
     c.Reset();
   }
   mem_chunks_.clear();
-  mem_chunks_.shrink_to_fit();
+  // T3462: shrink_to_fit may throw bad_alloc out of this Status path.
+  std::vector<DataChunk>().swap(mem_chunks_);
   mem_bytes_ = 0;
   staging_reserved_bytes_ = 0;
   if (grant_cache_.has_value()) {
@@ -186,7 +187,9 @@ Status SpillableStore::AppendRow(const Row& row, RowPosition pos) {
       if (!staging_chunk_.Empty()) {
         RETURN_IF_FAIL(FlushStagingChunk());
       }
-      if (!spilled_ && !grant_cache_->Reserve(row_bytes)) {
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+      // success
+      if (!spilled_ && !grant_cache_->Reserve(row_bytes)) {  // NOLINT(bugprone-unchecked-optional-access)
         RETURN_IF_FAIL(TransitionToSpill());
       }
     }
@@ -219,7 +222,9 @@ Status SpillableStore::Seal() {
     segment_id_ = id;
     writer_.reset();
     scratch_codec_.clear();
-    scratch_codec_.shrink_to_fit();
+    // T3462: shrink_to_fit can throw bad_alloc across the Status boundary;
+    // swap-with-empty frees the capacity without allocating (T2060 idiom).
+    std::string().swap(scratch_codec_);
   }
   sealed_ = true;
   mem_cursor_idx_ = 0;

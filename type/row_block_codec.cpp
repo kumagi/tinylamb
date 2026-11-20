@@ -13,9 +13,9 @@ namespace {
 
 template <typename T>
 void AppendPod(T val, std::string* dst) {
-  const size_t off = dst->size();
-  dst->resize(off + sizeof(T));
-  std::memcpy(dst->data() + off, &val, sizeof(T));
+  // append() writes the bytes once; resize() would zero-fill then memcpy.
+  const char* bytes = reinterpret_cast<const char*>(&val);
+  dst->append(bytes, sizeof(T));
 }
 
 template <typename T>
@@ -64,7 +64,7 @@ Status EncodeValueImpl(const Value& val, std::string* dst, int depth) {
       const std::string_view sql_type = val.ArrayElementSqlType();
       if (sql_type.size() > std::numeric_limits<uint32_t>::max()) {
         return StatusError(StatusCode::kTooBigData,
-                           "array sql type exceeds 4GiB spill limit");
+                           "array SQL type exceeds 4GiB spill limit");
       }
       const auto type_len = static_cast<uint32_t>(sql_type.size());
       AppendPod(type_len, dst);
@@ -119,9 +119,8 @@ size_t EstimateValueMemoryBytes(const Value& val) noexcept {
     case ValueType::kDouble:
       break;
     case ValueType::kVarChar:
-      // Count payload only if it likely lives on heap (> inline SSO ~15 B),
-      // conservatively include varchar_value.size() so string-heavy skew
-      // never undercounts.
+      // Count the full VARCHAR payload conservatively (including short
+      // strings that may live in SSO) so string-heavy skew never undercounts.
       total += val.value.varchar_value.size();
       break;
     case ValueType::kArray:
@@ -199,7 +198,7 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
                            "truncated varchar in row spill stream");
       }
       Value out;
-      out.SetStringView(src->substr(0, len));
+      out.CopyFromStringView(src->substr(0, len));
       src->remove_prefix(len);
       out.SetCollation(collation);
       return out;
@@ -209,7 +208,7 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
       RETURN_IF_FAIL(ReadPod(src, &type_len));
       if (src->size() < type_len) {
         return StatusError(StatusCode::kCorrupt,
-                           "truncated array sql type in row spill stream");
+                           "truncated array SQL type in row spill stream");
       }
       std::string sql_type(src->substr(0, type_len));
       src->remove_prefix(type_len);
@@ -280,6 +279,8 @@ Status EncodeRowBlock(std::span<const Row> rows, std::string* dst) {
     return StatusError(StatusCode::kTooBigData,
                        "row block count exceeds uint32_t");
   }
+  // [row_count, payload_bytes] only: no magic/version, as with OOC spill
+  // frames (temporary storage, never shared across binary versions).
   const size_t header_off = dst->size();
   AppendPod(static_cast<uint32_t>(rows.size()), dst);
   AppendPod(uint32_t{0}, dst);  // placeholder for payload_bytes

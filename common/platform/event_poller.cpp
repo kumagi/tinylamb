@@ -168,21 +168,26 @@ bool Waker::Open() {
 }
 
 void Waker::Close() {
+  // Publish -1 before the close so a concurrent Wake() either skips or
+  // writes an fd that is still open or just closed (EBADF) — never a torn
+  // fd number. Callers must still ensure every Wake() source is joined
+  // before the Waker dies (the server stops its read workers first).
+  write_fd_.store(-1, std::memory_order_relaxed);
   if (read_fd_ >= 0) {
     ::close(read_fd_);
   }
   read_fd_ = -1;
-  write_fd_ = -1;
 }
 
 void Waker::Wake() const {
-  if (write_fd_ < 0) {
+  const int fd = write_fd_.load(std::memory_order_relaxed);
+  if (fd < 0) {
     return;
   }
   const uint64_t one = 1;
   ssize_t written = 0;
   do {
-    written = ::write(write_fd_, &one, sizeof(one));
+    written = ::write(fd, &one, sizeof(one));
   } while (written < 0 && errno == EINTR);
 }
 
@@ -268,19 +273,29 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
       errno = EBADF;
       return -1;
     }
-    poll_fds.reserve(interest_.size());
-    interests.reserve(interest_.size());
+    std::vector<std::pair<int, uint32_t>> snapshot;
+    snapshot.reserve(interest_.size());
     for (const auto& [fd, interest] : interest_) {
-      SHORT ev = 0;
-      if ((interest & (kPollReadable | kPollPeerClosed)) != 0U) {
-        ev |= POLLRDNORM;
+      snapshot.emplace_back(fd, interest);
+    }
+    if (snapshot != poll_cache_snapshot_) {
+      poll_cache_snapshot_ = std::move(snapshot);
+      poll_cache_fds_.clear();
+      poll_cache_interests_.clear();
+      poll_cache_fds_.reserve(poll_cache_snapshot_.size());
+      poll_cache_interests_.reserve(poll_cache_snapshot_.size());
+      for (const auto& [fd, interest] : poll_cache_snapshot_) {
+        SHORT ev = 0;
+        if ((interest & (kPollReadable | kPollPeerClosed)) != 0U) {
+          ev |= POLLRDNORM;
+        }
+        if ((interest & kPollWritable) != 0U) {
+          ev |= POLLWRNORM;
+        }
+        poll_cache_fds_.push_back(WSAPOLLFD{
+            .fd = static_cast<SOCKET>(fd), .events = ev, .revents = 0});
+        poll_cache_interests_.push_back(interest);
       }
-      if ((interest & kPollWritable) != 0U) {
-        ev |= POLLWRNORM;
-      }
-      poll_fds.push_back(
-          WSAPOLLFD{.fd = static_cast<SOCKET>(fd), .events = ev, .revents = 0});
-      interests.push_back(interest);
     }
   }
   if (timeout_ms >= 0) {
@@ -349,18 +364,21 @@ bool Waker::Open() {
 }
 
 void Waker::Close() {
+  // Exchange first so a concurrent Wake() never reads a torn fd; see the
+  // Linux implementation for the full ordering rationale.
+  const int write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
   if (read_fd_ >= 0) CloseSocket(read_fd_);
-  if (write_fd_ >= 0) CloseSocket(write_fd_);
+  if (write_fd >= 0) CloseSocket(write_fd);
   read_fd_ = -1;
-  write_fd_ = -1;
 }
 
 void Waker::Wake() const {
-  if (write_fd_ < 0) return;
+  const int fd = write_fd_.load(std::memory_order_relaxed);
+  if (fd < 0) return;
   const char one = 1;
   ssize_t written = 0;
   do {
-    written = SendNoSignal(write_fd_, &one, sizeof(one));
+    written = SendNoSignal(fd, &one, sizeof(one));
   } while (written < 0 && errno == EINTR);
 }
 
@@ -520,18 +538,21 @@ bool Waker::Open() {
 }
 
 void Waker::Close() {
+  // Exchange first so a concurrent Wake() never reads a torn fd; see the
+  // Linux implementation for the full ordering rationale.
+  const int write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
   if (read_fd_ >= 0) ::close(read_fd_);
-  if (write_fd_ >= 0) ::close(write_fd_);
+  if (write_fd >= 0) ::close(write_fd);
   read_fd_ = -1;
-  write_fd_ = -1;
 }
 
 void Waker::Wake() const {
-  if (write_fd_ < 0) return;
+  const int fd = write_fd_.load(std::memory_order_relaxed);
+  if (fd < 0) return;
   const char one = 1;
   ssize_t written = 0;
   do {
-    written = ::write(write_fd_, &one, sizeof(one));
+    written = ::write(fd, &one, sizeof(one));
   } while (written < 0 && errno == EINTR);
   // EAGAIN: the pipe is full, so a wake-up is already pending.
 }

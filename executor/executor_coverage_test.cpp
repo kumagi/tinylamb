@@ -58,7 +58,7 @@ std::vector<Value> ReadAll(ExecutorBase* exec) {
 // TopNExecutor
 // ---------------------------------------------------------------------------
 
-TEST(TopNCoverageTest, LimitZeroFastPathReturnsNothing) {
+TEST(ExecutorCoverageTest, LimitZeroFastPathReturnsNothing) {
   const Schema schema("t", {Column("x", ValueType::kInt64)});
   auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
       Row({Value(int64_t{1})}),
@@ -71,7 +71,7 @@ TEST(TopNCoverageTest, LimitZeroFastPathReturnsNothing) {
   EXPECT_TRUE(ReadAll(&topn).empty());
 }
 
-TEST(TopNCoverageTest, BatchedHeapKeepsStableNullOrderPayloadAndPositions) {
+TEST(ExecutorCoverageTest, BatchedHeapKeepsStableNullOrderPayloadAndPositions) {
   class Source final : public ExecutorBase {
    public:
     std::vector<Row> rows;
@@ -126,7 +126,7 @@ TEST(TopNCoverageTest, BatchedHeapKeepsStableNullOrderPayloadAndPositions) {
   EXPECT_EQ(top.GetStatus(), Status::kSuccess);
 }
 
-TEST(TopNCoverageTest, WithTiesExtendsBoundaryTies) {
+TEST(ExecutorCoverageTest, WithTiesExtendsBoundaryTies) {
   const Schema schema("t", {Column("x", ValueType::kInt64)});
   // Boundary at LIMIT 3 is x = 30, which appears three times: all ties must
   // be emitted even though the heap would stop at three rows.
@@ -148,7 +148,7 @@ TEST(TopNCoverageTest, WithTiesExtendsBoundaryTies) {
   EXPECT_EQ(rows[4], Value(int64_t{30}));
 }
 
-TEST(TopNCoverageTest, WithTiesHonorsOffsetAndOverflowCapacity) {
+TEST(ExecutorCoverageTest, WithTiesHonorsOffsetAndOverflowCapacity) {
   const Schema schema("t", {Column("x", ValueType::kInt64)});
   auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
       Row({Value(int64_t{1})}),
@@ -175,7 +175,7 @@ TEST(TopNCoverageTest, WithTiesHonorsOffsetAndOverflowCapacity) {
   EXPECT_TRUE(ReadAll(&saturated).empty());
 }
 
-TEST(TopNCoverageTest, WithTiesNullOrderingBothDirections) {
+TEST(ExecutorCoverageTest, WithTiesNullOrderingBothDirections) {
   const Schema schema("t", {Column("x", ValueType::kInt64)});
   auto make_src = []() {
     return std::make_shared<ValuesExecutor>(std::vector<Row>{
@@ -213,7 +213,7 @@ TEST(TopNCoverageTest, WithTiesNullOrderingBothDirections) {
   EXPECT_EQ(desc[2], Value(int64_t{5}));
 }
 
-TEST(TopNCoverageTest, WithTiesNaNAndDescendingDoubleKeys) {
+TEST(ExecutorCoverageTest, WithTiesNaNAndDescendingDoubleKeys) {
   const Schema schema("t", {Column("x", ValueType::kDouble)});
   const double nan = std::numeric_limits<double>::quiet_NaN();
   auto make_src = [nan]() {
@@ -250,7 +250,7 @@ TEST(TopNCoverageTest, WithTiesNaNAndDescendingDoubleKeys) {
   EXPECT_EQ(desc_rows[1], Value(2.0));
 }
 
-TEST(TopNCoverageTest, KeyEvaluationFailurePropagates) {
+TEST(ExecutorCoverageTest, KeyEvaluationFailurePropagates) {
   const Schema schema("t", {Column("x", ValueType::kInt64)});
   auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
       Row({Value(int64_t{1})}),
@@ -277,7 +277,7 @@ TEST(TopNCoverageTest, KeyEvaluationFailurePropagates) {
   EXPECT_NE(heap.GetStatus(), Status::kSuccess);
 }
 
-TEST(TopNCoverageTest, DumpRendersConfiguration) {
+TEST(ExecutorCoverageTest, DumpRendersConfiguration) {
   const Schema schema("t", {Column("x", ValueType::kInt64)});
   auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
       Row({Value(int64_t{1})}),
@@ -411,7 +411,10 @@ TEST(IncrementalSortCoverageTest, SpilledNullPeerAndExplicitMaterialization) {
   EXPECT_EQ(row, Row({Value(), Value(0)}));
   sort.MaterializePipeline();
   EXPECT_TRUE(sort.IsMaterialized());
-  EXPECT_EQ(sort.MaterializedRowCount(), 2001U);
+  // Next() prefetches one batch (T4494), so up to kDefaultVectorSize rows
+  // are already streamed past the store before the explicit materialization.
+  EXPECT_GE(sort.MaterializedRowCount(), 2001U - 1024U);
+  EXPECT_LE(sort.MaterializedRowCount(), 2001U);
   for (int64_t i = 1; i <= 2000; ++i) {
     ASSERT_TRUE(sort.Next(&row, nullptr));
     EXPECT_EQ(row, Row({Value(), Value(i)}));
@@ -456,7 +459,9 @@ TEST(LimitCoverageTest, BoundedDemandCrossesProjectionAndFilterWithOffset) {
   EXPECT_EQ(row, Row({Value(207)}));
   EXPECT_EQ(position, RowPosition(1, 207));
   DataChunk batch;
-  ASSERT_EQ(limit.NextBatch(&batch, 1), 1U);
+  // Mixing row-at-a-time Next() with batch pulls must go through
+  // NextBatchDraining() so rows buffered by Next() are served first (T4494).
+  ASSERT_EQ(limit.NextBatchDraining(&batch, 1), 1U);
   EXPECT_EQ(batch.RowAt(0), Row({Value(307)}));
   ASSERT_TRUE(limit.Next(&row, &position));
   EXPECT_EQ(row, Row({Value(407)}));

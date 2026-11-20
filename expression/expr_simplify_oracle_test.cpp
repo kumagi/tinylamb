@@ -30,7 +30,7 @@ TEST(ExprSimplifyOracle, SeededIterationsPreserveSemantics) {
     EXPECT_TRUE(generated.sql.empty() == false);
     EXPECT_TRUE(generated.sexpr.empty() == false);
     EXPECT_EQ(CheckSimplifyEquivalence(generated.expr), "")
-        << (seed != 0U) << generated.sql << "\nsexpr: " << generated.sexpr;
+        << "seed=" << seed << " " << generated.sql << "\nsexpr: " << generated.sexpr;
     ++ran;
   }
   EXPECT_EQ(ran, kIterations);
@@ -100,6 +100,10 @@ TEST(ExprSimplifyOracle, SimplifyValuesEqualHandlesEdgeCases) {
                           Value(-std::numeric_limits<double>::infinity())));
   EXPECT_TRUE(SimplifyValuesEqual(Value(int64_t{7}), Value(int64_t{7})));
   EXPECT_FALSE(SimplifyValuesEqual(Value(int64_t{7}), Value(7.0)));
+  // P561: +0.0 vs -0.0 are distinct under the oracle (signbit), even though
+  // SQL `=` calls them equal.
+  EXPECT_FALSE(SimplifyValuesEqual(Value(0.0), Value(-0.0)));
+  EXPECT_TRUE(SimplifyValuesEqual(Value(-0.0), Value(-0.0)));
 }
 
 // Shrinking a consistent tree is a no-op and always terminates.

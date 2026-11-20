@@ -85,7 +85,7 @@ bool RelationRenamePlan::IsOrderedBy(
 void RelationRenamePlan::Dump(std::ostream& o, int indent) const {
   o << "Rename: " << physical_ << " AS " << relation_ << "\n"
     << Indent(static_cast<size_t>(indent) + 2);
-  src_->Dump(o, indent + 2);
+  DumpChild(o, *src_, indent + 2);
 }
 
 std::string RelationRenamePlan::ToString() const {

@@ -26,6 +26,10 @@ def main() -> None:
     print(f"Running: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     stdout, _ = proc.communicate()
+    if proc.returncode != 0:
+        print(f"Error: {binary} exited with {proc.returncode}", file=sys.stderr)
+        print(stdout, file=sys.stderr)
+        sys.exit(1)
 
     passed = []
     failed = []
@@ -64,6 +68,8 @@ def main() -> None:
         print(f"\nFAILED FILES ({len(failed)}):")
         for f in sorted(failed):
             print(f"  [FAIL] {f}")
+            for detail in failures_by_test.get(f, []):
+                print(f"      {detail}")
 
 
 if __name__ == "__main__":

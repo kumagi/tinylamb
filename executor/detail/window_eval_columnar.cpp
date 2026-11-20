@@ -93,6 +93,10 @@ bool CanReadColumnAsFlatNumeric(const ColumnarTable& table, size_t slot,
       return false;
     }
   }
+  // Empty/all-NULL columns have no flat numeric/text representation.
+  if (seen == ValueType::kNull) {
+    return false;
+  }
   *detected_type = seen;
   return true;
 }
@@ -860,11 +864,9 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
           std::vector<std::pair<size_t, size_t>> merges;
           for (size_t w = 0; w + step < sort_workers; w += 2 * step) {
             const size_t lo = n * w / sort_workers;
-            const size_t mid = n * (w + step) / sort_workers;
             const size_t hi =
                 n * std::min(sort_workers, w + (2 * step)) / sort_workers;
             merges.emplace_back(lo, hi);
-            (void)mid;
           }
           RETURN_IF_FAIL(RunParallelTasks(merges.size(), [&](size_t idx) {
             const size_t w = idx * 2 * step;
@@ -893,106 +895,193 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
       }
     }
   } else {
-    constexpr size_t kBuckets = 64;
-    const size_t scatter_workers =
-        n < 8192 ? 1
-                 : std::min<size_t>({8, n / 4096,
-                                     QueryParallelWorkerLimit(
-                                         std::thread::hardware_concurrency())});
-    std::vector<std::array<std::vector<FlatBucketItem>, kBuckets>>
-        worker_buckets(scatter_workers);
-    const size_t approx =
-        std::max<size_t>(4, ((n / scatter_workers) / kBuckets) + 4);
-    for (auto& wb : worker_buckets) {
-      for (auto& vec : wb) {
-        vec.reserve(approx);
+    const bool nonnull_part_and_ord = !part_col.any_null && !check_ord_null;
+    auto item_before_nonnull = [has_order](const FlatBucketItem& a,
+                                           const FlatBucketItem& b) {
+      if (a.part_key != b.part_key) {
+        return a.part_key < b.part_key;
       }
-    }
-    RETURN_IF_FAIL(RunParallelTasks(scatter_workers, [&](size_t worker) {
-      const size_t begin = n * worker / scatter_workers;
-      const size_t end = n * (worker + 1) / scatter_workers;
-      auto& wb = worker_buckets[worker];
-      for (size_t r = begin; r < end; ++r) {
-        FlatBucketItem item;
-        item.row = static_cast<uint32_t>(r);
-        size_t b = 0;
-        if (part_col.IsNull(r)) {
-          item.flags = FlatBucketItem::kPartNull;
-        } else {
-          item.part_key = part_col.vals[r];
-          b = static_cast<size_t>(
-                  SplitMix64Window(static_cast<uint64_t>(item.part_key))) &
-              (kBuckets - 1);
-        }
-        fill_ord(item.row, &item.ord_key, &item.flags);
-        wb[b].push_back(item);
+      if (has_order && a.ord_key != b.ord_key) {
+        return a.ord_key < b.ord_key;
       }
-    }));
-
-    std::atomic<size_t> next_bucket{0};
-    const size_t eval_workers = std::min<size_t>(
-        kBuckets,
-        QueryParallelWorkerLimit(std::thread::hardware_concurrency()));
-    std::vector<std::vector<uint8_t>> worker_null(
-        eval_workers, std::vector<uint8_t>(win_count, 0));
-    RETURN_IF_FAIL(RunParallelTasks(eval_workers, [&](size_t worker) {
-      auto& local_null = worker_null[worker];
-      size_t local_ovf = win_count;
-      std::vector<FlatBucketItem> bucket_items;
-      while (overflow_win.load(std::memory_order_relaxed) == win_count) {
-        const size_t b = next_bucket.fetch_add(1, std::memory_order_relaxed);
-        if (b >= kBuckets) {
-          break;
+      return a.row < b.row;
+    };
+    const auto run_partitioned_buckets = [&]<size_t kBuckets>() -> Status {
+      const size_t scatter_workers =
+          n < 8192 ? 1
+                   : std::min<size_t>(
+                         {8, n / 4096,
+                          QueryParallelWorkerLimit(
+                              std::thread::hardware_concurrency())});
+      std::vector<std::array<std::vector<FlatBucketItem>, kBuckets>>
+          worker_buckets(scatter_workers);
+      const size_t approx =
+          std::max<size_t>(4, ((n / scatter_workers) / kBuckets) + 4);
+      for (auto& wb : worker_buckets) {
+        for (auto& vec : wb) {
+          vec.reserve(approx);
         }
-        size_t b_total = 0;
-        for (size_t w = 0; w < scatter_workers; ++w) {
-          b_total += worker_buckets[w][b].size();
-        }
-        if (b_total == 0) {
-          continue;
-        }
-        bucket_items.clear();
-        bucket_items.reserve(b_total);
-        for (size_t w = 0; w < scatter_workers; ++w) {
-          auto& src = worker_buckets[w][b];
-          bucket_items.insert(bucket_items.end(), src.begin(), src.end());
-          std::vector<FlatBucketItem>().swap(src);
-        }
-        std::sort(bucket_items.begin(), bucket_items.end(), item_before);
-        size_t pos = 0;
-        while (pos < bucket_items.size()) {
-          size_t end = pos + 1;
-          const FlatBucketItem& head = bucket_items[pos];
-          while (end < bucket_items.size() &&
-                 bucket_items[end].PartNull() == head.PartNull() &&
-                 (head.PartNull() ||
-                  bucket_items[end].part_key == head.part_key)) {
-            ++end;
-          }
-          if (!eval_partition(bucket_items.data(), pos, end, local_null,
-                              local_ovf)) {
-            size_t cur = overflow_win.load(std::memory_order_relaxed);
-            while (local_ovf < cur &&
-                   !overflow_win.compare_exchange_weak(
-                       cur, local_ovf, std::memory_order_relaxed)) {
+      }
+      RETURN_IF_FAIL(RunParallelTasks(scatter_workers, [&](size_t worker) {
+        const size_t begin = n * worker / scatter_workers;
+        const size_t end = n * (worker + 1) / scatter_workers;
+        auto& wb = worker_buckets[worker];
+        if (nonnull_part_and_ord) {
+          const int64_t* pvals = part_col.vals;
+          if (!has_order) {
+            for (size_t r = begin; r < end; ++r) {
+              const int64_t pk = pvals[r];
+              const size_t b =
+                  static_cast<size_t>(SplitMix64Window(static_cast<uint64_t>(pk))) &
+                  (kBuckets - 1);
+              wb[b].push_back(FlatBucketItem{
+                  .part_key = pk,
+                  .ord_key = 0,
+                  .row = static_cast<uint32_t>(r),
+                  .flags = 0});
             }
-            return;
+          } else if (ord_vt == ValueType::kDouble) {
+            const double* ovals = ord_dbl_col.vals;
+            for (size_t r = begin; r < end; ++r) {
+              const int64_t pk = pvals[r];
+              const size_t b =
+                  static_cast<size_t>(SplitMix64Window(static_cast<uint64_t>(pk))) &
+                  (kBuckets - 1);
+              wb[b].push_back(FlatBucketItem{
+                  .part_key = pk,
+                  .ord_key = EncodeDoubleOrderKey(ovals[r], ord_asc),
+                  .row = static_cast<uint32_t>(r),
+                  .flags = 0});
+            }
+          } else {
+            const int64_t* ovals = ord_int_col.vals;
+            for (size_t r = begin; r < end; ++r) {
+              const int64_t pk = pvals[r];
+              const size_t b =
+                  static_cast<size_t>(SplitMix64Window(static_cast<uint64_t>(pk))) &
+                  (kBuckets - 1);
+              wb[b].push_back(FlatBucketItem{
+                  .part_key = pk,
+                  .ord_key = EncodeSignedIntOrderKey(ovals[r], ord_asc),
+                  .row = static_cast<uint32_t>(r),
+                  .flags = 0});
+            }
           }
-          pos = end;
+          return;
+        }
+        for (size_t r = begin; r < end; ++r) {
+          FlatBucketItem item;
+          item.row = static_cast<uint32_t>(r);
+          size_t b = 0;
+          if (part_col.IsNull(r)) {
+            item.flags = FlatBucketItem::kPartNull;
+          } else {
+            item.part_key = part_col.vals[r];
+            b = static_cast<size_t>(
+                    SplitMix64Window(static_cast<uint64_t>(item.part_key))) &
+                (kBuckets - 1);
+          }
+          fill_ord(item.row, &item.ord_key, &item.flags);
+          wb[b].push_back(item);
+        }
+      }));
+
+      std::atomic<size_t> next_bucket{0};
+      const size_t eval_workers = std::min<size_t>(
+          kBuckets,
+          QueryParallelWorkerLimit(std::thread::hardware_concurrency()));
+      std::vector<std::vector<uint8_t>> worker_null(
+          eval_workers, std::vector<uint8_t>(win_count, 0));
+      RETURN_IF_FAIL(RunParallelTasks(eval_workers, [&](size_t worker) {
+        auto& slot_null = worker_null[worker];
+        size_t local_ovf = win_count;
+        std::vector<FlatBucketItem> bucket_items;
+        while (overflow_win.load(std::memory_order_relaxed) == win_count) {
+          const size_t b = next_bucket.fetch_add(1, std::memory_order_relaxed);
+          if (b >= kBuckets) {
+            break;
+          }
+          size_t b_total = 0;
+          for (size_t w = 0; w < scatter_workers; ++w) {
+            b_total += worker_buckets[w][b].size();
+          }
+          if (b_total == 0) {
+            continue;
+          }
+          bucket_items.clear();
+          bucket_items.reserve(b_total);
+          for (size_t w = 0; w < scatter_workers; ++w) {
+            auto& src = worker_buckets[w][b];
+            bucket_items.insert(bucket_items.end(), src.begin(), src.end());
+            std::vector<FlatBucketItem>().swap(src);
+          }
+          if (nonnull_part_and_ord) {
+            std::sort(bucket_items.begin(), bucket_items.end(),
+                      item_before_nonnull);
+          } else {
+            std::sort(bucket_items.begin(), bucket_items.end(), item_before);
+          }
+          size_t pos = 0;
+          const size_t bsize = bucket_items.size();
+          const FlatBucketItem* bdata = bucket_items.data();
+          if (nonnull_part_and_ord) {
+            while (pos < bsize) {
+              size_t end = pos + 1;
+              const int64_t pk = bdata[pos].part_key;
+              while (end < bsize && bdata[end].part_key == pk) {
+                ++end;
+              }
+              if (!eval_partition(bdata, pos, end, slot_null, local_ovf)) {
+                size_t cur = overflow_win.load(std::memory_order_relaxed);
+                while (local_ovf < cur &&
+                       !overflow_win.compare_exchange_weak(
+                           cur, local_ovf, std::memory_order_relaxed)) {
+                }
+                return;
+              }
+              pos = end;
+            }
+          } else {
+            while (pos < bsize) {
+              size_t end = pos + 1;
+              const FlatBucketItem& head = bdata[pos];
+              while (end < bsize &&
+                     bdata[end].PartNull() == head.PartNull() &&
+                     (head.PartNull() ||
+                      bdata[end].part_key == head.part_key)) {
+                ++end;
+              }
+              if (!eval_partition(bdata, pos, end, slot_null, local_ovf)) {
+                size_t cur = overflow_win.load(std::memory_order_relaxed);
+                while (local_ovf < cur &&
+                       !overflow_win.compare_exchange_weak(
+                           cur, local_ovf, std::memory_order_relaxed)) {
+                }
+                return;
+              }
+              pos = end;
+            }
+          }
+        }
+      }));
+      const size_t ovf = overflow_win.load(std::memory_order_relaxed);
+      if (ovf < win_count) {
+        return StatusError(StatusCode::kIsInfinity,
+                           "integer overflow in " + specs[ovf].fn_name);
+      }
+      for (size_t worker = 0; worker < eval_workers; ++worker) {
+        for (size_t w = 0; w < win_count; ++w) {
+          if (worker_null[worker][w] != 0) {
+            win_any_null[w] = 1;
+          }
         }
       }
-    }));
-    const size_t ovf = overflow_win.load(std::memory_order_relaxed);
-    if (ovf < win_count) {
-      return StatusError(StatusCode::kIsInfinity,
-                         "integer overflow in " + specs[ovf].fn_name);
-    }
-    for (size_t worker = 0; worker < eval_workers; ++worker) {
-      for (size_t w = 0; w < win_count; ++w) {
-        if (worker_null[worker][w] != 0) {
-          win_any_null[w] = 1;
-        }
-      }
+      return Status::kSuccess;
+    };
+    if (n >= 65536) {
+      RETURN_IF_FAIL(run_partitioned_buckets.template operator()<256>());
+    } else {
+      RETURN_IF_FAIL(run_partitioned_buckets.template operator()<64>());
     }
   }
 
@@ -1273,6 +1362,10 @@ bool ClassifyUniformColumnType(const ColumnarTable& table, size_t slot,
     } else if (seen != c.type) {
       return false;
     }
+  }
+  // Empty/all-NULL columns have no flat numeric/text representation.
+  if (seen == ValueType::kNull) {
+    return false;
   }
   *detected_type = seen;
   return true;

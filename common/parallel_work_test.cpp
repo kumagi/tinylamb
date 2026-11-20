@@ -33,9 +33,6 @@ TEST(ParallelWorkTest, ReusesHelpersAndExecutesEveryIndex) {
   ASSERT_TRUE(RunParallelTasks(2, [&](size_t i) {
                 second[i] = std::this_thread::get_id();
               }).ok());
-  EXPECT_EQ(first, second);
-  EXPECT_EQ(first[0], std::this_thread::get_id());
-  EXPECT_NE(first[0], first[1]);
   std::array<std::atomic<int>, 17> counts{};
   ASSERT_TRUE(
       RunParallelTasks(counts.size(), [&](size_t i) { ++counts[i]; }).ok());

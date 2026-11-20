@@ -104,6 +104,25 @@ TEST(MinMaxIndexExecutorTest, EmptyAndNullPrefixProduceScalarNull) {
   EXPECT_FALSE(empty.Next(&result, nullptr));
 }
 
+TEST(MinMaxIndexExecutorTest,
+     NullPrefixSpanningMultipleBatchesFindsFirstNonNull) {
+  // T3767: the source is pulled in kDefaultVectorSize-sized batches now; a
+  // NULL run crossing a batch boundary must keep the scan going instead of
+  // stopping at the first all-NULL batch.
+  std::vector<Row> rows;
+  for (size_t i = 0; i < 2 * kDefaultVectorSize + 5; ++i) {  // NOLINT(readability-math-missing-parentheses)
+    rows.emplace_back(std::vector<Value>{Value()});  // NOLINT(performance-inefficient-vector-operation)
+  }
+  rows.emplace_back(std::vector<Value>{Value(int64_t{-7})});
+  MinMaxIndexExecutor executor(
+      std::make_shared<ValuesExecutor>(std::move(rows)), 0);
+  Row result;
+  EXPECT_TRUE(executor.Next(&result, nullptr));
+  ASSERT_EQ(result.values_.size(), 1U);
+  EXPECT_EQ(result[0], Value(int64_t{-7}));
+  EXPECT_FALSE(executor.Next(&result, nullptr));
+}
+
 TEST(PercentileContTest, OrderedSetAggregationLinearInterpolation) {
   const Schema schema("scores", {Column("val", ValueType::kDouble)});
   auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
@@ -253,7 +272,7 @@ TEST(BatchNestedLoopJoinTest, RightOuterEmitsUnmatchedRightRows) {
   EXPECT_EQ(null_left, 1);
 }
 
-TEST(ScanFilterTest, UnsignedComparisonsMatchGroundTruth) {
+TEST(ScanFilterExecutorTest, UnsignedComparisonsMatchGroundTruth) {
   // Fixed: the signed int fast path mis-filtered UINT64 boundary values
   // (UINT64_MAX stored as bit pattern -1 matched `id < 0`).
   Column unsigned_col("id", ValueType::kInt64);
@@ -278,7 +297,7 @@ TEST(ScanFilterTest, UnsignedComparisonsMatchGroundTruth) {
   EXPECT_FALSE(relational_detail::MatchSimpleCompare(tagged, pred));
 }
 
-TEST(ScanFilterTest, CompileTimeResolvesDeterministicConstantConjuncts) {
+TEST(ScanFilterExecutorTest, CompileTimeResolvesDeterministicConstantConjuncts) {
   // Constant-residual boundary: a deterministic conjunct with a compile-time
   // value is decided once by CompileScanFilter, not per row.  TRUE
   // discharges the conjunct; FALSE / NULL rejects the whole conjunction
@@ -368,7 +387,7 @@ TEST(ScanFilterTest, CompileTimeResolvesDeterministicConstantConjuncts) {
 // same expression in SELECT-list position.  The full statement semantics
 // are pinned at the SQL level (QueryTest.
 // GroupedHavingErrorAbsorptionStaysPerRow).
-TEST(ScanFilterTest, ConstantResidualBoundaryNeverDecidesColumnConjuncts) {
+TEST(ScanFilterExecutorTest, ConstantResidualBoundaryNeverDecidesColumnConjuncts) {
   const Schema schema("boundary_col", {Column("key", ValueType::kInt64)});
   {
     // ISERROR(key + 1/key) touches the key column: stays per-row.
@@ -584,6 +603,7 @@ std::vector<Row> RunStatAggregation(
                                        schema, aggregates, 2);
   Row parallel_result;
   EXPECT_TRUE(parallel.Next(&parallel_result, nullptr));
+  EXPECT_FALSE(parallel.Next(&parallel_result, nullptr));
   results.push_back(parallel_result);
   return results;
 }

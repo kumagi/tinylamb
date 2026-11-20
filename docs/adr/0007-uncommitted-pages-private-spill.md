@@ -45,7 +45,7 @@ INSERT はメモリ上限を守れない。
 
 ## 影響
 
-- `EvictBatch` の退避条件と、ページの読み戻し経路（`EnsurePageResident`）が変わる。
+- `EvictBatch` の退避条件と、ページの読み戻し経路（`EnsureEvictedPageResident`）が変わる。
 - `recovery_invariants.md` に「未コミットの状態は一時領域にだけ書かれ、再起動で破棄される」を足す。
 - [`docs/lock_order.md`](../lock_order.md) に、オーバーレイ書き出し中に保持してよいラッチを足す。
 - 専用領域のディスク使用量は、スピルのディスク上限に含める。

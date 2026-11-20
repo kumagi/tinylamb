@@ -133,6 +133,14 @@ AggregationExecutor::AggregationExecutor(
       }
     }
     all_typed_ = all_typed_ && input.kind != AggregateInputKind::kGeneric;
+    // T3950: pre-resolve the column slot the generic per-row loop would
+    // otherwise look up by name on every row.
+    if (input.kind == AggregateInputKind::kGeneric && !IsCountStar(agg) &&
+        agg.Child() != nullptr &&
+        agg.Child()->Type() == TypeTag::kColumnValue) {
+      input.generic_column =
+          input_schema_.Offset(agg.Child()->AsColumnValue().GetColumnName());
+    }
     inputs_.push_back(std::move(input));
   }
 }
@@ -166,6 +174,7 @@ bool AggregationExecutor::Execute(Row* dst) {
         return FailWith(ts);
       }
       rows_seen_ += input_batch_.Size();
+      input_rows_ += input_batch_.Size();
       if (!jit_attempted_ && rows_seen_ >= jit_threshold_rows_) {
         jit_attempted_ = true;
         // Prefer the overflow-checked kernel so a single huge batch throws
@@ -458,27 +467,26 @@ StatusOr<bool> AggregationExecutor::TryFoldDistinctColumn(Row* dst) {
   if (offset < 0) {
     return false;
   }
-  const auto type = input_schema_.GetColumn(static_cast<size_t>(offset)).Type();
-  // VARCHAR values may carry case-insensitive or interval collation tags under
-  // which distinct code/byte entries can be collation-equal (e.g. 'A'/'a').
-  // The fold path has no collation awareness, so reject VARCHAR and let the
-  // regular aggregation path handle it (AggregateAccumulator::Add uses
-  // CanonicalDistinctValue for correct collation semantics).
-  if (type != ValueType::kInt64 && type != ValueType::kDate) {
+  const Column& definition = input_schema_.GetColumn(static_cast<size_t>(offset));
+  const ValueType type = definition.Type();
+  // A raw scan column carries the stored schema's semantics. COLLATE is an
+  // expression and is excluded above by the bare-column gate. INTERVAL
+  // columns need semantic comparison of their encodings.
+  if (definition.IsInterval() ||
+      (type != ValueType::kInt64 && type != ValueType::kDate &&
+       type != ValueType::kVarChar)) {
     return false;
   }
   const auto& store = *scan->GetLSTableStore();
   const slot_t column = scan->TableColumnSlot(static_cast<size_t>(offset));
   const auto& dictionary = store.dictionaries[column];
   const size_t domain = type == ValueType::kVarChar
-                            ? dictionary.entries.size()
-                            : dictionary.int_entries.size();
+                            ? dictionary.StringEntryCount()
+                            : dictionary.IntEntryCount();
   const bool coded = dictionary.wide_code_bytes != 0 && domain != 0;
   const bool code_equality =
       coded && (type != ValueType::kVarChar || dictionary.bytewise_equality);
-  if (code_equality &&
-      !input_schema_.GetColumn(static_cast<size_t>(offset)).IsInterval() &&
-      dictionary.code_counts.size() == domain + 1 &&
+  if (code_equality && dictionary.code_counts.size() == domain + 1 &&
       domain <= static_cast<uint64_t>(INT64_MAX)) {
     int64_t distinct = 0;
     ASSIGN_OR_RETURN(bool, summarized,
@@ -534,11 +542,12 @@ StatusOr<bool> AggregationExecutor::TryFoldDistinctColumn(Row* dst) {
             }
           } else {
             const auto mark = [&]<typename Code>() {
-              const auto* codes = dictionary.wide_codes.data();
-              const size_t rows = dictionary.wide_codes.size() / sizeof(Code);
+              const auto codes = dictionary.WideCodes();
+              const size_t rows = codes.size() / sizeof(Code);
               for (size_t row = 0; row < rows; ++row) {
                 Code code = 0;
-                std::memcpy(&code, codes + (row * sizeof(Code)), sizeof(Code));
+                std::memcpy(&code, codes.data() + (row * sizeof(Code)),
+                            sizeof(Code));
                 if (code < domain) {
                   seen_codes[code] = 1;
                 }
@@ -587,7 +596,7 @@ StatusOr<bool> AggregationExecutor::TryFoldDistinctColumn(Row* dst) {
   } else if (type == ValueType::kVarChar) {
     for (size_t code = 0; code < seen_codes.size(); ++code) {
       if (seen_codes[code] != 0) {
-        strings.insert(dictionary.entries[code]);
+        strings.insert(dictionary.StringEntryAt(code));
       }
     }
     std::unordered_set<Value> canonical;
@@ -1566,6 +1575,7 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
         ts != Status::kSuccess) {
       return FailWith(ts);
     }
+    input_rows_ += input_batch_.Size();
     if (AccumulateTypedBatch(&results, &counts, input_batch_)) {
       continue;
     }
@@ -1682,8 +1692,8 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
         if (IsCountStar(agg)) {
           val = Value(1);
         } else if (agg.Child()->Type() == TypeTag::kColumnValue) {
-          const int offset = input_schema_.Offset(
-              agg.Child()->AsColumnValue().GetColumnName());
+          // T3950: precomputed slot instead of a per-row name scan.
+          const int offset = inputs_[i].generic_column;
           if (offset >= 0) {
             val = input_batch_.ColumnAt(static_cast<size_t>(offset))
                       .ValueAt(row_index);
@@ -1910,7 +1920,14 @@ void AggregationExecutor::Dump(std::ostream& o, int indent) const {
       << Indent(static_cast<size_t>(indent) + 2) << agg.name << ": "
       << *agg.expression;
   }
-  o << "\n" << Indent(static_cast<size_t>(indent)) << "}\n";
+  o << "\n" << Indent(static_cast<size_t>(indent)) << "}";
+  // T1793: input_rows_ is a measured counter; rendering it before any drain
+  // (plain EXPLAIN) would print an unexecuted operator as a zero-row
+  // profile.  Only surface it after rows have actually been consumed.
+  if (input_rows_ > 0) {
+    o << " (input_rows=" << input_rows_ << ")";
+  }
+  o << "\n";
   child_->Dump(o, indent + 2);
 }
 

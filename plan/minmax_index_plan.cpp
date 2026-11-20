@@ -46,9 +46,12 @@ MinMaxIndexPlan::MinMaxIndexPlan(Plan child, NamedExpression aggregate,
               default:
                 break;
             }
-          } catch (...) {  // NOLINT(bugprone-empty-catch)
-            // Best-effort schema derivation: if the aggregate's result type
-            // cannot be resolved, keep the default ValueType::kInt64.
+          } catch (const std::exception& e) {
+            LOG(LogLevel::kWarn) << "MinMaxIndexPlan: cannot derive aggregate result "
+                            "type, defaulting to INT64: " << e.what();
+          } catch (...) {
+            LOG(LogLevel::kWarn) << "MinMaxIndexPlan: cannot derive aggregate result "
+                            "type, defaulting to INT64";
           }
         }
         return Schema("", {Column(aggregate_.name, value_type)});
@@ -56,7 +59,7 @@ MinMaxIndexPlan::MinMaxIndexPlan(Plan child, NamedExpression aggregate,
 
 void MinMaxIndexPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << ToString() << "\n";
-  child_->Dump(output, indent + 2);
+  DumpChild(output, *child_, indent + 2);
 }
 
 std::string MinMaxIndexPlan::ToString() const {
@@ -65,9 +68,12 @@ std::string MinMaxIndexPlan::ToString() const {
     return "MinMaxIndexScan invalid aggregate";
   }
   const auto& aggregate = aggregate_.expression->AsAggregateExpression();
-  const bool is_max = aggregate.GetType() == AggregationType::kMax;
+  const auto type = aggregate.GetType();
+  if (type != AggregationType::kMin && type != AggregationType::kMax) {
+    return "MinMaxIndexScan invalid aggregate";
+  }
   std::string result = "MinMaxIndexScan ";
-  result += is_max ? "MAX" : "MIN";
+  result += type == AggregationType::kMax ? "MAX" : "MIN";
   result += " limit=1";
   if (reverse_) {
     result += " reverse";

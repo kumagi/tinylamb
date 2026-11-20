@@ -17,8 +17,8 @@ namespace {
 // GoogleSQL requires. Anything else (a column, a parameter, a nested call) is
 // resolved per row at evaluation time instead, so it contributes no static
 // collation — which is why this is optional and not a plain string_view: an
-// empty *literal* is still a collator (COLLATE(x, '') folds), while no
-// literal at all is not.
+// an empty spec is NOT accepted (CollationOfSpec rejects it); only a
+// non-empty literal such as "und:ci" is a static collation.
 std::optional<std::string_view> LiteralCollationSpec(
     const Expression& collator) {
   if (collator == nullptr || collator->Type() != TypeTag::kConstantValue) {
@@ -49,8 +49,11 @@ Collation CollationOfExpression(const Expression& expression) {
     return Collation::kNone;
   }
   // The same resolution COLLATE() itself applies at evaluation time, so the
-  // static answer and the tag a value carries never disagree.
-  return CollationOfSpec(*spec);
+  // static answer and the tag a value carries never disagree. An unsupported
+  // spec resolves to kNone here (no static collation); the runtime evaluator
+  // still rejects it with an error when COLLATE() is actually invoked.
+  const auto resolved = CollationOfSpec(*spec);
+  return resolved ? *resolved : Collation::kNone;
 }
 
 std::optional<CollatedOrdinal> AsCollatedOrdinal(const Expression& key) {

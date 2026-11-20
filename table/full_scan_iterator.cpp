@@ -394,7 +394,12 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
     // the latch. Re-pinning invalidates this verdict before any newer image
     // is read. A cached false verdict only keeps the ordinary MVCC resolver.
     bool is_stub = (*page_)->body.row_page.IsColumnarStub();
-    if (is_stub && lock_rows_) {
+    // P356/426: a stub carries the current TLCS image with no version
+    // chains, so it may only serve transactions entitled to a physical read
+    // (PhysicalReadEligible below).  Locking (DML) scans hydrate always; a
+    // pinned/read-version scan of a chained or mutating transaction hydrates
+    // too instead of answering with rows that "became newer".
+    if (is_stub && (lock_rows_ || !PhysicalReadEligible(*txn_, **page_))) {
       const page_id_t pid = pos_.page_id;
       page_.reset();
       const Status h = table_->EnsurePageHydratedIfStub(*txn_, pid);
@@ -411,7 +416,7 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
       physical_read_eligible_ = PhysicalReadEligible(*txn_, **page_);
     }
     if (is_stub && stub_decoded_pid_ != pos_.page_id) {
-      std::shared_ptr<const TlcsFile> tlcs = table_->GetBackingTLCSStore();
+      std::shared_ptr<const TlcsFile> tlcs = table_->GetBackingTlcsStore();
       if (tlcs == nullptr) {
         status_ = StatusError(StatusCode::kNotExists,
                               "stub page missing backing tlcs store");
@@ -810,7 +815,9 @@ const RowDecodePlan* FullScanIterator::RowPlan() {
   plan.all_fixed = all_fixed;
   plan.kept_count = kept.size();
   plan.slot_unsigned.resize(kept.size());
+  plan.slot_interval.resize(kept.size());
   bool has_unsigned = false;
+  bool has_interval = false;
   for (size_t k = 0; k < kept.size(); ++k) {
     plan.stored_slot[kept[k]] = k;
     plan.slot_unsigned[k] =
@@ -819,8 +826,13 @@ const RowDecodePlan* FullScanIterator::RowPlan() {
             ? uint8_t{1}
             : uint8_t{0};
     has_unsigned = has_unsigned || plan.slot_unsigned[k] != 0;
+    plan.slot_interval[k] = schema.GetColumn(kept[k]).IsInterval()
+                                ? uint8_t{1}
+                                : uint8_t{0};
+    has_interval = has_interval || plan.slot_interval[k] != 0;
   }
   plan.has_unsigned = has_unsigned;
+  plan.has_interval = has_interval;
   row_plan_.emplace(std::move(plan));
   return &*row_plan_;
 }
@@ -1079,6 +1091,7 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
         if (skip_error != Status::kSuccess) [[unlikely]] {
           status_ = skip_error;
           pos_.page_id = ~0ULL;
+          batch->rows = count;
           return count;
         }
         cursor += skipped;
@@ -1123,6 +1136,7 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
           status_ = StatusError(StatusCode::kCorrupt,
                                 "typed batch decode met an unplanned type");
           pos_.page_id = ~0ULL;
+          batch->rows = count;
           return count;
       }
       ++kept_cursor;
@@ -1307,7 +1321,7 @@ bool FullScanIterator::LSTableRowMatches(const LSTablePageBlock& blk,
         (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
       return false;
     }
-    const int64_t key = col.int_cells[row];
+    const int64_t key = col.IntAt(row);
     const bool rejected = runtime_filter_ != nullptr
                               ? runtime_filter_->Reject(key)
                               : !key_filter_->contains(key);
@@ -1325,7 +1339,7 @@ bool FullScanIterator::LSTableRowMatches(const LSTablePageBlock& blk,
           (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
         return false;
       }
-      if (!MatchIntegerCompare(col.int_cells[row], pred.op, pred.constant)) {
+      if (!MatchIntegerCompare(col.IntAt(row), pred.op, pred.constant)) {
         return false;
       }
     }
@@ -1454,17 +1468,18 @@ void FullScanIterator::EnsureLSTableRowMaterialized() const {
     }
     switch (col.type) {
       case ValueType::kInt64:
-        current_row_.values_[k] = Value(col.int_cells[r]);
+        current_row_.values_[k] = Value(col.IntAt(r));
         if (col.is_unsigned) {
           current_row_.values_[k].SetUnsigned();
         }
         break;
       case ValueType::kDate:
-        current_row_.values_[k] = Value::DateFromDays(col.int_cells[r]);
+        current_row_.values_[k] = Value::DateFromDays(col.IntAt(r));
         break;
       case ValueType::kDouble: {
         double d = 0.0;
-        std::memcpy(&d, &col.int_cells[r], sizeof(d));
+        const int64_t bits = col.IntAt(r);
+        std::memcpy(&d, &bits, sizeof(d));
         current_row_.values_[k] = Value(d);
         break;
       }
@@ -1509,15 +1524,20 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
         const LSTableColumnBlock& col = blk->columns[col_idx];
         const size_t vslot = typed_varchar_slot_[k];
         if (vslot == SIZE_MAX) {
-          const int64_t* __restrict src = col.int_cells.data() + r0;
           if (stride == 1) {
-            std::memcpy(batch->cells.data() + count, src,
-                        take * sizeof(int64_t));
-          } else {
+            col.MaterializeIntSlice(r0, take, batch->cells.data() + count);
+          } else if (col.HasRawIntCells()) {
+            const int64_t* __restrict src = col.int_cells.data() + r0;
             int64_t* __restrict dst =
                 batch->cells.data() + (count * stride) + k;
             for (size_t r = 0; r < take; ++r) {
               dst[r * stride] = src[r];
+            }
+          } else {
+            int64_t* __restrict dst =
+                batch->cells.data() + (count * stride) + k;
+            for (size_t r = 0; r < take; ++r) {
+              dst[r * stride] = col.IntAt(r0 + r);
             }
           }
         } else if (col.all_single_byte_varchar) {
@@ -1525,8 +1545,9 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
           auto& dst_ends = batch->varchar_ends[vslot];
           const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
           const size_t old_ends = dst_ends.size();
-          dst_bytes.insert(dst_bytes.end(), col.varchar_bytes.data() + r0,
-                           col.varchar_bytes.data() + r0 + take);
+          const std::span<const uint8_t> src_bytes = col.VarcharBytes();
+          dst_bytes.insert(dst_bytes.end(), src_bytes.data() + r0,
+                           src_bytes.data() + r0 + take);
           dst_ends.resize(old_ends + take);
           uint32_t* __restrict out_ends = dst_ends.data() + old_ends;
           for (size_t r = 0; r < take; ++r) {
@@ -1544,15 +1565,15 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
         } else {
           auto& dst_bytes = batch->varchar_bytes[vslot];
           auto& dst_ends = batch->varchar_ends[vslot];
-          const uint32_t src_byte_begin =
-              r0 == 0 ? 0U : col.varchar_ends[r0 - 1];
-          const uint32_t src_byte_end = col.varchar_ends[r0 + take - 1];
+          const std::span<const uint8_t> src_bytes = col.VarcharBytes();
+          const std::span<const uint32_t> src_ends_all = col.VarcharEnds();
+          const uint32_t src_byte_begin = r0 == 0 ? 0U : src_ends_all[r0 - 1];
+          const uint32_t src_byte_end = src_ends_all[r0 + take - 1];
           const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
-          dst_bytes.insert(dst_bytes.end(),
-                           col.varchar_bytes.data() + src_byte_begin,
-                           col.varchar_bytes.data() + src_byte_end);
+          dst_bytes.insert(dst_bytes.end(), src_bytes.data() + src_byte_begin,
+                           src_bytes.data() + src_byte_end);
           const uint32_t offset_delta = dst_base - src_byte_begin;
-          const uint32_t* __restrict src_ends = col.varchar_ends.data() + r0;
+          const uint32_t* __restrict src_ends = src_ends_all.data() + r0;
           const size_t old_ends = dst_ends.size();
           dst_ends.resize(old_ends + take);
           uint32_t* __restrict out_ends = dst_ends.data() + old_ends;
@@ -1588,11 +1609,17 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
           const LSTableColumnBlock& col = blk->columns[col_idx];
           const size_t vslot = typed_varchar_slot_[k];
           if (vslot == SIZE_MAX) {
-            const int64_t* __restrict src = col.int_cells.data();
             int64_t* __restrict dst =
                 batch->cells.data() + (count * stride) + k;
-            for (size_t i = 0; i < n_match; ++i) {
-              dst[i * stride] = src[match_rows[i]];
+            if (col.HasRawIntCells()) {
+              const int64_t* __restrict src = col.int_cells.data();
+              for (size_t i = 0; i < n_match; ++i) {
+                dst[i * stride] = src[match_rows[i]];
+              }
+            } else {
+              for (size_t i = 0; i < n_match; ++i) {
+                dst[i * stride] = col.IntAt(match_rows[i]);
+              }
             }
           } else if (col.all_single_byte_varchar) {
             auto& dst_bytes = batch->varchar_bytes[vslot];
@@ -1601,7 +1628,7 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
             const size_t old_ends = dst_ends.size();
             dst_bytes.resize(dst_base + n_match);
             dst_ends.resize(old_ends + n_match);
-            const uint8_t* __restrict src_bytes = col.varchar_bytes.data();
+            const uint8_t* __restrict src_bytes = col.VarcharBytes().data();
             uint8_t* __restrict out_bytes = dst_bytes.data() + dst_base;
             uint32_t* __restrict out_ends = dst_ends.data() + old_ends;
             for (size_t i = 0; i < n_match; ++i) {
@@ -1651,7 +1678,7 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
           continue;
         }
         if (vslot == SIZE_MAX) {
-          batch->cells[base + k] = col.int_cells[r];
+          batch->cells[base + k] = col.IntAt(r);
         } else {
           const std::string_view sv = col.VarcharAt(r);
           auto& dst_bytes = batch->varchar_bytes[vslot];
@@ -1678,7 +1705,7 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
 const std::shared_ptr<const TlcsFile>& FullScanIterator::EnsureBackingTlcs()
     const {
   if (!backing_tlcs_checked_) {
-    backing_tlcs_ = table_->GetBackingTLCSStore();
+    backing_tlcs_ = table_->GetBackingTlcsStore();
     backing_tlcs_checked_ = true;
   }
   return backing_tlcs_;
@@ -1876,6 +1903,11 @@ bool FullScanIterator::EnsureStubBlockColumns(
   stub_cache_->block.row_count = delta.row_count;
   for (size_t i = 0; i < delta.column_ids.size(); ++i) {
     const slot_t cid = delta.column_ids[i];
+    if (stub_cache_->block.columns.size() >= std::numeric_limits<slot_t>::max()) {
+      status_ = StatusError(StatusCode::kCorrupt,
+                            "columnar stub has too many columns");
+      return false;
+    }
     const auto idx = static_cast<slot_t>(stub_cache_->block.columns.size());
     stub_cache_->block.column_ids.push_back(cid);
     stub_cache_->block.columns.push_back(std::move(delta.columns[i]));

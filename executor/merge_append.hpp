@@ -35,11 +35,16 @@ class MergeAppendExecutor final : public ExecutorBase {
     Row row;
     RowPosition position;
     size_t source{0};
+    // Sort keys evaluated once when this head is pulled, not per comparison.
+    std::vector<Value> sort_keys;
   };
 
   bool PullNextFromSource(size_t source, Row* row, RowPosition* position);
+  // T1793: measured output counter, surfaced by Dump only after a drain.
+  size_t emitted_rows_{0};
   [[nodiscard]] StatusOr<Value> KeyValue(const Head& head,
                                          const SortExecutor::Key& key) const;
+  Status RefreshSortKeys(Head* head) const;
   [[nodiscard]] bool Before(const Head& left, const Head& right) const;
   Status Initialize();
 

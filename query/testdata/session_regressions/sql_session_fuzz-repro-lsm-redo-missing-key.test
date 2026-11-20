@@ -1,0 +1,17 @@
+-- tinylamb-session-test v1
+-- seed: 1
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 INT64, c2 INT64);
+-- stmt: INSERT INTO tbl0 VALUES (0, -1, -2);
+-- ddl: CREATE INDEX idx_dual_tbl0 ON tbl0 KEY(1)
+-- begin2
+-- commit
+-- stmt2: INSERT INTO tbl0 VALUES (2, 2, NULL);
+-- stmt: INSERT INTO tbl0 VALUES (3, 2, NULL);
+-- commit
+-- crash
+-- stmt2: INSERT INTO tbl0 VALUES (7, -1, -1);
+-- check2: tbl0
+-- expect: [0, -1, -2]
+-- expect: [3, 2, NULL]
+-- expect: [7, -1, -1]
+-- failure: hand-minimized | crash recovery redo of a committed index put read a missing key as a live empty list (StatusOr<bool> negation), so the loser's uncommitted position survived recovery and a reused slot was returned twice

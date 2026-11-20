@@ -21,9 +21,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <vector>
 #include <system_error>
 
 #include "common/platform/os.hpp"
@@ -191,21 +193,61 @@ int OpenUnlinkedTempFile(const std::filesystem::path& dir) {
   if (tmp_fd >= 0) {
     return tmp_fd;
   }
+  // T2629: keep the true failure reason of the O_TMPFILE path; a fallback
+  // that fails for its own unrelated reason must not mask e.g. fd exhaustion.
+  const int tmpfile_errno = errno;
 #endif
   std::string tmpl = (target_dir / "tinylamb_tmp_XXXXXX").string();
   const int fd = ::mkstemp(tmpl.data());
   if (fd < 0) {
+#if defined(__linux__) && defined(O_TMPFILE)
+    if (tmpfile_errno != EOPNOTSUPP && tmpfile_errno != EISDIR &&
+        tmpfile_errno != ENOTDIR && tmpfile_errno != EINVAL &&
+        tmpfile_errno != ENOSYS) {
+      errno = tmpfile_errno;
+    }
+#endif
     return -1;
   }
-  (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+  // T2623: the header promises a non-inheritable descriptor (the O_TMPFILE
+  // path passes O_CLOEXEC, Windows passes _O_NOINHERIT); a failed
+  // F_SETFD must fail the call, not leak an inheritable temp fd.
+  if (::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+    const int saved = errno;
+    (void)::close(fd);
+    ::remove(tmpl.c_str());  // NOLINT(cert-err33-c)
+    errno = saved;
+    return -1;
+  }
   if (::unlink(tmpl.c_str()) != 0) {
     const int saved = errno;
     (void)::close(fd);
+    // T2620: the contract is "no name survives" -- on unlink failure the
+    // mkstemp file would linger forever (tmpl dies with this frame, so no
+    // one else can remove it). Best-effort remove before reporting.
+    ::remove(tmpl.c_str());  // NOLINT(cert-err33-c)
     errno = saved != 0 ? saved : EIO;
     return -1;
   }
   return fd;
 #endif
+}
+
+std::FILE* FdOpenStream(int fd, const char* mode) {
+  if (fd < 0) {
+    return nullptr;
+  }
+#ifdef TINYLAMB_OS_WINDOWS
+  std::FILE* file = ::_fdopen(fd, mode);
+#else
+  std::FILE* file = ::fdopen(fd, mode);
+#endif
+  if (file == nullptr) {
+    const int saved = errno;
+    (void)CloseFile(fd);
+    errno = saved;
+  }
+  return file;
 }
 
 int Dup2(int oldfd, int newfd) {
@@ -384,7 +426,23 @@ int UnlockFile(int fd) {
 
 int SyncDirectory(const std::filesystem::path& dir) {
 #ifdef TINYLAMB_OS_WINDOWS
-  (void)dir;
+  // Flush the directory entry itself so a rename is durable across a power
+  // loss. FILE_FLAG_BACKUP_SEMANTICS is required to open a directory handle.
+  HANDLE h = ::CreateFileW(dir.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    errno = MapWin32ErrorToErrno(::GetLastError());
+    return -1;
+  }
+  const BOOL ok = ::FlushFileBuffers(h);
+  const DWORD err = ok ? 0 : ::GetLastError();
+  ::CloseHandle(h);
+  if (!ok) {
+    errno = MapWin32ErrorToErrno(err);
+    return -1;
+  }
   return 0;
 #else
   const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
@@ -419,13 +477,34 @@ int DataSync(int fd) {
   if (!::FlushFileBuffers(reinterpret_cast<HANDLE>(raw))) {
     const DWORD err = ::GetLastError();
     if (err == ERROR_ACCESS_DENIED) {
-      // Read-only descriptor (e.g. WriteSegmentMetadata); the preceding
-      // writer handle already flushed its CRT stream.  Windows cannot flush
-      // through a read-only handle, so this reports success WITHOUT a real
-      // durability barrier -- a divergence from the POSIX paths, where
-      // fdatasync on an O_RDONLY fd still flushes the inode.  Callers that
-      // need a guarantee must DataSync a writable handle for the file.
-      return 0;
+      // Windows cannot FlushFileBuffers through a read-only handle. Recover
+      // the file name and flush via a writable handle so callers still get
+      // a real durability barrier (matching POSIX fdatasync on O_RDONLY).
+      alignas(FILE_NAME_INFO) char buf[sizeof(FILE_NAME_INFO) +
+                                       (MAX_PATH + 1) * sizeof(wchar_t)];
+      auto* info = reinterpret_cast<FILE_NAME_INFO*>(buf);
+      if (::GetFileInformationByHandleEx(reinterpret_cast<HANDLE>(raw),
+                                         FileNameInfo, buf, sizeof(buf)) &&
+          info->FileNameLength > 0) {
+        std::wstring path(info->FileName,
+                          info->FileNameLength / sizeof(wchar_t));
+        HANDLE writable = ::CreateFileW(
+            path.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (writable != INVALID_HANDLE_VALUE) {
+          const BOOL flushed = ::FlushFileBuffers(writable);
+          const DWORD flush_err = flushed ? 0 : ::GetLastError();
+          ::CloseHandle(writable);
+          if (flushed) {
+            return 0;
+          }
+          errno = MapWin32ErrorToErrno(flush_err);
+          return -1;
+        }
+      }
+      errno = EACCES;
+      return -1;
     }
     errno = MapWin32ErrorToErrno(err);
     return -1;
@@ -470,8 +549,9 @@ int Preallocate(int fd, int64_t size) {
   do {
     allocated = ::posix_fallocate(fd, 0, static_cast<off_t>(size));
   } while (allocated == EINTR);
-  if (allocated != 0 && allocated != EOPNOTSUPP && allocated != ENOSYS &&
-      allocated != EINVAL) {
+  // Only "filesystem does not support fallocate" is benign. EINVAL means an
+  // invalid size/offset request and must surface as an error.
+  if (allocated != 0 && allocated != EOPNOTSUPP && allocated != ENOSYS) {
     errno = allocated;
     return -1;
   }

@@ -15,6 +15,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "query/googlesql_frontend.hpp"
+#include "query/plan_cache.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
@@ -349,21 +350,44 @@ TEST_F(SqlEngineCoverageTest, ExplainRejectsNonSelectStatements) {
 // ------------------------------------------------------------- plan cache ---
 
 TEST_F(SqlEngineCoverageTest, PlanCacheReusesTemplateAndStaysCorrect) {
+  // T4447: the test name promises reuse, so assert it with the
+  // process-global PlanCacheStats counters (query/AGENTS.md). Row values
+  // alone stay green even if the cache is disabled outright. On the
+  // Execute() route the compiled-plan cache answers the repeat before the
+  // parsed-tree template lookup runs, so the reuse signal here is
+  // `replays` -- the same idiom as sql_engine_extra_test's concurrency
+  // test; `template_fills` proves the fingerprint machinery is engaged.
+  const uint64_t fills_before = PlanCacheStats().template_fills.load();
+  const uint64_t replays_before = PlanCacheStats().replays.load();
   for (const int64_t key : {int64_t{1}, int64_t{2}, int64_t{3}, int64_t{2}}) {
     const auto rows = Rows("SELECT b FROM t WHERE a = " + std::to_string(key));
     ASSERT_EQ(rows.size(), 1U);
     EXPECT_EQ(rows[0][0], Value(std::string(1, static_cast<char>('w' + key))));
   }
+  // Four structural twins over t: the first fills, the rest replay.
+  EXPECT_GT(PlanCacheStats().template_fills.load(), fills_before)
+      << "fingerprint/template machinery never engaged";
+  EXPECT_GT(PlanCacheStats().replays.load(), replays_before)
+      << "every execution re-parsed verbatim; the cache served nothing";
   // Structurally identical statements over another table reuse the same
   // machinery and stay correct after DDL changes the catalog.
   RunSql(engine_.get(), context_.get(),
          "CREATE TABLE t2 (a INT64, b VARCHAR(10));");
   RunSql(engine_.get(), context_.get(),
          "INSERT INTO t2 (a, b) VALUES (1, 'p'), (2, 'r')");
+  const uint64_t replays_before_t2 = PlanCacheStats().replays.load();
+  const uint64_t invalidations_before =
+      PlanCacheStats().epoch_invalidations.load();
   for (const int64_t key : {int64_t{1}, int64_t{2}}) {
     const auto rows = Rows("SELECT b FROM t2 WHERE a = " + std::to_string(key));
     ASSERT_EQ(rows.size(), 1U);
   }
+  // t2's second twin must replay off what the first one filled, and plain
+  // repeated SELECTs must not spuriously invalidate the cache epoch.
+  EXPECT_GT(PlanCacheStats().replays.load(), replays_before_t2)
+      << "cross-statement reuse failed over t2";
+  EXPECT_EQ(PlanCacheStats().epoch_invalidations.load(), invalidations_before)
+      << "repeated identical queries invalidated the cache epoch";
   RunSql(engine_.get(), context_.get(), "DROP TABLE t2");
   EXPECT_THROW(Rows("SELECT b FROM t2 WHERE a = 1"), std::runtime_error);
 }
@@ -453,6 +477,32 @@ TEST_F(SqlEngineCoverageTest, TemplateRebindKeepsAggregateAttributes) {
   EXPECT_EQ(Scalar("SELECT ARRAY_AGG(a WHERE u > 2 ORDER BY u LIMIT 2) FROM ta")
                 .AsString(),
             "ARRAY<INT64>[7]");
+}
+
+TEST_F(SqlEngineCoverageTest, OrderByOrdinalsNeverShareAPlanCacheEntry) {
+  // T3834: "ORDER BY <n>" differs only in a bare integer, so literal-stripped
+  // fingerprints collided and the ordinal resolution of one statement
+  // replayed for the other (wrong sort column, truncated result).  The
+  // ordinal clause now joins the fingerprint.  Repeat each shape first so a
+  // matching replay is proven alive before crossing shapes.
+  const auto run = [&](const char* sql) {
+    return RunSql(engine_.get(), context_.get(), sql);
+  };
+  const std::vector<std::string> by_first = {"1", "2", "3"};
+  const std::vector<std::string> by_second = {"3", "2", "1"};
+  const std::string first = "SELECT a AS p, 4 - a AS q FROM t ORDER BY 1";
+  const std::string second = "SELECT a AS p, 4 - a AS q FROM t ORDER BY 2";
+  for (int round = 0; round < 3; ++round) {
+    for (const auto* sql : {first.c_str(), second.c_str()}) {
+      const auto rows = run(sql);
+      const auto& want = sql == first ? by_first : by_second;
+      ASSERT_EQ(rows.size(), 3U) << sql;
+      for (size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(rows[i][0].AsString(), want[i])
+            << "round " << round << " " << sql;
+      }
+    }
+  }
 }
 
 TEST_F(SqlEngineCoverageTest, NonAnalyticArrayAggIgnoreNulls) {

@@ -24,8 +24,9 @@ struct TableScanOptions {
   // Comparison domain `runtime_filter` was built over. INT64 and DATE share the
   // int64 bit domain but not the comparison domain, so the pre-decode peek
   // refuses to apply the filter when the scanned column's declared type does
-  // not match. kNull means "unknown" and is accepted for any INT64/DATE column,
-  // which is only sound for a group that rejects unconditionally.
+  // not match. kNull means "unknown" and is ACCEPTED ONLY for a group that
+  // rejects unconditionally (it compares no values); on any other group an
+  // unknown build domain must not be applied to an INT64/DATE column.
   ValueType runtime_filter_type = ValueType::kNull;
   // DML source scans set lock_rows: every occupied slot is write-intent
   // locked BEFORE its row is resolved, so the yielded image is the head

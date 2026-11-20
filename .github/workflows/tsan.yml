@@ -1,8 +1,11 @@
 name: tsan
 on: [ push, pull_request ]
+permissions:
+  contents: read
 jobs:
   concurrency:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -10,7 +13,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake clang
-          cmake -S . -B build \
+          CC=clang CXX=clang++ cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Debug \
             -DTINYLAMB_ENABLE_TSAN=ON \
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
@@ -19,7 +22,35 @@ jobs:
           # tests, so the job vacuously passed. Anchored to the suite start:
           # unanchored "Transaction" also pulled in PostgresServerTest
           # TCP-protocol tests, which are not part of the concurrency subset.
+          # Every alternative must name a suite that exists today (the old
+          # LockManager/LockWaitProgress/CacheConcurrent/PagePool/
+          # RowPageConcurrent/BPlusTreeConcurrent suites were deleted, so six
+          # of seven alternatives silently matched nothing). These are the
+          # suites whose tests spawn threads or exercise latch/MVCC/WAL/
+          # budget concurrency.
           ctest --test-dir build \
-            -R '^(LockManager|LockWaitProgress|CacheConcurrent|PagePool|RowPageConcurrent|BPlusTreeConcurrent|Transaction)' \
+            -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|QueueTable|FullScanMvccFastPath|PageManager|ParallelWork|SpillStore|Logger|TableTest|MemoryBudget|QueryGrant|QueryParallelismBudget)' \
             -j"$(nproc)" --output-on-failure
           python3 scripts/clean_root_artifacts.py
+
+  # Lock-order (ABBA) detection needs TSan's deadlock detector, which the job
+  # above disables.  Advisory until the baseline reports are triaged.
+  lock-order:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and test with detect_deadlocks=1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTINYLAMB_ENABLE_TSAN=ON \
+            -DTINYLAMB_TSAN_DETECT_DEADLOCKS=ON \
+            -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+          cmake --build build -j"$(nproc)"
+          ctest --test-dir build \
+            -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|PageManager|ParallelWork|SpillStore|Logger|TableTest)' \
+            -j"$(nproc)" --output-on-failure

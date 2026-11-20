@@ -133,7 +133,10 @@ class ScopedQueryMemory {
 // RAII for the semi-reduction domain cap.
 class ScopedDomainCap {
  public:
-  explicit ScopedDomainCap(size_t keys) { Set(keys); }
+  explicit ScopedDomainCap(size_t keys)
+      : restore_(HashJoin::SemiReductionMaxDomainKeysForTest()) {
+    Set(keys);
+  }
   explicit ScopedDomainCap(size_t keys, size_t restore_to)
       : restore_(restore_to) {
     Set(keys);
@@ -667,7 +670,7 @@ TEST_F(HashSemiReductionExecutorTest, EveryJoinKindProducesTheSameRows) {
           std::vector<slot_t>{0},
           std::make_shared<ConstantExecutor>(BuildRows()),
           std::vector<slot_t>{0}, HashJoinMode::kInMemory, kind,
-          /*right_width=*/1, /*left_width=*/2);
+          /*worker_count=*/1, /*right_width=*/1, /*left_width=*/2);
       if (enable) {
         join->EnableSemiReduction();
       }
@@ -988,9 +991,9 @@ TEST_F(HashSemiReductionExecutorTest, SpilledProbeSideAgreesWithThePlainPath) {
   for (int64_t key = 0; key < 50; ++key) {
     build.push_back(Row({Value(key)}));
   }
-  // 8 KiB (soft limit 6.5 KiB) against a ~24 KiB probe side pushes every probe
-  // row into the spill files, so `s.left.rows` is empty and the domain can only
-  // be built by reading the partitions back.
+  // 8 KiB (about 6.5 KiB of soft budget) against a ~24 KiB probe side forces
+  // the probe to spill; the final 200-row match below proves the domain was
+  // rebuilt from every partition rather than from a partial in-memory prefix.
   const auto run = [&](bool enable) {
     ScopedQueryMemory budget(static_cast<size_t>(8) * 1024);
     auto join = std::make_shared<HashJoin>(

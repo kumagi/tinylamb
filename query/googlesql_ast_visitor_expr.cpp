@@ -106,9 +106,9 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
   if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
       tz_str.starts_with("GMT+") || tz_str.starts_with("GMT-") ||
       tz_str[0] == '+' || tz_str[0] == '-') {
-    auto parsed = TryTimeZoneOffsetAtLocalTime(tz_str, Y < 1970 ? 1970 : Y,
-                                               static_cast<unsigned>(M),
-                                               static_cast<unsigned>(D), h, m, s);
+    auto parsed = TryTimeZoneOffsetAtLocalTime(
+        tz_str, Y < 1970 ? 1970 : Y, static_cast<unsigned>(M),
+        static_cast<unsigned>(D), h, m, s);
     return parsed.HasValue() ? parsed.Value() : default_offset;
   }
   std::string zone_name(tz_str);
@@ -135,7 +135,7 @@ StatusOr<std::string> InferAggregateArrayElementType(
 // usable depth is only ~140 on an 8 MiB stack, so the cap must stay far
 // below that to keep Debug/ASan runs from overflowing before the guard
 // fires.
-constexpr size_t kMaxExpressionDepth = 96;
+constexpr size_t kMaxExpressionDepth = 64;  // ~46% of the ~140 ASan limit
 
 size_t& ExpressionDepthCounter() {
   static thread_local size_t depth = 0;
@@ -172,8 +172,8 @@ class ExpressionDepthGuard {
 };
 
 }  // namespace
-// Dump-produced literals must be digits-only and in range: std::stoll would
-// accept signs and std::stoull would wrap "-1" into a huge positive value.
+// Dump-produced literals must be digits-only and in range; std::from_chars
+// below enforces that without accepting signs or wrapping "-1".
 // Hex literals (0x / 0X) are accepted up to 16 digits; values above INT64_MAX
 // are GoogleSQL UINT64 literals kept as their two's-complement bit pattern.
 StatusOr<int64_t> ParseIntLiteral(const GoogleSqlAstNode& node) {
@@ -715,8 +715,7 @@ bool IsBooleanAstNode(const GoogleSqlAstNode& node) {
         node.detail == "<" || node.detail == "<=" || node.detail == ">" ||
         node.detail == ">=" || node.detail == "LIKE" ||
         node.detail == "NOT LIKE" || node.detail == "IS" ||
-        node.detail == "IS NOT" ||
-        node.detail == "IS DISTINCT FROM" ||
+        node.detail == "IS NOT" || node.detail == "IS DISTINCT FROM" ||
         node.detail == "IS NOT DISTINCT FROM") {
       return true;
     }
@@ -855,8 +854,8 @@ bool IsValidUtf8Text(std::string_view text) {
   }
   return true;
 }
-// it for literal struct sources. Anything not statically checkable is left
-// to the existing runtime behavior untouched.
+// Validate cast coercibility for literal struct sources. Anything not
+// statically checkable is left to the existing runtime behavior untouched.
 Status ValidateStructCastCoercibility(const GoogleSqlAstNode& node, bool safe) {
   (void)safe;
   if (node.children.size() < 2 || node.children[1]->kind != "StructType") {
@@ -975,6 +974,15 @@ bool IsBytesAstNode(const GoogleSqlAstNode& node) {
       }
       const std::string fn = Lower(hv53862_0.MoveValue());
       if (fn == "byte_substr" || fn == "b") {
+        return true;
+      }
+      // Functions whose GoogleSQL result type is always BYTES. Their digests
+      // are arbitrary bytes, so LENGTH(MD5(x)) must count bytes (16), not
+      // UTF-8 lead bytes.
+      static constexpr std::array<std::string_view, 7> kBytesResult = {
+          "md5",    "sha1",        "sha256",     "sha512",
+          "from_base64", "from_base32", "from_hex"};
+      if (std::ranges::find(kBytesResult, fn) != kBytesResult.end()) {
         return true;
       }
     }
@@ -1347,6 +1355,115 @@ StatusOr<Expression> VisitFunction(
       }
     }
   }
+  // T2233: GoogleSQL named arguments (name => value) reach the visitor as
+  // NamedArgument nodes; the generic argument loop below visits children as
+  // plain expressions, where a NamedArgument falls out of the visitor as
+  // "unsupported expression".  The TVF route has its own handler in the
+  // table-source layer; for scalar calls, support is per-function because
+  // the engine has no general parameter-name table.  MAKE_INTERVAL is the
+  // GoogleSQL-defined named-argument function: `year/month/day/hour/
+  // minute/second => value`, each desugared to the engine's
+  // make_interval(value, 'unit') plus interval addition (verified
+  // supported: make_interval(1,'day') + make_interval(2,'hour') folds to a
+  // compound interval).  Positional spellings keep flowing to the generic
+  // loop untouched, so the engine's own make_interval(x, 'unit') surface
+  // is unaffected.
+  if (name == "make_interval") {
+    bool has_named = false;
+    for (size_t i = 1; i < node.children.size(); ++i) {
+      if (node.children[i]->kind == "NamedArgument") {
+        has_named = true;
+        break;
+      }
+    }
+    if (has_named) {
+      static constexpr std::array<std::string_view, 6> kIntervalSlots = {
+          "year", "month", "day", "hour", "minute", "second"};
+      std::array<Expression, 6> slots;
+      size_t next_positional = 0;
+      bool seen_named = false;
+      for (size_t i = 1; i < node.children.size(); ++i) {
+        const GoogleSqlAstNode& child = *node.children[i];
+        if (child.kind == "Location") {
+          continue;
+        }
+        Expression value;
+        std::string_view unit;
+        if (child.kind == "NamedArgument") {
+          seen_named = true;
+          const GoogleSqlAstNode* name_node = child.Child("Identifier");
+          if (name_node == nullptr) {
+            return AstError<Expression>(
+                "GoogleSQL AST: MAKE_INTERVAL named argument without a name");
+          }
+          ASSIGN_OR_RETURN(std::string, arg_name, (Identifier(*name_node)));
+          unit = std::string_view(arg_name);
+          const auto slot =  // NOLINT(readability-qualified-auto)
+              std::find(kIntervalSlots.begin(), kIntervalSlots.end(), unit);
+          if (slot == kIntervalSlots.end()) {
+            return AstError<Expression>(
+                "GoogleSQL AST: MAKE_INTERVAL unknown argument name " +
+                arg_name);
+          }
+          const size_t index =  // NOLINT(modernize-use-auto)
+              static_cast<size_t>(slot - kIntervalSlots.begin());
+          if (slots[index]) {
+            return AstError<Expression>(
+                "GoogleSQL AST: MAKE_INTERVAL argument " + arg_name +
+                " given twice");
+          }
+          const GoogleSqlAstNode* value_node = nullptr;
+          for (const auto& grandchild : child.children) {
+            if (grandchild->kind == "Location" ||
+                grandchild->kind == "Identifier") {
+              continue;
+            }
+            value_node = grandchild.get();
+            break;
+          }
+          if (value_node == nullptr) {
+            return AstError<Expression>(
+                "GoogleSQL AST: MAKE_INTERVAL argument " + arg_name +
+                " has no value");
+          }
+          ASSIGN_OR_RETURN(Expression, hv_named,
+                           (VisitExpression(*value_node)));
+          slots[index] = std::move(hv_named);
+          continue;
+        }
+        if (seen_named) {
+          return AstError<Expression>(
+              "GoogleSQL AST: MAKE_INTERVAL positional argument after a "
+              "named argument");
+        }
+        if (next_positional >= kIntervalSlots.size()) {
+          return AstError<Expression>(
+              "GoogleSQL AST: MAKE_INTERVAL takes at most 6 positional "
+              "arguments");
+        }
+        ASSIGN_OR_RETURN(Expression, hv_pos, (VisitExpression(child)));
+        slots[next_positional++] = std::move(hv_pos);
+      }
+      Expression combined;
+      for (size_t index = 0; index < kIntervalSlots.size(); ++index) {
+        if (!slots[index]) {
+          continue;
+        }
+        Expression part = FunctionCallExp(
+            "make_interval",
+            {std::move(slots[index]),
+             ConstantValueExp(Value(std::string(kIntervalSlots[index])))});
+        combined = combined ? BinaryExpressionExp(std::move(combined),
+                                                  BinaryOperation::kAdd,
+                                                  std::move(part))
+                            : std::move(part);
+      }
+      if (!combined) {
+        return IntervalExpressionExp(0, "second");
+      }
+      return combined;
+    }
+  }
   std::vector<Expression> arguments;
   AggregateHavingModifier having = AggregateHavingModifier::kNone;
   Expression having_condition;
@@ -1410,13 +1527,34 @@ StatusOr<Expression> VisitFunction(
         if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
           ASSIGN_OR_RETURN(uint64_t, hv65738_0, (ParseUnsignedLiteral(*value)));
           inner_limit = static_cast<size_t>(hv65738_0);
+        } else {
+          // A non-literal LIMIT (e.g. `1+1`, `CAST(2 AS INT64)`) must not be
+          // silently dropped: that would return the whole array instead of
+          // the requested prefix. Try a constant fold; otherwise reject.
+          ASSIGN_OR_RETURN(Expression, limit_expr,
+                           (VisitExpression(*limit_node)));
+          if (limit_expr && limit_expr->Type() == TypeTag::kConstantValue) {
+            const Value& cv = limit_expr->AsConstantValue().GetValue();
+            if (cv.type == ValueType::kInt64 && !cv.IsNull() &&
+                cv.value.int_value >= 0) {
+              inner_limit = static_cast<size_t>(
+                  cv.IsUnsigned() ? static_cast<uint64_t>(cv.value.int_value)
+                                  : cv.value.int_value);
+            } else {
+              return AstError<Expression>(
+                  "aggregate LIMIT must be a non-negative integer constant");
+            }
+          } else {
+            return AstError<Expression>(
+                "aggregate LIMIT must be a constant integer");
+          }
         }
       }
       continue;
     }
     ASSIGN_OR_RETURN(Expression, hv65853_0, (VisitExpression(child)));
     Expression arg = std::move(hv65853_0);
-    if (name == "concat") {
+    if (name == "concat" || name == "safe.concat") {
       arg = WrapIfBoolean(std::move(arg), child);
     }
     arguments.push_back(std::move(arg));
@@ -1426,6 +1564,18 @@ StatusOr<Expression> VisitFunction(
   }
 
   auto finish_aggregate = [&](AggregationType type) -> StatusOr<Expression> {
+    // GoogleSQL only orders/limits the aggregates whose result keeps input
+    // order (ARRAY_AGG, STRING_AGG, ARRAY_CONCAT_AGG).  COUNT(DISTINCT v
+    // ORDER BY u LIMIT 1) and friends are rejected rather than silently
+    // ignoring (or half-applying) the modifier.
+    if ((!inner_order_by.empty() || inner_limit.has_value()) &&
+        type != AggregationType::kArrayAgg &&
+        type != AggregationType::kStringAgg &&
+        type != AggregationType::kArrayConcatAgg) {
+      return AstError<Expression>(
+          "GoogleSQL AST: ORDER BY / LIMIT inside an aggregate function is "
+          "only supported for ARRAY_AGG, STRING_AGG and ARRAY_CONCAT_AGG");
+    }
     auto aggregate = std::make_shared<AggregateExpression>(
         type, arguments.empty() ? nullptr : arguments[0],
         node.detail.find("distinct=true") != std::string::npos);
@@ -1668,6 +1818,11 @@ StatusOr<Expression> VisitFunction(
     } else if (name == "percentile_cont") {
       extended = AggregationType::kPercentileCont;
       min_arity = max_arity = 2;
+    } else if (name == "percentile_disc") {
+      // T2243: PERCENTILE_DISC is an aggregate AND an analytic function; the
+      // window route already existed, the aggregate alias did not.
+      extended = AggregationType::kPercentileDisc;
+      min_arity = max_arity = 2;
     } else if (name == "approx_count_distinct") {
       extended = AggregationType::kApproxCountDistinct;
       min_arity = max_arity = 1;
@@ -1692,6 +1847,22 @@ StatusOr<Expression> VisitFunction(
     } else {
       return expanded.MoveValue();
     }
+  }
+  // T2232: SAFE.<fn>(...) is GoogleSQL's blanket error-suppression prefix.
+  // NULLIFERROR(expr) already carries exactly that contract (any error from
+  // the operand evaluates to NULL, lazily, in both evaluators), so desugar
+  // SAFE.FOO(a, b) into NULLIFERROR(FOO(a, b)) at the single call-building
+  // exit. SAFE.CAST/EXTRACT/IF are operator syntax in GoogleSQL (safe_cast
+  // is handled with the CAST node) and never reach this generic path with a
+  // usable shape.
+  if (name.starts_with("safe.") && name.size() > 5) {
+    const std::string base = name.substr(5);
+    if (base == "cast" || base == "extract" || base == "if") {
+      return AstError<Expression>(
+          "GoogleSQL AST: SAFE. prefix does not apply to " + name);
+    }
+    return FunctionCallExp("nulliferror",
+                           {FunctionCallExp(base, std::move(arguments))});
   }
   return FunctionCallExp(name, std::move(arguments));
 }
@@ -1822,7 +1993,8 @@ StatusOr<std::string> SqlTypeFromAst(
         }
         std::string params;
         for (const auto& param : child->children) {
-          if (param->kind == "IntLiteral" || param->kind == "Identifier") {
+          if (param->kind == "IntLiteral" || param->kind == "Identifier" ||
+              param->kind == "StringLiteral") {
             if (!params.empty()) {
               params += ", ";
             }
@@ -2372,9 +2544,13 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
     parts.order_by = std::move(h_tmp_2553);
   }
   if (const GoogleSqlAstNode* frame = spec.Child("WindowFrame")) {
-    parts.frame_unit = UpperCopy(frame->detail) == "RANGE"
-                           ? WindowFrameUnit::kRange
-                           : WindowFrameUnit::kRows;
+    // T3697: GoogleSQL has three frame units; the old binary test turned
+    // `GROUPS BETWEEN ...` into ROWS, evaluating peer-group frames as plain
+    // row offsets (window_eval's kGroups arm was unreachable from SQL).
+    const std::string frame_unit_text = UpperCopy(frame->detail);
+    parts.frame_unit = frame_unit_text == "RANGE"    ? WindowFrameUnit::kRange
+                       : frame_unit_text == "GROUPS" ? WindowFrameUnit::kGroups
+                                                     : WindowFrameUnit::kRows;
     const auto bounds = frame->Children("WindowFrameExpr");
     // Single-bound frames (`ROWS UNBOUNDED PRECEDING`, `ROWS 3 PRECEDING`,
     // `ROWS CURRENT ROW`) mean BETWEEN <bound> AND CURRENT ROW; a FOLLOWING
@@ -2451,11 +2627,13 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
     }
     if (child.kind == "WhereClause") {
       // AGG(x WHERE cond) OVER (...): row-level pre-filter.
-      if (!child.children.empty()) {
-        ASSIGN_OR_RETURN(Expression, hv94301_0,
-                         (VisitExpression(*child.children[0])));
-        window->where_filter = std::move(hv94301_0);
+      if (child.children.empty()) {
+        return AstError<Expression>(
+            "GoogleSQL AST: empty WhereClause in aggregate call");
       }
+      ASSIGN_OR_RETURN(Expression, hv94301_0,
+                       (VisitExpression(*child.children[0])));
+      window->where_filter = std::move(hv94301_0);
       continue;
     }
     if (child.kind == "OrderBy") {
@@ -2471,6 +2649,24 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
         if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
           ASSIGN_OR_RETURN(uint64_t, hv94767_0, (ParseUnsignedLiteral(*value)));
           window->inner_limit = static_cast<size_t>(hv94767_0);
+        } else {
+          ASSIGN_OR_RETURN(Expression, limit_expr,
+                           (VisitExpression(*limit_node)));
+          if (limit_expr && limit_expr->Type() == TypeTag::kConstantValue) {
+            const Value& cv = limit_expr->AsConstantValue().GetValue();
+            if (cv.type == ValueType::kInt64 && !cv.IsNull() &&
+                cv.value.int_value >= 0) {
+              window->inner_limit = static_cast<size_t>(
+                  cv.IsUnsigned() ? static_cast<uint64_t>(cv.value.int_value)
+                                  : cv.value.int_value);
+            } else {
+              return AstError<Expression>(
+                  "aggregate LIMIT must be a non-negative integer constant");
+            }
+          } else {
+            return AstError<Expression>(
+                "aggregate LIMIT must be a constant integer");
+          }
         }
       }
       continue;
@@ -2534,7 +2730,7 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
 std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
   std::string norm_ts = text;
   if (text.size() < 10) {
-    return norm_ts;
+    return std::nullopt;  // too short for YYYY-MM-DD
   }
   size_t tz_pos = std::string::npos;
   for (size_t i = 10; i < text.size(); ++i) {
@@ -2543,49 +2739,67 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
       break;
     }
   }
-  int total_offset_mins = 0;
+  // Keep the offset in seconds: named/default zones (and tzdata LMT periods)
+  // frequently carry a sub-minute offset, and truncating to minutes shifts
+  // such timestamps by up to 59 seconds.
+  int total_offset_secs = 0;
   bool has_explicit_tz = false;
   if (text.find("UTC") != std::string::npos ||
       text.find("utc") != std::string::npos ||
       text.find('Z') != std::string::npos ||
       text.find('z') != std::string::npos) {
-    total_offset_mins = 0;
+    total_offset_secs = 0;
     has_explicit_tz = true;
   }
   std::string base_time = text;
   if (tz_pos != std::string::npos) {
-    has_explicit_tz = true;
     base_time = text.substr(0, tz_pos);
-    char sign = text[tz_pos];
-    std::string tz_part = text.substr(tz_pos + 1);
-    int tz_hours = 0, tz_mins = 0;
-    size_t colon = tz_part.find(':');
-    if (colon != std::string::npos) {
-      try {
-        tz_hours = std::stoi(tz_part.substr(0, colon));
-        tz_mins = std::stoi(tz_part.substr(colon + 1));
-      } catch (...) {
-        tz_hours = 0;
-        tz_mins = 0;
+    const char sign = text[tz_pos];
+    const std::string tz_part = text.substr(tz_pos + 1);
+    // GoogleSQL requires [+-]HH[:MM] or [+-]HHMM with bounded fields. The old
+    // parser treated anything not four digits as a bare hour ("+530" became
+    // +530 hours) and swallowed parse errors as UTC, so a malformed literal
+    // silently produced a wildly wrong instant. Reject it instead.
+    const auto all_digits = [](std::string_view s) {
+      if (s.empty()) {
+        return false;
       }
-    } else {
-      try {
-        if (tz_part.size() >= 4 &&
-            std::isdigit(static_cast<unsigned char>(tz_part[0])) != 0 &&
-            std::isdigit(static_cast<unsigned char>(tz_part[1])) != 0 &&
-            std::isdigit(static_cast<unsigned char>(tz_part[2])) != 0 &&
-            std::isdigit(static_cast<unsigned char>(tz_part[3])) != 0) {
-          tz_hours = std::stoi(tz_part.substr(0, 2));
-          tz_mins = std::stoi(tz_part.substr(2, 2));
-        } else {
-          tz_hours = std::stoi(tz_part);
+      for (char c : s) {  // NOLINT(readability-use-anyofallof)
+        if (std::isdigit(static_cast<unsigned char>(c)) == 0) {
+          return false;
         }
-      } catch (...) {
-        tz_hours = 0;
-        tz_mins = 0;
+      }
+      return true;
+    };
+    int tz_hours = 0;
+    int tz_mins = 0;
+    bool valid_offset = false;
+    const size_t colon = tz_part.find(':');
+    if (colon != std::string::npos) {
+      const std::string hours = tz_part.substr(0, colon);
+      const std::string mins = tz_part.substr(colon + 1);
+      if (hours.size() <= 2 && mins.size() == 2 && all_digits(hours) &&
+          all_digits(mins)) {
+        tz_hours = std::stoi(hours);
+        tz_mins = std::stoi(mins);
+        valid_offset = tz_hours <= 14 && tz_mins <= 59;
+      }
+    } else if (all_digits(tz_part)) {
+      if (tz_part.size() == 4) {
+        tz_hours = std::stoi(tz_part.substr(0, 2));
+        tz_mins = std::stoi(tz_part.substr(2, 2));
+        valid_offset = tz_hours <= 14 && tz_mins <= 59;
+      } else if (tz_part.size() <= 2) {
+        tz_hours = std::stoi(tz_part);
+        valid_offset = tz_hours <= 14;
       }
     }
-    total_offset_mins = (tz_hours * 60 + tz_mins) * (sign == '-' ? -1 : 1);
+    if (!valid_offset) {
+      return std::nullopt;
+    }
+    total_offset_secs =
+        (tz_hours * 3600 + tz_mins * 60) * (sign == '-' ? -1 : 1);
+    has_explicit_tz = true;
   }
   if (base_time.size() > 10 && (base_time[10] == 'T' || base_time[10] == 't')) {
     base_time[10] = ' ';
@@ -2664,21 +2878,21 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
     }
   }
   if (!has_explicit_tz) {
-    total_offset_mins = ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
-                                            static_cast<int>(s_val)) /
-                        60;
+    total_offset_secs = ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
+                                            static_cast<int>(s_val));
   } else if (!named_zone.empty()) {
-    total_offset_mins = ParseTimeZoneOffset(named_zone, Y, M, D, h, m,
-                                            static_cast<int>(s_val)) /
-                        60;
+    total_offset_secs =
+        ParseTimeZoneOffset(named_zone, Y, M, D, h, m, static_cast<int>(s_val));
   }
   struct tm t = {};
   t.tm_year = Y - 1900;
   t.tm_mon = M - 1;
   t.tm_mday = D;
   t.tm_hour = h;
-  t.tm_min = m - total_offset_mins;
-  t.tm_sec = static_cast<int>(s_val);
+  t.tm_min = m;
+  // TimeGm/timegm normalize out-of-range fields, so subtracting the whole
+  // offset (including sub-minute seconds) here is safe.
+  t.tm_sec = static_cast<int>(s_val) - total_offset_secs;
   t.tm_isdst = 0;
   const int64_t epoch = platform::TimeGm(&t);
   struct tm utc = {};
@@ -2725,6 +2939,10 @@ bool SplitJsonObjectFields(
       return;
     }
     std::string key = current.substr(0, sep_pos);
+    while (!key.empty() &&
+           std::isspace(static_cast<unsigned char>(key.back()))) {
+      key.pop_back();
+    }
     if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
       key = key.substr(1, key.size() - 2);
     }
@@ -3003,8 +3221,8 @@ StatusOr<Expression> VisitExpression(
                                   text);
     }
     if (!std::isfinite(parsed)) {
-      return AstError<Expression>("GoogleSQL AST: numeric literal out of range " +
-                                  text);
+      return AstError<Expression>(
+          "GoogleSQL AST: numeric literal out of range " + text);
     }
     return ConstantValueExp(Value(parsed));
   }
@@ -3020,7 +3238,14 @@ StatusOr<Expression> VisitExpression(
     ASSIGN_OR_RETURN(std::string, hv107344_0, (DecodeString(*literal)));
     const std::string text = std::move(hv107344_0);
     if (node.detail == "TYPE_DATE") {
-      return ConstantValueExp(Value::Date(text));
+      // Value::Date is a throwing EXC-SHIM wrapper; keep a malformed literal
+      // inside the StatusOr boundary instead of letting the exception escape.
+      try {
+        return ConstantValueExp(Value::Date(text));
+      } catch (const std::exception& e) {
+        return AstError<Expression>(std::string("invalid DATE literal: ") +
+                                    e.what());
+      }
     }
     if (node.detail == "TYPE_DATETIME") {
       std::string dt_str = text;
@@ -3349,7 +3574,25 @@ StatusOr<Expression> VisitExpression(
       }
       ASSIGN_OR_RETURN(Expression, hv118716_0, (VisitExpression(*child)));
       Expression arg = std::move(hv118716_0);
-      if (arg->Type() != TypeTag::kArrayExp) {
+      // Decide array-vs-string concatenation from the evaluated operand type:
+      // an ARRAY column is a kColumnValue expression (not a kArrayExp literal),
+      // so the old AST-shape-only test sent `array_col || array_col` to
+      // string concat. A VarChar element type could be an array of strings or
+      // a plain string; ResultType() tells them apart after evaluation.
+      bool is_array = arg->Type() == TypeTag::kArrayExp;
+      if (!is_array) {
+        try {
+          is_array = arg->ResultType(Schema()).GetType() == TypeTag::kArray;
+        } catch (const std::exception&) {
+          // No schema available here for a bare column: fall back to the
+          // caller's inferred type (ConcatExpr::InferArrayElementSqlType).
+          auto inferred_or = InferArrayElementSqlType(*child);
+          const std::string inferred =
+              inferred_or.HasValue() ? inferred_or.MoveValue() : std::string{};
+          is_array = inferred.starts_with("ARRAY<");
+        }
+      }
+      if (!is_array) {
         all_arrays = false;
       }
       arg = WrapIfBoolean(std::move(arg), *child);
@@ -3432,9 +3675,10 @@ StatusOr<Expression> VisitExpression(
     } else if (accessor == "ORDINAL") {
       fn = "array_element_ordinal";
     }
-    if (fn.find("safe") == std::string::npos &&
-        (accessor.starts_with("SAFE_") ||
-         accessor.find("_SAFE") != std::string::npos)) {
+    const std::string accessor_upper = AsciiToUpper(accessor);
+    if (fn.find("_safe") == std::string::npos &&
+        (accessor_upper.starts_with("SAFE_") ||
+         accessor_upper.find("_SAFE") != std::string::npos)) {
       fn += "_safe";
     }
     ASSIGN_OR_RETURN(Expression, h_idx, (VisitExpression(*index_node)));
@@ -3868,11 +4112,22 @@ StatusOr<Expression> VisitExpression(
           return ConstantValueExp(
               Value(static_cast<int64_t>(magnitude)).WithUnsigned());
         }
-        if (safe_cast_target) {
+        // A bare 9223372036854775808 is a UINT64 literal: only its negation
+        // (-9223372036854775808, a unary-minus node, not this IntLiteral
+        // child) spells INT64_MIN, so narrowing it to INT64 is out of range.
+        const std::string upper_target = UpperCopy(target);
+        // Widening targets accept the full UINT64 range. Let the general cast
+        // path fold the UINT64-typed literal (see the IntLiteral visitor)
+        // into STRING/FLOAT64/DOUBLE instead of rejecting it here.
+        if (upper_target == "STRING" || upper_target == "FLOAT64" ||
+            upper_target == "DOUBLE" || upper_target == "JSON") {
+          // fall through to the normal CAST construction below
+        } else if (safe_cast_target) {
           return ConstantValueExp(Value());
+        } else {
+          return AstError<Expression>(upper_target +
+                                      " out of range: " + digits);
         }
-        return AstError<Expression>(UpperCopy(target) +
-                                    " out of range: " + digits);
       }
     }
     // BYTES -> STRING must carry valid UTF-8; GoogleSQL raises on invalid
@@ -4055,8 +4310,11 @@ StatusOr<Expression> VisitExpression(
                     !(arg_node->kind == "StructConstructorWithKeyword" ||
                       arg_node->kind == "StructConstructorWithParens" ||
                       arg_node->kind == "StructConstructorWithType");
-              } else if (v.type == ValueType::kInt64) {
-                field.text = std::to_string(v.value.int_value);
+              } else if (v.type ==
+                         ValueType::kInt64) {  // NOLINT(bugprone-branch-clone)
+                // AsString() respects the unsigned tag; to_string(int_value)
+                // would render UINT64_MAX as -1 in the folded struct text.
+                field.text = v.AsString();
               } else if (v.type == ValueType::kDouble) {
                 field.text = FormatDoubleShortest(v.value.double_value);
               } else if (v.type == ValueType::kDate) {
@@ -4081,7 +4339,8 @@ StatusOr<Expression> VisitExpression(
         [](const StructFieldJson& f) { return static_cast<bool>(f.deferred); });
     if (any_deferred) {
       // Runtime struct construction: alternating name / value / is-string
-      // flag arguments, resolved by the function evaluator per row or per group.
+      // flag arguments, resolved by the function evaluator per row or per
+      // group.
       std::vector<Expression> args;
       args.reserve(fields.size() * 3);
       for (auto& f : fields) {
@@ -4127,15 +4386,10 @@ StatusOr<Expression> VisitExpression(
           case '\\':
             escaped += "\\\\";
             break;
-          case '\n':
-            escaped += "\\n";
-            break;
-          case '\r':
-            escaped += "\\r";
-            break;
-          case '\t':
-            escaped += "\\t";
-            break;
+          // No short escapes for \n/\r/\t: the runtime EncodeStructJson()
+          // emits \u00XX for every control char, and struct values are
+          // compared as raw JSON text. Emitting "\n" here would make the
+          // folded and runtime forms of the same STRUCT compare unequal.
           default:
             if (static_cast<unsigned char>(c) < 0x20) {
               std::array<char, 8> buf{};
@@ -4497,6 +4751,14 @@ bool NeedsRelationalEvaluation(
       // the estimate collapse that regressed Q9 then (vacuous stats on
       // computed projection columns) was fixed the same day in
       // ProjectionPlan/table_statistics.
+      // Even when the hatch lets a scalar call cross the Cascades bridge,
+      // its arguments may contain subqueries/relations that still need the
+      // relational route (same recursion every other node kind performs).
+      for (const Expression& arg : call.Args()) {
+        if (NeedsRelationalEvaluation(arg)) {
+          return true;
+        }
+      }
       static const bool scalar_functions_cascades = [] {
         const char* hatch = std::getenv("TINYLAMB_SCALAR_FN_CASCADES");
         return hatch != nullptr && std::string_view(hatch) == "1";

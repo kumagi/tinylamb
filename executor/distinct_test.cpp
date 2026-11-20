@@ -6,15 +6,23 @@
 #include <cstdint>
 #include <memory>
 #include <ostream>
+#include <sstream>
 #include <utility>
 #include <vector>
 
+#include "executor/aggregation.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/grouped_aggregate.hpp"
+#include "executor/merge_append.hpp"
+#include "executor/sort.hpp"
+#include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -90,7 +98,7 @@ TEST(DistinctExecutorTest, CollapsesInfinities) {
   EXPECT_EQ(CountDistinct(Rows(std::move(vals))), 2);
 }
 
-TEST(DistinctExecutorTest, DistinctDoublesScenarioMatchesGoogleSQL) {
+TEST(DistinctExecutorTest, DistinctDoublesScenarioMatchesGoogleSql) {
   const double nan = std::nan("");
   std::vector<Value> vals;
   auto d = [&](double x) { vals.emplace_back(x); };
@@ -128,6 +136,93 @@ TEST(SortDistinctExecutorTest, CollapsesAdjacentSignedZeros) {
                         Row(std::vector<Value>{Value(0.0)}),
                         Row(std::vector<Value>{Value(+0.0)})};
   EXPECT_EQ(CountSortDistinct(std::move(rows)), 1);
+}
+
+// T1791/T1793: Dump rendered measured counters (groups/input_rows/rows)
+// unconditionally, so a plain EXPLAIN -- which calls Dump before anything
+// is consumed -- printed dressed-up zeros as a profile.  Counters now join
+// only after a drain, per the Selection::DumpHeader rows_seen_ contract.
+TEST(ExecutorDumpCountersTest, DistinctCountersRenderOnlyAfterDrain) {
+  DistinctExecutor hash_distinct(
+      std::make_shared<FakeSource>(Rows({Value(1), Value(1), Value(2)})));
+  std::ostringstream plain;
+  hash_distinct.Dump(plain, 0);
+  EXPECT_EQ(plain.str().find("HashDistinct\n"), 0U) << plain.str();
+
+  Row r;
+  while (hash_distinct.Next(&r, nullptr)) {
+  }
+  std::ostringstream analyzed;
+  hash_distinct.Dump(analyzed, 0);
+  EXPECT_NE(analyzed.str().find("HashDistinct (input_rows=3, output_rows=2)"),
+            std::string::npos)
+      << analyzed.str();
+
+  SortDistinctExecutor sort_distinct(
+      std::make_shared<FakeSource>(Rows({Value(1), Value(1), Value(2)})));
+  std::ostringstream plain_sd;
+  sort_distinct.Dump(plain_sd, 0);
+  EXPECT_EQ(plain_sd.str().find("SortDistinct\n"), 0U) << plain_sd.str();
+  while (sort_distinct.Next(&r, nullptr)) {
+  }
+  std::ostringstream analyzed_sd;
+  sort_distinct.Dump(analyzed_sd, 0);
+  EXPECT_NE(
+      analyzed_sd.str().find("SortDistinct (input_rows=3, output_rows=2)"),
+      std::string::npos)
+      << analyzed_sd.str();
+}
+
+TEST(ExecutorDumpCountersTest, AggregateDumpsHideUnexecutedCounters) {
+  const Schema schema("t", {Column("k", ValueType::kInt64)});
+  const Expression k = ColumnValueExp("k");
+  const Expression count =
+      AggregateExpressionExp(AggregationType::kCount, nullptr);
+
+  HashAggregateExecutor hash(
+      std::make_shared<FakeSource>(Rows({Value(1), Value(1), Value(2)})),
+      schema, {NamedExpression{"k", k}}, {NamedExpression{"n", count}});
+  std::ostringstream plain;
+  hash.Dump(plain, 0);
+  EXPECT_EQ(plain.str().find("groups="), std::string::npos) << plain.str();
+  EXPECT_EQ(plain.str().find("spill="), std::string::npos) << plain.str();
+  EXPECT_NE(plain.str().find("HashAggregate (budget="), std::string::npos)
+      << plain.str();
+  Row r;
+  while (hash.Next(&r, nullptr)) {
+  }
+  std::ostringstream analyzed;
+  hash.Dump(analyzed, 0);
+  EXPECT_NE(analyzed.str().find("HashAggregate (groups=2, input_rows=3"),
+            std::string::npos)
+      << analyzed.str();
+
+  AggregationExecutor scalar(
+      std::make_shared<FakeSource>(Rows({Value(1), Value(1), Value(2)})),
+      schema, {NamedExpression{"n", count}});
+  std::ostringstream s_plain;
+  scalar.Dump(s_plain, 0);
+  EXPECT_EQ(s_plain.str().find("input_rows"), std::string::npos)
+      << s_plain.str();
+  while (scalar.Next(&r, nullptr)) {
+  }
+  std::ostringstream s_analyzed;
+  scalar.Dump(s_analyzed, 0);
+  EXPECT_NE(s_analyzed.str().find("(input_rows=3)"), std::string::npos)
+      << s_analyzed.str();
+
+  MergeAppendExecutor append(
+      {std::make_shared<FakeSource>(Rows({Value(1), Value(2)}))}, {schema},
+      schema, {SortExecutor::Key{.expression = k}});
+  std::ostringstream m_plain;
+  append.Dump(m_plain, 0);
+  EXPECT_EQ(m_plain.str().find(" rows="), std::string::npos) << m_plain.str();
+  while (append.Next(&r, nullptr)) {
+  }
+  std::ostringstream m_analyzed;
+  append.Dump(m_analyzed, 0);
+  EXPECT_NE(m_analyzed.str().find(" rows=2"), std::string::npos)
+      << m_analyzed.str();
 }
 
 }  // namespace

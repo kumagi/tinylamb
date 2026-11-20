@@ -56,10 +56,20 @@ namespace tinylamb {
 
 namespace {
 
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+// Storage is always big-endian (common/serdes.hpp applies the swap on every
+// host). Conditional swapping here made big-endian builds decode every cell
+// byte-reversed, silently corrupting values and zone maps.
+#if defined(__GNUC__) || defined(__clang__)
 #define TINYLAMB_LST_BSWAP64(x) __builtin_bswap64(x)
 #else
-#define TINYLAMB_LST_BSWAP64(x) (x)
+inline uint64_t LstSwap64Portable(uint64_t v) {
+  v = ((v >> 1) & 0x5555555555555555ULL) | ((v & 0x5555555555555555ULL) << 1);
+  v = ((v >> 2) & 0x3333333333333333ULL) | ((v & 0x3333333333333333ULL) << 2);
+  v = ((v >> 4) & 0x0F0F0F0F0F0F0F0FULL) | ((v & 0x0F0F0F0F0F0F0F0FULL) << 4);
+  return ((v >> 8) & 0x00FF00FF00FF00FFULL) |
+         ((v & 0x00FF00FF00FF00FFULL) << 8);
+}
+#define TINYLAMB_LST_BSWAP64(x) LstSwap64Portable(x)
 #endif
 
 std::optional<Schema> ConvertToLSTableSchema(const Schema& schema) {
@@ -652,15 +662,17 @@ std::shared_ptr<const LSTableIntegerRuns> LSTableStore::IntegerRuns(
     slot_t column) const {
   try {
     std::scoped_lock lock(integer_runs_mutex_);
-    if (integer_runs_ && integer_runs_->column == column) { return integer_runs_;
-}
+    if (integer_runs_ && integer_runs_->column == column) {
+      return integer_runs_;
+    }
     if (total_rows == 0 || total_rows > UINT32_MAX ||
         column >= integer_columns.size() ||
-        column >= column_is_monotonic.size() || (column_is_monotonic[column] == 0U) ||
+        column >= column_is_monotonic.size() ||
+        (column_is_monotonic[column] == 0U) ||
         column >= column_has_null.size() || (column_has_null[column] != 0U) ||
         integer_columns[column].size() != total_rows) {
       return nullptr;
-}
+    }
     const auto& keys = integer_columns[column];
     const uint64_t span = static_cast<uint64_t>(keys.back()) -
                           static_cast<uint64_t>(keys.front()) + 1;
@@ -668,14 +680,14 @@ std::shared_ptr<const LSTableIntegerRuns> LSTableStore::IntegerRuns(
     if (span == 0 || span >= max_bytes / sizeof(uint32_t) ||
         span > total_rows * 4) {
       return nullptr;
-}
+    }
     auto index = std::make_shared<LSTableIntegerRuns>();
     index->memory_charge =
         std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
-    if (!index->memory_charge->TryAddWithReclaim(((span + 1) * sizeof(uint32_t)) +
-                                                 sizeof(LSTableIntegerRuns))) {
+    if (!index->memory_charge->TryAddWithReclaim(
+            ((span + 1) * sizeof(uint32_t)) + sizeof(LSTableIntegerRuns))) {
       return nullptr;
-}
+    }
     index->column = column;
     index->minimum = keys.front();
     index->offsets.resize(span + 1);
@@ -684,8 +696,9 @@ std::shared_ptr<const LSTableIntegerRuns> LSTableStore::IntegerRuns(
     uint32_t run_begin = 0;
     index->run_count = 1;
     for (uint32_t row = 0; row < total_rows; ++row) {
-      if (keys[row] < previous) { return nullptr;
-}
+      if (keys[row] < previous) {
+        return nullptr;
+      }
       if (keys[row] != previous) {
         ++index->run_count;
         index->max_run_rows = std::max(index->max_run_rows, row - run_begin);
@@ -694,8 +707,9 @@ std::shared_ptr<const LSTableIntegerRuns> LSTableStore::IntegerRuns(
       previous = keys[row];
       const uint64_t slot = static_cast<uint64_t>(keys[row]) -
                             static_cast<uint64_t>(index->minimum);
-      if (slot >= span) { return nullptr;
-}
+      if (slot >= span) {
+        return nullptr;
+      }
       if (slot >= next) {
         std::fill(index->offsets.begin() + next,
                   index->offsets.begin() + slot + 1, row);
@@ -720,14 +734,15 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
     const auto runs = IntegerRuns(key_column);
     if (!runs || value_column >= integer_columns.size() ||
         integer_columns[value_column].size() != total_rows ||
-        value_column >= column_has_null.size() || (column_has_null[value_column] != 0U)) {
+        value_column >= column_has_null.size() ||
+        (column_has_null[value_column] != 0U)) {
       return nullptr;
-}
+    }
     std::scoped_lock lock(integer_runs_mutex_);
     if (integer_run_bounds_ && integer_run_bounds_->key_column == key_column &&
         integer_run_bounds_->value_column == value_column) {
       return integer_run_bounds_;
-}
+    }
     const auto& cells = integer_columns[value_column];
     int64_t low = 0, high = 0;
     if (value_column < column_min_int.size() &&
@@ -742,11 +757,12 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
     }
     if (static_cast<uint64_t>(high) - static_cast<uint64_t>(low) > UINT16_MAX) {
       return nullptr;
-}
+    }
     const size_t count = runs->offsets.size() - 1;
     constexpr size_t max_bytes = size_t{256} << 20;
-    if (count > max_bytes / sizeof(uint32_t)) { return nullptr;
-}
+    if (count > max_bytes / sizeof(uint32_t)) {
+      return nullptr;
+    }
     const size_t occupied = runs->run_count;
     const bool sparse = count > 4096 && occupied < count / 2;
     const size_t words = sparse ? (count + 63) / 64 : 0;
@@ -760,11 +776,12 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
     // or other hot tables, only to rebuild them on every following query.
     bool coarse = false;
     if (!bounds->memory_charge->TryAdd(bytes + sizeof(*bounds))) {
-      const size_t coarse_bytes = (packed_count * sizeof(uint16_t)) +
-                                  (words * (sizeof(uint64_t) + sizeof(uint32_t)));
+      const size_t coarse_bytes =
+          (packed_count * sizeof(uint16_t)) +
+          (words * (sizeof(uint64_t) + sizeof(uint32_t)));
       if (!bounds->memory_charge->TryAdd(coarse_bytes + sizeof(*bounds))) {
         return nullptr;
-}
+      }
       coarse = true;
     }
     bounds->key_column = key_column;
@@ -786,8 +803,9 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
     size_t packed_row = 0;
     for (size_t i = 0; i < count; ++i) {
       const uint32_t begin = runs->offsets[i], end = runs->offsets[i + 1];
-      if (begin == end) { continue;
-}
+      if (begin == end) {
+        continue;
+      }
       int64_t lo = cells[begin], hi = lo;
       for (size_t r = begin + 1; r < end; ++r) {
         lo = std::min(lo, cells[r]);
@@ -798,8 +816,9 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
       const auto delta_hi = static_cast<uint32_t>(static_cast<uint64_t>(hi) -
                                                   static_cast<uint64_t>(low));
       const size_t offset = sparse ? packed_row++ : i;
-      if (sparse) { bounds->key_bits[i >> 6] |= uint64_t{1} << (i & 63);
-}
+      if (sparse) {
+        bounds->key_bits[i >> 6] |= uint64_t{1} << (i & 63);
+      }
       if (coarse) {
         bounds->coarse[offset] = (delta_lo >> bounds->coarse_shift) |
                                  ((delta_hi >> bounds->coarse_shift) << 8);
@@ -874,18 +893,18 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
     return nullptr;
   }
   const std::shared_ptr<const TlcsFile> backing_tlcs =
-      table.GetBackingTLCSStore();
+      table.GetBackingTlcsStore();
   if (backing_tlcs != nullptr &&
       backing_tlcs->LayoutGeneration() == generation &&
       backing_tlcs->FirstPageId() == table.FirstPageId()) {
     if (projection == nullptr) {
       if (auto resident = backing_tlcs->ResidentStore(); resident != nullptr) {
-        table.SetLSTableStore(resident);
+        table.RefillLSTableStore(resident);
         return resident;
       }
       if (backing_tlcs->IsPaged()) {
         if (max_bytes == LSTableStore::kBuildByteLimit) {
-          table.RejectLSTableCapacity(generation);
+          table.NoteLSTableCapacityRejected(generation);
         }
         return nullptr;
       }
@@ -893,7 +912,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
       if (auto projected = backing_tlcs->BuildProjectedResidentStore(
               schema, projection, effective_max_bytes);
           projected != nullptr) {
-        table.SetProjectedLSTableStore(projected);
+        table.RefillProjectedLSTableStore(projected);
         return projected;
       }
       if (backing_tlcs->IsPaged()) {
@@ -936,6 +955,41 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
   uint64_t estimated_bytes = 0;
   auto mem_charge =
       std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+
+  constexpr size_t kStreamDictSlotCount = 512;
+  constexpr size_t kStreamDictSlotMask = kStreamDictSlotCount - 1;
+  struct StreamDictSlot {
+    uint64_t hash{0};
+    uint32_t entry_idx{0};
+  };
+  struct StreamVarCharDict {
+    bool active{false};
+    bool viable{false};
+    bool all_blocks_single_byte{true};
+    std::vector<std::string> entries;
+    std::array<StreamDictSlot, kStreamDictSlotCount> slots{};
+    std::vector<std::vector<uint8_t>> block_codes;
+    size_t precharged_code_bytes{0};
+  };
+  auto stream_hash_sv = [](std::string_view sv) noexcept -> uint64_t {
+    uint64_t h = 14695981039346656037ULL;
+    for (const char ch : sv) {
+      h ^= static_cast<unsigned char>(ch);
+      h *= 1099511628211ULL;
+    }
+    return h == 0 ? 1ULL : h;
+  };
+  std::vector<StreamVarCharDict> stream_varchar_dicts(schema.ColumnCount());
+  for (slot_t c = 0; c < schema.ColumnCount(); ++c) {
+    if (store->HasColumn(c) &&
+        schema.GetColumn(c).Type() == ValueType::kVarChar) {
+      stream_varchar_dicts[c].active = true;
+      stream_varchar_dicts[c].viable = true;
+      stream_varchar_dicts[c].entries.reserve(
+          LSTableColumnDictionary::kMaxEntries);
+    }
+  }
+
   while (page_id != 0) {
     if (!visited.insert(page_id).second) {
       return nullptr;
@@ -1053,7 +1107,133 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
     max_page_id = std::max(max_page_id, page_id);
     store->page_ids.push_back(page_id);
     store->total_rows += block.row_count;
-    size_t block_bytes = 0;
+
+    // Stream-compress low-cardinality VARCHAR columns (<= 254 distinct strings)
+    // per block so transient raw string buffers never blow past
+    // `effective_max_bytes` on multi-ten-million-row projections (e.g. TPC-H
+    // SF=10 `l_shipinstruct` + `l_shipmode`). If any later block exceeds 254
+    // distinct strings, earlier blocks are losslessly rehydrated back to
+    // `varchar_bytes`/`varchar_ends` and charged before continuing.
+    size_t extra_code_bytes_this_block = 0;
+    for (slot_t c = 0; c < schema.ColumnCount(); ++c) {
+      StreamVarCharDict& sd = stream_varchar_dicts[c];
+      if (!sd.viable) {
+        continue;
+      }
+      LSTableColumnBlock& col = block.columns[c];
+      std::vector<uint8_t> codes(block.row_count,
+                                 LSTableColumnDictionary::kNullCode);
+      bool fits_dict = true;
+      std::string_view prev_sv;
+      uint8_t prev_code = 0;
+      bool have_prev = false;
+      for (uint32_t r = 0; r < block.row_count; ++r) {
+        if (col.IsNull(r)) {
+          sd.all_blocks_single_byte = false;
+          continue;
+        }
+        const std::string_view sv = col.VarcharAt(r);
+        if (have_prev && sv == prev_sv) {
+          codes[r] = prev_code;
+          continue;
+        }
+        const uint64_t h = stream_hash_sv(sv);
+        size_t slot = static_cast<size_t>(h) & kStreamDictSlotMask;
+        uint8_t found_code = 0;
+        bool matched = false;
+        while (sd.slots[slot].hash != 0) {
+          const uint32_t idx = sd.slots[slot].entry_idx;
+          if (sd.slots[slot].hash == h && sd.entries[idx] == sv) {
+            found_code = static_cast<uint8_t>(idx);
+            matched = true;
+            break;
+          }
+          slot = (slot + 1) & kStreamDictSlotMask;
+        }
+        if (!matched) {
+          if (sd.entries.size() >= LSTableColumnDictionary::kMaxEntries) {
+            fits_dict = false;
+            break;
+          }
+          found_code = static_cast<uint8_t>(sd.entries.size());
+          sd.entries.emplace_back(sv);
+          sd.slots[slot] = StreamDictSlot{.hash = h, .entry_idx = found_code};
+        }
+        codes[r] = found_code;
+        prev_sv = sd.entries[found_code];
+        prev_code = found_code;
+        have_prev = true;
+      }
+
+      if (fits_dict) {
+        if (block.row_count > 0 && !col.all_single_byte_varchar) {
+          sd.all_blocks_single_byte = false;
+          std::vector<uint8_t>().swap(col.varchar_bytes);
+        }
+        std::vector<uint32_t>().swap(col.varchar_ends);
+        extra_code_bytes_this_block += codes.size();
+        sd.precharged_code_bytes += codes.size();
+        sd.block_codes.push_back(std::move(codes));
+      } else {
+        // Rehydrate previously compressed blocks `0..store->blocks.size()-1`.
+        size_t restored_raw_bytes = 0;
+        for (size_t bi = 0; bi < store->blocks.size(); ++bi) {
+          LSTableColumnBlock& prev_col = store->blocks[bi].columns[c];
+          const std::vector<uint8_t>& bc = sd.block_codes[bi];
+          const uint32_t nrows = store->blocks[bi].row_count;
+          prev_col.varchar_ends.resize(nrows);
+          if (prev_col.all_single_byte_varchar) {
+            for (uint32_t r = 0; r < nrows; ++r) {
+              prev_col.varchar_ends[r] = r + 1;
+            }
+            restored_raw_bytes += nrows * sizeof(uint32_t);
+          } else {
+            size_t total_chars = 0;
+            for (uint32_t r = 0; r < nrows; ++r) {
+              if (bc[r] != LSTableColumnDictionary::kNullCode) {
+                total_chars += sd.entries[bc[r]].size();
+              }
+            }
+            prev_col.varchar_bytes.resize(total_chars);
+            uint32_t cur_off = 0;
+            for (uint32_t r = 0; r < nrows; ++r) {
+              const uint8_t code = bc[r];
+              if (code != LSTableColumnDictionary::kNullCode) {
+                const std::string& s = sd.entries[code];
+                if (!s.empty()) {
+                  std::memcpy(prev_col.varchar_bytes.data() + cur_off, s.data(),
+                              s.size());
+                }
+                cur_off += static_cast<uint32_t>(s.size());
+              }
+              prev_col.varchar_ends[r] = cur_off;
+            }
+            restored_raw_bytes +=
+                total_chars + (static_cast<size_t>(nrows) * sizeof(uint32_t));
+          }
+        }
+        if (sd.precharged_code_bytes > 0) {
+          mem_charge->Release(sd.precharged_code_bytes);
+          estimated_bytes -= sd.precharged_code_bytes;
+          sd.precharged_code_bytes = 0;
+        }
+        estimated_bytes += restored_raw_bytes;
+        if (estimated_bytes > effective_max_bytes ||
+            !mem_charge->TryAddWithReclaim(restored_raw_bytes)) {
+          if (projection == nullptr &&
+              max_bytes == LSTableStore::kBuildByteLimit &&
+              table.LayoutGeneration() == generation) {
+            table.NoteLSTableCapacityRejected(generation);
+          }
+          return nullptr;
+        }
+        std::vector<std::vector<uint8_t>>().swap(sd.block_codes);
+        std::vector<std::string>().swap(sd.entries);
+        sd.viable = false;
+      }
+    }
+
+    size_t block_bytes = extra_code_bytes_this_block;
     for (slot_t c = 0; c < schema.ColumnCount(); ++c) {
       if (!store->HasColumn(c)) {
         continue;
@@ -1073,7 +1253,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
       // builds. Snapshot/IO failures must never become a capacity verdict.
       if (projection == nullptr && max_bytes == LSTableStore::kBuildByteLimit &&
           table.LayoutGeneration() == generation) {
-        table.RejectLSTableCapacity(generation);
+        table.NoteLSTableCapacityRejected(generation);
       }
       return nullptr;
     }
@@ -1125,7 +1305,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
     if (!store->memory_charge->TryAddWithReclaim(map_bytes)) {
       if (projection == nullptr && max_bytes == LSTableStore::kBuildByteLimit &&
           table.LayoutGeneration() == generation) {
-        table.RejectLSTableCapacity(generation);
+        table.NoteLSTableCapacityRejected(generation);
       }
       return nullptr;
     }
@@ -1149,15 +1329,6 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
   store->column_has_null.assign(col_count, 0);
   store->column_min_int.assign(col_count, std::numeric_limits<int64_t>::max());
   store->column_max_int.assign(col_count, std::numeric_limits<int64_t>::min());
-
-  auto hash_sv = [](std::string_view sv) noexcept -> uint64_t {
-    uint64_t h = 14695981039346656037ULL;
-    for (const char ch : sv) {
-      h ^= static_cast<unsigned char>(ch);
-      h *= 1099511628211ULL;
-    }
-    return h == 0 ? 1ULL : h;
-  };
 
   for (slot_t c = 0; c < col_count; ++c) {
     if (!store->HasColumn(c)) {
@@ -1465,8 +1636,10 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
     }
 
     if (vt == ValueType::kVarChar && store->total_rows > 0) {
-      bool all_blocks_single_byte = !any_null;
-      if (all_blocks_single_byte) {
+      StreamVarCharDict& sd = stream_varchar_dicts[c];
+      bool all_blocks_single_byte =
+          !any_null && (!sd.active || !sd.viable || sd.all_blocks_single_byte);
+      if (all_blocks_single_byte && (!sd.active || !sd.viable)) {
         for (const LSTablePageBlock& blk : store->blocks) {
           if (blk.row_count > 0 && !blk.columns[c].all_single_byte_varchar) {
             all_blocks_single_byte = false;
@@ -1475,6 +1648,12 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
         }
       }
       if (all_blocks_single_byte) {
+        if (sd.precharged_code_bytes > 0) {
+          store->memory_charge->Release(sd.precharged_code_bytes);
+          sd.precharged_code_bytes = 0;
+        }
+        std::vector<std::vector<uint8_t>>().swap(sd.block_codes);
+        std::vector<std::string>().swap(sd.entries);
         std::array<uint8_t, 256> seen{};
         size_t distinct_count = 0;
         for (const LSTablePageBlock& blk : store->blocks) {
@@ -1522,148 +1701,72 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
         continue;
       }
 
-      // General low-cardinality VARCHAR dictionary discovery (up to 254 codes).
-      struct DictSlot {
-        uint64_t hash{0};
-        const char* data{nullptr};
-        uint32_t size{0};
-        uint8_t code{0};
-      };
-      constexpr size_t kTableSize = 512;
-      constexpr size_t kTableMask = kTableSize - 1;
-      std::array<DictSlot, kTableSize> table_slots{};
-      std::vector<std::string_view> distinct_views;
-      distinct_views.reserve(LSTableColumnDictionary::kMaxEntries);
-      bool fits_dictionary = true;
-      std::string_view prev_sv;
-      bool have_prev_sv = false;
+      if (sd.active && sd.viable) {
+        if (!sd.entries.empty()) {
+          const size_t n_ent = sd.entries.size();
+          std::vector<size_t> order(n_ent);
+          for (size_t i = 0; i < n_ent; ++i) {
+            order[i] = i;
+          }
+          std::ranges::sort(order, [&](size_t a, size_t b) {
+            return sd.entries[a] < sd.entries[b];
+          });
+          std::array<uint8_t, 256> old_to_new{};
+          old_to_new.fill(LSTableColumnDictionary::kNullCode);
+          LSTableColumnDictionary& dict = store->dictionaries[c];
+          dict.active = true;
+          dict.entries.reserve(n_ent);
+          dict.all_single_byte = !any_null;
+          for (size_t new_idx = 0; new_idx < n_ent; ++new_idx) {
+            const size_t old_idx = order[new_idx];
+            old_to_new[old_idx] = static_cast<uint8_t>(new_idx);
+            std::string& s = sd.entries[old_idx];
+            if (s.size() != 1) {
+              dict.all_single_byte = false;
+            } else {
+              dict.single_byte_chars[new_idx] = static_cast<uint8_t>(s[0]);
+            }
+            dict.entries.push_back(std::move(s));
+          }
+          dict.codes_follow_string_order =
+              std::adjacent_find(dict.entries.begin(), dict.entries.end(),
+                                 [](const auto& a, const auto& b) {
+                                   return CompareVarCharForOrderBy(a, b,
+                                                                   false) >= 0;
+                                 }) == dict.entries.end();
 
-      for (const LSTablePageBlock& blk : store->blocks) {
-        const LSTableColumnBlock& col = blk.columns[c];
-        for (uint32_t r = 0; r < blk.row_count; ++r) {
-          if (col.IsNull(r)) {
-            continue;
-          }
-          const std::string_view sv = col.VarcharAt(r);
-          if (have_prev_sv && sv == prev_sv) {
-            continue;
-          }
-          prev_sv = sv;
-          have_prev_sv = true;
-          const uint64_t h = hash_sv(sv);
-          size_t slot = static_cast<size_t>(h) & kTableMask;
-          while (true) {
-            if (table_slots[slot].hash == 0) {
-              if (distinct_views.size() >=
-                  LSTableColumnDictionary::kMaxEntries) {
-                fits_dictionary = false;
-                break;
+          AllocateNarrowCodes(*store, c);
+          for (size_t bi = 0; bi < store->blocks.size(); ++bi) {
+            LSTablePageBlock& blk = store->blocks[bi];
+            LSTableColumnBlock& col = blk.columns[c];
+            col.dict_mask = {0ULL, 0ULL, 0ULL, 0ULL};
+            uint8_t* __restrict codes =
+                dict.narrow_codes.data() + col.wide_code_begin;
+            const std::vector<uint8_t>& raw_codes = sd.block_codes[bi];
+            for (uint32_t r = 0; r < blk.row_count; ++r) {
+              const uint8_t mapped = old_to_new[raw_codes[r]];
+              codes[r] = mapped;
+              if (mapped != LSTableColumnDictionary::kNullCode) {
+                col.dict_mask[mapped >> 6] |= uint64_t{1} << (mapped & 63);
               }
-              table_slots[slot] =
-                  DictSlot{.hash = h,
-                           .data = sv.data(),
-                           .size = static_cast<uint32_t>(sv.size()),
-                           .code = static_cast<uint8_t>(distinct_views.size())};
-              distinct_views.push_back(sv);
-              break;
             }
-            if (table_slots[slot].hash == h &&
-                table_slots[slot].size == sv.size() &&
-                (sv.empty() || std::memcmp(table_slots[slot].data, sv.data(),
-                                           sv.size()) == 0)) {
-              break;
+            col.dict = &dict;
+            if (!col.all_single_byte_varchar) {
+              std::vector<uint8_t>().swap(col.varchar_bytes);
             }
-            slot = (slot + 1) & kTableMask;
-          }
-          if (!fits_dictionary) {
-            break;
+            std::vector<uint32_t>().swap(col.varchar_ends);
           }
         }
-        if (!fits_dictionary) {
-          break;
+        if (sd.precharged_code_bytes > 0) {
+          store->memory_charge->Release(sd.precharged_code_bytes);
+          sd.precharged_code_bytes = 0;
         }
+        std::vector<std::vector<uint8_t>>().swap(sd.block_codes);
+        std::vector<std::string>().swap(sd.entries);
+        continue;
       }
 
-      if (!fits_dictionary) {
-        BuildWideStringDictionary(store.get(), c, &dictionary_summary_budget);
-      } else if (!distinct_views.empty()) {
-        LSTableColumnDictionary& dict = store->dictionaries[c];
-        dict.active = true;
-        dict.entries.reserve(distinct_views.size());
-        for (const std::string_view sv : distinct_views) {
-          dict.entries.emplace_back(sv);
-        }
-        std::ranges::sort(dict.entries);
-        dict.codes_follow_string_order =
-            std::adjacent_find(dict.entries.begin(), dict.entries.end(),
-                               [](const auto& a, const auto& b) {
-                                 return CompareVarCharForOrderBy(a, b, false) >=
-                                        0;
-                               }) == dict.entries.end();
-        dict.all_single_byte = !any_null;
-        table_slots.fill(DictSlot{});
-        for (size_t idx = 0; idx < dict.entries.size(); ++idx) {
-          const std::string& s = dict.entries[idx];
-          if (s.size() != 1) {
-            dict.all_single_byte = false;
-          } else {
-            dict.single_byte_chars[idx] = static_cast<uint8_t>(s[0]);
-          }
-          const std::string_view sv(s);
-          const uint64_t h = hash_sv(sv);
-          size_t slot = static_cast<size_t>(h) & kTableMask;
-          while (table_slots[slot].hash != 0) {
-            slot = (slot + 1) & kTableMask;
-          }
-          table_slots[slot] = DictSlot{.hash = h,
-                                       .data = sv.data(),
-                                       .size = static_cast<uint32_t>(sv.size()),
-                                       .code = static_cast<uint8_t>(idx)};
-        }
-
-        AllocateNarrowCodes(*store, c);
-        for (LSTablePageBlock& blk : store->blocks) {
-          LSTableColumnBlock& col = blk.columns[c];
-          col.dict_mask = {0ULL, 0ULL, 0ULL, 0ULL};
-          uint8_t* __restrict codes =
-              dict.narrow_codes.data() + col.wide_code_begin;
-          std::string_view last_sv;
-          uint8_t last_code = LSTableColumnDictionary::kNullCode;
-          bool have_last = false;
-          for (uint32_t r = 0; r < blk.row_count; ++r) {
-            if (col.IsNull(r)) {
-              codes[r] = LSTableColumnDictionary::kNullCode;
-              continue;
-            }
-            const std::string_view sv = col.VarcharAt(r);
-            uint8_t code = last_code;
-            if (!have_last || sv != last_sv) {
-              const uint64_t h = hash_sv(sv);
-              size_t slot = static_cast<size_t>(h) & kTableMask;
-              while (true) {
-                if (table_slots[slot].hash == h &&
-                    table_slots[slot].size == sv.size() &&
-                    (sv.empty() || std::memcmp(table_slots[slot].data,
-                                               sv.data(), sv.size()) == 0)) {
-                  code = table_slots[slot].code;
-                  break;
-                }
-                slot = (slot + 1) & kTableMask;
-              }
-              last_sv = std::string_view(dict.entries[code]);
-              last_code = code;
-              have_last = true;
-            }
-            codes[r] = code;
-            col.dict_mask[code >> 6] |= uint64_t{1} << (code & 63);
-          }
-          col.dict = &dict;
-          if (!col.all_single_byte_varchar) {
-            std::vector<uint8_t>().swap(col.varchar_bytes);
-          }
-          std::vector<uint32_t>().swap(col.varchar_ends);
-        }
-      }
+      BuildWideStringDictionary(store.get(), c, &dictionary_summary_budget);
     }
   }
 
@@ -1713,7 +1816,9 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
       const auto& column = schema.GetColumn(c);
       if (column.Type() != ValueType::kInt64 || column.IsUnsigned() ||
           store->dictionaries[c].active ||
-          store->column_min_int[c] == store->column_max_int[c]) {
+          // An all-NULL column stores the inverted sentinel
+          // (min=INT64_MAX > max=INT64_MIN); skip it like a constant one.
+          store->column_min_int[c] >= store->column_max_int[c]) {
         continue;
       }
       std::vector<uint64_t> bits(bit_count / 64);
@@ -1755,7 +1860,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
         !store->memory_charge->TryAddWithReclaim(extra_bytes)) {
       if (projection == nullptr && max_bytes == LSTableStore::kBuildByteLimit &&
           table.LayoutGeneration() == generation) {
-        table.RejectLSTableCapacity(generation);
+        table.NoteLSTableCapacityRejected(generation);
       }
       return nullptr;
     }
@@ -1850,10 +1955,10 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
   if (projection != nullptr) {
     // Replacing the one cached projection bounds cache growth across queries.
     // Existing readers keep their immutable shared store until completion.
-    table.SetProjectedLSTableStore(store);
+    table.RefillProjectedLSTableStore(store);
   } else if (store->uncommitted_owner_txn == 0 ||
              table.GetLSTableStore() == nullptr) {
-    table.SetLSTableStore(store);
+    table.RefillLSTableStore(store);
   }
   return store;
 }
@@ -1922,10 +2027,69 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
   if (projection == nullptr || !table.LSTableCapacityRejected(generation)) {
     return nullptr;
   }
+  const slot_t col_count = table.GetSchema().ColumnCount();
+  std::vector<uint8_t> req_mask(col_count, 0);
+  size_t req_unique = 0;
+  for (const slot_t c : *projection) {
+    if (c >= col_count) {
+      return nullptr;
+    }
+    if (req_mask[c] == 0) {
+      req_mask[c] = 1;
+      ++req_unique;
+    }
+  }
+  if (req_unique >= col_count) {
+    // All columns were already rejected by the full-table capacity check; do
+    // not evict a valid proper-subset projection for a guaranteed failure.
+    return nullptr;
+  }
+  std::vector<slot_t> union_proj;
+  {
+    auto old_partial = table.GetProjectedLSTableStore();
+    if (table.GetBackingTlcsStore() == nullptr && old_partial != nullptr &&
+        old_partial->layout_generation == generation &&
+        old_partial->first_pid == table.FirstPageId() &&
+        (old_partial->uncommitted_owner_txn == 0 ||
+         old_partial->uncommitted_owner_txn == txn.ID()) &&
+        old_partial->total_rows >= 1'000'000 &&
+        old_partial->memory_charge != nullptr) {
+      std::vector<uint8_t> merged_mask = req_mask;
+      uint64_t added_est_bytes = 0;
+      for (slot_t c = 0; c < col_count; ++c) {
+        if (old_partial->HasColumn(c)) {
+          merged_mask[c] = 1;
+        } else if (req_mask[c] != 0) {
+          const ValueType vt = table.GetSchema().GetColumn(c).Type();
+          added_est_bytes += old_partial->total_rows *
+                             (vt == ValueType::kVarChar ? 16ULL : 8ULL);
+        }
+      }
+      const uint64_t total_est =
+          static_cast<uint64_t>(old_partial->memory_charge->Bytes()) +
+          added_est_bytes + (uint64_t{256} << 20);
+      if (total_est <= EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit)) {
+        union_proj.reserve(col_count);
+        for (slot_t c = 0; c < col_count; ++c) {
+          if (merged_mask[c] != 0) {
+            union_proj.push_back(c);
+          }
+        }
+        if (union_proj.size() >= col_count || union_proj.size() == req_unique) {
+          union_proj.clear();
+        }
+      }
+    }
+  }
   // The single cached projection cannot serve this request. Release its
   // cache ownership before allocating a replacement so peak memory need not
   // contain both images. Active readers retain their own shared snapshots.
-  table.SetProjectedLSTableStore(nullptr);
+  table.RefillProjectedLSTableStore(nullptr);
+  if (!union_proj.empty()) {
+    if (auto merged = BuildLSTableStore(txn, table, &union_proj)) {
+      return merged;
+    }
+  }
   return BuildLSTableStore(txn, table, projection);
 }
 

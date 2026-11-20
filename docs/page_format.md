@@ -17,7 +17,7 @@
 
 ## `<dbname>.db` snapshot format (`page/page_manager.cpp`)
 
-When LSM compaction completes (or on explicit `WriteCheckpoint` / shutdown),
+When LSM compaction completes or an explicit `WriteCheckpoint` runs (shutdown does not write a final snapshot; the WAL is replayed on next open),
 `PageManager::WriteFuzzyCheckpoint` atomically writes `<dbname>.db` via a
 temporary file + `fsync` + `rename` with the following layout:
 

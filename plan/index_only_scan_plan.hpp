@@ -96,4 +96,4 @@ class IndexOnlyScanPlan : public PlanBase {
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_INDEX_SCAN_PLAN_HPP
+#endif  // TINYLAMB_INDEX_ONLY_SCAN_PLAN_HPP

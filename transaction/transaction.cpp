@@ -17,6 +17,7 @@
 #include "transaction/transaction.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -34,7 +35,9 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "common/memory_budget.hpp"
 #include "common/serdes.hpp"
+#include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
 #include "common/unwind_guard.hpp"
 #include "page/page_manager.hpp"
@@ -46,34 +49,386 @@
 
 namespace tinylamb {
 
-bool Transaction::FindPendingLsmWrite(page_id_t root, std::string_view key,
-                                      std::string* value, bool* deleted) const {
-  std::scoped_lock guard(chain_mu_);
-  const auto records = std::views::reverse(staged_records_);
-  const auto found =
-      std::ranges::find_if(records, [&](const LogRecord& record) {
-        return record.pid == root && record.key == key &&
-               (record.type == LogType::kLsmPut ||
-                record.type == LogType::kLsmDelete);
-      });
-  if (found == records.end()) {
+TransactionWriteSet::TransactionWriteSet() = default;
+
+TransactionWriteSet::~TransactionWriteSet() { clear(); }
+
+TransactionWriteSet::TransactionWriteSet(TransactionWriteSet&& o) noexcept
+    : small_(std::move(o.small_)),
+      spill_(std::move(o.spill_)),
+      spill_tail_(std::move(o.spill_tail_)),
+      spill_store_(std::move(o.spill_store_)),
+      segment_writer_(std::move(o.segment_writer_)),
+      spill_segment_id_(o.spill_segment_id_),
+      mem_charge_(std::move(o.mem_charge_)),
+      total_count_(o.total_count_),
+      spilled_(o.spilled_),
+      disk_spilled_(o.disk_spilled_) {
+  o.spill_segment_id_ = kInvalidSpillSegmentId;
+  o.total_count_ = 0;
+  o.spilled_ = false;
+  o.disk_spilled_ = false;
+}
+
+TransactionWriteSet& TransactionWriteSet::operator=(
+    TransactionWriteSet&& o) noexcept {
+  if (this == &o) {
+    return *this;
+  }
+  clear();
+  small_ = std::move(o.small_);
+  spill_ = std::move(o.spill_);
+  spill_tail_ = std::move(o.spill_tail_);
+  spill_store_ = std::move(o.spill_store_);
+  segment_writer_ = std::move(o.segment_writer_);
+  spill_segment_id_ = o.spill_segment_id_;
+  mem_charge_ = std::move(o.mem_charge_);
+  total_count_ = o.total_count_;
+  spilled_ = o.spilled_;
+  disk_spilled_ = o.disk_spilled_;
+  o.spill_segment_id_ = kInvalidSpillSegmentId;
+  o.total_count_ = 0;
+  o.spilled_ = false;
+  o.disk_spilled_ = false;
+  return *this;
+}
+
+Status TransactionWriteSet::FlushTailToWriter(uint64_t* spilled_bytes_out) {
+  if (spill_tail_.empty() || segment_writer_ == nullptr) {
+    return Status::kSuccess;
+  }
+  const size_t bytes = spill_tail_.size() * sizeof(RowPosition);
+  RETURN_IF_FAIL(segment_writer_->Write(spill_tail_.data(), bytes));
+  spill_tail_.clear();
+  if (spilled_bytes_out != nullptr) {
+    *spilled_bytes_out += bytes;
+  }
+  return Status::kSuccess;
+}
+
+bool TransactionWriteSet::TryInsert(const value_type& value,
+                                    const std::shared_ptr<SpillStore>& store,
+                                    size_t max_in_memory_entries,
+                                    uint64_t* spilled_bytes_out,
+                                    bool* initial_spill_out,
+                                    Status* error_out) {
+  if (spilled_bytes_out != nullptr) {
+    *spilled_bytes_out = 0;
+  }
+  if (initial_spill_out != nullptr) {
+    *initial_spill_out = false;
+  }
+  if (error_out != nullptr) {
+    *error_out = Status::kSuccess;
+  }
+  if (disk_spilled_) {
+    if (spill_tail_.size() >= kSpillTailCapacity) {
+      const Status flush_st = FlushTailToWriter(spilled_bytes_out);
+      if (flush_st != Status::kSuccess) {
+        if (error_out != nullptr) {
+          *error_out = flush_st;
+        }
+        return false;
+      }
+    }
+    spill_tail_.push_back(value);
+    ++total_count_;
+    return true;
+  }
+
+  auto transition_to_disk = [&](const auto& entries) -> bool {
+    if (store == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = StatusError(
+            StatusCode::kMemoryLimitExceeded,
+            "transaction write-set/version payload exceeds the query memory "
+            "limit and no spill store is configured (pool=query)");
+      }
+      return false;
+    }
+    segment_writer_ =
+        std::make_unique<SpillSegmentWriter>(store.get(), kSpillBufferBytes);
+    const Status open_st = segment_writer_->EnsureOpen();
+    if (open_st != Status::kSuccess) {
+      if (error_out != nullptr) {
+        *error_out = open_st;
+      }
+      segment_writer_.reset();
+      return false;
+    }
+    spill_store_ = store;
+    spill_segment_id_ = segment_writer_->SegmentId();
+    std::vector<RowPosition> chunk;
+    chunk.reserve(std::min<size_t>(entries.size(), kSpillTailCapacity));
+    uint64_t written = 0;
+    for (const RowPosition& rp : entries) {
+      chunk.push_back(rp);
+      if (chunk.size() >= kSpillTailCapacity) {
+        const size_t bytes = chunk.size() * sizeof(RowPosition);
+        const Status write_st = segment_writer_->Write(chunk.data(), bytes);
+        if (write_st != Status::kSuccess) {
+          if (error_out != nullptr) {
+            *error_out = write_st;
+          }
+          segment_writer_->Abort();
+          segment_writer_.reset();
+          spill_segment_id_ = kInvalidSpillSegmentId;
+          spill_store_.reset();
+          return false;
+        }
+        written += bytes;
+        chunk.clear();
+      }
+    }
+    if (!chunk.empty()) {
+      const size_t bytes = chunk.size() * sizeof(RowPosition);
+      const Status write_st = segment_writer_->Write(chunk.data(), bytes);
+      if (write_st != Status::kSuccess) {
+        if (error_out != nullptr) {
+          *error_out = write_st;
+        }
+        segment_writer_->Abort();
+        segment_writer_.reset();
+        spill_segment_id_ = kInvalidSpillSegmentId;
+        spill_store_.reset();
+        return false;
+      }
+      written += bytes;
+    }
+    std::vector<RowPosition>().swap(small_);
+    std::unordered_set<RowPosition>().swap(spill_);
+    mem_charge_.ReleaseAll();
+    if (!mem_charge_.TryAdd(kSpillBufferBytes,
+                            /*respect_soft_limit=*/false)) {
+      return false;
+    }
+    spilled_ = false;
+    disk_spilled_ = true;
+    if (initial_spill_out != nullptr) {
+      *initial_spill_out = true;
+    }
+    if (spilled_bytes_out != nullptr) {
+      *spilled_bytes_out += written;
+    }
+    spill_tail_.push_back(value);
+    ++total_count_;
+    return true;
+  };
+
+  if (spilled_) {
+    if (spill_.contains(value)) {
+      return true;
+    }
+    const bool over_entries = spill_.size() >= max_in_memory_entries;
+    const bool charge_ok =
+        !over_entries &&
+        mem_charge_.TryAdd(kEntryChargeBytes, /*respect_soft_limit=*/false);
+    if ((over_entries || !charge_ok) && store != nullptr) {
+      return transition_to_disk(spill_);
+    }
+    if (!charge_ok && store == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = StatusError(
+            StatusCode::kMemoryLimitExceeded,
+            "transaction write-set/version payload exceeds the query memory "
+            "limit and no spill store is configured (pool=query)");
+      }
+      return false;
+    }
+    spill_.insert(value);
+    ++total_count_;
+    return true;
+  }
+
+  const auto position =
+      std::lower_bound(small_.begin(), small_.end(), value, Less{});
+  if (position != small_.end() && *position == value) {
+    return true;
+  }
+  const size_t small_cap =
+      std::min(kSmallCapacity, std::max<size_t>(1, max_in_memory_entries));
+  if (small_.size() < small_cap) {
+    small_.insert(position, value);
+    ++total_count_;
+    return true;
+  }
+  if (small_.size() >= max_in_memory_entries && store != nullptr) {
+    return transition_to_disk(small_);
+  }
+  const size_t need_bytes = (small_.size() + 1) * kEntryChargeBytes;
+  if (!mem_charge_.TryAdd(need_bytes, /*respect_soft_limit=*/false)) {
+    if (store != nullptr) {
+      return transition_to_disk(small_);
+    }
+    if (error_out != nullptr) {
+      *error_out = StatusError(
+            StatusCode::kMemoryLimitExceeded,
+            "transaction write-set/version payload exceeds the query memory "
+            "limit and no spill store is configured (pool=query)");
+    }
     return false;
   }
-  *deleted = found->type == LogType::kLsmDelete;
-  *value = *deleted ? std::string() : found->redo_data;
+  std::unordered_set<RowPosition> replacement;
+  replacement.reserve(small_.size() + 1);
+  for (const RowPosition& entry : small_) {
+    replacement.insert(entry);
+  }
+  replacement.insert(value);
+  spill_.swap(replacement);
+  std::vector<RowPosition>().swap(small_);
+  spilled_ = true;
+  ++total_count_;
   return true;
+}
+
+TransactionWriteSet::size_type TransactionWriteSet::erase(
+    const value_type& value) {
+  if (disk_spilled_) {
+    const size_t n = std::erase(spill_tail_, value);
+    if (n > 0) {
+      total_count_ = total_count_ >= n ? total_count_ - n : 0;
+      return n;
+    }
+    // The value may already be in a flushed spill segment, which this
+    // in-memory erase cannot reach; report 0 instead of lying to the caller.
+    return 0;
+  }
+  if (spilled_) {
+    const size_type n = spill_.erase(value);
+    if (n > 0 && total_count_ > 0) {
+      --total_count_;
+      mem_charge_.Release(kEntryChargeBytes);
+    }
+    return n;
+  }
+  const auto position =
+      std::lower_bound(small_.begin(), small_.end(), value, Less{});
+  if (position == small_.end() || *position != value) {
+    return 0;
+  }
+  small_.erase(position);
+  if (total_count_ > 0) {
+    --total_count_;
+  }
+  return 1;
+}
+
+Status TransactionWriteSet::ForEach(
+    const std::function<Status(const RowPosition&)>& fn) {
+  if (!disk_spilled_) {
+    if (spilled_) {
+      for (const RowPosition& rp : spill_) {
+        RETURN_IF_FAIL(fn(rp));
+      }
+    } else {
+      for (const RowPosition& rp : small_) {
+        RETURN_IF_FAIL(fn(rp));
+      }
+    }
+    return Status::kSuccess;
+  }
+  for (const RowPosition& rp : spill_tail_) {
+    RETURN_IF_FAIL(fn(rp));
+  }
+  // Keep the tail until Finish succeeds: if the writer fails, a retrying
+  // ForEach must see these rows again instead of silently dropping them.
+  SpillSegmentId seg_id = spill_segment_id_;
+  if (segment_writer_ != nullptr) {
+    ASSIGN_OR_RETURN(SpillSegmentId, finished_seg,
+                     segment_writer_->Finish(/*keep_empty=*/false));
+    seg_id = finished_seg;
+    segment_writer_.reset();
+    spill_segment_id_ = kInvalidSpillSegmentId;
+    std::vector<RowPosition>().swap(spill_tail_);
+  }
+  if (seg_id != kInvalidSpillSegmentId && spill_store_ != nullptr) {
+    const auto store = spill_store_;
+    UnwindGuard drop_guard([&store, seg_id] { store->DropSegment(seg_id); });
+    SpillSegmentReader reader(store.get(), seg_id, kSpillBufferBytes);
+    RETURN_IF_FAIL(reader.Open());
+    std::array<RowPosition, 512> batch{};
+    while (!reader.Eof()) {
+      ASSIGN_OR_RETURN(size_t, bytes,
+                       reader.ReadUpTo(batch.data(), sizeof(batch)));
+      if (bytes == 0) {
+        break;
+      }
+      const size_t count = bytes / sizeof(RowPosition);
+      for (size_t i = 0; i < count; ++i) {
+        RETURN_IF_FAIL(fn(batch[i]));
+      }
+    }
+  }
+  clear();
+  return Status::kSuccess;
+}
+
+void TransactionWriteSet::clear() {
+  std::vector<RowPosition>().swap(small_);
+  std::unordered_set<RowPosition>().swap(spill_);
+  std::vector<RowPosition>().swap(spill_tail_);
+  if (segment_writer_ != nullptr) {
+    segment_writer_->Abort();
+    segment_writer_.reset();
+  }
+  if (spill_segment_id_ != kInvalidSpillSegmentId && spill_store_ != nullptr) {
+    spill_store_->DropSegment(spill_segment_id_);
+  }
+  spill_segment_id_ = kInvalidSpillSegmentId;
+  spill_store_.reset();
+  mem_charge_.ReleaseAll();
+  total_count_ = 0;
+  spilled_ = false;
+  disk_spilled_ = false;
+}
+
+bool Transaction::FindPendingLsmWrite(page_id_t root, std::string_view key,
+                                      std::string* value, bool* deleted) const {
+  bool reread = false;
+  {
+    std::scoped_lock guard(chain_mu_);
+    reread = wal_reread_mode_;
+    if (!reread) {
+      const auto records = std::views::reverse(staged_records_);
+      const auto found =
+          std::ranges::find_if(records, [&](const LogRecord& record) {
+            return record.pid == root && record.key == key &&
+                   (record.type == LogType::kLsmPut ||
+                    record.type == LogType::kLsmDelete);
+          });
+      if (found == records.end()) {
+        return false;
+      }
+      *deleted = found->type == LogType::kLsmDelete;
+      *value = *deleted ? std::string() : found->redo_data;
+      return true;
+    }
+  }
+  return transaction_manager_ != nullptr &&
+         transaction_manager_->FindPendingLsmWriteViaWal(*this, root, key,
+                                                         value, deleted);
 }
 
 void Transaction::ForEachPendingLsmWrite(
     page_id_t root, std::string_view key,
     const std::function<void(const LogRecord&)>& fn) const {
-  std::scoped_lock guard(chain_mu_);
-  for (const LogRecord& record : staged_records_) {
-    if (record.pid == root && record.key == key &&
-        (record.type == LogType::kLsmPut ||
-         record.type == LogType::kLsmDelete)) {
-      fn(record);
+  bool reread = false;
+  {
+    std::scoped_lock guard(chain_mu_);
+    reread = wal_reread_mode_;
+    if (!reread) {
+      for (const LogRecord& record : staged_records_) {
+        if (record.pid == root && record.key == key &&
+            (record.type == LogType::kLsmPut ||
+             record.type == LogType::kLsmDelete)) {
+          fn(record);
+        }
+      }
+      return;
     }
+  }
+  if (transaction_manager_ != nullptr) {
+    transaction_manager_->ForEachPendingLsmWriteViaWal(*this, root, key, fn);
   }
 }
 
@@ -122,6 +477,9 @@ void Transaction::FinishRunningNoexcept() noexcept {
             failed_.store(true, std::memory_order_release);
           }
         }
+        staged_charge_.ReleaseAll();
+        staged_bytes_ = 0;
+        wal_reread_mode_ = false;
         try {
           manager->AbortVersions(*this);
         } catch (...) {
@@ -171,9 +529,9 @@ Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
       // timestamp cannot be read safely before registration).
       snapshot_ts_(0),
       shard_epoch_(NextShardEpoch()),
+      transaction_manager_(tm),
       status_(TransactionStatus::kRunning),
-      read_only_(read_only),
-      transaction_manager_(tm) {}
+      read_only_(read_only) {}
 
 // Begin() registers the address of the Transaction it is about to return.
 // NRVO usually makes that address the final one; when the return instead
@@ -183,32 +541,45 @@ Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
 Transaction::Transaction(Transaction&& o) noexcept
     : txn_id_(o.txn_id_),
       snapshot_ts_(o.snapshot_ts_),
-      read_set_(std::move(o.read_set_)),
-      write_set_(std::move(o.write_set_)),
-      recycled_page_allocations_(std::move(o.recycled_page_allocations_)),
-      mutated_index_roots_(std::move(o.mutated_index_roots_)),
-      index_undo_reservations_(std::move(o.index_undo_reservations_)),
-      staged_records_(std::move(o.staged_records_)),
+      read_set_count_(o.read_set_count_),
+      staged_bytes_(o.staged_bytes_),
       shard_epoch_(o.shard_epoch_),
       write_epoch_(o.write_epoch_.load(std::memory_order_acquire)),
-      version_read_caches_(std::move(o.version_read_caches_)),
       read_state_mutex_(std::move(o.read_state_mutex_)),
-      serialization_scratch_(std::move(o.serialization_scratch_)),
       // chain_mu_ is not in the init list on purpose: it stays per-object.
       prev_lsn_(o.prev_lsn_.load(std::memory_order_relaxed)),
       prev_end_lsn_(o.prev_end_lsn_.load(std::memory_order_relaxed)),
       first_lsn_(o.first_lsn_.load(std::memory_order_relaxed)),
-      has_log_(o.has_log_.load(std::memory_order_relaxed)),
-      has_table_drop_(o.has_table_drop_.load(std::memory_order_acquire)),
-      finish_hooks_(std::move(o.finish_hooks_)),
-      finish_hooks_finalized_(o.finish_hooks_finalized_),
       durability_dependence_(
           o.durability_dependence_.load(std::memory_order_acquire)),
+      transaction_manager_(o.transaction_manager_),
+      statement_timeout_ms_(
+          o.statement_timeout_ms_.load(std::memory_order_relaxed)),
+      statement_deadline_ns_(
+          o.statement_deadline_ns_.load(std::memory_order_relaxed)),
+      recycled_page_allocations_(std::move(o.recycled_page_allocations_)),
+      mutated_index_roots_(std::move(o.mutated_index_roots_)),
+      index_undo_reservations_(std::move(o.index_undo_reservations_)),
+      staged_records_(std::move(o.staged_records_)),
+      staged_charge_(std::move(o.staged_charge_)),
+      finish_hooks_(std::move(o.finish_hooks_)),
+      serialization_scratch_(std::move(o.serialization_scratch_)),
+      read_set_(std::move(o.read_set_)),
+      version_read_caches_(std::move(o.version_read_caches_)),
+      write_set_(std::move(o.write_set_)),
+      write_set_spill_store_(std::move(o.write_set_spill_store_)),
+      wal_reread_mode_(o.wal_reread_mode_),
+      has_log_(o.has_log_.load(std::memory_order_relaxed)),
+      has_table_drop_(o.has_table_drop_.load(std::memory_order_acquire)),
+      finish_hooks_finalized_(o.finish_hooks_finalized_),
       status_(o.status_.load(std::memory_order_relaxed)),
       failed_(o.failed_.load(std::memory_order_acquire)),
       read_only_(o.read_only_),
-      transaction_manager_(o.transaction_manager_),
-      wounded_(o.wounded_.load(std::memory_order_acquire)) {
+      wounded_(o.wounded_.load(std::memory_order_acquire)),
+      abort_started_(o.abort_started_.load(std::memory_order_acquire)),
+      catalog_dirty_(o.catalog_dirty_),
+      intent_wait_failure_(o.intent_wait_failure_),
+      write_set_failure_status_(std::move(o.write_set_failure_status_)) {
   debug_phase_.store(o.debug_phase_.load(std::memory_order_relaxed),
                      std::memory_order_relaxed);
   debug_tid_.store(o.debug_tid_.load(std::memory_order_relaxed),
@@ -221,6 +592,9 @@ Transaction::Transaction(Transaction&& o) noexcept
   o.transaction_manager_ = nullptr;
   o.finish_hooks_.clear();
   o.finish_hooks_finalized_ = true;
+  o.wal_reread_mode_ = false;
+  o.staged_bytes_ = 0;
+  o.read_set_count_ = 0;
 }
 
 Status Transaction::PreCommit() { return PreCommitImpl(nullptr); }
@@ -236,13 +610,15 @@ Status Transaction::PreCommitImpl(lsn_t* external_durability_target) {
     return Status::kRuntimeError;
   }
   if (IsFailed()) {
+    Status abort_status = Status::kRuntimeError;
     try {
-      (void)Abort();
+      abort_status = Abort();
     } catch (...) {
       failed_.store(true, std::memory_order_release);
     }
     FinishRunningNoexcept();
-    return Status::kRuntimeError;
+    return abort_status != Status::kSuccess ? abort_status
+                                            : Status::kRuntimeError;
   }
   if (transaction_manager_ == nullptr) {
     return Status::kRuntimeError;
@@ -285,6 +661,9 @@ Status Transaction::Abort() {
           txn_id_, staged_records_);
       staged_records_.clear();
     }
+    staged_charge_.ReleaseAll();
+    staged_bytes_ = 0;
+    wal_reread_mode_ = false;
     transaction_manager_->AbortVersions(*this);
     status_.store(TransactionStatus::kAborted, std::memory_order_release);
     transaction_manager_->ForgetTransaction(*this);
@@ -298,22 +677,55 @@ bool Transaction::AddReadSet(const RowPosition& rp) {
   assert(!IsFinished());
   // MV2PL readers use snapshot-visible row versions and therefore never take
   // a lock that conflicts with a writer's exclusive lock.
-  // Hash joins may consume both children concurrently.  Index scans on those
-  // children register their reads against the same transaction, so protect
-  // the diagnostic set just like the version-cache state.
+  // Keep a bounded diagnostic sample in RAM so large scans never blow kTx.
   std::scoped_lock state_guard(*read_state_mutex_);
-  read_set_.insert(rp);
+  ++read_set_count_;
+  if (read_set_.size() < kMaxDiagnosticReadSetEntries) {
+    read_set_.insert(rp);
+  }
   return true;
+}
+
+bool Transaction::TryInsertWriteSet(const RowPosition& rp, Status* error_out) {
+  std::shared_ptr<SpillStore> store;
+  size_t threshold = 4096;
+  if (transaction_manager_ != nullptr) {
+    threshold = transaction_manager_->EffectiveWriteSetSpillThresholdEntries();
+    if (!write_set_.IsDiskSpilled()) {
+      // P472: the manager's spill store never changes once created, so
+      // fetch (and mutex-guard) it at most once per transaction instead of
+      // taking the global write_set_spill_mu_ on every insert while the
+      // write set sits in the 64..threshold pre-spill window.
+      if (write_set_spill_store_ == nullptr &&
+          write_set_.size() >= std::min<size_t>(threshold, 64)) {
+        write_set_spill_store_ =
+            transaction_manager_->GetOrCreateWriteSetSpillStore();
+      }
+      store = write_set_spill_store_;
+    }
+  }
+  uint64_t spilled_bytes = 0;
+  bool initial_spill = false;
+  const bool ok = write_set_.TryInsert(rp, store, threshold, &spilled_bytes,
+                                       &initial_spill, error_out);
+  if (transaction_manager_ != nullptr && (initial_spill || spilled_bytes > 0)) {
+    transaction_manager_->RecordWriteSetSpill(spilled_bytes, initial_spill);
+  }
+  return ok;
 }
 
 bool Transaction::AddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
+  write_set_failure_status_ = Status::kSuccess;
   // IsFinished() must be enforced, not just asserted: a stale caller that
   // keeps writing through a committed transaction would install a permanent
   // write intent that no PreCommit/Abort can ever release (both short-circuit
   // on a finished status), blocking that row for the life of the database.
-  if (IsFailed() || IsFinished() || read_only_ ||
-      transaction_manager_ == nullptr) {
+  if (IsFailed()) {
+    RecordWriteSetFailure(Status::kRuntimeError);
+    return false;
+  }
+  if (IsFinished() || read_only_ || transaction_manager_ == nullptr) {
     return false;
   }
   if (IsWounded()) {
@@ -322,33 +734,40 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   }
   if (transaction_manager_->FailStopped()) {
     RecordIntentWaitFailure(IntentWaitFailure::kFailStopped);
+    RecordWriteSetFailure(StatusError(StatusCode::kIOError,
+                                      "transaction manager is fail-stopped"));
     return false;
   }
-  if (write_set_.contains(rp)) {
+  if (HasWriteSet(rp)) {
     return true;
   }
-  write_set_.insert(rp);
   {
-    // If the acquire path unwinds (e.g. allocation failure), drop both the
-    // intent and the write-set entry before the failure propagates.
-    UnwindGuard rollback([this, &rp] {
-      transaction_manager_->ReleaseWriteIntent(*this, rp);
-      write_set_.erase(rp);
-    });
-    const bool acquired = transaction_manager_->AcquireWriteIntent(*this, rp, true);
-    rollback.Disarm();
-    if (acquired) {
-      return true;
+    UnwindGuard rollback(
+        [this, &rp] { transaction_manager_->ReleaseWriteIntent(*this, rp); });
+    if (!transaction_manager_->AcquireWriteIntent(*this, rp, true)) {
+      rollback.Disarm();
+      return false;
     }
+    Status insert_err = Status::kSuccess;
+    if (!TryInsertWriteSet(rp, &insert_err)) {
+      RecordWriteSetFailure(insert_err != Status::kSuccess
+                                ? std::move(insert_err)
+                                : Status::kMemoryLimitExceeded);
+      return false;
+    }
+    rollback.Disarm();
+    return true;
   }
-  write_set_.erase(rp);
-  return false;
 }
 
 bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
   assert(!IsFinished());
-  if (IsFailed() || IsFinished() || read_only_ ||
-      transaction_manager_ == nullptr) {
+  write_set_failure_status_ = Status::kSuccess;
+  if (IsFailed()) {
+    RecordWriteSetFailure(Status::kRuntimeError);
+    return false;
+  }
+  if (IsFinished() || read_only_ || transaction_manager_ == nullptr) {
     return false;
   }
   if (IsWounded()) {
@@ -357,9 +776,11 @@ bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
   }
   if (transaction_manager_->FailStopped()) {
     RecordIntentWaitFailure(IntentWaitFailure::kFailStopped);
+    RecordWriteSetFailure(StatusError(StatusCode::kIOError,
+                                      "transaction manager is fail-stopped"));
     return false;
   }
-  if (write_set_.contains(rp)) {
+  if (HasWriteSet(rp)) {
     // The write set may have pre-reserved this row without a before-image
     // (TryAddWriteSet); re-acquire so the image is recorded and concurrent
     // snapshots keep seeing the pre-update value.
@@ -370,28 +791,33 @@ bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
     }
     return acquired;
   }
-  write_set_.insert(rp);
   {
-    // If the acquire path unwinds (e.g. allocation failure), drop both the
-    // intent and the write-set entry before the failure propagates.
-    UnwindGuard rollback([this, &rp] {
-      transaction_manager_->ReleaseWriteIntent(*this, rp);
-      write_set_.erase(rp);
-    });
-    const bool acquired = transaction_manager_->AcquireWriteIntent(*this, rp, true, before);
-    rollback.Disarm();
-    if (acquired) {
-      return true;
+    UnwindGuard rollback(
+        [this, &rp] { transaction_manager_->ReleaseWriteIntent(*this, rp); });
+    if (!transaction_manager_->AcquireWriteIntent(*this, rp, true, before)) {
+      rollback.Disarm();
+      return false;
     }
+    Status insert_err = Status::kSuccess;
+    if (!TryInsertWriteSet(rp, &insert_err)) {
+      RecordWriteSetFailure(insert_err != Status::kSuccess
+                                ? std::move(insert_err)
+                                : Status::kMemoryLimitExceeded);
+      return false;
+    }
+    rollback.Disarm();
+    return true;
   }
-  write_set_.erase(rp);
-  return false;
 }
 
 bool Transaction::TryAddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
-  if (IsFailed() || IsFinished() || read_only_ ||
-      transaction_manager_ == nullptr) {
+  write_set_failure_status_ = Status::kSuccess;
+  if (IsFailed()) {
+    RecordWriteSetFailure(Status::kRuntimeError);
+    return false;
+  }
+  if (IsFinished() || read_only_ || transaction_manager_ == nullptr) {
     return false;
   }
   if (IsWounded()) {
@@ -400,27 +826,42 @@ bool Transaction::TryAddWriteSet(const RowPosition& rp) {
   }
   if (transaction_manager_->FailStopped()) {
     RecordIntentWaitFailure(IntentWaitFailure::kFailStopped);
+    RecordWriteSetFailure(StatusError(StatusCode::kIOError,
+                                      "transaction manager is fail-stopped"));
     return false;
   }
-  if (write_set_.contains(rp)) {
+  if (HasWriteSet(rp)) {
     return true;
   }
-  write_set_.insert(rp);
   {
-    // If the acquire path unwinds (e.g. allocation failure), drop both the
-    // intent and the write-set entry before the failure propagates.
-    UnwindGuard rollback([this, &rp] {
-      transaction_manager_->ReleaseWriteIntent(*this, rp);
-      write_set_.erase(rp);
-    });
-    const bool acquired = transaction_manager_->AcquireWriteIntent(*this, rp, false);
-    rollback.Disarm();
-    if (acquired) {
-      return true;
+    UnwindGuard rollback(
+        [this, &rp] { transaction_manager_->ReleaseWriteIntent(*this, rp); });
+    if (!transaction_manager_->AcquireWriteIntent(*this, rp, false)) {
+      rollback.Disarm();
+      return false;
     }
+    Status insert_err = Status::kSuccess;
+    if (!TryInsertWriteSet(rp, &insert_err)) {
+      RecordWriteSetFailure(insert_err != Status::kSuccess
+                                ? std::move(insert_err)
+                                : Status::kMemoryLimitExceeded);
+      return false;
+    }
+    rollback.Disarm();
+    return true;
   }
-  write_set_.erase(rp);
-  return false;
+}
+
+bool Transaction::WriteIntentUnavailable(const RowPosition& rp) const {
+  if (IsFailed() || IsFinished() || read_only_ ||
+      transaction_manager_ == nullptr || IsWounded() ||
+      transaction_manager_->FailStopped()) {
+    return true;
+  }
+  if (HasWriteSet(rp)) {
+    return false;
+  }
+  return transaction_manager_->HasForeignWriteIntent(*this, rp);
 }
 
 bool Transaction::SnapshotSeesRow(const RowPosition& rp) const {
@@ -546,11 +987,10 @@ StatusOr<std::string_view> Transaction::ReadVersion(
     // directly and bound it the same way.
     shard.retired.push_back(std::move(*served));
     if (shard.retired.size() > kMaxRetiredViews) {
-      shard.retired.erase(
-          shard.retired.begin(),
-          shard.retired.begin() +
-              static_cast<std::ptrdiff_t>(shard.retired.size() -
-                                          (kMaxRetiredViews / 2)));
+      shard.retired.erase(shard.retired.begin(),
+                          shard.retired.begin() + static_cast<std::ptrdiff_t>(
+                                                      shard.retired.size() -
+                                                      (kMaxRetiredViews / 2)));
     }
     return std::string_view(shard.retired.back());
   }
@@ -577,7 +1017,10 @@ StatusOr<std::string_view> Transaction::ReadVersion(
   // The retired pool exists so recently evicted strings stay alive while a
   // consumer finishes with their views.  Once it grows past its bound the
   // oldest half is beyond any plausible in-flight view window and is freed;
-  // this bounds total cache memory at roughly twice the live-entry budget.
+  // this bounds the NUMBER of retired strings at roughly twice the
+  // live-entry count. Each string is a full row image, so a workload of very
+  // wide VARCHAR rows can still consume far more than 2x the live bytes;
+  // the bound is on entry count, not memory.
   if (shard.retired.size() > kMaxRetiredViews) {
     shard.retired.erase(shard.retired.begin(),
                         shard.retired.begin() +
@@ -601,13 +1044,8 @@ void Transaction::RegisterVersionWrite(const RowPosition& rp,
   // their readers.
   write_epoch_.fetch_add(1, std::memory_order_release);
   transaction_manager_->RegisterVersionWrite(*this, rp, before, after);
-  // Drop this thread's own copy eagerly to bound memory; other threads'
-  // shards keep theirs until natural eviction, neutralized by the epoch tag.
-  auto found = version_read_caches_.find(std::this_thread::get_id());
-  if (found != version_read_caches_.end()) {
-    std::scoped_lock shard_lock(found->second->mutex);
-    found->second->entries.erase(rp);
-  }
+  // Only read-only transactions populate their thread-local cache, and this
+  // write path cannot be one; the epoch bump above invalidates every shard.
 }
 
 bool Transaction::CancelStagedVersion(const RowPosition& rp) {
@@ -627,6 +1065,12 @@ bool Transaction::CancelStagedVersion(const RowPosition& rp) {
       canceled = true;
     } else if (found->second.pending && found->second.pending->owner == ID() &&
                found->second.pending->staged) {
+      // Release the payload accounting before dropping the staged version:
+      // every sibling path (ReleaseWriteIntent / AbortVersions /
+      // CommitVersions) does this, and the write-set erase below means no
+      // later abort can recover the charge if we skip it here.
+      transaction_manager_->ReleaseVersionPayloadBytes(
+          found->second.pending->payload.InlineBytes());
       found->second.pending.reset();
       shard.write_intent_released.notify_all();
       canceled = true;
@@ -707,8 +1151,31 @@ StatusOr<lsn_t> Transaction::AppendLog(const LogRecord& lr) {
   if (record.type != LogType::kBegin && record.type != LogType::kCommit &&
       record.type != LogType::kAbort &&
       record.type != LogType::kBeginCheckpoint &&
-      record.type != LogType::kEndCheckpoint) {
-    staged_records_.push_back(std::move(record));
+      record.type != LogType::kEndCheckpoint && !wal_reread_mode_) {
+    // Account for the serialized record (header + payload + CRC), not the
+    // in-memory LogRecord struct; the latter overcounts small records by ~100x.
+    const size_t rec_bytes = record.Size();
+    const bool can_reread =
+        transaction_manager_ != nullptr && transaction_manager_->CanWalReread();
+    const size_t limit =
+        transaction_manager_ != nullptr
+            ? transaction_manager_->EffectiveWalRereadThresholdBytes()
+            : TransactionManager::kDefaultWalRereadThresholdBytes;
+    if (can_reread &&
+        (staged_bytes_ + rec_bytes > limit ||
+         !staged_charge_.TryAdd(rec_bytes, /*respect_soft_limit=*/false))) {
+      wal_reread_mode_ = true;
+      std::vector<LogRecord>().swap(staged_records_);
+      staged_charge_.ReleaseAll();
+      staged_bytes_ = 0;
+      transaction_manager_->RecordWalRereadActivation();
+    } else {
+      if (!can_reread) {
+        (void)staged_charge_.TryAdd(rec_bytes, /*respect_soft_limit=*/false);
+      }
+      staged_bytes_ += rec_bytes;
+      staged_records_.push_back(std::move(record));
+    }
   }
   DebugSetPhase(nullptr);
   return start;
@@ -813,8 +1280,145 @@ Status Transaction::CommitWait() const {
   if (transaction_manager_ == nullptr) {
     return Status::kSuccess;
   }
-  return transaction_manager_->WaitForWALDurable(
+  return transaction_manager_->WaitForWalDurable(
       std::max(PrevRecordEndLSN(), DurabilityDependence()));
+}
+
+namespace {
+std::atomic<int64_t>& StatementTimeoutOverrideMs() noexcept {
+  static std::atomic<int64_t> val{-1};
+  return val;
+}
+thread_local int64_t tl_statement_deadline_ns = 0;
+
+Status CheckDeadlineNs(int64_t deadline) noexcept {
+  if (deadline == 0) {
+    return Status::kSuccess;
+  }
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  if (now_ns >= deadline) {
+    return StatusError(StatusCode::kQueryCanceled,
+                       "statement timeout exceeded");
+  }
+  return Status::kSuccess;
+}
+}  // namespace
+
+void Transaction::SetDefaultStatementTimeoutForTest(
+    std::chrono::milliseconds timeout) noexcept {
+  StatementTimeoutOverrideMs().store(timeout.count(),
+                                     std::memory_order_release);
+}
+
+std::chrono::milliseconds Transaction::DefaultStatementTimeout() noexcept {
+  const int64_t over =
+      StatementTimeoutOverrideMs().load(std::memory_order_acquire);
+  if (over >= 0) {
+    return std::chrono::milliseconds(over);
+  }
+  static const int64_t kEnvTimeoutMs = []() -> int64_t {
+    const char* raw = std::getenv("TINYLAMB_STATEMENT_TIMEOUT_MS");
+    if (raw == nullptr || *raw == '\0') {
+      return 0;
+    }
+    char* end = nullptr;
+    if (raw[0] == '-') {
+      return 0;
+    }
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(raw, &end, 10);
+    if (errno == ERANGE || end == raw || *end != '\0' ||
+        parsed > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      return 0;
+    }
+    return static_cast<int64_t>(parsed);
+  }();
+  return std::chrono::milliseconds(kEnvTimeoutMs);
+}
+
+namespace {
+// ms * 1e6 and now_ns + delta can both overflow int64 for extreme timeout
+// values (e.g. a corrupt TINYLAMB_STATEMENT_TIMEOUT_MS). Saturate instead of
+// invoking undefined behaviour, which would make the deadline wrap into the
+// past (instant timeout) or a small positive value (effectively unbounded).
+int64_t SaturatingDeadlineNs(int64_t now_ns, int64_t ms) noexcept {
+  if (ms <= 0) {
+    return 0;
+  }
+  int64_t delta = 0;
+  if (__builtin_mul_overflow(ms, INT64_C(1000000), &delta) || delta < 0) {
+    return INT64_MAX;
+  }
+  int64_t deadline = 0;
+  if (__builtin_add_overflow(now_ns, delta, &deadline)) {
+    return INT64_MAX;
+  }
+  return deadline;
+}
+}  // namespace
+
+void Transaction::SetStatementTimeout(
+    std::chrono::milliseconds timeout) noexcept {
+  const int64_t ms = timeout.count();
+  statement_timeout_ms_.store(ms, std::memory_order_release);
+  if (ms > 0) {
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    statement_deadline_ns_.store(SaturatingDeadlineNs(now_ns, ms),
+                                 std::memory_order_release);
+  } else {
+    statement_deadline_ns_.store(0, std::memory_order_release);
+  }
+}
+
+std::chrono::milliseconds Transaction::StatementTimeout() const noexcept {
+  const int64_t ms = statement_timeout_ms_.load(std::memory_order_acquire);
+  if (ms >= 0) {
+    return std::chrono::milliseconds(ms);
+  }
+  return DefaultStatementTimeout();
+}
+
+void Transaction::BeginStatementTimer() noexcept {
+  const int64_t ms = StatementTimeout().count();
+  if (ms > 0) {
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    statement_deadline_ns_.store(SaturatingDeadlineNs(now_ns, ms),
+                                 std::memory_order_release);
+  } else {
+    statement_deadline_ns_.store(0, std::memory_order_release);
+  }
+}
+
+Status Transaction::CheckStatementTimeout() const noexcept {
+  return CheckDeadlineNs(
+      statement_deadline_ns_.load(std::memory_order_relaxed));
+}
+
+Transaction::ScopedThreadStatementDeadline::ScopedThreadStatementDeadline(
+    int64_t deadline_ns) noexcept
+    : prev_deadline_ns_(tl_statement_deadline_ns) {
+  if (deadline_ns != 0) {
+    tl_statement_deadline_ns = prev_deadline_ns_ == 0
+                                   ? deadline_ns
+                                   : std::min(prev_deadline_ns_, deadline_ns);
+  }
+}
+
+Transaction::ScopedThreadStatementDeadline::~ScopedThreadStatementDeadline() {
+  tl_statement_deadline_ns = prev_deadline_ns_;
+}
+
+Status Transaction::CheckThreadStatementTimeout() noexcept {
+  return CheckDeadlineNs(tl_statement_deadline_ns);
 }
 
 }  // namespace tinylamb

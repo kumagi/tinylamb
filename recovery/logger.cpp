@@ -38,6 +38,7 @@
 #include "common/constants.hpp"
 #include "common/crc32c.hpp"
 #include "common/log_message.hpp"
+#include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
 #include "common/serdes.hpp"
 
@@ -183,6 +184,14 @@ StatusOr<FixedTail> ReadFixedTail(int fd, uint64_t index, size_t size,
   if (platform::FileSize(fd, &file_size) != 0) {
     return StatusError(StatusCode::kIOError, "Failed to stat fixed WAL frame");
   }
+  if (file_size == 0) {
+    // Crash residue between creating the segment file and materializing its
+    // frame + footers: no append can have landed before initialization, so
+    // the logical end is provably 0. Treat the frame as empty-and-valid
+    // (mirroring the legacy WAL's zero-length exemption for force-free
+    // reopens); the opener re-initializes it.
+    return FixedTail{};
+  }
   bool valid =
       file_size >= 0 &&
       size <= static_cast<size_t>(std::numeric_limits<int64_t>::max()) -
@@ -291,6 +300,14 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
     return StatusError(StatusCode::kCorrupt,
                        "WAL segment metadata is truncated: " + path.string());
   }
+  char trailing = 0;
+  in.read(&trailing, 1);
+  if (in.gcount() > 0) {
+    return StatusError(StatusCode::kCorrupt,
+                       "WAL segment metadata has trailing bytes: " +
+                           path.string());
+  }
+  in.clear();
   uint32_t magic = 0;
   uint32_t version = 0;
   uint64_t segment_size = 0;
@@ -309,10 +326,13 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
         StatusCode::kCorrupt,
         "WAL segment metadata checksum/version mismatch: " + path.string());
   }
-  if (segment_size > std::numeric_limits<size_t>::max()) {
-    return StatusError(
-        StatusCode::kCorrupt,
-        "WAL segment size does not fit this platform: " + path.string());
+  // A segment size must leave room for the LSN arithmetic that multiplies
+  // it by a segment index; reject implausibly large values even on 64-bit.
+  constexpr uint64_t kMaxSegmentSize = uint64_t{1} << 40;  // 1 TiB
+  if (segment_size > kMaxSegmentSize) {
+    return StatusError(StatusCode::kCorrupt,
+                       "WAL segment size is implausibly large: " +
+                           path.string());
   }
   if (fixed_size != nullptr) {
     *fixed_size = version == 2U;
@@ -323,7 +343,8 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
 Status Logger::WriteSegmentMetadata(const std::filesystem::path& base,
                                     size_t segment_size, bool fixed_size) {
   if (segment_size == 0) {
-    return StatusError(StatusCode::kIOError, "WAL segment size must be > 0");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "WAL segment size must be > 0");
   }
   const std::filesystem::path path = SegmentMetadataPath(base);
   std::error_code ec;
@@ -429,7 +450,10 @@ StatusOr<size_t> Logger::SegmentLogicalSize(const std::filesystem::path& base,
                        "Failed to read fixed WAL " + path.string());
   }
   auto tail = ReadFixedTail(fd, index, segment_size, allow_torn_footer);
-  platform::CloseFile(fd);
+  if (platform::CloseFile(fd) != 0 && tail.HasValue()) {
+    return StatusError(StatusCode::kIOError,
+                       "Failed to close fixed WAL " + path.string());
+  }
   if (!tail.HasValue()) {
     return tail.GetStatus();
   }
@@ -502,7 +526,17 @@ StatusOr<uint64_t> Logger::FindHighestSegment(const std::filesystem::path& base,
   }
   ec.clear();
   for (const std::filesystem::directory_entry& entry : it) {
-    if (!entry.is_regular_file(ec)) {
+    if (ec) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to scan " + dir.string() + ": " + ec.message());
+    }
+    const bool regular = entry.is_regular_file(ec);
+    if (ec) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to inspect " + entry.path().string() + ": " +
+                             ec.message());
+    }
+    if (!regular) {
       continue;
     }
     const std::string name = entry.path().filename().string();
@@ -538,7 +572,17 @@ StatusOr<uint64_t> Logger::FindLowestSegment(const std::filesystem::path& base,
   }
   ec.clear();
   for (const std::filesystem::directory_entry& entry : it) {
-    if (!entry.is_regular_file(ec)) {
+    if (ec) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to scan " + dir.string() + ": " + ec.message());
+    }
+    const bool regular = entry.is_regular_file(ec);
+    if (ec) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to inspect " + entry.path().string() + ": " +
+                             ec.message());
+    }
+    if (!regular) {
       continue;
     }
     const std::string name = entry.path().filename().string();
@@ -660,7 +704,7 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
   close_src();
   RETURN_IF_FAIL(SyncDirectoryOf(base));
   LOG(INFO) << "Folded legacy WAL " << base.string() << " (" << file_size
-            << " bytes) into " << index << " overflow segment file(s)";
+            << " bytes) into " << (index - 1) << " overflow segment file(s)";
   return Status::kSuccess;
 }
 
@@ -668,7 +712,8 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
     const std::filesystem::path& logfile, size_t buffer_size, size_t every_ms,
     size_t segment_size, bool preallocate_new_series, bool allow_torn_footer) {
   if (segment_size == 0) {
-    return StatusError(StatusCode::kIOError, "WAL segment size must be > 0");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "WAL segment size must be > 0");
   }
   // A crash between WriteSegmentMetadata's temp write and its rename leaves
   // the temp behind; the next write overwrites it, so removal is pure
@@ -764,6 +809,17 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
   ASSIGN_OR_RETURN(int, fd, CreateFile(start_path));
   FixedTail fixed_tail;
   if (fixed_size) {
+    int64_t existing_frame_size = -1;
+    if (existed && platform::FileSize(fd, &existing_frame_size) != 0) {
+      platform::CloseFile(fd);
+      return StatusError(StatusCode::kIOError,
+                         "Failed to stat fixed WAL frame");
+    }
+    // A zero-length frame is crash residue between the segment file's
+    // creation and its materialization + footer sync; no record could have
+    // been appended before initialization, so it is repaired by re-init
+    // rather than failing the open with kCorrupt (P425/390).
+    const bool zero_length_frame = existed && existing_frame_size == 0;
     StatusOr<FixedTail> tail =
         existed
             ? ReadFixedTail(fd, start_segment, segment_size, allow_torn_footer)
@@ -776,11 +832,12 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
     // Rewriting both slots is only needed for a new or explicitly repaired
     // frame. A normal reopen keeps the alternating generation history.
     const bool needs_init =
-        !existed ||
+        !existed || zero_length_frame ||
         !ReadFixedTail(fd, start_segment, segment_size, false).HasValue();
     if (ClearAppend(fd) != 0 ||
-        (needs_init && InitializeFixedFile(fd, start_segment, segment_size,
-                                           fixed_tail.end, !existed) != 0)) {
+        (needs_init &&
+         InitializeFixedFile(fd, start_segment, segment_size, fixed_tail.end,
+                             !existed || zero_length_frame) != 0)) {
       const int saved = errno;
       platform::CloseFile(fd);
       return StatusError(StatusCode::kIOError,
@@ -799,8 +856,12 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
   // first RecycleUpTo must not walk that prefix.
   bool any_lowest = false;
   uint64_t lowest_segment = 0;
-  if (auto scanned = FindLowestSegment(logfile, &any_lowest);
-      scanned.HasValue() && any_lowest) {
+  auto scanned = FindLowestSegment(logfile, &any_lowest);
+  if (!scanned.HasValue()) {
+    platform::CloseFile(fd);
+    return scanned.GetStatus();
+  }
+  if (any_lowest) {
     lowest_segment = scanned.Value();
   }
   std::error_code ec;
@@ -828,15 +889,43 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
   }
   // std::thread has no noexcept construction path; EAGAIN/ENOMEM from the
   // pthread layer is caught at this boundary and mapped to a Status.
+  const size_t buf_bytes = std::max<size_t>(1, buffer_size);
+  ProcessMemoryCharge buf_charge(MemoryPoolKind::kTx);
+  bool used_emergency = false;
+  if (!buf_charge.TryAddWithReclaim(buf_bytes)) {
+    // T1835: ReserveEmergency caps the AGGREGATE emergency ledger against
+    // EmergencyLimit(). A grant marks the buffer emergency-backed (its
+    // ReleaseEmergency is gated on this flag). A rejection for a request
+    // larger than the whole cap keeps the historical kMemoryLimitExceeded
+    // error; a rejection caused only by aggregate exhaustion keeps the
+    // must-succeed contract by proceeding untracked (recovery cannot be
+    // declined because other emergency users got here first).
+    if (ProcessMemoryBudget::Global().ReserveEmergency(MemoryPoolKind::kTx,
+                                                       buf_bytes)) {
+      used_emergency = true;
+    } else if (buf_bytes > ProcessMemoryBudget::Global().EmergencyLimit()) {
+      platform::CloseFile(fd);
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "memory limit exceeded allocating WAL buffer (" +
+                             std::to_string(buf_bytes) +
+                             " bytes in pool 'tx')");
+    }
+  }
   std::unique_ptr<Logger> logger;
   try {
     logger = std::unique_ptr<Logger>(
         new Logger(logfile, buffer_size, every_ms, segment_size));  // NOLINT
-  } catch (const std::bad_alloc&) {
-    // The fd is still owned by this frame; ~Logger has not run, so close it
-    // here or the descriptor leaks on an allocation failure.
+    logger->wal_buffer_charge_ = std::move(buf_charge);
+    logger->wal_buffer_emergency_ = used_emergency;
+  } catch (...) {
+    // vector can throw length_error (not only bad_alloc) for an insane
+    // buffer_size; release the fd and emergency reserve for any failure.
+    if (used_emergency) {
+      ProcessMemoryBudget::Global().ReleaseEmergency(MemoryPoolKind::kTx,
+                                                     buf_bytes);
+    }
     platform::CloseFile(fd);
-    return StatusError(StatusCode::kIOError,
+    return StatusError(StatusCode::kMemoryLimitExceeded,
                        "Failed to allocate logger for " + logfile.string());
   }
   // Transfer fd ownership before anything that can throw: the destructor
@@ -880,6 +969,12 @@ Logger::~Logger() {
     platform::CloseFile(dst_);
     dst_ = -1;
   }
+  if (wal_buffer_emergency_) {
+    ProcessMemoryBudget::Global().ReleaseEmergency(MemoryPoolKind::kTx,
+                                                   buffer_.size());
+    wal_buffer_emergency_ = false;
+  }
+  wal_buffer_charge_.ReleaseAll();
 }
 
 void Logger::NotifyWorker() {
@@ -911,14 +1006,14 @@ void Logger::SetFailed(int err) {
     const auto free_bytes = std::filesystem::space(
         std::filesystem::path(base_path_).parent_path(), ec);
     if (!ec) {
-      LOG(ERROR) << std::strerror(err) << " on WAL volume of " << base_path_
+      LOG(ERROR) << std::string(std::strerror(err)) << " on WAL volume of " << base_path_
                  << ": " << (free_bytes.available >> 20) << " MiB free of "
                  << (free_bytes.capacity >> 20) << " MiB";
     } else {
-      LOG(ERROR) << std::strerror(err) << " on WAL " << base_path_;
+      LOG(ERROR) << std::string(std::strerror(err)) << " on WAL " << base_path_;
     }
   } else {
-    LOG(ERROR) << std::strerror(err) << " (WAL " << base_path_ << ")";
+    LOG(ERROR) << std::string(std::strerror(err)) << " (WAL " << base_path_ << ")";
   }
   {
     std::scoped_lock lock(durable_mu_);
@@ -973,6 +1068,9 @@ int Logger::WriteFixedTail(size_t logical_end) {
 }
 
 int Logger::SyncSegment(size_t logical_end) {
+  // Time the whole sync path: in fixed-size mode the tail-slot pwrite and
+  // the pre-sync hook are part of making a barrier durable, not just fsync.
+  const auto begin = std::chrono::steady_clock::now();
   if (fixed_size_segments_) {
     if (logical_end == std::numeric_limits<size_t>::max()) {
       const lsn_t start = current_segment_ * static_cast<lsn_t>(segment_size_);
@@ -996,15 +1094,16 @@ int Logger::SyncSegment(size_t logical_end) {
       return -1;
     }
   }
-  const auto begin = std::chrono::steady_clock::now();
   const int result = FdataSync(dst_);
   const int saved = errno;
+  sync_seq_.fetch_add(1, std::memory_order_relaxed);  // odd: update in progress
   sync_count_.fetch_add(1, std::memory_order_relaxed);
   sync_ns_.fetch_add(static_cast<uint64_t>(
                          std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now() - begin)
                              .count()),
                      std::memory_order_relaxed);
+  sync_seq_.fetch_add(1, std::memory_order_release);  // even: pair published
   errno = saved;
   return result;
 }
@@ -1099,12 +1198,23 @@ Status Logger::RollToLocked(uint64_t index) {
   }
   if (fixed_size_segments_) {
     std::error_code ec;
-    const bool present =
-        std::filesystem::exists(SegmentPath(base_path_, index), ec);
-    if (ec || present) {
-      return StatusError(
-          StatusCode::kCorrupt,
-          "Refusing to overwrite an existing future WAL segment");
+    const auto future_path = SegmentPath(base_path_, index);
+    const bool present = std::filesystem::exists(future_path, ec);
+    if (ec) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to stat future WAL segment: " + ec.message());
+    }
+    if (present) {
+      // A zero-length residue of a crash between the segment file's creation
+      // and its initialization is not content: re-initialize it instead of
+      // refusing the roll (P425/390).
+      std::error_code size_ec;
+      const auto future_size = std::filesystem::file_size(future_path, size_ec);
+      if (size_ec || future_size != 0) {
+        return StatusError(
+            StatusCode::kCorrupt,
+            "Refusing to overwrite an existing future WAL segment");
+      }
     }
   }
   ASSIGN_OR_RETURN(int, fd, CreateFile(SegmentPath(base_path_, index)));
@@ -1247,6 +1357,12 @@ bool Logger::TryCopyBuffered(lsn_t lsn, char* dst, size_t len) const {
   if (cap == 0) {
     return false;
   }
+  // Pre-roll zeroing makes the oldest resident bytes read as zeros ahead of
+  // the buffered_lsn_ store: refuse the ring for its whole duration and let
+  // the caller fall through to the (always correct) segment files (P424/473).
+  if (ring_zeroing_.load(std::memory_order_seq_cst)) {
+    return false;
+  }
   const lsn_t buffered = buffered_lsn_.load(std::memory_order_acquire);
   // Oldest byte the ring still holds: positions below (buffered - cap) were
   // overwritten by the wrap. Bytes below ring_floor_lsn_ never passed through
@@ -1256,6 +1372,9 @@ bool Logger::TryCopyBuffered(lsn_t lsn, char* dst, size_t len) const {
                                 : 0;
   const lsn_t window_start =
       std::max(ring_floor_lsn_.load(std::memory_order_acquire), oldest_ring);
+  if (len > std::numeric_limits<lsn_t>::max() - lsn) {
+    return false;
+  }
   const lsn_t end = lsn + static_cast<lsn_t>(len);
   if (lsn < window_start || end > buffered) {
     return false;
@@ -1274,7 +1393,17 @@ bool Logger::TryCopyBuffered(lsn_t lsn, char* dst, size_t len) const {
   // Re-verify with a fresh load: producers overwrite position x only after
   // the (monotonic) buffered pointer passes x + cap, so a passing check
   // proves no byte of the copied range was rewritten while the memcpy ran.
+  // Pre-roll zeroing is the one writer that runs AHEAD of the pointer, so
+  // also require the zeroing flag to be clear: a copy straddling the memset
+  // reads a byte the memset wrote (after the flag store) and a whole-read
+  // inside the window loads the flag while set (P424/473).
   const lsn_t after = buffered_lsn_.load(std::memory_order_acquire);
+  if (cap > std::numeric_limits<lsn_t>::max() - lsn) {
+    return false;
+  }
+  if (ring_zeroing_.load(std::memory_order_seq_cst)) {
+    return false;
+  }
   return after >= end && after < lsn + static_cast<lsn_t>(cap);
 }
 
@@ -1287,7 +1416,7 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
   }
   // Drop [0, before) from page cache across the segment files: those bytes
   // are now safe to discard because the checkpoint that anchored them has
-  // been durably committed to the master record. Without this hint fdatasync
+  // been durably committed to the WAL. Without this hint fdatasync
   // keeps having to wait for every dirty page from the start of the WAL to
   // reach disk, which on long TPC-C runs turns a sub-millisecond barrier
   // into a multi-millisecond one.
@@ -1335,6 +1464,9 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
 }
 
 void Logger::SetRecycleBoundaryValidator(std::function<bool(lsn_t)> validator) {
+  // RecycleUpTo reads this under segment_mu_; take the same lock here so
+  // installation cannot race with a running checkpoint worker.
+  std::scoped_lock segment_guard(segment_mu_);
   recycle_boundary_validator_ = std::move(validator);
 }
 
@@ -1500,8 +1632,37 @@ StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
     }
     const lsn_t next_lsn =
         static_cast<lsn_t>(next_segment) * static_cast<lsn_t>(segment_size_);
+    // Zero the rolled pre-roll padding gap in the ring buffer so concurrent
+    // in-memory WAL re-read scans (ADR 0008 / WalkWalRecordsForward) see zeros
+    // matching disk instead of stale bytes from an earlier ring lap.
+    bool zeroing = false;
+    if (!buffer_.empty() && next_lsn > lsn) {
+      // Announce the zeroing before the memset starts (P424/473): readers
+      // refuse the ring while the flag is set, and the seq_cst pairing with
+      // the buffered_lsn_ store below means a read whose re-verify saw the
+      // pre-roll value still observed the flag.
+      zeroing = true;
+      ring_zeroing_.store(true, std::memory_order_seq_cst);
+      const size_t cap = buffer_.size();
+      const auto to_zero =
+          static_cast<size_t>(std::min<lsn_t>(next_lsn - lsn, cap));
+      auto pos = static_cast<size_t>(lsn % static_cast<lsn_t>(cap));
+      size_t rem = to_zero;
+      while (rem > 0) {
+        const size_t chunk = std::min(rem, cap - pos);
+        std::memset(buffer_.data() + pos, 0, chunk);
+        rem -= chunk;
+        pos = (pos + chunk) % cap;
+      }
+    }
     flushed_lsn_.store(next_lsn, std::memory_order_relaxed);
     buffered_lsn_.store(next_lsn, std::memory_order_release);
+    if (zeroing) {
+      // The zeroed positions are out of the window at the new buffered
+      // value: ring and disk agree again (zeros on both), so readers may
+      // serve from the ring (P424/473).
+      ring_zeroing_.store(false, std::memory_order_seq_cst);
+    }
     lsn = next_lsn;
   }
   while (!payload.empty()) {

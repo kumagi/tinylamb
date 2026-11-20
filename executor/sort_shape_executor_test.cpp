@@ -128,7 +128,7 @@ class FailingRows final : public ExecutorBase {
 // plumbing can be exercised on both shapes.
 class ExplodingKey final : public ExpressionBase {
  public:
-  [[nodiscard]] TypeTag Type() const override {
+  [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kFunctionCallExp;
   }
   [[nodiscard]] StatusOr<Value> TryEvaluate(
@@ -248,10 +248,10 @@ TEST(SortShapeExecutorTest, TheDefaultConstructorKeepsTheAdaptiveMode) {
   EXPECT_EQ(
       std::string(SortExecutor::SpillModeLabel(SortExecutor::SpillMode::kAuto)),
       "adaptive");
-  // The historical Dump still names the parallel sort.
+  // Dump names the sort honestly: "ParallelSort" only with >1 worker.
   std::ostringstream dump;
   sort->Dump(dump, 0);
-  EXPECT_NE(dump.str().find("ParallelSort"), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("Sort ("), std::string::npos) << dump.str();
   EXPECT_NE(dump.str().find("spill=adaptive"), std::string::npos) << dump.str();
 }
 

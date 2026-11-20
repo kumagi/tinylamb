@@ -23,7 +23,7 @@ using AggregateResultMap =
     std::unordered_map<const AggregateExpression*, Value>;
 
 // Abstract boundary between expression evaluation and query execution
-// (improvement3.md A1 / S3).  Expression nodes reach everything that needs
+// (the design contract).  Expression nodes reach everything that needs
 // executor or database machinery through this interface only:
 //
 //   - SelectStatement and Row are forward declared; the expression layer does

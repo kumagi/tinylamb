@@ -44,7 +44,7 @@ graph TD
 1. **子式数の制約**: 入力関係が左右 2 つであること。
 2. **行位置要求の排除**: `PhysicalProperties` に行位置要求（`require_row_position`）が含まれないこと。外部結合で生成される NULL パディング行は物理ストレージ上のタプル位置を持たないため、行位置の保証は不可能です。
 3. **等値キー対の存在**: 述語 `logical.predicate` から 1 組以上の等値結合キー対を抽出できること。
-4. **残余述语的扱い**: 外部結合の等値条件以外の残余述語は候補から除去せず、join node 内で候補ごとに評価します。候補が全て FALSE/NULL のとき、match として記録せず、preserved side を NULL pad します。semi/anti の残余は probe side だけで評価できないため従来どおり候補を生成しません。
+4. **残余述語の扱い**: 外部結合の等値条件以外の残余述語は候補から除去せず、join node 内で候補ごとに評価します。候補が全て FALSE/NULL のとき、match として記録せず、preserved side を NULL pad します。semi/anti の残余は probe side だけで評価できないため従来どおり候補を生成しません。
 
 ## 意味論的根拠と物理実行の契約
 

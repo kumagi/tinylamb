@@ -61,7 +61,9 @@ size_t RecursiveCteExecutor::NextBatch(DataChunk* destination,
     }
   }
   while (destination->Size() < max_rows && row_idx_ < rows_.size()) {
-    destination->Append(rows_[row_idx_++]);
+    // rows_ is not reused after emission; move its VARCHAR payloads into
+    // the destination instead of deep-copying each row.
+    destination->Append(std::move(rows_[row_idx_++]));
   }
   return destination->Size();
 }

@@ -20,6 +20,7 @@
 
 #ifndef TINYLAMB_LOGGER_FUZZER_HPP
 #define TINYLAMB_LOGGER_FUZZER_HPP
+#include "common/digest.hpp"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -56,7 +57,10 @@ inline Status AppendLoggerFuzzInput(Logger& logger, ByteStream& stream,
     ASSIGN_OR_RETURN(lsn_t, start, logger.AddLog(log_data));
     durable_target = start + log_data.size();
     if (verbose) {
-      LOG(TRACE) << log_data;
+      // Fuzzer bytes may contain NUL/newline/escape sequences; log a hex
+      // rendering so one input cannot forge multiple log lines or terminal
+      // control sequences.
+      LOG(TRACE) << digest::ToHex(log_data);
     }
     written->emplace_back(std::move(log_data));
   }
@@ -103,7 +107,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   for (const auto& exp : written) {
     std::string actual;
     actual.resize(exp.size());
-    file.read(actual.data(), actual.size());
+    file.read(actual.data(), static_cast<std::streamsize>(actual.size()));
     if (exp != actual) {
       LOG(FATAL) << lsn << ": expected: " << exp << " actual: " << actual;
     }

@@ -44,7 +44,7 @@ LsmIndexIterator::LsmIndexIterator(LsmIndex* tree, Transaction* txn,
     return;
   }
   entries_ = txn_->GetPageManager()->LsmScanRange(tree_->Root(), begin, end,
-                                                  true, txn_);
+                                                  true, txn_, &status_);
   if (entries_.empty()) {
     valid_ = false;
     return;
@@ -146,6 +146,17 @@ StatusOr<std::string> LsmIndex::Read(Transaction& txn, std::string_view key,
     *hint_leaf = root_;
   }
   return txn.GetPageManager()->LsmRead(root_, key);
+}
+
+StatusOr<std::string> LsmIndex::ReadVisible(Transaction& txn,
+                                            std::string_view key) const {
+  Status status;
+  auto entries =
+      txn.GetPageManager()->LsmScanRange(root_, key, key, true, &txn, &status);
+  RETURN_IF_FAIL(status);
+  if (entries.empty()) { return Status::kNotExists;
+}
+  return std::move(entries.front().second);
 }
 
 LsmIndexIterator LsmIndex::Begin(Transaction& txn, std::string_view begin,

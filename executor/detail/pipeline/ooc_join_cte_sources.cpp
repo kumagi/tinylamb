@@ -143,8 +143,6 @@ bool JoinValueUnmatchable(const Value& value) {
 
 bool IdenticalValue(const Value& a, const Value& b);
 
-
-
 bool EqualRowsExact(const Row& a, const Row& b) {
   if (a.Count() != b.Count()) {
     return false;
@@ -169,6 +167,7 @@ bool IdenticalValue(const Value& a, const Value& b) {
     return a.IsNull() && b.IsNull();
   }
   switch (a.type) {
+    // NOLINTNEXTLINE(bugprone-branch-clone) distinct intent in each branch
     case ValueType::kInt64:
       return a.value.int_value == b.value.int_value;
     case ValueType::kDate:
@@ -802,8 +801,7 @@ StatusOr<bool> OocBandJoinSource::NextBatch(PipelineContext* ctx,
           return StatusError(StatusCode::kCorrupt,
                              "BandJoin tagged pair row is too narrow");
         }
-        const auto le_idx =
-            static_cast<size_t>(tagged_row_[0].value.int_value);
+        const auto le_idx = static_cast<size_t>(tagged_row_[0].value.int_value);
         if (le_idx >= left_block_.size()) {
           return StatusError(StatusCode::kCorrupt,
                              "BandJoin tagged pair row names a dead entry");
@@ -1201,6 +1199,10 @@ StatusOr<bool> OocCrossJoinProbeSource::NextBatch(PipelineContext* ctx,
         if (!ok) {
           continue;
         }
+        if (kind == JoinKind::kSingle && ++le.matches > 1) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "single join matched more than once");
+        }
         le.matched = true;
         if (right_outer) {
           SetBit(&right_matched_bits_, right_gidx);
@@ -1387,6 +1389,10 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
     std::vector<OocSortKey> keys;
     keys.reserve(working_cols);
     for (size_t c = 0; c < working_cols; ++c) {
+      if (c > std::numeric_limits<slot_t>::max()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "sort key column index out of range");
+      }
       keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(c)});
     }
     ExternalSorter::Options sopts;
@@ -1447,7 +1453,9 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
         return false;
       }
       const size_t add = EstimateRowMemoryBytes(payload) + 32;
-      if (mem_seen_bytes > 0 && mem_seen_bytes + add > seen_budget) {
+      // Include the first row: a single large row can exceed the budget on
+      // its own and must spill immediately rather than stay resident.
+      if (mem_seen_bytes + add > seen_budget) {
         RETURN_IF_FAIL(spill_reached_from_mem());
       } else {
         // The row already lives in `work_index`; only account for its
@@ -1611,13 +1619,17 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
   uint64_t total_emitted = 0;
 
   std::unique_ptr<ExternalSorter> anchor_sorter;
-  auto ensure_anchor_sorter = [&]() {
+  auto ensure_anchor_sorter = [&]() -> Status {
     if (anchor_sorter != nullptr) {
-      return;
+      return Status::kSuccess;
     }
     std::vector<OocSortKey> keys;
     keys.reserve(working_cols);
     for (size_t c = 0; c < working_cols; ++c) {
+      if (c > std::numeric_limits<slot_t>::max()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "sort key column index out of range");
+      }
       keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(c)});
     }
     ExternalSorter::Options sopts;
@@ -1627,6 +1639,7 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
     sopts.keys = std::move(keys);
     sopts.force_spill = ProcessMemoryBudget::Global().AlwaysSpillEnabled();
     anchor_sorter = std::make_unique<ExternalSorter>(std::move(sopts));
+    return Status::kSuccess;
   };
 
   Status anchor_st = Status::kSuccess;
@@ -1642,11 +1655,11 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
             return Status::kSuccess;
           }
           if (spilled_seen) {
-            ensure_anchor_sorter();
+            RETURN_IF_FAIL(ensure_anchor_sorter());
             return anchor_sorter->AddRow(r);
           }
         } else {
-          ensure_anchor_sorter();
+          RETURN_IF_FAIL(ensure_anchor_sorter());
           return anchor_sorter->AddRow(r);
         }
       }
@@ -1695,13 +1708,17 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
         ctx->txn->execution_runtime());
     next_delta->schema = work_schema;
     std::unique_ptr<ExternalSorter> cand_sorter;
-    auto ensure_cand_sorter = [&]() {
+    auto ensure_cand_sorter = [&]() -> Status {
       if (cand_sorter != nullptr) {
-        return;
+        return Status::kSuccess;
       }
       std::vector<OocSortKey> keys;
       keys.reserve(working_cols);
       for (size_t c = 0; c < working_cols; ++c) {
+        if (c > std::numeric_limits<slot_t>::max()) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "sort key column index out of range");
+        }
         keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(c)});
       }
       ExternalSorter::Options sopts;
@@ -1711,6 +1728,7 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
       sopts.keys = std::move(keys);
       sopts.force_spill = ProcessMemoryBudget::Global().AlwaysSpillEnabled();
       cand_sorter = std::make_unique<ExternalSorter>(std::move(sopts));
+      return Status::kSuccess;
     };
 
     uint64_t added_this_round = 0;
@@ -1747,11 +1765,11 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
                 return Status::kSuccess;
               }
               if (spilled_seen) {
-                ensure_cand_sorter();
+                RETURN_IF_FAIL(ensure_cand_sorter());
                 return cand_sorter->AddRow(row);
               }
             } else {
-              ensure_cand_sorter();
+              RETURN_IF_FAIL(ensure_cand_sorter());
               return cand_sorter->AddRow(row);
             }
           }
@@ -1807,10 +1825,10 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
 StatusOr<bool> OocRecursiveCteSource::NextBatch(PipelineContext* /*ctx*/,
                                                 DataChunk* out,
                                                 size_t max_rows) {
-  (void)max_rows;
   if (!result_store_) {
     return false;
   }
+  (void)max_rows;  // SpillableStore::NextChunk has no per-call row cap
   ASSIGN_OR_RETURN(bool, got, result_store_->NextChunk(out));
   if (!got) {
     result_store_->Reset();
@@ -1936,7 +1954,6 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
       active_inner_chunk_idx_ = 0;
 
       if (inner_query_ != nullptr) {
-        ++cache_probes_;
         bool cache_hit = false;
         const size_t probe_hash =
             relational_detail::GroupKeyTransparentHash{}(cur_outer_row_);
@@ -1945,7 +1962,6 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
             continue;
           }
           if (EqualRowsExact(lru_cache_[i - 1].key, cur_outer_row_)) {
-            ++cache_hits_;
             active_inner_view_ = lru_cache_[i - 1].rows;
             if (i != lru_cache_.size()) {
               LruEntry moved = std::move(lru_cache_[i - 1]);
@@ -2034,11 +2050,10 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
             active_inner_view_ = shared_rows;
             if (entry_bytes <= cache_budget_bytes_) {
               lru_bytes_ += entry_bytes;
-              lru_cache_.push_back(LruEntry{
-                  .key = cur_outer_row_,
-                  .rows = std::move(shared_rows),
-                  .bytes = entry_bytes,
-                  .key_hash = probe_hash});
+              lru_cache_.push_back(LruEntry{.key = cur_outer_row_,
+                                            .rows = std::move(shared_rows),
+                                            .bytes = entry_bytes,
+                                            .key_hash = probe_hash});
             }
           }
         }

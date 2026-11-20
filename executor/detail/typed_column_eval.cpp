@@ -788,6 +788,13 @@ StatusOr<Value> EvaluateTypedIntExprOnRow(const TypedIntExprInput& expr,
                                           const Row& row) {
   std::array<int64_t, 16> stack{};
   size_t sp = 0;
+  // Producers cap ops at 16 entries so pushes can never exceed the stack;
+  // keep that bound explicit here instead of relying on the upstream
+  // compiler invariant.
+  if (expr.ops.size() > stack.size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "typed INT expression operand stack overflow");
+  }
   for (const TypedIntExprOp& op : expr.ops) {
     switch (op.kind) {
       case TypedIntExprOp::Kind::kLoadIntCol: {
@@ -804,7 +811,7 @@ StatusOr<Value> EvaluateTypedIntExprOnRow(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kAdd: {
         int64_t out = 0;
         if (__builtin_add_overflow(stack[sp - 2], stack[sp - 1], &out)) {
-          return StatusError(StatusCode::kIsInfinity,
+          return StatusError(StatusCode::kInvalidArgument,
                              "integer overflow on '+'");
         }
         stack[sp - 2] = out;
@@ -814,7 +821,7 @@ StatusOr<Value> EvaluateTypedIntExprOnRow(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kSub: {
         int64_t out = 0;
         if (__builtin_sub_overflow(stack[sp - 2], stack[sp - 1], &out)) {
-          return StatusError(StatusCode::kIsInfinity,
+          return StatusError(StatusCode::kInvalidArgument,
                              "integer overflow on '-'");
         }
         stack[sp - 2] = out;
@@ -824,7 +831,7 @@ StatusOr<Value> EvaluateTypedIntExprOnRow(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kMul: {
         int64_t out = 0;
         if (__builtin_mul_overflow(stack[sp - 2], stack[sp - 1], &out)) {
-          return StatusError(StatusCode::kIsInfinity,
+          return StatusError(StatusCode::kInvalidArgument,
                              "integer overflow on '*'");
         }
         stack[sp - 2] = out;
@@ -866,6 +873,12 @@ Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
                                    const Row& row) {
   std::array<double, 16> stack{};
   size_t sp = 0;
+  // Producers cap ops at 16 entries so pushes can never exceed the stack;
+  // keep that bound explicit here instead of relying on the upstream
+  // compiler invariant.
+  if (expr.ops.size() > stack.size()) {
+    return {};
+  }
   for (const TypedDoubleExprOp& op : expr.ops) {
     switch (op.kind) {
       case TypedDoubleExprOp::Kind::kLoadDoubleCol: {
@@ -1495,11 +1508,19 @@ TypedAggregationPlan PlanTypedAggregation(
       }
     } else if (!distinct_free && type == AggregationType::kCount) {
       // COUNT(DISTINCT ...) over a numeric/DATE input keeps the inline-slot
-      // slim layout (same 8-slot threshold as the generic accumulator).
+      // slim layout. The slim accumulator uses 8 inline slots for all
+      // distinct kinds; the generic one uses 8 for INT64 and 4 for DOUBLE
+      // (kInlineDistinctValueCapacity), so the thresholds differ for DOUBLE.
       ValueType input_type = ValueType::kNull;
       if (input.column.has_value()) {
-        input_type =
-            scan_schema.GetColumn(static_cast<slot_t>(*input.column)).Type();
+        const Column& column =
+            scan_schema.GetColumn(static_cast<slot_t>(*input.column));
+        // The slim distinct set keys on the raw int64 bit pattern and cannot
+        // distinguish signed -1 from unsigned UINT64_MAX. Leave unsigned
+        // columns on the generic accumulator (same guard as MIN/MAX below).
+        if (!column.IsUnsigned()) {
+          input_type = column.Type();
+        }
       } else if (input.conditional.has_value()) {
         input_type = input.conditional->result_type;
       } else if (input.child.has_value()) {
@@ -1858,6 +1879,35 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
     Expression child;
   };
   std::vector<PartialAggSpec> arguments;
+  // T4824: cache each argument child's ToString alongside the spec; the
+  // match loop used to re-serialize the stored expression on every probe.
+  std::vector<std::string> argument_child_strs;
+  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  //   (rollup_sum_homomorphic_arbitrary_expr_sound)
+  const auto valid_partial_agg_child = [](const Expression& ch) -> bool {
+    if (!ch || ContainsQuery(ch) || ContainsAggregate(ch) ||
+        ContainsParameterSlot(ch) || ContainsVolatileCall(ch)) {
+      return false;
+    }
+    const auto has_win = [](auto&& self, const Expression& e) -> bool {
+      if (!e) {  // NOLINT(clang-diagnostic-error)
+        return false;
+      }
+      if (e->Type() == TypeTag::kWindowFunctionExp) {
+        return true;
+      }
+      if (e->Type() == TypeTag::kQueryExp) {
+        return false;
+      }
+      for (const Expression& sub : ExpressionChildren(e)) {  // NOLINT(readability-use-anyofallof)
+        if (self(self, sub)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    return !has_win(has_win, ch);
+  };
   const auto find_or_add_agg =
       [&](const AggregateExpression& aggregate) -> std::optional<size_t> {
     if ((aggregate.GetType() != AggregationType::kAvg &&
@@ -1866,14 +1916,14 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
         aggregate.Having() != AggregateHavingModifier::kNone ||
         !aggregate.InnerOrderBy().empty() || aggregate.SecondaryArg() ||
         !aggregate.ExtraArgs().empty() || !aggregate.TrailingArgs().empty() ||
-        aggregate.NeedsGroupContext() || !aggregate.Child() ||
-        aggregate.Child()->Type() != TypeTag::kColumnValue) {
+        aggregate.NeedsGroupContext() ||
+        !valid_partial_agg_child(aggregate.Child())) {
       return std::nullopt;
     }
     const std::string child_str = aggregate.Child()->ToString();
     for (size_t i = 0; i < arguments.size(); ++i) {
       if (arguments[i].type == aggregate.GetType() &&
-          arguments[i].child->ToString() == child_str) {
+          argument_child_strs[i] == child_str) {
         return i;
       }
     }
@@ -1881,6 +1931,7 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
       return std::nullopt;
     }
     arguments.push_back({aggregate.GetType(), aggregate.Child()});
+    argument_child_strs.push_back(child_str);
     return arguments.size() - 1;
   };
   bool head_aggs_ok = true;
@@ -1899,6 +1950,13 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
   }
   const bool allow_float_sums = !any_avg;
   bool eligible = head_aggs_ok && !arguments.empty();
+  // T4824: render each head GROUP BY key once for the per-set membership
+  // checks below.
+  std::vector<std::string> head_group_strs;
+  head_group_strs.reserve(head.GroupBy().size());
+  for (const auto& fine : head.GroupBy()) {
+    head_group_strs.push_back(fine ? fine->ToString() : std::string());
+  }
   std::string prefix = "__partial_total";
   while (std::ranges::any_of(head.GroupBy(), [&](const auto& key) {
     return AsciiToLower(key->AsColumnValue().GetColumnName().name)
@@ -1920,10 +1978,15 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
       if (set->IsGroupAll()) {
         break;
       }
+      // T4824: serialize the incoming key once and compare against the
+      // pre-rendered head keys instead of head.GroupBy().size() ToString
+      // calls per key.
+      const std::string key_str = key ? key->ToString() : std::string();
       eligible = eligible && key &&
-                 std::ranges::any_of(head.GroupBy(), [&](const auto& fine) {
-                   return key->ToString() == fine->ToString();
-                 });
+                 std::ranges::any_of(head_group_strs,
+                                     [&](const std::string& fine_str) {
+                                       return fine_str == key_str;
+                                     });
     }
     const auto find_agg =
         [&](const AggregateExpression& aggregate) -> std::optional<size_t> {
@@ -1933,14 +1996,14 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
           aggregate.Having() != AggregateHavingModifier::kNone ||
           !aggregate.InnerOrderBy().empty() || aggregate.SecondaryArg() ||
           !aggregate.ExtraArgs().empty() || !aggregate.TrailingArgs().empty() ||
-          aggregate.NeedsGroupContext() || !aggregate.Child() ||
-          aggregate.Child()->Type() != TypeTag::kColumnValue) {
+          aggregate.NeedsGroupContext() ||
+          !valid_partial_agg_child(aggregate.Child())) {
         return std::nullopt;
       }
       const std::string child_str = aggregate.Child()->ToString();
       for (size_t i = 0; i < arguments.size(); ++i) {
         if (arguments[i].type == aggregate.GetType() &&
-            arguments[i].child->ToString() == child_str) {
+            argument_child_strs[i] == child_str) {
           return i;
         }
       }
@@ -1962,7 +2025,17 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
         const bool in_group_by =
             !set->IsGroupAll() &&
             std::ranges::any_of(set->GroupBy(), [&](const auto& key) {
-              return key && key->ToString() == expression->ToString();
+              // T4824: both sides are the narrow kColumnValue shape here
+              // in practice; compare the qualified names structurally and
+              // keep the string fallback for exotic key shapes.
+              if (!key) {
+                return false;
+              }
+              if (key->Type() == TypeTag::kColumnValue) {
+                return key->AsColumnValue().GetColumnName() ==
+                       expression->AsColumnValue().GetColumnName();
+              }
+              return key->ToString() == expression->ToString();
             });
         if (!in_group_by) {
           return false;
@@ -1999,7 +2072,11 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
         if (!rewrite_expr(child, &next_child)) {
           return false;
         }
-        if (next_child->ToString() != child->ToString()) {
+        // T4824: every rewrite arm either returns the SAME shared_ptr when
+        // nothing changed (constant / group-key column / unchanged subtree)
+        // or a freshly built node, so pointer identity answers "was it
+        // rewritten" without serializing both trees.
+        if (next_child.get() != child.get()) {
           child = std::move(next_child);
           changed = true;
         }
@@ -2098,16 +2175,24 @@ bool CanUseExactIntegerGroupingSets(TransactionContext& context,
     }
   }
   const Schema schema("", std::move(columns));
-  return std::ranges::all_of(head.SelectList(), [&](const auto& item) {
-    if (item.expression->Type() != TypeTag::kAggregateExp) {
-      return true;
-    }
-    const auto& aggregate = item.expression->AsAggregateExpression();
-    const auto slot = LocalColumnOffset(
-        schema, aggregate.Child()->AsColumnValue().GetColumnName());
-    return slot && schema.GetColumn(*slot).Type() == ValueType::kInt64 &&
-           !schema.GetColumn(*slot).IsUnsigned();
-  });
+  std::vector<const AggregateExpression*> head_aggs;
+  std::unordered_set<const AggregateExpression*> seen_head_aggs;
+  for (const auto& item : head.SelectList()) {
+    CollectAggregates(item.expression, &head_aggs, &seen_head_aggs);
+  }
+  return !head_aggs.empty() &&
+         std::ranges::all_of(
+             head_aggs, [&](const AggregateExpression* aggregate) {
+               if (aggregate == nullptr || !aggregate->Child() ||
+                   aggregate->Child()->Type() != TypeTag::kColumnValue) {
+                 return false;
+               }
+               const auto slot = LocalColumnOffset(
+                   schema, aggregate->Child()->AsColumnValue().GetColumnName());
+               return slot &&
+                      schema.GetColumn(*slot).Type() == ValueType::kInt64 &&
+                      !schema.GetColumn(*slot).IsUnsigned();
+             });
 }
 
 GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
@@ -2185,7 +2270,9 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
       return false;
     }
     for (const Expression& key : statement.GroupBy()) {
-      if (key && key->ToString() == expr->ToString()) {
+      // The common case is the very same Expression object; avoid building
+      // two full ToString() trees per group-expression pair.
+      if (key && (key == expr || key->ToString() == expr->ToString())) {
         return false;
       }
     }

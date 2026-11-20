@@ -133,15 +133,25 @@ Value ColumnValue::Evaluate(const Row* left, const Schema& left_schema,
 Type ColumnValue::ResultType(const Schema& schema) const {
   const int offset = ResolveOffset(schema, col_name_);
   if (offset < 0) {
-    throw std::runtime_error("column type not found");
+    // T371: mirror the evaluator's message ("column <name> not found") so a
+    // type-resolution failure names the offending column.
+    throw std::runtime_error("column " + col_name_.ToString() + " not found");
   }
   return ColumnType(schema.GetColumn(static_cast<size_t>(offset)));
 }
 
 Type ColumnValue::ResultType(const Schema& left, const Schema& right) const {
   const int left_offset = ResolveOffset(left, col_name_);
+  const int right_offset = ResolveOffset(right, col_name_);
+  // The two-schema overload must consider both sides: a join output may
+  // carry the same column name with different types, in which case the
+  // left schema (the canonical evaluation row) decides, but we still
+  // resolve right so a left-only miss falls back correctly.
   if (left_offset >= 0) {
     return ColumnType(left.GetColumn(static_cast<size_t>(left_offset)));
+  }
+  if (right_offset >= 0) {
+    return ColumnType(right.GetColumn(static_cast<size_t>(right_offset)));
   }
   return ResultType(right);
 }

@@ -4,8 +4,8 @@ Vendored from [google/googlesql](https://github.com/google/googlesql)
 `googlesql/compliance/testdata/*.test` (Apache-2.0).
 
 Pin: `TINYLAMB_GOOGLESQL_VERSION` in CMakeLists.txt (currently `2026.7.2`).
-Currently **274** upstream `*.test` files from that tag, plus locally authored
-`optimizer_*.test` expectation suites (currently 13 files / 262 cases).
+Currently **277** upstream `*.test` files from that tag, plus locally authored
+`optimizer_*.test` expectation suites (currently 13 files / 272 cases).
 
 Re-fetch with:
 
@@ -17,7 +17,7 @@ The script pulls `googlesql/compliance/testdata/*.test` from that git tag.
 It preserves local `optimizer_*.test` files.
 
 Differential privacy / anonymization files are **not** copied. Every other
-upstream `*.test` file is included so tinylamb's SQL engine can grow against
+upstream `*.test` file outside the SKIP list in scripts/fetch_googlesql_compliance.py is included so tinylamb's SQL engine can grow against
 the real golden corpus. Cases tinylamb cannot execute yet are expected to fail
 the parameterized `googlesql_compliance_test` binary; they are not rewritten
 to match local bugs.

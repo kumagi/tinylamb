@@ -1,6 +1,6 @@
 # outer_nested_loop
 
-- 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: done   /   執筆基準リビジョン: `72ad60a` (2026-11-19)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の登録 `"outer_nested_loop"`（パターンは `cascades::dsl::LeftOuterJoin()`）
 
 ## 概要
@@ -85,10 +85,17 @@ graph TD
 
 ```cpp
           Plan join = std::make_shared<ProductPlan>(
-              children[0].plan, children[1].plan, LeftOuterJoinKind());
-          SetJoinNotes(join, *logical.predicate);
-          const double estimate =
-              std::max(children[0].estimated_rows, children[1].estimated_rows);
+              children[0].plan, children[1].plan, LeftOuterJoinKind(),
+              RowEstimate(children[0].estimated_rows *
+                          children[1].estimated_rows));
+          // The executor evaluates the full predicate while pairing and
+          // null-pads unmatched outer rows, so unlike the inner nested loop
+          // no Selection wrapper may be added: it would filter the padded
+          // rows back out (same reason JoinAlternatives refuses residuals
+          // for non-inner hash joins).
+          std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes(
+              {}, *logical.predicate);
+          const auto estimate = static_cast<double>(join->EmitRowCount());
           const double local_cost =
               children[0].estimated_rows * children[1].estimated_rows;
           return std::vector<PlanAlternative>{
@@ -97,17 +104,18 @@ graph TD
                               .estimated_rows = estimate}};
 ```
 
-- **物理計画ノード**: `ProductPlan(left, right, LeftOuterJoinKind())` を生成します。`SetJoinNotes` により述語を物理ノードへ保持させます。実行時は `executor/relational_factory.cpp` において `LeftOuter` 判定により NULL パディング付きネステッドループ実行器が生成されます。
+- **物理計画ノード**: `ProductPlan(left, right, LeftOuterJoinKind(), RowEstimate(l × r))` を生成します。メンバ呼び出し `std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes({}, predicate)` により述語を物理ノードへ保持させます。実行時は `executor/relational_factory.cpp` において `LeftOuter` 判定により NULL パディング付きネステッドループ実行器が生成されます。
 - **局所コスト計算**:
   ```cpp
-  local_cost = children[0].estimated_rows * children[1].estimated_rows;
+          const double local_cost =
+              children[0].estimated_rows * children[1].estimated_rows;
   ```
   外側行ごとに内側関係をフル走査する直積相当の二次コストを計上します。
 - **カーディナリティ推定**:
   ```cpp
-  estimated_rows = std::max(children[0].estimated_rows, children[1].estimated_rows);
+          const auto estimate = static_cast<double>(join->EmitRowCount());
   ```
-  左外部結合の最小出力行数は外側行数以上となるため、安全な下限値を採用します。
+  推定値は `ProductPlan` 自身の行数見積りから取得します。左外部形状の見積りは `std::max(left_rows, matches)`（`plan/product_plan.cpp` の `EstimatedJoinRowCount`）で、外側行数を下限として保持しながらマッチ行数を上回れないようにします。
 
 ## 最適化効果
 

@@ -602,8 +602,10 @@ TEST(DataChunkFeatureTest, UnsignedIntColumnsRoundTrip) {
   // Bitwise aggregates report unsigned results too.
   EXPECT_TRUE(chunk.AggregateBitAnd(0).IsUnsigned());
   EXPECT_EQ(chunk.AggregateBitAnd(0), Value(int64_t{5}).WithUnsigned());
-  EXPECT_TRUE(chunk.AggregateBitOr(0).IsUnsigned());
-  EXPECT_TRUE(chunk.AggregateBitXor(0).IsUnsigned());
+  EXPECT_EQ(chunk.AggregateBitOr(0),
+            Value(uint64_t{18446744073709551615ULL}).WithUnsigned());
+  EXPECT_EQ(chunk.AggregateBitXor(0),
+            Value(uint64_t{18446744073709551610ULL}).WithUnsigned());
 }
 
 TEST(DataChunkFeatureTest, AppendChunkCopiesZoneMapsAcrossTypes) {
@@ -618,8 +620,8 @@ TEST(DataChunkFeatureTest, AppendChunkCopiesZoneMapsAcrossTypes) {
   src.Append(Row({Value(), Value(), Value(), Value(), Value()}));
 
   DataChunk dst;
-  dst.Append(src, 0);
-  dst.Append(src, 1);
+  dst.AppendFrom(src, 0);
+  dst.AppendFrom(src, 1);
   ASSERT_EQ(dst.Size(), 2U);
   EXPECT_EQ(dst.ColumnAt(0).ValueAt(0), Value(int64_t{1}));
   EXPECT_TRUE(dst.ColumnAt(1).IsNull(1));
@@ -816,19 +818,22 @@ TEST(SimdComparisonKernelTest, DoubleScalarCoversAllOperators) {
 }
 
 TEST(SimdComparisonKernelTest, StringPrefixCoversAllOperators) {
-  const std::vector<std::string_view> data = {"apple", "banana", "cherry",
-                                              "banana", "date"};
+  const std::vector<std::string_view> data = {
+      "apple", "banana", "cherry", "banana", "date",
+      "bananabananabanana", "bananabananab"};  // NOLINT(clang-diagnostic-error)
   struct Case {
     BinaryOperation op;
     size_t expected;
   };
   const std::vector<Case> cases = {
+      // The two long "banana…" strings (past the 8-byte prefix) both sort
+      // after "banana", so they count as not-equal and greater.
       {BinaryOperation::kEquals, 2},
-      {BinaryOperation::kNotEquals, 3},
+      {BinaryOperation::kNotEquals, 5},
       {BinaryOperation::kLessThan, 1},
       {BinaryOperation::kLessThanEquals, 3},
-      {BinaryOperation::kGreaterThan, 2},
-      {BinaryOperation::kGreaterThanEquals, 4},
+      {BinaryOperation::kGreaterThan, 4},
+      {BinaryOperation::kGreaterThanEquals, 6},
   };
   for (const Case& c : cases) {
     ValidityBitmap mask;

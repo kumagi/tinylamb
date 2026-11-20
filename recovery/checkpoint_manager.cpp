@@ -17,7 +17,9 @@
 #include "recovery/checkpoint_manager.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -41,14 +43,47 @@ CheckpointManager::CheckpointManager(std::string_view path,
     : master_record_path(path),
       tm_(tm),
       pm_(pm),
-      interval_seconds_(interval),
-      checkpoint_worker_([this] { WorkerThreadTask(); }) {
+      interval_seconds_(interval) {
+  // Do NOT start the worker in the member-init list. SetCompactionCallback
+  // copies a std::function and can throw bad_alloc; if the constructor body
+  // throws after a joinable thread was started, ~thread calls terminate
+  // instead of letting the caller map the failure to a Status.
   if (pm_ != nullptr && interval_seconds_ != 0) {
     pm_->SetCompactionCallback([this] { RequestCompaction(); });
   }
+  checkpoint_worker_ = std::thread([this] { WorkerThreadTask(); });
 }
 
 CheckpointManager::~CheckpointManager() { Stop(); }
+
+void CheckpointManager::Start() {
+  // T3687: Stop() joined the worker thread out of existence, so a plain
+  // predicate flip could never resume processing.  Re-arm stop_, re-
+  // register the compaction callback and spawn a fresh worker; the old
+  // behaviour was a silent no-op that left every later compaction request
+  // unconsumed (WAL grew forever).
+  if (stop_.load(std::memory_order_acquire) && interval_seconds_ == 0) {
+    LOG(WARN) << "CheckpointManager::Start() ignored: checkpointing is "
+                 "disabled (interval_seconds == 0)";
+    return;
+  }
+  // Register the callback BEFORE taking worker_wait_mu_: the LSM compaction
+  // thread fires the callback under compaction_cb_mu_, and RequestCompaction
+  // grabs worker_wait_mu_ -- acquiring cb_mu_ under worker_wait_mu_ would
+  // invert that order.
+  if (stop_.load(std::memory_order_acquire) && pm_ != nullptr) {
+    pm_->SetCompactionCallback([this] { RequestCompaction(); });
+  }
+  std::scoped_lock lk(worker_wait_mu_);
+  // Re-check under the lock: a concurrent Start() may have restarted
+  // already, in which case this call only (re-)armed start_.
+  if (stop_.load(std::memory_order_acquire) && !checkpoint_worker_.joinable()) {
+    stop_.store(false, std::memory_order_release);
+    checkpoint_worker_ = std::thread([this] { WorkerThreadTask(); });
+  }
+  start_.store(true, std::memory_order_release);
+  worker_wait_cv_.notify_all();
+}
 
 void CheckpointManager::Stop() {
   if (pm_ != nullptr) {
@@ -57,6 +92,7 @@ void CheckpointManager::Stop() {
   {
     std::scoped_lock lk(worker_wait_mu_);
     stop_.store(true, std::memory_order_release);
+    start_.store(false, std::memory_order_release);
   }
   worker_wait_cv_.notify_all();
   if (checkpoint_worker_.joinable()) {
@@ -68,33 +104,85 @@ void CheckpointManager::RequestCompaction() {
   {
     std::scoped_lock lk(worker_wait_mu_);
     compaction_requested_ = true;
+    ++request_generation_;
   }
   worker_wait_cv_.notify_one();
 }
 
 void CheckpointManager::WorkerThreadTask() {
+  // T4262: interval_seconds_ is the worker's poll period.  The wait is
+  // wait_for(interval), so the worker wakes on its own even when no
+  // compaction callback ever fires.  A wake with nothing pending and WAL
+  // retention below the checkpoint-lag threshold touches no disk, keeping
+  // the documented "compaction-driven persistence, no idle periodic WAL
+  // writes" design intact while giving the interval setting real meaning:
+  // retained WAL above the lag threshold is checkpointed within one
+  // interval instead of growing unboundedly (previously the interval was
+  // only consulted as an enable/disable boolean at :interval_seconds_==0).
   while (!stop_.load(std::memory_order_acquire)) {
+    bool requested = false;
+    uint64_t consumed_generation = 0;
     {
       std::unique_lock wait_lock(worker_wait_mu_);
-      worker_wait_cv_.wait(wait_lock, [this] {
-        return stop_.load(std::memory_order_acquire) ||
-               (start_.load(std::memory_order_acquire) &&
-                compaction_requested_);
-      });
+      worker_wait_cv_.wait_for(
+          wait_lock, std::chrono::seconds(interval_seconds_), [this] {
+            return stop_.load(std::memory_order_acquire) ||
+                   (start_.load(std::memory_order_acquire) &&
+                    compaction_requested_);
+          });
       if (stop_.load(std::memory_order_acquire) || interval_seconds_ == 0) {
         return;
       }
-      compaction_requested_ = false;
+      requested = compaction_requested_;
+      consumed_generation = request_generation_;
     }
+    if (!requested) {
+      if (!start_.load(std::memory_order_acquire)) {
+        continue;
+      }
+      // Periodic watchdog pass: only checkpoint when the retained (durable
+      // but not yet recycled) WAL has grown past the lag threshold.
+      const lsn_t lowest_retained = tm_->logger_->LowestRetainedLSN();
+      const lsn_t durable_lsn = tm_->logger_->DurableLSN();
+      const uint64_t retained_bytes =
+          durable_lsn > lowest_retained
+              ? static_cast<uint64_t>(durable_lsn - lowest_retained)
+              : 0;
+      if (retained_bytes < WalLagCheckpointBytes()) {
+        continue;
+      }
+    }
+    bool checkpoint_ok = false;
     try {
       const auto res = WriteCheckpoint();
       if (!res.HasValue()) {
         LOG(ERROR) << "Background compaction failed: " << res.GetStatus();
+      } else {
+        checkpoint_ok = true;
       }
     } catch (const std::exception& error) {
       LOG(ERROR) << "Background compaction threw: " << error.what();
     } catch (...) {
       LOG(ERROR) << "Background compaction threw an unknown exception";
+    }
+    // Keep the request pending on failure so the next worker pass retries
+    // instead of dropping the checkpoint until the next threshold/callback.
+    if (checkpoint_ok) {
+      worker_checkpoints_.fetch_add(1, std::memory_order_release);
+      std::scoped_lock lk(worker_wait_mu_);
+      // Clear only the request this pass consumed; a RequestCompaction that
+      // arrived while the checkpoint ran keeps the next pass armed.
+      if (requested && request_generation_ == consumed_generation) {
+        compaction_requested_ = false;
+      }
+    } else if (requested) {
+      // T4262 companion: the predicate would re-satisfy immediately with the
+      // request still pending, retrying in a hot loop until success.  Wait
+      // out one interval (only stop_ short-circuits) as the retry backoff.
+      std::unique_lock wait_lock(worker_wait_mu_);
+      worker_wait_cv_.wait_for(
+          wait_lock, std::chrono::seconds(interval_seconds_),
+          [this] { return stop_.load(std::memory_order_acquire); });
     }
   }
 }
@@ -106,8 +194,16 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
     return StatusError(StatusCode::kIOError,
                        "cannot checkpoint a failed transaction engine");
   }
+  // Without a PageManager there is no snapshot to write. Recycling WAL in
+  // that case would discard committed history with no durable image left;
+  // fail before any Advise/Recycle work instead of skipping only the snapshot.
+  if (pm_ == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "cannot checkpoint without a page manager");
+  }
 
   lsn_t oldest_active_first_lsn = std::numeric_limits<lsn_t>::max();
+  txn_id_t oldest_active_txn_id = 0;
   lsn_t snap_lsn = 0;
   {
     std::scoped_lock lk(tm_->transaction_table_lock);
@@ -115,8 +211,10 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
     for (const auto& it : tm_->active_transactions_) {
       std::scoped_lock chain_guard(it.second->chain_mu_);
       if (it.second->HasLogRecord()) {
-        oldest_active_first_lsn =
-            std::min(oldest_active_first_lsn, it.second->FirstLSN());
+        if (it.second->FirstLSN() < oldest_active_first_lsn) {
+          oldest_active_first_lsn = it.second->FirstLSN();
+          oldest_active_txn_id = it.first;
+        }
       }
     }
   }
@@ -134,7 +232,73 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
 
   tm_->logger_->AdviseOldBytesDurable(replay_start_lsn);
   tm_->logger_->RecycleUpTo(replay_start_lsn);
+
+  const lsn_t lowest_retained = tm_->logger_->LowestRetainedLSN();
+  const lsn_t durable_lsn = tm_->logger_->DurableLSN();
+  const uint64_t retained_bytes =
+      durable_lsn > lowest_retained ? (durable_lsn - lowest_retained) : 0;
+  MaybeWarnWalRetention(retained_bytes, oldest_active_txn_id,
+                        oldest_active_first_lsn, replay_start_lsn,
+                        lowest_retained, durable_lsn);
   return replay_start_lsn;
+}
+
+uint64_t CheckpointManager::DefaultWalRetentionWarnBytes() noexcept {
+  static const uint64_t kDefaultBytes = []() -> uint64_t {
+    const char* raw = std::getenv("TINYLAMB_WAL_RETENTION_WARN_BYTES");
+    if (raw == nullptr || *raw == '\0') {
+      return uint64_t{64} << 20;
+    }
+    if (*raw == '-' || *raw == '+') {
+      return uint64_t{64} << 20;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0') {
+      return uint64_t{64} << 20;
+    }
+    return static_cast<uint64_t>(parsed);
+  }();
+  return kDefaultBytes;
+}
+
+void CheckpointManager::MaybeWarnWalRetention(
+    uint64_t retained_bytes, txn_id_t oldest_txn, lsn_t oldest_first_lsn,
+    lsn_t replay_anchor_lsn, lsn_t lowest_retained_lsn, lsn_t durable_lsn) {
+  const uint64_t override_bytes =
+      wal_retention_warn_bytes_override_.load(std::memory_order_acquire);
+  const uint64_t warn_bytes =
+      override_bytes != std::numeric_limits<uint64_t>::max()
+          ? override_bytes
+          : DefaultWalRetentionWarnBytes();
+  if (warn_bytes == 0 || retained_bytes < warn_bytes) {
+    return;
+  }
+  const int64_t now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  int64_t last = last_wal_retention_warn_ms_.load(std::memory_order_relaxed);
+  constexpr int64_t kWarnIntervalMs = int64_t{60} * 1000;
+  if (last != 0 && now_ms - last < kWarnIntervalMs) {
+    return;
+  }
+  if (!last_wal_retention_warn_ms_.compare_exchange_strong(
+          last, now_ms == 0 ? 1 : now_ms, std::memory_order_relaxed)) {
+    return;
+  }
+  wal_retention_warn_count_.fetch_add(1, std::memory_order_relaxed);
+  LOG(WARN) << "WAL retention is high: " << retained_bytes
+            << " bytes retained (warn threshold=" << warn_bytes
+            << "B, lowest_retained_lsn=" << lowest_retained_lsn
+            << ", durable_lsn=" << durable_lsn
+            << ", replay_anchor_lsn=" << replay_anchor_lsn
+            << ", oldest_active_txn=" << oldest_txn
+            << ", oldest_active_first_lsn="
+            << (oldest_txn != 0 ? oldest_first_lsn : 0)
+            << "). Finish or abort long-running transactions to recycle old "
+               "WAL segments.";
 }
 
 }  // namespace tinylamb

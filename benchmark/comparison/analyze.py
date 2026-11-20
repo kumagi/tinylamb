@@ -72,7 +72,12 @@ def oltp_tables(records):
             tps_values.append(f"{median:,.1f} [{low:,.1f}–{high:,.1f}]; {rate:.2f}%")
             p95 = [t["p95_ms"] for t in valid if t["p95_ms"] is not None]
             p99 = [t["p99_ms"] for t in valid if t["p99_ms"] is not None]
-            latency = f"{statistics.median(p95):.3f} / {statistics.median(p99):.3f}" if p95 else "成功サンプルなし"
+            if p95 and p99:
+                latency = f"{statistics.median(p95):.3f} / {statistics.median(p99):.3f}"
+            elif p95:
+                latency = f"{statistics.median(p95):.3f} / n/a"
+            else:
+                latency = "成功サンプルなし"
             sample_count = sum(t["completed"] for t in valid)
             if p95 and (sample_count < 1000 or len(p95) != len(valid)):
                 latency += f"（成功{sample_count}件、有値{len(p95)}/{len(valid)}試行）"

@@ -97,9 +97,16 @@ bool IsScalarBytecodeCompilable(const Expression& node) {
     return true;
   }
   if (node->Type() == TypeTag::kFunctionCallExp) {
+    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // (ascii_substr_1based_slice_sound)
     const auto& name = node->AsFunctionCallExpression().FuncName();
     if (!IdentifierEquals(name, "coalesce") &&
-        !IdentifierEquals(name, "ifnull") && !IdentifierEquals(name, "round")) {
+        !IdentifierEquals(name, "ifnull") && !IdentifierEquals(name, "round") &&
+        !IdentifierEquals(name, "substr") &&
+        !IdentifierEquals(name, "substring") &&
+        !IdentifierEquals(name, "byte_length") &&
+        !IdentifierEquals(name, "length") &&
+        !IdentifierEquals(name, "char_length")) {
       return false;
     }
   }
@@ -506,8 +513,15 @@ Status ApplyOrderBy(TransactionContext& context,
     std::optional<slot_t> ordinal_column;
     if (const std::optional<CollatedOrdinal> collated =
             AsCollatedOrdinal(expression);
-        collated.has_value() && collated->ordinal >= 1 &&
-        std::cmp_less_equal(collated->ordinal, output->schema.ColumnCount())) {
+        collated.has_value()) {
+      // A COLLATE-qualified ordinal is still an ordinal: reject out-of-range
+      // values here instead of falling through to the constant-key path,
+      // which would silently sort by a constant instead of erroring.
+      if (collated->ordinal < 1 ||
+          std::cmp_greater(collated->ordinal, output->schema.ColumnCount())) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ORDER BY ordinal out of range");
+      }
       ordinal_column = static_cast<slot_t>(collated->ordinal - 1);
     } else if (expression && expression->Type() == TypeTag::kConstantValue &&
                dynamic_cast<const ParameterSlot*>(expression.get()) ==
@@ -571,6 +585,8 @@ Status ApplyOrderBy(TransactionContext& context,
     bool col_keys_ok = true;
     for (size_t i = 0; i < key_expressions.size(); ++i) {
       if (direct_key_cols[i].has_value()) {
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+        // success
         col_topn_keys.push_back(ColumnarTopNKey::Direct(*direct_key_cols[i]));
         continue;
       }
@@ -638,6 +654,62 @@ Status ApplyOrderBy(TransactionContext& context,
        QueryMemoryBudget::Global().CanReserve(output->TotalRows() * 160))) {
     RETURN_IF_FAIL(output->EnsureRowsMaterializedChecked());
   }
+  if (allow_bounded && statement.HasLimit() && statement.Limit() == 1 &&
+      statement.Offset() == 0 && statement.WithTies() && !output->HasSpill() &&
+      !output->HasColumnarOnly() && output->rows.size() > 1 &&
+      !order_specs.empty()) {
+    std::vector<Value> best_keys;
+    std::vector<Value> cur_keys(key_expressions.size());
+    std::vector<size_t> winner_indices;
+    for (size_t ri = 0; ri < output->rows.size(); ++ri) {
+      const Row& row = output->rows[ri];
+      Scope scope{.row = &row, .schema = &output->schema, .outer = outer};
+      for (size_t k = 0; k < key_expressions.size(); ++k) {
+        if (direct_key_cols[k].has_value()) {
+          cur_keys[k] = row[*direct_key_cols[k]];
+          continue;
+        }
+        ASSIGN_OR_RETURN(
+            Value, kv,
+            (TryEvaluate(key_expressions[k], scope, nullptr, context, ctes)));
+        cur_keys[k] = std::move(kv);
+      }
+      if (winner_indices.empty()) {
+        best_keys = cur_keys;
+        winner_indices.push_back(ri);
+        continue;
+      }
+      int cmp = 0;
+      for (size_t k = 0; k < order_specs.size(); ++k) {
+        cmp = order_specs[k].Compare(cur_keys[k], best_keys[k]);
+        if (cmp != 0) {
+          break;
+        }
+      }
+      if (cmp < 0) {
+        best_keys = cur_keys;
+        winner_indices.clear();
+        winner_indices.push_back(ri);
+      } else if (cmp == 0) {
+        winner_indices.push_back(ri);
+      }
+    }
+    std::vector<Row> old_rows = std::move(output->rows);
+    output->ResetContents();
+    output->rows.reserve(winner_indices.size());
+    for (const size_t wi : winner_indices) {
+      output->AddRow(std::move(old_rows[wi]));
+    }
+    RETURN_IF_FAIL(output->FinishSpill());
+    if (context.execution_runtime() != nullptr) {
+      ++context.execution_runtime()->topn_finish_uses;
+      context.execution_runtime()->topn_finish_capacity = 1;
+      context.execution_runtime()->topn_finish_input_rows = old_rows.size();
+      context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
+    }
+    return Status::kSuccess;
+  }
+
   if (!output->HasSpill() && !output->HasColumnarOnly() && all_direct_keys &&
       output->rows.size() <= std::numeric_limits<uint32_t>::max()) {
     const size_t n = output->rows.size();

@@ -372,3 +372,31 @@ def main : IO Unit := do
     (sqlGtInt ps.2 (some cnt)).inWhere)
   IO.println s!"  ✅ Q20 相関 SUM 不等号 -> INNER JOIN 相関除去: {repr tpch20CorrSum} == {repr tpch20InnerSum} ({tpch20CorrSum == tpch20InnerSum})"
   IO.println s!"  ❌ もし COUNT(*) だった場合 (key=2 の 0件一致行が生き残る Kim の罠): {repr tpch20CorrCnt}"
+  IO.println ""
+
+  IO.println "=== [13] ClickBench 第2弾（CB-7..CB-12: 商バケット刈り込み・Markov HAVING・アフィン和・ボトム除外下界）==="
+  -- (CB-7) Q34/Q35/Q17/Q19: 商ハッシュバケット上界による Heavy-Hitter 厳密刈り込み
+  let cb7Rows : Rel String := ["u1", "u1", "u1", "u1", "u1", "u2", "u2", "u2", "u2", "rareA", "rareB"]
+  let cb7Bucket : String → Int := fun s => if s == "u1" then 0 else if s == "u2" then 1 else 2
+  let cb7CandBuckets : List Int := [0, 1]
+  let cb7Pruned := cb7Rows.filter (fun s => cb7CandBuckets.contains (cb7Bucket s))
+  let u1P := groupCount id cb7Pruned "u1"
+  let u1F := groupCount id cb7Rows "u1"
+  let u2P := groupCount id cb7Pruned "u2"
+  let u2F := groupCount id cb7Rows "u2"
+  IO.println s!"  ✅ CB-7 商バケット Heavy-Hitter 刈り込み: u1={u1P}/{u1F}, u2={u2P}/{u2F}"
+
+  -- (CB-9) Q30: アフィン線形和 `SUM(x + c) = SUM(x) + c * COUNT(x)` (+ 空NULL保存)
+  let cb9Rows : List (SqlVal Int) := [some 10, none, some 20, some 30]
+  let cb9Direct := sqlSum (fun r => sqlAddOpt r (some 7)) cb9Rows
+  let cb9Affine := sqlAddOpt (sqlSum id cb9Rows) (sqlMulOpt (some 7) (some (sqlCountNonNull cb9Rows)))
+  let cb9Empty : List (SqlVal Int) := [none, none]
+  let cb9EmptyDirect := sqlSum (fun r => sqlAddOpt r (some 7)) cb9Empty
+  let cb9EmptyAffine := sqlAddOpt (sqlSum id cb9Empty) (sqlMulOpt (some 7) (some (sqlCountNonNull cb9Empty)))
+  IO.println s!"  ✅ CB-9 アフィン線形和準同型: 通常={repr cb9Direct}=={repr cb9Affine}, 全NULL={repr cb9EmptyDirect}=={repr cb9EmptyAffine}"
+
+  -- (CB-12) Q26: ボトム元 `""` 除外による Zone-Map 非空下界引き締め
+  let cb12Blk : List String := ["", "zebra", "yak"]
+  let cb12Surv := cb12Blk.filter (fun s => s != "")
+  let cb12AllGt := cb12Surv.all (fun s => s > "cat")
+  IO.println s!"  ✅ CB-12 ボトム元除外下界 (cutoff=cat): 生存行={repr cb12Surv}, 全要素 > cat = {cb12AllGt}"

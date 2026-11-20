@@ -85,7 +85,7 @@ LateMaterializationJoin::LateMaterializationJoin(
       index_read_guard_(
           AcquireReadGuard(txn_, right_index_, std::move(index_read_guard))),
       unique_winner_(unique_winner) {
-  if (!Validate() && initial_status_ == Status::kSuccess) {
+  if (!InitializeAndValidate() && initial_status_ == Status::kSuccess) {
     initial_status_ = StatusError(StatusCode::kInvalidArgument,
                                   "invalid late materialization equi-join "
                                   "contract");
@@ -105,7 +105,7 @@ LateMaterializationJoin::LateMaterializationJoin(
       residual_conjuncts_(SplitConjuncts(residual_)),
       identity_(LateMaterializationIdentity::kRowId),
       rowid_(rowid) {
-  if (!Validate() && initial_status_ == Status::kSuccess) {
+  if (!InitializeAndValidate() && initial_status_ == Status::kSuccess) {
     initial_status_ = StatusError(StatusCode::kInvalidArgument,
                                   "invalid late materialization rowid-join "
                                   "contract");
@@ -114,7 +114,7 @@ LateMaterializationJoin::LateMaterializationJoin(
 
 LateMaterializationJoin::~LateMaterializationJoin() = default;
 
-bool LateMaterializationJoin::Validate() {
+bool LateMaterializationJoin::InitializeAndValidate() {
   const auto reject = [this](std::string message) {
     initial_status_ =
         StatusError(StatusCode::kInvalidArgument, std::move(message));

@@ -15,7 +15,7 @@ SortDistinctPlan::SortDistinctPlan(Plan child)
 
 void SortDistinctPlan::Dump(std::ostream& output, int indent) const {
   output << "SortDistinct\n" << Indent(static_cast<size_t>(indent) + 2);
-  child_->Dump(output, indent + 2);
+  DumpChild(output, *child_, indent + 2);
 }
 
 std::string SortDistinctPlan::ToString() const { return "SortDistinct"; }

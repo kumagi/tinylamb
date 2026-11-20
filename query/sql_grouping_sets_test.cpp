@@ -526,9 +526,17 @@ TEST_F(SqlGroupingSetsTest, CteBodyExecutesOncePerGroupingSetExpansion) {
   const size_t scan_rows = [&dumped]() -> size_t {
     const std::string key = "scan_rows=";
     const size_t at = dumped.find(key);
-    return at == std::string::npos
-               ? 0
-               : std::stoull(dumped.substr(at + key.size()));
+    if (at == std::string::npos) {
+      return 0;
+    }
+    const std::string tail = dumped.substr(at + key.size());
+    size_t used = 0;
+    try {
+      const unsigned long long parsed = std::stoull(tail, &used);
+      return used == 0 ? 0 : static_cast<size_t>(parsed);
+    } catch (const std::exception&) {
+      return 0;
+    }
   }();
   EXPECT_GT(scan_rows, 0U) << dumped;
   EXPECT_LE(scan_rows, 8U) << dumped;

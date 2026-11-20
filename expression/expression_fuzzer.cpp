@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "expression/expression_fuzzer.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -44,6 +46,7 @@
 #include "expression/unary_expression.hpp"
 #include "query/evaluation_context_impl.hpp"
 #include "type/column.hpp"
+#include "type/interval.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -51,6 +54,14 @@
 
 namespace tinylamb {
 namespace {
+
+// T4267: the AST-is-ground-truth oracles below must fire in release fuzz
+// builds too; a plain assert vanishes under -DNDEBUG and green-lights real
+// AST-vs-bytecode/detail splits.  Issue #33: violations are now *recorded*
+// by ExpressionFuzzRun (FUZZ_REQUIRE below) instead of aborting inside the
+// differential body, so the same code path serves libFuzzer (which aborts
+// on the returned violation and collects a self-contained `.test` repro)
+// and the committed ctest replay regression (expression_fuzzer_test).
 
 struct FuzzStream {
   const uint8_t* data{};
@@ -84,8 +95,18 @@ struct FuzzStream {
   [[nodiscard]] bool Exhausted() const { return offset >= size; }
 };
 
+Value GenerateValue(FuzzStream& stream);
+Value GenerateIntValue(FuzzStream& stream);
+Value GenerateDoubleValue(FuzzStream& stream);
+Value GenerateStringValue(FuzzStream& stream);
+Value GenerateDateValue(FuzzStream& stream);
+
 Value GenerateValue(FuzzStream& stream) {
-  const uint8_t type_pick = stream.NextU8() % 5;
+  // T1210: the pick used to be % 5 (NULL/INT64/DOUBLE/BOOL/VARCHAR), so the
+  // unsigned tag, DATE, INTERVAL and ARRAY representations -- the known
+  // tag-drop bug family (P555/P618/P779) -- could never reach the
+  // AST-vs-bytecode comparison no matter how the input was mutated.
+  const uint8_t type_pick = stream.NextU8() % 9;
   switch (type_pick) {
     case 0:
       return {};  // Null
@@ -136,6 +157,71 @@ Value GenerateValue(FuzzStream& stream) {
         s.push_back(static_cast<char>('a' + (stream.NextU8() % 26)));
       }
       return Value(std::move(s));
+    }
+    case 5: {
+      // unsigned-tagged INT64 (collation tag 3): raw bit patterns including
+      // the INT64_MIN that reads as 2^63 once tagged.
+      const uint8_t special = stream.NextU8() % 6;
+      int64_t bits = stream.NextI64();
+      switch (special) {
+        case 0:
+          bits = 0;
+          break;
+        case 1:
+          bits = 1;
+          break;
+        case 2:
+          bits = -1;
+          break;
+        case 3:
+          bits = std::numeric_limits<int64_t>::max();
+          break;
+        case 4:
+          bits = std::numeric_limits<int64_t>::min();
+          break;
+        default:
+          break;
+      }
+      return Value(bits).WithUnsigned();
+    }
+    case 6:
+      return GenerateDateValue(stream);
+    case 7: {
+      // INTERVAL: kVarChar payload + tag 4 (Value::WithInterval), with the
+      // canonical text the memcomparable decode path produces.
+      IntervalValue iv;
+      const uint8_t mag = stream.NextU8() % 4;
+      const int64_t base = mag == 0   ? 0
+                           : mag == 1 ? 1
+                           : mag == 2 ? -1
+                                      : stream.NextI64() % 1000;
+      iv.months = base;
+      iv.days = (stream.NextU8() % 2) == 0 ? 0 : base;
+      iv.nanos = (stream.NextU8() % 2) == 0 ? 0 : base * 1000000000LL;
+      StatusOr<std::string> text = iv.TryToString();
+      if (!text.HasValue()) {
+        return {};
+      }
+      return Value(std::move(text.Value())).WithInterval();
+    }
+    case 8: {
+      // ARRAY of one homogeneous scalar element type (empty included).
+      const uint8_t elem = stream.NextU8() % 3;
+      const size_t len = stream.NextU8() % 4;
+      std::vector<Value> elements;
+      elements.reserve(len);
+      for (size_t i = 0; i < len; ++i) {
+        if (elem == 0) {
+          elements.push_back(GenerateIntValue(stream));
+        } else if (elem == 1) {
+          elements.push_back(GenerateDoubleValue(stream));
+        } else {
+          elements.push_back(GenerateStringValue(stream));
+        }
+      }
+      return Value::Array(std::move(elements), elem == 0   ? "INT64"
+                                               : elem == 1 ? "DOUBLE"
+                                                           : "STRING");
     }
     default:
       break;
@@ -212,7 +298,10 @@ Value GenerateDateValue(FuzzStream& stream) {
   if (stream.NextU8() % 8 == 0) {
     return {};  // NULL
   }
-  return Value::DateFromDays(static_cast<int64_t>(stream.NextU8() % 4000));
+  // Cover a wide date span (roughly years 0..4700) instead of only the first
+  // eleven years after the epoch, so date arithmetic and formatting paths see
+  // leap-century and large-year boundaries.
+  return Value::DateFromDays(stream.NextI64() % 1700000);
 }
 
 Expression GenerateExpression(FuzzStream& stream, int depth) {
@@ -460,7 +549,6 @@ bool ContainsStaticallyMismatchedComparison(const Expression& exp,
     return std::ranges::any_of(in.list_, [&schema](const Expression& item) {
       return ContainsStaticallyMismatchedComparison(item, schema);
     });
-    return false;
   }
   if (exp->Type() == TypeTag::kBinaryExp) {
     const auto& binary = exp->AsBinaryExpression();
@@ -570,15 +658,27 @@ bool PinnedIdentityPromotion(const Expression& exp, const Value& a,
 }
 
 }  // namespace
-}  // namespace tinylamb
 
-extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
-                                                       size_t size) {
+// Records the first oracle violation instead of aborting; the libFuzzer
+// entry point turns that into an abort + `.test` artifact, the ctest replay
+// test turns it into a EXPECT failure (issue #33).
+#define FUZZ_REQUIRE(cond)                                            \
+  do {                                                                \
+    if (!(cond)) {                                                    \
+      violation = std::string("oracle violation: ") + #cond +         \
+                  " (" __FILE__ ":" + std::to_string(__LINE__) + ")"; \
+      result.ok = false;                                              \
+      return result;                                                  \
+    }                                                                 \
+  } while (0)
+
+ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
+  ExpressionFuzzResult result;
+  std::string& violation = result.violation;
   if (size < 4 || size > 4096) {
-    return 0;
+    return result;
   }
 
-  using namespace tinylamb;
   FuzzStream stream{.data = data, .size = size};
 
   Schema schema("fuzz_schema", {
@@ -597,7 +697,7 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
 
   Expression exp = GenerateExpression(stream, 4);
   if (!exp) {
-    return 0;
+    return result;
   }
 
   if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
@@ -629,8 +729,13 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
       DataChunk chunk(schema);
       chunk.Append(row);
       ColumnVector out = program->EvaluateBatch(chunk);
-      assert(out.Size() == 1);
+      FUZZ_REQUIRE(out.Size() == 1);
       bc_result = out.ValueAt(0);
+    } catch (const std::exception& e) {
+      bc_threw = true;
+      if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
+        (void)fprintf(stderr, "bc throw reason: %s\n", e.what());
+      }
     } catch (...) {
       bc_threw = true;
     }
@@ -696,7 +801,7 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
           static_cast<int>(ContainsNeutralArithmetic(exp)),
           exp->ToString().c_str(), fold_dump.c_str());
     }
-    assert(ast_threw == bc_threw || fold_tolerated);
+    FUZZ_REQUIRE(ast_threw == bc_threw || fold_tolerated);  // NOLINT(readability-simplify-boolean-expr): FUZZ_REQUIRE negates its condition
     if (!ast_threw && !bc_threw && !ValuesMatch(ast_result, bc_result) &&
         !PinnedIdentityPromotion(exp, ast_result, bc_result) &&
         (getenv("TINYLAMB_EXPR_FUZZ_PASSES") != nullptr)) {
@@ -744,8 +849,8 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
           exp->ToString().c_str(), folded_text.c_str(), row.ToString().c_str());
     }
     if (!ast_threw && !bc_threw) {
-      assert(ValuesMatch(ast_result, bc_result) ||
-             PinnedIdentityPromotion(exp, ast_result, bc_result));
+      FUZZ_REQUIRE(ValuesMatch(ast_result, bc_result) ||
+                   PinnedIdentityPromotion(exp, ast_result, bc_result));
     }
   }
 
@@ -767,7 +872,7 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                   static_cast<int>(ast_threw), static_cast<int>(detail_threw),
                   exp->ToString().c_str(), row.ToString().c_str());
   }
-  assert(ast_threw == detail_threw);
+  FUZZ_REQUIRE(ast_threw == detail_threw);
   if (!ast_threw && !ValuesMatch(ast_result, detail_result) &&
       !PinnedIdentityPromotion(exp, ast_result, detail_result)) {
     (void)fprintf(stderr, "value mismatch ast=%s detail=%s exp=%s row=%s\n",
@@ -776,9 +881,125 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                   row.ToString().c_str());
   }
   if (!ast_threw) {
-    assert(ValuesMatch(ast_result, detail_result) ||
-           PinnedIdentityPromotion(exp, ast_result, detail_result));
+    FUZZ_REQUIRE(ValuesMatch(ast_result, detail_result) ||
+                 PinnedIdentityPromotion(exp, ast_result, detail_result));
   }
 
+  return result;
+}
+
+namespace {
+
+// Format helpers for the self-contained repro file: '#' comment header
+// lines + the raw input as lowercase hex (whitespace-insensitive).
+constexpr std::string_view kHexDigits = "0123456789abcdef";
+
+std::string Fnv1aHex(const uint8_t* data, size_t size) {
+  uint64_t hash = 1469598103934665603ULL;
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= data[i];
+    hash *= 1099511628211ULL;
+  }
+  std::string out(16, '0');
+  for (size_t i = 0; i < 16; ++i) {
+    out[i] = kHexDigits[(hash >> (60 - 4 * i)) & 0xF];
+  }
+  return out;
+}
+
+int HexDigitValue(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+}  // namespace
+
+std::string ExpressionFuzzReproText(const uint8_t* data, size_t size) {
+  std::string out =
+      "# tinylamb expression_fuzzer differential repro (issue #33).\n"
+      "# Self-contained: raw libFuzzer input as lowercase hex below.\n"
+      "# Replay: expression_fuzzer_test over "
+      "TINYLAMB_EXPR_FUZZ_REGRESSION_DIR\n";
+  for (size_t i = 0; i < size; ++i) {
+    out.push_back(kHexDigits[data[i] >> 4]);
+    out.push_back(kHexDigits[data[i] & 0xF]);
+    if (i % 32 == 31) {
+      out.push_back('\n');
+    }
+  }
+  out.push_back('\n');
+  return out;
+}
+
+StatusOr<std::vector<uint8_t>> DecodeExpressionFuzzRepro(
+    std::string_view text) {
+  std::vector<uint8_t> bytes;
+  int pending = -1;
+  bool in_comment = false;
+  for (const char c : text) {
+    if (c == '\n') {
+      in_comment = false;
+      continue;
+    }
+    if (in_comment) {
+      continue;
+    }
+    if (c == '#') {
+      in_comment = true;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r') {
+      continue;
+    }
+    const int digit = HexDigitValue(c);
+    if (digit < 0) {
+      return Status::kInvalidArgument;
+    }
+    if (pending < 0) {
+      pending = digit;
+    } else {
+      bytes.push_back(static_cast<uint8_t>((pending << 4) | digit));
+      pending = -1;
+    }
+  }
+  if (pending >= 0) {
+    return Status::kInvalidArgument;
+  }
+  return bytes;
+}
+
+void WriteExpressionFuzzRepro(const uint8_t* data, size_t size) {
+  const std::string path =
+      "expression_fuzzer_fuzz-repro-" + Fnv1aHex(data, size) + ".test";
+  std::FILE* file = std::fopen(path.c_str(), "wb");  // NOLINT(cppcoreguidelines-owning-memory): closed below
+  if (file == nullptr) {
+    return;
+  }
+  const std::string text = ExpressionFuzzReproText(data, size);
+  (void)std::fwrite(text.data(), 1, text.size(), file);
+  (void)std::fclose(file);  // NOLINT(cppcoreguidelines-owning-memory)
+  (void)std::fprintf(stderr, "repro written: %s\n", path.c_str());
+}
+
+}  // namespace tinylamb
+
+extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
+                                                       size_t size) {
+  const tinylamb::ExpressionFuzzResult result =
+      tinylamb::ExpressionFuzzRun(data, size);
+  if (!result.ok) {
+    (void)std::fprintf(stderr, "%s\n", result.violation.c_str());
+    (void)std::fflush(stderr);
+    tinylamb::WriteExpressionFuzzRepro(data, size);
+    std::abort();
+  }
   return 0;
 }

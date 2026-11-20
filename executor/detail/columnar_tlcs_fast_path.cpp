@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -91,7 +92,7 @@ std::shared_ptr<const TlcsFile> ResolveCleanBackingTlcs(
       return nullptr;
     }
   }
-  std::shared_ptr<const TlcsFile> tlcs = table.GetBackingTLCSStore();
+  std::shared_ptr<const TlcsFile> tlcs = table.GetBackingTlcsStore();
   if (tlcs == nullptr || tlcs->LayoutGeneration() != generation ||
       tlcs->FirstPageId() != table.FirstPageId()) {
     return nullptr;
@@ -130,8 +131,13 @@ void FinalizePredicateMetadata(const TlcsFile& tlcs, const Schema& table_schema,
             cmp.string_match ==
                 TypedFilterCompare::StringMatchKind::kContains &&
             !cmp.string_constant.empty()) {
-          set->contains_prechecks.push_back(
-              {.full_col = cmp.left, .needle = cmp.string_constant});
+          set->contains_prechecks.push_back({
+              .full_col = cmp.left,
+              .needle = cmp.string_constant,
+              .kernel = tlcs.BlockCount() >= 128
+                            ? JitLiteralSearch::Compile(cmp.string_constant)
+                            : std::nullopt,
+          });
         }
       }
     }
@@ -516,7 +522,8 @@ bool CompilePredicatesFromExpressions(
         }
       }
       (void)std::fprintf(stderr, "[TLCS-PRED-BAIL] cols=%u%s\n",
-                         scan_schema.ColumnCount(), extra.c_str());
+                         static_cast<unsigned>(scan_schema.ColumnCount()),
+                         extra.c_str());
     }
     return false;
   }
@@ -975,6 +982,91 @@ bool RowMatchesColPtrs(
   });
 }
 
+// Lean proof: lean/TinylambOpt/PhysicalJitFusion.lean
+// (first_hit_decides_row, refine_candidates_sound)
+bool TryJitContainsRows(
+    const ColumnarPredicateSet& preds,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
+    uint32_t row_count, bool refine, std::vector<uint32_t>* rows) {
+  // One positive literal is enough to generate the candidate list. The
+  // regular evaluator handles the remaining conjuncts on surviving rows.
+  for (const auto& precheck : preds.contains_prechecks) {
+    const auto* chunk = col_ptrs[precheck.full_col];
+    if (!precheck.kernel || chunk == nullptr || chunk->dict_encoded ||
+        row_count == 0 || chunk->varchar_ends.size() != row_count ||
+        chunk->varchar_ends.back() != chunk->varchar_bytes.size()) {
+      continue;
+    }
+    const std::span<const uint8_t> bytes(chunk->varchar_bytes);
+    const auto& kernel = *precheck.kernel;
+    size_t match = kernel.Find(bytes);
+    if (match == bytes.size()) {
+      rows->clear();
+      return true;
+    }
+    // A TLCS decoder can supply malformed offsets. Keep the ordinary per-row
+    // bounds behavior for those chunks and search only monotone offsets.
+    const auto& ends = chunk->varchar_ends;
+    if (!std::ranges::is_sorted(ends)) {
+      continue;
+    }
+    // A hit costs a native call and an offset lookup. Keep this path for
+    // sparse matches, and leave the caller's candidates intact on fallback.
+    constexpr size_t kMaxHitRows = 64;
+    std::array<uint32_t, kMaxHitRows> candidate_rows{};
+    size_t candidate_count = 0;
+    auto row_end = ends.begin();
+    for (size_t hits = 0; match < bytes.size() && hits < kMaxHitRows; ++hits) {
+      row_end = std::upper_bound(row_end, ends.end(), match);
+      const auto row = static_cast<uint32_t>(row_end - ends.begin());
+      const size_t end = *row_end;
+      if (precheck.needle.size() <= end - match && !chunk->IsNull(row)) {
+        candidate_rows[candidate_count++] = row;
+      }
+      // If the earliest hit crosses the boundary, every later start within
+      // this row crosses it too. In either case the row has been decided.
+      match = end + kernel.Find(bytes.subspan(end));
+    }
+    if (match < bytes.size()) {
+      continue;
+    }
+
+    if (!refine) {
+      rows->clear();
+    }
+    size_t read = 0;
+    size_t write = 0;
+    const bool only_literal = preds.compares.size() == 1 &&
+                              preds.nulls.empty() && preds.inlists.empty();
+    for (uint32_t row : std::span(candidate_rows).first(candidate_count)) {
+      if (refine) {
+        while (read < rows->size() && (*rows)[read] < row) {
+          ++read;
+        }
+        if (read == rows->size()) {
+          break;
+        }
+        if ((*rows)[read] != row) {
+          continue;
+        }
+        ++read;
+      }
+      if (only_literal || RowMatchesColPtrs(preds, col_ptrs, row)) {
+        if (refine) {
+          (*rows)[write++] = row;
+        } else {
+          rows->push_back(row);
+        }
+      }
+    }
+    if (refine) {
+      rows->resize(write);
+    }
+    return true;
+  }
+  return false;
+}
+
 // Fast block-level byte search for `LIKE '%needle%'` filters prior to row-level
 // boundary scanning or decoding other columns.
 bool BlockPassesContainsPrecheck(const TlcsFile::DecodedColumnChunk& chunk,
@@ -1035,6 +1127,56 @@ Status FoldRowIntoAggState(
     st.has_value = true;
     return Status::kSuccess;
   }
+  if (spec.double_arith != nullptr) {
+    for (const slot_t fc : spec.double_arith->referenced_cols) {
+      if (col_ptrs[fc]->IsNull(row)) {
+        return Status::kSuccess;
+      }
+    }
+    std::array<double, 32> stk{};
+    size_t sp = 0;
+    for (const auto& ins : spec.double_arith->rpn) {
+      switch (ins.op) {
+        case ColDoubleArithExpr::Op::kColDouble:
+          stk[sp++] =
+              std::bit_cast<double>(col_ptrs[ins.full_col]->int_cells[row]);
+          break;
+        case ColDoubleArithExpr::Op::kColInt64:
+          stk[sp++] =
+              static_cast<double>(col_ptrs[ins.full_col]->int_cells[row]);
+          break;
+        case ColDoubleArithExpr::Op::kConst:
+          stk[sp++] = ins.constant;
+          break;
+        case ColDoubleArithExpr::Op::kAdd:
+          stk[sp - 2] += stk[sp - 1];
+          --sp;
+          break;
+        case ColDoubleArithExpr::Op::kSub:
+          stk[sp - 2] -= stk[sp - 1];
+          --sp;
+          break;
+        case ColDoubleArithExpr::Op::kMul:
+          stk[sp - 2] *= stk[sp - 1];
+          --sp;
+          break;
+        case ColDoubleArithExpr::Op::kNeg:
+          stk[sp - 1] = -stk[sp - 1];
+          break;
+      }
+    }
+    if (sp == 1) {
+      if (spec.kind == ColAggKind::kSumDouble && std::isinf(stk[0])) {
+        st.saw_inf = true;  // P603 infinity provenance
+      }
+      st.double_val += stk[0];
+      if (spec.kind == ColAggKind::kAvgDouble) {
+        ++st.count;
+      }
+      st.has_value = true;
+    }
+    return Status::kSuccess;
+  }
   const TlcsFile::DecodedColumnChunk& chunk = *col_ptrs[spec.full_col];
   if (chunk.IsNull(row)) {
     return Status::kSuccess;
@@ -1060,10 +1202,15 @@ Status FoldRowIntoAggState(
       st.int_val += static_cast<int64_t>(chunk.VarcharLength(row));
       st.has_value = true;
       break;
-    case ColAggKind::kSumDouble:
-      st.double_val += std::bit_cast<double>(chunk.int_cells[row]);
+    case ColAggKind::kSumDouble: {
+      const auto v = std::bit_cast<double>(chunk.int_cells[row]);
+      if (std::isinf(v)) {
+        st.saw_inf = true;  // P603 infinity provenance
+      }
+      st.double_val += v;
       st.has_value = true;
       break;
+    }
     case ColAggKind::kAvgDouble:
       st.double_val += chunk.type == ValueType::kDouble
                            ? std::bit_cast<double>(chunk.int_cells[row])
@@ -1318,6 +1465,10 @@ Status MergeAggState(const ColAggSpec& spec, RuntimeAggState& dst,
       dst.has_value = true;
       break;
     case ColAggKind::kSumDouble:
+      // P603: propagate input provenance only.  A worker partial that
+      // already overflowed to inf keeps the flag clear so the merged
+      // finite-input infinity still raises at finish.
+      dst.saw_inf = dst.saw_inf || src.saw_inf;
       dst.double_val += src.double_val;
       dst.has_value = true;
       break;
@@ -1693,7 +1844,8 @@ class SingleIntWorkerTable {
 
 }  // namespace
 
-Value FinishAggState(const ColAggSpec& spec, const RuntimeAggState& st) {
+StatusOr<Value> FinishAggState(const ColAggSpec& spec,
+                               const RuntimeAggState& st) {
   switch (spec.kind) {
     case ColAggKind::kCountStar:
     case ColAggKind::kCountCol:
@@ -1703,7 +1855,18 @@ Value FinishAggState(const ColAggSpec& spec, const RuntimeAggState& st) {
     case ColAggKind::kSumByteLen:
       return st.has_value ? Value(st.int_val) : Value();
     case ColAggKind::kSumDouble:
-      return st.has_value ? Value(st.double_val) : Value();
+      if (!st.has_value) {
+        return Value();
+      }
+      if (!st.saw_inf && std::isinf(st.double_val)) {
+        // P603: finite inputs whose running sum left the double range
+        // raise, matching the canonical accumulator (aggregate_accumulator
+        // "SUM overflow: result is infinite"); an actual infinity input
+        // legitimately propagates as inf.
+        return StatusError(StatusCode::kIsInfinity,
+                           "SUM overflow: result is infinite");
+      }
+      return Value(st.double_val);
     case ColAggKind::kAvgDouble:
     case ColAggKind::kAvgByteLen:
       return st.count == 0
@@ -1721,7 +1884,7 @@ Value FinishAggState(const ColAggSpec& spec, const RuntimeAggState& st) {
     case ColAggKind::kMaxDouble:
       // GoogleSQL: any NaN in the group makes MIN/MAX NaN.
       if (!st.has_value) {
-        return {};
+        return Value();
       }
       return Value(st.saw_nan ? std::numeric_limits<double>::quiet_NaN()
                               : st.double_val);
@@ -1732,13 +1895,19 @@ Value FinishAggState(const ColAggSpec& spec, const RuntimeAggState& st) {
     case ColAggKind::kCountDistinctInt64:
     case ColAggKind::kCountDistinctDate:
     case ColAggKind::kCountDistinctDouble:
+      if (st.distinct_count_final) {
+        return Value(st.count);
+      }
       return Value(static_cast<int64_t>(
           st.distinct_ints != nullptr ? st.distinct_ints->Size() : 0));
     case ColAggKind::kCountDistinctVarChar:
+      if (st.distinct_count_final) {
+        return Value(st.count);
+      }
       return Value(static_cast<int64_t>(
           st.distinct_strs != nullptr ? st.distinct_strs->size() : 0));
   }
-  return {};
+  return Value();
 }
 
 namespace {
@@ -1824,6 +1993,110 @@ bool TryClassifyAggregate(const AggregateExpression* agg,
   if (at == AggregationType::kAvg && leaf->Type() == TypeTag::kCastExp &&
       leaf->AsCastExpression().TargetValueType() == ValueType::kDouble) {
     leaf = leaf->AsCastExpression().Child();
+  }
+  if (!distinct &&
+      (at == AggregationType::kSum || at == AggregationType::kAvg) && leaf &&
+      leaf->Type() != TypeTag::kColumnValue &&
+      leaf->ResultType(qualified_schema).GetType() == TypeTag::kDouble) {
+    auto arith = std::make_shared<ColDoubleArithExpr>();
+    size_t max_depth = 0;
+    const std::function<bool(const Expression&, size_t)> compile_rpn =
+        [&](const Expression& e, size_t depth) -> bool {
+      if (!e || depth > 24) {
+        return false;
+      }
+      max_depth = std::max(max_depth, depth);
+      if (e->Type() == TypeTag::kConstantValue) {
+        const Value& cv = e->AsConstantValue().GetValue();
+        if (cv.IsNull() || cv.IsUnsigned()) {
+          return false;
+        }
+        if (cv.type == ValueType::kDouble) {
+          arith->rpn.push_back({.op = ColDoubleArithExpr::Op::kConst,
+                                .constant = cv.value.double_value});
+          return true;
+        }
+        if (cv.type == ValueType::kInt64) {
+          arith->rpn.push_back(
+              {.op = ColDoubleArithExpr::Op::kConst,
+               .constant = static_cast<double>(cv.value.int_value)});
+          return true;
+        }
+        return false;
+      }
+      if (e->Type() == TypeTag::kColumnValue) {
+        const auto s = LocalColumnOffset(qualified_schema,
+                                         e->AsColumnValue().GetColumnName());
+        if (!s || *s >= qualified_schema.ColumnCount()) {
+          return false;
+        }
+        const Column& c = qualified_schema.GetColumn(*s);
+        if (c.IsUnsigned() || c.IsInterval()) {
+          return false;
+        }
+        const slot_t fc = MapSlot(*s, proj_to_full);
+        const ValueType vt = table_schema.GetColumn(fc).Type();
+        if (vt != ValueType::kDouble && vt != ValueType::kInt64) {
+          return false;
+        }
+        if (std::ranges::find(arith->referenced_cols, fc) ==
+            arith->referenced_cols.end()) {
+          arith->referenced_cols.push_back(fc);
+        }
+        arith->rpn.push_back({.op = vt == ValueType::kDouble
+                                        ? ColDoubleArithExpr::Op::kColDouble
+                                        : ColDoubleArithExpr::Op::kColInt64,
+                              .full_col = fc});
+        return true;
+      }
+      if (e->Type() == TypeTag::kCastExp &&
+          e->AsCastExpression().TargetValueType() == ValueType::kDouble &&
+          !e->AsCastExpression().ReturnNullOnError()) {
+        return compile_rpn(e->AsCastExpression().Child(), depth + 1);
+      }
+      if (e->Type() == TypeTag::kUnaryExp &&
+          e->AsUnaryExpression().Op() == UnaryOperation::kMinus &&
+          e->ResultType(qualified_schema).GetType() == TypeTag::kDouble) {
+        if (!compile_rpn(e->AsUnaryExpression().Child(), depth + 1)) {
+          return false;
+        }
+        arith->rpn.push_back({.op = ColDoubleArithExpr::Op::kNeg});
+        return true;
+      }
+      if (e->Type() == TypeTag::kBinaryExp &&
+          e->ResultType(qualified_schema).GetType() == TypeTag::kDouble) {
+        const auto& bin = e->AsBinaryExpression();
+        ColDoubleArithExpr::Op rop = ColDoubleArithExpr::Op::kAdd;
+        switch (bin.Op()) {
+          case BinaryOperation::kAdd:
+            rop = ColDoubleArithExpr::Op::kAdd;
+            break;
+          case BinaryOperation::kSubtract:
+            rop = ColDoubleArithExpr::Op::kSub;
+            break;
+          case BinaryOperation::kMultiply:
+            rop = ColDoubleArithExpr::Op::kMul;
+            break;
+          default:
+            return false;
+        }
+        if (!compile_rpn(bin.Left(), depth + 1) ||
+            !compile_rpn(bin.Right(), depth + 1)) {
+          return false;
+        }
+        arith->rpn.push_back({.op = rop});
+        return true;
+      }
+      return false;
+    };
+    if (compile_rpn(leaf, 1) && !arith->referenced_cols.empty() &&
+        arith->rpn.size() <= 30) {
+      out->kind = at == AggregationType::kSum ? ColAggKind::kSumDouble
+                                              : ColAggKind::kAvgDouble;
+      out->full_col = arith->referenced_cols[0];
+      out->double_arith = std::move(arith);
+      return true;
+    }
   }
   if (!leaf || leaf->Type() != TypeTag::kColumnValue) {
     return false;
@@ -2159,8 +2432,15 @@ StatusOr<Value> EvaluateBindingValue(
       return finished_aggs[b.index];
     case OutputSlotBinding::Kind::kKey: {
       Value& cached = (*cached_key_values)[b.index];
-      if (!cached.IsNull() || keys[b.index].is_null) {
-        if (keys[b.index].is_null) {
+      // NOLINTNEXTLINE(clang-analyzer-core.NullDereference) intentional pattern
+      // in this code
+      if (!cached.IsNull() ||
+          keys[b.index]  // NOLINT(clang-analyzer-core.NullDereference)
+              .is_null) {  // NOLINT(clang-analyzer-core.NullDereference)
+        // NOLINTNEXTLINE(clang-analyzer-core.NullDereference) intentional
+        // pattern in this code
+        if (keys[b.index]  // NOLINT(clang-analyzer-core.NullDereference)
+                .is_null) {  // NOLINT(clang-analyzer-core.NullDereference)
           return Value();
         }
         return cached;
@@ -2178,7 +2458,11 @@ StatusOr<Value> EvaluateBindingValue(
         if (s.is_key) {
           ASSIGN_OR_RETURN(
               Value, kv,
-              MaterializeKeyCellValue(key_specs[s.index], keys[s.index]));
+              // NOLINTNEXTLINE(clang-analyzer-core.NonNullParamChecker)
+              // intentional pattern in this code
+              MaterializeKeyCellValue(  // NOLINT(clang-analyzer-core.NonNullParamChecker)
+                  key_specs[s.index],
+                  keys[s.index]));  // NOLINT(clang-analyzer-core.NonNullParamChecker)
           arg_row.values_.push_back(std::move(kv));
         } else {
           arg_row.values_.push_back(finished_aggs[s.index]);
@@ -2234,11 +2518,15 @@ StatusOr<bool> EvalPositionalHavingOnStates(
       }
       continue;
     }
-    (*finished_scratch)[clause.agg_index] =
-        FinishAggState(agg_specs[clause.agg_index], ast[clause.agg_index]);
+    ASSIGN_OR_RETURN(
+        Value, lhs_value,
+        (FinishAggState(agg_specs[clause.agg_index], ast[clause.agg_index])));
+    (*finished_scratch)[clause.agg_index] = std::move(lhs_value);
     if (clause.rhs_is_agg) {
-      (*finished_scratch)[clause.rhs_agg_index] = FinishAggState(
-          agg_specs[clause.rhs_agg_index], ast[clause.rhs_agg_index]);
+      ASSIGN_OR_RETURN(Value, rhs_value,
+                       (FinishAggState(agg_specs[clause.rhs_agg_index],
+                                       ast[clause.rhs_agg_index])));
+      (*finished_scratch)[clause.rhs_agg_index] = std::move(rhs_value);
     }
     const Value* rhs = clause.rhs_is_agg
                            ? &(*finished_scratch)[clause.rhs_agg_index]
@@ -2315,6 +2603,13 @@ ColumnarStageSchedule BuildColumnarStageSchedule(
   }
   for (const auto& as : agg_specs) {
     if (as.kind == ColAggKind::kCountStar) {
+      continue;
+    }
+    if (as.double_arith != nullptr) {
+      for (const slot_t fc : as.double_arith->referenced_cols) {
+        payload_needed[fc] = 1;
+        ++non_case_refs[fc];
+      }
       continue;
     }
     payload_needed[as.full_col] = 1;
@@ -2425,9 +2720,7 @@ StatusOr<bool> DecodeAndFilterBlock(
   };
 
   if (!sched.stage1a_cols.empty() && !sched.stage1b_cols.empty()) {
-    // Decode cheap integer / length-only filter columns (`stage1b_cols`, e.g.
-    // `SearchPhrase <> ''` in ClickBench Q22/Q23) FIRST so blocks with 0
-    // survivors never read or decompress wide `LIKE` columns (`Title`, `URL`)!
+    // Read cheap filter columns before the wider LIKE inputs.
     RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
         bidx, sched.stage1b_cols, table_schema, &scratch->blk1b, true,
         &scratch->io1b, sched.stage1b_len_only));
@@ -2435,13 +2728,45 @@ StatusOr<bool> DecodeAndFilterBlock(
     for (size_t i = 0; i < sched.stage1b_cols.size(); ++i) {
       (*col_ptrs)[sched.stage1b_cols[i]] = &scratch->blk1b.columns[i];
     }
-    for (uint32_t r = 0; r < scratch->blk1b.row_count; ++r) {
-      if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
-        cand_rows->push_back(r);
+    // For a raw length-only gate, prove an empty block cheaply. On other
+    // blocks let the literal kernel generate candidates and evaluate the
+    // length comparison on those rows. Lean: literal_before_length_gate.
+    bool refine_literal = true;
+    if (sched.stage1b_cols.size() == 1 && sched.stage1b_len_only[0] != 0U &&
+        std::ranges::any_of(preds.contains_prechecks, [](const auto& check) {
+          return check.kernel.has_value();
+        })) {
+      const slot_t slot = sched.stage1b_cols[0];
+      const auto& chunk = scratch->blk1b.columns[0];
+      if (!chunk.has_null && !chunk.dict_encoded &&
+          chunk.varchar_ends.size() == scratch->blk1b.row_count &&
+          !chunk.varchar_ends.empty() &&
+          std::ranges::any_of(
+              preds.compares, [slot](const TypedFilterCompare& cmp) {
+                return cmp.left == slot && cmp.constant_payload &&
+                       cmp.string_payload &&
+                       cmp.string_match ==
+                           TypedFilterCompare::StringMatchKind::kExact &&
+                       cmp.string_constant.empty() &&
+                       cmp.op == BinaryOperation::kNotEquals;
+              })) {
+        if (chunk.varchar_ends.back() == 0 &&
+            std::ranges::all_of(chunk.varchar_ends,
+                                [](uint32_t end) { return end == 0; })) {
+          return false;
+        }
+        refine_literal = false;
       }
     }
-    if (cand_rows->empty()) {
-      return false;
+    if (refine_literal) {
+      for (uint32_t r = 0; r < scratch->blk1b.row_count; ++r) {
+        if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
+          cand_rows->push_back(r);
+        }
+      }
+      if (cand_rows->empty()) {
+        return false;
+      }
     }
 
     RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
@@ -2450,21 +2775,27 @@ StatusOr<bool> DecodeAndFilterBlock(
     for (size_t i = 0; i < sched.stage1a_cols.size(); ++i) {
       (*col_ptrs)[sched.stage1a_cols[i]] = &scratch->blk1a.columns[i];
     }
-    for (const auto& pc : preds.contains_prechecks) {
-      const auto* ch = (*col_ptrs)[pc.full_col];
-      if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
-        cand_rows->clear();
-        return false;
+    if (!TryJitContainsRows(preds, *col_ptrs, scratch->blk1a.row_count,
+                            refine_literal, cand_rows)) {
+      for (const auto& pc : preds.contains_prechecks) {
+        const auto* ch = (*col_ptrs)[pc.full_col];
+        if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
+          cand_rows->clear();
+          return false;
+        }
+      }
+      if (refine_literal) {
+        std::erase_if(*cand_rows, [&](uint32_t r) {
+          return !RowMatchesColPtrs(preds, *col_ptrs, r);
+        });
+      } else {
+        for (uint32_t r = 0; r < scratch->blk1a.row_count; ++r) {
+          if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
+            cand_rows->push_back(r);
+          }
+        }
       }
     }
-    std::vector<uint32_t> filtered;
-    filtered.reserve(cand_rows->size());
-    for (const uint32_t r : *cand_rows) {
-      if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
-        filtered.push_back(r);
-      }
-    }
-    cand_rows->swap(filtered);
     if (cand_rows->empty()) {
       return false;
     }
@@ -2472,7 +2803,7 @@ StatusOr<bool> DecodeAndFilterBlock(
     if (!sched.stage1c_cols.empty()) {
       RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
           bidx, sched.stage1c_cols, table_schema, &scratch->blk1c, true,
-          &scratch->io1c, {}));
+          &scratch->io1c, {}, false, *cand_rows));
       for (size_t i = 0; i < sched.stage1c_cols.size(); ++i) {
         (*col_ptrs)[sched.stage1c_cols[i]] = &scratch->blk1c.columns[i];
       }
@@ -2509,15 +2840,18 @@ StatusOr<bool> DecodeAndFilterBlock(
     for (size_t i = 0; i < sched.stage1a_cols.size(); ++i) {
       (*col_ptrs)[sched.stage1a_cols[i]] = &scratch->blk1a.columns[i];
     }
-    for (const auto& pc : preds.contains_prechecks) {
-      const auto* ch = (*col_ptrs)[pc.full_col];
-      if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
-        return false;
+    if (!TryJitContainsRows(preds, *col_ptrs, scratch->blk1a.row_count, false,
+                            cand_rows)) {
+      for (const auto& pc : preds.contains_prechecks) {
+        const auto* ch = (*col_ptrs)[pc.full_col];
+        if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
+          return false;
+        }
       }
-    }
-    for (uint32_t r = 0; r < scratch->blk1a.row_count; ++r) {
-      if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
-        cand_rows->push_back(r);
+      for (uint32_t r = 0; r < scratch->blk1a.row_count; ++r) {
+        if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
+          cand_rows->push_back(r);
+        }
       }
     }
     if (cand_rows->empty()) {
@@ -2527,7 +2861,7 @@ StatusOr<bool> DecodeAndFilterBlock(
     if (!sched.stage1c_cols.empty()) {
       RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
           bidx, sched.stage1c_cols, table_schema, &scratch->blk1c, true,
-          &scratch->io1c, {}));
+          &scratch->io1c, {}, false, *cand_rows));
       for (size_t i = 0; i < sched.stage1c_cols.size(); ++i) {
         (*col_ptrs)[sched.stage1c_cols[i]] = &scratch->blk1c.columns[i];
       }
@@ -2637,17 +2971,34 @@ StatusOr<bool> DecodeAndFilterBlock(
           uint8_t priority;
         };
         std::array<FastIntPred, 16> fps{};
-        const size_t nf = preds.compares.size();
-        for (size_t i = 0; i < nf; ++i) {
-          const auto& cmp = preds.compares[i];
+        size_t nf = 0;
+        for (const auto& cmp : preds.compares) {
+          const auto& column = *(*col_ptrs)[cmp.left];
+          if (column.has_min_max && !column.is_unsigned) {
+            // Lean: bounded_compare_true. The flat path already checked that
+            // the input contains no NULLs, so the zone may prove the atom.
+            const int64_t lo = column.min_int;
+            const int64_t hi = column.max_int;
+            const int64_t c = cmp.int_constant;
+            const bool always_true =
+                (cmp.op == BinaryOperation::kEquals && lo == c && hi == c) ||
+                (cmp.op == BinaryOperation::kNotEquals && (hi < c || c < lo)) ||
+                (cmp.op == BinaryOperation::kLessThan && hi < c) ||
+                (cmp.op == BinaryOperation::kLessThanEquals && hi <= c) ||
+                (cmp.op == BinaryOperation::kGreaterThan && lo > c) ||
+                (cmp.op == BinaryOperation::kGreaterThanEquals && lo >= c);
+            if (always_true) {
+              continue;
+            }
+          }
           const uint8_t prio =
               (cmp.op == BinaryOperation::kEquals && cmp.int_constant != 0)
                   ? 0
                   : (cmp.op == BinaryOperation::kEquals ? 1 : 2);
-          fps[i] = {.cells = (*col_ptrs)[cmp.left]->int_cells.data(),
-                    .op = cmp.op,
-                    .c = cmp.int_constant,
-                    .priority = prio};
+          fps[nf++] = {.cells = column.int_cells.data(),
+                       .op = cmp.op,
+                       .c = cmp.int_constant,
+                       .priority = prio};
         }
         std::sort(fps.begin(), fps.begin() + nf,
                   [](const FastIntPred& a, const FastIntPred& b) {
@@ -2904,6 +3255,262 @@ bool BindExpressionToOutputSlot(const Expression& expr,
   return false;
 }
 
+// Lean proof: TinylambOpt.TlcsBoundaryAggregate. The file's boundary
+// frequencies are exact. The reservoir's NDV, histogram and MCV are estimates.
+StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
+    const TlcsFile& tlcs, const SelectStatement& stmt, const Schema& schema,
+    const Schema& qualified_schema, const ColumnarPredicateSet& preds,
+    const std::vector<ColGroupKeySpec>& keys,
+    const std::vector<ColAggSpec>& aggregates,
+    const std::vector<OutputSlotBinding>& emit,
+    const std::vector<ColumnarOrderBinding>& order,
+    std::span<const NamedExpression> output_names, ExecutionRuntime* runtime) {
+  if (tlcs.TotalRows() > static_cast<uint64_t>(INT64_MAX) ||
+      std::getenv("TINYLAMB_DISABLE_TLCS_BOUNDARY_AGG") != nullptr) {
+    return std::nullopt;
+  }
+  const bool extrema =
+      preds.Empty() && keys.empty() && !aggregates.empty() &&
+      std::ranges::all_of(aggregates, [](const ColAggSpec& agg) {
+        return agg.kind == ColAggKind::kMinInt64 ||
+               agg.kind == ColAggKind::kMaxInt64 ||
+               agg.kind == ColAggKind::kMinDate ||
+               agg.kind == ColAggKind::kMaxDate ||
+               agg.kind == ColAggKind::kCountCol ||
+               agg.kind == ColAggKind::kCountStar;
+      });
+  const bool grouped_count = keys.size() == 1 && preds.Empty();
+  const bool frequency =
+      keys.size() <= 1 && aggregates.size() == 1 &&
+      aggregates[0].kind == ColAggKind::kCountStar &&
+      (grouped_count || (preds.compares.size() == 1 && preds.nulls.empty() &&
+                         preds.inlists.empty()));
+  if (!extrema && !frequency) {
+    return std::nullopt;
+  }
+  auto stats =
+      DecodeTlcsColumnStats(tlcs.SerializedColumnStats(), schema.ColumnCount());
+  if (!stats) {
+    return std::nullopt;
+  }
+  const auto valid_stats = [&](slot_t slot) {
+    const auto& s = (*stats)[slot];
+    const auto& col = schema.GetColumn(slot);
+    return s.Type() == col.Type() && !col.IsUnsigned() &&
+           (col.Type() == ValueType::kDate ||
+            col.Type() == ValueType::kInt64) &&
+           s.Count() <= tlcs.TotalRows() &&
+           s.NullCount() == tlcs.TotalRows() - s.Count();
+  };
+  struct BoundRow {
+    RuntimeKeyCell key;
+    std::vector<Value> aggs;
+    std::vector<Value> order_values;
+  };
+  std::vector<BoundRow> rows;
+  if (extrema) {
+    rows.resize(1);
+    for (const auto& agg : aggregates) {
+      if (agg.kind == ColAggKind::kCountStar) {
+        rows[0].aggs.emplace_back(static_cast<int64_t>(tlcs.TotalRows()));
+        continue;
+      }
+      if (!valid_stats(agg.full_col)) {
+        return std::nullopt;
+      }
+      const auto& s = (*stats)[agg.full_col];
+      if (agg.kind == ColAggKind::kCountCol) {
+        rows[0].aggs.emplace_back(static_cast<int64_t>(s.Count()));
+      } else if (s.Count() == 0) {
+        rows[0].aggs.emplace_back();
+      } else {
+        const bool min = agg.kind == ColAggKind::kMinInt64 ||
+                         agg.kind == ColAggKind::kMinDate;
+        const auto& boundary = min ? s.LowestValues() : s.HighestValues();
+        if (boundary.empty() ||
+            std::ranges::any_of(boundary, [&](const auto& item) {
+              return item.value.type != s.Type() || item.value.IsUnsigned();
+            })) {
+          return std::nullopt;
+        }
+        const auto best = std::ranges::min_element(
+            boundary, [min](const auto& a, const auto& b) {
+              const int c = CompareForOrderBy(a.value, b.value);
+              return min ? c < 0 : c > 0;
+            });
+        rows[0].aggs.push_back(best->value);
+      }
+    }
+  } else {
+    const auto* compare = grouped_count ? nullptr : &preds.compares[0];
+    const slot_t slot = grouped_count ? keys[0].full_col : compare->left;
+    if (!valid_stats(slot) ||
+        (compare != nullptr &&
+         (!compare->constant_payload || compare->string_payload ||
+          compare->is_double || !IsComparison(compare->op))) ||
+        (!keys.empty() &&
+         (keys[0].full_col != slot || keys[0].kind != ColKeyKind::kColInt64))) {
+      return std::nullopt;
+    }
+    const auto& s = (*stats)[slot];
+    std::vector<ValueFrequency> domain;
+    size_t covered = 0;
+    for (const auto* boundary : {&s.LowestValues(), &s.HighestValues()}) {
+      for (const auto& item : *boundary) {
+        if (item.value.type != s.Type() || item.value.IsUnsigned()) {
+          return std::nullopt;
+        }
+        const auto found =
+            std::ranges::find(domain, item.value, &ValueFrequency::value);
+        if (found != domain.end()) {
+          if (found->count != item.count) {
+            return std::nullopt;
+          }
+          continue;
+        }
+        if (item.count == 0 || item.count > s.Count() - covered) {
+          return std::nullopt;
+        }
+        domain.push_back(item);
+        covered += item.count;
+      }
+    }
+    const auto raw = [&](const Value& v) -> int64_t {
+      return s.Type() == ValueType::kDate ? v.DateDays() : v.AsInt64();
+    };
+    if (covered != s.Count() && !keys.empty()) {
+      using Frequencies = std::shared_ptr<const TlcsFile::IntFrequencies>;
+      ASSIGN_OR_RETURN(
+          Frequencies, histogram,
+          tlcs.GetOrComputeIntFrequencies(slot, schema, grouped_count));
+      if (histogram) {
+        const auto entries = tlcs.Dictionary(slot).IntEntries();
+        domain.clear();
+        covered = 0;
+        for (size_t i = 0; i < histogram->counts.size(); ++i) {
+          const uint64_t count = histogram->counts[i];
+          if (count > s.Count() - covered) {
+            return std::nullopt;
+          }
+          if (count > 0) {
+            const int64_t value =
+                histogram->first_value
+                    ? *histogram->first_value + static_cast<int64_t>(i)
+                    : entries[i];
+            domain.push_back(
+                {.value = Value(value), .count = static_cast<size_t>(count)});
+          }
+          covered += static_cast<size_t>(count);
+        }
+      }
+    }
+    if (covered != s.Count()) {
+      // Exact equality/inequality needs one known frequency, not a full
+      // domain. Its complement is over non-NULL rows only.
+      if (compare == nullptr || !keys.empty() ||
+          (compare->op != BinaryOperation::kEquals &&
+           compare->op != BinaryOperation::kNotEquals)) {
+        return std::nullopt;
+      }
+      const auto it = std::ranges::find_if(domain, [&](const auto& item) {
+        return raw(item.value) == compare->int_constant;
+      });
+      if (it == domain.end()) {
+        return std::nullopt;
+      }
+      const size_t count = compare->op == BinaryOperation::kEquals
+                               ? it->count
+                               : s.Count() - it->count;
+      rows.push_back({.key = {},
+                      .aggs = {Value(static_cast<int64_t>(count))},
+                      .order_values = {}});
+    } else {
+      TlcsFile::DecodedColumnChunk chunk;
+      chunk.int_cells.reserve(domain.size());
+      for (const auto& item : domain) {
+        chunk.int_cells.push_back(raw(item.value));
+      }
+      std::vector<const TlcsFile::DecodedColumnChunk*> columns(
+          schema.ColumnCount(), nullptr);
+      columns[slot] = &chunk;
+      size_t total = 0;
+      for (uint32_t i = 0; i < domain.size(); ++i) {
+        if (!RowMatchesColPtrs(preds, columns, i)) {
+          continue;
+        }
+        total += domain[i].count;
+        if (!keys.empty()) {
+          rows.push_back(
+              {.key = {.int_val = chunk.int_cells[i]},
+               .aggs = {Value(static_cast<int64_t>(domain[i].count))},
+               .order_values = {}});
+        }
+      }
+      if (keys.empty()) {
+        rows.push_back({.key = {},
+                        .aggs = {Value(static_cast<int64_t>(total))},
+                        .order_values = {}});
+      } else if (grouped_count && s.NullCount() != 0) {
+        // Lean: exact_grouped_null_count. COUNT(*) includes NULL key rows.
+        rows.push_back({.key = {.is_null = true},
+                        .aggs = {Value(static_cast<int64_t>(s.NullCount()))},
+                        .order_values = {}});
+      }
+    }
+  }
+  for (auto& row : rows) {
+    std::vector<Value> cached_keys(keys.size());
+    for (const auto& item : order) {
+      ASSIGN_OR_RETURN(Value, v,
+                       EvaluateBindingValue(item.binding, keys, &row.key,
+                                            row.aggs, &cached_keys));
+      row.order_values.push_back(std::move(v));
+    }
+  }
+  std::stable_sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) {
+    for (size_t i = 0; i < order.size(); ++i) {
+      const int cmp =
+          order[i].order.Compare(a.order_values[i], b.order_values[i]);
+      if (cmp != 0) {
+        return cmp < 0;
+      }
+    }
+    return false;
+  });
+  const size_t cap =
+      stmt.HasLimit() ? stmt.Offset() + stmt.Limit() : rows.size();
+  Relation result(runtime);
+  std::vector<Column> out_cols;
+  for (size_t i = 0; i < emit.size(); ++i) {
+    if (i >= output_names.size()) {
+      out_cols.emplace_back("col_" + std::to_string(i), ValueType::kInt64);
+      continue;
+    }
+    const auto& item = output_names[i];
+    const auto type = item.expression->ResultType(qualified_schema).GetType();
+    out_cols.emplace_back(ProjectionName(item, i), type == TypeTag::kDate
+                                                       ? ValueType::kDate
+                                                       : ValueType::kInt64);
+  }
+  for (size_t r = 0; r < std::min(cap, rows.size()); ++r) {
+    std::vector<Value> values;
+    std::vector<Value> cached_keys(keys.size());
+    for (size_t i = 0; i < emit.size(); ++i) {
+      ASSIGN_OR_RETURN(Value, v,
+                       EvaluateBindingValue(emit[i], keys, &rows[r].key,
+                                            rows[r].aggs, &cached_keys));
+      if (!v.IsNull() && result.rows.empty()) {
+        out_cols[i] = Column(out_cols[i].Name(), ValueTypeOf(v));
+        out_cols[i].SetUnsigned(v.IsUnsigned());
+      }
+      values.push_back(std::move(v));
+    }
+    result.AddRow(Row(std::move(values)));
+  }
+  result.schema = Schema("", std::move(out_cols));
+  return result;
+}
+
 }  // namespace
 
 StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
@@ -3012,6 +3619,14 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         any_computed_key = true;
         if (ks.kind == ColKeyKind::kRegexReplaceVarChar) {
           any_regex_key = true;
+          if (tlcs->BlockCount() >= 128) {
+            auto capture = DescribeDelimitedRegexCapture(ks.regex_pattern,
+                                                         ks.regex_replacement);
+            if (capture.HasValue() && capture.Value()) {
+              ks.regex_capture_jit =
+                  JitDelimitedCapture::Compile(*capture.Value());
+            }
+          }
         }
       }
       key_specs.push_back(std::move(ks));
@@ -3103,6 +3718,25 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     }
   }
 
+  if (!having_expr) {
+    ASSIGN_OR_RETURN(std::optional<Relation>, metadata,
+                     TryFoldTlcsBoundaryAggregate(
+                         *tlcs, stmt, table_schema, qualified_schema, preds,
+                         key_specs, agg_specs, emit_bindings, order_bindings,
+                         stmt.SelectList(), runtime));
+    if (metadata) {
+      if (publish_lstable_marker && runtime != nullptr) {
+        auto marker = std::make_shared<Relation>(runtime);
+        marker->schema = qualified_schema;
+        runtime->base_relations.emplace(fold_cache_key, std::move(marker));
+      }
+      if (dbg) {
+        (void)std::fprintf(stderr, "[TLCS-AGG-OK] exact-boundary-statistics\n");
+      }
+      return metadata;
+    }
+  }
+
   // Prune directory blocks.
   const auto dir_begin = std::chrono::steady_clock::now();
   ASSIGN_OR_RETURN(std::vector<uint32_t>, candidate_blocks,
@@ -3118,19 +3752,73 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     std::atomic<size_t> cached_rows_total{0};
     bool complete{false};
   };
+  struct HavingBucketCertificate {
+    std::vector<uint8_t> tracked;
+    uint32_t minimum_count;
+    bool observe_only;
+    std::optional<std::vector<uint32_t>>* observed_buckets;
+
+    [[nodiscard]] size_t Bucket(uint64_t hash) const noexcept {
+      return (hash ^ (hash >> 32U)) & (tracked.size() - 1);
+    }
+  };
+
+  auto sum_int64_provably_no_overflow = [&](slot_t full_col) -> StatusOr<bool> {
+    const uint32_t dg_count = tlcs->DirGroupCount();
+    const uint32_t dg_size = tlcs->DirGroupSize();
+    std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(dg_count);
+    for (uint32_t g = 0; g < dg_count; ++g) {
+      ASSIGN_OR_RETURN(std::shared_ptr<const TlcsFile::DirGroup>, grp,
+                       tlcs->GetDirGroup(g));
+      dir_groups[g] = std::move(grp);
+    }
+    __int128 max_pos_sum = 0;
+    __int128 min_neg_sum = 0;
+    for (const uint32_t bidx : candidate_blocks) {
+      const auto& blk = dir_groups[bidx / dg_size]->blocks[bidx % dg_size];
+      const auto& meta = blk.columns[full_col];
+      if (meta.encoding == TlcsColumnEncoding::kConstNull ||
+          blk.row_count == 0) {
+        continue;
+      }
+      if (!meta.has_min_max) {
+        return false;
+      }
+      if (meta.max_int > 0) {
+        max_pos_sum += static_cast<__int128>(meta.max_int) *
+                       static_cast<__int128>(blk.row_count);
+        if (max_pos_sum >
+            static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
+          return false;
+        }
+      }
+      if (meta.min_int < 0) {
+        min_neg_sum += static_cast<__int128>(meta.min_int) *
+                       static_cast<__int128>(blk.row_count);
+        if (min_neg_sum <
+            static_cast<__int128>(std::numeric_limits<int64_t>::min())) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
 
   // Helper that executes a classified `(key_specs, agg_specs, having, order,
   // emit)` plan over `candidate_blocks` using either the partitioned sharded
   // Wave-B2 engine or the resident worker engine.
   auto run_classified_plan =
-      [&](const std::vector<ColAggSpec>& plan_agg_specs,
+      [&](const SelectStatement& plan_stmt,
+          const std::vector<ColAggSpec>& plan_agg_specs,
           const std::vector<PositionalHaving>& plan_having,
           const std::vector<OutputSlotBinding>& plan_emit,
           const std::vector<ColumnarOrderBinding>& plan_order,
           const std::vector<NamedExpression>& plan_select_names,
           ExecutionRuntime* plan_runtime, bool plan_publish_marker,
-          Stage1BlockFilterMemo* filter_memo_out =
+          Stage1BlockFilterMemo* filter_memo_out = nullptr,
+          const HavingBucketCertificate* certificate =
               nullptr) -> StatusOr<std::optional<Relation>> {
+    const SelectStatement& stmt = plan_stmt;
     bool plan_any_byte_len = false;
     bool plan_any_distinct = false;
     for (const ColAggSpec& spec : plan_agg_specs) {
@@ -3174,7 +3862,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         std::vector<Value> finished_aggs(plan_agg_specs.size());
         for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
           RuntimeAggState empty_st;
-          finished_aggs[a] = FinishAggState(plan_agg_specs[a], empty_st);
+          ASSIGN_OR_RETURN(Value, finished_value,
+                           (FinishAggState(plan_agg_specs[a], empty_st)));
+          finished_aggs[a] = std::move(finished_value);
         }
         bool passes_having = true;
         for (const PositionalHaving& clause : plan_having) {
@@ -3472,19 +4162,579 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       }
     }
 
+    // Block-monotonic streaming run aggregation: when grouping by a single
+    // non-null integer/date column whose candidate TLCS block intervals are
+    // monotonically non-decreasing (`block_max[m-1] <= block_min[m]`), any key
+    // strictly inside `(shared_lo ? block_min[m] : -inf, shared_hi ?
+    // block_max[m] : +inf)` is globally complete within block `m`. Evaluating
+    // `HAVING` (or bounded Top-K) per block in O(1) streaming registers avoids
+    // materializing multi-million-entry hash tables (e.g. TPC-H Q18's 60M-row,
+    // 15M-group `lineitem` scan).
+    const size_t mono_topk_cap =
+        stmt.HasLimit() ? (stmt.Offset() <= std::numeric_limits<size_t>::max() -
+                                                stmt.Limit()
+                               ? stmt.Offset() + stmt.Limit()
+                               : std::numeric_limits<size_t>::max())
+                        : 0;
+    const bool mono_bounded_topk = stmt.HasLimit() && !plan_order.empty() &&
+                                   mono_topk_cap > 0 && mono_topk_cap <= 4096;
+    if (filter_memo_out == nullptr && !is_group_all && key_specs.size() == 1 &&
+        !plan_any_distinct && candidate_blocks.size() >= 4 &&
+        (key_specs[0].kind == ColKeyKind::kColInt64 ||
+         key_specs[0].kind == ColKeyKind::kColDate) &&
+        (!plan_having.empty() || mono_bounded_topk)) {
+      const slot_t kcol = key_specs[0].full_col;
+      const uint32_t dg_count = tlcs->DirGroupCount();
+      const uint32_t dg_size = tlcs->DirGroupSize();
+      std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(
+          dg_count);
+      bool dir_ok = true;
+      for (uint32_t g = 0; g < dg_count; ++g) {
+        auto grp_or = tlcs->GetDirGroup(g);
+        if (!grp_or.HasValue()) {
+          dir_ok = false;
+          break;
+        }
+        dir_groups[g] = std::move(grp_or.Value());
+      }
+      struct MonoBlockMeta {
+        uint32_t bidx{0};
+        int64_t min_k{0};
+        int64_t max_k{0};
+        bool shared_lo{false};
+        bool shared_hi{false};
+      };
+      std::vector<MonoBlockMeta> mblocks;
+      bool blocks_mono = dir_ok;
+      bool any_int_sum_risk = false;
+      __int128 pos_int_sum_bound = 0;
+      __int128 neg_int_sum_bound = 0;
+      if (blocks_mono) {
+        mblocks.reserve(candidate_blocks.size());
+        for (const uint32_t bidx : candidate_blocks) {
+          const auto& blk = dir_groups[bidx / dg_size]->blocks[bidx % dg_size];
+          if (blk.row_count == 0) {
+            continue;
+          }
+          const auto& meta = blk.columns[kcol];
+          if (meta.has_null || !meta.has_min_max || meta.is_unsigned ||
+              meta.encoding == TlcsColumnEncoding::kConstNull) {
+            blocks_mono = false;
+            break;
+          }
+          if (!mblocks.empty() && mblocks.back().max_k > meta.min_int) {
+            blocks_mono = false;
+            break;
+          }
+          for (const ColAggSpec& as : plan_agg_specs) {
+            if (as.kind == ColAggKind::kSumInt64 && !any_int_sum_risk) {
+              const auto& am = blk.columns[as.full_col];
+              if (am.encoding == TlcsColumnEncoding::kConstNull) {
+                continue;
+              }
+              if (!am.has_min_max) {
+                any_int_sum_risk = true;
+              } else {
+                if (am.max_int > 0) {
+                  pos_int_sum_bound += static_cast<__int128>(am.max_int) *
+                                       static_cast<__int128>(blk.row_count);
+                }
+                if (am.min_int < 0) {
+                  neg_int_sum_bound += static_cast<__int128>(am.min_int) *
+                                       static_cast<__int128>(blk.row_count);
+                }
+                if (pos_int_sum_bound >
+                        static_cast<__int128>(
+                            std::numeric_limits<int64_t>::max()) ||
+                    neg_int_sum_bound <
+                        static_cast<__int128>(
+                            std::numeric_limits<int64_t>::min())) {
+                  any_int_sum_risk = true;
+                }
+              }
+            }
+          }
+          mblocks.push_back(
+              {.bidx = bidx, .min_k = meta.min_int, .max_k = meta.max_int});
+        }
+      }
+      if (blocks_mono && !mblocks.empty()) {
+        for (size_t m = 0; m < mblocks.size(); ++m) {
+          mblocks[m].shared_lo =
+              (m > 0 && mblocks[m - 1].max_k == mblocks[m].min_k);
+          mblocks[m].shared_hi = (m + 1 < mblocks.size() &&
+                                  mblocks[m].max_k == mblocks[m + 1].min_k);
+        }
+        const ColumnarStageSchedule msched = BuildColumnarStageSchedule(
+            table_schema, preds, key_specs, plan_agg_specs);
+        const size_t mworkers =
+            any_int_sum_risk
+                ? size_t{1}
+                : std::max<size_t>(
+                      1, std::min<size_t>(
+                             {QueryParallelWorkerLimit(
+                                  std::thread::hardware_concurrency()),
+                              mblocks.size(), size_t{16}}));
+        struct MonoSurvivor {
+          int64_t key{0};
+          std::vector<Value> order_vals;
+          std::vector<Value> emit_vals;
+        };
+        struct BoundaryGroup {
+          int64_t key{0};
+          std::vector<RuntimeAggState> aggs;
+        };
+        auto cmp_survivors = [&](const MonoSurvivor& a,
+                                 const MonoSurvivor& b) noexcept {
+          for (size_t k = 0; k < plan_order.size(); ++k) {
+            const int c =
+                plan_order[k].order.Compare(a.order_vals[k], b.order_vals[k]);
+            if (c != 0) {
+              return c < 0;
+            }
+          }
+          return a.key < b.key;
+        };
+        auto emit_interior_or_boundary =
+            [&](int64_t key, RuntimeAggState* ast, QueryMemoryCharge& charge,
+                std::vector<MonoSurvivor>& surv_vec,
+                std::vector<Value>& finished_scratch,
+                std::vector<Value>& cached_keys) -> Status {
+          ASSIGN_OR_RETURN(
+              bool, pass,
+              EvalPositionalHavingOnStates(plan_having, plan_agg_specs, ast,
+                                           &finished_scratch));
+          if (!pass) {
+            return Status::kSuccess;
+          }
+          for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
+            ASSIGN_OR_RETURN(Value, finished_value,
+                             (FinishAggState(plan_agg_specs[a], ast[a])));
+            finished_scratch[a] = std::move(finished_value);
+          }
+          RuntimeKeyCell kc{.int_val = key};
+          cached_keys.assign(1, Value());
+          MonoSurvivor item;
+          item.key = key;
+          if (!plan_order.empty()) {
+            item.order_vals.resize(plan_order.size());
+            for (size_t k = 0; k < plan_order.size(); ++k) {
+              ASSIGN_OR_RETURN(
+                  Value, ov,
+                  EvaluateBindingValue(plan_order[k].binding, key_specs, &kc,
+                                       finished_scratch, &cached_keys));
+              item.order_vals[k] = std::move(ov);
+            }
+            if (mono_bounded_topk && surv_vec.size() >= mono_topk_cap &&
+                !cmp_survivors(item, surv_vec.front())) {
+              return Status::kSuccess;
+            }
+          }
+          item.emit_vals.resize(plan_emit.size());
+          size_t approx_bytes =
+              sizeof(MonoSurvivor) +
+              ((item.order_vals.size() + plan_emit.size()) * sizeof(Value));
+          for (size_t i = 0; i < plan_emit.size(); ++i) {
+            ASSIGN_OR_RETURN(
+                Value, ev,
+                EvaluateBindingValue(plan_emit[i], key_specs, &kc,
+                                     finished_scratch, &cached_keys));
+            if (ev.type == ValueType::kVarChar) {
+              approx_bytes += ev.AsStringView().size();
+            }
+            item.emit_vals[i] = std::move(ev);
+          }
+          if (mono_bounded_topk) {
+            if (surv_vec.size() < mono_topk_cap) {
+              if (!charge.TryAdd(approx_bytes)) {
+                return StatusError(StatusCode::kMemoryLimitExceeded,
+                                   "monotonic survivor heap exceeded budget");
+              }
+              surv_vec.push_back(std::move(item));
+              std::push_heap(surv_vec.begin(), surv_vec.end(), cmp_survivors);
+            } else {
+              std::pop_heap(surv_vec.begin(), surv_vec.end(), cmp_survivors);
+              surv_vec.back() = std::move(item);
+              std::push_heap(surv_vec.begin(), surv_vec.end(), cmp_survivors);
+            }
+          } else {
+            if (!charge.TryAdd(approx_bytes)) {
+              return StatusError(StatusCode::kMemoryLimitExceeded,
+                                 "monotonic survivors exceeded budget");
+            }
+            surv_vec.push_back(std::move(item));
+          }
+          return Status::kSuccess;
+        };
+
+        std::vector<QueryMemoryCharge> w_charges(mworkers);
+        std::vector<std::unique_ptr<PagedStringArena>> b_arenas(mworkers);
+        for (size_t w = 0; w < mworkers; ++w) {
+          b_arenas[w] = std::make_unique<PagedStringArena>(&w_charges[w]);
+        }
+        std::vector<std::vector<MonoSurvivor>> w_survivors(mworkers);
+        std::vector<std::vector<BoundaryGroup>> w_boundaries(mworkers);
+        std::vector<Status> w_status(mworkers, Status::kSuccess);
+        std::atomic<size_t> next_mb{0};
+        std::atomic<uint64_t> mono_scanned{0};
+        std::atomic<uint64_t> mono_matching{0};
+        std::atomic<uint64_t> mono_interior_groups{0};
+
+        auto copy_to_boundary =
+            [&](int64_t key, RuntimeAggState* src_aggs,
+                QueryMemoryCharge& charge, PagedStringArena& barena,
+                std::vector<BoundaryGroup>& out_b) -> Status {
+          const size_t bbytes =
+              sizeof(BoundaryGroup) +
+              (plan_agg_specs.size() * sizeof(RuntimeAggState));
+          if (!charge.TryAdd(bbytes)) {
+            return StatusError(StatusCode::kMemoryLimitExceeded,
+                               "monotonic boundary groups exceeded budget");
+          }
+          BoundaryGroup bg{
+              .key = key,
+              .aggs = std::vector<RuntimeAggState>(plan_agg_specs.size())};
+          for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
+            RETURN_IF_FAIL(MergeAggState(plan_agg_specs[a], bg.aggs[a],
+                                         src_aggs[a], barena));
+          }
+          out_b.push_back(std::move(bg));
+          return Status::kSuccess;
+        };
+
+        auto mono_worker_fn = [&](size_t tid) {
+          BlockDecodeScratch scratch;
+          std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(
+              table_schema.ColumnCount(), nullptr);
+          std::vector<uint32_t> cand_rows;
+          std::vector<RuntimeAggState> run_aggs(plan_agg_specs.size());
+          std::vector<Value> finished_scratch(plan_agg_specs.size());
+          std::vector<Value> cached_keys(1);
+          uint64_t local_scanned = 0;
+          uint64_t local_matching = 0;
+          uint64_t local_groups = 0;
+
+          while (true) {
+            const size_t m = next_mb.fetch_add(1, std::memory_order_relaxed);
+            if (m >= mblocks.size()) {
+              break;
+            }
+            const MonoBlockMeta& mb = mblocks[m];
+            auto dec_or = DecodeAndFilterBlock(
+                *tlcs, mb.bidx, table_schema, preds, msched, &scratch,
+                &col_ptrs, &cand_rows, &local_scanned);
+            if (!dec_or.HasValue()) {
+              w_status[tid] = dec_or.GetStatus();
+              return;
+            }
+            if (!dec_or.Value() || cand_rows.empty()) {
+              continue;
+            }
+            local_matching += cand_rows.size();
+            const auto* kch = col_ptrs[kcol];
+            const int64_t* kcells = kch->int_cells.data();
+            bool intra_sorted = true;
+            for (size_t i = 1; i < cand_rows.size(); ++i) {
+              if (kcells[cand_rows[i]] < kcells[cand_rows[i - 1]]) {
+                intra_sorted = false;
+                break;
+              }
+            }
+            if (intra_sorted) {
+              QueryMemoryCharge blk_str_charge;
+              PagedStringArena blk_arena(&blk_str_charge);
+              int64_t cur_k = kcells[cand_rows[0]];
+              run_aggs.clear();
+              run_aggs.resize(plan_agg_specs.size());
+              auto flush_run = [&](int64_t fk) -> Status {
+                const bool is_boundary = (mb.shared_lo && fk == mb.min_k) ||
+                                         (mb.shared_hi && fk == mb.max_k);
+                if (is_boundary) {
+                  return copy_to_boundary(fk, run_aggs.data(), w_charges[tid],
+                                          *b_arenas[tid], w_boundaries[tid]);
+                }
+                ++local_groups;
+                return emit_interior_or_boundary(
+                    fk, run_aggs.data(), w_charges[tid], w_survivors[tid],
+                    finished_scratch, cached_keys);
+              };
+              for (const uint32_t r : cand_rows) {
+                const int64_t kv = kcells[r];
+                if (kv != cur_k) {
+                  Status fst = flush_run(cur_k);
+                  if (fst != Status::kSuccess) {
+                    w_status[tid] = std::move(fst);
+                    return;
+                  }
+                  cur_k = kv;
+                  for (auto& st : run_aggs) {
+                    st = RuntimeAggState{};
+                  }
+                }
+                for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
+                  Status st = FoldRowIntoAggState(plan_agg_specs[a], col_ptrs,
+                                                  r, run_aggs[a], blk_arena);
+                  if (st != Status::kSuccess) {
+                    w_status[tid] = std::move(st);
+                    return;
+                  }
+                }
+              }
+              Status last_st = flush_run(cur_k);
+              if (last_st != Status::kSuccess) {
+                w_status[tid] = std::move(last_st);
+                return;
+              }
+            } else {
+              QueryMemoryCharge blk_charge;
+              SingleIntWorkerTable btable(plan_agg_specs.size(), &blk_charge,
+                                          false);
+              for (const uint32_t r : cand_rows) {
+                const int64_t kv = kcells[r];
+                auto gid_or = btable.FindOrInsertNonNull(kv);
+                if (!gid_or.HasValue()) {
+                  w_status[tid] = gid_or.GetStatus();
+                  return;
+                }
+                RuntimeAggState* st_arr = btable.AggsAt(gid_or.Value());
+                for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
+                  Status st = FoldRowIntoAggState(plan_agg_specs[a], col_ptrs,
+                                                  r, st_arr[a], btable.Arena());
+                  if (st != Status::kSuccess) {
+                    w_status[tid] = std::move(st);
+                    return;
+                  }
+                }
+              }
+              for (uint32_t g = 0; g < btable.NonNullCount(); ++g) {
+                const int64_t fk = btable.KeyAt(g);
+                const bool is_boundary = (mb.shared_lo && fk == mb.min_k) ||
+                                         (mb.shared_hi && fk == mb.max_k);
+                Status fst =
+                    is_boundary
+                        ? copy_to_boundary(fk, btable.AggsAt(g), w_charges[tid],
+                                           *b_arenas[tid], w_boundaries[tid])
+                        : (++local_groups, emit_interior_or_boundary(
+                                               fk, btable.AggsAt(g),
+                                               w_charges[tid], w_survivors[tid],
+                                               finished_scratch, cached_keys));
+                if (fst != Status::kSuccess) {
+                  w_status[tid] = std::move(fst);
+                  return;
+                }
+              }
+            }
+          }
+          mono_scanned.fetch_add(local_scanned, std::memory_order_relaxed);
+          mono_matching.fetch_add(local_matching, std::memory_order_relaxed);
+          mono_interior_groups.fetch_add(local_groups,
+                                         std::memory_order_relaxed);
+        };
+
+        if (mworkers == 1) {
+          mono_worker_fn(0);
+        } else {
+          RunParallelTasks(mworkers, mono_worker_fn);
+        }
+        bool mono_mem_exceeded = false;
+        for (const Status& st : w_status) {
+          if (st == StatusCode::kMemoryLimitExceeded ||
+              st == StatusCode::kInvalidArgument) {
+            mono_mem_exceeded = true;
+            break;
+          }
+          RETURN_IF_FAIL(st);
+        }
+        if (!mono_mem_exceeded) {
+          const auto merge_begin = std::chrono::steady_clock::now();
+          size_t total_b = 0;
+          for (const auto& wb : w_boundaries) {
+            total_b += wb.size();
+          }
+          std::vector<BoundaryGroup> all_b;
+          all_b.reserve(total_b);
+          for (auto& wb : w_boundaries) {
+            for (auto& bg : wb) {
+              all_b.push_back(std::move(bg));
+            }
+          }
+          std::ranges::sort(all_b, [](const BoundaryGroup& a,
+                                      const BoundaryGroup& b) noexcept {
+            return a.key < b.key;
+          });
+
+          QueryMemoryCharge final_charge;
+          PagedStringArena final_arena(&final_charge);
+          std::vector<MonoSurvivor> final_survivors;
+          if (mono_bounded_topk) {
+            final_survivors.reserve(mono_topk_cap + 1);
+          }
+          for (auto& ws : w_survivors) {
+            for (auto& item : ws) {
+              if (mono_bounded_topk) {
+                if (final_survivors.size() < mono_topk_cap) {
+                  final_survivors.push_back(std::move(item));
+                  std::push_heap(final_survivors.begin(), final_survivors.end(),
+                                 cmp_survivors);
+                } else if (cmp_survivors(item, final_survivors.front())) {
+                  std::pop_heap(final_survivors.begin(), final_survivors.end(),
+                                cmp_survivors);
+                  final_survivors.back() = std::move(item);
+                  std::push_heap(final_survivors.begin(), final_survivors.end(),
+                                 cmp_survivors);
+                }
+              } else {
+                final_survivors.push_back(std::move(item));
+              }
+            }
+          }
+
+          size_t boundary_distinct_groups = 0;
+          std::vector<Value> f_scratch(plan_agg_specs.size());
+          std::vector<Value> c_keys(1);
+          bool merge_ok = true;
+          for (size_t i = 0; i < all_b.size();) {
+            size_t j = i + 1;
+            while (j < all_b.size() && all_b[j].key == all_b[i].key) {
+              for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
+                Status mst = MergeAggState(plan_agg_specs[a], all_b[i].aggs[a],
+                                           all_b[j].aggs[a], final_arena);
+                if (mst == StatusCode::kMemoryLimitExceeded) {
+                  merge_ok = false;
+                  break;
+                }
+                RETURN_IF_FAIL(mst);
+              }
+              if (!merge_ok) {
+                break;
+              }
+              ++j;
+            }
+            if (!merge_ok) {
+              break;
+            }
+            ++boundary_distinct_groups;
+            Status est = emit_interior_or_boundary(
+                all_b[i].key, all_b[i].aggs.data(), final_charge,
+                final_survivors, f_scratch, c_keys);
+            if (est == StatusCode::kMemoryLimitExceeded) {
+              merge_ok = false;
+              break;
+            }
+            RETURN_IF_FAIL(est);
+            i = j;
+          }
+
+          if (merge_ok) {
+            if (!plan_order.empty() && !final_survivors.empty()) {
+              if (mono_bounded_topk) {
+                std::sort_heap(final_survivors.begin(), final_survivors.end(),
+                               cmp_survivors);
+              } else {
+                const size_t ecap =
+                    stmt.HasLimit()
+                        ? std::min(final_survivors.size(), mono_topk_cap)
+                        : final_survivors.size();
+                if (ecap < final_survivors.size() &&
+                    ecap * 2 < final_survivors.size()) {
+                  std::partial_sort(final_survivors.begin(),
+                                    final_survivors.begin() +
+                                        static_cast<std::ptrdiff_t>(ecap),
+                                    final_survivors.end(), cmp_survivors);
+                } else {
+                  std::sort(final_survivors.begin(), final_survivors.end(),
+                            cmp_survivors);
+                }
+              }
+            }
+            size_t emit_count = final_survivors.size();
+            if (stmt.HasLimit()) {
+              emit_count = std::min(emit_count, mono_topk_cap);
+            }
+            if (plan_publish_marker && plan_runtime != nullptr) {
+              auto marker = std::make_shared<Relation>(plan_runtime);
+              marker->schema = qualified_schema;
+              plan_runtime->base_relations.emplace(fold_cache_key,
+                                                   std::move(marker));
+            }
+            Relation output(plan_runtime);
+            output.rows.reserve(emit_count);
+            std::vector<Column> out_cols;
+            out_cols.reserve(plan_emit.size());
+            for (size_t i = 0; i < plan_emit.size(); ++i) {
+              ValueType vt = ValueType::kInt64;
+              std::string cname = "col_" + std::to_string(i);
+              if (i < plan_select_names.size()) {
+                cname = ProjectionName(plan_select_names[i], i);
+                if (plan_select_names[i].expression) {
+                  auto rt = plan_select_names[i].expression->ResultType(
+                      qualified_schema);
+                  vt = rt.GetType() == TypeTag::kDouble    ? ValueType::kDouble
+                       : rt.GetType() == TypeTag::kDate    ? ValueType::kDate
+                       : rt.GetType() == TypeTag::kVarChar ? ValueType::kVarChar
+                                                           : ValueType::kInt64;
+                }
+              }
+              out_cols.emplace_back(std::move(cname), vt);
+            }
+            std::vector<uint8_t> type_refined(out_cols.size(), 0);
+            for (size_t r = 0; r < emit_count; ++r) {
+              auto& vals = final_survivors[r].emit_vals;
+              for (size_t i = 0; i < vals.size(); ++i) {
+                if (type_refined[i] == 0U && !vals[i].IsNull()) {
+                  out_cols[i] =
+                      Column(out_cols[i].Name(), ValueTypeOf(vals[i]));
+                  out_cols[i].SetUnsigned(vals[i].IsUnsigned());
+                  type_refined[i] = 1;
+                }
+              }
+              output.AddRow(Row(std::move(vals)));
+            }
+            output.schema = Schema("", std::move(out_cols));
+            if (dbg) {
+              (void)std::fprintf(
+                  stderr,
+                  "[TLCS-AGG-OK] mono-block-run scan=%.2fms merge=%.2fms "
+                  "blocks=%zu surv=%zu\n",
+                  MsSince(scan_begin), MsSince(merge_begin), mblocks.size(),
+                  emit_count);
+            }
+            if (plan_runtime != nullptr) {
+              const double scan_ms = MsSince(scan_begin);
+              plan_runtime->scan_ms += scan_ms;
+              plan_runtime->filter_ms += scan_ms;
+              plan_runtime->scan_rows += mono_scanned.load();
+              plan_runtime->scan_output_rows += mono_matching.load();
+              plan_runtime->typed_parallel_aggregations += 1;
+              plan_runtime->aggregate_groups +=
+                  mono_interior_groups.load() + boundary_distinct_groups;
+              plan_runtime->aggregate_input_rows += mono_matching.load();
+              plan_runtime->aggregate_ms += MsSince(merge_begin);
+            }
+            return std::optional<Relation>(std::move(output));
+          }
+        }
+      }
+    }
+
+    const bool plan_any_double_arith = std::ranges::any_of(
+        plan_agg_specs,
+        [](const ColAggSpec& s) { return s.double_arith != nullptr; });
     const double survive_ratio =
         static_cast<double>(candidate_blocks.size()) /
         static_cast<double>(std::max<uint32_t>(1, tlcs->BlockCount()));
     const bool grouped_admitted =
         is_group_all || survive_ratio < 0.60 ||
         !preds.contains_prechecks.empty() || plan_any_byte_len ||
-        any_regex_key ||
+        plan_any_double_arith || any_regex_key ||
         (resident_store_hint == nullptr && candidate_blocks.size() <= 512);
     const bool computed_unadmitted = !is_group_all && any_computed_key &&
-                                     !any_regex_key && survive_ratio >= 0.60 &&
+                                     !any_regex_key && !plan_any_double_arith &&
+                                     survive_ratio >= 0.60 &&
                                      candidate_blocks.size() > 512;
     const bool high_key_multi = !is_group_all && key_specs.size() >= 4 &&
                                 !any_regex_key && !plan_any_distinct &&
+                                !plan_any_double_arith &&
                                 candidate_blocks.size() >= 8;
     const bool force_partitioned = (!is_group_all && plan_any_distinct) ||
                                    !grouped_admitted || computed_unadmitted ||
@@ -3516,18 +4766,43 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     const ColumnarStageSchedule sched = BuildColumnarStageSchedule(
         table_schema, preds, key_specs, plan_agg_specs);
 
-    const bool has_checked_int_sum =
-        std::any_of(plan_agg_specs.begin(), plan_agg_specs.end(),
-                    [](const ColAggSpec& spec) {
-                      return spec.kind == ColAggKind::kSumInt64;
-                    });
+    // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+    //   (bounded_int64_sum_parallel_sound, const_block_sum_fold_sound,
+    //    unbounded_int64_sum_reordering_overflow_bug)
+    bool has_unbounded_checked_int_sum = false;
+    for (const ColAggSpec& spec : plan_agg_specs) {
+      if (spec.kind == ColAggKind::kSumInt64) {
+        ASSIGN_OR_RETURN(bool, safe_sum,
+                         sum_int64_provably_no_overflow(spec.full_col));
+        if (!safe_sum) {
+          has_unbounded_checked_int_sum = true;
+          break;
+        }
+      }
+    }
     const size_t workers =
-        has_checked_int_sum
+        has_unbounded_checked_int_sum
             ? size_t{1}
             : std::max<size_t>(
                   1, std::min<size_t>({QueryParallelWorkerLimit(
                                            std::thread::hardware_concurrency()),
                                        candidate_blocks.size(), size_t{16}}));
+
+    const bool can_fold_const_blocks_scalar =
+        is_group_all && preds.Empty() && !plan_any_distinct &&
+        !plan_any_byte_len && !plan_any_double_arith &&
+        !has_unbounded_checked_int_sum;
+    std::vector<std::shared_ptr<const TlcsFile::DirGroup>> scalar_dir_groups;
+    const uint32_t scalar_dg_size = tlcs->DirGroupSize();
+    if (can_fold_const_blocks_scalar) {
+      const uint32_t dg_count = tlcs->DirGroupCount();
+      scalar_dir_groups.resize(dg_count);
+      for (uint32_t g = 0; g < dg_count; ++g) {
+        ASSIGN_OR_RETURN(std::shared_ptr<const TlcsFile::DirGroup>, grp,
+                         tlcs->GetDirGroup(g));
+        scalar_dir_groups[g] = std::move(grp);
+      }
+    }
 
     bool packed_int32_pair = false;
     if (!is_group_all && key_specs.size() == 2 && !plan_any_distinct &&
@@ -3607,6 +4882,16 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       }
     }
     std::vector<Status> worker_status(workers, Status::kSuccess);
+    QueryMemoryCharge certificate_charge;
+    std::vector<std::vector<uint32_t>> bucket_counts;
+    if (certificate != nullptr) {
+      if (!certificate_charge.TryAdd(
+              (workers + 1) * certificate->tracked.size() * sizeof(uint32_t))) {
+        return std::nullopt;
+      }
+      bucket_counts.assign(
+          workers, std::vector<uint32_t>(certificate->tracked.size(), 0));
+    }
     std::atomic<size_t> next_idx{0};
     std::atomic<uint64_t> total_scanned{0};
     std::atomic<uint64_t> total_matching{0};
@@ -3623,12 +4908,176 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       uint64_t local_matching = 0;
       std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(ncols, nullptr);
 
+      std::vector<slot_t> dyn_scalar_cols;
       while (true) {
         const size_t bi = next_idx.fetch_add(1, std::memory_order_relaxed);
         if (bi >= candidate_blocks.size()) {
           break;
         }
         const uint32_t bidx = candidate_blocks[bi];
+        if (can_fold_const_blocks_scalar) {
+          const auto& blk_meta = scalar_dir_groups[bidx / scalar_dg_size]
+                                     ->blocks[bidx % scalar_dg_size];
+          const uint32_t b_rows = blk_meta.row_count;
+          local_scanned += b_rows;
+          local_matching += b_rows;
+          if (b_rows == 0) {
+            continue;
+          }
+          dyn_scalar_cols.clear();
+          std::fill(col_ptrs.begin(), col_ptrs.end(), nullptr);
+          for (const ColAggSpec& as : plan_agg_specs) {
+            if (as.kind == ColAggKind::kCountStar) {
+              continue;
+            }
+            const auto& cm = blk_meta.columns[as.full_col];
+            const bool is_const_int_or_date =
+                (as.kind == ColAggKind::kCountCol ||
+                 as.kind == ColAggKind::kSumInt64 ||
+                 as.kind == ColAggKind::kAvgDouble ||
+                 as.kind == ColAggKind::kMinInt64 ||
+                 as.kind == ColAggKind::kMaxInt64 ||
+                 as.kind == ColAggKind::kMinDate ||
+                 as.kind == ColAggKind::kMaxDate) &&
+                table_schema.GetColumn(as.full_col).Type() !=
+                    ValueType::kDouble &&
+                table_schema.GetColumn(as.full_col).Type() !=
+                    ValueType::kVarChar &&
+                (cm.encoding == TlcsColumnEncoding::kConstNull ||
+                 (!cm.has_null && cm.has_min_max && cm.min_int == cm.max_int));
+            if (!is_const_int_or_date &&
+                std::ranges::find(dyn_scalar_cols, as.full_col) ==
+                    dyn_scalar_cols.end()) {
+              dyn_scalar_cols.push_back(as.full_col);
+            }
+          }
+          if (!dyn_scalar_cols.empty()) {
+            Status dst = tlcs->DecodeBlockColumnsWithOptions(
+                bidx, dyn_scalar_cols, table_schema, &decode_scratch.blk1b,
+                true, &decode_scratch.io1b, {});
+            if (dst != Status::kSuccess) {
+              worker_status[tid] = std::move(dst);
+              return;
+            }
+            for (size_t i = 0; i < dyn_scalar_cols.size(); ++i) {
+              col_ptrs[dyn_scalar_cols[i]] = &decode_scratch.blk1b.columns[i];
+            }
+          }
+          auto& sa = scalar_worker_aggs[tid];
+          for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
+            const ColAggSpec& as = plan_agg_specs[a];
+            if (as.kind == ColAggKind::kCountStar) {
+              sa[a].count += static_cast<int64_t>(b_rows);
+              sa[a].has_value = true;
+              continue;
+            }
+            if (col_ptrs[as.full_col] == nullptr) {
+              const auto& cm = blk_meta.columns[as.full_col];
+              if (cm.encoding == TlcsColumnEncoding::kConstNull) {
+                continue;
+              }
+              const int64_t cv = cm.min_int;
+              switch (as.kind) {
+                case ColAggKind::kCountCol:
+                  sa[a].count += static_cast<int64_t>(b_rows);
+                  sa[a].has_value = true;
+                  break;
+                case ColAggKind::kSumInt64:
+                  sa[a].int_val += static_cast<int64_t>(b_rows) * cv;
+                  sa[a].has_value = true;
+                  break;
+                case ColAggKind::kAvgDouble:
+                  sa[a].double_val +=
+                      static_cast<double>(b_rows) * static_cast<double>(cv);
+                  sa[a].count += static_cast<int64_t>(b_rows);
+                  sa[a].has_value = true;
+                  break;
+                case ColAggKind::kMinInt64:
+                case ColAggKind::kMinDate:
+                  if (!sa[a].has_value || cv < sa[a].int_val) {
+                    sa[a].int_val = cv;
+                    sa[a].has_value = true;
+                  }
+                  break;
+                case ColAggKind::kMaxInt64:
+                case ColAggKind::kMaxDate:
+                  if (!sa[a].has_value || cv > sa[a].int_val) {
+                    sa[a].int_val = cv;
+                    sa[a].has_value = true;
+                  }
+                  break;
+                default:
+                  break;
+              }
+              continue;
+            }
+            const auto* dch = col_ptrs[as.full_col];
+            if (!dch->has_null &&
+                table_schema.GetColumn(as.full_col).Type() ==
+                    ValueType::kInt64 &&
+                (as.kind == ColAggKind::kSumInt64 ||
+                 as.kind == ColAggKind::kAvgDouble ||
+                 as.kind == ColAggKind::kCountCol)) {
+              if (as.kind == ColAggKind::kCountCol) {
+                sa[a].count += static_cast<int64_t>(b_rows);
+                sa[a].has_value = true;
+                continue;
+              }
+              const int64_t* __restrict cells = dch->int_cells.data();
+              if (as.kind == ColAggKind::kSumInt64) {
+                int64_t bsum = 0;
+                for (uint32_t r = 0; r < b_rows; ++r) {
+                  bsum += cells[r];
+                }
+                sa[a].int_val += bsum;
+                sa[a].has_value = true;
+                continue;
+              }
+              // kAvgDouble over non-null INT64: if block values stay safely
+              // within exact 53-bit double integer sum, accumulate int64 first!
+              const auto& cm = blk_meta.columns[as.full_col];
+              const __int128 max_abs =
+                  cm.has_min_max
+                      ? std::max<__int128>(
+                            cm.min_int < 0 ? -static_cast<__int128>(cm.min_int)
+                                           : static_cast<__int128>(cm.min_int),
+                            cm.max_int < 0 ? -static_cast<__int128>(cm.max_int)
+                                           : static_cast<__int128>(cm.max_int))
+                      : (static_cast<__int128>(1) << 60);
+              if (max_abs * b_rows < (static_cast<__int128>(1) << 52)) {
+                int64_t bsum = 0;
+                for (uint32_t r = 0; r < b_rows; ++r) {
+                  bsum += cells[r];
+                }
+                sa[a].double_val += static_cast<double>(bsum);
+                sa[a].count += static_cast<int64_t>(b_rows);
+                sa[a].has_value = true;
+                continue;
+              }
+              // Preserve the checked accumulator's conversion and addition
+              // order. Signed integer inputs cannot supply NaN or infinity.
+              if (!dch->is_unsigned) {
+                double total = sa[a].double_val;
+                for (uint32_t r = 0; r < b_rows; ++r) {
+                  total += static_cast<double>(cells[r]);
+                }
+                sa[a].double_val = total;
+                sa[a].count += static_cast<int64_t>(b_rows);
+                sa[a].has_value = true;
+                continue;
+              }
+            }
+            for (uint32_t r = 0; r < b_rows; ++r) {
+              Status fold_st = FoldRowIntoAggState(as, col_ptrs, r, sa[a],
+                                                   *scalar_arenas[tid]);
+              if (fold_st != Status::kSuccess) {
+                worker_status[tid] = std::move(fold_st);
+                return;
+              }
+            }
+          }
+          continue;
+        }
         auto dec_or = DecodeAndFilterBlock(*tlcs, bidx, table_schema, preds,
                                            sched, &decode_scratch, &col_ptrs,
                                            &cand_rows, &local_scanned);
@@ -3870,6 +5319,14 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           }
           const uint64_t khash =
               GroupKeySliceHasher::HashTyped(probe_keys.data(), key_specs);
+          if (certificate != nullptr) {
+            const size_t bucket = certificate->Bucket(khash);
+            ++bucket_counts[tid][bucket];
+            if (!certificate->observe_only &&
+                certificate->tracked[bucket] == 0) {
+              continue;
+            }
+          }
           auto gid_or = wtable.FindOrInsert(probe_keys.data(), khash);
           if (!gid_or.HasValue()) {
             worker_status[tid] = gid_or.GetStatus();
@@ -3902,6 +5359,25 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       }
       RETURN_IF_FAIL(st);
     }
+    if (certificate != nullptr) {
+      // Lean: QuotientFusion.untracked_group_fails_count_having.
+      // An earlier execution proposes buckets; these full-scan bounds decide.
+      auto& observed = certificate->observed_buckets->emplace();
+      bool complete = true;
+      for (size_t bucket = 0; bucket < certificate->tracked.size(); ++bucket) {
+        uint64_t total = 0;
+        for (const auto& worker : bucket_counts) {
+          total += worker[bucket];
+        }
+        if (total >= certificate->minimum_count) {
+          observed.push_back(static_cast<uint32_t>(bucket));
+          complete &= certificate->tracked[bucket] != 0;
+        }
+      }
+      if (!certificate->observe_only && !complete) {
+        return std::nullopt;
+      }
+    }
     if (filter_memo_out != nullptr &&
         !filter_memo_out->block_has_match.empty()) {
       filter_memo_out->complete = true;
@@ -3926,7 +5402,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       }
       std::vector<Value> finished_aggs(plan_agg_specs.size());
       for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
-        finished_aggs[a] = FinishAggState(plan_agg_specs[a], merged[a]);
+        ASSIGN_OR_RETURN(Value, finished_value,
+                         (FinishAggState(plan_agg_specs[a], merged[a])));
+        finished_aggs[a] = std::move(finished_value);
       }
       bool passes = true;
       for (const PositionalHaving& clause : plan_having) {
@@ -4545,6 +6023,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           }
           if (use_shard_heap) {
             if (out_vec.size() < topk_cap) {
+              // NOLINTNEXTLINE(performance-move-const-arg) move is harmless
               out_vec.push_back(std::move(probe));
               std::push_heap(out_vec.begin(), out_vec.end(), cmp_rows);
             } else if (cmp_rows(probe, out_vec.front())) {
@@ -4553,12 +6032,19 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               std::push_heap(out_vec.begin(), out_vec.end(), cmp_rows);
             }
           } else {
+            // NOLINTNEXTLINE(performance-move-const-arg) move is harmless
             out_vec.push_back(std::move(probe));
           }
         } else if (!plan_order.empty()) {
           for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
             if (needed_agg_before_emit[a]) {
-              finished_scratch[a] = FinishAggState(plan_agg_specs[a], ast[a]);
+              StatusOr<Value> finished_value =
+                  FinishAggState(plan_agg_specs[a], ast[a]);
+              if (!finished_value.HasValue()) {
+                shard_extract_status[s] = finished_value.GetStatus();
+                return;
+              }
+              finished_scratch[a] = finished_value.MoveValue();
             }
           }
           std::fill(cached_keys.begin(), cached_keys.end(), Value());
@@ -4656,6 +6142,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     survivors.reserve(total_survivors);
     for (auto& sv : shard_survivors) {
       for (auto& item : sv) {
+        // NOLINTNEXTLINE(performance-move-const-arg) move is harmless
         survivors.push_back(std::move(item));
       }
     }
@@ -4709,7 +6196,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       WorkerGroupTable& mt = *merged_shards[fg.shard];
       const RuntimeAggState* ast = mt.AggsAt(fg.gid);
       for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
-        full_finished[a] = FinishAggState(plan_agg_specs[a], ast[a]);
+        ASSIGN_OR_RETURN(Value, finished_value,
+                         (FinishAggState(plan_agg_specs[a], ast[a])));
+        full_finished[a] = std::move(finished_value);
       }
       std::vector<Value> row_vals;
       row_vals.reserve(plan_emit.size());
@@ -4762,58 +6251,119 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
   // defer expensive payload aggregates (`MIN/MAX(VARCHAR)`, `COUNT(DISTINCT)`,
   // and provably non-overflowing unreferenced aggregates) to a second pass over
   // ONLY the `W <= K` winning group keys using NULL-safe key membership!
+  // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+  //   (having_count_markov_bound_sound, having_two_stage_late_agg_sound,
+  //    having_sum_signed_unbounded_groups_bug)
+  uint64_t min_having_count = 0;
+  for (const PositionalHaving& h : positional_having) {
+    if (!h.has_constant || h.rhs_is_agg || h.agg_index >= agg_specs.size() ||
+        h.constant.IsNull() || h.constant.IsUnsigned() ||
+        h.constant.type != ValueType::kInt64) {
+      continue;
+    }
+    const ColAggKind hk = agg_specs[h.agg_index].kind;
+    if (hk != ColAggKind::kCountStar && hk != ColAggKind::kCountCol &&
+        hk != ColAggKind::kCountByteLen) {
+      continue;
+    }
+    const int64_t cval = h.constant.value.int_value;
+    int64_t min_req = 0;
+    if (h.op == BinaryOperation::kGreaterThan && cval >= 0 &&
+        cval < std::numeric_limits<int64_t>::max()) {
+      min_req = cval + 1;
+    } else if ((h.op == BinaryOperation::kGreaterThanEquals ||
+                h.op == BinaryOperation::kEquals) &&
+               cval >= 1) {
+      min_req = cval;
+    }
+    if (min_req >= 1 &&
+        tlcs->TotalRows() / static_cast<uint64_t>(min_req) <= 1024ULL) {
+      min_having_count = static_cast<uint64_t>(min_req);
+      break;
+    }
+  }
+
+  const bool markov_having_bounded = min_having_count != 0;
   const size_t outer_topk_cap =
       stmt.HasLimit()
           ? (stmt.Offset() <= std::numeric_limits<size_t>::max() - stmt.Limit()
                  ? stmt.Offset() + stmt.Limit()
                  : std::numeric_limits<size_t>::max())
           : 0;
-  if (!is_group_all && stmt.HasLimit() && !order_bindings.empty() &&
-      outer_topk_cap > 0 && outer_topk_cap <= 256 &&
+  const bool topk_two_stage_eligible =
+      stmt.HasLimit() && !order_bindings.empty() && outer_topk_cap > 0 &&
+      outer_topk_cap <= 256;
+  const bool try_certified_capture =
+      markov_having_bounded && key_specs.size() == 1 &&
+      key_specs[0].regex_capture_jit && tlcs->TotalRows() <= UINT32_MAX &&
+      min_having_count <= UINT32_MAX && candidate_blocks.size() >= 128 &&
+      std::getenv("TINYLAMB_DISABLE_FUSED_CAPTURE_HAVING") == nullptr &&
+      std::ranges::all_of(agg_specs, [&](const ColAggSpec& agg) {
+        return agg.kind == ColAggKind::kCountStar ||
+               (agg.full_col == key_specs[0].full_col &&
+                (agg.kind == ColAggKind::kMinVarChar ||
+                 agg.kind == ColAggKind::kMaxVarChar ||
+                 agg.kind == ColAggKind::kAvgByteLen));
+      });
+  using BucketProfiles = std::unordered_map<std::string, std::vector<uint32_t>>;
+  static std::mutex profiles_mu;
+  static BucketProfiles profiles;
+  std::string profile_key;
+  std::optional<HavingBucketCertificate> capture_certificate;
+  std::optional<std::vector<uint32_t>> observed_buckets;
+  const auto publish_capture_profile = [&] {
+    if (!observed_buckets) {
+      return;
+    }
+    const std::scoped_lock lock(profiles_mu);
+    if (profiles.contains(profile_key) || profiles.size() < 32) {
+      profiles.insert_or_assign(profile_key, std::move(*observed_buckets));
+    }
+    observed_buckets.reset();
+  };
+  QueryMemoryCharge capture_mask_charge;
+  constexpr size_t kHavingBuckets = 1U << 18;
+  if (try_certified_capture && capture_mask_charge.TryAdd(kHavingBuckets)) {
+    capture_certificate.emplace(HavingBucketCertificate{
+        .tracked = std::vector<uint8_t>(kHavingBuckets),
+        .minimum_count = static_cast<uint32_t>(min_having_count),
+        .observe_only = true,
+        .observed_buckets = &observed_buckets});
+    const auto& capture_key = key_specs[0];
+    profile_key =
+        tlcs->Path() + "\n" + std::to_string(tlcs->LayoutGeneration()) + "\n" +
+        std::to_string(capture_key.full_col) + "\n" +
+        std::to_string(min_having_count) + "\n" + capture_key.regex_pattern +
+        "\n" + capture_key.regex_replacement;
+    {
+      const std::scoped_lock lock(profiles_mu);
+      if (const auto entry = profiles.find(profile_key);
+          entry != profiles.end()) {
+        for (uint32_t bucket : entry->second) {
+          capture_certificate->tracked[bucket] = 1;
+        }
+        capture_certificate->observe_only = false;
+      }
+    }
+    if (!capture_certificate->observe_only) {
+      ASSIGN_OR_RETURN(
+          std::optional<Relation>, fused,
+          run_classified_plan(stmt, agg_specs, positional_having, emit_bindings,
+                              order_bindings, stmt.SelectList(), runtime,
+                              publish_lstable_marker, nullptr,
+                              &*capture_certificate));
+      publish_capture_profile();
+      if (fused) {
+        if (dbg) {
+          (void)std::fprintf(stderr,
+                             "[TLCS-AGG-OK] fused count-HAVING certificate\n");
+        }
+        return fused;
+      }
+    }
+  }
+  if (!is_group_all && (topk_two_stage_eligible || markov_having_bounded) &&
       !candidate_blocks.empty() && !agg_specs.empty()) {
-    auto sum_int64_provably_no_overflow =
-        [&](slot_t full_col) -> StatusOr<bool> {
-      const uint32_t dg_count = tlcs->DirGroupCount();
-      const uint32_t dg_size = tlcs->DirGroupSize();
-      std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(
-          dg_count);
-      for (uint32_t g = 0; g < dg_count; ++g) {
-        ASSIGN_OR_RETURN(std::shared_ptr<const TlcsFile::DirGroup>, grp,
-                         tlcs->GetDirGroup(g));
-        dir_groups[g] = std::move(grp);
-      }
-      __int128 max_pos_sum = 0;
-      __int128 min_neg_sum = 0;
-      for (const uint32_t bidx : candidate_blocks) {
-        const auto& blk = dir_groups[bidx / dg_size]->blocks[bidx % dg_size];
-        const auto& meta = blk.columns[full_col];
-        if (meta.encoding == TlcsColumnEncoding::kConstNull ||
-            blk.row_count == 0) {
-          continue;
-        }
-        if (!meta.has_min_max) {
-          return false;
-        }
-        if (meta.max_int > 0) {
-          max_pos_sum += static_cast<__int128>(meta.max_int) *
-                         static_cast<__int128>(blk.row_count);
-          if (max_pos_sum >
-              static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
-            return false;
-          }
-        }
-        if (meta.min_int < 0) {
-          min_neg_sum += static_cast<__int128>(meta.min_int) *
-                         static_cast<__int128>(blk.row_count);
-          if (min_neg_sum <
-              static_cast<__int128>(std::numeric_limits<int64_t>::min())) {
-            return false;
-          }
-        }
-      }
-      return true;
-    };
-
     std::vector<uint8_t> is_early(agg_specs.size(), 0);
     for (const PositionalHaving& h : positional_having) {
       is_early[h.agg_index] = 1;
@@ -4821,14 +6371,36 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         is_early[h.rhs_agg_index] = 1;
       }
     }
-    for (const ColumnarOrderBinding& ob : order_bindings) {
-      if (ob.binding.kind == OutputSlotBinding::Kind::kAgg) {
-        is_early[ob.binding.index] = 1;
-      } else if (ob.binding.kind == OutputSlotBinding::Kind::kPostAgg &&
-                 ob.binding.post_agg != nullptr) {
-        for (const auto& s : ob.binding.post_agg->slots) {
-          if (!s.is_key && s.index < is_early.size()) {
-            is_early[s.index] = 1;
+    bool defer_order_to_s2 = false;
+    if (markov_having_bounded) {
+      for (const ColumnarOrderBinding& ob : order_bindings) {
+        if (ob.binding.kind == OutputSlotBinding::Kind::kAgg &&
+            is_early[ob.binding.index] == 0U) {
+          defer_order_to_s2 = true;
+        } else if (ob.binding.kind == OutputSlotBinding::Kind::kPostAgg &&
+                   ob.binding.post_agg != nullptr) {
+          for (const auto& s : ob.binding.post_agg->slots) {
+            if (!s.is_key && s.index < is_early.size() &&
+                is_early[s.index] == 0U) {
+              defer_order_to_s2 = true;
+            }
+          }
+        }
+      }
+      if (!stmt.HasLimit()) {
+        defer_order_to_s2 = true;
+      }
+    }
+    if (!defer_order_to_s2) {
+      for (const ColumnarOrderBinding& ob : order_bindings) {
+        if (ob.binding.kind == OutputSlotBinding::Kind::kAgg) {
+          is_early[ob.binding.index] = 1;
+        } else if (ob.binding.kind == OutputSlotBinding::Kind::kPostAgg &&
+                   ob.binding.post_agg != nullptr) {
+          for (const auto& s : ob.binding.post_agg->slots) {
+            if (!s.is_key && s.index < is_early.size()) {
+              is_early[s.index] = 1;
+            }
           }
         }
       }
@@ -4843,12 +6415,20 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       }
     }
 
-    auto is_heavy_agg = [](ColAggKind k) noexcept {
-      return k == ColAggKind::kMinVarChar || k == ColAggKind::kMaxVarChar ||
-             k == ColAggKind::kCountDistinctInt64 ||
-             k == ColAggKind::kCountDistinctDate ||
-             k == ColAggKind::kCountDistinctDouble ||
-             k == ColAggKind::kCountDistinctVarChar;
+    auto is_heavy_agg = [&](ColAggKind k) noexcept {
+      if (k == ColAggKind::kMinVarChar || k == ColAggKind::kMaxVarChar ||
+          k == ColAggKind::kCountDistinctInt64 ||
+          k == ColAggKind::kCountDistinctDate ||
+          k == ColAggKind::kCountDistinctDouble ||
+          k == ColAggKind::kCountDistinctVarChar) {
+        return true;
+      }
+      if (markov_having_bounded &&
+          (k == ColAggKind::kAvgByteLen || k == ColAggKind::kSumByteLen ||
+           k == ColAggKind::kMinByteLen || k == ColAggKind::kMaxByteLen)) {
+        return true;
+      }
+      return false;
     };
     bool early_has_heavy = false;
     bool late_has_heavy = false;
@@ -4871,9 +6451,15 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         late_aggs.push_back(agg_specs[a]);
       }
     }
+    // For large COUNT-first groups, deferring the numeric payload avoids
+    // using the larger aggregate state for every hash-table entry.
+    if (!late_has_heavy && candidate_blocks.size() >= 512 &&
+        early_aggs.size() == 1 &&
+        early_aggs[0].kind == ColAggKind::kCountStar && late_aggs.size() >= 2) {
+      late_has_heavy = true;
+    }
     // Ensure Stage 1 has at least one aggregate (`COUNT(*)` if ORDER BY is key)
-    // and Stage 2 skips at least one heavy `MIN/MAX(VARCHAR)` or
-    // `COUNT(DISTINCT)` aggregate.
+    // and Stage 2 skips at least one heavy or multi-column payload aggregate.
     if (!early_has_heavy && late_has_heavy && !early_aggs.empty()) {
       std::vector<PositionalHaving> s1_having = positional_having;
       for (PositionalHaving& h : s1_having) {
@@ -4882,25 +6468,36 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           h.rhs_agg_index = orig_to_early[h.rhs_agg_index];
         }
       }
-      std::vector<ColumnarOrderBinding> s1_order = order_bindings;
+      std::vector<ColumnarOrderBinding> s1_order;
       bool s1_order_ok = true;
-      for (ColumnarOrderBinding& ob : s1_order) {
-        if (ob.binding.kind == OutputSlotBinding::Kind::kAgg) {
-          ob.binding.index = orig_to_early[ob.binding.index];
-        } else if (ob.binding.kind == OutputSlotBinding::Kind::kPostAgg) {
-          // Clone PostAggExpr with remapped aggregate indices.
-          auto cloned = std::make_shared<PostAggExpr>(*ob.binding.post_agg);
-          for (auto& sl : cloned->slots) {
-            if (!sl.is_key) {
-              if (sl.index >= orig_to_early.size() ||
-                  orig_to_early[sl.index] == SIZE_MAX) {
-                s1_order_ok = false;
-                break;
+      SelectStatement s1_stmt_storage;
+      const SelectStatement* s1_stmt_ptr = &stmt;
+      if (defer_order_to_s2) {
+        s1_stmt_storage = stmt;
+        s1_stmt_storage.SetOrderBy({});
+        s1_stmt_storage.SetLimit(std::nullopt);
+        s1_stmt_storage.SetOffset(0);
+        s1_stmt_ptr = &s1_stmt_storage;
+      } else {
+        s1_order = order_bindings;
+        for (ColumnarOrderBinding& ob : s1_order) {
+          if (ob.binding.kind == OutputSlotBinding::Kind::kAgg) {
+            ob.binding.index = orig_to_early[ob.binding.index];
+          } else if (ob.binding.kind == OutputSlotBinding::Kind::kPostAgg) {
+            // Clone PostAggExpr with remapped aggregate indices.
+            auto cloned = std::make_shared<PostAggExpr>(*ob.binding.post_agg);
+            for (auto& sl : cloned->slots) {
+              if (!sl.is_key) {
+                if (sl.index >= orig_to_early.size() ||
+                    orig_to_early[sl.index] == SIZE_MAX) {
+                  s1_order_ok = false;
+                  break;
+                }
+                sl.index = orig_to_early[sl.index];
               }
-              sl.index = orig_to_early[sl.index];
             }
+            ob.binding.post_agg = std::move(cloned);
           }
-          ob.binding.post_agg = std::move(cloned);
         }
       }
       if (s1_order_ok) {
@@ -4919,12 +6516,29 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           s1_emit.push_back(std::move(ab));
         }
         Stage1BlockFilterMemo s1_memo;
-        ASSIGN_OR_RETURN(
-            std::optional<Relation>, s1_res,
-            run_classified_plan(early_aggs, s1_having, s1_emit, s1_order, {},
-                                /*plan_runtime=*/nullptr,
-                                /*plan_publish_marker=*/false, &s1_memo));
-        if (s1_res.has_value()) {
+        std::optional<Relation> s1_res;
+        if (s1_having.empty() && preds.Empty()) {
+          ASSIGN_OR_RETURN(
+              std::optional<Relation>, metadata,
+              TryFoldTlcsBoundaryAggregate(
+                  *tlcs, *s1_stmt_ptr, table_schema, qualified_schema, preds,
+                  key_specs, early_aggs, s1_emit, s1_order, {}, nullptr));
+          s1_res = std::move(metadata);
+        }
+        if (!s1_res) {
+          ASSIGN_OR_RETURN(
+              std::optional<Relation>, scanned,
+              run_classified_plan(
+                  *s1_stmt_ptr, early_aggs, s1_having, s1_emit, s1_order, {},
+                  /*plan_runtime=*/nullptr,
+                  /*plan_publish_marker=*/false, &s1_memo,
+                  capture_certificate && capture_certificate->observe_only
+                      ? &*capture_certificate
+                      : nullptr));
+          publish_capture_profile();
+          s1_res = std::move(scanned);
+        }
+        if (s1_res.has_value() && s1_res->rows.size() <= 1024) {
           Relation& s1_rel = *s1_res;
           const size_t n_win = s1_rel.rows.size();
           if (n_win == 0) {
@@ -5037,8 +6651,11 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             bool win_p0_has_null = false;
             int64_t win_p0_min = std::numeric_limits<int64_t>::max();
             int64_t win_p0_max = std::numeric_limits<int64_t>::min();
+            std::vector<int64_t> win_p0_values;
             const bool p0_int_prunable =
                 n_phys >= 1 &&
+                !table_schema.GetColumn(km.phys_specs[0].full_col)
+                     .IsUnsigned() &&
                 (km.phys_specs[0].kind == ColKeyKind::kColInt64 ||
                  km.phys_specs[0].kind == ColKeyKind::kColDate);
 
@@ -5050,6 +6667,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 } else {
                   win_p0_min = std::min(win_p0_min, pk[0].int_val);
                   win_p0_max = std::max(win_p0_max, pk[0].int_val);
+                  win_p0_values.push_back(pk[0].int_val);
                 }
               }
               const uint64_t h =
@@ -5066,6 +6684,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             std::vector<uint32_t> p2_blocks;
             if (p0_int_prunable && !win_p0_has_null &&
                 win_p0_min <= win_p0_max) {
+              std::ranges::sort(win_p0_values);
               const uint32_t dg_count = tlcs->DirGroupCount();
               const uint32_t dg_size = tlcs->DirGroupSize();
               std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(
@@ -5084,9 +6703,14 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 if (m.encoding == TlcsColumnEncoding::kConstNull) {
                   continue;
                 }
-                if (m.has_min_max &&
-                    (m.max_int < win_p0_min || m.min_int > win_p0_max)) {
-                  continue;
+                if (m.has_min_max) {
+                  // Lean: shortlist_interval_cannot_match. Test the exact
+                  // shortlist against the zone, even inside the global hull.
+                  const auto first =
+                      std::ranges::lower_bound(win_p0_values, m.min_int);
+                  if (first == win_p0_values.end() || *first > m.max_int) {
+                    continue;
+                  }
                 }
                 p2_blocks.push_back(bidx);
               }
@@ -5126,24 +6750,36 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                   p2_memo_key_cols.push_back(c);
                 }
               };
-              for (const slot_t c : memo_ks.stage1a_cols) { add_memo_key(c);
-}
-              for (const slot_t c : memo_ks.stage1b_cols) { add_memo_key(c);
-}
-              for (const slot_t c : memo_ks.stage2_cols) { add_memo_key(c);
-}
-              for (const slot_t c : memo_ks.cond_cols) { add_memo_key(c);
-}
+              for (const slot_t c : memo_ks.stage1a_cols) {
+                add_memo_key(c);
+              }
+              for (const slot_t c : memo_ks.stage1b_cols) {
+                add_memo_key(c);
+              }
+              for (const slot_t c : memo_ks.stage2_cols) {
+                add_memo_key(c);
+              }
+              for (const slot_t c : memo_ks.cond_cols) {
+                add_memo_key(c);
+              }
               std::vector<uint8_t> memo_late_seen(table_schema.ColumnCount(),
                                                   0);
               std::vector<uint8_t> memo_late_bytes(table_schema.ColumnCount(),
                                                    0);
               for (const ColAggSpec& ls : late_aggs) {
-                if (ls.kind == ColAggKind::kCountStar) { continue;
-}
+                if (ls.kind == ColAggKind::kCountStar) {
+                  continue;
+                }
+                if (ls.double_arith != nullptr) {
+                  for (const slot_t fc : ls.double_arith->referenced_cols) {
+                    memo_late_seen[fc] = 1;
+                  }
+                  continue;
+                }
                 memo_late_seen[ls.full_col] = 1;
-                if (ls.needs_bytes) { memo_late_bytes[ls.full_col] = 1;
-}
+                if (ls.needs_bytes) {
+                  memo_late_bytes[ls.full_col] = 1;
+                }
               }
               for (size_t c = 0; c < table_schema.ColumnCount(); ++c) {
                 if (memo_late_seen[c] != 0U && in_memo_key[c] == 0U) {
@@ -5180,6 +6816,12 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             std::vector<uint8_t> extra_bytes(ncols, 0);
             for (const ColAggSpec& ls : late_aggs) {
               if (ls.kind == ColAggKind::kCountStar) {
+                continue;
+              }
+              if (ls.double_arith != nullptr) {
+                for (const slot_t fc : ls.double_arith->referenced_cols) {
+                  extra_seen[fc] = 1;
+                }
                 continue;
               }
               extra_seen[ls.full_col] = 1;
@@ -5253,7 +6895,30 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 n_phys == 1 &&
                 (km.phys_specs[0].kind == ColKeyKind::kColInt64 ||
                  km.phys_specs[0].kind == ColKeyKind::kColDate);
+            const bool use_key_fence =
+                n_phys > 1 && p0_int_prunable && !win_p0_has_null &&
+                p2_blocks.size() >= 512 &&
+                tlcs->DictionaryKind(km.phys_specs[0].full_col) !=
+                    TlcsDictKind::kCompleteNarrow &&
+                static_cast<__int128>(win_p0_max) - win_p0_min >= (1 << 20);
+            std::array<uint64_t, 64> key_fence{};
+            const auto fence_bit = [](int64_t value) {
+              const auto bits = static_cast<uint64_t>(value);
+              return (bits ^ (bits >> 32)) & 4095;
+            };
+            if (use_key_fence) {
+              for (int64_t value : win_p0_values) {
+                const uint64_t bit = fence_bit(value);
+                key_fence[bit / 64] |= uint64_t{1} << (bit % 64);
+              }
+            }
 
+            const bool p2_reads_text =
+                std::ranges::any_of(late_aggs, [&](const ColAggSpec& spec) {
+                  return spec.needs_bytes &&
+                         table_schema.GetColumn(spec.full_col).Type() ==
+                             ValueType::kVarChar;
+                });
             auto p2_worker_fn = [&](size_t tid) {
               BlockDecodeScratch scratch;
               TlcsFile::DecodedBlock blk_extra;
@@ -5267,6 +6932,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               std::vector<RuntimeKeyCell> probe_keys(n_phys);
               std::vector<std::pair<uint32_t, uint32_t>> matched_wins;
               uint64_t local_scanned = 0;
+              constexpr size_t kPrecheckSample = 16;
+              size_t precheck_blocks = 0;
+              size_t precheck_hits = 0;
 
               // 4096-slot L1 session dedup filter for sharded int distinct.
               static constexpr size_t kL1DistSlots = 4096;
@@ -5284,6 +6952,41 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                   break;
                 }
                 const uint32_t bidx = p2_blocks[bi];
+                if (use_key_fence &&
+                    (precheck_blocks < kPrecheckSample ||
+                     precheck_hits * 4 < precheck_blocks * 3)) {
+                  // Start with one column. Only blocks with a shortlisted
+                  // leading value can need the other keys or late payloads.
+                  const std::array columns{km.phys_specs[0].full_col};
+                  auto& leading = scratch.blk_cond;
+                  Status status = tlcs->DecodeBlockColumnsWithOptions(
+                      bidx, columns, table_schema, &leading, true,
+                      &scratch.io_cond, {});
+                  if (!status.ok()) {
+                    p2_status[tid] = std::move(status);
+                    return;
+                  }
+                  ++precheck_blocks;
+                  if (leading.row_count == 0) {
+                    continue;
+                  }
+                  const auto& column = leading.columns[0];
+                  bool hit = false;
+                  for (uint32_t row = 0; row < leading.row_count; ++row) {
+                    const int64_t value = column.int_cells[row];
+                    const uint64_t bit = fence_bit(value);
+                    if (((key_fence[bit / 64] >> (bit % 64)) & 1) != 0 &&
+                        !column.IsNull(row) &&
+                        std::ranges::binary_search(win_p0_values, value)) {
+                      hit = true;
+                      break;
+                    }
+                  }
+                  if (!hit) {
+                    continue;
+                  }
+                  ++precheck_hits;
+                }
                 const bool use_memo_rows = s1_memo.complete &&
                                            bidx < s1_memo.block_rows.size() &&
                                            !s1_memo.block_rows[bidx].empty();
@@ -5349,7 +7052,17 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                     }
                   }
                 } else {
+                  const auto* first_key =
+                      use_key_fence ? col_ptrs[km.phys_specs[0].full_col]
+                                    : nullptr;
                   for (const uint32_t r : cand_rows) {
+                    if (first_key != nullptr) {
+                      const uint64_t bit = fence_bit(first_key->int_cells[r]);
+                      if (first_key->IsNull(r) ||
+                          ((key_fence[bit / 64] >> (bit % 64)) & 1) == 0) {
+                        continue;
+                      }
+                    }
                     Status kst = Status::kSuccess;
                     for (size_t p = 0; p < n_phys; ++p) {
                       if (!ExtractSingleKeyCell(
@@ -5385,9 +7098,18 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 const auto& need_late_len =
                     use_memo_rows ? p2_memo_late_len_only : p2_extra_len_only;
                 if (!need_late_cols.empty()) {
+                  std::span<const uint32_t> text_rows;
+                  if (p2_reads_text && matched_wins.size() <= 512) {
+                    cand_rows.clear();
+                    cand_rows.reserve(matched_wins.size());
+                    for (const auto& match : matched_wins) {
+                      cand_rows.push_back(match.first);
+                    }
+                    text_rows = cand_rows;
+                  }
                   Status est = tlcs->DecodeBlockColumnsWithOptions(
                       bidx, need_late_cols, table_schema, &blk_extra, true,
-                      &io_extra, need_late_len);
+                      &io_extra, need_late_len, false, text_rows);
                   if (est != Status::kSuccess) {
                     p2_status[tid] = std::move(est);
                     return;
@@ -5603,6 +7325,12 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 std::vector<uint8_t> type_refined(out_cols.size(), 0);
                 std::vector<Value> full_finished(agg_specs.size());
                 std::vector<Value> cached_keys(key_specs.size());
+                struct BuiltStage2Row {
+                  std::vector<Value> ord_vals;
+                  Row emit_row;
+                };
+                std::vector<BuiltStage2Row> built_rows;
+                built_rows.reserve(n_win);
                 for (size_t w = 0; w < n_win; ++w) {
                   for (size_t a = 0; a < agg_specs.size(); ++a) {
                     if (orig_to_early[a] != SIZE_MAX) {
@@ -5616,13 +7344,28 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                       full_finished[orig_a] =
                           Value(static_cast<int64_t>(sharded_dist_counts[w]));
                     } else {
-                      full_finished[orig_a] = FinishAggState(
-                          late_aggs[la], merged_late[(w * n_late) + la]);
+                      ASSIGN_OR_RETURN(
+                          Value, finished_value,
+                          (FinishAggState(late_aggs[la],
+                                          merged_late[(w * n_late) + la])));
+                      full_finished[orig_a] = std::move(finished_value);
                     }
                   }
                   std::fill(cached_keys.begin(), cached_keys.end(), Value());
                   for (size_t fk = 0; fk < key_specs.size(); ++fk) {
                     cached_keys[fk] = s1_rel.rows[w][fk];
+                  }
+                  std::vector<Value> ord_vals;
+                  if (defer_order_to_s2 && !order_bindings.empty()) {
+                    ord_vals.reserve(order_bindings.size());
+                    for (const auto& ob : order_bindings) {
+                      ASSIGN_OR_RETURN(Value, ov,
+                                       EvaluateBindingValue(
+                                           ob.binding, key_specs,
+                                           &win_full_keys[w * key_specs.size()],
+                                           full_finished, &cached_keys));
+                      ord_vals.push_back(std::move(ov));
+                    }
                   }
                   std::vector<Value> row_vals;
                   row_vals.reserve(emit_bindings.size());
@@ -5639,7 +7382,30 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                     }
                     row_vals.push_back(std::move(v));
                   }
-                  out.AddRow(Row(std::move(row_vals)));
+                  built_rows.push_back(
+                      BuiltStage2Row{.ord_vals = std::move(ord_vals),
+                                     .emit_row = Row(std::move(row_vals))});
+                }
+                if (defer_order_to_s2 && !order_bindings.empty()) {
+                  std::stable_sort(
+                      built_rows.begin(), built_rows.end(),
+                      [&](const BuiltStage2Row& a, const BuiltStage2Row& b) {
+                        for (size_t k = 0; k < order_bindings.size(); ++k) {
+                          const int c = order_bindings[k].order.Compare(
+                              a.ord_vals[k], b.ord_vals[k]);
+                          if (c != 0) {
+                            return c < 0;
+                          }
+                        }
+                        return false;
+                      });
+                }
+                const size_t emit_limit =
+                    (defer_order_to_s2 && stmt.HasLimit())
+                        ? std::min(built_rows.size(), outer_topk_cap)
+                        : built_rows.size();
+                for (size_t i = 0; i < emit_limit; ++i) {
+                  out.AddRow(std::move(built_rows[i].emit_row));
                 }
                 out.schema = Schema("", std::move(out_cols));
                 if (dbg) {
@@ -5664,7 +7430,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     }
   }
 
-  return run_classified_plan(agg_specs, positional_having, emit_bindings,
+  return run_classified_plan(stmt, agg_specs, positional_having, emit_bindings,
                              order_bindings, stmt.SelectList(), runtime,
                              publish_lstable_marker);
 }

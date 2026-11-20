@@ -536,6 +536,44 @@ TEST(GoogleSqlAstTest, CreateTableColumnTypes) {
   EXPECT_EQ(create.Columns()[9].Type(), ValueType::kInt64);
 }
 
+// P557/596: the validated ENGINE=/USING/OPTIONS(engine=) value is transcribed
+// into CreateTableStatement's IR dump (it used to be checked and dropped).
+TEST(GoogleSqlAstTest, CreateTableEngineIsTranscribed) {
+  struct Case {
+    const char* sql;
+    const char* engine;
+  };
+  const std::array<Case, 6> cases = {{
+      {.sql = "CREATE TABLE e1 (a INT64) ENGINE=LSTABLE;", .engine = "lstable"},
+      {.sql = "CREATE TABLE e2 (a INT64) ENGINE=PAX;", .engine = "pax"},
+      {.sql = "CREATE TABLE e3 (a INT64) USING COLUMNAR;",
+       .engine = "columnar"},
+      {.sql = "CREATE TABLE e4 (a INT64) OPTIONS (engine = 'default');",
+       .engine = "default"},
+      {.sql = "CREATE TABLE e5 (a INT64);", .engine = ""},
+      {.sql = "CREATE TABLE e6 ENGINE=LST AS SELECT 1 AS a;", .engine = "lst"},
+  }};
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.sql);
+    auto statement = VisitSql(c.sql);
+    ASSERT_NE(statement, nullptr);
+    std::ostringstream out;
+    statement->Dump(out);
+    if (c.engine[0] == '\0') {
+      EXPECT_EQ(out.str().find("engine="), std::string::npos) << out.str();
+    } else {
+      EXPECT_NE(out.str().find(std::string("engine=") + c.engine),
+                std::string::npos)
+          << out.str();
+    }
+  }
+  // Unknown engines stay rejected; conflicting duplicates are loud.
+  EXPECT_EQ(VisitSql("CREATE TABLE e7 (a INT64) ENGINE=ROCKSDB;"), nullptr);
+  EXPECT_EQ(VisitSql("CREATE TABLE e8 (a INT64) "
+                     "OPTIONS (engine='pax', engine='columnar');"),
+            nullptr);
+}
+
 TEST(GoogleSqlAstTest, CreateIndexPreservesKeysStoringAndModifiers) {
   auto statement = VisitSql(
       "CREATE /*comment*/ UNIQUE INDEX IF NOT EXISTS "
@@ -733,7 +771,16 @@ TEST(GoogleSqlAstTest, TableValuedFunctionExpandsStoredBody) {
   // expands the stored defining query with the call-site arguments (unknown
   // functions and non-constant arguments stay explicit errors).
   EXPECT_THROW(VisitSqlOrThrow("SELECT * FROM my_func(1);"), std::exception);
-  VisitSqlOrThrow("CREATE TABLE FUNCTION my_func(x INT64) AS SELECT x;");
+  // T2552: CREATE FUNCTION visits into a CreateObjectStatement; the
+  // thread_local registration runs when the statement executes.  Drive the
+  // side effect explicitly here (this test exercises the visitor, not the
+  // engine's PrepareStatement dispatch).
+  const std::unique_ptr<Statement>& create =
+      VisitSqlOrThrow("CREATE TABLE FUNCTION my_func(x INT64) AS SELECT x;");
+  ASSERT_EQ(create->Type(), StatementType::kCreateFunction);
+  EXPECT_EQ(static_cast<const CreateObjectStatement*>(create.get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+                ->RunSideEffect(),
+            Status::kSuccess);
   const std::unique_ptr<Statement>& statement =
       VisitSqlOrThrow("SELECT * FROM my_func(1);");
   const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
@@ -1219,7 +1266,10 @@ TEST(GoogleSqlAstTest, UnitlessIntervalLiteralsReturnStatusNotThrow) {
       GoogleSqlAstParser::Parse(dump);
   ASSERT_TRUE(ast.HasValue()) << ToString(ast.GetStatus());
   // Any outcome is fine as long as it is a Status, never an exception.
-  EXPECT_NO_THROW((void)GoogleSqlAstVisitor::Visit(*ast.Value()));
+  StatusOr<std::unique_ptr<Statement>> visited = Status::kSuccess;
+  EXPECT_NO_THROW(visited = GoogleSqlAstVisitor::Visit(*ast.Value()));
+  EXPECT_FALSE(visited.HasValue())
+      << "malformed interval literal must surface a Status, not a Value";
 
   // A hand-built dump cannot express every malformed shape; also feed the
   // original crash input verbatim (opaque bytes are valid here because the
@@ -1249,6 +1299,13 @@ TEST(GoogleSqlAstTest, UdfDefinitionsAreScopedToTheirSession) {
   ast_visitor_detail::SqlUdf udf;
   udf.name = "f";
 
+  struct ScopeGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+    ~ScopeGuard() {
+      ast_visitor_detail::SetUdfSessionScope(0);
+      ast_visitor_detail::PurgeUdfSessionDefinitions(kSessionA);
+      ast_visitor_detail::PurgeUdfSessionDefinitions(kSessionB);
+    }
+  } scope_guard;
   ast_visitor_detail::SetUdfSessionScope(kSessionA);
   ast_visitor_detail::RegisterUdf(udf);
   ASSERT_NE(ast_visitor_detail::FindUdf("f"), nullptr);

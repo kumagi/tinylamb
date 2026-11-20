@@ -2,7 +2,7 @@
 
 - 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(`built.Add(Rule("push_semi_join_through_inner_join", …)`)
-  登録式。ヘルパは `UnionRelations` / `EnsureDerivedGroup`。
+  登録式。ヘルパーは `UnionRelations` / `EnsureDerivedGroup`。
 
 ## 概要
 

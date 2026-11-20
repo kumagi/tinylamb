@@ -77,6 +77,10 @@ void ReplayCommittedRegressionShard(size_t shard, size_t total_shards) {
     GTEST_SKIP() << "set TINYLAMB_SESSION_REGRESSION_DIR to replay .test files";
   }
   const std::vector<std::string> files = ListTestFiles(dir);
+  // T3944: an existing-but-empty directory (checkout miss, wrong path) must
+  // not report success while replaying zero guards; mirrors the ooc /
+  // griffin / join regression replays.
+  EXPECT_FALSE(files.empty()) << "no .test files in " << dir;
   for (size_t i = shard; i < files.size(); i += total_shards) {
     const std::string& path = files[i];
     std::ifstream file(path);
@@ -309,7 +313,7 @@ TEST(SqlSessionFuzzer, RepeatSeedForNondeterministicBugs) {
       parsed_repeat <= 0 || parsed_repeat > std::numeric_limits<int>::max()) {
     GTEST_SKIP() << "invalid TINYLAMB_SESSION_REPEAT";
   }
-  const uint64_t seed = static_cast<uint64_t>(parsed_seed);
+  const auto seed = static_cast<uint64_t>(parsed_seed);
   const int repeat = static_cast<int>(parsed_repeat);
   for (int i = 0; i < repeat; ++i) {
     // Same fold as SessionFuzzTry so a .test file's -- seed: value can be
@@ -323,7 +327,16 @@ TEST(SqlSessionFuzzer, RepeatSeedForNondeterministicBugs) {
           "sql_session_fuzz-repro-" + std::to_string(seed) + ".test";
       std::ofstream out(path);
       out << SerializeSessionTest(seed, trace, report);
-      std::cerr << "wrote " << path << "\n";
+      out.close();
+      // T4514: the repro file is the promotion path to a regression guard;
+      // never claim it landed when the open/write failed.
+      if (out) {
+        std::cerr << "wrote " << path << "\n";
+      } else {
+        std::cerr << "FAILED to write repro file " << path
+                  << " (disk full or unwritable cwd) -- save seed=" << seed
+                  << " manually\n";
+      }
     }
     ASSERT_EQ(report, "") << "seed=" << seed << " iteration=" << i << "\n"
                           << report;
@@ -418,4 +431,3 @@ TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard3) {
 }
 
 }  // namespace tinylamb
-namespace tinylamb {}  // namespace tinylamb

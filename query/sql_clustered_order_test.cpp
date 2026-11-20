@@ -133,13 +133,20 @@ class SqlClusteredOrderTest : public ::testing::Test {
 
   // Waits (bounded) for the background GC worker to drop the committed
   // version chains, which is what arms the index-only visibility map.
+  // T4884: do not rely on the worker getting scheduled -- under ctest -j a
+  // pure wall-clock budget starves the test even when the implementation is
+  // correct. Poll alongside a synchronous sweep of committed chains; only
+  // reader-pinned chains persist, and those clear on a later iteration.
   void WaitForChainFreePages() const {
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (database_->TransactionStats().version_chains != 0) {
       ASSERT_LT(std::chrono::steady_clock::now(), deadline)
-          << "background GC did not drop version chains";
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          << "background GC did not drop version chains within 30s despite "
+             "synchronous sweeps";
+      TransactionContext ctx = database_->BeginContext();
+      ctx.txn_.SweepCommittedVersionChains();
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
   }
 
@@ -560,6 +567,33 @@ TEST_F(SqlClusteredOrderTest, InListPointUnionKeepsKeyOrder) {
   EXPECT_EQ(rows[0][0], Value(int64_t{3}));
   EXPECT_EQ(rows[1][0], Value(int64_t{7}));
   EXPECT_EQ(rows[2][0], Value(int64_t{9}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+// Guard pin for the multi-range (disjunctive prefix) candidate: it advertises
+// the full index key order, so ORDER BY key LIMIT n must keep using the
+// ordered scan (no Sort) and stream the prefix -- and since it now receives
+// the same ApplyLimitHint as the point-union sibling, its priced rows stay
+// within the limit.  (Whether the hint flips the winner is cost-landscape
+// dependent; this pins shape + results, not the flip.)
+TEST_F(SqlClusteredOrderTest, DisjunctivePrefixScanKeepsKeyOrderUnderLimit) {
+  Analyze();
+  TransactionContext ctx = database_->BeginContext();
+  RunSql(ctx, *database_,
+         "CREATE INDEX clustered_tag_id ON clustered (tag, id);");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = database_->BeginContext();
+  const std::string plan = Explain(
+      ctx, *database_,
+      "EXPLAIN SELECT id, tag FROM clustered WHERE (tag = 'tag3' AND id = 3) "
+      "OR (tag = 'tag7' AND id = 7) ORDER BY tag, id LIMIT 1;");
+  EXPECT_EQ(plan.find("Sort"), std::string::npos) << plan;
+  const std::vector<Row> rows =
+      RunSql(ctx, *database_,
+             "SELECT id, tag FROM clustered WHERE (tag = 'tag3' AND id = 3) "
+             "OR (tag = 'tag7' AND id = 7) ORDER BY tag, id LIMIT 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{3}));
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 

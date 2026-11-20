@@ -17,8 +17,12 @@
 #include "recovery/recovery_manager.hpp"
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -92,6 +96,28 @@ class RecoveryManagerTest : public ::testing::Test {
     std::ignore = std::remove((prefix_ + ".db").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt.tmp").c_str());
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+      // T4188: a failed enumeration or dereference must not silently leave
+      // this test's .db.blocks.*/.db.lsm.* debris behind (AGENTS.md §3
+      // throwaway-artifact contract); surface it loudly instead.
+      if (ec) {
+        ADD_FAILURE() << "TearDown directory scan failed: " << ec.message();
+        break;
+      }
+      const std::string fname = entry.path().filename().string();
+      if (fname.starts_with(prefix_ + ".db.blocks.") ||
+          fname.starts_with(prefix_ + ".db.lsm.")) {
+        std::filesystem::remove(entry.path(), ec);
+        if (ec) {
+          ADD_FAILURE() << "TearDown could not remove " << fname << ": "
+                        << ec.message();
+        }
+      }
+    }
+    if (ec) {
+      ADD_FAILURE() << "TearDown directory iteration error: " << ec.message();
+    }
     RemoveLogAndSegments(prefix_ + ".log");
   }
 
@@ -101,6 +127,71 @@ class RecoveryManagerTest : public ::testing::Test {
   std::unique_ptr<RecoveryManager> rm_;
   std::unique_ptr<TransactionManager> tm_;
 };
+
+// P642: `LogEnd()` folds a scan/IO failure into 0.  Callers that tell
+// "WAL is empty" apart from "WAL is unreadable" must use `LogEndStatus()`
+// so a transient I/O failure is not misdiagnosed as kCorrupt.
+TEST(RecoveryManagerLogEndStatus, PropagatesIoFailureWhereLogEndFoldsToZero) {
+  const std::string dir = "recovery_logend_" + RandomString();
+  const std::string missing = dir + "/nested/nope.log";
+  {
+    RecoveryManager rm(missing, nullptr);
+    const StatusOr<lsn_t> end = rm.LogEndStatus();
+    ASSERT_FALSE(end.HasValue());
+    EXPECT_EQ(end.GetStatus().GetCode(), StatusCode::kIOError);
+    EXPECT_EQ(rm.LogEnd(), 0U);
+  }
+  std::filesystem::create_directories(dir);
+  {
+    // Present but empty WAL directory: the scan succeeds and positively
+    // reports "no segments" (0), which is the only shape the kCorrupt
+    // misdiagnosis guard must accept.
+    const std::string empty = dir + "/empty.log";
+    RecoveryManager rm(empty, nullptr);
+    ASSERT_SUCCESS(rm.LogEndStatus().GetStatus());
+    EXPECT_EQ(rm.LogEndStatus().Value(), 0U);
+  }
+  {
+    // A readable unsuffixed segment reports its logical size, not 0.
+    const std::string base = dir + "/data.log";
+    {
+      std::ofstream out(base);
+      out << std::string(1234, 'x');
+    }
+    RecoveryManager rm(base, nullptr);
+    ASSIGN_OR_ASSERT_FAIL(lsn_t, end, rm.LogEndStatus());
+    EXPECT_EQ(end, 1234U);
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
+TEST_F(RecoveryManagerTest, RejectsRecordsLargerThanTheLoggerLimit) {
+  // Serialize records directly: AddLog already refuses the second one.
+  const size_t overhead = LogRecord::InsertingLogRecord(0, 10, 5, 2, "").Size();
+  const size_t max_payload = Logger::kMaxRecordSize - overhead;
+  const auto record = [&](size_t size) {
+    return LogRecord::InsertingLogRecord(0, 10, 5, 2, std::string(size, 'x'))
+        .Serialize();
+  };
+  const auto path = prefix_ + "-size-limit.log";
+  {
+    std::ofstream log(path, std::ios::binary);
+    log << record(max_payload) << record(max_payload + 1);
+    ASSERT_TRUE(log.good());
+  }
+
+  // Keep both records inside a single segment; only their per-record length
+  // distinguishes them, and both have a valid checksum.
+  {
+    RecoveryManager reader(path, pm_->GetPool(), size_t{64} << 20);
+    LogRecord recovered;
+    EXPECT_TRUE(reader.ReadLog(0, &recovered));
+    EXPECT_EQ(recovered.Size(), Logger::kMaxRecordSize);
+    EXPECT_FALSE(reader.ReadLog(Logger::kMaxRecordSize, &recovered));
+  }
+  std::filesystem::remove(path);
+}
 
 TEST_F(RecoveryManagerTest, ReplaysCommittedAndIgnoresUncommittedLosers) {
   page_id_t block_pid = 0;
@@ -153,6 +244,70 @@ TEST_F(RecoveryManagerTest, ReplaysCommittedAndIgnoresUncommittedLosers) {
   EXPECT_EQ(val, "v_committed");
   EXPECT_EQ(idx.Read(verify, "k_loser").GetStatus(), Status::kNotExists);
   ASSERT_SUCCESS(verify.PreCommit());
+}
+
+TEST_F(RecoveryManagerTest,
+       RecoveryTxnBitmapHandlesSpacedAndAbortedTransactions) {
+  std::vector<page_id_t> committed_pids;
+  std::vector<slot_t> committed_slots;
+  std::vector<page_id_t> aborted_pids;
+
+  for (int i = 0; i < 64; ++i) {
+    Transaction txn = tm_->Begin();
+    ASSIGN_OR_ASSERT_FAIL(PageRef, p,
+                          pm_->AllocateNewPage(txn, PageType::kRowPage));
+    const page_id_t pid = p->PageID();
+    if (i % 4 == 0) {
+      aborted_pids.push_back(pid);
+      p.PageUnlock();
+      ASSERT_SUCCESS(txn.Abort());
+      continue;
+    }
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot,
+                          p->Insert(txn, "txn_val_" + std::to_string(i)));
+    committed_pids.push_back(pid);
+    committed_slots.push_back(slot);
+    p.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+    if (i == 31) {
+      ASSERT_SUCCESS(pm_->WriteFuzzyCheckpoint(logger_->BufferedLSN()));
+    }
+  }
+
+  ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
+  pm_->DropAllPages();
+  Open();
+
+  Transaction verify = tm_->Begin();
+  for (size_t i = 0; i < committed_pids.size(); ++i) {
+    ASSIGN_OR_ASSERT_FAIL(PageRef, p, pm_->GetPage(committed_pids[i]));
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, got,
+                          p->Read(verify, committed_slots[i]));
+    EXPECT_FALSE(got.empty());
+    p.PageUnlock();
+  }
+  ASSERT_SUCCESS(verify.PreCommit());
+}
+
+// T2115: the LogRecord stream form rendered `type` as a raw uint8 and
+// printed the pid/slot numeric_limits::max() sentinels for record kinds
+// that never touch them (BEGIN/COMMIT/ABORT/checkpoints).  Names now,
+// and location fields only when real.
+TEST(LogRecordDumpTest, RendersTypeNameAndSuppressesSentinelLocation) {
+  std::ostringstream oss;
+  oss << LogRecord(1, 2, LogType::kBegin);
+  EXPECT_EQ(oss.str(), "{prev:1 txn:2 type:kBegin}");
+
+  LogRecord insert(3, 4, LogType::kInsertRow);
+  insert.pid = 7;
+  insert.slot = 2;
+  oss.str("");
+  oss << insert;
+  EXPECT_EQ(oss.str(), "{prev:3 txn:4 type:kInsertRow pid:7 slot:2}");
+
+  oss.str("");
+  oss << LogRecord(5, 6, static_cast<LogType>(200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): exercise unknown log type
+  EXPECT_EQ(oss.str(), "{prev:5 txn:6 type:kInvalid}");
 }
 
 }  // namespace

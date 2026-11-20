@@ -24,10 +24,14 @@
 #include <unordered_set>
 #include <vector>
 
-// NOTE: LOG() never filters levels. LOG(FATAL) flushes the message to stderr
-// and then aborts the process; callers wanting a survivable diagnostic must
-// use LOG(ERROR) or below.
-#define LOG(level) LogMessage(level, __FILE__, __LINE__, __func__).stream()
+// LOG() filters by the process minimum level (see TINYLAMB_LOG_LEVEL). A
+// filtered message is a no-op: no timestamp, no stringstream formatting and
+// no cerr lock. LOG(FATAL) is never filtered -- it flushes to stderr and then
+// aborts; callers wanting a survivable diagnostic must use LOG(ERROR) or below.
+#define LOG(level)                                                         \
+  LogMessage(level, __FILE__, __LINE__, __func__,                            \
+             ::tinylamb::detail::LogLevelEnabled(level))                    \
+      .stream()
 #define STATUS(s, message)                    \
   do {                                        \
     if ((s) != Status::kSuccess) {            \
@@ -70,8 +74,8 @@ enum class LogLevel : uint16_t {
   kInfo = 2000,
   kNotice = 2500,
   kWarn = 3000,
-  kAlert = 4000,
-  kError = 5000,
+  kError = 4000,
+  kAlert = 5000,  // more severe than ERROR (syslog ALERT < ERR is inverted)
   kFatal = 9000,
 };
 
@@ -86,6 +90,15 @@ enum class LogLevel : uint16_t {
 #define TRACE LogLevel::kTrace
 #endif  // ERROR_CODE_DEFINE
 
+namespace tinylamb::detail {
+// The minimum level that is emitted. Set from TINYLAMB_LOG_LEVEL at startup;
+// defaults to kTrace (no filtering) so observable behaviour is unchanged
+// unless a deployment opts in. FATAL always emits regardless of the threshold.
+void SetMinLogLevel(LogLevel level) noexcept;
+[[nodiscard]] LogLevel MinLogLevel() noexcept;
+[[nodiscard]] bool LogLevelEnabled(LogLevel level) noexcept;
+}  // namespace tinylamb::detail
+
 class LogMessage;
 class LogStream {
   friend class LogMessage;
@@ -99,6 +112,7 @@ class LogStream {
 
   template <size_t N>
   LogStream& operator<<(const std::array<char, N>& rhs) {
+    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
     // Route through string_view with the explicit array extent: streaming the
     // raw array pointer would make the ostream call strlen(), reading past the
     // array when it is not NUL-terminated and truncating embedded NUL bytes.
@@ -108,6 +122,7 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const std::unordered_set<T>& rhs) {
+    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
     message_ << "{";
     bool first = true;
     for (const auto& r : rhs) {
@@ -123,6 +138,7 @@ class LogStream {
 
   template <typename K, typename V>
   LogStream& operator<<(const std::unordered_map<K, V>& rhs) {
+    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
     message_ << "{";
     bool first = true;
     for (const auto& r : rhs) {
@@ -138,6 +154,7 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const std::vector<T>& rhs) {
+    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
     message_ << "[";
     bool first = true;
     for (const auto& r : rhs) {
@@ -153,6 +170,7 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const T& rhs) {
+    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
     message_ << rhs;
     return *this;
   }
@@ -160,14 +178,16 @@ class LogStream {
   ~LogStream();
 
  private:
+  friend class LogMessage;
   std::stringstream message_;
   bool fatal_{false};
+  bool enabled_{true};
 };
 
 class LogMessage {
  public:
   LogMessage(LogLevel log_level, const char* filename, int lineno,
-             const char* func_name);
+             const char* func_name, bool enabled);
   LogStream& stream() { return ls; }
 
  private:

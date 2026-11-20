@@ -47,7 +47,7 @@ class CastExpression : public ExpressionBase {
   [[nodiscard]] bool ReturnNullOnError() const { return return_null_on_error_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kCastExp; }
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kCastExp; }
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
  private:
@@ -57,6 +57,11 @@ class CastExpression : public ExpressionBase {
   TypeTag target_type_tag_{TypeTag::kInvalid};
   bool return_null_on_error_{false};
 };
+
+// Direct value cast used by CastExpression and the bytecode VM.
+[[nodiscard]] StatusOr<Value> TryCastValue(const Value& val,
+                                           const std::string& type_name,
+                                           ValueType target_type, bool safe);
 
 }  // namespace tinylamb
 

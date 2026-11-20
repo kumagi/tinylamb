@@ -26,7 +26,7 @@ namespace tinylamb {
 class ConstantValue : public ExpressionBase {
  public:
   explicit ConstantValue(Value v) : val_(std::move(v)) {}
-  [[nodiscard]] TypeTag Type() const override {
+  [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kConstantValue;
   }
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
@@ -50,7 +50,12 @@ class ConstantValue : public ExpressionBase {
   }
 
   friend std::ostream& operator<<(std::ostream& o, const ConstantValue& c) {
-    o << c.val_;
+    // T2104: Value::operator<< is a bare AsString(), which silently drops the
+    // INTERVAL tag (kVarChar + collation 4) -- the stream form printed a
+    // quoted plain string where ToString()/Dump() printed "INTERVAL ...".
+    // Route through ToString() so every debug rendering of one constant
+    // agrees.
+    o << c.ToString();
     return o;
   }
 

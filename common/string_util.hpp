@@ -91,18 +91,23 @@ namespace tinylamb {
 }
 
 // Byte length of the UTF-8 sequence led by `lead` (1 for ASCII and for any
-// byte that cannot start a sequence, so malformed input degrades to bytes).
+// byte that cannot start a VALID sequence, so malformed input degrades to
+// bytes).  T1542: 0xC0/0xC1 (overlong 2-byte forms) and 0xF5..0xF7 (lead
+// bytes beyond U+10FFFF) do start sequences under the old masking, so TRIM
+// cutsets and LIKE `_` consumed them as one character while the canonical
+// validator (IsValidUtf8Text) rejects exactly those leads.  Acceptance is
+// now the same C2..DF / E0..EF / F0..F4 window.
 [[nodiscard]] constexpr size_t Utf8SequenceLength(unsigned char lead) noexcept {
   if (lead < 0x80U) {
     return 1;
   }
-  if ((lead & 0xE0U) == 0xC0U) {
+  if (lead >= 0xC2U && lead <= 0xDFU) {
     return 2;
   }
   if ((lead & 0xF0U) == 0xE0U) {
     return 3;
   }
-  if ((lead & 0xF8U) == 0xF0U) {
+  if (lead >= 0xF0U && lead <= 0xF4U) {
     return 4;
   }
   return 1;

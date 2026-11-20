@@ -62,9 +62,9 @@ ops to accelerate consecutive ops inside one UPDATE.
   the sticky `RowsRewrittenInPlace()` latch set by UPDATE/DELETE (an in-place
   rewrite leaves a pre-image an older snapshot can resolve, and MVCC versions
   are in-memory only, so no measurement of current images speaks for it).
-  Generations are seeded from a process-global counter with a $2^{32}$ stride:
-  a reopened database never reproduces a stamp a persisted record was written
-  with.
+  Generations are seeded from a process-global counter with a $2^{32}$ stride
+  (starting at 1 each process); the process does not track stamps written by
+  previous processes, so no cross-process guarantee of uniqueness is made.
 
 ## Layering notes (allowlisted edges)
 

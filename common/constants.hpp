@@ -81,6 +81,10 @@ enum class StatusCode : uint8_t {
   kInvalidArgument = 14,
   kRuntimeError = 15,
   kMemoryLimitExceeded = 16,
+  // Statement deadline (TINYLAMB_STATEMENT_TIMEOUT_MS) expired mid-run.
+  // Distinct from kRuntimeError so clients can tell a cancel/timeout from
+  // a server fault (PostgreSQL SQLSTATE 57014 query_canceled).
+  kQueryCanceled = 17,
 };
 
 // A status code plus an optional human-readable message. Equality (and every
@@ -115,6 +119,7 @@ class Status {
   static const inline StatusCode kRuntimeError{StatusCode::kRuntimeError};
   static const inline StatusCode kMemoryLimitExceeded{
       StatusCode::kMemoryLimitExceeded};
+  static const inline StatusCode kQueryCanceled{StatusCode::kQueryCanceled};
 
   [[nodiscard]] StatusCode GetCode() const { return code_; }
   [[nodiscard]] bool ok() const { return code_ == StatusCode::kSuccess; }
@@ -236,7 +241,8 @@ using page_id_t = uint64_t;
 using slot_t = uint16_t;
 using bin_size_t = uint16_t;
 
-// Page id reserved for the MetaPage (allocator state).
+// Page id reserved for the MetaPage (allocator state). Currently unused; the
+// allocator state lives in PageManager itself.
 constexpr page_id_t kMetaPageId = 0;
 
 static_assert(kPageSize <= std::numeric_limits<slot_t>::max());
@@ -278,6 +284,8 @@ inline std::string_view ToString(StatusCode s) {
       return "RuntimeError";
     case StatusCode::kMemoryLimitExceeded:
       return "MemoryLimitExceeded";
+    case StatusCode::kQueryCanceled:
+      return "QueryCanceled";
   }
   return "INVALID STATUS";
 }
@@ -294,6 +302,32 @@ inline std::string_view ToString(StatusCode s) {
       return "40001";  // serialization_failure (write-intent conflict/wound)
     case StatusCode::kDuplicates:
       return "23505";  // unique_violation
+    case StatusCode::kQueryCanceled:
+      return "57014";  // query_canceled (statement timeout)
+    case StatusCode::kNotImplemented:
+      return "0A000";  // feature_not_supported
+    case StatusCode::kInvalidArgument:
+      // The overloaded "bad SQL semantics" status: identical at Prepare and
+      // at execution time (P2838 removed the per-call-site split).
+      return "42601";  // syntax_error
+    case StatusCode::kNotExists:
+      return "42P01";  // undefined_table (dominant use: missing relation)
+    case StatusCode::kAmbiguousQuery:
+      return "42702";  // ambiguous_column
+    case StatusCode::kUnknownType:
+      return "42704";  // undefined_object
+    case StatusCode::kTooBigData:
+      // P2842: a row / aggregate value that exceeds the operator budget is
+      // a rejected program limit (ADR 0012 defines kTooBigData apart from
+      // kMemoryLimitExceeded/kNoSpace), not a SQL syntax error and not
+      // silent truncation. PostgreSQL's program_limit_exceeded is 54000.
+      return "54000";
+    case StatusCode::kIsInfinity:
+      return "22003";  // numeric_value_out_of_range
+    case StatusCode::kRuntimeError:
+    case StatusCode::kIOError:
+    case StatusCode::kCorrupt:
+      return "XX000";  // internal_error: server-side fault, not retryable
     default:
       return fallback;
   }

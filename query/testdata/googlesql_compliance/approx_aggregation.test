@@ -458,6 +458,13 @@ FROM UNNEST(['bar', 'baz', 'zoo', 'foo', 'foo', 'foo', 'foo', 'foo', 'foo']) x
 ARRAY<STRUCT<value STRING>>[{"foo"}]
 
 ==
+[name=approx_top_count_preserves_delimiter_in_value]
+SELECT APPROX_TOP_COUNT(x, 1)[OFFSET(0)].value
+FROM UNNEST(['a,b', 'c', 'a,b']) AS x
+--
+ARRAY<STRUCT<value STRING>>[{"a,b"}]
+
+==
 [name=approx_top_count_invalid_0]
 [parameters=0 as count]
 SELECT APPROX_TOP_COUNT(x, @count)

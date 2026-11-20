@@ -32,6 +32,9 @@ serializes through here; depends only on `common/`.
   handles qualified names (`users.id`).
 - `constraint.{hpp,cpp}` (`kNotNull/kUnique/kPrimaryKey`), `function.hpp`
   (catalog function signatures), `date.*`, `interval.*`.
+- `row_block_codec.{hpp,cpp}` — `RowBlockCodec`: self-describing arbitrary-length
+  `Row` and `RowPosition` serialization used by `SpillStore` and transaction
+  write-set / version spills.
 
 ## Before reading code here
 
@@ -44,4 +47,4 @@ Note: `type/column.hpp -> page/row_position.hpp` (constants only) is an
 allowlisted edge in `scripts/check_layering.py`.
 
 Test: `./build/value_test`, `collation_test`, `row_test`, `schema_test`,
-`constraint_test`.
+`constraint_test`, `row_block_codec_test`.

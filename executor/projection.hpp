@@ -51,6 +51,13 @@ class Projection : public ExecutorBase {
   [[nodiscard]] const std::vector<size_t>& CseUseCounts() const {
     return cse_use_counts_;
   }
+  struct Int64Affine {
+    uint16_t column{0};
+    int64_t multiplier{1};
+    int64_t addend{0};
+  };
+  [[nodiscard]] static std::optional<Int64Affine> ResolveInt64Affine(
+      const Expression& expression, const Schema& input_schema);
 
  private:
   std::vector<NamedExpression> expressions_;

@@ -49,6 +49,8 @@ class CrossJoin : public ExecutorBase {
   Executor right_;
 
   Row hold_left_;
+  std::vector<Row> left_rows_;  // batched pull from the left child
+  size_t left_pos_{0};
   bool table_constructed_{false};
   std::vector<Row> right_table_;
   std::vector<Row>::iterator right_iter_;

@@ -549,17 +549,6 @@ inline uint64_t FarmRotate(uint64_t val, int shift) {
 
 inline uint64_t FarmShiftMix(uint64_t val) { return val ^ (val >> 47); }
 
-// Murmur-inspired 128 -> 64 mixing (farmhash.h Hash128to64).
-inline uint64_t FarmHash128to64(uint64_t lo, uint64_t hi) {
-  constexpr uint64_t kMul = 0x9ddfea08eb382d69ULL;
-  uint64_t a = (lo ^ hi) * kMul;
-  a ^= (a >> 47);
-  uint64_t b = (hi ^ a) * kMul;
-  b ^= (b >> 47);
-  b *= kMul;
-  return b;
-}
-
 inline uint64_t FarmHashLen16(uint64_t u, uint64_t v, uint64_t mul) {
   uint64_t a = (u ^ v) * mul;
   a ^= (a >> 47);

@@ -167,6 +167,7 @@ TEST_F(SqlWindowAggCoverageTest, SlidingSumIgnoresTransientFrameOverflow) {
          "(1, 9223372036854775807), (2, -1), (3, 9223372036854775807);");
 
   auto& budget = ProcessMemoryBudget::Global();
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
   struct ResetGuard {
     ResetGuard() = default;
     ResetGuard(const ResetGuard&) = delete;
@@ -308,6 +309,48 @@ TEST_F(WindowSqlCov, NanOrderKeysAreOnePeerGroupBeforeFiniteValues) {
   EXPECT_DOUBLE_EQ(out[2][2].value.double_value, 0.2);
   EXPECT_DOUBLE_EQ(out[3][2].value.double_value, 0.8);
   EXPECT_DOUBLE_EQ(out[4][2].value.double_value, 1.0);
+}
+
+// P349: PERCENTILE_CONT/DISC ignore the frame, and frame-less MODE over an
+// unordered partition sees the whole partition from every row; such
+// whole-partition frames are now evaluated once per partition and
+// broadcast.  The pin locks the broadcast values to the per-row values the
+// old m-times loop produced, covering a multi-row partition, a single-row
+// partition (m=1), a unique-mode partition, and a no-unique-mode partition.
+TEST_F(WindowSqlCov, WholePartitionFrameBroadcastsPerPartitionValue) {
+  ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(),
+                        "INSERT INTO wx VALUES "
+                        "(3, 7, 70, 9.5, DATE '2020-02-01', 'plum'), "
+                        "(3, 8, 70, 9.5, DATE '2020-02-02', 'quince'), "
+                        "(3, 9, 80, 9.5, DATE '2020-02-03', 'raisin');")
+                  .HasValue());
+  const auto rows = TryRunSql(engine_.get(), context_.get(),
+                              "SELECT g, v, MODE(v) OVER (PARTITION BY g), "
+                              "PERCENTILE_CONT(v, 0.5) OVER (PARTITION BY g), "
+                              "PERCENTILE_DISC(v, 0.5) OVER (PARTITION BY g) "
+                              "FROM wx ORDER BY g, v");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  ASSERT_EQ(rows.Value().size(), 9U);
+  const std::vector<Row>& out = rows.Value();
+  // g=1: five rows, every value frequency 1 -> the engine's documented
+  // first-to-maximum tie-break keeps 10 on every row of the partition.
+  for (size_t i = 0; i < 5U; ++i) {
+    EXPECT_EQ(out[i][0], Value(1)) << i;
+    EXPECT_EQ(out[i][2], Value(10)) << i;
+    EXPECT_DOUBLE_EQ(out[i][3].value.double_value, 30.0) << i;
+    EXPECT_EQ(out[i][4], Value(30)) << i;
+  }
+  // g=2: single-row partition broadcast.
+  EXPECT_EQ(out[5][2], Value(60));
+  EXPECT_DOUBLE_EQ(out[5][3].value.double_value, 60.0);
+  EXPECT_EQ(out[5][4], Value(60));
+  // g=3: 70 appears twice -> unique mode; median 70.
+  for (size_t i = 6; i < 9U; ++i) {
+    EXPECT_EQ(out[i][0], Value(3)) << i;
+    EXPECT_EQ(out[i][2], Value(70)) << i;
+    EXPECT_DOUBLE_EQ(out[i][3].value.double_value, 70.0) << i;
+    EXPECT_EQ(out[i][4], Value(70)) << i;
+  }
 }
 
 TEST_F(WindowSqlCov, WindowOrderPlacesNanBeforeFiniteValues) {
@@ -763,13 +806,15 @@ TEST_F(WindowSqlCov, ArrayAndSketchWindowAggregates) {
             (std::vector<Value>({Value(10), Value(20), Value(30)})));
   // Top-2 by count: 20 (count 2) leads; the tie for second is unspecified.
   ASSERT_TRUE(r[5].IsArray());
-  EXPECT_NE(r[5].ArrayElements()[0].AsString().find("\"value\":20"),
+  EXPECT_NE(r[5].ArrayElements()[0].AsStringView().find("\"value\":20"),
             std::string::npos);
-  EXPECT_NE(r[5].ArrayElements()[0].AsString().find("\"count\":2"),
+  EXPECT_NE(r[5].ArrayElements()[0].AsStringView().find("\"count\":2"),
             std::string::npos);
   ASSERT_TRUE(r[6].IsArray());
   EXPECT_EQ(r[6].ArrayElements().size(), 1U);
-  EXPECT_NE(r[6].ArrayElements()[0].AsString().find("\"value\":20"),
+  EXPECT_NE(r[6].ArrayElements()[0].AsStringView().find("\"value\":20"),
+            std::string::npos);
+  EXPECT_NE(r[6].ArrayElements()[0].AsStringView().find("\"sum\":2"),
             std::string::npos);
 }
 
@@ -888,6 +933,7 @@ TEST_F(WindowSqlCov, SpilledOocRangeFramesWithNullAndNaNKeysFollowAst) {
           "(2, 30.0, 30);")
           .HasValue());
 
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
   struct {
     const char* sql;
     std::vector<Row> expected;
@@ -2090,7 +2136,7 @@ TEST_F(AggBigCov, JoinInstallsIntegerKeyFilterOnProbeSide) {
 // mixed numeric operands, disjunctive branch errors).
 // ---------------------------------------------------------------------------
 
-class ScanFilterDirectCov : public ::testing::Test {
+class ScanFilterDirectTest : public ::testing::Test {
  protected:
   using CompiledScanFilter = relational_detail::CompiledScanFilter;
 
@@ -2124,7 +2170,7 @@ class ScanFilterDirectCov : public ::testing::Test {
   std::unique_ptr<TransactionContext> context_;
 };
 
-TEST_F(ScanFilterDirectCov, SimpleCompareEveryOpBothOperandOrders) {
+TEST_F(ScanFilterDirectTest, SimpleCompareEveryOpBothOperandOrders) {
   const Schema schema("t", {Column("v", ValueType::kInt64)});
   const auto cmp = [](BinaryOperation op, int64_t l, int64_t r) {
     switch (op) {
@@ -2171,7 +2217,7 @@ TEST_F(ScanFilterDirectCov, SimpleCompareEveryOpBothOperandOrders) {
   }
 }
 
-TEST_F(ScanFilterDirectCov, DateColumnVersusStringConstants) {
+TEST_F(ScanFilterDirectTest, DateColumnVersusStringConstants) {
   const Schema schema("t", {Column("d", ValueType::kDate)});
   const Value date = Value::Date("2020-01-15");
   struct OpCase {
@@ -2221,7 +2267,7 @@ TEST_F(ScanFilterDirectCov, DateColumnVersusStringConstants) {
   EXPECT_FALSE(Match(null_row, Row({Value()}), schema));
 }
 
-TEST_F(ScanFilterDirectCov, MixedNumericOperandTypes) {
+TEST_F(ScanFilterDirectTest, MixedNumericOperandTypes) {
   const Schema schema(
       "t", {Column("i", ValueType::kInt64), Column("f", ValueType::kDouble)});
   struct Case {
@@ -2310,7 +2356,7 @@ TEST_F(ScanFilterDirectCov, MixedNumericOperandTypes) {
   }
 }
 
-TEST_F(ScanFilterDirectCov, DisjunctiveBranchesOrOfAnds) {
+TEST_F(ScanFilterDirectTest, DisjunctiveBranchesOrOfAnds) {
   const Schema schema(
       "t", {Column("v", ValueType::kInt64), Column("w", ValueType::kInt64)});
   Expression pred = BinaryExpressionExp(
@@ -2335,7 +2381,7 @@ TEST_F(ScanFilterDirectCov, DisjunctiveBranchesOrOfAnds) {
   EXPECT_FALSE(Match(f, Row({Value(int64_t{1}), Value(int64_t{9})}), schema));
 }
 
-TEST_F(ScanFilterDirectCov, DisjunctiveCrossProductAndTooWideGuard) {
+TEST_F(ScanFilterDirectTest, DisjunctiveCrossProductAndTooWideGuard) {
   const Schema schema(
       "t", {Column("v", ValueType::kInt64), Column("w", ValueType::kInt64)});
   auto eq = [](const std::string& col, int64_t value) {
@@ -2373,7 +2419,7 @@ TEST_F(ScanFilterDirectCov, DisjunctiveCrossProductAndTooWideGuard) {
       Match(crossed, Row({Value(int64_t{2}), Value(int64_t{6})}), schema));
 }
 
-TEST_F(ScanFilterDirectCov, BranchResidualErrorIsReportedToCaller) {
+TEST_F(ScanFilterDirectTest, BranchResidualErrorIsReportedToCaller) {
   const Schema schema("t", {Column("v", ValueType::kInt64)});
   // (v = 1 AND 10/(v - v) > 0) OR v = 2: evaluating row v=1 raises inside the
   // first branch's residual; no branch passes and the error surfaces.
@@ -2403,7 +2449,7 @@ TEST_F(ScanFilterDirectCov, BranchResidualErrorIsReportedToCaller) {
   EXPECT_TRUE(ok_error.ok());
 }
 
-TEST_F(ScanFilterDirectCov, ResidualBytecodeErrorFallsBackPerConjunct) {
+TEST_F(ScanFilterDirectTest, ResidualBytecodeErrorFallsBackPerConjunct) {
   const Schema schema("t", {Column("v", ValueType::kInt64)});
   // 10/(v-v) > 0 raises on every row: bytecode eval fails, the per-conjunct
   // fallback records the error, and the row is rejected.
@@ -2421,7 +2467,7 @@ TEST_F(ScanFilterDirectCov, ResidualBytecodeErrorFallsBackPerConjunct) {
   EXPECT_FALSE(error.ok());
 }
 
-TEST_F(ScanFilterDirectCov, ResidualOnlyFiltersUseBytecode) {
+TEST_F(ScanFilterDirectTest, ResidualOnlyFiltersUseBytecode) {
   const Schema schema("t", {Column("v", ValueType::kInt64)});
   CompiledScanFilter f = Compile(
       {BinaryExpressionExp(
@@ -2435,7 +2481,7 @@ TEST_F(ScanFilterDirectCov, ResidualOnlyFiltersUseBytecode) {
   EXPECT_FALSE(Match(f, Row({Value()}), schema));
 }
 
-TEST_F(ScanFilterDirectCov, UnsignedColumnsAreRetaggedBeforeMatching) {
+TEST_F(ScanFilterDirectTest, UnsignedColumnsAreRetaggedBeforeMatching) {
   Column u("u", ValueType::kInt64);
   u.SetUnsigned(true);
   Schema schema("t", {u});
@@ -2450,7 +2496,7 @@ TEST_F(ScanFilterDirectCov, UnsignedColumnsAreRetaggedBeforeMatching) {
   EXPECT_TRUE(Match(f, Row({Value(int64_t{0})}), schema));
 }
 
-TEST_F(ScanFilterDirectCov, BuildIntegerPeeksSkipsUnusablePredicates) {
+TEST_F(ScanFilterDirectTest, BuildIntegerPeeksSkipsUnusablePredicates) {
   Column unsigned_col("u", ValueType::kInt64);
   unsigned_col.SetUnsigned(true);
   const Schema schema(
@@ -2484,7 +2530,7 @@ TEST_F(ScanFilterDirectCov, BuildIntegerPeeksSkipsUnusablePredicates) {
   EXPECT_TRUE(peeks.empty());
 }
 
-TEST_F(ScanFilterDirectCov, SplitAndCombineDisjuncts) {
+TEST_F(ScanFilterDirectTest, SplitAndCombineDisjuncts) {
   Expression or3 = BinaryExpressionExp(
       BinaryExpressionExp(ColumnValueExp("v"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(int64_t{1}))),

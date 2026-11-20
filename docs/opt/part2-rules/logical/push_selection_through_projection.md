@@ -2,7 +2,7 @@
 
 - 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(登録式。述語の書き換えは
-  ヘルパ `RewriteThroughOutputs` / `OutputMatchesColumn` に委譲)
+  ヘルパー `RewriteThroughOutputs` / `OutputMatchesColumn` に委譲)
 
 ## 概要
 

@@ -43,7 +43,8 @@ bool TopNPlan::IsOrderedBy(const std::vector<Expression>& expressions,
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (keys_[i].ascending != ascending[i] ||
+    if (!keys_[i].expression || !expressions[i] ||
+        keys_[i].ascending != ascending[i] ||
         keys_[i].expression->ToString() != expressions[i]->ToString()) {
       return false;
     }
@@ -86,7 +87,7 @@ Collation TopNPlan::OrderCollation() const {
 void TopNPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << ToString() << "\n"
          << Indent(static_cast<size_t>(indent) + 2);
-  child_->Dump(output, indent + 2);
+  DumpChild(output, *child_, indent + 2);
 }
 
 std::string TopNPlan::ToString() const {
@@ -99,6 +100,13 @@ std::string TopNPlan::ToString() const {
     }
     output << keys_[i].expression->ToString()
            << (keys_[i].ascending ? " ASC" : " DESC");
+    // T2668: mirror SortPlan::KeysToString -- explicit NULLS placement is
+    // part of the order contract IsOrderedBy checks, so it belongs in the
+    // render too.
+    const auto nulls_first = keys_[i].nulls_first;
+    if (nulls_first.has_value()) {
+      output << (*nulls_first ? " NULLS FIRST" : " NULLS LAST");
+    }
   }
   output << "]";
   return output.str();
@@ -120,7 +128,7 @@ bool TopNPlan::InstallParameterSlots(const std::vector<Value>& parameters,
     return false;
   }
   for (TopNKey& key : keys_) {
-    if (!SlotizeInPlace(&key.expression, parameters, cursor, slots)) {
+    if (!CollectParameterSlots(&key.expression, slots)) {
       return false;
     }
   }

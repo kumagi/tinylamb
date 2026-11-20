@@ -13,3 +13,11 @@ import TinylambOpt.ClickBenchDiscovery
 import TinylambOpt.TpchSf10Discovery
 import TinylambOpt.BranchlessJitCodegen
 import TinylambOpt.TpcdsExecCodegen
+import TinylambOpt.ClickBenchRound2
+import TinylambOpt.PhysicalJitFusion
+import TinylambOpt.DelimitedCaptureJit
+import TinylambOpt.SimdGroupHash
+import TinylambOpt.QuotientFusion
+import TinylambOpt.FusedAggregateJit
+import TinylambOpt.FilterHashProbe
+import TinylambOpt.TlcsBoundaryAggregate

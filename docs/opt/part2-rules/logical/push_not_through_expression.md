@@ -2,7 +2,7 @@
 
 - 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(`built.Add(Rule("push_not_through_expression", …)`)
-  登録式。依存ヘルパなし(ラムダ内部の自己再帰ラムダ `normalize_not`)。
+  登録式。依存ヘルパーなし(ラムダ内部の自己再帰ラムダ `normalize_not`)。
 
 ## 概要
 

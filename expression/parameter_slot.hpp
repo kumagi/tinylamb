@@ -8,7 +8,8 @@
 
 // A bindable literal standing in for one SQL parameter. Type() is
 // kConstantValue and the class derives from ConstantValue, so planner code
-// that calls AsConstantValue().GetValue() sees the current binding. INSERT
+// that calls AsConstantValue().GetValue() sees the base Value only (NULL for
+// INSERT slots, where the binding is read by Evaluate()). INSERT
 // artifacts keep a per-execution PreparedValues pointer (immutable cached
 // tree). SELECT/UPDATE/DELETE artifacts call Bind() so one thread-local plan
 // serves every literal combination.
@@ -38,11 +39,29 @@
 
 namespace tinylamb {
 
+// Arguments that are operator names, field paths or interval units rather
+// than bindable SQL literals. Shared by template binding and parameter-slot
+// assignment so the two paths cannot drift.
+inline bool IsStructuralCallArg(std::string_view func, size_t index) {
+  if (func == "__quantified__") {
+    return index >= 2;
+  }
+  if (func == "__struct_json__") {
+    return index % 3 != 1;
+  }
+  if (func == "make_interval" || func == "get_field") {
+    return index == 1;
+  }
+  return false;
+}
+
 class PreparedValues {
  public:
   explicit PreparedValues(std::vector<Value> values)
       : values_(std::move(values)) {}
-  [[nodiscard]] const Value& at(size_t index) const { return values_[index]; }
+  [[nodiscard]] const Value& at(size_t index) const {
+    return values_.at(index);
+  }
   [[nodiscard]] size_t size() const { return values_.size(); }
 
  private:
@@ -70,6 +89,9 @@ class ParameterSlot final : public ConstantValue {
 
   [[nodiscard]] size_t Index() const { return slot_index_; }
   [[nodiscard]] ValueType ExpectedType() const { return expected_; }
+  [[nodiscard]] bool UsesPreparedValues() const noexcept {
+    return use_prepared_values_;
+  }
 
   void Bind(const Value& value) { ResetValue(value); }
 
@@ -215,7 +237,11 @@ inline bool SameQuerySubtrees(  // NOLINT(misc-no-recursion)
     case TypeTag::kFunctionCallExp: {
       const auto& lf = left->AsFunctionCallExpression();
       const auto& rf = right->AsFunctionCallExpression();
-      if (lf.Args().size() != rf.Args().size()) {
+      // T4802: the call's identity is its name as much as its arity --
+      // f(x) and g(x) are different subtrees. (The only current caller
+      // pre-checks ToString(), so this was latent.)
+      if (lf.FuncName() != rf.FuncName() ||
+          lf.Args().size() != rf.Args().size()) {
         return false;
       }
       for (size_t i = 0; i < lf.Args().size(); ++i) {
@@ -357,6 +383,93 @@ inline bool IsBindableLiteral(const Value& value) {
 
 // `expected` non-null: the constant must equal the next parameter or `ok` is
 // cleared, and the slot is recorded. A null `expected` builds the INSERT form.
+// Rebuilds the kAggregateExp `expression`, mapping `map` over every
+// expression-bearing attribute in the same SQL text order BindExpression
+// uses (child -> secondary -> trailing -> WHERE -> HAVING -> inner ORDER BY
+// -> inner GROUP BY) and carrying the plain attributes (distinct,
+// ignore-nulls, inner limit, array element type).  P295: ContainsParameterSlot
+// and SameQuerySubtrees descend into every one of these attributes, so every
+// rebuilder (SlotizeLiterals, CloneWithPreparedValues) must rebuild them all
+// from this one place — the historical bug was a rebuilder that kept only
+// (type, child, distinct) and silently dropped `AGG(x WHERE cond)` filters,
+// inner ordering, limits, and trailing arguments.  Clears nothing itself; if
+// `ok` is non-null and false after a map call the original is returned.
+template <typename Mapper>
+inline Expression RebuildAggregateAttributes(const Expression& expression,
+                                             Mapper&& map,
+                                             bool* ok) {  // NOLINT
+  const auto aborted = [ok] { return ok != nullptr && !*ok; };
+  const auto& aggregate = expression->AsAggregateExpression();
+  auto bound = std::make_shared<AggregateExpression>(
+      aggregate.GetType(), map(aggregate.Child()), aggregate.Distinct());
+  if (aborted()) {
+    return expression;
+  }
+  bound->SetIgnoreNulls(aggregate.IgnoreNulls());
+  if (aggregate.SecondaryArg()) {
+    bound->SetSecondaryArg(map(aggregate.SecondaryArg()));
+    if (aborted()) {
+      return expression;
+    }
+  }
+  if (!aggregate.TrailingArgs().empty()) {
+    std::vector<Expression> trailing;
+    trailing.reserve(aggregate.TrailingArgs().size());
+    for (const Expression& extra : aggregate.TrailingArgs()) {
+      if (!extra) {
+        trailing.emplace_back();
+        continue;
+      }
+      trailing.push_back(map(extra));
+      if (aborted()) {
+        return expression;
+      }
+    }
+    bound->SetTrailingArgs(std::move(trailing));
+  }
+  if (aggregate.HasWhereFilter()) {
+    bound->SetWhereFilter(map(aggregate.WhereFilter()));
+    if (aborted()) {
+      return expression;
+    }
+  }
+  if (aggregate.Having() != AggregateHavingModifier::kNone) {
+    bound->SetHaving(aggregate.Having(), map(aggregate.HavingCondition()));
+    if (aborted()) {
+      return expression;
+    }
+  }
+  if (!aggregate.InnerOrderBy().empty()) {
+    std::vector<WindowOrderTerm> order;
+    order.reserve(aggregate.InnerOrderBy().size());
+    for (const WindowOrderTerm& term : aggregate.InnerOrderBy()) {
+      WindowOrderTerm rebuilt = term;
+      rebuilt.expression = map(term.expression);
+      if (aborted()) {
+        return expression;
+      }
+      order.push_back(std::move(rebuilt));
+    }
+    bound->SetInnerOrderBy(std::move(order));
+  }
+  if (aggregate.InnerLimit().has_value()) {
+    bound->SetInnerLimit(aggregate.InnerLimit());
+  }
+  if (aggregate.HasInnerGroupBy()) {
+    std::vector<Expression> group_by;
+    group_by.reserve(aggregate.InnerGroupBy().size());
+    for (const Expression& key : aggregate.InnerGroupBy()) {
+      group_by.push_back(map(key));
+      if (aborted()) {
+        return expression;
+      }
+    }
+    bound->SetInnerGroupBy(std::move(group_by));
+  }
+  bound->SetArrayElementSqlType(aggregate.ArrayElementSqlType());
+  return Expression{std::move(bound)};
+}
+
 inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
     const Expression& expression, size_t* slot_cursor, bool* ok,
     const std::vector<Value>* expected = nullptr,
@@ -421,86 +534,19 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
           unary.Op());
     }
     case TypeTag::kAggregateExp: {
-      const auto& aggregate = expression->AsAggregateExpression();
       // Rebuild every expression-bearing attribute in the same SQL text order
       // BindExpression uses (child -> secondary -> trailing -> WHERE ->
       // HAVING -> inner ORDER BY -> inner GROUP BY), so slot numbering stays
-      // identical. Rebuilding only type/child/distinct silently dropped
+      // identical.  Rebuilding only type/child/distinct silently dropped
       // `AGG(arg WHERE cond)` filters, inner ordering, limits and extra
-      // arguments on every parameterized plan.
-      const auto slotize = [&](const Expression& inner) {
-        return SlotizeLiterals(inner, slot_cursor, ok, expected, slots);
-      };
-      auto bound = std::make_shared<AggregateExpression>(
-          aggregate.GetType(),
-          SlotizeLiterals(aggregate.Child(), slot_cursor, ok, expected, slots),
-          aggregate.Distinct());
-      if (!*ok) {
-        return expression;
-      }
-      if (aggregate.SecondaryArg()) {
-        bound->SetSecondaryArg(slotize(aggregate.SecondaryArg()));
-        if (!*ok) {
-          return expression;
-        }
-      }
-      if (!aggregate.TrailingArgs().empty()) {
-        std::vector<Expression> trailing;
-        trailing.reserve(aggregate.TrailingArgs().size());
-        for (const Expression& extra : aggregate.TrailingArgs()) {
-          if (!extra) {
-            trailing.emplace_back();
-            continue;
-          }
-          trailing.push_back(slotize(extra));
-          if (!*ok) {
-            return expression;
-          }
-        }
-        bound->SetTrailingArgs(std::move(trailing));
-      }
-      if (aggregate.HasWhereFilter()) {
-        bound->SetWhereFilter(slotize(aggregate.WhereFilter()));
-        if (!*ok) {
-          return expression;
-        }
-      }
-      if (aggregate.Having() != AggregateHavingModifier::kNone) {
-        bound->SetHaving(aggregate.Having(),
-                         slotize(aggregate.HavingCondition()));
-        if (!*ok) {
-          return expression;
-        }
-      }
-      if (!aggregate.InnerOrderBy().empty()) {
-        std::vector<WindowOrderTerm> order;
-        order.reserve(aggregate.InnerOrderBy().size());
-        for (const WindowOrderTerm& term : aggregate.InnerOrderBy()) {
-          WindowOrderTerm bound_term = term;
-          bound_term.expression = slotize(term.expression);
-          if (!*ok) {
-            return expression;
-          }
-          order.push_back(std::move(bound_term));
-        }
-        bound->SetInnerOrderBy(std::move(order));
-      }
-      if (aggregate.InnerLimit().has_value()) {
-        bound->SetInnerLimit(aggregate.InnerLimit());
-      }
-      if (aggregate.HasInnerGroupBy()) {
-        std::vector<Expression> group_by;
-        group_by.reserve(aggregate.InnerGroupBy().size());
-        for (const Expression& key : aggregate.InnerGroupBy()) {
-          group_by.push_back(slotize(key));
-          if (!*ok) {
-            return expression;
-          }
-        }
-        bound->SetInnerGroupBy(std::move(group_by));
-      }
-      bound->SetArrayElementSqlType(aggregate.ArrayElementSqlType());
-      return Expression{std::move(bound)};
+      // arguments on every parameterized plan (P295; shared helper with
+      // CloneWithPreparedValues).
+      return RebuildAggregateAttributes(
+          expression,
+          [&](const Expression& inner) {
+            return SlotizeLiterals(inner, slot_cursor, ok, expected, slots);
+          },
+          ok);
     }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
@@ -556,10 +602,7 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
         // Structural arguments (operator names, field paths, interval units)
         // are not SQL literals. Numbering them would shift every later slot.
         const std::string& func = call.FuncName();
-        const bool structural =
-            (func == "__quantified__" && i >= 2) ||
-            (func == "__struct_json__" && i % 3 != 1) ||
-            ((func == "make_interval" || func == "get_field") && i == 1);
+        const bool structural = IsStructuralCallArg(func, i);
         if (structural) {
           args.push_back(call.Args()[i]);
           continue;
@@ -671,9 +714,14 @@ inline void AppendParameterSlots(  // NOLINT(misc-no-recursion)
   }
 }
 
-inline bool SlotizeInPlace(Expression* expression,
-                           const std::vector<Value>& /*parameters*/,
-                           size_t* /*cursor*/, std::vector<Expression>* slots) {
+// T4806: this helper never "installed" anything -- the literal-to-slot
+// conversion is SlotizeLiterals' job; this one only walks an already-slotized
+// expression tree and collects its ParameterSlot nodes into `slots`. The old
+// name plus dead `parameters`/`cursor` arguments invited plan callers to read
+// it as an install. Always returns true (kept as bool so the plan-side
+// `if (!...) return false;` chain style stays uniform).
+inline bool CollectParameterSlots(Expression* expression,
+                                  std::vector<Expression>* slots) {
   if (expression == nullptr || !*expression) {
     return true;
   }

@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <ios>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/memory_budget.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
@@ -90,6 +92,61 @@ std::string FormatBytes(size_t bytes) {
 }
 
 namespace {
+
+// T1794: the QueryMemory annotation must describe the budget the ACTIVE
+// execution lane actually spends against.  The default pipeline lane sizes
+// admission and spills from ProcessMemoryBudget with per-query
+// QueryMemoryGrants (the EXPLAIN ANALYZE "Pipeline:" rows report the real
+// granted bytes); the legacy lane alone uses the global QueryMemoryBudget
+// configured by TINYLAMB_QUERY_MEMORY_BYTES.  Label both so the number can
+// never be mistaken for the per-query grant.
+void EmitQueryMemoryLine(std::ostream& output, const std::string& pad) {
+  const char* env = std::getenv("TINYLAMB_EXEC_ENGINE");
+  const bool pipeline =
+      env == nullptr || env[0] == '\0' || std::string_view(env) != "legacy";
+  output << pad << "QueryMemory limit=";
+  if (pipeline) {
+    const ProcessMemoryBudget& process = ProcessMemoryBudget::Global();
+    if (process.Unlimited()) {
+      output << "unlimited (process; per-query grants are smaller)";
+    } else {
+      output << FormatBytes(process.Limit())
+             << " soft=" << FormatBytes(process.SoftLimit())
+             << " (process; per-query grants are smaller)";
+    }
+  } else {
+    const QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+    if (budget.Unlimited()) {
+      output << "unlimited (legacy global)";
+    } else {
+      output << FormatBytes(budget.Limit())
+             << " soft=" << FormatBytes(budget.Limit() / 5 * 4)
+             << " (legacy global)";
+    }
+  }
+  output << '\n';
+}
+
+// T2658: the bare "TopN limit=N" annotation hid both OFFSET and WITH TIES,
+// while TopNExecutor's real work set is a heap of offset+limit candidates
+// (executor/topn.cpp) or, with WITH TIES, a full-input materializing sort
+// with no heap at all.  Spell the actual contract out.
+std::string TopnWorkAnnotation(const SelectStatement& statement) {
+  std::ostringstream out;
+  if (statement.Offset() != 0) {
+    out << " offset=" << statement.Offset();
+  }
+  if (statement.WithTies()) {
+    out << " with_ties(full_sort)";
+  } else {
+    const size_t capacity =
+        statement.Offset() > static_cast<size_t>(-1) - statement.Limit()
+            ? static_cast<size_t>(-1)
+            : statement.Offset() + statement.Limit();
+    out << " heap=" << capacity;
+  }
+  return out.str();
+}
 
 size_t StatsRows(TransactionContext& context, const std::string& table,
                  bool* rows_known) {
@@ -396,7 +453,9 @@ bool AffineOnIndexColumn(const Expression& expression, std::string_view name,
     if (!AffineOnIndexColumn(binary.Left(), name, multiplier)) {
       return false;
     }
-    *multiplier *= value.value.int_value;
+    if (__builtin_mul_overflow(*multiplier, value.value.int_value, multiplier)) {
+      return false;  // cannot prove an affine index order after overflow
+    }
     return true;
   }
   if ((binary.Op() == BinaryOperation::kAdd ||
@@ -720,6 +779,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   // ORDER BY expressions that are also projected can consume the same hidden
   // scalar slot as the projection.  This avoids a second evaluation before
   // TopN and is independent of whether the input is a base scan or a join.
+  size_t cse_slot = 0;
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
     if (!term.expression) {
       continue;
@@ -732,8 +792,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         if (key.size() >= 2 && key.front() == '(' && key.back() == ')') {
           key = key.substr(1, key.size() - 2);
         }
-        output << pad << "TopN key=" << key << " slot=$cse0\n"
-               << pad << "ComputeScalar $cse0 once\n";
+        const std::string slot = "$cse" + std::to_string(cse_slot++);
+        output << pad << "TopN key=" << key << " slot=" << slot << "\n"
+               << pad << "ComputeScalar " << slot << " once\n";
         break;
       }
     }
@@ -830,15 +891,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   }
   if (proven_empty) {
     output << pad << "EmptyResult" << '\n';
-    const QueryMemoryBudget& budget = QueryMemoryBudget::Global();
-    output << pad << "QueryMemory limit=";
-    if (budget.Unlimited()) {
-      output << "unlimited";
-    } else {
-      output << FormatBytes(budget.Limit())
-             << " soft=" << FormatBytes(budget.Limit() / 5 * 4);
-    }
-    output << '\n';
+    EmitQueryMemoryLine(output, pad);
     return;
   }
 
@@ -1060,7 +1113,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       } else if (statement.OrderBy().empty() && statement.Limit() > 0 &&
                  !statement.UnionDistinct()) {
         output << pad << "Limit count=" << statement.Limit() << " under Append"
-               << '\n';
+               << (statement.WithTies() ? " with_ties" : "") << '\n';
       }
       for (const Expression& conjunct :
            SplitConjuncts(statement.WhereClause())) {
@@ -1293,7 +1346,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       if (derived.HasLimit() && derived.Limit() > 0 && derived.Offset() == 0 &&
           !statement.SelectList().empty()) {
         output << pad << "Limit count=" << derived.Limit() << " below Project"
-               << '\n';
+               << (derived.WithTies() ? " with_ties" : "") << '\n';
       }
     }
 
@@ -1436,7 +1489,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   for (const NamedExpression& item : statement.SelectList()) {
     if (item.expression &&
         item.expression->Type() == TypeTag::kWindowFunctionExp) {
-      window_fns.push_back(static_cast<const WindowFunctionCallExpression*>(
+      window_fns.push_back(static_cast<const WindowFunctionCallExpression*>(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           item.expression.get()));
     }
   }
@@ -1448,7 +1501,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       const auto& bin = q->AsBinaryExpression();
       if (bin.Left() && bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
         qualify_window_fn =
-            static_cast<const WindowFunctionCallExpression*>(bin.Left().get());
+            static_cast<const WindowFunctionCallExpression*>(bin.Left().get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       }
     }
   }
@@ -1463,7 +1516,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       const auto& bin = q->AsBinaryExpression();
       if (bin.Left() && bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
         const auto* wf =
-            static_cast<const WindowFunctionCallExpression*>(bin.Left().get());
+            static_cast<const WindowFunctionCallExpression*>(bin.Left().get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         if (wf->function == "ROW_NUMBER" &&
             (bin.Op() == BinaryOperation::kLessThanEquals ||
              bin.Op() == BinaryOperation::kLessThan)) {
@@ -1571,7 +1624,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         if ((bin.Op() == BinaryOperation::kLessThanEquals ||
              bin.Op() == BinaryOperation::kLessThan) &&
             bin.Left() && bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
-          const auto* wf = static_cast<const WindowFunctionCallExpression*>(
+          const auto* wf = static_cast<const WindowFunctionCallExpression*>(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               bin.Left().get());
           if (wf->function == "ROW_NUMBER") {
             partition_topn = true;
@@ -1739,15 +1792,19 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         }
         if (order_matches) {
           output << pad << "TopN limit=" << statement.Limit()
-                 << " reuses_window_order=true" << '\n';
+                 << TopnWorkAnnotation(statement) << " reuses_window_order=true"
+                 << '\n';
         }
       }
     }
   } else {
     // Check for TopN when no window functions but ORDER BY + LIMIT
     if (!statement.OrderBy().empty() && statement.Limit() > 0) {
+      // The bounded heap holds offset+limit rows; WITH TIES falls back to a
+      // full sort, so surface both instead of claiming a plain N-row heap.
       output << pad << "TopN limit=" << statement.Limit()
-             << " reuses_window_order=false" << '\n';
+             << TopnWorkAnnotation(statement) << " reuses_window_order=false"
+             << '\n';
     }
   }
 
@@ -1767,12 +1824,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     }
   }
 
-  // Detect QUALIFY filter placement relative to window.
-  // If QUALIFY compares a window function result (like ROW_NUMBER()),
-  // emit "Filter X above Window" before the window block above.
-  // Note: this is emitted before window detection, so we save and
-  // emit it here. Actually we need to emit it BEFORE the window block.
-  // For now, the QUALIFY filter is part of the window logic.
+  // QUALIFY placement relative to a window is already handled earlier in this
+  // function (~:1460): a QUALIFY over a window function is emitted there as
+  // "Filter X above Window" BEFORE the window block. No further action here.
 
   // Aggregate strategy detection.
   // Determine if we need aggregation and what strategy to use.
@@ -1836,27 +1890,30 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
           auto table_or = context.GetTable(src.table);
           if (table_or.HasValue() && table_or.Value()) {
             const Schema& table_schema = table_or.Value()->GetSchema();
-            if (table_schema.ColumnCount() > 0 &&
-                table_schema.GetColumn(0).GetConstraint().IsUnique()) {
-              // Check if all GROUP BY keys reference the first column.
+            // A GROUP BY over a table's UNIQUE/PK column(s) has at most one
+            // row per group, so the aggregate node can be elided. Consider
+            // every unique column (composite keys included), not just col 0.
+            std::unordered_set<std::string> unique_columns;
+            for (size_t ci = 0; ci < table_schema.ColumnCount(); ++ci) {
+              if (table_schema.GetColumn(ci).GetConstraint().IsUnique()) {
+                unique_columns.insert(table_schema.GetColumn(ci).Name().name);
+              }
+            }
+            if (!unique_columns.empty()) {
               pk_group_aggregate_eliminated = std::ranges::all_of(
                   statement.GroupBy(), [&](const Expression& key) {
-                    if (!key) {
-                      return false;
-                    }
-                    if (key->Type() != TypeTag::kColumnValue) {
+                    if (!key || key->Type() != TypeTag::kColumnValue) {
                       return false;
                     }
                     const ColumnName& cname =
                         key->AsColumnValue().GetColumnName();
-                    // Match with or without table prefix.
-                    const std::string col0_name =
-                        table_schema.GetColumn(0).Name().name;
-                    // ColumnName keeps the qualifier in `schema`.
-                    return cname.name == col0_name &&
-                           (cname.schema.empty() || cname.schema == src.table ||
-                            cname.schema == src.alias);
-                  });
+                    if (!cname.schema.empty() && cname.schema != src.table &&
+                        cname.schema != src.alias) {
+                      return false;
+                    }
+                    return unique_columns.contains(cname.name);
+                  }) &&
+                  !statement.GroupBy().empty();
             }
           }
         }
@@ -2013,8 +2070,11 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         }
         const std::string group_keys_str = gk.str();
         // Check if ORDER BY matches GROUP BY keys (stream aggregate)
+        // StreamAggregate needs the input ordered by the COMPLETE group key
+        // in group-key order, not merely an ORDER BY that is a subset of it.
         const bool order_matches_group =
             !statement.OrderBy().empty() &&
+            statement.OrderBy().size() == statement.GroupBy().size() &&
             std::ranges::all_of(statement.OrderBy(),
                                 [&group_by = statement.GroupBy()](
                                     const SelectStatement::OrderByTerm& term) {
@@ -2201,22 +2261,37 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         statement.Distinct() && !statement.OrderBy().empty();
 
     if (!index_ordered && !is_stream_agg && !is_sort_distinct) {
-      output << pad << "Sort keys=" << statement.OrderBy().size() << '\n';
+      // T2665: the count alone collapsed ASC NULLS LAST vs DESC NULLS FIRST
+      // and binary vs collated keys into the same line; render the full
+      // ordering contract (expression text, direction, explicit NULLS
+      // placement).  COLLATE specs live inside the expression text, so the
+      // EXPLAIN golden can now pin collation-sensitive sorts (the
+      // "EXPLAIN does not render the ordering's collation" caveat in
+      // query/sql_collation_test.cpp).
+      output << pad << "Sort keys=" << statement.OrderBy().size() << ":";
+      for (size_t i = 0; i < statement.OrderBy().size(); ++i) {
+        const auto& term = statement.OrderBy()[i];
+        output << (i == 0 ? " " : ", ")
+               << (term.expression ? term.expression->ToString()
+                                   : std::string("<expr>"))
+               << (term.ascending ? " ASC" : " DESC");
+        if (term.nulls_first.has_value()) {
+          output << (*term.nulls_first ? " NULLS FIRST" : " NULLS LAST");
+        }
+      }
+      output << '\n';
     }
   }
-  if (statement.Limit() != 0 || statement.Offset() != 0) {
-    output << pad << "Limit count=" << statement.Limit()
-           << " offset=" << statement.Offset() << '\n';
+  if (statement.HasLimit() || statement.Offset() != 0) {
+    // OFFSET without LIMIT returns all rows; Limit()==0 alone would render
+    // as count=0, which reads as an empty result.
+    output << pad << "Limit count="
+           << (statement.HasLimit() ? std::to_string(statement.Limit())
+                                    : std::string("all"))
+           << " offset=" << statement.Offset()
+           << (statement.WithTies() ? " with_ties" : "") << '\n';
   }
-  const QueryMemoryBudget& budget = QueryMemoryBudget::Global();
-  output << pad << "QueryMemory limit=";
-  if (budget.Unlimited()) {
-    output << "unlimited";
-  } else {
-    output << FormatBytes(budget.Limit())
-           << " soft=" << FormatBytes(budget.Limit() / 5 * 4);
-  }
-  output << '\n';
+  EmitQueryMemoryLine(output, pad);
 }
 
 }  // namespace tinylamb::relational_detail

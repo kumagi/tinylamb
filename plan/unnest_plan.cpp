@@ -78,7 +78,12 @@ UnnestPlan::UnnestPlan(
   auto built = BuildUnnestSchema(child_, alias_, offset_alias_, schema);
   unnest_section_ = std::move(built.second);
   schema_ = std::move(built.first);
-  stats_ = MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10);
+  const size_t child_rows = child_ ? child_->EmitRowCount() : 1;
+  const size_t estimated =
+      child_rows > std::numeric_limits<size_t>::max() / 10
+          ? std::numeric_limits<size_t>::max()
+          : child_rows * 10;
+  stats_ = MakeStats(schema_, estimated);
 }
 
 void UnnestPlan::Dump(std::ostream& output, int indent) const {
@@ -92,7 +97,7 @@ void UnnestPlan::Dump(std::ostream& output, int indent) const {
   }
   output << "\n";
   if (child_) {
-    child_->Dump(output, indent + 2);
+    DumpChild(output, *child_, indent + 2);
   }
 }
 

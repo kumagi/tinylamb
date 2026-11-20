@@ -43,6 +43,12 @@ TEST(SortedDistinctRunsTest, FiveMillionInputsUseBoundedRuns) {
     chunk.erase(duplicates.begin(), duplicates.end());
     ASSERT_SUCCESS(runs.Add(chunk));
   }
+  // Boundedness: the 77 sorted Adds act like binary carries, so at most one
+  // live run per level (<= 7 for 77 adds) and each run retains at most
+  // kDomain distinct values.  An unbounded single-vector implementation
+  // would fail these pins even though the output below stays correct.
+  EXPECT_LE(runs.RunCountForTest(), 7U);
+  EXPECT_LE(runs.RetainedCountForTest(), 7U * kDomain);
   uint64_t expected = 0;
   ASSERT_SUCCESS(
       runs.ForEach([&](uint64_t value) { EXPECT_EQ(value, expected++); }));

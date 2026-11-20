@@ -205,15 +205,15 @@ struct Range {
                            (direction == Direction::kLeft &&
                             operation == BinaryOperation::kGreaterThanEquals);
         if (upper) {
-          if (!max || value <= *max) {
+          if (!max || value < *max || (value == *max && !max_inclusive)) {
             max = value;
+            max_inclusive = true;
           }
-          max_inclusive = true;
         } else {
-          if (!min || *min <= value) {
+          if (!min || *min < value || (*min == value && !min_inclusive)) {
             min = value;
+            min_inclusive = true;
           }
-          min_inclusive = true;
         }
         return;
       }
@@ -329,6 +329,25 @@ std::optional<std::pair<std::string, std::string>> LikePrefixBounds(
   return std::pair{std::string(prefix), std::move(upper)};
 }
 
+// Memo expressions may be deeper than the original parser-bounded AST after
+// CTE inline / derived flattening, so guard these walks explicitly.
+constexpr size_t kMaxImplementationRuleDepth = 512;
+thread_local size_t tls_impl_rule_depth = 0;
+struct ImplementationRuleDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+  bool entered{false};
+  ImplementationRuleDepthGuard() {
+    if (tls_impl_rule_depth < kMaxImplementationRuleDepth) {
+      ++tls_impl_rule_depth;
+      entered = true;
+    }
+  }
+  ~ImplementationRuleDepthGuard() {
+    if (entered) {
+      --tls_impl_rule_depth;
+    }
+  }
+};
+
 // Rewrites column qualifiers equal to `relation` into `physical`. Scan-level
 // machinery (range extraction, executor evaluation) speaks physical table
 // names while memo conjuncts speak relation identities (Phase 8).
@@ -337,7 +356,8 @@ Expression QualifyDown(
                                    // recursion mirrors expression tree depth;
                                    // bounded by parser depth guard.
     const std::string& relation, const std::string& physical) {
-  if (!expression || relation == physical) {
+  ImplementationRuleDepthGuard depth_guard;
+  if (!expression || relation == physical || !depth_guard.entered) {
     return expression;
   }
   if (expression->Type() == TypeTag::kColumnValue) {
@@ -365,7 +385,8 @@ Expression DropQualifiers(
     const Expression& expression) {  // NOLINT(misc-no-recursion) // AST rewrite
                                      // recursion mirrors expression tree depth;
                                      // bounded by parser depth guard.
-  if (!expression) {
+  ImplementationRuleDepthGuard depth_guard;
+  if (!expression || !depth_guard.entered) {
     return expression;
   }
   if (expression->Type() == TypeTag::kColumnValue) {
@@ -573,7 +594,7 @@ double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
 // Lookup locality (Phase 2 "ソート済み外側からのlookup locality").  When the
 // outer side already arrives in the probe key order, consecutive probes either
 // land on the leaf the previous one used or on the one next to it, so the
-// the looked-up leaf page stays in the buffer pool instead
+// the looked-up run position stays hot in the index scan instead
 // of being re-read per row.  True when `plan` delivers `columns` ascending; the
 // probe's own left-column names are handed over unchanged because every
 // IsOrderedBy implementation resolves the qualified and unqualified spellings.
@@ -810,9 +831,8 @@ std::vector<PlanAlternative> ScanAlternatives(
 
   const double filter_selectivity = Selectivity(statistics, schema, filter);
 
-  // A descending leading ORDER BY key is deliverable natively: the B+Tree
-  // iterator positions below `end` and walks left, so the same begin/end
-  // keys serve a reverse scan.  Offer a reverse twin only when the root
+  // A descending leading ORDER BY key is deliverable natively: the LSM index
+  // iterator walks the range backwards with a stable leaf cache.  Offer a reverse twin only when the root
   // ordering actually asks for it so unordered queries keep a stable
   // candidate set (the forward twin is always emitted first).
   const bool wants_descending = [&] {
@@ -838,8 +858,13 @@ std::vector<PlanAlternative> ScanAlternatives(
     // Constant IN lists per column (Phase 8 B): each distinct value becomes
     // one point-lookup range on a leading index key.
     std::unordered_map<slot_t, std::vector<Value>> point_sets;
+    std::vector<Expression> disjunctions;
     std::vector<Expression> range_predicates;
     for (const Expression& conjunct : SplitConjuncts(filter)) {
+      if (conjunct->Type() == TypeTag::kBinaryExp &&
+          conjunct->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+        disjunctions.push_back(conjunct);
+      }
       if (conjunct->Type() == TypeTag::kInExp) {
         const auto& in = conjunct->AsInExpression();
         if (in.child_ == nullptr ||
@@ -970,6 +995,9 @@ std::vector<PlanAlternative> ScanAlternatives(
     // candidate does not depend on the loop's current index: build it once
     // instead of once per qualifying index (k identical alternatives would
     // multiply rule time and eat the memo's expression cap).
+    const bool can_prefilter_conjunction =
+        !ranges.empty() && (!disjunctions.empty() || !point_sets.empty()) &&
+        SafeToReduceEvaluationCountWithSchema(filter, schema);
     bool and_bitmap_built = false;
     for (size_t index_offset = 0; index_offset < table.IndexCount();
          ++index_offset) {
@@ -1099,14 +1127,14 @@ std::vector<PlanAlternative> ScanAlternatives(
         }
       }
 
-      // OR: build one bitmap range per disjunct on this index.  Only
-      // comparison ranges are admitted; residual rechecking handles strict
-      // versus inclusive boundaries and any additional conjuncts.
-      if (!required.require_row_position && filter &&
-          index.sc_.key_.size() == 1) {
-        const std::vector<Expression> disjuncts =
-            relational_detail::SplitDisjuncts(filter);
-        if (disjuncts.size() >= 2) {
+      // Each top-level OR conjunct can supply bitmap ranges, even when a
+      // rewrite has added an enclosing range. Recheck the full predicate.
+      if (!required.require_row_position && index.sc_.key_.size() == 1) {
+        for (const Expression& disjunction : disjunctions) {
+          if (disjunction != filter && !can_prefilter_conjunction) {
+            continue;
+          }
+          const auto disjuncts = relational_detail::SplitDisjuncts(disjunction);
           std::vector<BitmapIndexRange> or_ranges;
           for (const Expression& disjunct : disjuncts) {
             const auto disjunct_ranges = ComparisonRanges(disjunct, schema);
@@ -1182,9 +1210,19 @@ std::vector<PlanAlternative> ScanAlternatives(
               std::make_shared<ProjectionPlan>(disjunctive, fallback_select);
         }
         disjunctive = finalize(disjunctive);
-        candidates.push_back(PlanAlternative{.plan = std::move(disjunctive),
-                                             .local_cost = access_rows,
-                                             .estimated_rows = access_rows});
+        double disjunctive_cost = access_rows;
+        double disjunctive_rows = access_rows;
+        // Like the point-union sibling, this scan advertises the full key
+        // order (sorted, disjoint ranges), so an ORDER BY key LIMIT n can
+        // stop after the requested prefix.  Without the hint the candidate
+        // is priced as a full walk and loses the cost race to point-union /
+        // full-scan alternatives that take the discount.
+        ApplyLimitHint(disjunctive, required, context, filter_selectivity,
+                       &disjunctive_cost, &disjunctive_rows);
+        candidates.push_back(
+            PlanAlternative{.plan = std::move(disjunctive),
+                            .local_cost = disjunctive_cost,
+                            .estimated_rows = disjunctive_rows});
       }
 
       // Point-union alternative for a constant IN list after an equality
@@ -1213,7 +1251,8 @@ std::vector<PlanAlternative> ScanAlternatives(
           has_point_column ? index.sc_.key_[point_key_offset] : slot_t{0};
       const auto points =
           has_point_column ? point_sets.find(point_key_slot) : point_sets.end();
-      if (points != point_sets.end() && !ranges.contains(point_key_slot)) {
+      if (points != point_sets.end() &&
+          (!ranges.contains(point_key_slot) || can_prefilter_conjunction)) {
         std::vector<Value> values = points->second;
         std::ranges::sort(values);
         values.erase(std::ranges::unique(values).begin(), values.end());
@@ -2547,7 +2586,7 @@ std::vector<PlanAlternative> JoinAlternatives(
               right_physical, *stats_it->second, declared_output, index_rows);
           bool range_adopted = false;
           for (const LookupRangeCandidate& range : ranges) {
-            if (static_cast<ProductPlan&>(*join).SetLookupRange(
+            if (static_cast<ProductPlan&>(*join).SetLookupRange(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
                     prefix_len, range.left_column, range.right_physical,
                     range.operation)) {
               range_adopted = true;
@@ -3638,7 +3677,8 @@ Expression FoldAntiJoinColumnsToNull(
     }
     if (col_type == ValueType::kNull) {
       for (const auto& [name, table] : context.tables) {
-        if (!table) continue;
+        if (!table) { continue;
+}
         const Schema& schema = table->GetSchema();
         const int off = schema.Offset(ColumnName("", col.name));
         if (off >= 0) {

@@ -147,7 +147,7 @@ bool SchemeHasCompressedDomainKernel(PaxChunk::Scheme s) {
 // ---------------------------------------------------------------------------
 
 // The chunk's varchar kernels take the StrScanOp enum; the IR uses the
-// shared CompareOp. The mapping is total (the two enums carry the same six
+// shared CompareOp. The mapping is total (the two enums carry the same
 // operators).
 StrScanOp ToStrScanOp(CompareOp op) {
   switch (op) {
@@ -224,16 +224,30 @@ bool CompareOpHolds(CompareOp op, std::string_view value,
   return false;
 }
 
-// The half-open range [lo, hi) with either side unbounded.
-bool VarcharRangeHolds(std::string_view value, std::string_view lo,
-                       std::string_view hi) {
-  if (!lo.empty() && value < lo) {
+// The half-open range [lo, hi) with either side unbounded. T3108: bounds are
+// optionals so a bound spelled as the empty string (SQL's byte-order
+// minimum: `col < ''` matches nothing, `col >= ''` matches everything) is
+// honored instead of silently dissolving into "unbounded".
+bool VarcharRangeHolds(std::string_view value,
+                       std::optional<std::string_view> lo,
+                       std::optional<std::string_view> hi) {
+  if (lo.has_value() && value < *lo) {
     return false;
   }
-  if (!hi.empty() && !(value < hi)) {
+  if (hi.has_value() && !(value < *hi)) {
     return false;
   }
   return true;
+}
+
+std::optional<std::string_view> VarcharRangeLoBound(const Conjunct& c) {
+  return c.bytes_lo_set ? std::optional<std::string_view>(c.bytes_literal)
+                        : std::nullopt;
+}
+
+std::optional<std::string_view> VarcharRangeHiBound(const Conjunct& c) {
+  return c.bytes_hi_set ? std::optional<std::string_view>(c.bytes_literal_hi)
+                        : std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
@@ -567,14 +581,8 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
   varchar_masks.reserve(varchar_eval.size());
   for (const Conjunct& c : varchar_eval) {
     if (c.kind == ConjunctKind::kVarcharRange) {
-      const std::optional<std::string_view> lo =
-          c.bytes_literal.empty()
-              ? std::nullopt
-              : std::optional<std::string_view>(c.bytes_literal);
-      const std::optional<std::string_view> hi =
-          c.bytes_literal_hi.empty()
-              ? std::nullopt
-              : std::optional<std::string_view>(c.bytes_literal_hi);
+      const std::optional<std::string_view> lo = VarcharRangeLoBound(c);
+      const std::optional<std::string_view> hi = VarcharRangeHiBound(c);
       varchar_masks.push_back(VarcharRangeSelection(chunk, c.col, lo, hi, &sc));
     } else {
       varchar_masks.push_back(VarcharFilterSelection(
@@ -856,10 +864,10 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
         break;
       }
       const std::string_view text = v.AsStringView();
-      const bool hit =
-          c.kind == ConjunctKind::kVarcharRange
-              ? VarcharRangeHolds(text, c.bytes_literal, c.bytes_literal_hi)
-              : CompareOpHolds(c.op, text, c.bytes_literal);
+      const bool hit = c.kind == ConjunctKind::kVarcharRange
+                           ? VarcharRangeHolds(text, VarcharRangeLoBound(c),
+                                               VarcharRangeHiBound(c))
+                           : CompareOpHolds(c.op, text, c.bytes_literal);
       if (!hit) {
         passes = false;
         break;
@@ -989,10 +997,10 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
         break;
       }
       const std::string_view text = v.AsStringView();
-      const bool hit =
-          c.kind == ConjunctKind::kVarcharRange
-              ? VarcharRangeHolds(text, c.bytes_literal, c.bytes_literal_hi)
-              : CompareOpHolds(c.op, text, c.bytes_literal);
+      const bool hit = c.kind == ConjunctKind::kVarcharRange
+                           ? VarcharRangeHolds(text, VarcharRangeLoBound(c),
+                                               VarcharRangeHiBound(c))
+                           : CompareOpHolds(c.op, text, c.bytes_literal);
       if (!hit) {
         passes = false;
         break;
@@ -1120,22 +1128,40 @@ struct Accumulator {
 };
 
 // The value and NULL lookups of a row: the needed-column INDEX of a column
-// is resolved once (before the row loop) and the value is read from the
-// scan state's flat buffer.
+// is resolved once (before the row loop) into `index_of`, and the value is
+// read from the scan state's flat buffer.
 struct RowReader {
   const std::vector<int64_t>* flat_values{nullptr};
   const std::vector<uint8_t>* flat_nulls{nullptr};
-  const std::vector<slot_t>* needed{nullptr};
+  // column slot -> position inside the needed-column list (-1 when the
+  // column is not needed). Sized by the schema's column count.
+  std::vector<int32_t> index_of;
+
+  RowReader(const std::vector<int64_t>* values,
+            const std::vector<uint8_t>* nulls,
+            const std::vector<slot_t>* cols, uint32_t column_count)
+      : flat_values(values), flat_nulls(nulls), index_of(column_count, -1) {
+    for (size_t i = 0; i < cols->size(); ++i) {
+      const slot_t col = (*cols)[i];
+      if (col < column_count) {
+        index_of[col] = static_cast<int32_t>(i);
+      }
+    }
+  }
+
+  [[nodiscard]] int IndexOf(slot_t col) const {
+    return col < index_of.size() ? index_of[col] : -1;
+  }
 
   [[nodiscard]] int64_t Value(const SurvivingRow& row, slot_t col) const {
-    const int idx = NeededIndex(*needed, col);
+    const int idx = IndexOf(col);
     if (idx < 0) {
       return 0;
     }
     return (*flat_values)[row.value_offset + static_cast<uint32_t>(idx)];
   }
   [[nodiscard]] bool IsNull(const SurvivingRow& row, slot_t col) const {
-    const int idx = NeededIndex(*needed, col);
+    const int idx = IndexOf(col);
     if (idx < 0) {
       return true;
     }
@@ -1312,17 +1338,24 @@ Status ValidateFragment(const Schema& sc, const Fragment& frag) {
   }
   if (frag.aggregate.has_value()) {
     const Aggregate& agg = *frag.aggregate;
-    if (agg.kind == AggregateKind::kCountCol ||
-        agg.kind == AggregateKind::kMin || agg.kind == AggregateKind::kMax ||
-        agg.kind == AggregateKind::kApproxCountDistinct) {
-      if (agg.col >= sc.ColumnCount()) {
-        return Status::kCorruption;
-      }
+    // kSum reads agg.col only in its single-column form (terms empty); the
+    // monomial columns of the terms form are checked below.
+    const bool reads_col = agg.kind == AggregateKind::kCountCol ||
+                           agg.kind == AggregateKind::kMin ||
+                           agg.kind == AggregateKind::kMax ||
+                           agg.kind == AggregateKind::kApproxCountDistinct ||
+                           (agg.kind == AggregateKind::kSum &&
+                            agg.terms.empty());
+    if (reads_col && agg.col >= sc.ColumnCount()) {
+      return Status::kCorruption;
     }
     for (const AggTerm& t : agg.terms) {
       for (slot_t c : t.cols) {
         if (c >= sc.ColumnCount()) {
           return Status::kCorruption;
+        }
+        if (!IsInt64Column(sc, c)) {
+          return Status::kNotImplemented;
         }
       }
     }
@@ -1634,8 +1667,31 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
     return out;
   }();
 
+  bool any_artifact = false;
   for (const ArtifactRef& a : artifacts) {
+    // The same MVCC bound and presence gates ScanArtifacts applies: an
+    // artifact newer than the read version or missing its payload is not
+    // part of the effective set.
+    const bool present =
+        (a.kind == ArtifactRef::Kind::kChunk && a.chunk != nullptr) ||
+        (a.kind == ArtifactRef::Kind::kRun && a.run != nullptr) ||
+        (a.kind == ArtifactRef::Kind::kMemSnapshot && a.mem_rows != nullptr);
+    if (!present || a.generation > fragment.read_version) {
+      continue;
+    }
+    if (fragment.access == AccessMode::kPoint) {
+      // A point probe resolves to the key's row group only (chunk
+      // PointLookup, run LowerBound window, memtable key equality), so
+      // Execute prices about one row per artifact. Degenerate the estimate
+      // to that shape instead of pricing the whole-window scan.
+      any_artifact = true;
+      report.rows_in += 1;
+      report.rows_unknown += 1;
+      report.cpu_units += 4.0;  // index probe + one row compare
+      continue;
+    }
     if (a.kind == ArtifactRef::Kind::kChunk && a.chunk != nullptr) {
+      any_artifact = true;
       const PaxChunk& chunk = *a.chunk;
       const PaxChunk::Footer& footer = chunk.GetFooter();
       const uint32_t groups = footer.row_group_count;
@@ -1696,6 +1752,7 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
                        1.0;
           }
         }
+        // NOLINTNEXTLINE(readability-use-std-min-max) explicit comparison
         if (per_row < 1.0) {
           per_row = 1.0;
         }
@@ -1704,6 +1761,7 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
         report.cpu_units += 8.0;  // per-group dispatch
       }
     } else if (a.kind == ArtifactRef::Kind::kRun && a.run != nullptr) {
+      any_artifact = true;
       report.rows_in += a.run->Size();
       report.rows_unknown += a.run->Size();
       report.bytes_touched += a.run->Blob().size();
@@ -1711,11 +1769,28 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
           static_cast<double>(a.run->Size()) * static_cast<double>(eval.size());
     } else if (a.kind == ArtifactRef::Kind::kMemSnapshot &&
                a.mem_rows != nullptr) {
-      report.rows_in += a.mem_rows->size();
-      report.rows_unknown += a.mem_rows->size();
-      report.cpu_units += static_cast<double>(a.mem_rows->size()) *
+      any_artifact = true;
+      // ScanMemSnapshot applies the same per-entry MVCC bound: entries
+      // written after the read version are invisible to the scan.
+      uint64_t visible = 0;
+      for (const auto& entry : *a.mem_rows) {
+        if (entry.second.version == 0 ||
+            entry.second.version <= fragment.read_version) {
+          ++visible;
+        }
+      }
+      report.rows_in += visible;
+      report.rows_unknown += visible;
+      report.cpu_units += static_cast<double>(visible) *
                           static_cast<double>(eval.size());
     }
+  }
+  if (!any_artifact) {
+    // Every artifact was filtered out (generation bound or missing payload):
+    // the effective artifact set is empty -- the same answer the
+    // artifacts.empty() early return gives.
+    report.coverage = Coverage::kNone;
+    return report;
   }
   if (fragment.conjuncts.empty()) {
     // No conjuncts: every in-range row passes the (empty) filter trivially.
@@ -1727,7 +1802,12 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
   }
   if (residual.empty()) {
     report.coverage = Coverage::kFull;
-    report.duplicate_elimination = DuplicateElimination::kApplied;
+    // Execute folds duplicates only when the key column decodes as int64
+    // (ScanState::key_dedup_possible); mirror that gate here.
+    report.duplicate_elimination =
+        IsInt64Column(sc, sc.KeyColumnIndex())
+            ? DuplicateElimination::kApplied
+            : DuplicateElimination::kNotAccounted;
   } else {
     report.coverage = Coverage::kPartial;
     report.duplicate_elimination = DuplicateElimination::kNotAccounted;
@@ -1874,9 +1954,8 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
       result.rows_proved_pass = rows.size();
       return result;
     }
-    const RowReader reader{.flat_values = &state.values,
-                           .flat_nulls = &state.nulls,
-                           .needed = &needed};
+    const RowReader reader(&state.values, &state.nulls, &needed,
+                           schema.ColumnCount());
     std::map<std::vector<int64_t>, Accumulator> groups;
     for (const SurvivingRow& row : rows) {
       const std::vector<int64_t> key =
@@ -1908,9 +1987,8 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
 
   // The scalar aggregate.
   if (fragment.aggregate.has_value() && aggregate_pushed) {
-    const RowReader reader{.flat_values = &state.values,
-                           .flat_nulls = &state.nulls,
-                           .needed = &needed};
+    const RowReader reader(&state.values, &state.nulls, &needed,
+                           schema.ColumnCount());
     Accumulator acc;
     for (const SurvivingRow& row : rows) {
       AccumulateRow(*fragment.aggregate, row, reader, &acc);
@@ -1951,9 +2029,8 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
       result.coverage = Coverage::kFull;
       return result;
     }
-    const RowReader reader{.flat_values = &state.values,
-                           .flat_nulls = &state.nulls,
-                           .needed = &needed};
+    const RowReader reader(&state.values, &state.nulls, &needed,
+                           schema.ColumnCount());
     std::vector<uint64_t> artifact_base(artifacts.size(), 0);
     uint64_t base = 0;
     for (size_t i = 0; i < artifacts.size(); ++i) {
@@ -1965,7 +2042,8 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
       } else if (artifact.kind == ArtifactRef::Kind::kRun &&
                  artifact.run != nullptr) {
         base += artifact.run->Size();
-      } else if (artifact.mem_rows != nullptr) {
+      } else if (artifact.kind == ArtifactRef::Kind::kMemSnapshot &&
+                 artifact.mem_rows != nullptr) {
         base += artifact.mem_rows->size();
       }
     }
@@ -1993,9 +2071,8 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
   // The projection.
   if (!fragment.projection.empty()) {
     result.projected_width = static_cast<uint32_t>(fragment.projection.size());
-    const RowReader reader{.flat_values = &state.values,
-                           .flat_nulls = &state.nulls,
-                           .needed = &needed};
+    const RowReader reader(&state.values, &state.nulls, &needed,
+                           schema.ColumnCount());
     for (const auto& row : rows) {
       for (slot_t col : fragment.projection) {
         result.projected_values.push_back(reader.Value(row, col));
@@ -2016,8 +2093,11 @@ StatusOr<KeyValueRows> MaterializeKeyValue(Runtime runtime,
                                            const Fragment& fragment,
                                            const Schema& schema,
                                            slot_t value_col) {
-  if (ValidateFragment(schema, fragment) != Status::kSuccess) {
-    return Status::kCorruption;
+  const Status valid = ValidateFragment(schema, fragment);
+  if (valid != Status::kSuccess) {
+    // Three-valued contract: kNotImplemented is a decline (the caller falls
+    // back to the residual path), not corruption -- pass it through.
+    return valid;
   }
   const slot_t key_col = schema.KeyColumnIndex();
   if (!IsInt64Column(schema, key_col) || !IsInt64Column(schema, value_col)) {

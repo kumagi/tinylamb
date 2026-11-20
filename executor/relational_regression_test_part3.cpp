@@ -253,14 +253,20 @@ TEST_F(RelationalRegressionTest, FusedConditionalAggregateKeepsNullElse) {
     SELECT d.k, SUM(CASE WHEN d.k=1 THEN f.v ELSE NULL END),
       AVG(CASE WHEN d.k=1 THEN f.v END),
       COUNT(CASE WHEN d.k=1 THEN f.v END),
-      SUM(CASE WHEN d.k=2 THEN f.v*(1.0-f.v) END)
+      SUM(CASE WHEN d.k=2 THEN f.v*(1.0-f.v) END),
+      COUNT(CASE WHEN d.k=1 THEN 1 END),
+      COUNT(CASE WHEN d.k=1 THEN 1 ELSE 0 END),
+      COUNT(CASE WHEN d.k=1 THEN f.v+f.v END)
     FROM CaseFacts f, SmallKeys d WHERE f.k=d.k GROUP BY d.k ORDER BY d.k
   )sql";
   EXPECT_EQ(RelationalRun(*rs_, sql),
             std::vector<Row>(
-                {Row({Value(1), Value(2.5), Value(2.5), Value(1), Value()}),
-                 Row({Value(2), Value(), Value(), Value(0), Value(-12.0)}),
-                 Row({Value(3), Value(), Value(), Value(0), Value()})}));
+                {Row({Value(1), Value(2.5), Value(2.5), Value(1), Value(),
+                      Value(2), Value(2), Value(1)}),
+                 Row({Value(2), Value(), Value(), Value(0), Value(-12.0),
+                      Value(0), Value(1), Value(0)}),
+                 Row({Value(3), Value(), Value(), Value(0), Value(), Value(0),
+                      Value(1), Value(0)})}));
 }
 
 TEST_F(RelationalRegressionTest, GroupedJoinFusionKeepsGroupedJoinSemantics) {
@@ -348,16 +354,18 @@ TEST_F(RelationalRegressionTest,
   const std::string valid =
       "SELECT SUM(CASE WHEN a.k < 3 THEN a.v / 2 ELSE a.v END) "
       "FROM AggTable a JOIN SmallKeys s ON a.k = s.k";
-  EXPECT_NE(ExplainAnalyze(*rs_, valid).find("grouped_join_fusions=1"),
+  EXPECT_NE(ExplainAnalyze(*rs_, valid, /*force_relational=*/true)
+                .find("grouped_join_fusions=1"),
             std::string::npos);
   // The small join has one probe team. Its CASE and floating arithmetic
   // reuse expression scratch after a failed evaluation on the same caller.
   for (int repetition = 0; repetition < 3; ++repetition) {
-    const auto rows = RelationalRun(*rs_, valid);
+    const auto rows = RelationalRun(*rs_, valid, /*force_relational=*/true);
     ASSERT_EQ(rows.size(), 1U);
     EXPECT_EQ(rows[0], Row({Value(60.0)}));
     auto context = rs_->BeginReadOnlyContext();
     SqlEngine engine(*rs_);
+    engine.SetForceRelationalFallback(true);
     auto prepared = engine.Prepare(
         context,
         "SELECT SUM(CASE WHEN a.k < 3 THEN a.v / (a.k - 1) ELSE a.v END) "
@@ -376,7 +384,8 @@ TEST_F(RelationalRegressionTest,
     }
     context.Abort();
   }
-  EXPECT_EQ(RelationalRun(*rs_, valid), std::vector<Row>({Row({Value(60.0)})}));
+  EXPECT_EQ(RelationalRun(*rs_, valid, /*force_relational=*/true),
+            std::vector<Row>({Row({Value(60.0)})}));
 }
 
 TEST_F(RelationalRegressionTest, FilteredAggregateOverJoinUsesPredicate) {
@@ -3105,6 +3114,15 @@ TEST_F(RelationalRegressionTest,
 TEST_F(RelationalRegressionTest, SpilledProbeFeedsGroupedJoinDirectly) {
   auto setup = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(
+      Table, dimension,
+      rs_->CreateTable(setup,
+                       Schema("SpillDim", {Column("k", ValueType::kInt64),
+                                           Column("g", ValueType::kInt64)})));
+  for (int64_t i = 0; i < 10; ++i) {
+    ASSERT_SUCCESS(dimension.Insert(setup.txn_, Row({Value(i), Value(i + 100)}))
+                       .GetStatus());
+  }
+  ASSIGN_OR_ASSERT_FAIL(
       Table, fact,
       rs_->CreateTable(setup,
                        Schema("SpillFact", {Column("fk", ValueType::kInt64),
@@ -3121,14 +3139,16 @@ TEST_F(RelationalRegressionTest, SpilledProbeFeedsGroupedJoinDirectly) {
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
   QueryMemoryBudget::Global().ResetForTest(65536);
+  // Group by a payload from the dimension so a key-only join reduction cannot
+  // replace the join with a predicate over the fact table.
   const std::string sql =
-      "SELECT a.k, SUM(f.v), COUNT(*) FROM SpillFact f "
-      "JOIN KeyTable a ON f.fk = a.k GROUP BY a.k ORDER BY a.k";
+      "SELECT a.g, SUM(f.v), COUNT(*) FROM SpillFact f "
+      "JOIN SpillDim a ON f.fk = a.k GROUP BY a.g ORDER BY a.g";
   auto rows = RelationalRun(*rs_, sql);
   ASSERT_EQ(rows.size(), 9U);
   for (int64_t i = 0; i < 9; ++i) {
     EXPECT_EQ(rows[static_cast<size_t>(i)],
-              Row({Value(i), Value(600), Value(300)}));
+              Row({Value(i + 100), Value(600), Value(300)}));
   }
   const auto profile = ExplainAnalyze(*rs_, sql);
   EXPECT_NE(profile.find("grouped_join_fusions=1"), std::string::npos)
@@ -3626,6 +3646,7 @@ TEST_F(RelationalRegressionTest,
   ASSERT_TRUE(joined.HasValue()) << joined.GetStatus();
   ASSERT_TRUE(joined.Value().has_value());
   std::vector<Row> materialized;
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
   ASSERT_SUCCESS(joined.Value()->ForEachRow(
       [&](const Row& row) { materialized.push_back(row); }));
   const std::vector<Row> expected{

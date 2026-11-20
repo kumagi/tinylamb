@@ -568,7 +568,13 @@ Status AggregateAccumulator::TryApplyCore(
     case AggregationType::kApproxTopSum:
       // These are accumulated by the specialized path above.
       break;
-    case AggregationType::kPercentileCont: {
+    case AggregationType::kPercentileCont:
+    case AggregationType::kPercentileDisc: {
+      // T2243: PERCENTILE_DISC shares the PERCENTILE_CONT accumulation; only
+      // the finalize step differs (element pick vs interpolation).
+      const std::string fname = core_type_ == AggregationType::kPercentileDisc
+                                    ? "PERCENTILE_DISC"
+                                    : "PERCENTILE_CONT";
       Value val;
       Value percentile;
       if (!trailing_values.empty()) {
@@ -579,7 +585,7 @@ Status AggregateAccumulator::TryApplyCore(
         val = order_keys[0];
       } else {
         return StatusError(StatusCode::kInvalidArgument,
-                           "PERCENTILE_CONT requires two arguments");
+                           fname + " requires two arguments");
       }
       if (val.IsNull()) {
         break;
@@ -588,7 +594,7 @@ Status AggregateAccumulator::TryApplyCore(
                                   percentile.type != ValueType::kDouble)) {
         return StatusError(
             StatusCode::kInvalidArgument,
-            "The second argument to PERCENTILE_CONT must be numeric");
+            "The second argument to " + fname + " must be numeric");
       }
       const double p = percentile.type == ValueType::kInt64
                            ? static_cast<double>(percentile.value.int_value)
@@ -596,7 +602,7 @@ Status AggregateAccumulator::TryApplyCore(
       if (!std::isfinite(p) || p < 0.0 || p > 1.0) {
         return StatusError(
             StatusCode::kInvalidArgument,
-            "The second argument to PERCENTILE_CONT must be between 0 and 1");
+            "The second argument to " + fname + " must be between 0 and 1");
       }
       percentile_p_ = p;
       percentile_p_valid_ = true;
@@ -607,6 +613,9 @@ Status AggregateAccumulator::TryApplyCore(
       } else {
         return StatusError(StatusCode::kInvalidArgument,
                            "numeric value required");
+      }
+      if (core_type_ == AggregationType::kPercentileDisc) {
+        percentile_originals_.push_back(val);
       }
       break;
     }
@@ -1012,7 +1021,11 @@ Value SketchEntryToValue(int typecode, const std::string& entry) {
   }
 }
 
-std::string ValueToSketchEntry(int typecode, const Value& value) {
+std::string ValueToSketchEntry(int typecode, const Value& raw_value) {
+  // Canonicalize the same way DISTINCT / Count(DISTINCT) does: -0.0 folds to
+  // +0.0, every NaN folds to one quiet payload, and CI VARCHAR is folded.
+  // Raw byte encoding would otherwise count these as separate values.
+  const Value value = CanonicalDistinctValue(raw_value);
   switch (typecode) {
     case 1:
     case 2: {
@@ -1087,23 +1100,23 @@ StatusOr<Value> TryExtractSketchQuantilesStatic(const Value& sketch,
 
 namespace {
 
-// Renders one APPROX_TOP_* entry as a positional struct literal text. The
-// compliance matcher compares struct payloads field-wise against exactly
-// this shape.
-std::string TopEntryString(const Value& value, const std::string& metric_text) {
-  std::string out = "{";
+// STRUCT values use named JSON members so field access can distinguish the
+// ranking metric from the ranked value.
+std::string TopEntryString(const Value& value, std::string_view metric_name,
+                           std::string_view metric_text) {
+  std::string out = "{\"value\":";
   if (value.IsNull()) {
     out += "null";
   } else if (value.type == ValueType::kVarChar) {
-    // Raw content: strings match quoted expectations and BYTES match b""
-    // expectations through the same unquoting rules.
-    out += std::string(value.value.varchar_value);
+    out += json_text::EncodeJsonString(value.AsStringView());
   } else if (value.type == ValueType::kDate) {
-    out += FormatDateDays(value.value.int_value);
+    out += json_text::EncodeJsonString(FormatDateDays(value.DateDays()));
   } else {
     out += value.AsString();
   }
-  out += ", ";
+  out += ",\"";
+  out += metric_name;
+  out += "\":";
   out += metric_text;
   out += "}";
   return out;
@@ -1123,7 +1136,7 @@ bool LooksLikeZonedTimestampText(std::string_view text) {
       return false;
     }
   }
-  const size_t zone = text.find('+', 17);
+  const size_t zone = text.find_first_of("+-", 17);
   if (zone == std::string_view::npos || zone + 3 > text.size()) {
     return false;
   }
@@ -1475,9 +1488,9 @@ namespace {
 
 template <typename T>
 void AppendAggPod(T v, std::string* dst) {
-  const size_t off = dst->size();
-  dst->resize(off + sizeof(T));
-  std::memcpy(dst->data() + off, &v, sizeof(T));
+  // append() alone avoids the zero-fill that resize() would perform on the
+  // bytes this memcpy would immediately overwrite anyway.
+  dst->append(reinterpret_cast<const char*>(&v), sizeof(T));
 }
 
 template <typename T>
@@ -1677,6 +1690,10 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
   // ORDER BY / LIMIT, then feed the survivors into the streaming logic
   // (or build the ARRAY/STRING payload directly).
   if (buffer_ != nullptr) {
+    if (expression == nullptr) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "aggregate accumulator has no expression");
+    }
     std::vector<BufferedRow>& rows = *buffer_;
     if (expression->Having() != AggregateHavingModifier::kNone) {
       bool saw_threshold = false;
@@ -1756,7 +1773,9 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
       if (limited && array_values_.size() >= limit) {
         break;
       }
-      // Finish() is const by contract; replay mutates only scratch state.
+      // Finish() is const at the call site, but replaying buffered rows
+      // updates the accumulator result (count/total/extreme) as well as
+      // scratch state; the const_cast is deliberate, see expression_eval.hpp.
       RETURN_IF_FAIL(const_cast<AggregateAccumulator*>(this)->TryApplyCore(
           row.value, row.trailing_values, row.order_keys));
       // STRING_AGG delimiter comes from the first buffered row.
@@ -2000,13 +2019,15 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
             return Value();
           }
           return Value(static_cast<double>(my - ((sxy / sxx) * mx)));
-        case AggregationType::kRegrR2:
+        case AggregationType::kRegrR2: {
           // R² is the squared correlation; undefined when either side is
           // constant.
           if (count < 2 || sxx <= 0 || syy <= 0) {
             return Value();
           }
-          return Value(static_cast<double>((sxy * sxy) / (sxx * syy)));
+          double r2 = static_cast<double>((sxy * sxy) / (sxx * syy));  // NOLINT(modernize-use-auto)
+          return Value(std::clamp(r2, 0.0, 1.0));  // R^2 is in [0,1]
+        }
         default:
           return Value();
       }
@@ -2062,8 +2083,9 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         if (std::cmp_greater_equal(elements.size(), number)) {
           break;
         }
-        elements.emplace_back(TopEntryString(
-            top_count_values_[idx], std::to_string(top_count_counts_[idx])));
+        elements.emplace_back(
+            TopEntryString(top_count_values_[idx], "count",
+                           std::to_string(top_count_counts_[idx])));
       }
       // Struct entries ride as text payloads; the "STRING" element type
       // lets the compliance matcher compare struct content field-wise.
@@ -2099,13 +2121,13 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         const SumWeight& weight = top_sums_[idx];
         std::string sum_text;
         if (weight.weights == 0) {
-          sum_text = "NULL";
+          sum_text = "null";
         } else {
           const auto as_double = static_cast<double>(weight.sum);
           sum_text = any_double ? FormatWeightDouble(as_double)
                                 : std::to_string(weight.int_sum);
         }
-        elements.emplace_back(TopEntryString(weight.value, sum_text));
+        elements.emplace_back(TopEntryString(weight.value, "sum", sum_text));
       }
       return Value::Array(std::move(elements), "STRING");
     }
@@ -2187,7 +2209,8 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
     case AggregationType::kApproxCountDistinct:
       return Value(static_cast<int64_t>(
           approx_distinct_ ? approx_distinct_->size() : 0));
-    case AggregationType::kPercentileCont: {
+    case AggregationType::kPercentileCont:
+    case AggregationType::kPercentileDisc: {
       // GoogleSQL semantics: NULL inputs are ignored, NaN sorts before every
       // other value (including -inf), and the result is linear interpolation
       // over the sorted group values.
@@ -2212,6 +2235,30 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
           position > static_cast<double>(percentile_values_.size() - 1)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "invalid percentile position");
+      }
+      if (core_type_ == AggregationType::kPercentileDisc) {
+        // T2243: PERCENTILE_DISC rounds the rank UP to the next element and
+        // returns that actual input value (type preserved), mirroring the
+        // window route in executor/detail/window_eval.cpp.
+        std::sort(percentile_originals_.begin(), percentile_originals_.end(),
+                  [](const Value& x, const Value& y) {
+                    const auto as_double = [](const Value& v) {
+                      return v.type == ValueType::kDouble
+                                 ? v.value.double_value
+                                 : static_cast<double>(v.value.int_value);
+                    };
+                    const double dx = as_double(x);
+                    const double dy = as_double(y);
+                    const bool xn = std::isnan(dx);
+                    const bool yn = std::isnan(dy);
+                    if (xn || yn) {
+                      return xn && !yn;
+                    }
+                    return dx < dy;
+                  });
+        const size_t pick = std::min(static_cast<size_t>(std::ceil(position)),
+                                     percentile_originals_.size() - 1);
+        return percentile_originals_[pick];
       }
       const auto low = static_cast<size_t>(position);
       const size_t high = low + 1 < percentile_values_.size() ? low + 1 : low;

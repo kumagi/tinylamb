@@ -1,0 +1,12 @@
+-- tinylamb-plancache-test v1
+-- seed: 7
+-- setup: CREATE TABLE t (u INT64, k INT64, a INT64);
+-- setup: INSERT INTO t VALUES (0, 1, 10);
+-- setup: INSERT INTO t VALUES (1, 2, NULL);
+-- query: SELECT u FROM t WHERE u < 5;
+-- query: SELECT u, a FROM t WHERE k = 1;
+-- mutation: UPDATE t SET a = 7 WHERE u = 1;
+-- expect: |0|,
+-- expect: |0|,|10|,
+-- expect: |1|,
+-- failure: seed guard (honest trace): cached plans must keep matching fresh execution across a mutation; keeps the replay directory non-empty

@@ -37,7 +37,9 @@ class AggregateExpression : public ExpressionBase {
   AggregateExpression(AggregationType type, Expression child,
                       bool distinct = false)
       : type_(type), child_(std::move(child)), distinct_(distinct) {}
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kAggregateExp; }
+  [[nodiscard]] TypeTag NodeKind() const override {
+    return TypeTag::kAggregateExp;
+  }
   [[nodiscard]] StatusOr<Value> TryEvaluate(
       const Row& row, const Schema& schema) const override;
   [[nodiscard]] Value Evaluate(const Row& row,
@@ -67,7 +69,10 @@ class AggregateExpression : public ExpressionBase {
   [[nodiscard]] const std::optional<size_t>& InnerLimit() const {
     return inner_limit_;
   }
-  void SetInnerLimit(std::optional<size_t> limit) { inner_limit_ = limit; }
+  void SetInnerLimit(std::optional<size_t> limit) {
+    // NOLINTNEXTLINE(performance-move-const-arg) move is harmless
+    inner_limit_ = std::move(limit);
+  }
   // STRING_AGG delimiter (second argument), evaluated per row by call sites.
   [[nodiscard]] const Expression& SecondaryArg() const {
     return secondary_arg_;

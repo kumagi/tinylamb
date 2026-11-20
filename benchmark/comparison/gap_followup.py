@@ -33,7 +33,8 @@ def main():
     a.output = a.output.resolve()
     a.output.mkdir(parents=True, exist_ok=False)
     a.scratch = '/var/tmp'
-    a.server_cpus = ','.join(map(str, sorted(os.sched_getaffinity(0))[:8]))
+    a.server_cpus = (','.join(map(str, sorted(os.sched_getaffinity(0))[:8]))
+                     if hasattr(os, 'sched_getaffinity') else '0-7')
     a.tiny_port, a.pg_port, a.mysql_port = 55433, 55432, 53306
     a.postgres_image = 'postgres@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4'
     a.mysql_image = 'mysql@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7'

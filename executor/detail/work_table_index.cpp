@@ -33,9 +33,10 @@ size_t WorkTableRowHash::operator()(const Row& row) const {
       // EqualUnderCollation folds a VARCHAR pair when EITHER side carries a
       // case-insensitive tag, so hash every text cell folded (tagged or not)
       // so CI-tagged and untagged peers land in the same bucket (mirrors
-      // executor/distinct.cpp DistinctRowHash).
-      h = std::hash<std::string>{}(
-          FoldCaseForCollation(value.value.varchar_value));
+      // executor/distinct.cpp DistinctRowHash).  T3752: fold-and-hash
+      // streams the bytes instead of materializing FoldCaseForCollation's
+      // scratch string per cell.
+      h = HashFoldedForCollation(value.value.varchar_value);
     } else {
       h = std::hash<Value>()(CanonicalDistinctValue(value));
     }

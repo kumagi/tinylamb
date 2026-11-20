@@ -343,6 +343,7 @@ TEST_F(Phase0ContractTest, SqlCascadesAndDirectExecutorShareExpectedRows) {
 // something the test may invent.  Read it and make the executed matrix answer
 // to the document, so dropping a todo or a semantic class from either side is
 // a real failure instead of a tautology.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static std::string_view SemanticDocName(Semantic semantic) {
   switch (semantic) {
     case Semantic::kSuccess:
@@ -361,8 +362,23 @@ static std::string_view SemanticDocName(Semantic semantic) {
   return {};
 }
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static std::string LoadPhase0ManifestDoc() {
   std::error_code ec;
+  // The source tree is authoritative: this file lives in <root>/plan/, so
+  // look there first (an out-of-tree build directory need not sit under the
+  // source root), then fall back to walking up from the working directory.
+  {
+    const std::filesystem::path doc =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "docs" /
+        "cascades_optimizer.md";
+    if (std::filesystem::is_regular_file(doc, ec)) {
+      std::ifstream in(doc);
+      std::ostringstream contents;
+      contents << in.rdbuf();
+      return contents.str();
+    }
+  }
   std::filesystem::path dir = std::filesystem::current_path(ec);
   for (int depth = 0; depth < 8 && !ec && !dir.empty(); ++depth) {
     const std::filesystem::path doc = dir / "docs" / "cascades_optimizer.md";
@@ -381,6 +397,7 @@ static std::string LoadPhase0ManifestDoc() {
   return {};
 }
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static std::optional<size_t> ParseTodoNumber(const std::string& text, size_t& pos,
                                       size_t limit) {
   while (pos < limit &&
@@ -403,6 +420,7 @@ struct ManifestClaim {
   std::optional<size_t> last_todo;
 };
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static ManifestClaim ParsePhase0Manifest(const std::string& doc) {
   constexpr std::string_view kIntro = "manifest repeats the ";
   constexpr std::string_view kRange = "cases for Phase 0 items ";
@@ -437,7 +455,9 @@ TEST_F(Phase0ContractTest, ManifestCoversEveryTodoAndSemanticClass) {
       << "Phase 0 manifest sentence not found in docs/cascades_optimizer.md";
   ASSERT_TRUE(claim.first_todo.has_value());
   ASSERT_TRUE(claim.last_todo.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
   EXPECT_EQ(claim.first_todo.value(), kFirstTodo);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
   EXPECT_EQ(claim.last_todo.value(), kLastTodo);
   // Six classes => five separators in the documented comma-separated list.
   EXPECT_EQ(std::count(claim.semantic_classes.begin(),

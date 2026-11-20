@@ -30,7 +30,9 @@ std::string ReadFile(const std::filesystem::path& path) {
 
 void WriteFile(const std::filesystem::path& path, std::string_view body) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(out.is_open()) << path;
   out.write(body.data(), static_cast<std::streamsize>(body.size()));
+  ASSERT_TRUE(out.good()) << path;
 }
 
 // The segment metadata sidecar is 20 bytes: magic, version, u64 size, CRC.
@@ -432,7 +434,7 @@ TEST_F(LoggerSegmentTest, RejectsRecordLargerThanSegment) {
   EXPECT_SUCCESS(logger->Finish());
 }
 
-TEST(DatabaseDeleteAllSegmentCleanupTest, DeleteAllRemovesSegmentSeries) {
+TEST_F(LoggerSegmentTest, DeleteAllRemovesSegmentSeries) {
   const std::string name = "delete_all_segments-" + RandomString();
   auto db = Database::Create(name).MoveValue();
   TransactionContext ctx = db->BeginContext();

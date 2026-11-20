@@ -46,10 +46,16 @@ void ClearRelationRows(std::vector<Row>& rows) noexcept {
 }  // namespace
 
 std::shared_ptr<QueryMemoryCharge> TryReserveQueryMemory(size_t bytes) {
-  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
+  // T3724: reserve atomically.  The previous CanReserve() pre-check plus a
+  // QueryMemoryCharge constructor that forced the charge (ReserveForced)
+  // let concurrent callers all pass the check and then each overshoot the
+  // soft query budget.  QueryMemoryBudget::TryReserve CAS-updates the used
+  // counter (and the process pool) and fails exactly the losers.
+  if (!QueryMemoryBudget::Global().TryReserve(bytes)) {
     return nullptr;
   }
-  return std::make_shared<QueryMemoryCharge>(bytes);
+  return std::make_shared<QueryMemoryCharge>(
+      QueryMemoryCharge::kAlreadyReserved{}, bytes);
 }
 
 Relation::Relation(Relation&& other) noexcept
@@ -162,7 +168,9 @@ Status Relation::EnsureRowsMaterializedChecked() {
     }
     uniform_cell_types = false;
     ClearRelationRows(rows);
-    return st;
+    // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for
+    // this type
+    return st;  // NOLINT(performance-no-automatic-move)
   }
   uniform_cell_types = uniform_ok;
   peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
@@ -170,8 +178,8 @@ Status Relation::EnsureRowsMaterializedChecked() {
   return Status::kSuccess;
 }
 
-void Relation::EnsureRowsMaterialized() {
-  (void)EnsureRowsMaterializedChecked();
+Status Relation::EnsureRowsMaterialized() {
+  return EnsureRowsMaterializedChecked();
 }
 
 size_t Relation::ChargeFlushGranularity() {
@@ -293,7 +301,13 @@ void Relation::AddRow(Row row) {
 void Relation::AddRowSlowWithBytes(Row row, size_t bytes,
                                    size_t flush_granularity) {
   if (columnar != nullptr) {
-    EnsureRowsMaterialized();
+    // T4539: on materialization failure keep the columnar side intact and
+    // drop the incoming row: the failure is latched in spill_error_, so
+    // every subsequent ForEachRow()/GetStatus() on this relation surfaces
+    // the error instead of silently seeing an empty row set.
+    if (EnsureRowsMaterialized() != Status::kSuccess) {
+      return;
+    }
     columnar.reset();
   }
   uniform_cell_types = false;

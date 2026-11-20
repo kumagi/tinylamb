@@ -109,7 +109,7 @@
 
 `PERCENTILE_CONT` と `PERCENTILE_DISC` は、指定されたフレームを使わず、常にパーティション全体を参照する。既定では `NULL` を除外する。`RESPECT NULLS` を指定すると、`NULL`、`NaN`、通常値の順に並べるパーセンタイル専用の整列を行う。`PERCENTILE_DISC` は上側の離散順位を選び、`PERCENTILE_CONT` は隣接値を線形補間する。
 
-各出力行についてフレーム全体を走査し直し、直前の行で計算した状態を差分更新しない。フレームがパーティション全体なら、一関数当たり最悪 `O(N²)` 回の集約更新に、パーティションの整列費用が加わる。なお、旧 `WindowExecutor` の buffered 経路は全行をメモリ保持してスピルしないが、共通 PARTITION BY キーがある場合はパーティション分割 `SpillFile` 経路を選べ（§1 冒頭・`plan/window_plan.hpp`）、さらに既定の `PipelineLowering` 経路では `OocWindowSink`（`ExternalSorter` + `SpillableStore`）が予算超過時にディスクへスピルする。
+各出力行についてフレーム全体を走査し直し、直前の行で計算した状態を差分更新しない。フレームがパーティション全体なら、一関数当たり最悪 `O(N²)` 回の集約更新に、パーティションの整列費用が加わる。なお、`WindowExecutor` の buffered 経路は全行をメモリ保持してスピルしないが、共通 PARTITION BY キーがある場合はパーティション分割 `SpillFile` 経路を選べ（§1 冒頭・`plan/window_plan.hpp`）、さらに既定の `PipelineLowering` 経路では `OocWindowSink`（`ExternalSorter` + `SpillableStore`）が予算超過時にディスクへスピルする。
 
 ### 1.8 失敗と再試行状態
 

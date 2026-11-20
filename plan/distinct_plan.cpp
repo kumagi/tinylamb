@@ -39,8 +39,7 @@ TableStatistics EstimateDistinctPlanStats(const Plan& child) {
 DistinctPlan::DistinctPlan(Plan child, std::vector<Expression> distinct_on)
     : child_(std::move(child)),
       distinct_on_(std::move(distinct_on)),
-      stats_(distinct_on_.empty() ? EstimateDistinctPlanStats(child_)
-                                  : child_->GetStats()) {}
+      stats_(EstimateDistinctPlanStats(child_)) {}
 
 void DistinctPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << "HashDistinct";
@@ -50,12 +49,13 @@ void DistinctPlan::Dump(std::ostream& output, int indent) const {
       if (i > 0) {
         output << ", ";
       }
-      output << *distinct_on_[i];
+      output << (distinct_on_[i] ? distinct_on_[i]->ToString()
+                                 : std::string("?"));
     }
     output << "])";
   }
   output << "\n";
-  child_->Dump(output, indent + 2);
+  DumpChild(output, *child_, indent + 2);
 }
 
 std::string DistinctPlan::ToString() const { return "HashDistinct"; }
@@ -76,8 +76,14 @@ SkipScanDistinctPlan::SkipScanDistinctPlan(
 size_t SkipScanDistinctPlan::AccessRowCount() const { return stats_.Rows(); }
 
 size_t SkipScanDistinctPlan::EmitRowCount() const {
-  // The covering scan supplies statistics in output-column order.
-  return static_cast<size_t>(std::ceil(stats_.EstimateDistinctRows({0})));
+  // Estimate DISTINCT over every output column, not only the first one.
+  std::vector<size_t> columns;
+  columns.reserve(select_items_.size());
+  for (size_t i = 0; i < select_items_.size(); ++i) {
+    columns.push_back(i);
+  }
+  return static_cast<size_t>(
+      std::ceil(stats_.EstimateDistinctRows(columns)));
 }
 
 bool SkipScanDistinctPlan::IsOrderedBy(
@@ -93,6 +99,20 @@ bool SkipScanDistinctPlan::IsOrderedBy(
   if (!ascending_ || expressions.size() != select_items_.size() ||
       ascending.size() != expressions.size()) {
     return false;
+  }
+  // memcomparable NaN sorts above every DOUBLE, while ORDER BY sorts it
+  // first. If the key column contains NaN, the skip-scan byte order cannot
+  // prove the requested ascending order (mirrors DoubleKeyOrderIsSound).
+  if (!index_.sc_.key_.empty()) {
+    const slot_t key_col = index_.sc_.key_.front();
+    if (key_col < stats_.Columns()) {
+      for (const ValueFrequency& freq : stats_.Column(key_col).LowestValues()) {
+        const Value& v = freq.value;
+        if (v.type == ValueType::kDouble && std::isnan(v.value.double_value)) {
+          return false;
+        }
+      }
+    }
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
     if (!ascending[i] || !expressions[i] || !select_items_[i].expression) {

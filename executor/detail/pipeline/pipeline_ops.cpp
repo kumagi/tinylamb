@@ -138,7 +138,9 @@ Status FilterOp::Process(PipelineContext* /*ctx*/, const DataChunk& input,
     return Status::kSuccess;
   }
   feed_->SetChunk(&input);
-  const size_t n = std::max<size_t>(input.Size(), kDefaultVectorSize);
+  // The feed only exposes the actual input chunk, so asking for a full
+  // 1024-row batch makes the child reserve storage it never fills.
+  const size_t n = std::max<size_t>(input.Size(), 1);
   selection_->NextBatch(output, n);
   if (selection_->GetStatus() != Status::kSuccess) {
     return selection_->GetStatus();
@@ -196,7 +198,9 @@ Status ProjectOp::Process(PipelineContext* /*ctx*/, const DataChunk& input,
     return Status::kSuccess;
   }
   feed_->SetChunk(&input);
-  const size_t n = std::max<size_t>(input.Size(), kDefaultVectorSize);
+  // The feed only exposes the actual input chunk, so asking for a full
+  // 1024-row batch makes the child reserve storage it never fills.
+  const size_t n = std::max<size_t>(input.Size(), 1);
   projection_->NextBatch(output, n);
   if (projection_->GetStatus() != Status::kSuccess) {
     return projection_->GetStatus();
@@ -254,7 +258,7 @@ Status LimitOp::Process(PipelineContext* /*ctx*/, const DataChunk& input,
     }
   }
   for (size_t i = 0; i < take; ++i) {
-    output->Append(input, start + i);
+    output->AppendFrom(input, start + i);
   }
   consumed_rows_ += take;
   emitted_ += take;

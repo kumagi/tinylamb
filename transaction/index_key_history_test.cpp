@@ -18,9 +18,12 @@
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "plan/index_scan_plan.hpp"
+#include "recovery/logger.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
+#include "transaction/transaction_manager.hpp"
+#include "type/collation.hpp"
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -101,6 +104,31 @@ TEST_F(IndexKeyHistoryTest, EvictedHistoryRejectsOldButNotFreshSnapshots) {
   EXPECT_EQ(Changes(fresh.txn_, 7), std::vector<std::string>{});
 }
 
+TEST_F(IndexKeyHistoryTest, DisabledHistoryAdvancesEvictionWatermark) {
+  // T3846: dropping the whole key set (Disable) must move forgotten_through_ts
+  // like eviction does; a future re-enable of precision may not trust a
+  // history whose discarded keys sit above a stale watermark.
+  const std::string log_name =
+      "index_key_history-disable-" + RandomString() + ".log";
+  auto logger_holder = Logger::Create(log_name).MoveValue();
+  CHECK(logger_holder != nullptr);
+  TransactionManager tm(nullptr, &*logger_holder, nullptr);
+  tm.SetSynchronousCommit(false);
+  EXPECT_EQ(tm.IndexKeyHistoryStateForTest(7), std::make_pair(0ULL, true));
+  {
+    auto gate = tm.AcquireIndexWriteGuard(7);
+    tm.TrackIndexKeyMutation(1, 7, "kept-key");
+    // Unknown-key (empty) call revokes precision for the shard.
+    tm.TrackIndexKeyMutation(1, 7, std::string_view());
+  }
+  const auto state = tm.IndexKeyHistoryStateForTest(7);
+  EXPECT_FALSE(state.second);
+  // commit_timestamp_ is still 0 here: the watermark must cover the next
+  // possible commit (strictly greater than every snapshot that could miss
+  // the discarded keys), i.e. >= 1.  Before the fix it stayed at 0.
+  EXPECT_GE(state.first, 1ULL);
+}
+
 TEST_F(IndexKeyHistoryTest, OversizedPendingSetRevokesRatherThanLosesKeys) {
   auto reader = db_->BeginContext();
   auto writer = db_->BeginContext();
@@ -148,6 +176,26 @@ TEST_F(IndexKeyHistoryTest, BoundEncodingIsInclusivePrefixAndNullConservative) {
       index, encoded, {Value(std::string(text))}, {Value(std::string(text))}));
   EXPECT_FALSE(IndexScanIterator::EncodedKeyMayOverlap(
       index, encoded, {Value("a")}, {Value("a")}));
+}
+
+// T52: the raw-byte range verdict must not clear a stored key that a
+// collation-folded SQL endpoint still matches: byte-wise 'A' (0x41) is
+// below 'a', but under 'und:ci' the range ['a','z'] includes it.  Without
+// the guard the update path treats the changed key as "no overlap", keeps
+// the index scan, and can miss rows through the stale entry.
+TEST_F(IndexKeyHistoryTest, CollatedEndpointsNeverReportByteDisjointOverlap) {
+  Index index("strings", {0, 1}, 7, {}, IndexMode::kNonUnique);
+  const std::string key_a =
+      Row({Value("A"), Value(1)}).EncodeMemcomparableFormat();
+  // Untagged endpoints keep the byte-compare verdict: 'A' < 'a' excludes.
+  EXPECT_FALSE(IndexScanIterator::EncodedKeyMayOverlap(
+      index, key_a, {Value("a")}, {Value("z")}));
+  Value lo("a");
+  lo.SetCollation(static_cast<uint8_t>(Collation::kCaseInsensitive));
+  Value hi("z");
+  hi.SetCollation(static_cast<uint8_t>(Collation::kCaseInsensitive));
+  EXPECT_TRUE(
+      IndexScanIterator::EncodedKeyMayOverlap(index, key_a, {lo}, {hi}));
 }
 
 TEST_F(IndexKeyHistoryTest, DisjointCompoundRangeStaysIndexedAcrossCommit) {
@@ -263,7 +311,9 @@ TEST_F(IndexKeyHistoryTest, PointRangesAvoidRedundantLookahead) {
       table->GetSchema(), false, true, TransactionManager::IndexReadGuard{},
       true));
   const auto eager_reads = reads() - eager_start;
-  EXPECT_LT(planned_reads + ranges.size(), eager_reads);
+  // No arbitrary +N margin: the planned path must do strictly fewer cache
+  // touches than the eager lookahead path (both already verified equal above).
+  EXPECT_LT(planned_reads, eager_reads);
 }
 
 }  // namespace

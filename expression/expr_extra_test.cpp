@@ -75,6 +75,8 @@ TEST(ExprExtraTest, ThreeValuedComparisonKeepsNullUnknown) {
       BinaryExpressionExp(ConstantValueExp(Value()), BinaryOperation::kEquals,
                           ConstantValueExp(Value()));
   EXPECT_TRUE(Eval(null_equals_null).IsNull());
+  EXPECT_TRUE(Eval(UnaryExpressionExp(ConstantValueExp(Value()),
+                                     UnaryOperation::kNot)).IsNull());
 
   const Value compared = Eval(
       BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,

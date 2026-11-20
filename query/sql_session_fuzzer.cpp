@@ -1388,7 +1388,10 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     }
     const std::string sql = "CREATE TABLE " + m.name + " (" + cols + ");";
     std::string why;
-    if (!RunSqlWhy(*db, setup_ctx, sql, /*force_relational=*/false, &why)) {
+    // Route-aligned with replay (contract at RouteFlipFor): the step's
+    // generation route must equal RouteFlipFor(index it holds in the trace),
+    // so generate through the same predicate instead of a hardcoded false.
+    if (!RunSqlWhy(*db, setup_ctx, sql, RouteFlipFor(t.steps.size()), &why)) {
       t.steps.push_back({.sql = sql});
       std::string err = "dual setup CREATE TABLE rejected: ";
       err += sql;
@@ -1411,7 +1414,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       tuple += ")";
       const std::string ins =
           "INSERT INTO " + m.name + " VALUES " + tuple + ";";
-      if (!RunSqlWhy(*db, setup_ctx, ins, /*force_relational=*/false, &why)) {
+      if (!RunSqlWhy(*db, setup_ctx, ins, RouteFlipFor(t.steps.size()), &why)) {
         t.steps.push_back({.sql = ins});
         std::string err = "dual setup INSERT rejected: ";
         err += ins;
@@ -2022,7 +2025,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       op = Op::kCreateTable;
     } else if (roll <= 86) {
       // ANALYZE refreshes persisted statistics + bumps the schema epoch —
-      // invisible to the row mirror but it walks the stats B+Tree inside
+      // invisible to the row mirror but it walks the stats LSM index inside
       // the open transaction, so abort/crash must roll it back cleanly.
       op = Op::kAnalyze;
     } else if (roll <= 90 && !target->rows.empty() &&
@@ -3005,7 +3008,15 @@ bool ParseSessionTest(std::string_view text, uint64_t* seed,
       trace->steps.push_back(
           {.is_begin = true, .txn = line.back() == '2' ? 1 : 0});
     } else if (consume("-- seed: ", &value)) {
-      *seed = std::stoull(value);
+      size_t used = 0;
+      try {
+        *seed = std::stoull(value, &used);
+      } catch (const std::exception&) {
+        return false;
+      }
+      if (used != value.size()) {
+        return false;
+      }
     } else if (consume("-- stmt: ", &value)) {
       trace->steps.push_back({.sql = value});
     } else if (consume("-- stmt2: ", &value)) {

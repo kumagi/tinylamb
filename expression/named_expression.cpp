@@ -26,10 +26,42 @@
 namespace tinylamb {
 
 std::ostream& operator<<(std::ostream& o, const NamedExpression& ne) {
-  const std::string expression_text = ne.expression->ToString();
+  // T2108: expression is legitimately null for placeholder / star-modifier
+  // carriers -- every consumer loop (query_data.cpp select_ walks,
+  // BindFieldPaths, InlineSelectAliases, ORDER BY resolution) guards it, and
+  // dereferencing here crashed EXPLAIN/dump paths on a null item.
+  const std::string expression_text =
+      ne.expression ? ne.expression->ToString() : std::string("<null>");
   o << expression_text;
   if (!ne.name.empty() && ne.name != expression_text) {
     o << " AS " << ne.name;
+  }
+  // T2107: SELECT * EXCEPT / REPLACE would otherwise dump exactly like a bare
+  // star, hiding which columns the projection actually drops or rewrites.
+  if (ne.star_modifiers) {
+    if (!ne.star_modifiers->except_columns.empty()) {
+      o << " EXCEPT (";
+      for (size_t i = 0; i < ne.star_modifiers->except_columns.size(); ++i) {
+        if (i != 0) {
+          o << ", ";
+        }
+        o << ne.star_modifiers->except_columns[i];
+      }
+      o << ")";
+    }
+    if (!ne.star_modifiers->replace_items.empty()) {
+      o << " REPLACE (";
+      for (size_t i = 0; i < ne.star_modifiers->replace_items.size(); ++i) {
+        if (i != 0) {
+          o << ", ";
+        }
+        const StarReplaceItem& item = ne.star_modifiers->replace_items[i];
+        o << (item.expression ? item.expression->ToString()
+                              : std::string("<null>"))
+          << " AS " << item.column;
+      }
+      o << ")";
+    }
   }
   return o;
 }

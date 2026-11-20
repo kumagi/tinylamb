@@ -218,7 +218,7 @@ TEST_F(PlanTest, Construct) {
   // Assert -- nothing to verify; gtest green on pass, death on crash
 }
 
-TEST_F(PlanTest, ValuesPlanEmitsTypedMultiColumnRowsAndValidatesWidth) {
+TEST_F(PlanTest, ValuesPlanConstructionSmokeTest) {
   const Schema schema("values", {Column("id", ValueType::kInt64),
                                  Column("name", ValueType::kVarChar)});
   ValuesPlan values(
@@ -292,7 +292,7 @@ TEST_F(PlanTest, ProjectPlan) {
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST_F(PlanTest, ProjectionRebuildsStatisticsInOutputOrder) {
+TEST_F(PlanTest, ProjectionConstructionSmokeTest) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
@@ -393,7 +393,7 @@ TEST_F(PlanTest, SelectionPlan) {
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST_F(PlanTest, HashJoinPlan) {
+TEST_F(PlanTest, HashJoinPlanConstructionSmokeTest) {
   // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
@@ -414,7 +414,7 @@ TEST_F(PlanTest, HashJoinPlan) {
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST_F(PlanTest, IndexJoinPlan) {
+TEST_F(PlanTest, IndexJoinPlanConstructionSmokeTest) {
   // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
@@ -435,7 +435,7 @@ TEST_F(PlanTest, IndexJoinPlan) {
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST_F(PlanTest, ProductPlanCrossJoin) {
+TEST_F(PlanTest, ProductPlanCrossJoinConstructionSmokeTest) {
   // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
@@ -454,7 +454,7 @@ TEST_F(PlanTest, ProductPlanCrossJoin) {
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST_F(PlanTest, UnaryPlan) {
+TEST_F(PlanTest, UnaryPlanConstructionSmokeTest) {
   // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
@@ -472,7 +472,7 @@ TEST_F(PlanTest, UnaryPlan) {
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST_F(PlanTest, AggregationPlan) {
+TEST_F(PlanTest, AggregationPlanConstructionSmokeTest) {
   // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
@@ -1203,7 +1203,7 @@ TEST_F(PlanTest, NullSafeIndexJoinShapeFallsBackToHashJoin) {
           *tbl1_or.Value(), TableStatistics(tbl1_or.Value()->GetSchema())),
       {ColumnName("Sc1.c1")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
       {ColumnName("Sc2.d1")}, *stats2_or.Value()));
-  static_cast<ProductPlan&>(*prop).SetJoinNotes({true}, Expression());
+  static_cast<ProductPlan&>(*prop).SetJoinNotes({true}, Expression());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   Executor executor = prop->EmitExecutor(ctx);
   std::ostringstream dump;
   executor->Dump(dump, 0);
@@ -1239,7 +1239,7 @@ TEST_F(PlanTest, LookupProbeDerivesPrefixInIndexKeyOrder) {
       *reloaded.Value(), reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d4"), ColumnName("Sc2.d1"), ColumnName("Sc2.d3")},
       *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(*plan);
+  auto& product = static_cast<ProductPlan&>(*plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   const std::optional<LookupSeek>& probe = product.Lookup();
   ASSERT_TRUE(probe.has_value());
   assert(probe.has_value());
@@ -1292,7 +1292,7 @@ TEST_F(PlanTest, LookupRangeAcceptsOnlyInt64AndDate) {
       {ColumnName("Sc1.c1"), ColumnName("Sc1.c2")}, *reloaded.Value(),
       reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d1"), ColumnName("Sc2.d3")}, *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(*plan);
+  auto& product = static_cast<ProductPlan&>(*plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
   // The bound has to land on the index key column at that offset; d3 is a
   // plain column of the table, so a bound there cannot order the seek.
@@ -1368,7 +1368,7 @@ TEST_F(PlanTest, LookupRangeRejectsNonWhitelistedKeyColumnType) {
       {ColumnName("Sc1.c1"), ColumnName("Sc1.c3")}, *reloaded.Value(),
       reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d1"), ColumnName("Sc2.d4")}, *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(*plan);
+  auto& product = static_cast<ProductPlan&>(*plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
   // d3 is the right index key column at that offset and both operands are
   // VARCHAR, but
@@ -1399,7 +1399,7 @@ TEST_F(PlanTest, LookupSeekIsAbsentWithoutALeadingKeyJoinColumn) {
       std::make_shared<FullScanPlan>(*tbl1_or.Value(), left_stats),
       {ColumnName("Sc1.c3")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
       {ColumnName("Sc2.d4")}, *stats2_or.Value()));
-  EXPECT_EQ(static_cast<ProductPlan&>(*plan).Lookup(), std::nullopt);
+  EXPECT_EQ(static_cast<ProductPlan&>(*plan).Lookup(), std::nullopt);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   Executor executor = plan->EmitExecutor(ctx);
   std::ostringstream dump;
   executor->Dump(dump, 0);

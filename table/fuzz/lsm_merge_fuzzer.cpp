@@ -74,7 +74,9 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
       int64_t id = 0;
       std::memcpy(&id, data + off, sizeof(id));
       off += sizeof(int64_t);
-      ids.push_back(id % 100000);
+      // Keep the full INT64 range: narrowing to +/-99999 never exercises
+      // sign-boundary or memcomparable-key paths in the merge.
+      ids.push_back(id);
     }
     // Carry over up to 2 keys from the previous run so cross-generation
     // overwrites and tombstone shadowing are consistently exercised.

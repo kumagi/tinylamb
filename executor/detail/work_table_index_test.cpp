@@ -92,6 +92,23 @@ TEST(WorkTableIndexTest, CaseInsensitiveCollationFoldsLikeDistinct) {
   EXPECT_TRUE(binary.Insert(MakeRow({Value("A")})));
 }
 
+TEST(WorkTableIndexTest, StreamingFoldedHashMatchesMaterializedFold) {
+  // T3752: WorkTableRowHash folds byte-wise into the hash instead of
+  // materializing FoldCaseForCollation per cell.  The streaming helper must
+  // be a function of the folded bytes: hash(s) == hash(fold(s)) for every
+  // sample, and distinct folded texts stay distinct.
+  for (std::string_view s :
+       {"", "abc", "ABC", "MiXeD-CaSe 42", "0123456789", "ünïcode Ä"}) {
+    EXPECT_EQ(HashFoldedForCollation(s),
+              HashFoldedForCollation(FoldCaseForCollation(s)))
+        << "for " << s;
+  }
+  EXPECT_EQ(HashFoldedForCollation("AbC"), HashFoldedForCollation("aBC"));
+  EXPECT_NE(HashFoldedForCollation("abc"), HashFoldedForCollation("abd"));
+  relational_detail::WorkTableRowHash hash;
+  EXPECT_EQ(hash(MakeRow({Value("AbC")})), hash(MakeRow({Value("aBC")})));
+}
+
 TEST(WorkTableIndexTest, CountersOnlyPublishWhenEnabled) {
   // Top-level DISTINCT shares the class but must not touch the counters (hot
   // path); only the recursive loop opts in.

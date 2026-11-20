@@ -1,8 +1,11 @@
 name: clang-tidy
 on: [ push, pull_request ]
+permissions:
+  contents: read
 jobs:
   tidy:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,6 +21,15 @@ jobs:
         run: |
           # Ubuntu 24.04 ships the diff helper under a versioned name
           # (clang-tidy-diff-18.py); pick whichever is present.
-          TIDY_DIFF=$(command -v clang-tidy-diff.py || ls /usr/bin/clang-tidy-diff*.py | head -1)
-          git diff -U0 origin/master...HEAD -- '*.cpp' '*.hpp' | \
+          TIDY_DIFF=$(command -v clang-tidy-diff.py || ls /usr/bin/clang-tidy-diff*.py 2>/dev/null | head -1 || true)
+          if [ -z "$TIDY_DIFF" ] || [ ! -x "$TIDY_DIFF" ]; then
+            echo "clang-tidy-diff helper not found" >&2
+            exit 1
+          fi
+          CHANGED=$(git diff -U0 origin/master...HEAD -- '*.cpp' '*.hpp')
+          if [ -z "$CHANGED" ]; then
+            echo "no C++ diff against origin/master (direct push to master?)" >&2
+            exit 1
+          fi
+          printf '%s\n' "$CHANGED" | \
             "$TIDY_DIFF" -path build -checks='bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' -quiet

@@ -14,6 +14,7 @@
 
 #include "common/status_or.hpp"
 #include "expression/proto_text.hpp"
+#include "type/date.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -290,6 +291,142 @@ TEST(ProtoTextSetFieldTest, OuterBracesAreOptional) {
   assert(updated.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*updated, "a: 4");
+}
+
+TEST(ProtoTextWriteTest, VarCharValuesQuotedEnumMembersStayBare) {
+  // The proto TEXT writer must not decide bare-vs-quoted from token spelling
+  // alone: a VARCHAR source is a string value.  Bare "true" read back as
+  // bool 1, "007" as the number 7, and unquoted non-token text corrupted
+  // the payload so the next write failed with malformed proto
+  // (tracker #761).
+  const std::string base = "int64_key_1: 1 int64_key_2: 2";
+  const std::string type = "googlesql_test.KitchenSinkPB";
+  for (const std::string& text :
+       {std::string("true"), std::string("false"), std::string("007"),
+        std::string("5 apples"), std::string("GREEN"), std::string("1.5"),
+        std::string("hello world")}) {
+    auto updated = TryProtoTextSetField(base, {"string_val"},
+                                        Value(std::string(text)), type)
+                       .MoveValue();
+    ASSERT_TRUE(updated.has_value());
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    EXPECT_NE(updated->find("string_val: \""), std::string::npos) << *updated;
+    Value out;
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    ASSERT_TRUE(
+        TryProtoTextExtractField(*updated, "string_val", &out).MoveValue())
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
+        // assumes success
+        << *updated;  // NOLINT(bugprone-unchecked-optional-access)
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
+    // assumes success
+    EXPECT_EQ(out, Value(std::string(text))) << *updated;  // NOLINT(bugprone-unchecked-optional-access)
+    // The rewritten payload stays writable.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
+    // assumes success
+    auto again =
+        TryProtoTextSetField(*updated, {"int64_key_1"}, Value(int64_t{7}), type)  // NOLINT(bugprone-unchecked-optional-access)
+            .MoveValue();
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
+    // assumes success
+    ASSERT_TRUE(again.has_value()) << *updated;  // NOLINT(bugprone-unchecked-optional-access)
+  }
+
+  // Known enum fields carry enum member names, which proto TEXT renders
+  // bare.
+  auto enum_set = TryProtoTextSetField(base, {"test_enum"},
+                                       Value(std::string("TESTENUM1")), type)
+                      .MoveValue();
+  ASSERT_TRUE(enum_set.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_NE(enum_set->find("test_enum: TESTENUM1"), std::string::npos);
+  Value enum_out;
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  ASSERT_TRUE(
+      TryProtoTextExtractField(*enum_set, "test_enum", &enum_out).MoveValue());
+  EXPECT_EQ(enum_out, (Value(std::string("TESTENUM1"))));
+
+  // The NEW-constructor path follows the same rule: scalar strings and the
+  // repeated str_value channel render quoted even when the spelling is
+  // bool-, number- or identifier-shaped.
+  auto constructed = TryConstructProtoText(
+      "googlesql_test.TestExtraPB",
+      {{"str_value",
+        Value::Array({Value(std::string("true")), Value(std::string("GREEN")),
+                      Value(std::string("007"))},
+                     "STRING")}});
+  ASSERT_TRUE(constructed.HasValue());
+  EXPECT_EQ(constructed.Value(),
+            "str_value: \"true\" str_value: \"GREEN\" str_value: \"007\"");
+  auto scalar_constructed =
+      TryConstructProtoText("googlesql_test.TestExtraPB",
+                            {{"int32_val1", Value(std::string("true"))}});
+  ASSERT_TRUE(scalar_constructed.HasValue());
+  EXPECT_NE(scalar_constructed.Value().find("int32_val1: \"true\""),
+            std::string::npos);
+}
+
+TEST(ProtoTextExtractFieldTest, DateDecimalConversionReturnsStatusNotThrow) {
+  // Decimal-encoded (YYYYMMDD) dates with out-of-range month/day must
+  // surface as an InvalidArgument Status across the Status boundary,
+  // never as an exception escaping through the throwing ParseDateDays
+  // wrapper (bugs2 P731 / tracker #762).
+  for (const std::string& bad : {std::string("date_decimal: 20231301"),
+                                 std::string("date_decimal: 20230230"),
+                                 std::string("date_decimal: 20230099")}) {
+    Value out;
+    auto result = TryProtoTextExtractField(bad, "date_decimal", &out);
+    EXPECT_FALSE(result.HasValue()) << bad;
+    EXPECT_EQ(result.GetStatus(), Status::kInvalidArgument);
+  }
+  // Valid decimal dates still convert to DATE.
+  Value out;
+  ASSERT_TRUE(
+      TryProtoTextExtractField("date_decimal: 20230228", "date_decimal", &out)
+          .MoveValue());
+  ASSERT_EQ(out.type, ValueType::kDate);
+  EXPECT_EQ(out.DateDays(), TryParseDateDays("2023-02-28").MoveValue());
+  // Decimal-encoded 0 keeps reading as NULL.
+  Value null_out;
+  ASSERT_TRUE(
+      TryProtoTextExtractField("date_decimal: 0", "date_decimal", &null_out)
+          .MoveValue());
+  EXPECT_TRUE(null_out.IsNull());
+}
+
+// T3665: nested reads must follow the WHOLE path the way the SetField side
+// descends; passing only the leaf name looked for a top-level field and
+// missed anything inside a message (nested DML could write msg.a.b but the
+// matching read never found it).
+TEST(ProtoTextParseTest, GetFieldPathDescendsNestedMessages) {
+  Value out;
+  ASSERT_TRUE(
+      TryProtoTextGetFieldPath("outer { val: 7 }", {"outer", "val"}, &out)
+          .MoveValue());
+  EXPECT_FALSE(out.IsNull());
+  EXPECT_EQ(out, Value(int64_t{7}));
+  // Repeated leaves merge across every matching parent (a write replaces
+  // the leaf in EACH parent, so the read has to see all of them).
+  Value merged;
+  ASSERT_TRUE(TryProtoTextGetFieldPath(
+                  "outer { repeated_num: 1 } outer { repeated_num: 2 }",
+                  {"outer", "repeated_num"}, &merged)
+                  .MoveValue());
+  ASSERT_TRUE(merged.IsArray());
+  EXPECT_EQ(merged.ArrayElements().size(), 2U);
+  // An absent parent reads like an unset field (empty repeated array).
+  Value absent;
+  ASSERT_TRUE(
+      TryProtoTextGetFieldPath("other: 1", {"outer", "repeated_num"}, &absent)
+          .MoveValue());
+  ASSERT_TRUE(absent.IsArray());
+  EXPECT_TRUE(absent.ArrayElements().empty());
+  // Single-segment paths keep the flat reader semantics.
+  Value flat;
+  ASSERT_TRUE(
+      TryProtoTextGetFieldPath("repeated_num: 3", {"repeated_num"}, &flat)
+          .MoveValue());
+  EXPECT_TRUE(flat.IsArray());
 }
 
 }  // namespace tinylamb

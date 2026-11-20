@@ -11,7 +11,7 @@ fdatasyncが約0.1–3msと大きく変動し、更新のp95/p99とスループ�
 ## 方式
 
 新規のサーバ用WALに限り、セグメントの物理サイズをS+64に固定する。
-[0,S)は従来のLSNデータ領域であり、v6レコードとLSNは変えない。
+[0,S)はLSNデータ領域である。レコード形式はその後 v7 へ更新済み（wal_format.md 参照）。
 末尾64バイトに32バイトの論理終端スロットを2個置く。
 各スロットはbig-endianのmagic(u32)、segment index(u64)、generation(u64)、
 logical end(u64)、CRC32C(u32、先頭28バイト対象)を持つ。
@@ -53,7 +53,7 @@ WAL-before-data、own/observed commitの同期バリア、recycle floorは維持
 ## 採用記録（2026-10-30）
 
 新規server DBの既定方式として採用する。既存metadata v1を自動変換せず、
-埋込みDatabase/Loggerの既定も変更しない。旧バイナリがv2を拒否することを
+組込みDatabase/Loggerの既定も変更しない。旧バイナリがv2を拒否することを
 互換性上の制約として明示する。これはローカル実装の採用記録であり、既存の
 利用者DBを移行したという記録ではない。
 

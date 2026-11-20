@@ -35,6 +35,7 @@
 #include "table/iterator_base.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
+#include "type/collation.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -240,6 +241,17 @@ bool IndexScanIterator::EncodedKeyMayOverlap(
       std::ranges::any_of(end_key, &Value::IsNull)) {
     return true;
   }
+  // T52: a collation-tagged endpoint ('a' COLLATE 'und:ci') matches keys the
+  // raw byte order places outside the range ('A' < 'a'). The byte verdict
+  // can only prove disjointness for binary endpoints; stay conservative.
+  const auto collated = [](const Value& v) {
+    return v.Collation() != static_cast<uint8_t>(Collation::kNone) &&
+           v.Collation() != static_cast<uint8_t>(Collation::kBinary);
+  };
+  if (std::ranges::any_of(begin_key, collated) ||
+      std::ranges::any_of(end_key, collated)) {
+    return true;
+  }
   const std::string begin = EncodeParts(begin_key);
   const std::string end = EncodeEndParts(index, end_key);
   return (begin.empty() || key >= begin) && (end.empty() || key <= end);
@@ -389,7 +401,7 @@ void IndexScanIterator::ResolveRow() const {
     // const method: record the failure through the mutable sticky status.
     // Clear the cached row as well: operator* must not re-emit the previous
     // row once resolution failed.
-    const_cast<IndexScanIterator*>(this)->status_ = ref.GetStatus();
+    status_ = ref.GetStatus();
     current_row_.Clear();
     const_cast<IndexScanIterator*>(this)->Clear();
     current_row_resolved_ = true;
@@ -397,11 +409,75 @@ void IndexScanIterator::ResolveRow() const {
   }
   if (!ref.Value().IsValid() || ref.Value().IsNull() ||
       ref.Value()->Type() != PageType::kRowPage) {
-    const_cast<IndexScanIterator*>(this)->status_ = Status::kCorrupt;
+    status_ = Status::kCorrupt;
     current_row_.Clear();
     const_cast<IndexScanIterator*>(this)->Clear();
     current_row_resolved_ = true;
     return;
+  }
+  const auto serve_stub = [&]() {
+    // A compacted (TLCS-backed) stub page keeps no row images; the rows live
+    // in the backing columnar file.  Any write after compaction hydrates the
+    // page first (Table::Update/Delete), so a page that is still a stub
+    // holds exactly the compacted images and MVCC visibility is decided on
+    // them as usual.
+    ref.Value().PageUnlock();
+    std::string stub_image;
+    if (const Status st = table_.ReadEncodedFromStub(pos_, &stub_image);
+        st != Status::kSuccess) {
+      status_ = st;
+      current_row_.Clear();
+      const_cast<IndexScanIterator*>(this)->Clear();
+      current_row_resolved_ = true;
+      return;
+    }
+    DecodeVisibleRow(stub_image);
+  };
+  if (ref.Value()->body.row_page.IsColumnarStub()) {
+    const page_id_t stub_pid = pos_.page_id;
+    // P356/426: the stub holds the CURRENT image with no version chains, so
+    // it may only answer transactions entitled to a physical read of the
+    // page (same predicate as FullScanIterator::PhysicalReadEligible).  A
+    // scan pinned behind a chain hydrates the page instead of reading rows
+    // that "became newer" after compaction.
+    if (txn_.IsReadOnly() && !txn_.HasPageVersionChains(stub_pid)) {
+      serve_stub();
+      return;
+    }
+    // P356/426: drop our shared latch BEFORE hydrating -- the hydration
+    // path takes the page's exclusive latch and would self-deadlock
+    // against the reference held here (shard-10 OOC hang).
+    ref.Value().PageUnlock();
+    if (const Status h = table_.EnsurePageHydratedIfStub(txn_, stub_pid);
+        h != Status::kSuccess) {
+      status_ = h;
+      current_row_.Clear();
+      const_cast<IndexScanIterator*>(this)->Clear();
+      current_row_resolved_ = true;
+      return;
+    }
+    StatusOr<PageRef> again = txn_.GetPageManager()->GetPage(stub_pid, true);
+    if (!again.HasValue()) {
+      status_ = again.GetStatus();
+      current_row_.Clear();
+      const_cast<IndexScanIterator*>(this)->Clear();
+      current_row_resolved_ = true;
+      return;
+    }
+    ref = again.MoveValue();
+    if (ref.Value().IsNull() || ref.Value()->Type() != PageType::kRowPage) {
+      status_ = Status::kCorrupt;
+      current_row_.Clear();
+      const_cast<IndexScanIterator*>(this)->Clear();
+      current_row_resolved_ = true;
+      return;
+    }
+    if (ref.Value()->body.row_page.IsColumnarStub()) {
+      // Hydration reported success but the page is a stub again (a second
+      // compaction raced): answer from the newest compacted image.
+      serve_stub();
+      return;
+    }
   }
   const bool repeated_page = last_heap_page_ == pos_.page_id;
   last_heap_page_ = pos_.page_id;
@@ -432,7 +508,7 @@ void IndexScanIterator::ResolveRow() const {
       ref.Value()->Read(txn_, pos_.slot, resolve_head_);
   if (!row.HasValue()) {
     if (row.GetStatus() != Status::kNotExists) {
-      const_cast<IndexScanIterator*>(this)->status_ = row.GetStatus();
+      status_ = row.GetStatus();
       const_cast<IndexScanIterator*>(this)->Clear();
     }
     current_row_.Clear();
@@ -455,7 +531,7 @@ void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
     auto visible = txn_.ReadVersion(pos_, image, false);
     if (!visible.HasValue()) {
       if (visible.GetStatus() != Status::kNotExists) {
-        const_cast<IndexScanIterator*>(this)->status_ = visible.GetStatus();
+        status_ = visible.GetStatus();
         const_cast<IndexScanIterator*>(this)->Clear();
       }
       current_row_.Clear();
@@ -468,7 +544,7 @@ void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
         image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
         table_.schema_, peek.column);
     if (!peeked.HasValue()) {
-      const_cast<IndexScanIterator*>(this)->status_ = peeked.GetStatus();
+      status_ = peeked.GetStatus();
       const_cast<IndexScanIterator*>(this)->Clear();
       current_row_.Clear();
       return;
@@ -647,12 +723,23 @@ bool IndexScanIterator::TryReadIndexOnly(Row* dst) const {
 }
 
 void IndexScanIterator::Dump(std::ostream& o, int /*indent*/) const {
-  o << index_.sc_.name_ << " on " << table_.GetSchema().Name() << ": {";
+  // T2116: the old line omitted the index mode entirely (so UNIQUE and
+  // NON_UNIQUE scans rendered identically) and printed key slots as bare
+  // integers even though the table schema -- the very thing that resolves
+  // them -- is in hand here.
+  const Schema& schema = table_.GetSchema();
+  o << index_.sc_.name_ << " (" << index_.sc_.mode_ << ") on " << schema.Name()
+    << ": {";
   for (size_t i = 0; i < index_.sc_.key_.size(); ++i) {
     if (0 < i) {
       o << ", ";
     }
-    o << index_.sc_.key_[i];
+    const slot_t slot = index_.sc_.key_[i];
+    if (slot < schema.ColumnCount()) {
+      o << slot << ":" << schema.GetColumn(slot).Name();
+    } else {
+      o << slot;  // catalog drift: keep the raw slot rather than reading OOB
+    }
   }
   o << "},";
   if (!index_.sc_.include_.empty()) {
@@ -661,7 +748,12 @@ void IndexScanIterator::Dump(std::ostream& o, int /*indent*/) const {
       if (0 < i) {
         o << ", ";
       }
-      o << index_.sc_.include_[i];
+      const slot_t slot = index_.sc_.include_[i];
+      if (slot < schema.ColumnCount()) {
+        o << slot << ":" << schema.GetColumn(slot).Name();
+      } else {
+        o << slot;
+      }
     }
     o << "},";
   }

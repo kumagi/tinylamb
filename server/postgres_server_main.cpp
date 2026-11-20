@@ -31,14 +31,26 @@ void StopServer(int /*signal*/) {
 void Usage(std::ostream& output) {
   output << "usage: tinylamb_server <database-file> [--host ADDRESS] "
             "[--port PORT] [--read-workers COUNT] "
-            "[--max-connections COUNT] [--force]\n";
+            "[--max-connections COUNT] [--force]\n"
+         << "  --host ADDRESS          listen address (default 127.0.0.1)\n"
+         << "  --port PORT             TCP port (1..65535)\n"
+         << "  --read-workers COUNT    reader threads (1..1024)\n"
+         << "  --max-connections COUNT max clients (1..65536; env "
+            "TINYLAMB_MAX_CONNECTIONS)\n"
+         << "  --force                 truncate a torn WAL tail before opening "
+            "(destructive)\n"
+         << "  idle_timeout is 3600s (fixed; not configurable via CLI)\n";
 }
 
 bool ParseUnsigned(std::string_view input, unsigned long* result) {
+  if (input.empty() || input.front() == '-' || input.front() == '+') {
+    return false;
+  }
   char* end = nullptr;
   const std::string value(input);
+  errno = 0;
   const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
-  if (end == value.c_str() || *end != '\0') {
+  if (errno != 0 || end == value.c_str() || *end != '\0') {
     return false;
   }
   *result = parsed;
@@ -52,14 +64,24 @@ int main(int argc, char** argv) {
     Usage(std::cerr);
     return 2;
   }
+  // argv[1] is the database file; recognize --help/-h before it is consumed
+  // as a filename (the flag loop below starts at argv[2]).
+  if (const std::string_view first(argv[1]);
+      first == "--help" || first == "-h") {
+    Usage(std::cout);
+    return 0;
+  }
   tinylamb::PostgresServerOptions options;
   // Connection cap can be preset through the environment; the command line
   // flag overrides it. Connections beyond the limit are shed on accept.
   if (const char* env = std::getenv("TINYLAMB_MAX_CONNECTIONS");
       env != nullptr && env[0] != '\0') {
     unsigned long connections = 0;
-    if (!ParseUnsigned(env, &connections) || connections == 0) {
-      std::cerr << "invalid TINYLAMB_MAX_CONNECTIONS\n";
+    // P382: the flag path validates 1..65536; the env preset must apply the
+    // same bound (a huge value silently defeats the accept-time shed).
+    if (!ParseUnsigned(env, &connections) || connections == 0 ||
+        connections > 65536) {
+      std::cerr << "invalid TINYLAMB_MAX_CONNECTIONS (expected 1..65536)\n";
       return 2;
     }
     options.max_connections = static_cast<size_t>(connections);
@@ -108,6 +130,20 @@ int main(int argc, char** argv) {
   }
 
   std::unique_ptr<tinylamb::PostgresServer> instance;
+  // P2090: install the signal handlers BEFORE constructing the server.
+  // The constructor opens and recovers the database -- a WAL replay can
+  // take seconds -- and with the default disposition an interrupt in that
+  // window killed the process outright, skipping the clean shutdown that
+  // joins the WAL logger and checkpoint workers. StopServer tolerates the
+  // still-null pointer. (RequestStop()'s waker write is async-signal-safe
+  // on POSIX; on Windows the loopback send is best-effort -- recorded here
+  // so the comment above does not overstate the guarantee.)
+  if (std::signal(SIGINT, StopServer) == SIG_ERR ||
+      std::signal(SIGTERM, StopServer) == SIG_ERR) {
+    std::cerr << "failed to install signal handlers; Ctrl-C will not stop "
+                 "the server cleanly\n";
+    return 1;
+  }
   // The constructor opens (and recovers) the database; a startup failure is
   // reported by Listen() below instead of terminating the process.
   instance = std::make_unique<tinylamb::PostgresServer>(argv[1], options);
@@ -117,12 +153,6 @@ int main(int argc, char** argv) {
     return 1;
   }
   server.store(instance.get(), std::memory_order_relaxed);
-  if (std::signal(SIGINT, StopServer) == SIG_ERR ||
-      std::signal(SIGTERM, StopServer) == SIG_ERR) {
-    std::cerr << "failed to install signal handlers; Ctrl-C will not stop "
-                 "the server cleanly\n";
-    return 1;
-  }
   std::cout << "tinylamb PostgreSQL server listening on "
             << options.listen_address << ':' << instance->BoundPort()
             << " with " << instance->ReadWorkerCount() << " read workers\n";

@@ -17,7 +17,7 @@ graph TD
     U1["kUnnest<br/>(predicate: 展開式, alias, offset_alias)"] --> C1["子 Group"]
   end
   subgraph after["変換後: 物理計画 UnnestPlan"]
-    U2["UnnestPlan<br/>local_cost = 子の推定行数 × 1.0<br/>estimated_rows = 子の推定行数 × 10.0"] --> C2["子の最良物理計画"]
+    U2["UnnestPlan<br/>local_cost = 子の推定行数 × 10.0<br/>estimated_rows = 子の推定行数 × 10.0"] --> C2["子の最良物理計画"]
   end
 ```
 
@@ -60,11 +60,11 @@ UNNEST ノードの上流に結合や集約が配置される場合、入力行�
           const double rows = children[0].estimated_rows * 10.0;
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(plan),
-                              .local_cost = children[0].estimated_rows * 1.0,
+                              .local_cost = children[0].estimated_rows * 10.0,
                               .estimated_rows = rows}};
 ```
 
-- **局所コスト（`local_cost`）**: 子ノードの入力行数に 1.0 を乗じた値（`children[0].estimated_rows * 1.0`）。入力ストリームを 1 パス走査してコレクションを展開・送出する処理コストを表します。
+- **局所コスト（`local_cost`）**: 子ノードの入力行数に 1.0 を乗じた値（`children[0].estimated_rows * 10.0`）。入力ストリームを 1 パス走査してコレクションを展開・送出する処理コストを表します。
 - **推定出力行数（`estimated_rows`）**: 入力行数の 10 倍（`children[0].estimated_rows * 10.0`）。
 
 実行時には `UnnestPlan::EmitExecutor`（`executor/relational_factory.cpp`）が `UnnestExecutor` をインスタンス化し、行ごとのイテレーション処理を行います。

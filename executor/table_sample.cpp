@@ -36,7 +36,10 @@ StatusOr<double> NumericValue(const Value& value) {
                        "TABLESAMPLE requires non-null size");
   }
   if (value.type == ValueType::kInt64) {
-    return static_cast<double>(value.value.int_value);
+    return value.IsUnsigned()
+                    ? static_cast<double>(
+                          static_cast<uint64_t>(value.value.int_value))
+                    : static_cast<double>(value.value.int_value);
   }
   if (value.type == ValueType::kDouble) {
     return value.value.double_value;
@@ -127,7 +130,11 @@ uint64_t TableSampleExecutor::NextPriority(const RowPosition& position,
   }
   uint64_t identity = ordinal;
   if (position.IsValid()) {
-    identity = (position.page_id << 16) ^ position.slot;
+    // A 16-bit shift would fold 16-bit+ slots into the page id bits and make
+    // distinct positions share a priority. Mix both components at full width.
+    identity = Mix(static_cast<uint64_t>(position.page_id)) ^
+               (static_cast<uint64_t>(position.slot) + 0x9e3779b97f4a7c15ULL +
+                (identity << 6U) + (identity >> 2U));
   }
   return Mix(*seed_ ^ Mix(identity));
 }

@@ -205,9 +205,12 @@ TEST_F(SqlAuditRegressionTest, FailedViewRegistrationRetriesSameEpoch) {
   EXPECT_EQ(Rows("SELECT 1"), std::vector<Row>{Row({Value(1)})});
   {
     auto ctx = database_->BeginContext();
-    ASSERT_EQ(
-        database_->PutViewDefinition(ctx, "audit_retry_view", "SELECT 42 AS x"),
-        Status::kSuccess);
+    // The broken definition is still stored, so the retry replaces it
+    // (CREATE OR REPLACE VIEW); a plain re-create now reports a conflict.
+    ASSERT_EQ(database_->PutViewDefinition(ctx, "audit_retry_view",
+                                           "SELECT 42 AS x",
+                                           /*replace_existing=*/true),
+              Status::kSuccess);
     ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
   }
   ASSERT_EQ(database_->CatalogEpoch(), epoch);
@@ -622,10 +625,12 @@ TEST_F(SqlAuditRegressionTest, UnionAllNullConstantVarcharPartialSlice) {
              "SELECT '" +
              payload +
              "' AS c "
+             // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
              "UNION ALL SELECT '" +
              payload +
              "' "
              "UNION ALL SELECT CAST(NULL AS STRING) "
+             // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
              "UNION ALL SELECT '" +
              payload +
              "' "
@@ -730,6 +735,7 @@ TEST_F(SqlAuditRegressionTest,
     Rows(sql);
   }
   const size_t prev_limit = QueryMemoryBudget::Global().Limit();
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
   struct Restore {
     size_t limit;
     ~Restore() { QueryMemoryBudget::Global().ResetForTest(limit); }
@@ -782,6 +788,7 @@ TEST_F(SqlAuditRegressionTest, WindowPartitionCollationAndSpillParity) {
   EXPECT_EQ(expected.second[0][1], Value(int64_t{0}));
   EXPECT_EQ(expected.second[0][2], Value(int64_t{0}));
 
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
   struct KnobRestore {
     ~KnobRestore() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
   } restore;
@@ -875,6 +882,30 @@ TEST_F(SqlAuditRegressionTest, NullSafeJoinFoldsSignedZero) {
       "JOIN (SELECT k FROM audit_nsd) b ON a.x IS NOT DISTINCT FROM b.k");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{2}));
+}
+
+// ClickBench Q1 at 30M rows: `SELECT COUNT(*)` on a wide row table must not
+// decode (or demand a full-width columnar snapshot of) every column. The
+// pipeline lowering routes keyless scalar aggregates through
+// EmitScalarAggregation, whose COUNT(*) rule narrows the scan to one cell.
+TEST_F(SqlAuditRegressionTest, CountStarOnWideTableScansOneColumn) {
+  Rows("CREATE TABLE audit_wide (a INT64, b STRING, c INT64, d DOUBLE, "
+       "e STRING, f INT64)");
+  Rows("INSERT INTO audit_wide SELECT x, CAST(x AS STRING), x * 2, x / 3.0, "
+       "'payload', x FROM UNNEST(GENERATE_ARRAY(1, 10000)) AS x");
+  // The narrowing is gated on the planner knowing the table is big enough
+  // for a parallel scan, so give it statistics like a loaded fixture has.
+  Rows("ANALYZE");
+  EXPECT_EQ(Rows("SELECT COUNT(*) FROM audit_wide"),
+            std::vector<Row>({Row({Value(int64_t{10000})})}));
+  const auto plan = Rows("EXPLAIN ANALYZE SELECT COUNT(*) FROM audit_wide");
+  std::string text;
+  for (const Row& row : plan) {
+    for (const Value& value : row.values_) {
+      text += value.AsString();
+    }
+  }
+  EXPECT_NE(text.find("columns=1/6"), std::string::npos) << text;
 }
 
 }  // namespace tinylamb

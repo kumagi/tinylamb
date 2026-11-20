@@ -42,7 +42,7 @@ Strict-2PL + MVCC version chains + write intents. Normative doc:
   entry-time deadline for A/B comparisons.
   **The escape hatch is durability-aware**: while a WAL durability barrier
   is in flight (commit fsync, write-back gate — counted by
-  `DurabilityBarrierGuard` around `WaitForWALDurable`) or the group-commit
+  `DurabilityBarrierGuard` around `WaitForWalDurable`) or the group-commit
   backlog exceeds 1 MiB, an expired hatch deadline extends toward
   `kDurabilityIntentWaitFloor` (60 s) instead of firing. A stalled fsync slows
   holders without deadlocking them, and timing their waiters out manufactured
@@ -70,10 +70,24 @@ Strict-2PL + MVCC version chains + write intents. Normative doc:
   root-only mutation calls revoke manager-wide refinement. Commit/abort
   resolve records inside the existing write gate; allocation failure in this
   optional metadata must never fail an already published commit.
+- **Large-transaction OOC spills (P6a / P6b, ADRs 0007 / 0008):**
+  - WAL re-read mode (`kDefaultWalRereadThresholdBytes = 4 MiB`): once a
+    transaction's staged WAL buffer exceeds the threshold, staged copies are
+    dropped and abort/commit replay re-reads its WAL chain via `Logger::TryCopyBuffered`
+    and `RecoveryManager::ReadLog`.
+  - Write-set spill (`kDefaultWriteSetSpillEntries = 4096`): excess write-set
+    entries spill via `SpillStore` using `RowBlockCodec`.
+  - MVCC version payload spill (`kDefaultVersionSpillThresholdBytes = 4 MiB`,
+    `kVersionSpillSegmentBytes = 256 KiB`): cold MVCC version payloads spill
+    via `SpillStore` while active snapshot reads reload transparently.
+  - Statement timeout (`TINYLAMB_STATEMENT_TIMEOUT_MS` / `SetStatementTimeout` /
+    `CheckStatementTimeout`) bounds long-running reader retention of MVCC
+    versions and WAL segments.
 
 ## Two things you must not conflate
 
 Page content **latch** (`PageRef`) vs MVCC **write-intent** (version chain).
 Canonical flow: `Begin → write-intent → WAL → PreCommit/Abort`.
 
-Test: `./build/transaction_test`, `transaction_extra_test`.
+Test: `./build/transaction_test`, `transaction_extra_test`,
+`transaction_coverage_test`, `index_key_history_test`.

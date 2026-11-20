@@ -15,7 +15,7 @@
 
 namespace tinylamb {
 // Exact external union of sorted uint64 runs. Binary carries keep at most
-// log2(runs) anonymous temporary files open; every merge has fixed-size I/O
+// 16-way merge keeps at most log2_16(runs) temp files open; every merge has fixed-size I/O
 // buffers. Temporary files are closed/deleted on both success and failure.
 class SortedDistinctRuns {
  public:
@@ -23,6 +23,24 @@ class SortedDistinctRuns {
   Status Absorb(SortedDistinctRuns&& other);
   Status ForEach(const std::function<void(uint64_t)>& consume);
   [[nodiscard]] bool Empty() const { return levels_.empty(); }
+
+  // Test-only introspection: live runs (at most one per binary-carry level)
+  // and the total values retained across them, so boundedness tests can pin
+  // the logarithmic run count instead of only checking output correctness.
+  [[nodiscard]] size_t RunCountForTest() const {
+    size_t count = 0;
+    for (const auto& run : levels_) {
+      count += run.has_value() ? 1 : 0;
+    }
+    return count;
+  }
+  [[nodiscard]] uint64_t RetainedCountForTest() const {
+    uint64_t count = 0;
+    for (const auto& run : levels_) {
+      count += run.has_value() ? run->count : 0;
+    }
+    return count;
+  }
 
   // Test-only fault injection: makes the next Merge fail before it reads or
   // creates any file, so the strong-guarantee failure path is reproducible.

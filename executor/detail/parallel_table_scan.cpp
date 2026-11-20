@@ -144,7 +144,7 @@ bool ComparePositional(BinaryOperation op, const Left& left,
   }
 }
 
-Value ReadLstableCellValue(const LSTableColumnBlock& col, uint32_t r) {
+Value ReadLSTableCellValue(const LSTableColumnBlock& col, uint32_t r) {
   if (col.IsNull(r) || col.type == ValueType::kNull) {
     return {};
   }
@@ -166,20 +166,20 @@ Value ReadLstableCellValue(const LSTableColumnBlock& col, uint32_t r) {
       }
       return v;
     case ValueType::kVarChar:
-      v.SetStringView(col.VarcharAt(r));
+      v.CopyFromStringView(col.VarcharAt(r));
       return v;
     default:
       return {};
   }
 }
 
-void AppendLstableColumnSlice(const LSTableColumnBlock& blk_col,
+void AppendLSTableColumnSlice(const LSTableColumnBlock& blk_col,
                               const std::shared_ptr<const void>& owner,
                               size_t src_offset, const uint32_t* sel,
                               size_t count, ColumnarColumn* dst,
                               size_t prev_rows);
 
-void AppendLstableSubstringSlice(const LSTableColumnBlock& blk_col,
+void AppendLSTableSubstringSlice(const LSTableColumnBlock& blk_col,
                                  const std::shared_ptr<const void>& owner,
                                  size_t src_offset, const uint32_t* sel,
                                  size_t count, int64_t start, int64_t length,
@@ -199,7 +199,7 @@ void AppendLstableSubstringSlice(const LSTableColumnBlock& blk_col,
   }
   if (blk_col.type != ValueType::kVarChar) {
     ColumnarColumn tmp;
-    AppendLstableColumnSlice(blk_col, owner, src_offset, sel, count, &tmp, 0);
+    AppendLSTableColumnSlice(blk_col, owner, src_offset, sel, count, &tmp, 0);
     if (!dst->AppendSubstringFrom(tmp, 0, nullptr, count, start, length,
                                   has_length, prev_rows)) {
       dst->AppendConstant(Value(), count, nullptr, prev_rows);
@@ -294,7 +294,7 @@ void AppendLstableSubstringSlice(const LSTableColumnBlock& blk_col,
   }
 }
 
-void AppendLstableColumnSlice(const LSTableColumnBlock& blk_col,
+void AppendLSTableColumnSlice(const LSTableColumnBlock& blk_col,
                               const std::shared_ptr<const void>& owner,
                               size_t src_offset, const uint32_t* sel,
                               size_t count, ColumnarColumn* dst,
@@ -536,12 +536,12 @@ void AppendLstableColumnSlice(const LSTableColumnBlock& blk_col,
     dst->fallback.reserve(dst->fallback.size() + count);
     if (sel == nullptr) {
       for (size_t i = 0; i < count; ++i) {
-        dst->fallback.push_back(ReadLstableCellValue(
+        dst->fallback.push_back(ReadLSTableCellValue(
             blk_col, static_cast<uint32_t>(src_offset + i)));
       }
     } else {
       for (size_t i = 0; i < count; ++i) {
-        dst->fallback.push_back(ReadLstableCellValue(blk_col, sel[i]));
+        dst->fallback.push_back(ReadLSTableCellValue(blk_col, sel[i]));
       }
     }
     return;
@@ -913,7 +913,7 @@ bool TryParallelTableScan(
                                          lstable_store != nullptr ? 1 : 0);
   // When every non-simple filter component compiled to context-free
   // bytecode, workers decide rows themselves; only rows whose program
-  // raised are deferred for a contextful MatchScanFilter re-check.
+  // raised are deferred for a contextual MatchScanFilter re-check.
   // Simple-only filters keep the original tight inline loop: the generic
   // worker evaluator adds measurable per-row overhead on multi-million-row
   // scans with nothing non-simple to evaluate.
@@ -1078,7 +1078,9 @@ bool TryParallelTableScan(
   const auto can_eval_pm_on_dict = [&](const PrebuiltMembershipPredicate& pm,
                                        const LSTableColumnDictionary& dict,
                                        const Column& col) noexcept -> bool {
-    if (pm.runtime_filter != nullptr || col.IsUnsigned() || col.IsInterval()) {
+    if (pm.runtime_filter != nullptr || pm.distinct_witness_minmax != nullptr ||
+        pm.packed_pair_col2.has_value() || col.IsUnsigned() ||
+        col.IsInterval()) {
       return false;
     }
     if (pm.string_values != nullptr) {
@@ -1682,6 +1684,53 @@ bool TryParallelTableScan(
   const auto eval_prebuilt_membership_on_lstable =
       [&](const LSTablePageBlock& blk, uint32_t r,
           const PrebuiltMembershipPredicate& pred) -> bool {
+    if (pred.packed_pair_col2.has_value()) {
+      if (pred.values == nullptr ||
+          (pred.values->Empty() && !pred.contains_null)) {
+        return pred.negated;
+      }
+      const slot_t fc0 = to_full_col(pred.column);
+      const slot_t fc1 = to_full_col(*pred.packed_pair_col2);
+      if (fc0 >= blk.columns.size() || fc1 >= blk.columns.size()) {
+        return pred.negated;
+      }
+      const LSTableColumnBlock& c0 = blk.columns[fc0];
+      const LSTableColumnBlock& c1 = blk.columns[fc1];
+      if (c0.IsNull(r) || c1.IsNull(r) || c0.type != pred.domain_type ||
+          c1.type != pred.packed_pair_type2 || c0.is_unsigned ||
+          c1.is_unsigned) {
+        return pred.negated;
+      }
+      const int64_t k0 = c0.int_cells[r];
+      const int64_t k1 = c1.int_cells[r];
+      if (!std::in_range<int32_t>(k0) || !std::in_range<int32_t>(k1)) {
+        return pred.negated;
+      }
+      const uint64_t packed =
+          (static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(k0)))
+           << 32) |
+          static_cast<uint32_t>(static_cast<int32_t>(k1));
+      const bool found = pred.values->Contains(std::bit_cast<int64_t>(packed));
+      return pred.negated ? !found : found;
+    }
+    if (pred.distinct_witness_minmax != nullptr) {
+      const slot_t fk = to_full_col(pred.column);
+      const slot_t fw = to_full_col(pred.witness_column);
+      if (fk >= blk.columns.size() || fw >= blk.columns.size()) {
+        return pred.negated;
+      }
+      const LSTableColumnBlock& ck = blk.columns[fk];
+      const LSTableColumnBlock& cw = blk.columns[fw];
+      if (ck.IsNull(r) || cw.IsNull(r) || ck.type != pred.domain_type ||
+          cw.type != pred.witness_type || ck.is_unsigned || cw.is_unsigned) {
+        return pred.negated;
+      }
+      const auto* mm = pred.distinct_witness_minmax->Find(ck.int_cells[r]);
+      const int64_t ow = cw.int_cells[r];
+      const bool found =
+          (mm != nullptr) && (mm->first != ow || mm->second != ow);
+      return pred.negated ? !found : found;
+    }
     if (pred.runtime_filter != nullptr) {
       const slot_t full_col = to_full_col(pred.column);
       if (full_col >= blk.columns.size()) {
@@ -1947,6 +1996,7 @@ bool TryParallelTableScan(
       runtime_run_bounds =
           lstable_store->IntegerRunBounds(*lstable_key_column, interval.column);
       if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+        // NOLINTNEXTLINE(cert-err33-c) error intentionally ignored
         std::fprintf(stderr,
                      "[scan-bounds] key=%u value=%u rows=%zu null=%d min=%lld "
                      "max=%lld available=%d columnar=%zu total=%zu rss=%llu\n",
@@ -2009,6 +2059,7 @@ bool TryParallelTableScan(
       result->rows.empty() && !result->HasSpill() &&
       result->columnar == nullptr && !filter_unsigned_or_incomplete;
   if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+    // NOLINTNEXTLINE(cert-err33-c) error intentionally ignored
     std::fprintf(
         stderr,
         "[scan] rows=%llu estimate=%llu col_requested=%d sink=%d "
@@ -2188,7 +2239,7 @@ bool TryParallelTableScan(
               const slot_t col_idx = projection != nullptr
                                          ? (*projection)[k]
                                          : static_cast<slot_t>(k);
-              AppendLstableColumnSlice(ps.blk->columns[col_idx], lstable_store,
+              AppendLSTableColumnSlice(ps.blk->columns[col_idx], lstable_store,
                                        ps.src_offset, nullptr, ps.count,
                                        &out_chunk.columns[k], 0);
             }
@@ -2397,7 +2448,7 @@ bool TryParallelTableScan(
               const uint32_t* slice_sel = ps.sel_begin == ps.sel_end
                                               ? nullptr
                                               : (sel_all + ps.sel_begin);
-              AppendLstableColumnSlice(bc, lstable_store, ps.src_offset,
+              AppendLSTableColumnSlice(bc, lstable_store, ps.src_offset,
                                        slice_sel, ps.count, &dst, out_off);
               out_off += ps.count;
             }
@@ -2441,7 +2492,7 @@ bool TryParallelTableScan(
                 full_chunk.InitFromSchema(columnar_schema, 0);
                 full_chunk.rows = kColumnarChunkRows;
                 for (size_t k = 0; k < ncols; ++k) {
-                  AppendLstableColumnSlice(resolve_blk_col(k), lstable_store,
+                  AppendLSTableColumnSlice(resolve_blk_col(k), lstable_store,
                                            offset, nullptr, kColumnarChunkRows,
                                            &full_chunk.columns[k], 0);
                 }
@@ -2613,7 +2664,7 @@ bool TryParallelTableScan(
               ColumnarColumn& dst_col = cur_chunk.columns[k];
               switch (item.kind) {
                 case CompiledColumnarProjection::Kind::kPassThrough:
-                  AppendLstableColumnSlice(resolve_blk_col(item.src_col),
+                  AppendLSTableColumnSlice(resolve_blk_col(item.src_col),
                                            lstable_store,
                                            slice_sel == nullptr ? offset : 0,
                                            slice_sel, n, &dst_col, prev_rows);
@@ -2628,7 +2679,7 @@ bool TryParallelTableScan(
                   break;
                 }
                 case CompiledColumnarProjection::Kind::kSubstring:
-                  AppendLstableSubstringSlice(
+                  AppendLSTableSubstringSlice(
                       resolve_blk_col(item.src_col), lstable_store,
                       slice_sel == nullptr ? offset : 0, slice_sel, n,
                       item.substr_start, item.substr_length,
@@ -2660,7 +2711,7 @@ bool TryParallelTableScan(
                       for (size_t c = 0; c < in_cols; ++c) {
                         if (pushed_needed_by_bytecode[c] != 0) {
                           scan_scratch.fallback_row.values_[c] =
-                              ReadLstableCellValue(resolve_blk_col(c), r);
+                              ReadLSTableCellValue(resolve_blk_col(c), r);
                         }
                       }
                       StatusOr<Value> val_or = item.bytecode->TryEvaluateRow(
@@ -2680,6 +2731,7 @@ bool TryParallelTableScan(
                   }
                   break;
                 }
+                case CompiledColumnarProjection::Kind::kNullCoalesce:
                 case CompiledColumnarProjection::Kind::kFallback:
                   record_worker_error(
                       StatusError(StatusCode::kRuntimeError,
@@ -3021,6 +3073,7 @@ bool TryParallelTableScan(
                 proj_cols_buf[k] = cblk;
                 proj_types_buf[k] = cblk->type;
                 if (cblk->has_null || cblk->is_unsigned ||
+                    !cblk->HasRawIntCells() ||
                     (cblk->type != ValueType::kInt64 &&
                      cblk->type != ValueType::kDate &&
                      cblk->type != ValueType::kDouble)) {
@@ -3877,6 +3930,7 @@ bool TryParallelTableScan(
                     }
                     break;
                   }
+                  case CompiledColumnarProjection::Kind::kNullCoalesce:
                   case CompiledColumnarProjection::Kind::kFallback:
                     record_error(StatusError(
                         StatusCode::kRuntimeError,
@@ -3959,11 +4013,16 @@ bool TryParallelTableScan(
         shard_offsets[w + 1] = shard_offsets[w] + shards[w].rows.size();
       }
       result->rows.resize(total_in_memory);
+      std::vector<size_t> transferred_charges(workers, 0);
       {
         const auto move_shard = [&](size_t w) {
           std::move(shards[w].rows.begin(), shards[w].rows.end(),
                     result->rows.begin() +
                         static_cast<std::ptrdiff_t>(shard_offsets[w]));
+          // The bytes live in result now; hand over the budget charge
+          // instead of losing it when the shard is destroyed.
+          transferred_charges[w] = shards[w].charged_bytes_;
+          shards[w].charged_bytes_ = 0;
           shards[w].rows.clear();
           shards[w].rows.shrink_to_fit();
         };
@@ -3972,6 +4031,9 @@ bool TryParallelTableScan(
           record_error(merge_status);
           return false;
         }
+      }
+      for (size_t charge : transferred_charges) {
+        result->charged_bytes_ += charge;
       }
 
       result->peak_intermediate_rows =
@@ -3984,7 +4046,7 @@ bool TryParallelTableScan(
         result->rows.reserve(result->rows.size() + reserve_count);
       }
       // Workers decided every row except the deferred ones; move results and
-      // re-check the deferred rows with the contextful evaluator.
+      // re-check the deferred rows with the contextual evaluator.
       for (size_t w = 0; w < workers; ++w) {
         if (w < deferred_rows.size()) {
           for (Row& row : deferred_rows[w]) {
@@ -4031,13 +4093,22 @@ bool TryParallelTableScan(
     record_error(candidates.GetStatus());
     ScopedCorrelatedOuter correlated_outer(context, candidates);
     ColumnLookupCache lookup_cache;
-    record_error(candidates.ForEachRow([&](const Row& row) {
+    const bool moved = candidates.ForEachMutableRow([&](Row& row) {
       if (!MatchScanFilter(row, result_schema, residual_only, outer, context,
                            ctes, error, &lookup_cache)) {
         return;
       }
-      result->AddRow(row);
-    }));
+      result->AddRow(std::move(row));
+    });
+    if (!moved) {
+      record_error(candidates.ForEachRow([&](const Row& row) {
+        if (!MatchScanFilter(row, result_schema, residual_only, outer, context,
+                             ctes, error, &lookup_cache)) {
+          return;
+        }
+        result->AddRow(row);
+      }));
+    }
     candidates.ResetContents();
   } else {
     record_error(Relation::MergeShardsInto(shards, result));

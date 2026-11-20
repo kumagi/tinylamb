@@ -98,9 +98,9 @@ bool MultiIndexCoveringScanPlan::ContainsParameterSlots() const {
 }
 
 bool MultiIndexCoveringScanPlan::InstallParameterSlots(
-    const std::vector<Value>& parameters, size_t* cursor,
+    const std::vector<Value>& /*parameters*/, size_t* /*cursor*/,
     std::vector<Expression>* slots) {
-  return SlotizeInPlace(&where_, parameters, cursor, slots);
+  return CollectParameterSlots(&where_, slots);
 }
 
 }  // namespace tinylamb

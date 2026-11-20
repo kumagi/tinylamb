@@ -45,8 +45,8 @@ bool Constraint::operator==(const Constraint& rhs) const {
     case kForeign:
     case kCheck:
       // kForeign/kCheck carry the referenced table / checked expression in
-      // `value`; comparing only the kind made == agree with std::hash (which
-      // includes value) break for unordered containers.
+      // `value`; comparing only the kind made == disagree with std::hash
+      // (which includes value), breaking unordered containers.
       return rhs.ctype == ctype && value == rhs.value;
 
     default:
@@ -143,6 +143,11 @@ bool ParseForeignKeyReference(const Constraint& constraint, std::string* table,
       }
       parsed.push_back(std::move(col));
       pos = end + 1;
+    }
+    // A trailing comma ("t(a,)") leaves pos exactly on the closing ')':
+    // reject it instead of silently accepting the truncated column list.
+    if (pos == ref.size() - 1) {
+      return false;
     }
     if (parsed.empty()) {
       return false;

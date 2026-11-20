@@ -21,7 +21,8 @@ def read_run(directory, reference):
             samples = record[engine]['samples_ms']
             if len(samples) != manifest['repeats'] or any(not isinstance(s, (int, float)) or not math.isfinite(s) or s <= 0 for s in samples):
                 raise ValueError('invalid or missing measurement samples')
-            if statistics.median(samples) != record[engine]['median_ms']:
+            if not math.isclose(statistics.median(samples),
+                                record[engine]['median_ms'], rel_tol=1e-12):
                 raise ValueError('median does not match raw samples')
     return manifest, sorted(records, key=lambda r: r['query'])
 

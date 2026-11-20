@@ -17,9 +17,12 @@
 #ifndef TINYLAMB_TRANSACTION_CONTEXT_HPP
 #define TINYLAMB_TRANSACTION_CONTEXT_HPP
 
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
+#include "database/catalog_reader.hpp"
 #include "transaction/transaction.hpp"
 // #include "transaction/transaction_manager.hpp"
 
@@ -33,7 +36,7 @@ namespace relational_detail {
 struct ExecutionRuntime;
 }
 // expression/evaluation_context.hpp; forward declared so the database layer
-// keeps no include edge towards the expression layer (improvement3.md A1/S3).
+// keeps no include edge towards the expression layer.
 class EvaluationContext;
 
 class TransactionContext {
@@ -43,13 +46,29 @@ class TransactionContext {
       : txn_(std::move(txn)), catalog_(catalog) {}
   TransactionContext(const TransactionContext&) = delete;
   TransactionContext& operator=(const TransactionContext&) = delete;
-  TransactionContext(TransactionContext&&) = default;
+  TransactionContext(TransactionContext&& o) noexcept
+      : txn_(std::move(o.txn_)),
+        catalog_(o.catalog_),
+        tables_(std::move(o.tables_)),
+        stats_(std::move(o.stats_)),
+        evaluation_context_(o.evaluation_context_),
+        execution_runtime_(o.execution_runtime_) {
+    o.evaluation_context_ = nullptr;
+    o.execution_runtime_ = nullptr;
+  }
   TransactionContext& operator=(TransactionContext&& o) noexcept {
+    if (this == &o) {
+      return *this;
+    }
     txn_ = std::move(o.txn_);
     catalog_ = o.catalog_;
     // Caches belong to the old context; the moved-in txn must not reuse them.
+    // Clear the source too so a moved-from handle cannot observe stale
+    // snapshot-bound Table/Stats shared_ptrs (the move ctor moves them).
     tables_.clear();
     stats_.clear();
+    o.tables_.clear();
+    o.stats_.clear();
     evaluation_context_ = nullptr;
     execution_runtime_ = nullptr;
     return *this;
@@ -63,7 +82,18 @@ class TransactionContext {
   StatusOr<lsn_t> PrepareCommitForDurableReply() {
     return txn_.PrepareCommitForDurableReply();
   }
-  void Abort() { txn_.Abort(); }
+  Status Abort() {
+    const bool catalog_dirty = txn_.IsCatalogDirty();
+    Status status = txn_.Abort();
+    // T485: the rollback revives (or drops) uncommitted catalog entries,
+    // but the epoch counter never unwinds -- without the bump, a stamp
+    // taken from the transaction-local view would keep claiming that
+    // vanished state.
+    if (catalog_dirty && catalog_ != nullptr) {
+      catalog_->BumpCatalogEpoch();
+    }
+    return status;
+  }
   // True once the underlying transaction committed or aborted.
   [[nodiscard]] bool IsFinished() const { return txn_.IsFinished(); }
 
@@ -79,10 +109,36 @@ class TransactionContext {
     return evaluation_context_;
   }
 
+  class ScopedRuntimeOverride {
+   public:
+    ScopedRuntimeOverride(const TransactionContext& owner,
+                          relational_detail::ExecutionRuntime* runtime);
+    ScopedRuntimeOverride(const ScopedRuntimeOverride&) = delete;
+    ScopedRuntimeOverride& operator=(const ScopedRuntimeOverride&) = delete;
+    ScopedRuntimeOverride(ScopedRuntimeOverride&&) = delete;
+    ScopedRuntimeOverride& operator=(ScopedRuntimeOverride&&) = delete;
+    ~ScopedRuntimeOverride();
+
+   private:
+    const TransactionContext& owner_;
+    const TransactionContext* prev_owner_;
+    relational_detail::ExecutionRuntime* prev_runtime_;
+  };
+
   void set_execution_runtime(relational_detail::ExecutionRuntime* runtime) {
     execution_runtime_ = runtime;
   }
+  [[nodiscard]] relational_detail::ExecutionRuntime* raw_execution_runtime()
+      const {
+    return execution_runtime_;
+  }
   [[nodiscard]] relational_detail::ExecutionRuntime* execution_runtime() const {
+    if (runtime_override_depth_.load(std::memory_order_acquire) != 0) {
+      relational_detail::ExecutionRuntime* overridden = nullptr;
+      if (LookupThreadRuntimeOverride(this, &overridden)) {
+        return overridden;
+      }
+    }
     return execution_runtime_;
   }
 
@@ -95,6 +151,12 @@ class TransactionContext {
   std::unordered_map<std::string, std::shared_ptr<TableStatistics>> stats_;
 
  private:
+  static bool LookupThreadRuntimeOverride(
+      const TransactionContext* owner,
+      relational_detail::ExecutionRuntime** out);
+
+  mutable std::mutex cache_mutex_;
+  mutable std::atomic<uint32_t> runtime_override_depth_{0};
   EvaluationContext* evaluation_context_{nullptr};
   relational_detail::ExecutionRuntime* execution_runtime_{nullptr};
 };

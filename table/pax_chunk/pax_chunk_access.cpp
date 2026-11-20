@@ -2882,7 +2882,10 @@ bool CellIsNull(const PaxChunk::Footer& f, uint32_t g, uint32_t c,
   off +=
       static_cast<size_t>(c) * static_cast<size_t>((f.row_counts[g] + 7U) / 8U);
   if (off + (local >> 3) >= f.null_bitmaps.size()) {
-    return false;  // truncated
+    // Match RgColHasNull's defensive answer: a truncated null bitmap is
+    // treated as "may contain NULL" rather than silently reading raw 0 as
+    // a real value.
+    return true;  // truncated
   }
   const uint8_t b = f.null_bitmaps[off + (local >> 3)];
   return ((b >> (7 - (local & 7))) & 1) != 0;
@@ -5691,6 +5694,10 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
     case Scheme::kTemplate:
     case Scheme::kDStream:
     case Scheme::kChimp128:
+      // NOTE: kChimp128 has a scalar decoder (Int64AtFast), but unlike the
+      // other numeric schemes it has no random-access bracket here; falling
+      // through to "not found" would disagree with full decode. Callers must
+      // validate the region (ValidateWalk) before relying on this bound.
       break;
     case Scheme::kSimple8b: {
       // No random-access structure for a bisect, and the callers

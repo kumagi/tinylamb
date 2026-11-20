@@ -465,7 +465,7 @@ int main(int argc, char** argv) {
         // One worker only, diagnostics only. Never use traced latency/TPS in
         // comparisons: trace formatting and output alter the generator's pace.
         if (trace_sql && i == 0) {
-          static_cast<Session*>(session.get())
+          static_cast<Session*>(session.get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               ->TraceTransaction(++trace_sequence, t);
         }
         const auto before = Clock::now();

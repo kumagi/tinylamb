@@ -23,7 +23,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <ostream>
@@ -95,21 +97,35 @@ struct TransactionRuntimeStats {
   uint64_t table_tail_wait_ns{0};
   // Rows served by the index-only visibility-map fast path: a non-retained
   // index entry on a page with no version chains is answered from the
-  // B+Tree entry itself (key + INCLUDE payload) without the heap fetch
+  // index entry itself (key + INCLUDE payload) without the heap fetch
   // (see IndexScanIterator::TryReadIndexOnly).  A/B hatch:
   // TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP=1.
   uint64_t index_only_visible_serves{0};
   // Row pages warmed by the index-scan prefetcher (a second iterator runs a
-  // fixed distance ahead of the scan and fetches each upcoming page into the
-  // buffer pool, so the scan's own fetch is a pool hit).  A/B hatch:
+  // fixed distance ahead of the scan and warms each upcoming page through the
+  // PageManager, so the scan's own fetch finds it resident).  A/B hatch:
   // TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH=1.
   uint64_t index_scan_prefetch_pages{0};
+  // P6a (ADR 0008): transactions that dropped staged_records_ above the tx
+  // threshold into WAL re-read mode, plus bytes read back from WAL.
+  uint64_t wal_reread_activations{0};
+  uint64_t wal_reread_bytes{0};
+  // P6a: TransactionWriteSet spill transitions and total RowPosition bytes
+  // written to SpillStore for large transactions.
+  uint64_t write_set_spills{0};
+  uint64_t write_set_spilled_bytes{0};
+  // P6b: Cold MVCC version payload spills to SpillStore and currently resident
+  // inline MVCC payload bytes.
+  uint64_t version_spills{0};
+  uint64_t version_spill_bytes{0};
+  uint64_t version_payload_resident_bytes{0};
 };
 
 class Logger;
 class PageManager;
 class Transaction;
 class RecoveryManager;
+class SpillStore;
 enum class TransactionStatus : uint_fast8_t;
 struct LogRecord;
 struct RowPosition;
@@ -151,7 +167,7 @@ class TransactionManager {
 
   // With a target pointer, publish/finish the transaction and return the
   // explicit own+dependency barrier to the caller instead of waiting here.
-  // No externally visible reply may precede WaitForWALDurable(*target).
+  // No externally visible reply may precede WaitForWalDurable(*target).
   Status PreCommit(Transaction& txn,
                    lsn_t* external_durability_target = nullptr);
 
@@ -169,8 +185,10 @@ class TransactionManager {
   // Deadlock prevention/detection policy for write-intent acquisition.
   //   kWaitDie       -- an older transaction may wait for a younger holder;
   //                     a younger transaction aborts itself instead of waiting.
-  //                     This is conservative (no victim is rolled back while
-  //                     making progress), so the wait queue is FIFO by id.
+  //                     Conservative (no victim is rolled back while making
+  //                     progress) and deadlock-free by construction. There is
+  //                     no explicit FIFO queue: waiters re-check availability
+  //                     on each shard condition-variable broadcast.
   //   kWoundWait     -- a younger transaction is preempted: the older
   //                     arriving transaction aborts its younger holder and
   //                     takes the lock. Starves younger long transactions
@@ -236,7 +254,7 @@ class TransactionManager {
   }
   // Upper bound for the durability-stall extension of the write-intent
   // escape hatch (see ExtendIntentDeadlineForDurabilityBarrier).  The twin
-  // of LockManager::kDurabilityWaitFloor: a stalled fsync must not turn
+  // of the durability-intent wait floor: a stalled fsync must not turn
   // innocent waiters into spurious latch-cycle victims, but a genuine cycle
   // still cannot outwait this bound.
   static constexpr std::chrono::milliseconds kDurabilityIntentWaitFloor{60'000};
@@ -270,7 +288,7 @@ class TransactionManager {
   // wait loops consult.  Every engine-side fsync wait should go through this
   // (PreCommit barriers, write-back gates) so a stalled disk reads as "the
   // system is slow", not "my holder is deadlocked".
-  Status WaitForWALDurable(lsn_t lsn);
+  Status WaitForWalDurable(lsn_t lsn);
   [[nodiscard]] TransactionRuntimeStats RuntimeStats() const;
   [[nodiscard]] bool FailStopped() const {
     return fail_stop_.load(std::memory_order_acquire);
@@ -292,7 +310,29 @@ class TransactionManager {
       std::optional<std::string_view> before = std::nullopt);
   [[nodiscard]] bool HasForeignWriteIntent(const Transaction& txn,
                                            const RowPosition& rp) const;
+  [[nodiscard]] bool HoldsWriteIntent(const Transaction& txn,
+                                      const RowPosition& rp) const;
   Status WaitForRowWriteIntent(Transaction& txn, const RowPosition& rp);
+
+  void SetWalRereadThresholdBytesForTest(size_t bytes) noexcept {
+    wal_reread_threshold_bytes_.store(bytes, std::memory_order_release);
+  }
+  void SetWriteSetSpillThresholdForTest(size_t entries) noexcept {
+    write_set_spill_threshold_entries_.store(entries,
+                                             std::memory_order_release);
+  }
+  void SetVersionSpillThresholdBytesForTest(size_t bytes) noexcept {
+    version_spill_threshold_bytes_.store(bytes, std::memory_order_release);
+  }
+  void SetGcPinWarnThresholdsForTest(uint64_t chain_limit,
+                                     uint64_t age_commits) noexcept {
+    gc_pin_warn_chain_limit_.store(chain_limit, std::memory_order_release);
+    gc_pin_warn_age_commits_.store(age_commits, std::memory_order_release);
+    last_gc_pin_warn_ms_.store(0, std::memory_order_release);
+  }
+  [[nodiscard]] uint64_t GcPinWarnCountForTest() const noexcept {
+    return gc_pin_warn_count_.load(std::memory_order_acquire);
+  }
 
   [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
     return commit_timestamp_.load();
@@ -431,6 +471,12 @@ class TransactionManager {
   // aborting holder instead of riding the full wait limit -- see
   // Transaction::MarkAbortStarted.
   [[nodiscard]] bool IsAborting(txn_id_t id) const;
+  // True while |id| is registered and has not flipped to kCommitted (still
+  // running, or aborting).  Such a transaction has no published commit
+  // timestamp, so none of its writes is visible to any live snapshot: the
+  // kCommitted store precedes AllocatePendingCommit/PublishCommit, and a
+  // snapshot that could see the commit acquired stable_timestamp_ after it.
+  [[nodiscard]] bool IsRunningUncommitted(txn_id_t id) const;
   void RegisterVersionWrite(Transaction& txn, const RowPosition& rp,
                             std::optional<std::string_view> before,
                             std::optional<std::string_view> after);
@@ -491,6 +537,15 @@ class TransactionManager {
   void DisableIndexKeyTracking() {
     index_key_tracking_complete_.store(false, std::memory_order_release);
   }
+  // T3846 test hook: reports the per-shard eviction watermark and whether
+  // precision was revoked.  A revoked shard must carry a watermark covering
+  // everything it dropped so a future re-enable cannot trust stale history.
+  [[nodiscard]] std::pair<uint64_t, bool> IndexKeyHistoryStateForTest(
+      page_id_t index_root) const {
+    const IndexKeyHistory& history =
+        index_key_history_[IndexMutationShardIndex(index_root)];
+    return {history.forgotten_through_ts, history.precise};
+  }
   [[nodiscard]] IndexReadGuard AcquireIndexReadGuard(
       page_id_t index_root) const;
   [[nodiscard]] std::unique_lock<std::shared_mutex> AcquireIndexWriteGuard(
@@ -518,10 +573,34 @@ class TransactionManager {
 
   std::unordered_map<txn_id_t, Transaction*> active_transactions_;
   std::atomic<txn_id_t> next_txn_id_ = 1;
+  struct SpilledVersionSegment {
+    std::shared_ptr<SpillStore> store;
+    uint64_t segment_id{0};
+    SpilledVersionSegment(std::shared_ptr<SpillStore> s, uint64_t id);
+    SpilledVersionSegment(const SpilledVersionSegment&) = delete;
+    SpilledVersionSegment& operator=(const SpilledVersionSegment&) = delete;
+    SpilledVersionSegment(SpilledVersionSegment&&) = delete;
+    SpilledVersionSegment& operator=(SpilledVersionSegment&&) = delete;
+    ~SpilledVersionSegment();
+  };
+  struct VersionPayload {
+    bool has_value{false};
+    bool spilled{false};
+    uint64_t seq{0};
+    std::string inline_data;
+    std::shared_ptr<const SpilledVersionSegment> spilled_segment;
+    uint64_t spill_offset{0};
+    uint32_t spill_length{0};
+    uint32_t spill_crc32{0};
+
+    [[nodiscard]] size_t InlineBytes() const noexcept {
+      return (!spilled && has_value) ? inline_data.size() : 0;
+    }
+  };
   struct CommittedVersion {
     uint64_t begin_ts{0};
     uint64_t end_ts{std::numeric_limits<uint64_t>::max()};
-    std::optional<std::string> value;
+    VersionPayload payload;
     // D4 (docs/design.md): the durable point of the commit record that made
     // this version visible (Logger::BufferedLSN() after the commit AddLog).
     // Readers record it as a dependency LSN and the commit path waits for it
@@ -531,7 +610,7 @@ class TransactionManager {
   struct PendingVersion {
     txn_id_t owner{0};
     std::thread::id owner_thread{};
-    std::optional<std::string> value;
+    VersionPayload payload;
     bool staged{false};
   };
   struct VersionChain {
@@ -603,7 +682,7 @@ class TransactionManager {
   // Lock-free scan fast path: a zero shard counter proves the row's page has
   // no version chain anywhere in the shard, so its physical image is the
   // only version and ReadVersion can serve it without locking a shard.
-  // ReadTransaction::ReadVersion uses this instead of a full HasVersionChain
+  // Transaction::ReadVersion uses this instead of a full HasVersionChain
   // probe (which would take the shard mutex just to confirm what the caller
   // resolves again in TransactionManager::ReadVersion).
   [[nodiscard]] bool VersionShardIdle(const RowPosition& rp) const {
@@ -630,6 +709,12 @@ class TransactionManager {
   }
   std::array<IndexReservationShard, kIndexReservationShardCount>
       index_reservations_;
+  // Total live (shard, page, owner) reservation entries across all shards.
+  // Incremented under the owning shard mutex on insert, decremented on erase.
+  // Lets HasForeignIndexReservations fast-path the drained (empty) case with
+  // a single relaxed load instead of locking all 64 shard mutexes -- the hot
+  // path for drain waiters re-evaluating every 25 ms slice.
+  mutable std::atomic<size_t> index_reservation_owner_entries_{0};
   // Signaled after any reservation release for the coarse drain wait. The
   // notify takes this mutex alone (never nested with a shard mutex), so the
   // wait path's drain_mu_ -> shard-mutex order has no inverse.
@@ -643,6 +728,14 @@ class TransactionManager {
   void CommitIndexMutations(Transaction& txn, uint64_t commit_ts);
   void ClearPendingIndexMutations(Transaction& txn);
   void ReleasePendingIndexMutation(size_t shard);
+  // T3846: Disable() must advance the shard's forgotten_through_ts like
+  // eviction does; commit_timestamp_ + 1 bounds every change the history is
+  // about to forget (pending keys commit strictly later, committed keys
+  // already landed no newer).
+  [[nodiscard]] uint64_t ForgetThroughTsForDisable() const noexcept {
+    return commit_timestamp_.load(std::memory_order_acquire) + 1;
+  }
+
   void FinishIndexKeyChanges(txn_id_t owner, page_id_t index_root,
                              std::optional<uint64_t> commit_ts);
 
@@ -695,8 +788,20 @@ class TransactionManager {
     uint64_t forgotten_through_ts{0};
     std::vector<PendingIndexKeys> pending;
     std::deque<CommittedIndexKey> committed;
-    void Disable() noexcept {
+    // T3846: dropping keys MUST advance the watermark exactly like eviction
+    // (FinishIndexKeyChanges) does, or a future "re-enable precision" path
+    // would trust a history whose discarded keys are not covered by
+    // forgotten_through_ts -- older snapshots would skip the stale-root
+    // fallback for changes they cannot see.  `forget_through_ts` is the
+    // commit timestamp every discarded/uncommitted change lands strictly
+    // after (commit_timestamp_ + 1 at the call site): pending keys commit
+    // later than any snapshot that is not already covered, and committed
+    // keys being dropped are at most that old.
+    void Disable(uint64_t forget_through_ts) noexcept {
       precise = false;
+      if (forget_through_ts > forgotten_through_ts) {  // NOLINT(readability-use-std-min-max)
+        forgotten_through_ts = forget_through_ts;
+      }
       pending.clear();
       committed.clear();
       pending_bytes = pending_keys = history_bytes = 0;
@@ -744,6 +849,92 @@ class TransactionManager {
   std::atomic<uint64_t> write_intent_mutex_wait_ns_{0};
   std::atomic<uint64_t> commit_shard_mutex_wait_ns_{0};
 
+  // P6a: WAL re-read mode & spillable TransactionWriteSet support.
+  static constexpr size_t kDefaultWalRereadThresholdBytes = size_t{4} << 20;
+  static constexpr size_t kDefaultWriteSetSpillEntries = 4096;
+  std::atomic<size_t> wal_reread_threshold_bytes_{
+      kDefaultWalRereadThresholdBytes};
+  std::atomic<size_t> write_set_spill_threshold_entries_{
+      kDefaultWriteSetSpillEntries};
+  std::atomic<uint64_t> wal_reread_activations_{0};
+  mutable std::atomic<uint64_t> wal_reread_bytes_{0};
+  std::atomic<uint64_t> write_set_spills_{0};
+  std::atomic<uint64_t> write_set_spilled_bytes_{0};
+  mutable std::mutex write_set_spill_mu_;
+  std::shared_ptr<SpillStore> write_set_spill_store_;
+
+  // P6b: Cold MVCC version payload spill support.
+  static constexpr size_t kDefaultVersionSpillThresholdBytes = size_t{4} << 20;
+  static constexpr size_t kVersionSpillSegmentBytes = size_t{256} << 10;
+  std::atomic<size_t> version_spill_threshold_bytes_{
+      kDefaultVersionSpillThresholdBytes};
+  std::atomic<uint64_t> next_version_payload_seq_{1};
+  std::atomic<uint64_t> version_payload_resident_bytes_{0};
+  std::atomic<size_t> version_payload_kTx_charged_{0};
+  std::atomic<uint64_t> version_spills_{0};
+  std::atomic<uint64_t> version_spill_bytes_{0};
+  std::atomic<bool> version_spill_running_{false};
+  std::atomic<size_t> version_spill_shard_cursor_{0};
+  mutable std::mutex version_spill_mu_;
+  std::shared_ptr<SpillStore> version_spill_store_;
+  std::shared_ptr<SpilledVersionSegment> active_version_segment_;
+  size_t active_version_segment_bytes_{0};
+  std::atomic<int64_t> last_version_spill_warn_ms_{0};
+
+  [[nodiscard]] size_t EffectiveVersionSpillThresholdBytes() const noexcept;
+  void AddVersionPayloadBytes(size_t bytes) noexcept;
+  void ReleaseVersionPayloadBytes(size_t bytes) noexcept;
+  void AssignInlinePayload(VersionPayload* dst,
+                           std::optional<std::string> value) noexcept;
+  void AssignInlinePayloadView(VersionPayload* dst,
+                               std::optional<std::string_view> value);
+  bool InstallBaseBeforeImageLocked(VersionChain* chain,
+                                    std::optional<std::string_view> before);
+  [[nodiscard]] static StatusOr<std::optional<std::string>>
+  ReadSpilledVersionPayload(
+      const std::shared_ptr<const SpilledVersionSegment>& segment,
+      uint64_t offset, uint32_t length, uint32_t crc32);
+  void ReleaseChainPayloadBytes(const VersionChain& chain) noexcept;
+  void MaybeSpillColdVersionPayloads();
+  void SpillColdVersionPayloadsLockedSweep();
+  void ResetActiveVersionSegmentIfIdle() noexcept;
+
+  [[nodiscard]] bool CanWalReread() const noexcept {
+    return logger_ != nullptr && recovery_ != nullptr;
+  }
+  [[nodiscard]] size_t EffectiveWalRereadThresholdBytes() const noexcept;
+  [[nodiscard]] size_t EffectiveWriteSetSpillThresholdEntries() const noexcept;
+  [[nodiscard]] std::shared_ptr<SpillStore> GetOrCreateWriteSetSpillStore();
+  void RecordWalRereadActivation() noexcept {
+    wal_reread_activations_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void RecordWalRereadBytes(size_t bytes) const noexcept {
+    wal_reread_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+  void RecordWriteSetSpill(uint64_t bytes, bool initial_spill) noexcept {
+    if (initial_spill) {
+      write_set_spills_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (bytes > 0) {
+      write_set_spilled_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+  }
+  bool ReadWalRecordAt(lsn_t lsn, LogRecord* dst,
+                       size_t* bytes_read_out = nullptr) const;
+  bool WalkWalRecordsForward(
+      txn_id_t owner, lsn_t first_lsn, lsn_t end_lsn,
+      const std::function<void(lsn_t, LogRecord&)>& on_record,
+      const char* caller_name) const;
+  void ApplyTransactionAbortRecords(Transaction& txn);
+  Status ApplyTransactionCommitRecords(Transaction& txn, lsn_t commit_start,
+                                       lsn_t commit_end);
+  bool FindPendingLsmWriteViaWal(const Transaction& txn, page_id_t root,
+                                 std::string_view key, std::string* value,
+                                 bool* deleted) const;
+  void ForEachPendingLsmWriteViaWal(
+      const Transaction& txn, page_id_t root, std::string_view key,
+      const std::function<void(const LogRecord&)>& fn) const;
+
   // Background GC (declared last so the worker thread only starts after
   // every member it may touch is fully constructed).
   std::atomic<uint64_t> commits_since_gc_{0};
@@ -754,12 +945,15 @@ class TransactionManager {
   std::condition_variable gc_cv_;
   std::thread gc_worker_;
   // Rate limiting for MaybeWarnGcPin; steady_clock milliseconds.
+  std::atomic<uint64_t> gc_pin_warn_chain_limit_{kGcFullScanChainLimit};
+  std::atomic<uint64_t> gc_pin_warn_age_commits_{kGcPinWarnAgeCommits};
   std::atomic<int64_t> last_gc_pin_warn_ms_{0};
+  std::atomic<uint64_t> gc_pin_warn_count_{0};
   static constexpr std::chrono::milliseconds kGcPinWarnInterval{10 * 60 * 1000};
 
   // ---- deadlock policy & wait-for graph ----
   // Default is kDeadlockDetect: the wait-for graph detector resolves a
-  // genuine deadlock in ~one detector tick (2 ms) by wounding the youngest
+  // genuine deadlock in ~one detector backstop interval by wounding the youngest
   // participant, while kLegacy leaves a cycle to the 5 s write-intent
   // escape hatch -- measured on TPC-C (W=2, 32 clients) that turns every
   // cycle into a 5-second stall plus a full undo walk, 12x more engine

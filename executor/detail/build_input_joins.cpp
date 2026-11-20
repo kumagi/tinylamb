@@ -211,6 +211,14 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
     const Status iteration = elements.ForEachRow([&](const Row& element_row) {
       const size_t this_element = element_index++;
       Row combined = row + element_row;
+      if (combined.values_.size() > output.schema.ColumnCount()) {
+        // A later element row expanded to more columns than the schema
+        // initialized from the first row; truncating would silently drop data.
+        elements_status =
+            StatusError(StatusCode::kInvalidArgument,
+                        "LATERAL element row is wider than output schema");
+        return;
+      }
       combined.values_.resize(output.schema.ColumnCount());
       if (condition) {
         Scope combined_scope{
@@ -947,7 +955,7 @@ StatusOr<std::optional<Relation>> TryMaterializedStarJoin(
     }
     Relation& dim_rel = relations[dim.relation];
     if (!columnar_output && dim_rel.HasColumnarOnly()) {
-      dim_rel.EnsureRowsMaterialized();
+      RETURN_IF_FAIL(dim_rel.EnsureRowsMaterialized());
     }
     const auto type = dim_rel.schema.GetColumn(dim.key_column).Type();
     dim.key_type = type;
@@ -1086,7 +1094,7 @@ StatusOr<std::optional<Relation>> TryMaterializedStarJoin(
     }
   }
   if (!columnar_output && relations[fact].HasColumnarOnly()) {
-    relations[fact].EnsureRowsMaterialized();
+    RETURN_IF_FAIL(relations[fact].EnsureRowsMaterialized());
   }
   const bool fact_is_columnar = relations[fact].HasColumnarOnly();
   const size_t total = relations[fact].TotalRows();
@@ -1949,7 +1957,7 @@ StatusOr<std::optional<Relation>> TryMaterializedStarJoin(
   }
   for (const Dimension& dim : dimensions) {
     if (relations[dim.relation].HasColumnarOnly()) {
-      relations[dim.relation].EnsureRowsMaterialized();
+      RETURN_IF_FAIL(relations[dim.relation].EnsureRowsMaterialized());
     }
   }
   bool all_inputs_uniform =
@@ -2121,7 +2129,8 @@ void ReduceUnmatchedOuterProbes(TransactionContext& context,
     if (!predicate.resolved || predicate.contains_query ||
         predicate.sources.size() != relations.size() - 1 ||
         predicate.sources.contains(0) ||
-        !SafeToReduceEvaluationCount(predicate.expression)) {
+        !SafeToReduceEvaluationCountWithSchema(predicate.expression,
+                                               combined)) {
       continue;
     }
     const auto value =

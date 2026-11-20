@@ -2337,7 +2337,7 @@ uint32_t HuffDictLenAt(const HuffDictRegion& r, uint32_t s) {
   return HuffDictLenAtRaw(r.lens, s);
 }
 
-int64_t HuffDictDictAt(const HuffDictRegion& r, uint32_t s) {
+int64_t HuffDictAt(const HuffDictRegion& r, uint32_t s) {
   return static_cast<int64_t>(
       ReadBE64(reinterpret_cast<const char*>(r.dict) +
                (static_cast<size_t>(s) * sizeof(int64_t))));
@@ -2543,7 +2543,7 @@ int64_t HuffDictValueAt(const HuffDictRegion& v, uint32_t i) {
   if (sym >= v.d) {
     return 0;  // unreachable on a Kraft-complete table
   }
-  return HuffDictDictAt(v, sym);
+  return HuffDictAt(v, sym);
 }
 
 // Whole-cell decode: one forward pass from bit 0 (the checkpoints exist for
@@ -2555,7 +2555,7 @@ void DecodeHuffDictAll(const HuffDictRegion& v, int64_t* out) {
                    reinterpret_cast<const char*>(v.stream + v.stream_len));
   for (uint32_t i = 0; i < v.n; ++i) {
     const uint32_t sym = HuffDictDecodeSym(t, br);
-    out[i] = sym < v.d ? HuffDictDictAt(v, sym) : 0;
+    out[i] = sym < v.d ? HuffDictAt(v, sym) : 0;
   }
 }
 
@@ -2653,6 +2653,9 @@ bool ParseS4Region(const char* r, uint32_t n, uint32_t param, const char* end,
   if (S4HeaderBytes(n) > static_cast<uint64_t>(end - r)) {
     return false;
   }
+  // NOTE: the per-block checkpoint word (ckpt[b]) is not validated here;
+  // S4ValueAt replays from it while DecodeS4All starts from `base`. A caller
+  // that bypasses ValidateWalk can therefore see divergent point/full reads.
   if (static_cast<uint32_t>(static_cast<uint8_t>(r[8])) != nblk) {
     return false;
   }

@@ -18,6 +18,7 @@
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
+#include "transaction/transaction.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
@@ -63,13 +64,6 @@ ParallelMergeJoin::ParallelMergeJoin(
       residual_schema_(std::move(residual_schema)),
       right_width_(right_width),
       left_width_(left_width) {}
-
-bool ParallelMergeJoin::KeyIsNull(const Row& row,
-                                  const std::vector<slot_t>& cols) {
-  return std::ranges::any_of(cols, [&row](slot_t col) {
-    return col < row.Count() && row[col].IsNull();
-  });
-}
 
 bool ParallelMergeJoin::KeyCannotMatch(const Row& row,
                                        const std::vector<slot_t>& cols) {
@@ -437,7 +431,12 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
     }
   }
 
+  // Row is just a vector shell; charge the VARCHAR/ARRAY payloads too (as
+  // HashJoin / BatchNestedLoopJoin do) so OOC spill decisions see real RSS.
   size_t bytes = output_.size() * sizeof(std::pair<Row, RowPosition>);
+  for (const auto& item : output_) {
+    bytes += EstimateRowBytes(item.first);
+  }
   charge_.Add(bytes);
 }
 
@@ -470,11 +469,21 @@ void ParallelMergeJoin::EnsureMaterialized() {
 
   DataChunk batch;
   while (left_ && left_->NextBatch(&batch) != 0) {
+    if (const Status st = Transaction::CheckThreadStatementTimeout();
+        st != Status::kSuccess) {
+      FailWith(st);
+      return;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       left_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }
   }
   while (right_ && right_->NextBatch(&batch) != 0) {
+    if (const Status st = Transaction::CheckThreadStatementTimeout();
+        st != Status::kSuccess) {
+      FailWith(st);
+      return;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }

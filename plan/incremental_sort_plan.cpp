@@ -85,13 +85,32 @@ bool IncrementalSortPlan::IsOrderedBy(
 
 void IncrementalSortPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << ToString() << "\n";
-  child_->Dump(output, indent + 2);
+  DumpChild(output, *child_, indent + 2);
 }
 
 std::string IncrementalSortPlan::ToString() const {
   std::string result = "IncrementalSort";
-  if (!prefix_keys_.empty() && prefix_keys_.front().expression) {
-    result += " presorted=" + prefix_keys_.front().expression->ToString();
+  auto append_keys = [&](std::string_view label, const auto& keys) {
+    result += " " + std::string(label) + "=";
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (i != 0) {
+        result += ",";
+      }
+      result += keys[i].expression ? keys[i].expression->ToString() : "<null>";
+      result += keys[i].ascending ? " ASC" : " DESC";
+      if (keys[i].nulls_first.has_value()) {
+        result += *keys[i].nulls_first ? " NULLS FIRST" : " NULLS LAST";
+      }
+      if (keys[i].collation == Collation::kCaseInsensitive) {
+        result += " COLLATE und:ci";
+      }
+    }
+  };
+  if (!prefix_keys_.empty()) {
+    append_keys("presorted", prefix_keys_);
+  }
+  if (!suffix_keys_.empty()) {
+    append_keys("sorting", suffix_keys_);
   }
   return result;
 }

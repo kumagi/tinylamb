@@ -156,6 +156,10 @@ bool UnnestExecutor::NextRow(Row* dst, RowPosition* rp) {
     }
     relational_detail::CteMap ctes;
 
+    if (!unnest_expr_) {
+      return FailWith(StatusError(StatusCode::kInvalidArgument,
+                                  "UNNEST expression is missing"));
+    }
     StatusOr<Value> evaluated = relational_detail::TryEvaluate(
         unnest_expr_, scope, nullptr, ctx_, ctes);
     if (!evaluated.HasValue()) {

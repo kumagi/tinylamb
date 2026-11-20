@@ -44,7 +44,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P6a 実装済み: `transaction
 ## 影響
 
 - 実行時 Abort が WAL を読むようになる。`recovery_invariants.md` の
-  「Runtime abort and replay」節（現在は「WAL の鎖を読まない」と書いてある）を実装と同時に直す。
+  「Runtime abort and replay」節は実装時に更新済み（WAL の prev_lsn 鎖を後ろ向きに読む記述へ）。
 - しきい値の初期値は 4 MiB とし、`tx` プールの予約から払う
   （[ADR 0003](0003-memory-budget-thresholds.md)）。
 - 読み戻しモードに入った回数と読み戻したバイト数を統計に出す。

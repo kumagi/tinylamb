@@ -29,6 +29,7 @@
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "gtest/gtest.h"
+#include "type/collation.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -38,6 +39,25 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+// P186: the rewriter's per-child "changed" gate is pointer identity — cheap,
+// but only sound while a rule that does not fire returns its input pointer
+// and an unchanged node is returned as-is.  Pin that contract so a future
+// rule that structurally copies on every pass (which would silently rebuild
+// whole trees per iteration) fails here instead.
+TEST(ExpressionRewriteTest, NoOpRewritePreservesPointerIdentity) {
+  const ExpressionRuleSet& rules = ExpressionRuleSet::Default();
+  Expression column = ColumnValueExp("a");
+  Expression simple_cmp = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kGreaterThan, ColumnValueExp("b"));
+  Expression in_exp = InExpressionExp(
+      ColumnValueExp("a"), std::vector<Expression>{ColumnValueExp("b")});
+
+  EXPECT_EQ(ExpressionRewriter(rules).Rewrite(column).get(), column.get());
+  EXPECT_EQ(ExpressionRewriter(rules).Rewrite(simple_cmp).get(),
+            simple_cmp.get());
+  EXPECT_EQ(ExpressionRewriter(rules).Rewrite(in_exp).get(), in_exp.get());
+}
 
 TEST(ExpressionRewriteTest, DefaultRulesFoldAndNormalizeRecursively) {
   Expression expression = BinaryExpressionExp(
@@ -1233,6 +1253,21 @@ TEST(ExpressionRewriteTest, TypedConstantReassociationStaysExact) {
       BinaryOperation::kAdd, ConstantValueExp(Value(3)));
   EXPECT_EQ(rewritten(mixed_sub_add)->ToString(), mixed_sub_add->ToString());
 
+  // A mixed-sign pair anywhere in a longer chain blocks the whole collapse:
+  // `((i - 5) + 3) - 2` underflows on its `i - 5` intermediate for
+  // x = INT64_MIN + 4, where the collapsed `i - 4` would return INT64_MIN.
+  const Expression mixed_chain = BinaryExpressionExp(
+      BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kSubtract,
+                                              ConstantValueExp(Value(5))),
+                          BinaryOperation::kAdd, ConstantValueExp(Value(3))),
+      BinaryOperation::kSubtract, ConstantValueExp(Value(2)));
+  EXPECT_EQ(rewritten(mixed_chain)->ToString(), mixed_chain->ToString());
+  EXPECT_THROW(
+      static_cast<void>(mixed_chain->Evaluate(
+          Row({Value(std::numeric_limits<int64_t>::min() + 4), Value(0.0)}),
+          schema)),
+      std::runtime_error);
+
   // Chains collapse through the rewritten inner form.
   expect_form(BinaryExpressionExp(
                   BinaryExpressionExp(
@@ -1420,6 +1455,37 @@ TEST(ExpressionRewriteTest, WildcardFreeLikeBecomesEquality) {
                           ConstantValueExp(Value("a_c")));
   EXPECT_EQ(rewrite(like_underscore)->AsBinaryExpression().Op(),
             BinaryOperation::kLike);
+}
+
+// Issue 5038: `x LIKE INTERVAL 'pat'` must keep the LIKE. Folding it to
+// `x = 'pat'` ADDS a throw: the INTERVAL/STRING comparison guard fires when
+// exactly one side carries the interval flag, while LIKE ignores the flag.
+// The bytecode compiler folds before evaluating, so the AST reference
+// answers FALSE where the VM raises "INTERVAL/STRING type mismatch".
+TEST(ExpressionRewriteTest, LikeOfIntervalConstantDoesNotFoldToEquality) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  const Value interval_pattern = Value("-0-1 -1 0:0:0").WithInterval();
+
+  Expression like_interval =
+      BinaryExpressionExp(ColumnValueExp("col_s"), BinaryOperation::kLike,
+                          ConstantValueExp(interval_pattern));
+  EXPECT_EQ(rewrite(like_interval)->AsBinaryExpression().Op(),
+            BinaryOperation::kLike);
+
+  Expression not_like_interval =
+      BinaryExpressionExp(ColumnValueExp("col_s"), BinaryOperation::kNotLike,
+                          ConstantValueExp(interval_pattern));
+  EXPECT_EQ(rewrite(not_like_interval)->AsBinaryExpression().Op(),
+            BinaryOperation::kNotLike);
+
+  // Plain varchar patterns still fold -- the rule's whole purpose.
+  Expression like_plain =
+      BinaryExpressionExp(ColumnValueExp("col_s"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("abc")));
+  EXPECT_EQ(rewrite(like_plain)->AsBinaryExpression().Op(),
+            BinaryOperation::kEquals);
 }
 
 TEST(ExpressionRewriteTest, NullCheckCompositionCollapsesToConstant) {
@@ -1931,11 +1997,28 @@ TEST(ExpressionRewriteTest, IntervalNormalize) {
   ASSERT_EQ(rewritten_mul2->Type(), TypeTag::kIntervalExp);
   EXPECT_EQ(rewritten_mul2->AsIntervalExpression().GetIntervalValue().days, 6);
 
-  // - INTERVAL '5' DAY -> INTERVAL '-5' DAY
+  // T637: 768614336404564650 YEAR * 2 -> amount 1.54e18 fits INT64 but the
+  // YEAR->months conversion (x12) overflows, so the product is not a valid
+  // interval. The raw fast path must bail out unfolded instead of throwing
+  // from the eager IntervalValue::Parse inside the IntervalExpression ctor.
+  Expression huge_year =
+      IntervalExpressionExp(int64_t{768614336404564650}, "year");
+  Expression mul_huge =
+      BinaryExpressionExp(huge_year, BinaryOperation::kMultiply,
+                          ConstantValueExp(Value(int64_t{2})));
+  Expression rewritten_mul_huge = rewriter.Rewrite(mul_huge);
+  EXPECT_EQ(rewritten_mul_huge->Type(), TypeTag::kBinaryExp);
+  Expression mul_huge2 =
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{2})),
+                          BinaryOperation::kMultiply, huge_year);
+  Expression rewritten_mul_huge2 = rewriter.Rewrite(mul_huge2);
+  EXPECT_EQ(rewritten_mul_huge2->Type(), TypeTag::kBinaryExp);
+
+  // - INTERVAL '5' DAY stays unfolded: the AST evaluator rejects unary minus
+  // on an interval, and folding it would hide that error.
   Expression neg_iv = UnaryExpressionExp(iv5, UnaryOperation::kMinus);
   Expression rewritten_neg = rewriter.Rewrite(neg_iv);
-  ASSERT_EQ(rewritten_neg->Type(), TypeTag::kIntervalExp);
-  EXPECT_EQ(rewritten_neg->AsIntervalExpression().GetIntervalValue().days, -5);
+  EXPECT_EQ(rewritten_neg->Type(), TypeTag::kUnaryExp);
 
   // JUSTIFY_HOURS(INTERVAL '30' HOUR)
   Expression iv30h = IntervalExpressionExp(30, "hour");
@@ -2198,15 +2281,99 @@ TEST(ExpressionRewriteTest, RegexpPrefixExtraction) {
       rewritten2->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
       Value("hello"));
 
-  // REGEXP_MATCH(str, '^test') -> str LIKE 'test%'
+  // REGEXP_MATCH(str, '^test') -> str = 'test': regex_match anchors both
+  // ends, so an empty remainder is literal equality, not a prefix.
   Expression fn3 =
       FunctionCallExp("regexp_match", {str, ConstantValueExp(Value("^test"))});
   Expression rewritten3 = rewriter.Rewrite(fn3);
   ASSERT_EQ(rewritten3->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten3->AsBinaryExpression().Op(), BinaryOperation::kLike);
+  EXPECT_EQ(rewritten3->AsBinaryExpression().Op(), BinaryOperation::kEquals);
   EXPECT_EQ(
       rewritten3->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value("test"));
+
+  // REGEXP_MATCH(str, '^test.*') -> str LIKE 'test%': under full-match
+  // semantics '.*' consumes any suffix, so the literal prefix is a prefix.
+  Expression fn4 = FunctionCallExp("regexp_match",
+                                   {str, ConstantValueExp(Value("^test.*"))});
+  Expression rewritten4 = rewriter.Rewrite(fn4);
+  ASSERT_EQ(rewritten4->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten4->AsBinaryExpression().Op(), BinaryOperation::kLike);
+  EXPECT_EQ(
+      rewritten4->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
       Value("test%"));
+}
+
+TEST(ExpressionRewriteTest, RegexpPrefixExtractionRefusesUnsafeRewrites) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression str = ColumnValueExp("str");
+
+  auto assert_untouched = [&](const Expression& input) {
+    Expression rewritten = rewriter.Rewrite(input);
+    EXPECT_EQ(rewritten->ToString(), input->ToString())
+        << "regexp call must not be rewritten: " << *rewritten;
+  };
+
+  // '%' is literal in the regex but a wildcard in LIKE: '50%' + '%' would
+  // match "50abc" where ^50%.* does not.
+  assert_untouched(FunctionCallExp("regexp_contains",
+                                   {str, ConstantValueExp(Value("^50%.*"))}));
+  // '_' is literal in the regex but a single-char wildcard in LIKE.
+  assert_untouched(FunctionCallExp("regexp_contains",
+                                   {str, ConstantValueExp(Value("^a_b"))}));
+  assert_untouched(FunctionCallExp("regexp_match",
+                                   {str, ConstantValueExp(Value("^a_b.*"))}));
+
+  // '=' compares literally, so a literal '%' in the prefix is safe there.
+  Expression eq = FunctionCallExp("regexp_contains",
+                                  {str, ConstantValueExp(Value("^50%$"))});
+  Expression eq_rewritten = rewriter.Rewrite(eq);
+  ASSERT_EQ(eq_rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(eq_rewritten->AsBinaryExpression().Op(), BinaryOperation::kEquals);
+  EXPECT_EQ(
+      eq_rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value("50%"));
+
+  // LIKE/`=` fold under a case-insensitive collation; REGEXP_* compares
+  // raw bytes.  A COLLATE() argument must not be rewritten.
+  assert_untouched(FunctionCallExp(
+      "regexp_contains",
+      {FunctionCallExp("collate",
+                       {str, ConstantValueExp(Value(std::string("und:ci")))}),
+       ConstantValueExp(Value("^abc.*"))}));
+
+  // An all-constant call folds instead of surviving untouched, so the pin
+  // is that the fold keeps the regex' byte-wise answer rather than the
+  // coerced LIKE/`=` one.
+  // regex_match(AsString(1)='1', '^01$') is FALSE; '1' = '01' would fold
+  // TRUE through integer coercion.
+  Expression match_int = FunctionCallExp(
+      "regexp_match",
+      {ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value("^01$"))});
+  Expression rewritten_int = rewriter.Rewrite(match_int);
+  ASSERT_EQ(rewritten_int->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_int->AsConstantValue().GetValue(), Value(false));
+
+  // regex on the CI-tagged input is still byte-wise: 'ABC' does not match
+  // '^abc.*' (FALSE); a LIKE replacement would fold under the tag and
+  // answer TRUE.
+  Value ci_tagged = Value("ABC").WithCollation(
+      static_cast<uint8_t>(Collation::kCaseInsensitive));
+  Expression ci_call = FunctionCallExp(
+      "regexp_contains",
+      {ConstantValueExp(ci_tagged), ConstantValueExp(Value("^abc.*"))});
+  Expression rewritten_ci = rewriter.Rewrite(ci_call);
+  ASSERT_EQ(rewritten_ci->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_ci->AsConstantValue().GetValue(), Value(false));
+
+  // AsString(12)='12' matches '^1' (TRUE); '12 LIKE '1%'' would error on
+  // non-varchar operands and stay unfolded.
+  Expression contains_int = FunctionCallExp(
+      "regexp_contains",
+      {ConstantValueExp(Value(int64_t{12})), ConstantValueExp(Value("^1"))});
+  Expression rewritten_contains = rewriter.Rewrite(contains_int);
+  ASSERT_EQ(rewritten_contains->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_contains->AsConstantValue().GetValue(), Value(true));
 }
 
 TEST(ExpressionRewriteTest, CastPushdownComparison) {
@@ -2296,11 +2463,11 @@ TEST(ExpressionRewriteTest, DeterministicFunctionCse) {
   Expression nullif_dup = FunctionCallExp("nullif", {upper_x, upper_x});
   Expression rewritten_nullif = rewriter.Rewrite(nullif_dup);
   ASSERT_EQ(rewritten_nullif->Type(), TypeTag::kFunctionCallExp);
-  // With total (column) arguments the fold still fires.
+  // A column's DOUBLE-ness cannot be proven without a schema, so NULLIF(x, x)
+  // must stay as a call: folding it would turn a NaN column row into NULL.
   Expression nullif_col = FunctionCallExp("nullif", {x, ColumnValueExp("x")});
   Expression rewritten_nullif_col = rewriter.Rewrite(nullif_col);
-  ASSERT_TRUE(rewritten_nullif_col->Type() == TypeTag::kConstantValue);
-  EXPECT_TRUE(rewritten_nullif_col->AsConstantValue().GetValue().IsNull());
+  EXPECT_EQ(rewritten_nullif_col->Type(), TypeTag::kFunctionCallExp);
 
   // CASE WHEN c THEN upper(x) ELSE upper(x) END -> upper(x)
   Expression case_dup =
@@ -2604,11 +2771,11 @@ TEST(ExpressionRewriteTest, CoalesceAndNullifSimplification) {
   ASSERT_EQ(rewritten_c5->Type(), TypeTag::kConstantValue);
   EXPECT_TRUE(rewritten_c5->AsConstantValue().GetValue().IsNull());
 
-  // NULLIF(x, x) -> NULL
+  // NULLIF(x, x) stays a call for an unresolved column: without a schema the
+  // rewriter cannot prove x is not DOUBLE, and NaN = NaN is false in SQL.
   Expression n1 = FunctionCallExp("nullif", {x, x});
   Expression rewritten_n1 = rewriter.Rewrite(n1);
-  ASSERT_EQ(rewritten_n1->Type(), TypeTag::kConstantValue);
-  EXPECT_TRUE(rewritten_n1->AsConstantValue().GetValue().IsNull());
+  EXPECT_EQ(rewritten_n1->Type(), TypeTag::kFunctionCallExp);
 
   // NULLIF(42, 42) -> NULL
   Expression n2 = FunctionCallExp("nullif", {const_42, const_42});
@@ -2872,10 +3039,12 @@ TEST(ExpressionRewriteTest, PowIdentitiesFold) {
   // pow(x, 1) -> CAST(x AS FLOAT64): value-preserving for every x including
   // NULL, and it keeps pow's declared DOUBLE result type (a bare column
   // rewrite turned `pow(int_col, 1) / 2` into integer division).
-  const Expression to_first =
-      ExpressionRewriter(ExpressionRuleSet::Default())
-          .Rewrite(FunctionCallExp(
-              "pow", {ColumnValueExp("x"), ConstantValueExp(Value(1))}));
+  // The base must be provably numeric, so the rewrite needs the schema.
+  const Schema numeric_schema("", {Column("x", ValueType::kInt64)});
+  ExpressionRewriter typed(ExpressionRuleSet::Default());
+  typed.set_schema(&numeric_schema);
+  const Expression to_first = typed.Rewrite(
+      FunctionCallExp("pow", {ColumnValueExp("x"), ConstantValueExp(Value(1))}));
   ASSERT_EQ(to_first->Type(), TypeTag::kCastExp);
   EXPECT_EQ(to_first->AsCastExpression().Child()->ToString(),
             ColumnValueExp("x")->ToString());
@@ -2887,6 +3056,13 @@ TEST(ExpressionRewriteTest, PowIdentitiesFold) {
               "pow", {ColumnValueExp("x"), ConstantValueExp(Value(0))}));
   ASSERT_EQ(to_one->Type(), TypeTag::kFunctionCallExp);
   EXPECT_EQ(to_one->AsFunctionCallExpression().FuncName(), "pow");
+  // Without a schema the base type is unproven (it could be a string, which
+  // POW rejects but CAST would accept), so pow(x, 1) is left intact.
+  const Expression untyped =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(FunctionCallExp(
+              "pow", {ColumnValueExp("x"), ConstantValueExp(Value(1))}));
+  EXPECT_EQ(untyped->Type(), TypeTag::kFunctionCallExp);
 }
 
 // BitAndOrIdentities (x&x -> x, x&-1 -> x) was removed: after constant
@@ -3221,6 +3397,25 @@ TEST(ExpressionAuditTest, IfErrorContextMatchesPlainPromotion) {
   ASSERT_TRUE(scoped.HasValue());
   EXPECT_EQ(scoped.Value().type, plain.Value().type);
   EXPECT_EQ(scoped.Value(), plain.Value());
+}
+
+// T2407: the lenient parser (json_doc.hpp kMaxJsonDepth) and the strict
+// validator (json_text.hpp kMaxDepth) must stop at the SAME nesting
+// budget.  The parser previously descended to 512 -- twice the depth the
+// validator documents as stack-safe -- so a 300-level document parsed fine
+// here yet was invalid everywhere else.
+TEST(JsonLenientDepthTest, ParserStopsAtValidatorBudget) {
+  const std::string over_budget =
+      std::string(300, '[') + "1" + std::string(300, ']');
+  std::string_view in(over_budget);
+  (void)json_doc::ParseJsonSimple(in);
+  EXPECT_FALSE(in.empty()) << "300 > 256: parse must stop before the end";
+
+  const std::string within_budget =
+      std::string(200, '[') + "1" + std::string(200, ']');
+  std::string_view in_ok(within_budget);
+  (void)json_doc::ParseJsonSimple(in_ok);
+  EXPECT_TRUE(in_ok.empty()) << "200 < 256: still fully parsed";
 }
 
 }  // namespace tinylamb

@@ -42,12 +42,15 @@ Status PwriteAllFd(int fd, const void* data, size_t len, uint64_t offset) {
     const ssize_t n = platform::Pwrite(fd, ptr + done, len - done,
                                        static_cast<int64_t>(offset + done));
     if (n <= 0) {
-      if (errno == EINTR) {
+      if (n < 0 && errno == EINTR) {
         continue;
       }
-      return StatusError(
-          StatusCode::kIOError,
-          "lsm pwrite failed: " + std::string(std::strerror(errno)));
+      // errno is not guaranteed to be updated when pwrite returns 0
+      // (disk full / file-size limit / invalid fd); never print "Success".
+      const std::string reason = n == 0
+                                     ? "no progress (disk full or invalid fd)"
+                                     : std::string(std::strerror(errno));
+      return StatusError(StatusCode::kIOError, "LSM pwrite failed: " + reason);
     }
     done += static_cast<size_t>(n);
   }
@@ -69,7 +72,7 @@ Status PreadAllFd(int fd, void* dst, size_t len, uint64_t offset) {
       }
       return StatusError(
           StatusCode::kIOError,
-          "lsm pread failed: " + std::string(std::strerror(errno)));
+          "LSM pread failed: " + std::string(std::strerror(errno)));
     }
     done += static_cast<size_t>(n);
   }
@@ -104,7 +107,7 @@ bool ConsumeString(const char* data, size_t size, size_t* off,
 
 class LsmRunStreamWriter {
  public:
-  LsmRunStreamWriter(const int& fd, std::mutex& file_mu,
+  LsmRunStreamWriter(int fd, std::mutex& file_mu,
                      uint64_t* append_offset,
                      std::vector<LsmRunBlockMeta>* blocks_out)
       : fd_(fd),
@@ -115,6 +118,22 @@ class LsmRunStreamWriter {
   }
 
   Status Add(const LsmRunEntry& e) {
+    // T2377: both lengths encode as uint32. An entry above 4 GiB would wrap
+    // the length field silently -- LoadAndDecodeLsmBlock's ConsumeString
+    // then truncates (kCorrupt) or, worse, misaligns every following entry
+    // and decodes one key's value as another's. Fail loudly at the primitive
+    // boundary instead. (lsm_index.hpp's "no key/value size limits" holds
+    // for MemTable intake; the run block format enforces this bound here.)
+    if (e.key.size() > std::numeric_limits<uint32_t>::max() ||
+        e.value.size() > std::numeric_limits<uint32_t>::max()) {
+      return Status::kInvalidArgument;
+    }
+    // Readers use lower_bound on block last_keys; an unsorted producer would
+    // silently break Find/Seek. Catch it at the primitive boundary.
+    CHECK_MSG(!has_prev_key_ || e.key >= prev_key_,  // NOLINT(readability-simplify-boolean-expr)
+              "LsmRunStreamWriter requires sorted keys");
+    prev_key_ = e.key;
+    has_prev_key_ = true;
     if (block_count_ > 0 && block_buf_.size() >= kLsmBlockTargetBytes) {
       RETURN_IF_FAIL(FlushCurrentBlock());
     }
@@ -128,7 +147,13 @@ class LsmRunStreamWriter {
     block_buf_.append(e.key);
     AppendLe(&block_buf_, static_cast<uint32_t>(e.value.size()));
     block_buf_.append(e.value);
-    last_key_ = e.key;
+    // Remember where the key bytes live in the block buffer; only the last
+    // entry's key is needed, and only when the block is flushed.
+    // Layout: lsn(u64) deleted(u8) key_len(u32) key value_len(u32) value, so
+    // the key ends right before value_len.
+    last_key_offset_ = block_buf_.size() - static_cast<size_t>(e.value.size()) -
+                       sizeof(uint32_t) - e.key.size();
+    last_key_len_ = e.key.size();
     ++block_count_;
     return Status::kSuccess;
   }
@@ -149,7 +174,8 @@ class LsmRunStreamWriter {
     AppendLe(&block_buf_, kLsmDataBlockMagic);
     AppendLe(&block_buf_, uint32_t{0});  // placeholder for entry_count
     block_count_ = 0;
-    last_key_.clear();
+    last_key_offset_ = 0;
+    last_key_len_ = 0;
   }
 
   Status FlushCurrentBlock() {
@@ -161,7 +187,8 @@ class LsmRunStreamWriter {
     const uint32_t crc = Crc32C(block_buf_.data(), block_buf_.size());
     AppendLe(&block_buf_, crc);
     pending_metas_.push_back(PendingBlock{
-        .last_key = std::move(last_key_),
+        .last_key =
+            std::string(block_buf_.data() + last_key_offset_, last_key_len_),
         .rel_offset = io_buf_.size(),
         .length = static_cast<uint32_t>(block_buf_.size()),
         .entry_count = block_count_,
@@ -209,12 +236,15 @@ class LsmRunStreamWriter {
     uint32_t entry_count{0};
   };
 
-  const int& fd_;
+  int fd_;
   std::mutex& file_mu_;
   uint64_t* append_offset_{nullptr};
   std::vector<LsmRunBlockMeta>* blocks_out_{nullptr};
   std::string block_buf_;
-  std::string last_key_;
+  std::string prev_key_;  // last key seen across all blocks (sortedness guard)
+  bool has_prev_key_{false};
+  size_t last_key_offset_{0};
+  size_t last_key_len_{0};
   uint32_t block_count_{0};
   uint64_t total_entries_{0};
   bool has_tombstones_{false};
@@ -223,8 +253,12 @@ class LsmRunStreamWriter {
 };
 
 StatusOr<std::shared_ptr<const DecodedLsmBlock>> LoadAndDecodeLsmBlock(
-    const int& fd, std::mutex& file_mu, const LsmRunBlockMeta& meta) {
-  if (meta.length < (3 * sizeof(uint32_t))) {
+    int fd, std::mutex& file_mu, const LsmRunBlockMeta& meta) {
+  // `meta.length` comes from an on-disk directory entry. Bound it before the
+  // allocation so a corrupt length cannot request gigabytes up front.
+  constexpr uint32_t kMaxDecodedBlockBytes = 64U << 20;
+  if (meta.length < (3 * sizeof(uint32_t)) ||
+      meta.length > kMaxDecodedBlockBytes) {
     return Status::kCorrupt;
   }
   std::string raw(meta.length, '\0');
@@ -295,10 +329,18 @@ ssize_t EvictedPageTable::Set(page_id_t pid, const EvictedPageDesc& desc) {
     delta = static_cast<ssize_t>(sizeof(Chunk));
   }
   EvictedPageDesc& slot = it->second->slots[pid & kChunkMask];
-  if (slot.disk_offset == RowPage::kInvalidDiskOffset &&
-      desc.disk_offset != RowPage::kInvalidDiskOffset) {
-    ++it->second->count;
-    ++total_entries_;
+  if (slot.disk_offset == RowPage::kInvalidDiskOffset) {
+    if (desc.disk_offset != RowPage::kInvalidDiskOffset) {
+      ++it->second->count;
+      ++total_entries_;
+    }
+  } else if (desc.disk_offset == RowPage::kInvalidDiskOffset) {
+    // T4184: invalidating an occupied slot through Set must undo the
+    // original insert's bookkeeping; without this, Count() overstates the
+    // live entries and Erase's count==0 chunk reclamation never fires,
+    // so chunks leak monotonically.
+    --it->second->count;
+    --total_entries_;
   }
   slot = desc;
   return delta;
@@ -332,7 +374,7 @@ void EvictedPageTable::NextBatchAfter(
     page_id_t after_pid, size_t limit,
     std::vector<std::pair<page_id_t, EvictedPageDesc>>* out) const {
   out->clear();
-  if (limit == 0 || after_pid == std::numeric_limits<page_id_t>::max()) {
+  if (limit == 0 || after_pid >= std::numeric_limits<page_id_t>::max() - 1) {
     return;
   }
   const page_id_t start_chunk = (after_pid + 1) >> kChunkBits;
@@ -407,11 +449,17 @@ void BoundedFreeIdSet::Erase(page_id_t pid) {
     by_lo_.erase(it);
   } else if (lo == pid) {
     by_lo_.erase(it);
+    if (pid == std::numeric_limits<page_id_t>::max()) {
+      return;
+    }
     by_lo_.emplace(pid + 1, hi);
   } else if (hi == pid) {
     it->second = pid - 1;
   } else {
     it->second = pid - 1;
+    if (pid == std::numeric_limits<page_id_t>::max()) {
+      return;
+    }
     by_lo_.emplace(pid + 1, hi);
   }
   // A middle split grows the range count by one; enforce the same bound as
@@ -477,9 +525,12 @@ void LsmBlockCache::ReserveStorageBytes(size_t bytes,
   }
   if (!ProcessMemoryBudget::Global().TryReserve(MemoryPoolKind::kStorage, bytes,
                                                 /*respect_soft_limit=*/false)) {
-    ProcessMemoryBudget::Global().ReserveEmergency(MemoryPoolKind::kStorage,
-                                                   bytes);
-    *emergency_out += bytes;
+    // T1835: centrally capped; untracked on rejection (emergency_out is the
+    // release-pairing flag, so it only counts granted reserves).
+    if (ProcessMemoryBudget::Global().ReserveEmergency(MemoryPoolKind::kStorage,
+                                                       bytes)) {
+      *emergency_out += bytes;
+    }
   }
 }
 
@@ -500,7 +551,7 @@ void LsmBlockCache::ReleaseStorageBytes(size_t bytes,
 }
 
 StatusOr<std::shared_ptr<const DecodedLsmBlock>> LsmBlockCache::GetOrLoad(
-    const int& fd, std::mutex& file_mu, uint64_t run_id, uint32_t block_idx,
+    int fd, std::mutex& file_mu, uint64_t run_id, uint32_t block_idx,
     const LsmRunBlockMeta& meta, size_t limit_bytes, bool populate_cache) {
   const CacheKey key{.run_id = run_id, .block_idx = block_idx};
   {
@@ -537,11 +588,21 @@ StatusOr<std::shared_ptr<const DecodedLsmBlock>> LsmBlockCache::GetOrLoad(
       ReleaseStorageBytes(vb, em_rel);
     }
   }
+  const size_t emergency_before = emergency_bytes_;
   ReserveStorageBytes(entry_bytes, &emergency_bytes_);
+  const size_t emergency_added = emergency_bytes_ - emergency_before;
   lru_.push_back(key);
   auto lru_it = std::prev(lru_.end());
-  map_.emplace(key,
-               Entry{.block = loaded, .bytes = entry_bytes, .lru_it = lru_it});
+  const auto inserted = map_.emplace(
+      key, Entry{.block = loaded, .bytes = entry_bytes, .lru_it = lru_it});
+  if (!inserted.second) {
+    // Map insertion can fail (allocation or a concurrent duplicate key);
+    // undo the LRU entry and the storage charge rather than leaking them.
+    lru_.pop_back();
+    emergency_bytes_ = emergency_before;
+    ReleaseStorageBytes(entry_bytes, emergency_added);
+    return nullptr;
+  }
   cached_bytes_.fetch_add(entry_bytes, std::memory_order_relaxed);
   return loaded;
 }
@@ -605,7 +666,7 @@ void LsmBlockCache::Clear() noexcept {
   ReleaseStorageBytes(total, std::min(total, em));
 }
 
-LsmRunCursor::LsmRunCursor(const int& fd, std::mutex& file_mu,
+LsmRunCursor::LsmRunCursor(int fd, std::mutex& file_mu,
                            LsmBlockCache& cache, uint64_t run_id,
                            std::span<const LsmRunBlockMeta> blocks,
                            size_t cache_limit_bytes, bool populate_cache)
@@ -673,12 +734,16 @@ Status LsmRunCursor::Next() {
   return Status::kSuccess;
 }
 
-Status WriteLsmRunStream(const int& fd, std::mutex& file_mu,
+Status WriteLsmRunStream(int fd, std::mutex& file_mu,
                          uint64_t* append_offset,
                          const std::function<bool(LsmRunEntry*)>& next_entry,
                          std::vector<LsmRunBlockMeta>* blocks_out,
                          uint64_t* entry_count_out, bool* has_tombstones_out) {
+  // Initialise all outputs up front like MergeLsmSourcesToFd, so an early
+  // failure cannot leave stale metadata in caller-owned variables.
   blocks_out->clear();
+  *entry_count_out = 0;
+  *has_tombstones_out = false;
   LsmRunStreamWriter writer(fd, file_mu, append_offset, blocks_out);
   LsmRunEntry entry;
   while (next_entry(&entry)) {
@@ -688,7 +753,7 @@ Status WriteLsmRunStream(const int& fd, std::mutex& file_mu,
 }
 
 Status MergeLsmSourcesToFd(
-    const int& in_fd, std::mutex& in_file_mu, const int& out_fd,
+    int in_fd, std::mutex& in_file_mu, int out_fd,
     std::mutex& out_file_mu, uint64_t* out_append_offset, LsmBlockCache& cache,
     std::span<const LsmRunSpec> runs,
     const std::function<bool(LsmRunEntry*)>& next_mem_entry,

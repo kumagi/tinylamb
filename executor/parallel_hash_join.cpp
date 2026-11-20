@@ -95,11 +95,30 @@ ConcurrentJoinHashTable::ConcurrentJoinHashTable(size_t expected_entries) {
   }
 }
 
+void ConcurrentJoinHashTable::GrowShard(Shard& shard) {  // NOLINT(readability-convert-member-functions-to-static)
+  // The initial capacity is derived from a fixed guess (the shared build
+  // passes 2048 => 64 slots/shard). Without growth, every extra built row
+  // lengthens the probe chains and large joins degrade to O(build*probe/
+  // buckets). Grow under the shard's build lock; probes only run after the
+  // barrier, so no reader observes a half-rebuilt chain.
+  const size_t new_size = shard.head_slots.size() * 2;
+  shard.head_slots.assign(new_size, kNil);
+  shard.mask = new_size - 1;
+  for (size_t i = 0; i < shard.entries.size(); ++i) {
+    const size_t slot = (shard.entries[i].hash >> 8) & shard.mask;
+    shard.entries[i].next = shard.head_slots[slot];
+    shard.head_slots[slot] = i;
+  }
+}
+
 void ConcurrentJoinHashTable::Insert(uint64_t hash, std::string key_bytes,
                                      Row row, RowPosition position) {
   const size_t shard_idx = hash % kShardCount;
   auto& shard = shards_[shard_idx];
   std::scoped_lock lock(shard.mutex);
+  if ((shard.entries.size() + 1) * 10 >= shard.head_slots.size() * 7) {
+    GrowShard(shard);
+  }
   const size_t entry_idx = shard.entries.size();
   const size_t slot = (hash >> 8) & shard.mask;
   const size_t next = shard.head_slots[slot];
@@ -118,6 +137,9 @@ void ConcurrentJoinHashTable::InsertInt(uint64_t hash, const int64_t* key_parts,
   const size_t shard_idx = hash % kShardCount;
   auto& shard = shards_[shard_idx];
   std::scoped_lock lock(shard.mutex);
+  if ((shard.entries.size() + 1) * 10 >= shard.head_slots.size() * 7) {
+    GrowShard(shard);
+  }
   const size_t entry_idx = shard.entries.size();
   const size_t slot = (hash >> 8) & shard.mask;
   const size_t next = shard.head_slots[slot];
@@ -254,6 +276,7 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
   while (left_ && left_->NextBatch(&batch) != 0) {
     for (size_t i = 0; i < batch.Size(); ++i) {
       left_tuples.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+      charge_.Add(EstimateRowBytes(batch.RowAt(i)) + sizeof(RowPosition));
     }
   }
   if (left_ && left_->GetStatus() != Status::kSuccess) {
@@ -262,6 +285,7 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
   while (right_ && right_->NextBatch(&batch) != 0) {
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_tuples.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+      charge_.Add(EstimateRowBytes(batch.RowAt(i)) + sizeof(RowPosition));
     }
   }
   if (right_ && right_->GetStatus() != Status::kSuccess) {
@@ -356,9 +380,13 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
   // sides. A wider (or mismatched) key keeps the memcomparable byte encoding;
   // entering int mode there would drop the trailing columns from both the hash
   // and the equality check, turning distinct keys into false matches.
+  // Both sides must have the same arity: the int-key hash and equality
+  // only compare min(arity, kMaxIntKeyParts) parts, so asymmetric keys
+  // would hash differently and silently lose matches.
   const bool int_key_width_ok =
       build_cols.size() <= ConcurrentJoinHashTable::kMaxIntKeyParts &&
-      left_cols_.size() == build_cols.size();
+      left_cols_.size() == right_cols_.size() &&
+      build_cols.size() == left_cols_.size();
   if (all_int && int_key_width_ok && !int_keys_disabled) {
     int_key_type_ = build_type;
     shared_hash_table_.EnableIntKeys(build_cols.size());
@@ -728,6 +756,7 @@ size_t SharedBuildParallelHashJoin::NextBatch(DataChunk* destination,
     FailWith(status);
     return 0;
   }
+  std::scoped_lock lock(output_mu_);
   if (output_offset_ >= output_.size()) {
     return 0;
   }

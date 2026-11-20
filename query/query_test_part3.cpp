@@ -340,11 +340,19 @@ TEST_F(QueryTest, SqlEngineSelectLimitZeroReturnsNoRows) {
   EXPECT_TRUE(RunSql(ctx, *db_, "SELECT x.a FROM t AS x WHERE x.a = 2 LIMIT 0;")
                   .empty());
 
+  auto empty = engine.Execute(ctx, "SELECT a FROM t WHERE b / 0 = 1 LIMIT 0;");
+  ASSERT_TRUE(empty.HasValue()) << empty.GetStatus();
+  EXPECT_TRUE(empty.Value().Collect().empty());
+  EXPECT_EQ(empty.Value().GetStatus(), Status::kSuccess);
+  EXPECT_EQ(empty.Value().ColumnTypes(), (std::vector{ValueType::kInt64}));
+
   // Act + Assert -- neighbouring queries keep working after a LIMIT 0 ran.
   std::vector<Row> limited = RunSql(ctx, *db_, "SELECT a FROM t LIMIT 2;");
   ASSERT_EQ(limited.size(), 2U);
   std::vector<Row> all = RunSql(ctx, *db_, "SELECT a FROM t;");
   ASSERT_EQ(all.size(), 3U);
+  EXPECT_EQ(engine.Prepare(ctx, "SELECT missing FROM t LIMIT 0;").GetStatus(),
+            Status::kNotExists);
 
   ctx.txn_.Abort();
 }
@@ -1056,9 +1064,10 @@ TEST_F(QueryTest, FetchFirstWithTiesCollatedOrdinal) {
       ctx, *db_,
       "SELECT name, score FROM ordinal_ties ORDER BY 2 COLLATE 'und:ci' "
       "FETCH FIRST 2 ROWS WITH TIES;");
+  // Ascending score: 80 then the tied pair of 90s; 100 is past the boundary.
   ASSERT_EQ(res.size(), 3U);
-  EXPECT_EQ(res[0][0], Value("a"));
-  EXPECT_EQ(res[0][1], Value(100));
+  EXPECT_EQ(res[0][0], Value("D"));
+  EXPECT_EQ(res[0][1], Value(80));
   EXPECT_EQ(res[1][1], Value(90));
   EXPECT_EQ(res[2][1], Value(90));
 
@@ -1222,7 +1231,7 @@ TEST_F(QueryTest, DistinctIndexScanHonorsNullsLastBeforeLimit) {
 
 TEST_F(QueryTest, DescendingIndexScanReturnsReversedRange) {
   // The optimizer must offer reverse index scans for a descending ORDER BY
-  // over a range: the B+Tree iterator positions below `end` and walks left,
+  // over a range: the LsmIndex iterator positions below `end` and walks left,
   // so the sort (or TopN) can be elided.  Data correctness is the point:
   // begin/end keys are direction-symmetric and the residual predicate
   // re-checks boundary inclusivity.

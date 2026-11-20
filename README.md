@@ -24,12 +24,14 @@ printf 'CREATE TABLE t (k INT64, v VARCHAR); INSERT INTO t VALUES (1, %s);\nSELE
 `tinylamb` creates the database file on first use; it bootstraps only the
 catalog, so create your tables with DDL before querying.
 
-CMake downloads the pinned GoogleSQL `execute_query` release and verifies its
-SHA-256 checksum. Bazel is not required. GoogleSQL AST mode is required by the
+CMake prefers a locally staged GoogleSQL `execute_query` (via
+`~/.local/share/googlesql-zygote/` or `/google/bin/releases/`) without checksum
+verification; otherwise it downloads a pinned release and verifies its SHA-256
+checksum. Bazel is not required. GoogleSQL AST mode is required by the
 SQL executable; configuring with `-DTINYLAMB_ENABLE_GOOGLESQL=OFF` still
 builds every library, executable and test binary, but the SQL frontend
-becomes unavailable at runtime (statements fail to parse and frontend-driven
-tests skip themselves).
+becomes unavailable at runtime (statements fail to parse) and frontend-driven
+tests fail rather than skip, so keep the default ON when running ctest.
 
 The SQL execution path supports the TPC-C transaction query shapes (excluding
 stored procedures) and all 22 TPC-H queries. This includes inner and left
@@ -53,12 +55,15 @@ EXPLAIN ANALYZE SELECT l_returnflag, COUNT(*) FROM lineitem
 Storage engine
 --------------
 
-Tables use the hybrid row + `LSTable` columnar PAX/zone-map storage engine
-(`table/lstable/`). Full and parallel table scans use per-page min/max zone maps
-and zero-allocation columnar batch decoding when the table's layout generation is
-clean (refreshed by `ANALYZE` or first read-only analytical scan), while OLTP
-point lookups and in-place mutations use the underlying MVCC row pages and
-secondary B+Tree indexes without rebuilding the columnar store on writes.
+Tables use a hybrid row + columnar PAX/zone-map storage engine
+(`table/pax_chunk/`, `table/lstable_bridge.*`, and persistent columnar
+`TlcsFile` storage under `table/tlcs_file.*`, governed by `ProcessMemoryBudget`
+under `common/memory_budget.*`). Full and parallel table scans use per-page
+min/max zone maps and zero-allocation columnar batch decoding when the table's
+layout generation is clean (refreshed by `ANALYZE` or first read-only analytical
+scan), while OLTP point lookups and in-place mutations use the underlying MVCC
+row pages (`page/page_manager.*`, `page/page_lsm_store.*`) and secondary
+LSM-Tree indexes (`index/lsm_index.hpp`) without rebuilding the columnar store on writes.
 
 Explicit `CREATE TABLE` engine clauses naming `lstable` (`lstable`/`lst`/`columnar`/`pax`,
 case-insensitive) are accepted:
@@ -91,7 +96,7 @@ cmake --build build -j --target tinylamb_tpch_benchmark
 
 `--reuse-database` skips schema creation and loading for a previously loaded
 database, and `--query N` runs one query while investigating a plan. `--force`
-only replaces the three tinylamb database files at the exact path supplied.
+only replaces the tinylamb database artifacts at the exact path supplied (.db, .log, .log.meta, .log.meta.tmp, .last_checkpoint).
 Scale factors outside the official TPC-H set are accepted for quick engineering
 smoke tests but are reported as non-official.
 
@@ -119,7 +124,9 @@ worker pool (statements that start with `WITH` or `EXPLAIN` take the normal
 execution path because they can wrap writes), so independent clients execute
 read-only transactions in parallel
 without blocking the epoll I/O loop. The default worker count is the detected
-hardware concurrency and can be set with `--read-workers`. TLS/GSS encryption
+hardware concurrency capped at 16, and can be set with `--read-workers`
+(accepted range 1..1024; values above the server cap of 16 are clamped to 16
+with a warning at startup). TLS/GSS encryption
 requests are declined and
 clients continue over plain TCP. The default bind address is therefore
 `127.0.0.1`; binding to a non-loopback address should only be done on a trusted
@@ -148,10 +155,17 @@ and extension examples.
 
 **Call path:** `SqlEngine` builds `QueryData`, runs `Rewrite`, then calls
 `Optimizer::Optimize` (`plan/optimizer.cpp`). That entry point normalizes
-predicates, constructs a Cascades `Search`, and delegates join/order
+predicates, constructs a Cascades `SearchEngine`, and delegates join/order
 enumeration to `plan/cascades.cpp` via `RuleSet` / `ImplementationRuleSet`.
 There is no second standalone DP optimizer; `optimizer.cpp` is the façade and
-post-processing layer (aggregates, residual predicates).
+post-processing layer (aggregates, residual predicates). By default (`TINYLAMB_EXEC_ENGINE`
+unset or `!= legacy`), `SqlEngine` lowers physical plans into a DAG of
+Out-of-Core spillable pipeline stages via `PipelineLowering`
+(`executor/pipeline_lowering.hpp`, sinks in `executor/detail/pipeline/`) or the
+direct `ColumnarTlcsScanExecutor` fast path; grouped queries also route through
+`TryLowerGroupedStatementToPipeline` (`query/grouped_pipeline_lowering.hpp`). See
+[`ooca-v2.md`](ooca-v2.md) and
+[`docs/environment_variables.md`](docs/environment_variables.md).
 
 **Statement AST:** SQL DML/SELECT shapes live in `query/statement.hpp`
 (executor-side code includes it directly).
@@ -201,34 +215,13 @@ Cross-engine OLAP and OLTP comparison
 [`benchmark/comparison`](benchmark/comparison/README.md) runs portable OLAP,
 OLTP, HTAP, and all 22 TPC-H-derived queries against isolated tinylamb,
 PostgreSQL, and MySQL servers, with optional Oracle Free and DuckDB (official
-Quack) backends. It saves latency, throughput, transaction
-errors, result validation, query plans, and reproduction metadata.
-The [TPC-C three-engine comparison](docs/tpcc_three_comparison_2026-11-06.md)
-uses a shared C++ generator for Tinylamb C8, PostgreSQL and MySQL at W=1,
-10 clients, with three 30-second trials and aborts reported separately.
-The [five-engine comparison](docs/duckdb_comparison_2026-11-05.md) adds DuckDB
-2.0.0 and Oracle Free, with fresh measurements on a common two-core profile.
-See the [latest full three-engine comparison](docs/benchmark_full_comparison_2026-10-29.md)
-for all workloads with and without secondary indexes after the EXISTS and
-OLTP read improvements. Earlier runs are documented in the
-[second full rerun](docs/benchmark_full_rerun_2026-10-29.md),
-[first 2026-10-29 rerun](docs/olap_oltp_comparison_2026-10-29.md), and the
-[2026-10-28 report](docs/olap_oltp_comparison_2026-10-28.md).
-The [PostgreSQL twofold follow-up](docs/postgresql_twofold_results_2026-10-30.md)
-records the subsequent implementation work, a complete OLAP and Tiny/PG OLTP
-rerun, and matched-condition follow-ups. All original 161 targets and all 456
-comparisons are within 2x the contemporaneous PG reference after refinement;
-the report retains the 13 gaps from the short-window full run separately.
-These are engineering benchmarks,
+Quack) backends, as well as TPC-DS and ClickBench comparison suites
+([`benchmark/comparison/README-tpcds.md`](benchmark/comparison/README-tpcds.md),
+[`benchmark/comparison/README-clickbench.md`](benchmark/comparison/README-clickbench.md)).
+It saves latency, throughput, transaction errors, result validation, query
+plans, and reproduction metadata; historical benchmark snapshots are tracked in
+[`BenchmarkHistory.md`](BenchmarkHistory.md). These are engineering benchmarks,
 not audited TPC scores.
-The [EXISTS follow-up](docs/exists_performance_2026-10-29.md) records the
-million-row regression fix and three alternating before/after measurement pairs.
-The [OLTP read follow-up](docs/read_performance_2026-10-29.md) investigates
-non-key/range reads, fixes stranded MVCC garbage collection and index scan
-overhead, and compares all 12 targeted conditions with PostgreSQL.
-The [A–H implementation and follow-up report](docs/postgresql_gap_results_2026-10-29.md)
-records the changes, all 41 targeted comparisons, and the five remaining
-historical PostgreSQL gaps in durable write workloads.
 
 Remote SQL Fuzzing (`ssh oci`)
 ==============================

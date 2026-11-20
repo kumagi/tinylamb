@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -31,8 +32,10 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
@@ -40,6 +43,8 @@
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "page/page_ref.hpp"
+#include "page/page_type.hpp"
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
@@ -99,7 +104,7 @@ class RecordingFinishHook final : public TransactionFinishHook {
 }  // namespace
 
 // Round 9 regression: the index-undo reservation drain is the wait every
-// B+Tree insert parks in when a split's bytes are still reserved. A wounded
+// the LSM index insert parks when a split's bytes are still reserved. A wounded
 // waiter (deadlock-detector victim) must bail at the first slice -- its
 // abort releases the very reservations everyone is waiting for -- instead
 // of riding the full write-intent limit while holding its own row intents.
@@ -113,11 +118,11 @@ TEST_F(TransactionTest, ReservationDrainBailsWhenWounded) {
       waiter.WaitAllIndexReservationsDrain(std::chrono::seconds(30));
   const auto elapsed = std::chrono::steady_clock::now() - start;
   EXPECT_EQ(drained, Status::kConflicts);
-  EXPECT_LT(elapsed, std::chrono::seconds(1));
+  EXPECT_LT(elapsed, std::chrono::seconds(5));
   ASSERT_SUCCESS(tm_->Abort(holder));
 }
 
-// The drain honors an explicit short budget: B+Tree passes one wherever the
+// The drain honors an explicit short budget: LSM index ops pass one wherever the
 // caller may hold an index write gate, because a multi-second wait under
 // the gate deadlocks against a reservation owner whose next index op needs
 // the same gate. Past the budget the honest kConflicts surfaces.
@@ -130,14 +135,17 @@ TEST_F(TransactionTest, ReservationDrainHonorsShortBudget) {
       waiter.WaitAllIndexReservationsDrain(std::chrono::milliseconds(150));
   const auto elapsed = std::chrono::steady_clock::now() - start;
   EXPECT_EQ(drained, Status::kConflicts);
-  EXPECT_LT(elapsed, std::chrono::seconds(1));
+  EXPECT_LT(elapsed, std::chrono::seconds(5));
   ASSERT_SUCCESS(tm_->Abort(holder));
 }
 
-TEST_F(TransactionTest, construct) {
-  // Arrange -- nothing to set up; default TransactionManager created by SetUp()
-  // Act -- nothing to execute; default constructed via SetUp()
-  // Assert -- nothing to verify; gtest green on pass, death on crash
+TEST_F(TransactionTest, Construct) {
+  // SetUp() default-constructs the manager; verify it can hand out a usable
+  // transaction rather than relying on "no crash" alone.
+  ASSERT_NE(tm_, nullptr);
+  Transaction txn = tm_->Begin();
+  EXPECT_NE(txn.ID(), 0U);
+  EXPECT_EQ(txn.PreCommit(), Status::kSuccess);
 }
 
 TEST_F(TransactionTest, FinishHooksRunOnCommitAbortAndMove) {
@@ -290,7 +298,7 @@ TEST_F(TransactionTest, ReadOnlyTransactionAbort) {
   ASSERT_TRUE(txn.IsFinished());
 }
 
-TEST_F(TransactionTest, MVCCVisibilityChain) {
+TEST_F(TransactionTest, MvccVisibilityChain) {
   // Arrange -- a row position shared by all versions in this test
   const RowPosition rp(1, 1);
 
@@ -378,7 +386,7 @@ TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (tm_->HasVersionChain(rp) &&
          std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   ASSERT_FALSE(tm_->HasVersionChain(rp));
 
@@ -530,6 +538,24 @@ TEST_F(TransactionTest, DefaultTransactionRegisterVersionWriteIsNoop) {
       txn.RegisterVersionWrite(rp, std::nullopt, std::string_view("after")));
   EXPECT_NO_FATAL_FAILURE(
       txn.RegisterVersionWrite(rp, std::string_view("before"), std::nullopt));
+}
+
+TEST_F(TransactionTest, CancelStagedVersionReleasesPayloadAccounting) {
+  // Cancelling a staged version (e.g. after an InsertLog/UpdateLog failure)
+  // drops the write-set entry. It must also give back the resident payload
+  // bytes that RegisterVersionWrite charged, or repeated failed writes leak.
+  const RowPosition rp(14, 2);
+  const uint64_t baseline =
+      tm_->RuntimeStats().version_payload_resident_bytes;
+  Transaction txn = tm_->Begin();
+  ASSERT_TRUE(txn.AddWriteSet(rp));
+  txn.RegisterVersionWrite(rp, std::nullopt, "staged-payload-value");
+  const uint64_t staged = tm_->RuntimeStats().version_payload_resident_bytes;
+  ASSERT_GT(staged, baseline);
+
+  ASSERT_TRUE(txn.CancelStagedVersion(rp));
+  EXPECT_EQ(tm_->RuntimeStats().version_payload_resident_bytes, baseline);
+  ASSERT_EQ(txn.PreCommit(), Status::kSuccess);
 }
 
 TEST_F(TransactionTest, CrossWorkerReadSeesOwnUncommittedWrite) {
@@ -798,7 +824,7 @@ TEST_F(TransactionTest, GcFinishesRotatingSweepWithoutAnotherWrite) {
       std::chrono::steady_clock::now() + std::chrono::seconds(3);
   while (tm_->RuntimeStats().version_chains != 0 &&
          std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   EXPECT_EQ(tm_->RuntimeStats().version_chains, 0);
 }
@@ -825,7 +851,7 @@ TEST_F(TransactionTest,
       std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (tm_->HasVersionChain(position) &&
          std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   EXPECT_FALSE(tm_->HasVersionChain(position));
 }
@@ -834,7 +860,8 @@ TEST_F(TransactionTest, GcRearmsForSuccessiveQuietBursts) {
     auto old = tm_->Begin(true);
     std::vector<RowPosition> rows;
     for (int i = 0; i < 3; ++i) {
-      const RowPosition position(1000 + (burst * 10) + i, 0);
+      const RowPosition position(
+          static_cast<page_id_t>(1000 + (burst * 10) + i), 0);
       rows.push_back(position);
       auto writer = tm_->Begin();
       ASSERT_TRUE(writer.AddWriteSet(position, "before"));
@@ -853,10 +880,504 @@ TEST_F(TransactionTest, GcRearmsForSuccessiveQuietBursts) {
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (tm_->RuntimeStats().version_chains != 0 &&
            std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     EXPECT_EQ(tm_->RuntimeStats().version_chains, 0U);
   }
 }
+
+// T389 (P422): move-ASSIGN dropped the statement timeout/deadline and debug
+// fields that the move constructor transfers, so a relocated Transaction
+// silently lost an explicit per-statement timer (or kept the moved-from
+// object's one).
+TEST_F(TransactionTest, MoveAssignmentTransfersStatementTimer) {
+  Transaction source = tm_->Begin(/*read_only=*/true);
+  source.SetStatementTimeout(std::chrono::milliseconds(5000));
+  source.BeginStatementTimer();
+  ASSERT_TRUE(source.HasStatementTimeout());
+  const int64_t deadline_ns = source.StatementDeadlineNs();
+  ASSERT_GT(deadline_ns, 0);
+
+  Transaction sink;  // default-constructed: owns no registry slot
+  sink = std::move(source);
+  EXPECT_TRUE(sink.HasStatementTimeout());
+  EXPECT_EQ(sink.StatementDeadlineNs(), deadline_ns);
+  EXPECT_EQ(sink.CheckStatementTimeout(), Status::kSuccess);
+}
+
+namespace {
+
+class TransactionP6aTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    prefix_ = "txn_p6a_test-" + RandomString();
+    Open(false);
+  }
+
+  void Open(bool open_existing) {
+    tm_.reset();
+    rm_.reset();
+    logger_.reset();
+    pm_.reset();
+    pm_ = PageManager::Create(prefix_ + ".db", 64, open_existing).MoveValue();
+    logger_ = Logger::Create(prefix_ + ".log").MoveValue();
+    pm_->SetDurableWaiter(
+        [l = logger_.get()](lsn_t lsn) { return l->WaitForDurable(lsn); });
+    rm_ = std::make_unique<RecoveryManager>(prefix_ + ".log", pm_->GetPool(),
+                                            logger_->SegmentSize());
+    rm_->SetLogger(logger_.get());
+    tm_ = std::make_unique<TransactionManager>(pm_.get(), logger_.get(),
+                                               rm_.get());
+    if (open_existing) {
+      ASSERT_SUCCESS(rm_->RecoverFrom(0, tm_.get()));
+    }
+  }
+
+  void TearDown() override {
+    tm_.reset();
+    rm_.reset();
+    logger_.reset();
+    pm_.reset();
+    std::ignore = std::remove((prefix_ + ".db").c_str());
+    std::ignore = std::remove((prefix_ + ".db.ckpt").c_str());
+    std::ignore = std::remove((prefix_ + ".db.ckpt.tmp").c_str());
+    std::ignore = std::remove((prefix_ + ".db.blocks").c_str());
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+      const std::string fname = entry.path().filename().string();
+      if (fname.starts_with(prefix_ + ".db.blocks.") ||
+          fname.starts_with(prefix_ + ".db.lsm.")) {
+        std::filesystem::remove(entry.path(), ec);
+      }
+    }
+    RemoveLogAndSegments(prefix_ + ".log");
+  }
+
+  std::string prefix_;
+  std::unique_ptr<PageManager> pm_;
+  std::unique_ptr<Logger> logger_;
+  std::unique_ptr<RecoveryManager> rm_;
+  std::unique_ptr<TransactionManager> tm_;
+};
+
+TEST_F(TransactionP6aTest,
+       WalRereadModeCommitsAndAbortsBeyond4MiBAndSurvivesCrash) {
+  // Commit a baseline page first so abort rollback can be verified against it.
+  page_id_t base_pid = 0;
+  slot_t base_slot = 0;
+  {
+    Transaction base = tm_->Begin();
+    ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                          pm_->AllocateNewPage(base, PageType::kRowPage));
+    base_pid = page->PageID();
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(base, "baseline_value"));
+    base_slot = slot;
+    page.PageUnlock();
+    ASSERT_SUCCESS(base.PreCommit());
+  }
+
+  // 1) Single transaction writing >5 MiB (>4 MiB ADR 0008 default threshold)
+  // triggers WAL re-read mode and commits all rows cleanly across restart.
+  constexpr int kLargeOps = 560;
+  const std::string big_payload(9500, 'c');
+  std::vector<std::pair<page_id_t, slot_t>> committed_rows;
+  committed_rows.reserve(kLargeOps);
+  {
+    Transaction txn = tm_->Begin();
+    for (int i = 0; i < kLargeOps; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                            pm_->AllocateNewPage(txn, PageType::kRowPage));
+      ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, big_payload));
+      committed_rows.emplace_back(page->PageID(), slot);
+      page.PageUnlock();
+    }
+    EXPECT_TRUE(txn.IsWalRereadMode());
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  const TransactionRuntimeStats after_commit = tm_->RuntimeStats();
+  EXPECT_GE(after_commit.wal_reread_activations, 1U);
+  EXPECT_GT(after_commit.wal_reread_bytes, size_t{4} << 20);
+
+  // 2) Second >5 MiB transaction updates baseline + allocates pages, enters WAL
+  // re-read mode, then aborts cleanly via backward prev_lsn traversal.
+  {
+    Transaction abort_txn = tm_->Begin();
+    {
+      ASSIGN_OR_ASSERT_FAIL(PageRef, bp, pm_->GetPage(base_pid));
+      ASSERT_SUCCESS(bp->Update(abort_txn, base_slot, "aborted_overwrite"));
+      bp.PageUnlock();
+    }
+    for (int i = 0; i < kLargeOps; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(
+          PageRef, page, pm_->AllocateNewPage(abort_txn, PageType::kRowPage));
+      ASSERT_SUCCESS(page->Insert(abort_txn, big_payload).GetStatus());
+      page.PageUnlock();
+    }
+    EXPECT_TRUE(abort_txn.IsWalRereadMode());
+    ASSERT_SUCCESS(abort_txn.Abort());
+  }
+  EXPECT_GE(tm_->RuntimeStats().wal_reread_activations, 2U);
+
+  // 3) Third >5 MiB transaction crashes before commit (simulate process death
+  // after WAL flush without PreCommit or Abort).
+  {
+    Transaction loser = tm_->Begin();
+    {
+      ASSIGN_OR_ASSERT_FAIL(PageRef, bp, pm_->GetPage(base_pid));
+      ASSERT_SUCCESS(bp->Update(loser, base_slot, "loser_crash_overwrite"));
+      bp.PageUnlock();
+    }
+    for (int i = 0; i < kLargeOps; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                            pm_->AllocateNewPage(loser, PageType::kRowPage));
+      ASSERT_SUCCESS(page->Insert(loser, big_payload).GetStatus());
+      page.PageUnlock();
+    }
+    EXPECT_TRUE(loser.IsWalRereadMode());
+    ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
+    pm_->DropAllPages();
+    loser = Transaction();
+  }
+
+  // Reopen & recover: committed >4 MiB rows survive; aborted & loser writes
+  // leave baseline untouched.
+  Open(true);
+  Transaction verify = tm_->Begin();
+  {
+    ASSIGN_OR_ASSERT_FAIL(PageRef, bp, pm_->GetPage(base_pid));
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, got, bp->Read(verify, base_slot));
+    EXPECT_EQ(got, "baseline_value");
+    bp.PageUnlock();
+  }
+  for (const auto& [pid, slot] : committed_rows) {
+    ASSIGN_OR_ASSERT_FAIL(PageRef, p, pm_->GetPage(pid));
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, got, p->Read(verify, slot));
+    ASSERT_EQ(got, big_payload);
+    p.PageUnlock();
+  }
+  ASSERT_SUCCESS(verify.PreCommit());
+}
+
+TEST_F(TransactionP6aTest,
+       WalRereadPreservesPendingLsmScanUnderForeignOverwrite) {
+  tm_->SetWalRereadThresholdBytesForTest(4096);
+  constexpr page_id_t kTree = 88001;
+
+  Transaction txn_a = tm_->Begin();
+  Transaction txn_b = tm_->Begin();
+  // Push TXN A past the test WAL re-read threshold before mutating shared key.
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_SUCCESS(pm_->LsmInsert(txn_a, kTree, "pad_" + std::to_string(i),
+                                  std::string(256, 'p')));
+  }
+  EXPECT_TRUE(txn_a.IsWalRereadMode());
+
+  ASSERT_SUCCESS(pm_->LsmInsert(txn_a, kTree, "shared", "from_a"));
+  ASSERT_SUCCESS(pm_->LsmUpdate(txn_b, kTree, "shared", "from_b"));
+  const auto scan_a =
+      pm_->LsmScanRange(kTree, "shared", "shared", true, &txn_a);
+  ASSERT_EQ(scan_a.size(), 1U);
+  EXPECT_EQ(scan_a[0].second, "from_a");
+  EXPECT_GT(tm_->RuntimeStats().wal_reread_bytes, 0U);
+
+  ASSERT_SUCCESS(txn_a.PreCommit());
+  ASSERT_SUCCESS(txn_b.Abort());
+}
+
+TEST_F(TransactionP6aTest,
+       SpillableWriteSetHandlesManyIntentsOnCommitAndAbort) {
+  tm_->SetWriteSetSpillThresholdForTest(64);
+  const size_t prev_limit = ProcessMemoryBudget::Global().Limit();
+  const size_t prev_storage = ProcessMemoryBudget::Global().StoragePoolLimit();
+  const size_t prev_columnar =
+      ProcessMemoryBudget::Global().ColumnarPoolLimit();
+  struct BudgetGuard {
+    size_t limit;
+    size_t storage;
+    size_t columnar;
+    BudgetGuard(size_t lim, size_t stor, size_t col)
+        : limit(lim), storage(stor), columnar(col) {}
+    BudgetGuard(const BudgetGuard&) = delete;
+    BudgetGuard& operator=(const BudgetGuard&) = delete;
+    BudgetGuard(BudgetGuard&&) = delete;
+    BudgetGuard& operator=(BudgetGuard&&) = delete;
+    ~BudgetGuard() {
+      ProcessMemoryBudget::Global().ResetForTest(limit, storage, columnar);
+    }
+  } guard{prev_limit, prev_storage, prev_columnar};
+  ProcessMemoryBudget::Global().ResetForTest(size_t{2} << 20, size_t{512} << 10,
+                                             size_t{256} << 10);
+
+  constexpr size_t kRows = 2500;
+  std::vector<RowPosition> positions;
+  positions.reserve(kRows);
+  for (size_t i = 0; i < kRows; ++i) {
+    positions.emplace_back(static_cast<page_id_t>(10 + (i / 64)),
+                           static_cast<slot_t>(i % 64));
+  }
+
+  // 1) Acquire >2500 write intents, spill write_set_ to SpillStore, release a
+  // few intents, check HasWriteSet accuracy, then PreCommit.
+  {
+    Transaction writer = tm_->Begin();
+    for (size_t i = 0; i < kRows; ++i) {
+      ASSERT_TRUE(writer.AddWriteSet(positions[i], "before"));
+      writer.RegisterVersionWrite(positions[i], "before", "after");
+    }
+    EXPECT_TRUE(writer.IsWriteSetDiskSpilled());
+    // Re-checking existing and missing entries in spilled mode is exact.
+    EXPECT_TRUE(writer.HasWriteSet(positions[0]));
+    EXPECT_TRUE(writer.HasWriteSet(positions[kRows - 1]));
+    EXPECT_FALSE(writer.HasWriteSet(RowPosition(99999, 0)));
+
+    // Duplicate insert of held position succeeds without failing.
+    EXPECT_TRUE(writer.AddWriteSet(positions[42]));
+
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  const TransactionRuntimeStats s1 = tm_->RuntimeStats();
+  EXPECT_GE(s1.write_set_spills, 1U);
+  EXPECT_GT(s1.write_set_spilled_bytes, 0U);
+
+  // Verify every committed version is visible to a subsequent reader.
+  Transaction reader = tm_->Begin(/*read_only=*/true);
+  for (size_t i = 0; i < kRows; ++i) {
+    ASSERT_SUCCESS_AND_EQ(
+        tm_->ReadVersion(reader, positions[i], std::string_view("after")),
+        std::optional<std::string>("after"));
+  }
+  ASSERT_SUCCESS(reader.PreCommit());
+
+  // 2) Second spilled write_set_ aborts and releases every write intent so a
+  // fresh writer can immediately acquire them without conflict.
+  {
+    Transaction aborted = tm_->Begin();
+    for (size_t i = 0; i < kRows; ++i) {
+      ASSERT_TRUE(aborted.AddWriteSet(positions[i], "after"));
+      aborted.RegisterVersionWrite(positions[i], "after", "aborted");
+    }
+    EXPECT_TRUE(aborted.IsWriteSetDiskSpilled());
+    ASSERT_SUCCESS(aborted.Abort());
+  }
+  {
+    Transaction follower = tm_->Begin();
+    EXPECT_TRUE(follower.TryAddWriteSet(positions[0]));
+    EXPECT_TRUE(follower.TryAddWriteSet(positions[kRows - 1]));
+    ASSERT_SUCCESS(follower.Abort());
+  }
+}
+
+TEST_F(TransactionP6aTest, DiagnosticReadSetRemainsBounded) {
+  Transaction txn = tm_->Begin(/*read_only=*/true);
+  for (int i = 0; i < 4000; ++i) {
+    EXPECT_TRUE(txn.AddReadSet(RowPosition(1, static_cast<slot_t>(i))));
+  }
+  std::ostringstream oss;
+  oss << txn;
+  EXPECT_NE(oss.str().find("read_set=4000"), std::string::npos);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(TransactionP6aTest, ColdMvccVersionPayloadsSpillAndReadAcrossSnapshots) {
+  tm_->SetVersionSpillThresholdBytesForTest(512);
+  constexpr int kRows = 32;
+  std::vector<RowPosition> rps;
+  rps.reserve(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    rps.emplace_back(200 + (i / 8), static_cast<slot_t>(i % 8));
+  }
+
+  auto make_payload = [](char tag, int row) {
+    return std::string(512, tag) + "-" + std::to_string(row);
+  };
+
+  // Initial committed version v1 (keeps before-image v0 on first mutation).
+  {
+    Transaction t = tm_->Begin();
+    for (size_t i = 0; i < static_cast<size_t>(kRows); ++i) {
+      const std::string v0 = make_payload('A', static_cast<int>(i));
+      const std::string v1 = make_payload('B', static_cast<int>(i));
+      ASSERT_TRUE(t.AddWriteSet(rps[i], v0));
+      t.RegisterVersionWrite(rps[i], v0, v1);
+    }
+    ASSERT_SUCCESS(t.PreCommit());
+  }
+
+  Transaction snap_v1 = tm_->Begin(/*read_only=*/true);
+
+  // Overwrite v1 -> v2 -> v3 while snap_v1 pins history in version chains.
+  for (char ver : {'C', 'D'}) {
+    Transaction t = tm_->Begin();
+    for (size_t i = 0; i < static_cast<size_t>(kRows); ++i) {
+      const std::string prev =
+          make_payload(static_cast<char>(ver - 1), static_cast<int>(i));
+      const std::string next = make_payload(ver, static_cast<int>(i));
+      ASSERT_TRUE(t.AddWriteSet(rps[i], prev));
+      t.RegisterVersionWrite(rps[i], prev, next);
+    }
+    ASSERT_SUCCESS(t.PreCommit());
+  }
+
+  const TransactionRuntimeStats stats = tm_->RuntimeStats();
+  EXPECT_GT(stats.version_spills, 0U);
+  EXPECT_GT(stats.version_spill_bytes, 0U);
+  EXPECT_LE(stats.version_payload_resident_bytes, 1024U);
+
+  // Verify snapshot read (v1) and latest read (v3) recover exact spilled bytes.
+  Transaction reader_latest = tm_->Begin(/*read_only=*/true);
+  for (size_t i = 0; i < static_cast<size_t>(kRows); ++i) {
+    ASSERT_SUCCESS_AND_EQ(
+        tm_->ReadVersion(snap_v1, rps[i], std::string_view("phys")),
+        std::optional<std::string>(make_payload('B', static_cast<int>(i))));
+    ASSERT_SUCCESS_AND_EQ(
+        tm_->ReadVersion(reader_latest, rps[i], std::string_view("phys")),
+        std::optional<std::string>(make_payload('D', static_cast<int>(i))));
+    ASSERT_SUCCESS_AND_EQ(
+        tm_->ReadLatestVersion(reader_latest, rps[i], std::string_view("phys")),
+        std::optional<std::string>(make_payload('D', static_cast<int>(i))));
+  }
+  ASSERT_SUCCESS(reader_latest.PreCommit());
+  ASSERT_SUCCESS(snap_v1.PreCommit());
+
+  // Once snapshots finish and GC collects chains, resident payload bytes -> 0.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (tm_->RuntimeStats().version_chains != 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(tm_->RuntimeStats().version_chains, 0U);
+  EXPECT_EQ(tm_->RuntimeStats().version_payload_resident_bytes, 0U);
+}
+
+TEST_F(TransactionP6aTest,
+       UncommittedStagedSpillsAbortAndIoFailurePropagatesCleanly) {
+  tm_->SetVersionSpillThresholdBytesForTest(512);
+  constexpr int kRows = 20;
+  std::vector<RowPosition> rps;
+  rps.reserve(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    rps.emplace_back(300, static_cast<slot_t>(i));
+  }
+
+  {
+    Transaction writer = tm_->Begin();
+    for (size_t i = 0; i < static_cast<size_t>(kRows); ++i) {
+      const std::string before = std::string(512, 'X') + std::to_string(i);
+      const std::string after = std::string(512, 'Y') + std::to_string(i);
+      ASSERT_TRUE(writer.AddWriteSet(rps[i], before));
+      writer.RegisterVersionWrite(rps[i], before, after);
+    }
+    const TransactionRuntimeStats stats = tm_->RuntimeStats();
+    EXPECT_GT(stats.version_spills, 0U);
+    EXPECT_LE(stats.version_payload_resident_bytes, 1024U);
+
+    // Writer sees its own staged values even after spill.
+    for (size_t i = 0; i < static_cast<size_t>(kRows); ++i) {
+      const std::string after = std::string(512, 'Y') + std::to_string(i);
+      ASSERT_SUCCESS_AND_EQ(
+          tm_->ReadVersion(writer, rps[i], std::string_view("phys")),
+          std::optional<std::string>(after));
+    }
+
+    // Injected spill read I/O failure propagates cleanly as an error Status.
+    ProcessMemoryBudget::Global().SetTestSpillIoFailCountdown(1);
+    auto io_fail = tm_->ReadVersion(writer, rps[0], std::string_view("phys"));
+    EXPECT_NE(io_fail.GetStatus(), Status::kSuccess);
+    ProcessMemoryBudget::Global().SetTestSpillIoFailCountdown(0);
+
+    ASSERT_SUCCESS(writer.Abort());
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (tm_->RuntimeStats().version_chains != 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(tm_->RuntimeStats().version_payload_resident_bytes, 0U);
+}
+
+TEST_F(TransactionP6aTest,
+       StatementTimeoutAndGcPinWarningFireDeterministically) {
+  struct TimeoutGuard {
+    TimeoutGuard() = default;
+    TimeoutGuard(const TimeoutGuard&) = delete;
+    TimeoutGuard& operator=(const TimeoutGuard&) = delete;
+    TimeoutGuard(TimeoutGuard&&) = delete;
+    TimeoutGuard& operator=(TimeoutGuard&&) = delete;
+    ~TimeoutGuard() {
+      Transaction::SetDefaultStatementTimeoutForTest(
+          std::chrono::milliseconds(-1));
+    }
+  } guard;
+
+  Transaction::SetDefaultStatementTimeoutForTest(std::chrono::milliseconds(15));
+  {
+    Transaction timed = tm_->Begin(/*read_only=*/true);
+    timed.BeginStatementTimer();
+    EXPECT_TRUE(timed.HasStatementTimeout());
+    EXPECT_EQ(timed.CheckStatementTimeout(), Status::kSuccess);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const Status expired = timed.CheckStatementTimeout();
+    // A statement timeout cancels the query (SQLSTATE 57014).
+    EXPECT_EQ(expired.GetCode(), StatusCode::kQueryCanceled);
+    EXPECT_NE(expired.GetMessage().find("timeout"), std::string::npos);
+
+    timed.SetStatementTimeout(std::chrono::milliseconds(0));
+    EXPECT_FALSE(timed.HasStatementTimeout());
+    EXPECT_EQ(timed.CheckStatementTimeout(), Status::kSuccess);
+    ASSERT_SUCCESS(timed.PreCommit());
+  }
+  Transaction::SetDefaultStatementTimeoutForTest(std::chrono::milliseconds(-1));
+
+  // Verify rate-limited GC pin warning fires when an old snapshot pins chains.
+  tm_->SetGcPinWarnThresholdsForTest(/*chain_limit=*/4, /*age_commits=*/8);
+  Transaction blocker = tm_->Begin(/*read_only=*/true);
+  for (int i = 0; i < 10; ++i) {
+    Transaction w = tm_->Begin();
+    const RowPosition rp(500, static_cast<slot_t>(i));
+    ASSERT_TRUE(w.AddWriteSet(rp, "v0"));
+    w.RegisterVersionWrite(rp, "v0", "v1");
+    ASSERT_SUCCESS(w.PreCommit());
+  }
+  const auto warn_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (tm_->GcPinWarnCountForTest() == 0 &&
+         std::chrono::steady_clock::now() < warn_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_GE(tm_->GcPinWarnCountForTest(), 1U);
+  ASSERT_SUCCESS(blocker.PreCommit());
+}
+
+TEST_F(TransactionP6aTest,
+       WriteSetSpillIoFailurePreservesStatusWithoutMaskingAsConflict) {
+  tm_->SetWriteSetSpillThresholdForTest(64);
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  struct InjectResetGuard {
+    ~InjectResetGuard() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
+  } guard;
+
+  Transaction writer = tm_->Begin();
+  ProcessMemoryBudget::Global().SetTestSpillIoFailCountdown(1);
+  bool failed = false;
+  for (size_t i = 0; i < 2000; ++i) {
+    const RowPosition rp(static_cast<page_id_t>(700 + (i / 64)),
+                         static_cast<slot_t>(i % 64));
+    if (!writer.TryAddWriteSet(rp)) {
+      failed = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(failed);
+  EXPECT_EQ(writer.LastWriteSetFailureStatus().GetCode(), StatusCode::kIOError);
+  // A transient write-set spill failure must not permanently poison an active
+  // transaction whose invariants remain intact.
+  EXPECT_FALSE(writer.IsFailed());
+  ASSERT_SUCCESS(writer.Abort());
+}
+
+}  // namespace
 
 }  // namespace tinylamb

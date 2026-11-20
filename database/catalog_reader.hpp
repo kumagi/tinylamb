@@ -26,6 +26,10 @@ class CatalogReader {
 
   [[nodiscard]] virtual uint64_t CatalogEpoch() const noexcept = 0;
 
+  // Invalidates caches stamped at the current schema epoch (T485). Only
+  // readers that own a schema epoch implement this; the default is a no-op.
+  virtual void BumpCatalogEpoch() noexcept {}
+
   virtual StatusOr<Table> GetTable(TransactionContext& context,
                                    std::string_view name) = 0;
   virtual StatusOr<TableStatistics> GetStatistics(TransactionContext& context,

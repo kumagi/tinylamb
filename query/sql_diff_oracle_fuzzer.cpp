@@ -374,13 +374,25 @@ std::string CheckDqp(Database& db, TransactionContext& ctx,
                      const DiffOracleTrace& trace, DiffOracleStats* stats) {
   for (const std::string& sql : trace.queries) {
     std::vector<std::pair<std::string, std::string>> ran;
+    std::vector<std::string> errors;
     for (int mode = 0; mode < 3; ++mode) {
       std::string error;
       std::string dump;
       const std::string name = RunMode(db, ctx, sql, mode, &dump, &error);
       if (!name.empty()) {
         ran.emplace_back(name, dump);
+      } else if (!error.empty()) {
+        // A mode-only execution failure is exactly the regression this
+        // cross-route oracle exists to catch; never silently skip it.
+        errors.push_back(std::to_string(mode) + ": " + error);
       }
+    }
+    if (!errors.empty()) {
+      std::string report = "[DQP MODE ERROR]\n  query: " + sql;
+      for (const auto& e : errors) {
+        report += "\n  " + e;
+      }
+      return report;
     }
     if (ran.size() < 2) {
       continue;
@@ -572,6 +584,7 @@ std::string RunTqsIteration(std::mt19937& rng, bool /*verbose*/,
   if (report.empty()) {
     out->tqs_queries += static_cast<int>(t.queries.size());
   }
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
   return report;
 }
 
@@ -638,6 +651,7 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
         t.subset_and.size() + t.subset_or.size() + t.subset_dis.size() +
         t.subset_eq.size() + t.subset_card.size());
   }
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
   return report;
 }
 
@@ -695,6 +709,7 @@ std::string RunDqpIteration(std::mt19937& rng, bool /*verbose*/,
       }
     }
   }
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
   return report;
 }
 
@@ -744,6 +759,7 @@ std::string RunRadarIteration(std::mt19937& rng, bool /*verbose*/,
   if (report.empty()) {
     out->radar_queries += static_cast<int>(t.queries.size());
   }
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
   return report;
 }
 

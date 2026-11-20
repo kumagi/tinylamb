@@ -12,7 +12,7 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 4. [単項変換と制御](40-unary-control.md) — 選択、射影、制限、行数検査、計測、UNNEST
 5. [結合](50-join.md) — 入れ子ループ、索引、ハッシュ、マージ、相関、時系列・区間結合
 6. [整列・重複除去・集合演算](60-sort-distinct-set.md) — `Sort`、Top-N、`Distinct`、集合演算、マージ連結
-7. [集約](70-aggregation.md) — 単一・並列・二段・分散・グルーピング集合・辞書集約
+7. [集約](70-aggregation.md) — 単一・並列集約（二段／分散／グルーピング集合／辞書集約の各章は撤去済み・未接続）
 8. [ウィンドウ・再帰・交換](80-window-recursion-distribution.md) — ウィンドウフレーム、再帰 CTE、交換、遠隔入力、関係単位の実行境界
 9. [データ変更](90-data-modification.md) — 挿入、更新、削除、全行削除、`MERGE`、`RETURNING`
 

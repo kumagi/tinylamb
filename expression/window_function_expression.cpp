@@ -24,7 +24,7 @@ std::string OrderTermsToString(const std::vector<WindowOrderTerm>& terms) {
     if (!out.empty()) {
       out += ", ";
     }
-    out += term.expression->ToString();
+    out += term.expression ? term.expression->ToString() : std::string("?");
     out += term.ascending ? " ASC" : " DESC";
     if (term.nulls_first.has_value()) {
       out += *term.nulls_first ? " NULLS FIRST" : " NULLS LAST";
@@ -39,12 +39,12 @@ std::string FrameBoundToString(const WindowFrameBound& bound) {
       return "UNBOUNDED PRECEDING";
     case WindowFrameBoundType::kOffsetPreceding:
       return bound.offset ? bound.offset->ToString() + " PRECEDING"
-                          : "OFFSET PRECEDING";
+                          : "? PRECEDING";
     case WindowFrameBoundType::kCurrentRow:
       return "CURRENT ROW";
     case WindowFrameBoundType::kOffsetFollowing:
       return bound.offset ? bound.offset->ToString() + " FOLLOWING"
-                          : "OFFSET FOLLOWING";
+                          : "? FOLLOWING";
     case WindowFrameBoundType::kUnboundedFollowing:
       return "UNBOUNDED FOLLOWING";
   }

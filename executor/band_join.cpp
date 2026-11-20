@@ -14,6 +14,7 @@
 #include "common/status_or.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
+#include "transaction/transaction.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
@@ -107,7 +108,13 @@ StatusOr<bool> BandJoin::PairPasses(const Row& left, const Row& right) const {
   if (!predicate_) {
     return true;
   }
-  const Row combined = left + right;
+  pair_scratch_.values_.clear();
+  pair_scratch_.values_.reserve(left.values_.size() + right.values_.size());
+  pair_scratch_.values_.insert(pair_scratch_.values_.end(),
+                               left.values_.begin(), left.values_.end());
+  pair_scratch_.values_.insert(pair_scratch_.values_.end(),
+                               right.values_.begin(), right.values_.end());
+  const Row& combined = pair_scratch_;
   if (kind_ == JoinKind::kInner) {
     return relational_detail::EvaluateConjunctsTolerant(
         predicate_conjuncts_, [&](const Expression& conjunct) {
@@ -153,6 +160,11 @@ Status BandJoin::Materialize() {
 
   DataChunk batch;
   while (left_->NextBatch(&batch) != 0) {
+    if (const Status st = Transaction::CheckThreadStatementTimeout();
+        st != Status::kSuccess) {
+      FailWith(st);
+      return st;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       left_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }
@@ -161,6 +173,11 @@ Status BandJoin::Materialize() {
     return left_->GetStatus();
   }
   while (right_->NextBatch(&batch) != 0) {
+    if (const Status st = Transaction::CheckThreadStatementTimeout();
+        st != Status::kSuccess) {
+      FailWith(st);
+      return st;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }

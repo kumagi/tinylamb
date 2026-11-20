@@ -17,7 +17,7 @@ void GroupByPlan::Dump(std::ostream& o, int indent) const {
     o << " group_keys=" << statement_->GroupBy().size();
   }
   o << '\n';
-  child_->Dump(o, indent + 2);
+  DumpChild(o, *child_, indent + 2);
 }
 
 }  // namespace tinylamb

@@ -228,6 +228,15 @@ struct UdfParameter {
   std::unique_ptr<GoogleSqlAstNode> default_value;
 };
 
+// T2396: the 64-frame UDF/TVF expansion cap.  This guard used to be dead
+// code; it is now constructed on the table-function expansion route
+// (VisitTableSource below), which the expression visitor's
+// ExpressionDepthGuard does not cover.  The scalar UDF/lambda route is
+// bounded by the tighter 32-frame `t_udf_frames` recursion stack in
+// ExpandUdfCall (sql_frontend_coverage_test's
+// UdfExpansionChainHonorsFrameDepthCap pins it), so a scalar chain
+// reports "SQL function recursion limit exceeded" before this guard can
+// fire; nested TVF-in-TVF expansion is this guard's job.
 constexpr int kMaxUdfExpansionDepth = 64;
 
 thread_local int tls_udf_expansion_depth = 0;
@@ -258,6 +267,25 @@ class UdfExpansionDepthGuard {
   bool failed_{false};
 };
 
+// UDF/TVF expansion can hand these walkers a tree deeper than the parser
+// could ever produce, so enforce an explicit recursion bound.
+constexpr size_t kMaxSubstitutionDepth = 512;
+thread_local size_t tls_substitution_depth = 0;
+struct SubstitutionDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+  bool entered{false};
+  SubstitutionDepthGuard() {
+    if (tls_substitution_depth < kMaxSubstitutionDepth) {
+      ++tls_substitution_depth;
+      entered = true;
+    }
+  }
+  ~SubstitutionDepthGuard() {
+    if (entered) {
+      --tls_substitution_depth;
+    }
+  }
+};
+
 Expression SubstituteParameters(
     const Expression& expression,
     const std::unordered_map<std::string, Expression>& bindings);
@@ -283,7 +311,8 @@ Expression SubstituteParameters(
     const std::unordered_map<std::string, Expression>&
         bindings) {  // NOLINT(misc-no-recursion) // AST-shaped tree walk; depth
                      // bounded by the parser's expression nesting.
-  if (!expression) {
+  SubstitutionDepthGuard depth_guard;
+  if (!expression || !depth_guard.entered) {
     return expression;
   }
   switch (expression->Type()) {
@@ -417,6 +446,10 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
     const std::unordered_map<std::string, Expression>&
         bindings) {  // NOLINT(misc-no-recursion) // Mirrors statement-tree
                      // binding in sql_template.cpp.
+  SubstitutionDepthGuard depth_guard;
+  if (!depth_guard.entered) {
+    return nullptr;
+  }
   std::vector<NamedExpression> items;
   items.reserve(select.SelectList().size());
   for (const NamedExpression& item : select.SelectList()) {
@@ -475,6 +508,10 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
     }
     result->SetGroupBy(std::move(group));
   }
+  // `GROUP BY ()` is a placeholder constant key plus this marker; dropping
+  // the marker on re-clone made group-all builds emit 0 rows for empty
+  // input through template replay / TVF expansion paths.
+  result->SetGroupAll(select.IsGroupAll());
   if (select.Having()) {
     result->SetHaving(SubstituteParameters(select.Having(), bindings));
   }
@@ -681,7 +718,17 @@ StatusOr<TableSampleSpec> VisitTableSample(
                                      method_name);
   }
 
-  const std::string size_text = UpperCopy(SliceSource(size_node));
+  std::string size_text = UpperCopy(SliceSource(size_node));
+  // Comments inside the size expression must not decide the sample unit.
+  for (size_t i = 0; i + 1 < size_text.size();) {
+    if (size_text[i] == '/' && size_text[i + 1] == '*') {
+      const size_t end = size_text.find("*/", i + 2);
+      size_text.erase(i, end == std::string::npos ? std::string::npos
+                                                  : end + 2 - i);
+    } else {
+      ++i;
+    }
+  }
   if (size_text.find("PERCENT") != std::string::npos) {
     sample.unit = TableSampleUnit::kPercent;
   } else if (size_text.find("ROWS") != std::string::npos) {
@@ -862,8 +909,17 @@ StatusOr<SelectSource> VisitTableSource(
         return AstError<SelectSource>(
             "TABLESAMPLE is not valid directly on UNNEST");
       }
+      size_t unnest_expr_count = 0;
       for (const auto& child : unnest->children) {
         if (child->kind == "ExpressionWithOptAlias") {
+          ++unnest_expr_count;
+          if (unnest_expr_count > 1) {
+            // The engine's UNNEST models a single array (plus optional
+            // offset). Silently dropping later arrays changes row counts and
+            // column shape, so reject the zip form explicitly.
+            return AstError<SelectSource>(
+                "UNNEST with multiple arrays is not supported");
+          }
           for (const auto& expr_child : child->children) {
             if (expr_child->kind != "Location" && expr_child->kind != "Alias") {
               ASSIGN_OR_RETURN(Expression, hv167048_0,
@@ -946,6 +1002,9 @@ StatusOr<SelectSource> VisitTableSource(
       view_source.join_type = source.join_type;
       view_source.join_condition = std::move(source.join_condition);
       view_source.offset_alias = std::move(source.offset_alias);
+      view_source.using_columns = std::move(source.using_columns);
+      view_source.is_lateral = source.is_lateral;
+      view_source.from_nested_join = source.from_nested_join;
       if (const GoogleSqlAstNode* sample = node.Child("SampleClause")) {
         ASSIGN_OR_RETURN(TableSampleSpec, parsed, (VisitTableSample(*sample)));
         view_source.sample = std::move(parsed);
@@ -1914,6 +1973,49 @@ SqlUdf* FindUdf(const std::string& name) {
   return nullptr;
 }
 
+// Issue 2553: SQL UDFs/TVFs live only in the thread_local, session-bucketed
+// registry above.  A persistent view definition that captured one of them
+// re-expands for every session from the cataloged AST, so any other session
+// -- or a read worker that offloaded the query -- resolves the callee to
+// "unknown function" because the definition is cataloged but its dependency
+// is not.  CREATE VIEW must refuse the capture: this walker returns the
+// lowered name of the first scalar-function or TVF reference that resolves
+// to a session-local UDF in the current scope.  Names that VisitFunction
+// rewrites to builtins before consulting the registry (ucase/lcase/median,
+// the lambda array rewrites, the builtin TVF generate_series) can never
+// reach a UDF at read time, so shadowing those is not a capture.
+std::optional<std::string> FirstSessionLocalUdfReference(
+    const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion)
+  static const std::unordered_set<std::string> kRewrittenBeforeRegistry = {
+      "ucase",        "lcase",          "median",         "array_transform",
+      "array_filter", "array_includes", "generate_series"};
+  if (node.kind == "FunctionCall" || node.kind == "TVF") {
+    const GoogleSqlAstNode* path =
+        node.kind == "TVF"
+            ? node.Child("PathExpression")
+            : (!node.children.empty() &&
+                       node.children.front()->kind == "PathExpression"
+                   ? node.children.front().get()
+                   : nullptr);
+    if (path != nullptr) {
+      StatusOr<std::string> name = Path(*path);
+      if (name.HasValue()) {
+        std::string lowered = Lower(name.MoveValue());
+        if (!kRewrittenBeforeRegistry.contains(lowered) &&
+            FindUdf(lowered) != nullptr) {
+          return lowered;
+        }
+      }
+    }
+  }
+  for (const auto& child : node.children) {
+    if (auto hit = FirstSessionLocalUdfReference(*child); hit.has_value()) {
+      return hit;
+    }
+  }
+  return std::nullopt;
+}
+
 void PurgeUdfSessionDefinitions(uint64_t session_id) {
   auto& definitions = UdfRegistryStateForThread().definitions;
   for (auto it = definitions.begin(); it != definitions.end();) {
@@ -1934,6 +2036,7 @@ void PurgeUdfSessionDefinitions(uint64_t session_id) {
 // WITH clause, the set-operation wrapper and the nested-WITH wrapper: all
 // three build a recursive CTE but only the first used to carry the spec,
 // silently dropping the depth bounds and DEPTH column on those root shapes.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static Status ApplyRecursiveDepthFromAliased(SelectStatement* statement,
                                       const GoogleSqlAstNode& aliased,
                                       const std::string& cte_name) {
@@ -2284,6 +2387,9 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
               first_stmt->AddWithQuery(cte_name, std::move(h_q));
             }
           }
+        }
+        if (query.kind != "Select") {
+          return FoldPipeOperators(query, std::move(first_stmt));
         }
         return first_stmt;
       }
@@ -2992,12 +3098,26 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                                  group->detail.find("ALL") != std::string::npos;
     if (is_group_by_all) {
       std::vector<Expression> expressions;
+      const bool has_unexpanded_star =
+          std::ranges::any_of(statement->SelectList(),
+                              [](const NamedExpression& item) {
+                                return IsUnexpandedStar(item.expression);
+                              });
       for (const NamedExpression& named : statement->SelectList()) {
-        if (named.expression && !ContainsAggregate(named.expression) &&
+        if (!named.expression || IsUnexpandedStar(named.expression)) {
+          continue;  // the star's expansion isn't known until binding
+        }
+        if (!ContainsAggregate(named.expression) &&
             named.expression->Type() != TypeTag::kWindowFunctionExp &&
             named.expression->Type() != TypeTag::kConstantValue) {
           expressions.push_back(named.expression);
         }
+      }
+      if (has_unexpanded_star) {
+        // GROUP BY ALL with SELECT * groups by every expanded column. Leave
+        // the grouping list empty here; the star-expanding route materializes
+        // the full schema and derives the effective grouping from all columns.
+        expressions.clear();
       }
       statement->SetGroupBy(std::move(expressions));
     } else {
@@ -3409,6 +3529,9 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       // A single set behaves as a plain GROUP BY; ORDER BY stays in-statement
       // and GROUPING() folds to constants inside it.
       RETURN_IF_FAIL(rewrite_branch(*statement, pending_grouping_sets.front()));
+      if (query.kind != "Select") {
+        return FoldPipeOperators(query, std::move(statement));
+      }
       return statement;
     }
 
@@ -3502,6 +3625,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreateFunction(
       udf.default_values.push_back(std::move(default_expr));
     }
   }
+  bool has_pending_udf = false;
+  SqlUdf pending_udf;
   if (root.kind != "CreateTableFunctionStatement") {
     const GoogleSqlAstNode* body = FindSqlFunctionBody(root);
     if (body != nullptr) {
@@ -3511,7 +3636,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreateFunction(
       udf.parameter_counts.assign(udf.parameters.size(), 0);
       AnalyzeUdfBody(*udf.body, udf.parameters, &udf.parameter_counts,
                      &udf.simple_body);
-      RegisterUdf(std::move(udf));
+      pending_udf = std::move(udf);
+      has_pending_udf = true;
     }
   } else {
     // Table function: keep the defining Query AST so FROM references can
@@ -3525,12 +3651,26 @@ StatusOr<std::unique_ptr<Statement>> VisitCreateFunction(
       udf.body = udf.root->Child("Query");
       udf.parameter_counts.assign(udf.parameters.size(), 0);
     }
-    RegisterUdf(std::move(udf));
+    pending_udf = std::move(udf);
+    has_pending_udf = true;
   }
   std::vector<NamedExpression> projection;
   projection.emplace_back("", ConstantValueExp(Value(int64_t{0})));
-  return std::make_unique<SelectStatement>(
-      std::move(projection), std::vector<std::string>{}, Expression{});
+  if (!has_pending_udf) {
+    return std::make_unique<SelectStatement>(
+        std::move(projection), std::vector<std::string>{}, Expression{});
+  }
+  // T2552: the thread_local registry write is deferred into the statement
+  // and runs only when the CREATE executes (PrepareStatement dispatch).
+  // A Prepare that never dispatches -- EXPLAIN, or a re-Visit after a
+  // failure -- must leave no function behind, mirroring CREATE VIEW.
+  return std::make_unique<CreateObjectStatement>(
+      StatementType::kCreateFunction,
+      [udf = std::move(pending_udf)]() mutable {
+        RegisterUdf(std::move(udf));
+        return Status::kSuccess;
+      },
+      std::move(projection));
 }
 // Proto constructor (NEW) and SELECT AS <proto> validation against the
 // embedded compliance-proto registry.
@@ -3836,6 +3976,7 @@ Status ValidateSelectAsProjections(
 using ViewRegistryMap =
     std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>;
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static std::unordered_map<uint64_t, ViewRegistryMap>& AllViewRegistries() {
   static thread_local std::unordered_map<uint64_t, ViewRegistryMap> registries;
   return registries;
@@ -3927,6 +4068,10 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     ASSIGN_OR_RETURN(std::string, hv240028_0, (Path(*path)));
     std::string const_name = std::move(hv240028_0);
     std::string const_val;
+    // T2552: build the registry entry during the Visit, but write the
+    // thread_local registries only when the statement executes (see
+    // CreateObjectStatement / VisitCreateFunction).
+    std::optional<Expression> pending_entry;
     for (const auto& child : root.children) {
       if (child->kind != "PathExpression" && child->kind != "Location") {
         ASSIGN_OR_RETURN(Expression, hv240217_0, (VisitExpression(*child)));
@@ -3943,29 +4088,36 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
           }
           // Fully evaluable constant: pin the value itself so every
           // reference observes one deterministic result (e.g. Rand()).
-          SessionConstantExpressions()[Lower(const_name)] =
-              ConstantValueExp(Value(std::move(v)));
+          pending_entry = ConstantValueExp(Value(std::move(v)));
         } else {
           if (child->kind == "StringLiteral") {
             ASSIGN_OR_RETURN(std::string, hv240897_0, (DecodeString(*child)));
             const_val = std::move(hv240897_0);
-            SessionConstantExpressions()[Lower(const_name)] =
-                ConstantValueExp(Value(std::string(const_val)));
+            pending_entry = ConstantValueExp(Value(std::string(const_val)));
           } else {
             // Subqueries and function calls evaluate per reference through
             // the relational interpreter instead.
-            SessionConstantExpressions()[Lower(const_name)] = std::move(expr);
+            pending_entry = std::move(expr);
           }
         }
         break;
       }
     }
-    SetSessionConstant(const_name, const_val);
     std::vector<NamedExpression> proj;
     proj.emplace_back("constant",
                       ConstantValueExp(Value(std::string(const_name))));
-    return std::make_unique<SelectStatement>(
-        std::move(proj), std::vector<std::string>{}, Expression{});
+    std::string const_key = Lower(const_name);
+    return std::make_unique<CreateObjectStatement>(
+        StatementType::kCreateConstant,
+        [key = std::move(const_key), entry = std::move(pending_entry),
+         name = std::move(const_name), val = std::move(const_val)]() mutable {
+          if (entry) {
+            SessionConstantExpressions()[key] = std::move(*entry);
+          }
+          SetSessionConstant(name, val);
+          return Status::kSuccess;
+        },
+        std::move(proj));
   }
   if (root.kind == "CreateTableStatement") {
     return VisitCreate(root);
@@ -4092,8 +4244,9 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
         root.detail.find("is_or_replace") != std::string::npos;
     const bool if_not_exists =
         root.detail.find("is_if_not_exists") != std::string::npos;
+    const bool is_temp = root.detail.find("is_temp") != std::string::npos;
     return std::make_unique<CreateViewStatement>(
-        view_name, or_replace, SliceSource(query), if_not_exists);
+        view_name, or_replace, SliceSource(query), if_not_exists, is_temp);
   }
   if (root.kind == "CreateMaterializedViewStatement") {
     // Materialized views are catalog objects: materialize the query into a
@@ -4155,8 +4308,9 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
           "GoogleSQL AST: bad TRUNCATE");
     }
     ASSIGN_OR_RETURN(std::string, truncate_table, Path(*path));
-    return std::make_unique<DeleteStatement>(std::move(truncate_table),
-                                             ConstantValueExp(Value(true)));
+    auto stmt = std::make_unique<DeleteStatement>(
+        std::move(truncate_table), ConstantValueExp(Value(true)));
+    return stmt;
   }
   if (root.kind == "DropStatement VIEW") {
     const GoogleSqlAstNode* path = root.Child("PathExpression");

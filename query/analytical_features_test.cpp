@@ -271,6 +271,39 @@ TEST_F(AnalyticalFeaturesTest, RunningWindowSurvivesLimitWithRowsFrame) {
   EXPECT_EQ(rows[1][1], Value(30));
 }
 
+TEST_F(AnalyticalFeaturesTest, GroupsFrameBucketsPeersNotRows) {
+  // T3697: the visitor collapsed every frame unit that was not RANGE into
+  // ROWS, leaving the kGroups peer-bucketing arm in window_eval unreachable
+  // from the AST.  The visitor now maps GROUPS -> kGroups; the pinned
+  // GoogleSQL parser binary (2026.7.2) still rejects the GROUPS keyword at
+  // the grammar level (frame units: RANGE/ROWS only), which stays a
+  // parser-release concern.  The evaluator arm is pinned programmatically
+  // in QueryTest (frame_unit = kGroups); this test pins the parser gate and
+  // that ROWS frames keep sliding one row at a time.
+  //
+  // Issue 5029: re-checked against the newest release 2026.11.3 (published
+  // 2026-11-18) -- GROUPS frames and FILTER clauses are still rejected by
+  // the release grammar even with --enabled_language_features=DEV/MAXIMUM,
+  // so no version bump is possible yet.  When a release does accept them,
+  // flip this EXPECT_THROW (and the FILTER gate) to the peer-group
+  // assertions the report sketches and bump TINYLAMB_GOOGLESQL_VERSION with
+  // the matching SHA256 values in CMakeLists.txt.
+  EXPECT_THROW(
+      RunSql(engine_.get(), context_.get(),
+             "SELECT SUM(amt) OVER (ORDER BY cat GROUPS BETWEEN 1 PRECEDING "
+             "AND CURRENT ROW) FROM sales"),
+      std::exception);
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT SUM(amt) OVER (ORDER BY cat, amt ROWS BETWEEN 1 PRECEDING AND "
+      "CURRENT ROW) FROM sales ORDER BY cat, amt;");
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0][0], Value(10.0));
+  EXPECT_EQ(rows[1][0], Value(30.0));
+  EXPECT_EQ(rows[2][0], Value(50.0));
+  EXPECT_EQ(rows[3][0], Value(70.0));
+}
+
 TEST_F(AnalyticalFeaturesTest, QualifyFiltersGroupedAggregates) {
   // SUM(amt): 'a' sums to 30, 'b' to 70.
   const auto sum_filtered =
@@ -817,6 +850,58 @@ TEST_F(AnalyticalFeaturesTest, MedianMatchesPercentileCont) {
   EXPECT_DOUBLE_EQ(window[1][0].value.double_value, 6.0);
 }
 
+// T2243: PERCENTILE_DISC was registered on the window route only; the
+// aggregate spelling PERCENTILE_DISC(v, p) must resolve, round the rank UP
+// like the window implementation, and return an actual input element with
+// its type preserved.
+TEST_F(AnalyticalFeaturesTest, PercentileDiscAggregateMatchesWindowRoute) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE disc (g INT64, n DOUBLE);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO disc VALUES (1, 1.0), (1, 2.0), (1, 3.0), (1, 10.0), "
+         "(2, 5.0), (2, 7.0);");
+  const auto single = RunSql(engine_.get(), context_.get(),
+                             "SELECT PERCENTILE_DISC(n, 0.5) FROM disc "
+                             "WHERE g = 1");
+  ASSERT_EQ(single.size(), 1U);
+  EXPECT_DOUBLE_EQ(single[0][0].value.double_value, 3.0);
+  // Rank 0 / 1 land on the boundary elements; 0.25 rounds up to the 2nd.
+  const auto bounds = RunSql(engine_.get(), context_.get(),
+                             "SELECT PERCENTILE_DISC(n, 0), "
+                             "PERCENTILE_DISC(n, 1), PERCENTILE_DISC(n, 0.25) "
+                             "FROM disc WHERE g = 1");
+  ASSERT_EQ(bounds.size(), 1U);
+  EXPECT_DOUBLE_EQ(bounds[0][0].value.double_value, 1.0);
+  EXPECT_DOUBLE_EQ(bounds[0][1].value.double_value, 10.0);
+  EXPECT_DOUBLE_EQ(bounds[0][2].value.double_value, 2.0);
+  // INT64 input keeps its type (an actual element, not the interpolated
+  // FLOAT64 PERCENTILE_CONT would produce). g = four 1s and two 2s; the
+  // top rank returns the last element 2 as INT64.
+  const auto typed = RunSql(engine_.get(), context_.get(),
+                            "SELECT PERCENTILE_DISC(g, 1) FROM disc");
+  ASSERT_EQ(typed.size(), 1U);
+  EXPECT_EQ(typed[0][0], Value(int64_t{2}));
+  // Grouped and window forms agree.
+  const auto grouped =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT g, PERCENTILE_DISC(n, 0.5) FROM disc GROUP BY g "
+             "ORDER BY g");
+  ASSERT_EQ(grouped.size(), 2U);
+  EXPECT_DOUBLE_EQ(grouped[0][1].value.double_value, 3.0);
+  EXPECT_DOUBLE_EQ(grouped[1][1].value.double_value, 7.0);
+  const auto window = RunSql(engine_.get(), context_.get(),
+                             "SELECT DISTINCT PERCENTILE_DISC(n, 0.5) OVER "
+                             "(PARTITION BY g) FROM disc ORDER BY 1");
+  ASSERT_EQ(window.size(), 2U);
+  EXPECT_DOUBLE_EQ(window[0][0].value.double_value, 3.0);
+  EXPECT_DOUBLE_EQ(window[1][0].value.double_value, 7.0);
+  // Empty input and NULL inputs are NULL (same contract as CONT).
+  EXPECT_TRUE(
+      RunSql(engine_.get(), context_.get(),
+             "SELECT PERCENTILE_DISC(n, 0.5) FROM disc WHERE g = 9")[0][0]
+          .IsNull());
+}
+
 // FARM_FINGERPRINT is the signed INT64 view of FarmHash's Fingerprint64.
 // The expected values were generated against the reference implementation
 // (google/farmhash farmhashna::Hash64) and pinned here so the port cannot
@@ -839,6 +924,11 @@ TEST_F(AnalyticalFeaturesTest, FarmFingerprintMatchesReference) {
              "SELECT FARM_FINGERPRINT('a'), FARM_FINGERPRINT('a')")[0][0],
       RunSql(engine_.get(), context_.get(),
              "SELECT FARM_FINGERPRINT('a'), FARM_FINGERPRINT('a')")[0][0]);
+  // Distinct inputs must not collapse to the same fingerprint.
+  EXPECT_NE(RunSql(engine_.get(), context_.get(),
+                   "SELECT FARM_FINGERPRINT('a')")[0][0],
+            RunSql(engine_.get(), context_.get(),
+                   "SELECT FARM_FINGERPRINT('b')")[0][0]);
 }
 
 // PARSE_JSON validates strict JSON text and feeds the JSON accessors in the

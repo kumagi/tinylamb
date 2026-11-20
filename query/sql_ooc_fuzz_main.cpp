@@ -231,10 +231,20 @@ int RunGen(const Args& a) {
     }
   }
   std::ofstream trace_file;
+  // T3295: open (and validate) the trace up front -- a bad --trace-path
+  // used to leave an empty/absent trace while gen still reported OK.
+  if (!a.trace_path.empty()) {
+    trace_file.open(a.trace_path, std::ios::trunc);
+    if (!trace_file) {
+      std::cerr << "cannot open --trace " << a.trace_path << "\n";
+      return 2;
+    }
+  }
   Watchdog watchdog(a.op_timeout);
   options.on_profile = [&](const OocProfile& profile) {
-    if (!a.trace_path.empty()) {
-      trace_file.open(a.trace_path, std::ios::trunc);
+    if (trace_file.is_open()) {
+      // Write into the already-open stream: re-opening here would set
+      // failbit from a second callback onward.
       trace_file << tinylamb::SerializeOocHeader(a.seed, profile) << std::flush;
     }
   };
@@ -249,7 +259,15 @@ int RunGen(const Args& a) {
   const std::string report =
       tinylamb::RunOocSession(nullptr, 0, a.seed, options, &stats, &trace);
   watchdog.Disarm();
-  return Report(report, stats);
+  const int rc = Report(report, stats);
+  if (!a.trace_path.empty()) {
+    trace_file.close();
+    if (!trace_file) {
+      std::cerr << "failed writing --trace " << a.trace_path << "\n";
+      return rc == 0 ? 1 : rc;
+    }
+  }
+  return rc;
 }
 
 int RunReplay(const Args& a) {
@@ -294,8 +312,18 @@ int RunMinimize(const Args& a) {
       c = ' ';
     }
   }
-  std::ofstream(a.out_path)
-      << tinylamb::SerializeOocTest(seed, minimized, one_line.substr(0, 600));
+  {
+    std::ofstream out(a.out_path);
+    if (!out) {
+      std::cerr << "cannot write minimized trace to " << a.out_path << "\n";
+      return 1;
+    }
+    out << tinylamb::SerializeOocTest(seed, minimized, one_line.substr(0, 600));
+    if (!out) {
+      std::cerr << "failed writing minimized trace to " << a.out_path << "\n";
+      return 1;
+    }
+  }
   std::cout << "MINIMIZED: " << trace.ops.size() << " -> "
             << minimized.ops.size() << " ops, written to " << a.out_path
             << "\nFINDING: " << final_report

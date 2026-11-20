@@ -51,7 +51,8 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
 // regenerates the iteration from `trace.seed` to detect a tampered file.
 // Returns "" when the recorded failure no longer reproduces; otherwise the
 // fresh diagnostic.
-std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose = false);
+std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose = false,
+                               bool* skipped_out = nullptr);
 
 // Self-contained text format ("-- key: value" lines, one "-- stmt: " per
 // executed statement).

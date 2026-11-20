@@ -103,8 +103,8 @@ The pre-fix failure and successful retest are preserved in the run directory.
 The 306 existing related C++ tests and the new regression passed; layering
 and OOC invariant checks also passed. An OOC campaign completed 513 sessions
 and 67,534 checks with zero findings and zero ignored findings. The final
-binary retained the SF 1 gates: all 22 TPC-H queries within 1.708× and all
-99 TPC-DS queries within 1.888×, with matching answers.
+binary retained the SF 1 gates: all 22 TPC-H queries within 1.709× and all
+99 TPC-DS queries within 1.891×, with matching answers.
 
 [Scaling verification](../../build/quality/tpch-scaling-20261117/verification.json)
 contains per-scale measurements, outstanding performance ratios, artifact

@@ -89,7 +89,10 @@ def main():
     right.set_title('Hot update, one client: variation between trials')
     right.grid(alpha=.25)
     right.legend(fontsize=9, frameon=False)
-    fig.suptitle('tinylamb PostgreSQL gap follow-up: 2026-10-29', fontsize=15)
+    fig.suptitle(
+        'tinylamb PostgreSQL gap follow-up: '
+        + __import__('datetime').date.today().isoformat(),
+        fontsize=15)
     a.output.mkdir(parents=True, exist_ok=True)
     for suffix in ('png', 'svg'):
         fig.savefig(a.output / f'comparison.{suffix}', dpi=160)

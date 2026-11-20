@@ -27,14 +27,17 @@ a layer may only include equal or lower layers):
            -> sql(query/) -> server
 
 benchmark/, main.cpp and test targets (*_test*, *_fuzzer*, *_benchmark.*) sit
-above everything and may include freely.  page/recovery/transaction share one
-rank because CMake declares them as the single tightly-coupled Layer 3 (see
-CMakeLists.txt); splitting them apart is future work.  Known, accepted
-violations live in DEFAULT_ALLOWLIST -- shrinking that list is how layering
-regressions get paid off.
+above everything and may include freely -- except the fuzzer harnesses listed
+in PRODUCTION_FUZZERS, which CMake compiles into the production `tinylamb_sql`
+static library and are therefore ordinary layer members.  page/recovery/
+transaction share one rank because CMake declares them as the single
+tightly-coupled Layer 3 (see CMakeLists.txt); splitting them apart is future
+work.  Known, accepted violations live in DEFAULT_ALLOWLIST -- shrinking that
+list is how layering regressions get paid off.
 
 Usage:
     python3 scripts/check_layering.py                # enforce (exit 0/1)
+    python3 scripts/check_layering.py --root DIR     # check another checkout
     python3 scripts/check_layering.py --allowlist f  # extend allowlist
 """
 
@@ -65,7 +68,21 @@ LAYERS = (
 RANK = {name: rank for rank, (name, _) in enumerate(LAYERS)}
 
 TOP_PREFIXES = ("benchmark/",)  # plus main.cpp and test targets, below
-TEST_PATTERN = re.compile(r"_test\.|_fuzzer|_benchmark\.")
+TEST_PATTERN = re.compile(r"_test[\._]|_fuzzer|_benchmark\.")
+# Fuzzer harnesses compiled into a production library (the `tinylamb_sql`
+# sources in CMakeLists.txt), not into a test/executable target.  The generic
+# TEST_PATTERN exemption must not hide their includes from the DAG.
+PRODUCTION_FUZZERS = frozenset({
+    "query/expr_oracle_fuzzer.cpp",
+    "query/griffin_fuzzer.cpp",
+    "query/sql_aggregate_fuzzer.cpp",
+    "query/sql_diff_oracle_fuzzer.cpp",
+    "query/sql_join_fuzzer.cpp",
+    "query/sql_ooc_fuzzer.cpp",
+    "query/sql_oracle_fuzzer.cpp",
+    "query/sql_plan_cache_fuzzer.cpp",
+    "query/sql_session_fuzzer.cpp",
+})
 IGNORED_PREFIXES = ("scripts/", "docs/", ".git/", "build")
 INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.MULTILINE)
 
@@ -83,16 +100,18 @@ DEFAULT_ALLOWLIST = (
     # V4: plan -> executor。A5 relational ファクトリ移設でほぼ解消
     # (plan/plan.hpp は不透明前方宣言、各 *_plan.cpp の EmitExecutor 実装は
     #  executor/relational_factory.cpp へ移設済み)。残存はハイブリッド
-    # ハッシュのコスト推定ヘルパ (PreferHybridHashJoin / kHashJoinRowBytes
+    # ハッシュのコスト推定ヘルパー (PreferHybridHashJoin / kHashJoinRowBytes
     # Estimate) が executor/hash_join_mode.hpp に在籍しているための 2 辺のみ。
     "plan/product_plan.cpp -> executor/hash_join_mode.hpp",
     "plan/implementation_rules.cpp -> executor/hash_join_mode.hpp",
     # V3': statement IR が executor 層より上位にある問題。
     #      移行期間中の直参照を許容する。
-    # Expanded from wildcard 'executor/detail/* -> query/statement.hpp' (24 edges).
+    # Expanded from wildcard 'executor/detail/* -> query/statement.hpp' (29 edges).
     # Exact edges only: a wildcard silently allows future regressions.
     "executor/detail/aggregate_accumulator.cpp -> query/statement.hpp",
     "executor/detail/build_input.cpp -> query/statement.hpp",
+    "executor/detail/build_input_internal.hpp -> query/statement.hpp",
+    "executor/detail/build_input_joins.cpp -> query/statement.hpp",
     "executor/detail/columnar_tlcs_fast_path.hpp -> query/statement.hpp",
     "executor/detail/explain_format.cpp -> query/statement.hpp",
     "executor/detail/explain_format.hpp -> query/statement.hpp",
@@ -100,21 +119,24 @@ DEFAULT_ALLOWLIST = (
     "executor/detail/expression_eval.hpp -> query/statement.hpp",
     "executor/detail/fused_grouped_join.cpp -> query/statement.hpp",
     "executor/detail/fused_grouped_join.hpp -> query/statement.hpp",
+    "executor/detail/fused_grouped_join_stream.cpp -> query/statement.hpp",
     "executor/detail/parallel_table_scan.cpp -> query/statement.hpp",
     "executor/detail/pipeline/ooc_join_cte_sources.cpp -> query/statement.hpp",
     "executor/detail/planning_heuristics.cpp -> query/statement.hpp",
     "executor/detail/planning_heuristics.hpp -> query/statement.hpp",
+    "executor/detail/relational_sort_limit.cpp -> query/statement.hpp",
     "executor/detail/scan_filter.cpp -> query/statement.hpp",
     "executor/detail/scan_filter.hpp -> query/statement.hpp",
-    "executor/detail/stream_grouped_join.cpp -> query/statement.hpp",
     "executor/detail/subquery_runtime.cpp -> query/statement.hpp",
     "executor/detail/subquery_runtime.hpp -> query/statement.hpp",
     "executor/detail/typed_column_eval.cpp -> query/statement.hpp",
     "executor/detail/typed_stream_aggregate.cpp -> query/statement.hpp",
     "executor/detail/typed_stream_aggregate.hpp -> query/statement.hpp",
+    "executor/detail/typed_stream_aggregate_internal.hpp -> query/statement.hpp",
     "executor/detail/typed_stream_aggregate_partitioned.hpp -> query/statement.hpp",
     "executor/detail/window_eval.cpp -> query/statement.hpp",
     "executor/detail/window_eval.hpp -> query/statement.hpp",
+    "executor/detail/window_eval_internal.hpp -> query/statement.hpp",
     "executor/relational.cpp -> query/statement.hpp",
     # apply / recursive_cte / unnest 物理演算子とその plan ノードは
     # SelectStatement IR を直接扱う (relational と同じ V3' 系)。
@@ -165,8 +187,10 @@ DEFAULT_ALLOWLIST = (
     "expression/bytecode.cpp -> executor/data_chunk.hpp",
 
     # relational(executor/detail) から executor 本体への上向き。A5 で解消予定。
-    # Expanded from wildcard 'executor/detail/* -> executor/*' (34 edges).
+    # Expanded from wildcard 'executor/detail/* -> executor/*' (45 edges).
     # Exact edges only: a wildcard silently allows future regressions.
+    "executor/detail/build_input_joins.cpp -> executor/query_memory.hpp",
+    "executor/detail/columnar_table.hpp -> executor/query_memory.hpp",
     "executor/detail/columnar_tlcs_fast_path.cpp -> executor/query_memory.hpp",
     "executor/detail/columnar_tlcs_internal.hpp -> executor/query_memory.hpp",
     "executor/detail/explain_format.cpp -> executor/hash_join_mode.hpp",
@@ -178,6 +202,7 @@ DEFAULT_ALLOWLIST = (
     "executor/detail/ooc/external_sorter.hpp -> executor/data_chunk.hpp",
     "executor/detail/ooc/recursive_partitioner.hpp -> executor/data_chunk.hpp",
     "executor/detail/ooc/spillable_store.hpp -> executor/data_chunk.hpp",
+    "executor/detail/parallel_table_scan.cpp -> executor/query_memory.hpp",
     "executor/detail/pipeline/ooc_join_cte_sources.cpp -> executor/data_chunk.hpp",
     "executor/detail/pipeline/ooc_setop_incsort_sink.cpp -> executor/data_chunk.hpp",
     "executor/detail/pipeline/ooc_sinks.hpp -> executor/grouped_aggregate.hpp",
@@ -194,11 +219,19 @@ DEFAULT_ALLOWLIST = (
     "executor/detail/planning_heuristics.cpp -> executor/spill_file.hpp",
     "executor/detail/relation.cpp -> executor/query_memory.hpp",
     "executor/detail/relation.cpp -> executor/spill_file.hpp",
+    "executor/detail/relation.hpp -> executor/query_memory.hpp",
     "executor/detail/relation.hpp -> executor/spill_file.hpp",
+    "executor/detail/relational_sort_limit.cpp -> executor/query_memory.hpp",
+    "executor/detail/relational_sort_limit.cpp -> executor/spill_file.hpp",
+    "executor/detail/relational_sort_limit.hpp -> executor/query_memory.hpp",
+    "executor/detail/relational_sort_limit.hpp -> executor/spill_file.hpp",
     "executor/detail/subquery_runtime.cpp -> executor/aggregation.hpp",
+    "executor/detail/subquery_runtime.hpp -> executor/query_memory.hpp",
     "executor/detail/typed_column_eval.cpp -> executor/aggregation.hpp",
     "executor/detail/typed_stream_aggregate.cpp -> executor/aggregation.hpp",
     "executor/detail/typed_stream_aggregate.cpp -> executor/query_memory.hpp",
+    "executor/detail/typed_stream_aggregate_internal.hpp -> executor/aggregation.hpp",
+    "executor/detail/typed_stream_aggregate_internal.hpp -> executor/query_memory.hpp",
     "executor/detail/typed_stream_aggregate_partitioned.cpp -> executor/query_memory.hpp",
     "executor/detail/window_eval.cpp -> executor/query_memory.hpp",
     # optimizer は query_data を使う (CMake 上 tinylamb_executor 所属)。
@@ -217,11 +250,13 @@ DEFAULT_ALLOWLIST = (
     # GroupByFinish の EXPLAIN が保持しているステートメントの GROUP BY キー数
     # を報告するだけ (statement IR の読み取りのみ)。
     "plan/group_by_plan.cpp -> query/statement.hpp",
+    # Union of exact edges across tree states (no wildcard).
 )
 
 
 def layer_of(rel_path):
-    if TEST_PATTERN.search(rel_path) or rel_path == "main.cpp":
+    if rel_path not in PRODUCTION_FUZZERS and (
+            TEST_PATTERN.search(rel_path) or rel_path == "main.cpp"):
         return "top"
     if rel_path.startswith(TOP_PREFIXES):
         return "top"
@@ -241,6 +276,46 @@ def source_files(root):
         if rel.startswith(IGNORED_PREFIXES) or "/.git/" in rel:
             continue
         yield rel
+
+
+def header_index(root):
+    """Map basename -> list of repo-relative header paths (for bare includes)."""
+    index = {}
+    for path in sorted(root.rglob("*.hpp")):
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith(IGNORED_PREFIXES) or "/.git/" in rel:
+            continue
+        index.setdefault(path.name, []).append(rel)
+    return index
+
+
+def resolve_include(src, include, root, index):
+    """Resolve a quoted include to a repo-relative path.
+
+    Prefixed includes ("plan/plan.hpp") are already repo-relative. Bare
+    includes ("plan.hpp") are resolved by preferring the including file's own
+    directory, then the unique basename match. Returns None when the include
+    cannot be resolved unambiguously (caller skips it, as before).
+    """
+    if "/" in include:
+        return include
+    src_dir = src.rpartition("/")[0]
+    if src_dir:
+        sibling = f"{src_dir}/{include}"
+        if (root / sibling).is_file():
+            return sibling
+    candidates = index.get(include, [])
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        layers = {layer_of(c) for c in candidates}
+        if len(layers) == 1:
+            same = [c for c in candidates if c.startswith(src_dir + "/")]
+            return same[0] if len(same) == 1 else candidates[0]
+        same = [c for c in candidates if c.startswith(src_dir + "/")]
+        if len(same) == 1:
+            return same[0]
+    return None
 
 
 def allowed(edge, extra):
@@ -268,18 +343,23 @@ def main():
                   if line.strip() and not line.lstrip().startswith("#")]
 
     violations = []
+    index = header_index(Path(args.root))
+    root = Path(args.root)
     for src in source_files(Path(args.root)):
         src_layer = layer_of(src)
         if src_layer is None or src_layer == "top":
             continue
         for include in INCLUDE_RE.findall(
                 Path(args.root, src).read_text(encoding="utf-8", errors="replace")):
-            dst_layer = layer_of(include)
+            resolved = resolve_include(src, include, root, index)
+            if resolved is None:
+                continue
+            dst_layer = layer_of(resolved)
             if dst_layer is None or dst_layer == "top":
                 continue
-            if not is_violation(src, src_layer, include, dst_layer):
+            if not is_violation(src, src_layer, resolved, dst_layer):
                 continue
-            violations.append((src, src_layer, include, dst_layer))
+            violations.append((src, src_layer, resolved, dst_layer))
 
     unallowed = [v for v in violations if not allowed(f"{v[0]} -> {v[2]}", extra)]
     for src, src_layer, include, dst_layer in sorted(unallowed):

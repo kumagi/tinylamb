@@ -680,7 +680,11 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
       auto optimized = load(opt_sql);
       auto reference = load(ref_sql);
       if (!optimized.has_value() || !reference.has_value()) {
-        return true;
+        // A query that now errors is itself a NoREC regression; silently
+        // accepting it hides planner/runtime failures behind a green oracle.
+        *mismatch_report = std::string("[NoREC QUERY ERROR]\n  optimized: ") +
+                           opt_sql + "\n  reference: " + ref_sql + "\n";
+        return false;
       }
       std::vector<std::string> got;
       for (const Row& row : *optimized) {
@@ -736,7 +740,10 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
   auto ref_cnt = RunScalarCount(db, ctx, ref_query, &ref_err);
 
   if (!opt_cnt.has_value() || !ref_cnt.has_value()) {
-    return true;
+    *mismatch_report = "[NoREC QUERY ERROR]\n  optimized: " + opt_query +
+                       "  error=" + opt_err + "\n  reference: " + ref_query +
+                       "  error=" + ref_err + "\n";
+    return false;
   }
 
   if (*opt_cnt != *ref_cnt) {
@@ -969,13 +976,19 @@ void Worker(int thread_id, uint64_t base_seed, bool trace_cases,
 }  // namespace tinylamb
 
 int main(int argc, char** argv) {
-  // atoi neither reports conversion errors nor accepts non-NUL-terminated
-  // string_view tails; parse through an owned, NUL-terminated copy. Note the
-  // end pointer is intentionally ignored here: trailing garbage and overflow
-  // are NOT validated by this helper (unlike the strtoull CLI parsers).
-  const auto parse_int = [](std::string_view text) {
+  // Parse an owned, NUL-terminated copy with full validation; malformed
+  // values keep the caller's current/default value.
+  const auto parse_int = [](std::string_view text, int fallback) {
     const std::string owned(text);
-    return static_cast<int>(std::strtol(owned.c_str(), nullptr, 10));
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(owned.c_str(), &end, 10);
+    if (errno != 0 || end == owned.c_str() || *end != '\0' ||
+        parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+      return fallback;
+    }
+    return static_cast<int>(parsed);
   };
   std::optional<uint64_t> requested_seed;
   bool trace_cases = false;
@@ -1001,27 +1014,27 @@ int main(int argc, char** argv) {
     } else if (arg == "--trace-cases") {
       trace_cases = true;
     } else if (arg.starts_with("--duration_sec=")) {
-      duration_sec = parse_int(arg.substr(15));
+      duration_sec = parse_int(arg.substr(15), duration_sec);
     } else if (arg.starts_with("--duration=")) {
-      duration_sec = parse_int(arg.substr(11));
+      duration_sec = parse_int(arg.substr(11), duration_sec);
     } else if (arg.starts_with("--threads=")) {
-      num_threads = parse_int(arg.substr(10));
+      num_threads = parse_int(arg.substr(10), num_threads);
     } else if (!arg.starts_with("-")) {
       if (positional_idx == 0) {
-        duration_sec = parse_int(arg);
+        duration_sec = parse_int(arg, duration_sec);
         positional_idx++;
       } else if (positional_idx == 1) {
-        num_threads = parse_int(arg);
+        num_threads = parse_int(arg, num_threads);
         positional_idx++;
       }
     }
   }
 
   if (const char* env_dur = std::getenv("FUZZ_DURATION_SEC")) {
-    duration_sec = parse_int(env_dur);
+    duration_sec = parse_int(env_dur, duration_sec);
   }
   if (const char* env_threads = std::getenv("FUZZ_THREADS")) {
-    num_threads = parse_int(env_threads);
+    num_threads = parse_int(env_threads, num_threads);
   }
 
   std::random_device rd;

@@ -27,10 +27,36 @@ struct SetOperationRowEqual {
 
 // SQL equality folds case-insensitive VARCHAR text, so the hash must fold the
 // same text or CI peers land in different buckets and are never compared.
+//
+// Dedup keys reference the rows by pointer plus precomputed hash: the result
+// side already owns every output row, so the hash tables must not keep a
+// second full copy per row (wide VARCHAR-heavy rows paid a linear deep copy
+// per distinct key).  `row` must outlive the table; every use site keys rows
+// owned by the same materialization call that owns the table.
+struct HashedRowRef {
+  const Row* row{nullptr};
+  uint64_t hash{0};
+};
+
+struct HashedRowRefHash {
+  size_t operator()(const HashedRowRef& ref) const noexcept {
+    return static_cast<size_t>(ref.hash);
+  }
+};
+
+struct HashedRowRefEqual {
+  bool operator()(const HashedRowRef& left,
+                  const HashedRowRef& right) const noexcept {
+    return left.hash == right.hash &&
+           SetOperationRowEqual{}(*left.row, *right.row);
+  }
+};
+
 using SetOperationRowSet =
-    std::unordered_set<Row, DistinctRowHash, SetOperationRowEqual>;
+    std::unordered_set<HashedRowRef, HashedRowRefHash, HashedRowRefEqual>;
 using SetOperationRowMap =
-    std::unordered_map<Row, size_t, DistinctRowHash, SetOperationRowEqual>;
+    std::unordered_map<HashedRowRef, size_t, HashedRowRefHash,
+                       HashedRowRefEqual>;
 
 class SetOperationExecutor : public ExecutorBase {
  public:

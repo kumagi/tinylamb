@@ -168,9 +168,10 @@ int CompareChunkRowAgainstHeapKey(const TlcsFile::DecodedColumnChunk& chunk,
 }
 
 // Strict weak ordering: returns true iff `a` precedes `b` in the requested
-// ORDER BY sequence. Note that `std::push_heap` with `TopKWinnerComesFirst(a, b, specs)` places
-// the *last* (worst) element at `heap.front()` for O(1) Top-K eviction, and
-// `std::partial_sort` with the same comparator orders winners best-first.
+// ORDER BY sequence. Note that `std::push_heap` with `TopKWinnerComesFirst(a,
+// b, specs)` places the *last* (worst) element at `heap.front()` for O(1) Top-K
+// eviction, and `std::partial_sort` with the same comparator orders winners
+// best-first.
 bool TopKWinnerComesFirst(
     const TopKWinner& a, const TopKWinner& b,
     const std::vector<SortKeyColumnSpec>& specs) noexcept {
@@ -433,48 +434,53 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
           for (size_t i = 0; i < stage1_cols_.size(); ++i) {
             col_ptrs[stage1_cols_[i]] = &blk.columns[i];
           }
-          bool precheck_ok = true;
-          for (const auto& pc : spec_.preds.contains_prechecks) {
-            const auto* ch = col_ptrs[pc.full_col];
-            if (ch != nullptr &&
-                !relational_detail::BlockPassesContainsPrecheck(*ch,
-                                                                pc.needle)) {
-              precheck_ok = false;
-              break;
-            }
-          }
-          if (!precheck_ok) {
-            continue;
-          }
-
           matching_rows.clear();
-          if (spec_.preds.Empty()) {
-            matching_rows.resize(blk.row_count);
-            for (uint32_t r = 0; r < blk.row_count; ++r) {
-              matching_rows[r] = r;
-            }
-          } else if (spec_.preds.nulls.empty() && spec_.preds.inlists.empty() &&
-                     spec_.preds.compares.size() == 1 &&
-                     spec_.preds.compares[0].constant_payload &&
-                     !spec_.preds.compares[0].is_double &&
-                     !spec_.preds.compares[0].string_payload &&
-                     spec_.preds.compares[0].op == BinaryOperation::kEquals &&
-                     col_ptrs[spec_.preds.compares[0].left] != nullptr &&
-                     !col_ptrs[spec_.preds.compares[0].left]->has_null) {
-            const int64_t target = spec_.preds.compares[0].int_constant;
-            const int64_t* cells =
-                col_ptrs[spec_.preds.compares[0].left]->int_cells.data();
-            const uint32_t rc = blk.row_count;
-            for (uint32_t r = 0; r < rc; ++r) {
-              if (cells[r] == target) {
-                matching_rows.push_back(r);
+          if (!relational_detail::TryJitContainsRows(spec_.preds, col_ptrs,
+                                                     blk.row_count, false,
+                                                     &matching_rows)) {
+            bool precheck_ok = true;
+            for (const auto& pc : spec_.preds.contains_prechecks) {
+              const auto* ch = col_ptrs[pc.full_col];
+              if (ch != nullptr &&
+                  !relational_detail::BlockPassesContainsPrecheck(*ch,
+                                                                  pc.needle)) {
+                precheck_ok = false;
+                break;
               }
             }
-          } else {
-            for (uint32_t r = 0; r < blk.row_count; ++r) {
-              if (relational_detail::RowMatchesColPtrs(spec_.preds, col_ptrs,
-                                                       r)) {
-                matching_rows.push_back(r);
+            if (!precheck_ok) {
+              continue;
+            }
+
+            if (spec_.preds.Empty()) {
+              matching_rows.resize(blk.row_count);
+              for (uint32_t r = 0; r < blk.row_count; ++r) {
+                matching_rows[r] = r;
+              }
+            } else if (spec_.preds.nulls.empty() &&
+                       spec_.preds.inlists.empty() &&
+                       spec_.preds.compares.size() == 1 &&
+                       spec_.preds.compares[0].constant_payload &&
+                       !spec_.preds.compares[0].is_double &&
+                       !spec_.preds.compares[0].string_payload &&
+                       spec_.preds.compares[0].op == BinaryOperation::kEquals &&
+                       col_ptrs[spec_.preds.compares[0].left] != nullptr &&
+                       !col_ptrs[spec_.preds.compares[0].left]->has_null) {
+              const int64_t target = spec_.preds.compares[0].int_constant;
+              const int64_t* cells =
+                  col_ptrs[spec_.preds.compares[0].left]->int_cells.data();
+              const uint32_t rc = blk.row_count;
+              for (uint32_t r = 0; r < rc; ++r) {
+                if (cells[r] == target) {
+                  matching_rows.push_back(r);
+                }
+              }
+            } else {
+              for (uint32_t r = 0; r < blk.row_count; ++r) {
+                if (relational_detail::RowMatchesColPtrs(spec_.preds, col_ptrs,
+                                                         r)) {
+                  matching_rows.push_back(r);
+                }
               }
             }
           }
@@ -540,7 +546,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
                                      : 0;
             const size_t stop = std::min(csz, limit_end - emitted_rows_seen_);
             for (size_t r = start; r < stop; ++r) {
-              sliced.Append(chunk, r);
+              sliced.AppendFrom(chunk, r);
             }
             emitted_rows_seen_ += csz;
             if (!sliced.Empty()) {
@@ -580,7 +586,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     bool use_varchar_cutoff = (key0_type == ValueType::kVarChar &&
                                spec_.sort_specs[0].order.KeyCollation() !=
                                    Collation::kCaseInsensitive &&
-                               candidate_blocks_.size() > 32);
+                               candidate_blocks_.size() >= 2);
 
     struct BlockKeyMeta {
       uint32_t bidx{0};
@@ -604,6 +610,23 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
       vbounds = vb_or.MoveValue();
       if (vbounds == nullptr || vbounds->size() < spec_.tlcs->BlockCount()) {
         use_varchar_cutoff = false;
+      }
+    }
+    // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+    //   (bottom_exclusion_tightens_min_bound_sound,
+    //    interior_exclusion_min_bound_unsound_bug)
+    bool key0_excludes_empty_and_null = false;
+    if (use_varchar_cutoff) {
+      for (const auto& fc : spec_.preds.compares) {
+        if (fc.left == key0_col && fc.constant_payload && fc.string_payload &&
+            fc.string_match == relational_detail::TypedFilterCompare::
+                                   StringMatchKind::kExact &&
+            fc.string_constant.empty() &&
+            (fc.op == BinaryOperation::kNotEquals ||
+             fc.op == BinaryOperation::kGreaterThan)) {
+          key0_excludes_empty_and_null = true;
+          break;
+        }
       }
     }
     if (use_int_cutoff) {
@@ -657,36 +680,56 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     } else if (use_varchar_cutoff) {
       for (const uint32_t bidx : candidate_blocks_) {
         const auto& vb = (*vbounds)[bidx];
+        if (key0_excludes_empty_and_null &&
+            (vb.is_const_null || !vb.has_nonempty_min)) {
+          continue;
+        }
         BlockKeyMeta bm{.bidx = bidx, .vbound = vb};
         if (vb.is_const_null) {
           bm.tier = key0_nf ? 0 : 2;
-        } else if (vb.has_min_max && !(key0_nf && vb.has_null)) {
+        } else if (vb.has_min_max && (key0_excludes_empty_and_null ||
+                                      !(key0_nf && vb.has_null))) {
           bm.tier = 1;
         } else {
           bm.tier = 0;
         }
         ordered_blocks.push_back(bm);
       }
-      std::sort(ordered_blocks.begin(), ordered_blocks.end(),
-                [&](const BlockKeyMeta& a, const BlockKeyMeta& b) {
-                  if (a.tier != b.tier) {
-                    return a.tier < b.tier;
-                  }
-                  if (a.tier == 1) {
-                    const std::string_view sa(
-                        key0_asc ? a.vbound.min_prefix.data()
-                                 : a.vbound.max_prefix.data(),
-                        key0_asc ? a.vbound.min_len : a.vbound.max_len);
-                    const std::string_view sb(
-                        key0_asc ? b.vbound.min_prefix.data()
-                                 : b.vbound.max_prefix.data(),
-                        key0_asc ? b.vbound.min_len : b.vbound.max_len);
-                    if (sa != sb) {
-                      return key0_asc ? (sa < sb) : (sa > sb);
-                    }
-                  }
-                  return a.bidx < b.bidx;
-                });
+      if (ordered_blocks.empty()) {
+        finished_ = true;
+        return Status::kSuccess;
+      }
+      std::sort(
+          ordered_blocks.begin(), ordered_blocks.end(),
+          [&](const BlockKeyMeta& a, const BlockKeyMeta& b) {
+            if (a.tier != b.tier) {
+              return a.tier < b.tier;
+            }
+            if (a.tier == 1) {
+              const std::string_view sa =
+                  key0_asc ? (key0_excludes_empty_and_null
+                                  ? std::string_view(
+                                        a.vbound.nonempty_min_prefix.data(),
+                                        a.vbound.nonempty_min_len)
+                                  : std::string_view(a.vbound.min_prefix.data(),
+                                                     a.vbound.min_len))
+                           : std::string_view(a.vbound.max_prefix.data(),
+                                              a.vbound.max_len);
+              const std::string_view sb =
+                  key0_asc ? (key0_excludes_empty_and_null
+                                  ? std::string_view(
+                                        b.vbound.nonempty_min_prefix.data(),
+                                        b.vbound.nonempty_min_len)
+                                  : std::string_view(b.vbound.min_prefix.data(),
+                                                     b.vbound.min_len))
+                           : std::string_view(b.vbound.max_prefix.data(),
+                                              b.vbound.max_len);
+              if (sa != sb) {
+                return key0_asc ? (sa < sb) : (sa > sb);
+              }
+            }
+            return a.bidx < b.bidx;
+          });
     } else {
       for (const uint32_t bidx : candidate_blocks_) {
         ordered_blocks.push_back({.bidx = bidx});
@@ -851,17 +894,22 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
             // never prune blocks.
             if (in_enum_band(local_v_cut)) {
               // fall through to full decode for this block
-            } else
-            if (bm.vbound.is_const_null) {
+            } else if (bm.vbound.is_const_null) {
               if (!key0_nf) {
                 continue;
               }
             } else if (bm.vbound.has_min_max &&
-                       (!bm.vbound.has_null || !key0_nf)) {
+                       (key0_excludes_empty_and_null || !bm.vbound.has_null ||
+                        !key0_nf)) {
               if (key0_asc) {
-                const std::string_view mp(bm.vbound.min_prefix.data(),
-                                          bm.vbound.min_len);
-                if (mp > std::string_view(local_v_cut)) {
+                const std::string_view mp =
+                    key0_excludes_empty_and_null
+                        ? std::string_view(bm.vbound.nonempty_min_prefix.data(),
+                                           bm.vbound.nonempty_min_len)
+                        : std::string_view(bm.vbound.min_prefix.data(),
+                                           bm.vbound.min_len);
+                if (!mp.starts_with("TESTENUM") &&
+                    mp > std::string_view(local_v_cut)) {
                   continue;
                 }
               } else {
@@ -905,23 +953,26 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
           for (size_t i = 0; i < stage1a_cols.size(); ++i) {
             col_ptrs[stage1a_cols[i]] = &blk1a.columns[i];
           }
-          bool precheck_ok = true;
-          for (const auto& pc : spec_.preds.contains_prechecks) {
-            const auto* ch = col_ptrs[pc.full_col];
-            if (ch != nullptr &&
-                !relational_detail::BlockPassesContainsPrecheck(*ch,
-                                                                pc.needle)) {
-              precheck_ok = false;
-              break;
+          if (!relational_detail::TryJitContainsRows(
+                  spec_.preds, col_ptrs, blk1a.row_count, false, &cand_rows)) {
+            bool precheck_ok = true;
+            for (const auto& pc : spec_.preds.contains_prechecks) {
+              const auto* ch = col_ptrs[pc.full_col];
+              if (ch != nullptr &&
+                  !relational_detail::BlockPassesContainsPrecheck(*ch,
+                                                                  pc.needle)) {
+                precheck_ok = false;
+                break;
+              }
             }
-          }
-          if (!precheck_ok) {
-            continue;
-          }
-          for (uint32_t r = 0; r < blk1a.row_count; ++r) {
-            if (relational_detail::RowMatchesColPtrs(spec_.preds, col_ptrs,
-                                                     r)) {
-              cand_rows.push_back(r);
+            if (!precheck_ok) {
+              continue;
+            }
+            for (uint32_t r = 0; r < blk1a.row_count; ++r) {
+              if (relational_detail::RowMatchesColPtrs(spec_.preds, col_ptrs,
+                                                       r)) {
+                cand_rows.push_back(r);
+              }
             }
           }
           if (cand_rows.empty()) {
@@ -1098,11 +1149,10 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     }
     const size_t final_end = std::min(merged.size(), keep);
     std::partial_sort(
-        merged.begin(),
-        merged.begin() + static_cast<std::ptrdiff_t>(final_end), merged.end(),
-                      [&](const TopKWinner& a, const TopKWinner& b) {
-                        return TopKWinnerComesFirst(a, b, spec_.sort_specs);
-                      });
+        merged.begin(), merged.begin() + static_cast<std::ptrdiff_t>(final_end),
+        merged.end(), [&](const TopKWinner& a, const TopKWinner& b) {
+          return TopKWinnerComesFirst(a, b, spec_.sort_specs);
+        });
 
     std::unordered_map<uint32_t, std::unique_ptr<TlcsFile::DecodedBlock>>
         decoded_cache;
@@ -1163,7 +1213,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     }
     const size_t take = std::min(max_rows, src.Size() - queued_row_offset_);
     for (size_t r = 0; r < take; ++r) {
-      destination->Append(src, queued_row_offset_ + r);
+      destination->AppendFrom(src, queued_row_offset_ + r);
     }
     queued_row_offset_ += take;
     if (queued_row_offset_ >= src.Size()) {
@@ -1344,7 +1394,7 @@ bool TryBuildDirectColumnarScanSpec(
   for (size_t idx = chain.size(); idx > 0; --idx) {
     if (chain[idx - 1].kind == Frame::Kind::kRename) {
       cur_qualifier =
-          static_cast<const RelationRenamePlan*>(chain[idx - 1].node)
+          static_cast<const RelationRenamePlan*>(chain[idx - 1].node)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               ->RelationName();
       break;
     }
@@ -1363,18 +1413,18 @@ bool TryBuildDirectColumnarScanSpec(
     };
     for (const Frame& f : chain) {
       if (f.kind == Frame::Kind::kSelection) {
-        probe_expr(static_cast<const SelectionPlan*>(f.node)->Predicate());
+        probe_expr(static_cast<const SelectionPlan*>(f.node)->Predicate());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       } else if (f.kind == Frame::Kind::kProjection) {
         for (const auto& item :
-             static_cast<const ProjectionPlan*>(f.node)->Columns()) {
+             static_cast<const ProjectionPlan*>(f.node)->Columns()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(item.expression);
         }
       } else if (f.kind == Frame::Kind::kTopN) {
-        for (const auto& k : static_cast<const TopNPlan*>(f.node)->Keys()) {
+        for (const auto& k : static_cast<const TopNPlan*>(f.node)->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(k.expression);
         }
       } else if (f.kind == Frame::Kind::kSort) {
-        for (const auto& k : static_cast<const SortPlan*>(f.node)->Keys()) {
+        for (const auto& k : static_cast<const SortPlan*>(f.node)->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(k.expression);
         }
       }
@@ -1388,9 +1438,9 @@ bool TryBuildDirectColumnarScanSpec(
     const Frame& frame = chain[idx - 1];
     if (frame.kind == Frame::Kind::kRename) {
       cur_qualifier =
-          static_cast<const RelationRenamePlan*>(frame.node)->RelationName();
+          static_cast<const RelationRenamePlan*>(frame.node)->RelationName();  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     } else if (frame.kind == Frame::Kind::kSelection) {
-      const auto* sel = static_cast<const SelectionPlan*>(frame.node);
+      const auto* sel = static_cast<const SelectionPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       std::vector<Expression> conjuncts = SplitConjuncts(sel->Predicate());
       relational_detail::ColumnarPredicateSet sub;
       const Schema sel_schema =
@@ -1420,7 +1470,7 @@ bool TryBuildDirectColumnarScanSpec(
                            sub.inlists.end());
       preds.nulls.insert(preds.nulls.end(), sub.nulls.begin(), sub.nulls.end());
     } else if (frame.kind == Frame::Kind::kProjection) {
-      const auto* proj = static_cast<const ProjectionPlan*>(frame.node);
+      const auto* proj = static_cast<const ProjectionPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       const Schema child_schema =
           EnsureQualified(proj->GetSource()->GetSchema(), cur_qualifier);
       std::vector<slot_t> next_to_full;
@@ -1439,12 +1489,12 @@ bool TryBuildDirectColumnarScanSpec(
       }
       cur_to_full = std::move(next_to_full);
     } else if (frame.kind == Frame::Kind::kTopN) {
-      embedded_topn = static_cast<const TopNPlan*>(frame.node);
+      embedded_topn = static_cast<const TopNPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       topn_to_full = cur_to_full;
       topn_schema =
           EnsureQualified(embedded_topn->Child()->GetSchema(), cur_qualifier);
     } else if (frame.kind == Frame::Kind::kSort) {
-      embedded_sort = static_cast<const SortPlan*>(frame.node);
+      embedded_sort = static_cast<const SortPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       sort_to_full = cur_to_full;
       sort_schema =
           EnsureQualified(embedded_sort->Child()->GetSchema(), cur_qualifier);

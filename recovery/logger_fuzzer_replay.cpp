@@ -37,6 +37,10 @@ int main(int argc, char** argv) {
   }
   std::filesystem::path file(argv[1]);
   std::ifstream case_data(file, std::ios::in | std::ios::binary);
+  if (!case_data.is_open()) {
+    LOG(ERROR) << "cannot open fuzz case: " << file;
+    return 1;
+  }
   std::vector<char> content((std::istreambuf_iterator<char>(case_data)),
                             std::istreambuf_iterator<char>());
   LOG(INFO) << "test file: " << file << " (" << content.size() << " bytes)";

@@ -67,7 +67,11 @@ class LateMaterializationJoin final : public ExecutorBase {
   };
 
   bool NextRow(Row* destination, RowPosition* position);
-  bool Validate();
+  // Validates the join contract AND finishes setup: it fills an empty
+  // right_projection_ with all payload columns and may downgrade the
+  // unique-winner strategy when the index is not single-valued. Call once
+  // from construction, never as a side-effect-free check.
+  bool InitializeAndValidate();
   bool LoadNextIdentity();
   bool LoadEquiCandidates(const Row& left_row);
   bool LoadRowIdCandidate(const Row& left_row);

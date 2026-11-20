@@ -429,7 +429,7 @@ inline GeneratedData Generate(int64_t scale) {
   }
 
   // customer_demographics: every 2x5x5 gender x marital x education combo
-  // in two estimate variants, keyed 1..200 (fact rows reference 1..200).
+  // in two estimate variants, keyed 1..100 (fact rows reference 1..200; half have no match).
   {
     int64_t sk = 1;
     for (int64_t variant = 0; variant < 2 && sk <= 200; ++variant) {

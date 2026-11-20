@@ -8,8 +8,11 @@ enum header `type/value_type.hpp`, allowlisted).
 
 - `status_or.hpp` — `StatusOr<T>` + 3-arg macros `ASSIGN_OR_RETURN(type,
   value, expr)`, `ASSIGN_OR_ASSERT_FAIL[_CONST]`, `ASSIGN_OR_CRASH[_CONST]`,
-  `COERCE`. **DB logic never throws**; return `Status`/`StatusOr` (`exc_shim.hpp`
-  and `exception_status.hpp` provide transitional test/boundary adapters only).
+  `COERCE`. **DB logic must not let exceptions escape across `Status`
+  boundaries**; return `Status`/`StatusOr`. Transitional exception paths
+  remain (`exc_shim.hpp` / `exception_status.hpp` adapters, internal codec
+  bounds checks caught and translated at boundary callers), so "never throws"
+  is a boundary contract, not a statement about the whole call stack.
 - `constants.hpp` — canonical aliases: `lsn_t`/`txn_id_t`/`page_id_t` = u64,
   `slot_t` = u16, plus `StatusCode` (including `kMemoryLimitExceeded` and `kNoSpace`).
 - `memory_budget.{hpp,cpp}` — `ProcessMemoryBudget` global memory arbiter
@@ -41,6 +44,10 @@ enum header `type/value_type.hpp`, allowlisted).
   decode.
 
 ## `platform/` — OS abstraction (Linux + macOS + Windows)
+
+Windows means Clang (clang-cl) or GCC (MinGW-w64): `platform/extended_float.hpp`
+needs `unsigned __int128` / `__builtin_clzll` and hard-errors (T622) on
+anything without 128-bit integers, e.g. MSVC cl.exe.
 
 All OS- and libc-specific code goes through `common/platform/`; the rest of
 the tree must not include Linux-only headers (`<sys/epoll.h>`,

@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 
 #include "common/random_string.hpp"
@@ -101,6 +102,39 @@ TEST_F(TableStatisticsExtraTest, DistinctRowsEstimateTracksUniqueKeys) {
   const double strings = stats_.EstimateDistinctRows({1});
   EXPECT_GE(strings, 100.0);
   EXPECT_LE(strings, 400.0);
+}
+
+// T2112: the stream form must show the symbolic type, the UNMEASURED
+// distinction (both counters zero = never measured, not empty), and the
+// optimizer-visible fields (correlation / clustering / boundary / MCV),
+// and TableStatistics must label column identity by ordinal.
+TEST(ColumnStatsRenderTest, RendersSymbolicTypeAndOptimizerFields) {
+  std::ostringstream unmeasured;
+  unmeasured << ColumnStats(ValueType::kInt64);
+  EXPECT_NE(unmeasured.str().find("Type: Integer"), std::string::npos)
+      << unmeasured.str();
+  EXPECT_NE(unmeasured.str().find("UNMEASURED"), std::string::npos)
+      << unmeasured.str();
+
+  const ColumnStats measured = ColumnStats::FromRawParts(
+      ValueType::kInt64, /*non_null_count=*/4, /*null_count=*/1,
+      /*distinct_count=*/2,
+      /*histogram=*/
+      {HistogramBucket{
+          .lower = Value(1), .upper = Value(9), .count = 3, .distinct = 2}},
+      /*lowest_values=*/{ValueFrequency{.value = Value(1), .count = 3}},
+      /*highest_values=*/{ValueFrequency{.value = Value(9), .count = 1}},
+      /*most_common_values=*/{ValueFrequency{.value = Value(1), .count = 3}},
+      /*correlation=*/1.0);
+  std::ostringstream oss;
+  oss << measured;
+  const std::string text = oss.str();
+  EXPECT_EQ(text.find("UNMEASURED"), std::string::npos) << text;
+  EXPECT_NE(text.find("Correlation: 1"), std::string::npos) << text;
+  EXPECT_NE(text.find("Clustering: "), std::string::npos) << text;
+  EXPECT_NE(text.find("Lowest: ["), std::string::npos) << text;
+  EXPECT_NE(text.find("Highest: ["), std::string::npos) << text;
+  EXPECT_NE(text.find("MostCommon: ["), std::string::npos) << text;
 }
 
 }  // namespace tinylamb

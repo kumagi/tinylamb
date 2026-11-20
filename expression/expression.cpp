@@ -48,8 +48,8 @@ namespace tinylamb {
 namespace {
 template <typename Target, typename Source>
 Target& CheckedExpressionCast(Source& expression) {
-  // Most AST nodes have exactly the requested concrete type. Pointer identity
-  // proves that case without walking the RTTI inheritance graph. Extensions,
+  // Most AST nodes have exactly the requested concrete type. Comparing the
+  // type_info addresses (without dynamic_cast) proves that case. Extensions,
   // derived constants (ParameterSlot), and mismatches keep dynamic_cast's
   // original behavior, including std::bad_cast on an incompatible node.
   if (&typeid(expression) == &typeid(Target)) {

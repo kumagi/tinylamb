@@ -987,7 +987,6 @@ TEST(HashJoinSemiAntiTest, VariantsResidentAndSpilled) {
 TEST(HashJoinSemiAntiTest, AntiJoinWithEmptySpilledBuildEmitsAll) {
   std::vector<Row> probe_rows;
   probe_rows.reserve(200);
-  probe_rows.reserve(200);
   for (int64_t i = 0; i < 200; ++i) {
     probe_rows.push_back(IRow(i));
   }

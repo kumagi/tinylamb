@@ -13,6 +13,7 @@
 #include "common/join_kind.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
+#include "transaction/transaction.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
@@ -58,11 +59,13 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
   const bool keys_valid =
       !left_columns_.empty() && left_columns_.size() == right_columns_.size();
   CHECK_MSG(keys_valid, "MergeJoin requires equally-sized non-empty keys");
-}
-
-bool MergeJoin::KeyIsNull(const Row& row, const std::vector<slot_t>& columns) {
-  return std::ranges::any_of(
-      columns, [&](slot_t column) { return row[column].IsNull(); });
+  // The emit path only knows inner/left/right/semi/anti; a null-aware-anti or
+  // mark join here would silently fall through to the inner path and emit
+  // combined-width rows. Fail loudly, like the relational factory does.
+  CHECK_MSG(kind != JoinKind::kNullAwareAnti &&
+                kind != JoinKind::kMark,  // NOLINT(readability-simplify-boolean-expr):
+                                          // CHECK_MSG negates its condition
+            "MergeJoin does not support null-aware anti / mark joins");
 }
 
 bool MergeJoin::KeyCannotMatch(const Row& row,
@@ -106,7 +109,15 @@ bool MergeJoin::PairPasses(size_t i, size_t j) const {
   if (!residual_) {
     return true;
   }
-  const Row combined = Concatenate(i, j);
+  const Row& left = left_rows_[i];
+  const Row& right = right_rows_[j];
+  pair_scratch_.values_.clear();
+  pair_scratch_.values_.reserve(left.values_.size() + right.values_.size());
+  pair_scratch_.values_.insert(pair_scratch_.values_.end(),
+                               left.values_.begin(), left.values_.end());
+  pair_scratch_.values_.insert(pair_scratch_.values_.end(),
+                               right.values_.begin(), right.values_.end());
+  const Row& combined = pair_scratch_;
   if (kind_ == JoinKind::kInner) {
     // An inner-join residual is a WHERE-level filter: conjuncts may have
     // been reordered by canonicalization, so a sibling that cleanly rejects
@@ -136,6 +147,11 @@ void MergeJoin::Materialize() {
   materialized_ = true;
   DataChunk batch;
   while (left_->NextBatch(&batch) != 0) {
+    if (const Status st = Transaction::CheckThreadStatementTimeout();
+        st != Status::kSuccess) {
+      FailWith(st);
+      return;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       Row row = batch.RowAt(i);
       materialized_charge_.Add(EstimateRowBytes(row));

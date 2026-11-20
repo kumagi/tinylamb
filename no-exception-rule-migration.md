@@ -1,5 +1,7 @@
 # No-Exception Rule Migration
 
+> **アーカイブ済み実装記録 (2026-09 実施)**: Phases 1〜7 のライブラリ層 `Status` / `StatusOr<T>` 移行と Phase 8 検証は完了済み（下記チェック項目内の `vm_cache`, `page_pool`, `index/lsm_detail` 等は後のストレージ刷新により撤去・置換済み）。現行ルールは [CONTRIBUTING.md](CONTRIBUTING.md) と [AGENTS.md](AGENTS.md) を参照。
+
 Google C++ Style Guide に沿い、DB ロジック（ライブラリ層）から例外を全排除し、
 `Status` / `StatusOr<T>` による直和型で伝播させる_migration_記録。
 
@@ -104,9 +106,11 @@ Google C++ Style Guide に沿い、DB ロジック（ライブラリ層）から
 - [x] フォーマット（clang-format、2026-09-15: リポジトリ全体で未適用 0 件）
 - [x] 残存 throw の棚卸し: ライブラリ層の実 throw は `common/exc_shim.hpp`
       の shim 機構のみ。`recovery/log_record_oracle.cpp` は PBT サポート
-      （oracle 内 catch で完結、スコープ外扱い）。テスト/fuzzer/benchmark/
+      （oracle 内 catch で完結、スコープ外扱い）だったが、405ff4f の
+      LST 移行で oracle/fuzzer と共に削除済み。テスト/fuzzer/benchmark/
       main.cpp はスコープ外。
-- [ ] ドキュメント更新（common/AGENTS.md の "never throws" 記述の実態化）
+- [x] ドキュメント更新（common/AGENTS.md の "never throws" 記述の実態化、
+      2026-11-19: 境界契約としての正確な表現に更新）
 
 ### Phase 8 メモ（2026-09-15 健全化パス）
 - boundary catch（sql_engine / postgres_server）は残置 = Phase 7 未完のまま。
@@ -285,7 +289,7 @@ Google C++ Style Guide に沿い、DB ロジック（ライブラリ層）から
 - **未着手**: query / server 層の throw（googlesql_ast_visitor 117 他）と
   boundary catch 削除、全 EXC-SHIM 除去。
 
-- **Phase 7 完了（query / server / executor 残りを Status・sticky 化, 2218/2218 green）**:
+- **Phase 7 の throw 変換完了（query / server / executor 残り Status・sticky 化, 2218/2218 green。境界 catch 削除は上記 Phase 8 メモのとおり未完了＝Phase 7 自体は未完のまま）**:
   - `googlesql_ast_visitor.cpp`（throw 117→0: `AstError/AstStatus` +
     `StatusOr` 再帰, `Visit` は `StatusOr<unique_ptr<Statement>>`）。
     `sql_engine.cpp` / `sql_template.cpp`（`Bind*` 群を `StatusOr` 化）/

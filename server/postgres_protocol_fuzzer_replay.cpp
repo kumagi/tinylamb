@@ -7,6 +7,7 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #include "common/log_message.hpp"
 #include "server/postgres_protocol_fuzzer.hpp"
@@ -25,7 +26,16 @@ int main(int argc, char** argv) {
   }
   std::filesystem::path target_dir(argv[1]);
 
-  std::filesystem::directory_iterator dir(target_dir);
+  // T3946: the throwing constructor turns a missing/renamed replay dir
+  // into an uncaught filesystem_error stack dump; report it as the usage
+  // error it is and exit nonzero.
+  std::error_code dir_ec;
+  std::filesystem::directory_iterator dir(target_dir, dir_ec);
+  if (dir_ec) {
+    LOG(ERROR) << "cannot open directory " << target_dir << ": "
+               << dir_ec.message();
+    return 1;
+  }
   for (const auto& file : dir) {
     std::ifstream case_data(file.path(), std::ios::in | std::ios::binary);
     if (!case_data) {

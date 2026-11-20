@@ -58,7 +58,7 @@ def main():
     ports = dict(zip(('tinylamb', 'postgresql'), (s.getsockname()[1] for s in sockets)))
     for s in sockets:
         s.close()
-    name = f'tinylamb-pg15-{os.getpid()}'
+    name = f'tinylamb-pg-{os.getpid()}'
     tiny = None
     commands = []
     indexes = secondary_indexes('tpch')

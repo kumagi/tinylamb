@@ -2058,6 +2058,47 @@ TEST_F(RelationalRegressionTest, GroupingSetParentMapsKeepOrderAndSubsets) {
   }
 }
 
+TEST_F(RelationalRegressionTest, GroupingSetUniqueFinestKeysKeepSumsAndOrder) {
+  auto context = rs_->BeginContext();
+  relational_detail::Relation input;
+  input.schema = Schema(
+      "", {Column("a", ValueType::kVarChar), Column("b", ValueType::kInt64),
+           Column("v", ValueType::kDouble)});
+  for (int64_t i = 0; i < 8192; ++i) {
+    const double value = i % 3 == 0 ? 1.0e16 : i % 3 == 1 ? 1.0 : -1.0e16;
+    input.AddRow(Row({i % 7 == 0 ? Value() : Value("a"), Value(i),
+                      i % 11 == 0 ? Value() : Value(value)}));
+  }
+  const auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,
+                                                         ColumnValueExp("v"));
+  auto statements =
+      MakeGroupingSetStatements({{"a", "b"}, {"a"}, {}}, {{"s", sum}});
+  std::vector<const SelectStatement*> sets;
+  sets.reserve(statements.size());
+  for (const auto& statement : statements) {
+    sets.push_back(&statement);
+  }
+  std::atomic<size_t> active{0};
+  ScopedQueryParallelismBudget budget(&active, 4);
+  auto reference =
+      relational_detail::TryCompactGroupingSets(context, sets, input);
+  auto unique =
+      relational_detail::TryCompactGroupingSets(context, sets, input,
+                                                /*finest_keys_unique=*/true);
+  ASSERT_TRUE(reference.HasValue()) << reference.GetStatus();
+  ASSERT_TRUE(unique.HasValue()) << unique.GetStatus();
+  const auto& reference_rows = reference.Value();
+  const auto& unique_rows = unique.Value();
+  if (!reference_rows.has_value() || !unique_rows.has_value()) {
+    ADD_FAILURE() << "expected grouping set results";
+    return;
+  }
+  ASSERT_EQ(unique_rows->size(), reference_rows->size());
+  for (size_t s = 0; s < unique_rows->size(); ++s) {
+    EXPECT_EQ(unique_rows->at(s).rows, reference_rows->at(s).rows);
+  }
+}
+
 TEST_F(RelationalRegressionTest, GroupingSetBorrowedKeysBecomeOwnedOutputs) {
   auto context = rs_->BeginContext();
   const auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,
@@ -2481,7 +2522,7 @@ TEST_F(RelationalRegressionTest, CompactBorrowedKeysPreserveCanonicalPeers) {
 }
 
 // Computed GROUP BY keys and aggregate arguments join the parallel fold
-// through bytecode programs (workers cannot run the contextful evaluator;
+// through bytecode programs (workers cannot run the contextual evaluator;
 // a program that fails to compile keeps the serial loop).  The row count
 // keeps the fold above kParallelGroupMinRows; a machine below the worker
 // floor declines the parallel path and the serial loop must produce the

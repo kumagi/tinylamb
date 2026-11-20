@@ -140,6 +140,21 @@ void RunPlanFeedbackRange(uint32_t begin_seed, uint32_t end_seed) {
 
 }  // namespace
 
+// Only skip the fixed shards when the override is a valid iteration count;
+// a malformed value must not silently shrink the sweep to shard0 alone.
+// NOLINTNEXTLINE(misc-use-internal-linkage) intentional pattern in this code
+bool OracleItersEnvValid() {
+  const char* env = std::getenv("TINYLAMB_ORACLE_ITERS");
+  if (env == nullptr) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const long parsed = std::strtol(env, &end, 10);
+  return errno == 0 && end != env && *end == '\0' && parsed > 0 &&
+         std::in_range<uint32_t>(parsed);
+}
+
 TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard0) {
   uint32_t end_seed = 16;
   if (const char* env = std::getenv("TINYLAMB_ORACLE_ITERS")) {
@@ -155,21 +170,21 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard0) {
 }
 
 TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard1) {
-  if (std::getenv("TINYLAMB_ORACLE_ITERS") != nullptr) {
+  if (OracleItersEnvValid()) {
     return;
   }
   RunSeededOracleRange(16, 32);
 }
 
 TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard2) {
-  if (std::getenv("TINYLAMB_ORACLE_ITERS") != nullptr) {
+  if (OracleItersEnvValid()) {
     return;
   }
   RunSeededOracleRange(32, 48);
 }
 
 TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard3) {
-  if (std::getenv("TINYLAMB_ORACLE_ITERS") != nullptr) {
+  if (OracleItersEnvValid()) {
     return;
   }
   RunSeededOracleRange(48, 64);
@@ -381,7 +396,10 @@ TEST(SqlOracleFuzzer, NoRecCanonicalShapesAgree) {
   for (const std::string& sql : trace.setup) {
     ASSERT_TRUE(ExpectRuns(db, ctx, sql));
   }
-  (void)ctx.txn_.PreCommit();
+  // T4621: the setup replay must be durable-visible to the fresh context
+  // below; a failing PreCommit means the rig broke, not the engine, and the
+  // old (void) cast hid that.
+  ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess) << "seed=" << seed;
   ctx = db.BeginContext();
   for (const std::string& sql : trace.norec) {
     ASSERT_TRUE(ExpectRuns(db, ctx, sql));
@@ -553,7 +571,12 @@ TEST(SqlOracleFuzzer, ReplayCommittedRegressionFiles) {
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }
-  for (const std::string& path : ListTestFiles(dir)) {
+  const std::vector<std::string> paths = ListTestFiles(dir);
+  // T3944: an existing-but-empty directory (checkout miss, wrong path) must
+  // not report success while replaying zero guards; mirrors the ooc /
+  // griffin / join regression replays.
+  EXPECT_FALSE(paths.empty()) << "no .test files in " << dir;
+  for (const std::string& path : paths) {
     std::ifstream file(path);
     std::string text((std::istreambuf_iterator<char>(file)),
                      std::istreambuf_iterator<char>());
@@ -580,6 +603,12 @@ TEST(SqlOracleFuzzer, EmitFuzzFindingPersistsAndContinuesWhenConfigured) {
       std::filesystem::temp_directory_path() /
       ("tinylamb_fuzz_finding_test_" + RandomString(6));
   std::filesystem::create_directories(tmp_dir);
+  const char* prev_continue = std::getenv("TINYLAMB_FUZZ_CONTINUE");
+  const std::string saved_continue =
+      prev_continue != nullptr ? prev_continue : "";
+  const char* prev_findings = std::getenv("TINYLAMB_FUZZ_FINDINGS_DIR");
+  const std::string saved_findings =
+      prev_findings != nullptr ? prev_findings : "";
   ASSERT_EQ(setenv("TINYLAMB_FUZZ_CONTINUE", "1", 1), 0);
   ASSERT_EQ(setenv("TINYLAMB_FUZZ_FINDINGS_DIR", tmp_dir.c_str(), 1), 0);
 
@@ -595,8 +624,16 @@ TEST(SqlOracleFuzzer, EmitFuzzFindingPersistsAndContinuesWhenConfigured) {
   std::filesystem::remove(fname);
   std::filesystem::remove(stem + ".report.txt");
   std::filesystem::remove_all(tmp_dir);
-  ASSERT_EQ(unsetenv("TINYLAMB_FUZZ_CONTINUE"), 0);
-  ASSERT_EQ(unsetenv("TINYLAMB_FUZZ_FINDINGS_DIR"), 0);
+  if (prev_continue != nullptr) {
+    setenv("TINYLAMB_FUZZ_CONTINUE", saved_continue.c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_FUZZ_CONTINUE");
+  }
+  if (prev_findings != nullptr) {
+    setenv("TINYLAMB_FUZZ_FINDINGS_DIR", saved_findings.c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_FUZZ_FINDINGS_DIR");
+  }
 }
 
 TEST(SqlOracleFuzzer, LSTableDictAllPassExcludesNullRows) {

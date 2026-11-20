@@ -31,6 +31,7 @@
 #include <math.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -349,7 +350,7 @@ inline double FuzzDoubleWithSpecials(size_t index, double fallback) {
     std::memcpy(&value, &bits, sizeof(value));
     return value;
   }();
-  static const double kSpecials[] = {
+  static const std::array<double, 12> kSpecials = {
       qnan_pos,
       qnan_neg,
       std::numeric_limits<double>::infinity(),
@@ -363,8 +364,7 @@ inline double FuzzDoubleWithSpecials(size_t index, double fallback) {
       std::numeric_limits<double>::max(),
       -std::numeric_limits<double>::max(),
   };
-  constexpr size_t kSpecialCount = sizeof(kSpecials) / sizeof(kSpecials[0]);
-  return index < kSpecialCount ? kSpecials[index] : fallback;
+  return index < kSpecials.size() ? kSpecials[index] : fallback;
 }
 
 // `shape` steers the adaptive encoder so different scheme families become

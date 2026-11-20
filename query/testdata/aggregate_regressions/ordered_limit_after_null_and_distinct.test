@@ -1,0 +1,6 @@
+-- tinylamb-aggregate-test v1
+-- seed: 6143225862892401254
+-- setup: CREATE TABLE t (u INT64, a INT64, b INT64, s VARCHAR(8));
+-- setup: INSERT INTO t VALUES (0, 9, 2, NULL), (1, 9, 2, 'x'), (2, 9, -2, 'yy');
+-- query: SELECT ARRAY_AGG(DISTINCT b ORDER BY b DESC LIMIT 2), STRING_AGG(s ORDER BY u LIMIT 2) FROM t GROUP BY a;
+-- expect: |ARRAY<INT64>[2, -2]|,|"x,yy"|,

@@ -166,10 +166,9 @@ TEST_F(SqlEngineExtraTest, SqlCreateIndexFailureAndAbortKeepCatalogAtomic) {
   EXPECT_EQ(table.Value()->GetIndex(0).sc_.name_, "good");
   auto duplicate =
       engine_->Execute(*context_, "INSERT INTO t VALUES (1, 'z', 9.0)");
-  if (duplicate.HasValue()) {
-    duplicate.Value().Drain();
-    EXPECT_NE(duplicate.Value().GetStatus(), Status::kSuccess);
-  }
+  ASSERT_TRUE(duplicate.HasValue());
+  duplicate.Value().Drain();
+  EXPECT_NE(duplicate.Value().GetStatus(), Status::kSuccess);
 }
 
 TEST_F(SqlEngineExtraTest, UnnestSelectShapes) {
@@ -383,7 +382,7 @@ TEST_F(SqlEngineExtraTest,
         EXPECT_EQ(rows[static_cast<size_t>(i)], Row({Value(9 + (i * 10))}));
       }
     }
-    ASSERT_SUCCESS(reader.PreCommit());
+    EXPECT_SUCCESS(reader.PreCommit());
   };
   const uint64_t replay_before = PlanCacheStats().replays.load();
   const auto invalidations = PlanCacheStats().epoch_invalidations.load();
@@ -505,7 +504,7 @@ TEST_F(SqlEngineExtraTest, ImmutableScalarAggregatePlanSharesButNotItsResult) {
     for (int n = 0; n < 16; ++n) {
       EXPECT_EQ(RunSql(&engine, &reader, sql), expected);
     }
-    ASSERT_SUCCESS(reader.PreCommit());
+    EXPECT_SUCCESS(reader.PreCommit());
   };
   std::thread first(execute);
   std::thread second(execute);
@@ -742,5 +741,44 @@ TEST_F(SqlEngineExtraTest, FilteredComputedIntegerAggregateKeepsTypedFold) {
         {Row({Value(15), Value(4), Value(4)})});
     ExpectQuery("SELECT SUM(k * k + 1) FROM t WHERE k > 3", {Row({Value()})});
   }
+}
+
+// P363/432: the STRUCT/PROTO templating gate used to substring-match the
+// uppercased query text, so statements merely mentioning the token inside a
+// word (FROM protocols), a string ('STRUCT') or a comment were permanently
+// kept out of the template cache.  The gate now fires only on real keywords
+// outside quoted spans; genuine constructor shapes still opt out.
+TEST_F(SqlEngineExtraTest, StructProtoTemplateGateIsWordAndQuoteAware) {
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE gate_t(a INT64)");
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE protocols(a INT64)");
+  ASSERT_SUCCESS(context_->PreCommit());
+  context_ =
+      std::make_unique<TransactionContext>(database_->BeginReadOnlyContext());
+  const auto replay_pair = [&](const std::string& first,
+                               const std::string& second, bool expect_fill) {
+    const uint64_t before = PlanCacheStats().template_fills.load();
+    RunSql(engine_.get(), context_.get(), first);
+    RunSql(engine_.get(), context_.get(), second);
+    const uint64_t after = PlanCacheStats().template_fills.load();
+    if (expect_fill) {
+      EXPECT_GT(after, before) << "not templated: " << first;
+    } else {
+      EXPECT_EQ(after, before) << "unexpectedly templated: " << first;
+    }
+  };
+  replay_pair("SELECT a FROM gate_t WHERE a = 1;",
+              "SELECT a FROM gate_t WHERE a = 2;", true);
+  replay_pair("SELECT a FROM protocols WHERE a = 1;",
+              "SELECT a FROM protocols WHERE a = 2;", true);
+  replay_pair("SELECT a FROM gate_t WHERE a = 1 AND 'STRUCT' <> 'X';",
+              "SELECT a FROM gate_t WHERE a = 2 AND 'STRUCT' <> 'X';", true);
+  replay_pair("SELECT a FROM gate_t WHERE a = 1; -- STRUCT note",
+              "SELECT a FROM gate_t WHERE a = 2; -- STRUCT note", true);
+  replay_pair(
+      "SELECT a FROM gate_t WHERE a = 1 AND "
+      "CAST(NULL AS STRUCT<x INT64>) IS NULL;",
+      "SELECT a FROM gate_t WHERE a = 2 AND "
+      "CAST(NULL AS STRUCT<x INT64>) IS NULL;",
+      false);
 }
 }  // namespace tinylamb

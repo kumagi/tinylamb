@@ -15,7 +15,8 @@ namespace tinylamb {
 
 StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
                                            unsigned month, unsigned day,
-                                           int hour, int minute, int second) {
+                                           int hour, int minute, int second,
+                                           bool at_utc) {
   const auto invalid = [&] {
     return StatusError(StatusCode::kInvalidArgument,
                        "invalid timezone: " + std::string(zone));
@@ -36,6 +37,9 @@ StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
   if (offset.front() == '+' || offset.front() == '-') {
     const int sign = offset.front() == '-' ? -1 : 1;
     offset.remove_prefix(1);
+    if (offset.empty()) {
+      return invalid();
+    }
     const size_t colon = offset.find(':');
     std::string_view hours = offset;
     std::string_view minutes;
@@ -49,6 +53,8 @@ StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
       hours = offset.substr(0, 2);
       minutes = offset.substr(2);
     }
+    // Accept 1-2 hour digits consistently with or without a colon; the
+    // colon form already permitted 1 digit before this check was added.
     if (hours.empty() || hours.size() > 2) {
       return invalid();
     }
@@ -63,7 +69,9 @@ StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
       return value;
     };
     const int h = digits(hours), m = digits(minutes);
-    if (h < 0 || h > 23 || m < 0 || m > 59) {
+    // Real IANA/GoogleSQL offsets never exceed 14 hours; reject implausible
+    // numeric offsets instead of accepting a wall clock no zone can have.
+    if (h < 0 || h > 14 || m < 0 || m > 59 || (h == 14 && m != 0)) {
       return invalid();
     }
     return sign * (h * 3600 + m * 60);
@@ -72,7 +80,7 @@ StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
     zone = "Pacific/Chatham";
   }
   const auto result = platform::TimeZoneOffsetAtLocalTime(
-      zone, year, month, day, hour, minute, second);
+      zone, year, month, day, hour, minute, second, at_utc);
   if (!result.has_value()) {
     return invalid();
   }
@@ -210,6 +218,12 @@ StatusOr<std::string> TryFormatDateDays(int64_t days) {
   std::array<char, 16> buffer{};
   ASSIGN_OR_RETURN(sys_days, sd, ToSysDays(days));
   const year_month_day ymd{sd};
+  // The strict parser rejects negative years; fail here rather than emit a
+  // string that the same engine cannot read back.
+  if (static_cast<int>(ymd.year()) <= 0) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "DATE year out of representable range");
+  }
   const int written = std::snprintf(buffer.data(), buffer.size(),
                                     "%04d-%02u-%02u", int(ymd.year()),
                                     unsigned(ymd.month()), unsigned(ymd.day()));

@@ -91,11 +91,22 @@ void ZoneMap::AddDouble(double value) {
 void ZoneMap::AddString(std::string_view value) {
   initialized_ = true;
   ++value_count_;
+  // T4171: an improving extremum reuses the stored Value's string buffer
+  // (CopyFromStringView assigns in place) instead of allocating a fresh owned
+  // string and dropping the old one on every new min/max.
   if (!minimum_ || value < minimum_->value.varchar_value) {
-    minimum_ = Value(std::string(value));
+    if (minimum_) {
+      minimum_->CopyFromStringView(value);
+    } else {
+      minimum_ = Value(std::string(value));
+    }
   }
   if (!maximum_ || maximum_->value.varchar_value < value) {
-    maximum_ = Value(std::string(value));
+    if (maximum_) {
+      maximum_->CopyFromStringView(value);
+    } else {
+      maximum_ = Value(std::string(value));
+    }
   }
 }
 
@@ -124,6 +135,14 @@ void ZoneMap::AddIntRange(int64_t mn, int64_t mx, size_t count) {
     maximum_.reset();
     return;
   }
+  // T1935: a reversed interval would make MayMatch reject every row (same
+  // contract AddDoubleRange already enforces).
+  if (mn > mx) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
   if (!minimum_ || mn < minimum_->value.int_value) {
     minimum_ = Value(mn);
   }
@@ -139,6 +158,13 @@ void ZoneMap::AddDateRange(int64_t mn, int64_t mx, size_t count) {
   initialized_ = true;
   value_count_ += count;
   if (minimum_ && minimum_->type != ValueType::kDate) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
+  // T1935: reversed interval -> unbounded envelope (see AddIntRange).
+  if (mn > mx) {
     has_nan_ = true;
     minimum_.reset();
     maximum_.reset();
@@ -199,6 +225,13 @@ void ZoneMap::AddStringRange(std::string_view mn, std::string_view mx,
     maximum_.reset();
     return;
   }
+  // T1935: reversed interval -> unbounded envelope, never a false prune.
+  if (mx < mn) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
   if (!minimum_ || mn < minimum_->value.varchar_value) {
     minimum_ = Value(std::string(mn));
   }
@@ -253,23 +286,25 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   if (!initialized_) {
     return true;
   }
-  // PRODUCTION FIX: NaN-bearing zones keep every row (NaN compares false
-  // against everything, so envelope pruning is unsound for them).
-  if (has_nan_) {
-    return true;
-  }
-  // An initialized zone holding only NULLs cannot compare, and NULL
-  // constants never compare either.  minimum_/maximum_ are always populated
-  // together, so checking both here keeps the invariant explicit.  // NULL
-  // comparisons always evaluate to UNKNOWN (NULL) in SQL, so no row can ever
-  // satisfy = NULL or != NULL.
+  // T1621: a NaN-bearing zone used to keep every row ("NaN compares false
+  // against everything, so envelope pruning is unsound").  But the engine's
+  // AST ground truth (binary_expression.cpp) is IEEE-unordered: EVERY
+  // comparison against a NaN -- ordered, `=`, and even `!=` -- evaluates to
+  // FALSE, so a NaN row can never satisfy a BinaryOperation predicate.
+  // AddDouble/AddDoubleRange already keep NaN out of the envelope, so the
+  // finite min/max remains a sound pruning envelope for the whole zone and
+  // the unconditional bail-out only cost pruning for the batch's finite
+  // rows.  Zones whose envelope was dropped as unreliable (mixed types,
+  // reversed ranges) or that saw ONLY NaN keep the conservative answer via
+  // the empty-envelope branch below.
   if (constant.IsNull()) {
     return false;
   }
   if (!minimum_ || !maximum_) {
-    // Non-NULL values were observed but excluded from the envelope (arrays):
-    // nothing can be proven, so keep every row.
-    return value_count_ > 0;
+    // Non-NULL values were observed but excluded from the envelope (arrays,
+    // NaN-only zones) or the envelope was dropped as unreliable (mixed
+    // types, reversed ranges): nothing can be proven, so keep every row.
+    return value_count_ > 0 || has_nan_;
   }
   // Cross-type comparisons (e.g. int constant vs double zone) may match after
   // implicit conversion; pruning them would silently drop rows.

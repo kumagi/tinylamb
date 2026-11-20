@@ -35,7 +35,7 @@ std::pair<StatusOr<Value>, StatusOr<Value>> CastBoth(const Value& from,
 
 }  // namespace
 
-TEST(CastMatrixCoverage, SafeCastContractHoldsOverMatrix) {
+TEST(ExpressionCoverage, SafeCastContractHoldsOverMatrix) {
   std::vector<Value> sources = {
       Value(),
       Value(int64_t{42}),
@@ -98,7 +98,7 @@ TEST(CastMatrixCoverage, SafeCastContractHoldsOverMatrix) {
   }
 }
 
-TEST(CastMatrixCoverage, PinnedConversionEdges) {
+TEST(ExpressionCoverage, PinnedConversionEdges) {
   // Numeric strings tolerate surrounding whitespace; non-numerics fail.
   EXPECT_EQ(CastBoth(Value(" 42 "), "INT64").first.MoveValue(), Value(42));
   EXPECT_TRUE(CastBoth(Value("abc"), "INT64").first.HasValue() == false);
@@ -138,7 +138,8 @@ TEST(CastMatrixCoverage, PinnedConversionEdges) {
   // Array sources convert to their element text form.
   auto array_to_string =
       CastBoth(Value::Array({Value(1), Value(2)}, "INT64"), "STRING").first;
-  EXPECT_TRUE(array_to_string.HasValue());
+  ASSERT_TRUE(array_to_string.HasValue());
+  EXPECT_EQ(array_to_string.Value(), Value(std::string("[1,2]")));
   // Type parameters are stripped for base types but not array types.
   EXPECT_EQ(CastBoth(Value("42"), "STRING(5)").first.MoveValue(), Value("42"));
 }

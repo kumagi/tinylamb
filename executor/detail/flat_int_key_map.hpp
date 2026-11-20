@@ -23,10 +23,10 @@ namespace tinylamb::relational_detail {
 //
 // Two slot layouts, chosen by T:
 //  - unsigned integral T (the group-index shape): a 16-byte {key, value}
-//    slot whose occupancy is value == std::numeric_limits<uint64_t>::max() (uint64 max).  A 2.9M-group
-//    fold holds ~50 MB of slots either way, but the 16-byte slot puts 4 of
-//    them per cache line instead of 2.67, which shrinks both the probe
-//    traffic and the Grow() rehash pass by a third.  Callers must never store
+//    slot whose occupancy is value == std::numeric_limits<uint64_t>::max() (uint64 max).  At the
+//    shared capacity a 2.9M-group fold holds ~64 MiB of 16-byte slots vs
+//    ~96 MiB of 24-byte slots (4 vs 2.67 per cache line), which shrinks both
+//    the probe traffic and the Grow() rehash pass by a third. Callers must never store
 //    std::numeric_limits<uint64_t>::max() itself (group indices never do).
 //  - any other T (including signed integers): the historical 24-byte
 //    {key, value, used} slot.
@@ -277,6 +277,8 @@ class FlatIntSet {
     explicit DenseWriter(FlatIntSet& set) : set_(set) {}
     DenseWriter(const DenseWriter&) = delete;
     DenseWriter& operator=(const DenseWriter&) = delete;
+    DenseWriter(DenseWriter&&) = delete;
+    DenseWriter& operator=(DenseWriter&&) = delete;
     ~DenseWriter() { Flush(); }
 
     void Insert(int64_t key) noexcept {
@@ -421,22 +423,36 @@ class FlatIntSet {
           static_cast<uint64_t>(clamped_hi) - static_cast<uint64_t>(dense_min_);
       const auto word_lo = static_cast<size_t>(off_lo >> 6);
       const auto word_hi = static_cast<size_t>(off_hi >> 6);
-      if (word_hi - word_lo <= 8) {
-        const uint64_t low_mask = ~uint64_t{0} << (off_lo & 63);
-        const uint64_t high_mask = (~uint64_t{0}) >> (63 - (off_hi & 63));
-        if (word_lo == word_hi) {
-          return (dense_bits_[word_lo] & low_mask & high_mask) != 0;
-        }
-        if ((dense_bits_[word_lo] & low_mask) != 0) {
+      // Dense sets keep no hash slots, so every width is answered from the
+      // bitmap; a wide range over a large bitmap stays conservative (true).
+      if (word_hi - word_lo > 4096) {
+        return true;
+      }
+      const uint64_t low_mask = ~uint64_t{0} << (off_lo & 63);
+      const uint64_t high_mask = (~uint64_t{0}) >> (63 - (off_hi & 63));
+      if (word_lo == word_hi) {
+        return (dense_bits_[word_lo] & low_mask & high_mask) != 0;
+      }
+      if ((dense_bits_[word_lo] & low_mask) != 0) {
+        return true;
+      }
+      for (size_t w = word_lo + 1; w < word_hi; ++w) {
+        if (dense_bits_[w] != 0) {
           return true;
         }
-        for (size_t w = word_lo + 1; w < word_hi; ++w) {
-          if (dense_bits_[w] != 0) {
-            return true;
-          }
-        }
-        return (dense_bits_[word_hi] & high_mask) != 0;
       }
+      return (dense_bits_[word_hi] & high_mask) != 0;
+    }
+    // Hash mode: scan the slots rather than answering "yes" on any
+    // overlapping range. Cap the work via slots_.size() so a wide range
+    // over a large set stays conservative (true).
+    if (slots_.size() <= 2048) {
+      for (const Slot& slot : slots_) {  // NOLINT(readability-use-anyofallof)
+        if (slot.used != 0 && slot.key >= lo && slot.key <= hi) {
+          return true;
+        }
+      }
+      return false;
     }
     return true;
   }

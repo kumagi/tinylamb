@@ -41,7 +41,7 @@ graph TD
           }
    ```
 
-4. 共通ヘルパ `BuildEqualityOnAllColumns` が全列に対する有効な等値述語を構築できること。
+4. 共通ヘルパー `BuildEqualityOnAllColumns` が全列に対する有効な等値述語を構築できること。
 
 `kExceptAll`（重複度を考慮する多重集合差）に対しては本 Rule は発火しません。
 

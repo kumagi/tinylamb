@@ -407,7 +407,52 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       RETURN_IF_FAIL(ResolveExpression(
           child, col_table_map, ambiguous_column_name, relations, all_cols,
           expand_proto_value_table, ambiguous_column));
-      exp = WithExpressionChildren(exp, {std::move(child)});
+      // FILTER / HAVING / inner ORDER BY etc. are not in ExpressionChildren;
+      // resolve them too so they get the same qualification checks as Child.
+      const AggregateExpression& src = exp->AsAggregateExpression();
+      auto agg = std::make_shared<AggregateExpression>(src.GetType(), child,
+                                                       src.Distinct());
+      agg->SetIgnoreNulls(src.IgnoreNulls());
+      agg->SetHaving(src.Having(), src.HavingCondition());
+      agg->SetInnerLimit(src.InnerLimit());
+      agg->SetArrayElementSqlType(src.ArrayElementSqlType());
+      const auto resolve = [&](const Expression& in) -> StatusOr<Expression> {
+        if (!in) {
+          return Expression{};
+        }
+        Expression out = in;
+        RETURN_IF_FAIL(ResolveExpression(
+            out, col_table_map, ambiguous_column_name, relations, all_cols,
+            expand_proto_value_table, ambiguous_column));
+        return out;
+      };
+      if (src.WhereFilter()) {
+        ASSIGN_OR_RETURN(Expression, resolved, resolve(src.WhereFilter()));
+        agg->SetWhereFilter(std::move(resolved));
+      }
+      if (src.SecondaryArg()) {
+        ASSIGN_OR_RETURN(Expression, resolved, resolve(src.SecondaryArg()));
+        agg->SetSecondaryArg(std::move(resolved));
+      }
+      std::vector<Expression> trailing;
+      for (const Expression& arg : src.TrailingArgs()) {
+        ASSIGN_OR_RETURN(Expression, resolved, resolve(arg));
+        trailing.push_back(std::move(resolved));
+      }
+      agg->SetTrailingArgs(std::move(trailing));
+      std::vector<WindowOrderTerm> order = src.InnerOrderBy();
+      for (auto& term : order) {
+        ASSIGN_OR_RETURN(Expression, resolved, resolve(term.expression));
+        term.expression = std::move(resolved);
+      }
+      agg->SetInnerOrderBy(std::move(order));
+      std::vector<Expression> group_by;
+      for (const Expression& key : src.InnerGroupBy()) {
+        ASSIGN_OR_RETURN(Expression, resolved, resolve(key));
+        group_by.push_back(std::move(resolved));
+      }
+      agg->SetInnerGroupBy(std::move(group_by));
+      exp = agg;
       return Status::kSuccess;
     }
     default:

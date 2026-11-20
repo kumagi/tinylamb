@@ -76,10 +76,11 @@ namespace tinylamb {
 
 // Executes SQL through the SqlEngine in a fresh committed context and returns
 // every produced row.
-inline std::vector<Row> RelationalRun(Database& database,
-                                      std::string_view sql) {
+inline std::vector<Row> RelationalRun(Database& database, std::string_view sql,
+                                      bool force_relational = false) {
   TransactionContext context = database.BeginContext();
   SqlEngine engine(database);
+  engine.SetForceRelationalFallback(force_relational);
   StatusOr<Executor> prepared = engine.Prepare(context, sql);
   std::vector<Row> rows;
   if (!prepared.HasValue()) {
@@ -97,9 +98,11 @@ inline std::vector<Row> RelationalRun(Database& database,
 }
 
 // Collects EXPLAIN ANALYZE output lines for a statement.
-inline std::string ExplainAnalyze(Database& database, std::string_view sql) {
+inline std::string ExplainAnalyze(Database& database, std::string_view sql,
+                                  bool force_relational = false) {
   TransactionContext context = database.BeginContext();
   SqlEngine engine(database);
+  engine.SetForceRelationalFallback(force_relational);
   StatusOr<Executor> prepared = engine.Prepare(
       context, std::string("EXPLAIN ANALYZE ") + std::string(sql));
   std::string profile;

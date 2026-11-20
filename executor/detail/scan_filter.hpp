@@ -69,7 +69,7 @@ struct PrefixInPredicate {
 // INT64/DATE probes whose type tag and unsigned tag statically equal the
 // build domain, so the int-value set verdict equals the per-row runtime
 // membership build's exact verdict and the matcher is total: every input gets
-// the SQL three-valued answer, no row defers to the contextful path.
+// the SQL three-valued answer, no row defers to the contextual path.
 struct MembershipStringHash {
   using is_transparent = void;
   size_t operator()(std::string_view value) const noexcept {
@@ -99,6 +99,21 @@ struct PrebuiltMembershipPredicate {
   // Plain string members use byte equality; unusual probe collations fall
   // back to the canonical comparison against these owned member values.
   std::shared_ptr<const MembershipStringSet> string_values;
+  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // (distinct_witness_exists_to_minmax_sound)
+  // Optional (min_w, max_w) map for `EXISTS (... WHERE inner.k = outer.k AND
+  // inner.w <> outer.w [AND local_preds])`: a non-null witness differing from
+  // non-null `outer.w` exists iff `min_w != outer.w || max_w != outer.w`.
+  std::shared_ptr<const FlatIntKeyMap<std::pair<int64_t, int64_t>>>
+      distinct_witness_minmax;
+  slot_t witness_column{0};
+  ValueType witness_type{ValueType::kNull};
+  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  //   (packed_int32_pair_bijection_sound)
+  // Optional second correlation column for 2-key CTE EXISTS membership
+  // (`(uint64_t(uint32_t(int32_t(k0))) << 32) | uint32_t(int32_t(k1))`).
+  std::optional<slot_t> packed_pair_col2;
+  ValueType packed_pair_type2{ValueType::kNull};
 };
 
 // `col op (correlated scalar aggregate subquery)` with exactly one
@@ -206,6 +221,8 @@ bool MatchPrebuiltScalarCompare(const Row& row,
 bool IsNonThrowingScanComparison(const Expression& predicate,
                                  const Schema& schema);
 
+bool IsNonThrowingScanFilter(const Expression& predicate, const Schema& schema);
+
 std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
     const Expression& predicate, const Schema& schema);
 
@@ -286,7 +303,7 @@ WorkerScanFilterPrograms CompileWorkerFilter(const CompiledScanFilter& filter,
                                              const Schema& schema);
 
 // Worker-safe row decision: 0 = reject, 1 = accept, 2 = defer (a program
-// raised, so the row needs the contextful MatchScanFilter re-check).
+// raised, so the row needs the contextual MatchScanFilter re-check).
 // Semantically mirrors MatchScanFilter for every decided row.
 int MatchScanFilterWorker(const Row& row, const Schema& schema,
                           const CompiledScanFilter& filter,
@@ -346,7 +363,7 @@ bool ContainsQuery(const Expression& expression);
 // EXISTS queries; see FoldRowIndependentSubqueriesIn).  Nodes that raise keep
 // their original form, so per-row error behavior is unchanged.  Callers pass
 // the result to CompileScanFilter: folded compares become typed SimpleCompare
-// predicates, and query-free predicates no longer force the contextful serial
+// predicates, and query-free predicates no longer force the contextual serial
 // filter or a cached-relation snapshot.
 std::vector<Expression> FoldRowIndependentSubqueries(
     TransactionContext& context, const std::vector<Expression>& predicates,

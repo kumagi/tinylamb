@@ -1764,7 +1764,7 @@ ORDER BY
 LIMIT 100)sql";
 
 // ---------------------------------------------------------------------------
-// 2026-09-29 batch: q63 / q98 / q84 / q35 / q37 / q48 / q79 / q63 / q34 /
+// 2026-09-29 batch: q63 / q98 / q84 / q35 / q37 / q48 / q79 / q34 /
 // q29 / q76 / q77.  Adaptations:
 //  - q84 pins ca_city to 'Midway' (the fixture city pool) and narrows the
 //    income band to 40000..90000 (the fixture's 20 x 5000 bands);

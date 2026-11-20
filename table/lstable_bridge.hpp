@@ -221,14 +221,32 @@ struct LSTableColumnBlock {
   std::span<const uint8_t> nulls_view{};
   std::span<const uint8_t> varchar_bytes_view{};
   std::span<const uint32_t> varchar_ends_view{};
+  // Reserved for per-block synopsis; no producer populates it yet, so
+  // BlockBloomMayContain() is currently always true. Store-level integer
+  // membership bloom is a different structure and does not back this field.
   std::span<const uint64_t> block_bloom{};
+
+  // Owned vectors back stores built in memory; persistent `.tlcs` stores
+  // leave them empty and expose zero-copy views instead. Readers must go
+  // through these accessors rather than the raw vectors.
+  [[nodiscard]] std::span<const uint8_t> Nulls() const noexcept {
+    return !nulls_view.empty() ? nulls_view : std::span<const uint8_t>(nulls);
+  }
+  [[nodiscard]] std::span<const uint8_t> VarcharBytes() const noexcept {
+    return !varchar_bytes_view.empty()
+               ? varchar_bytes_view
+               : std::span<const uint8_t>(varchar_bytes);
+  }
+  [[nodiscard]] std::span<const uint32_t> VarcharEnds() const noexcept {
+    return !varchar_ends_view.empty() ? varchar_ends_view
+                                      : std::span<const uint32_t>(varchar_ends);
+  }
 
   [[nodiscard]] bool IsNull(size_t row) const noexcept {
     if (!has_null) {
       return false;
     }
-    const std::span<const uint8_t> n =
-        !nulls_view.empty() ? nulls_view : std::span<const uint8_t>(nulls);
+    const std::span<const uint8_t> n = Nulls();
     return row < n.size() && n[row] != 0;
   }
 
@@ -339,12 +357,8 @@ struct LSTableColumnBlock {
       }
       return {};
     }
-    const std::span<const uint32_t> ends =
-        !varchar_ends_view.empty() ? varchar_ends_view
-                                   : std::span<const uint32_t>(varchar_ends);
-    const std::span<const uint8_t> bytes =
-        !varchar_bytes_view.empty() ? varchar_bytes_view
-                                    : std::span<const uint8_t>(varchar_bytes);
+    const std::span<const uint32_t> ends = VarcharEnds();
+    const std::span<const uint8_t> bytes = VarcharBytes();
     if (row >= ends.size()) {
       return {};
     }
@@ -486,7 +500,7 @@ struct LSTableIntegerRunBounds {
 }
     const uint64_t bit = uint64_t{1} << (off & 63);
     const uint64_t bits = key_bits[word];
-    if ((bits & bit) == 0u) { return count;
+    if ((bits & bit) == 0U) { return count;
 }
     return key_prefix[word] + std::popcount(bits & (bit - 1));
   }
@@ -536,6 +550,9 @@ struct LSTableStore {
   // and snapshot checks as the encoded blocks. A positive probe is only a
   // candidate; it never substitutes for the row predicate.
   std::vector<std::shared_ptr<const BloomRuntimeFilter>> integer_membership;
+  // Monotonic in raw signed int64 bit order. For unsigned columns a 2^63
+  // wrap is still "monotonic" here; callers needing numeric order must also
+  // check !IsUnsigned() (see strict_monotonic / ProveIntegerUniqueness).
   std::vector<uint8_t> column_is_monotonic;
   std::vector<uint8_t> column_is_unique_nonnull;
   std::vector<uint8_t> column_is_identity_1_to_n;

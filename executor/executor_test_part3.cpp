@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cstdlib>
+
 #include "executor/executor_test.hpp"
 
 namespace tinylamb {
@@ -225,6 +227,24 @@ TEST_F(ExecutorTest, RelationalExplainNestedLoopUnknownRows) {
   EXPECT_NE(plan.find("rows~unknown"), std::string::npos) << plan;
 }
 
+// T1794: pins that the QueryMemory annotation tracks the ACTIVE lane.
+struct ScopedExecEnv {  // NOLINT(cppcoreguidelines-special-member-functions)
+  ScopedExecEnv() : saved_(std::getenv("TINYLAMB_EXEC_ENGINE") != nullptr) {
+    if (saved_) {
+      original_ = std::getenv("TINYLAMB_EXEC_ENGINE");
+    }
+  }
+  ~ScopedExecEnv() {
+    if (saved_) {
+      (void)setenv("TINYLAMB_EXEC_ENGINE", original_.c_str(), 1);
+    } else {
+      (void)unsetenv("TINYLAMB_EXEC_ENGINE");
+    }
+  }
+  std::string original_;
+  bool saved_;
+};
+
 TEST_F(ExecutorTest, RelationalExplainMemoryLimitBranches) {
   // EXISTS marker: keeps these joins on the relational engine so the
   // QueryMemory reporting branches stay covered (see
@@ -233,21 +253,61 @@ TEST_F(ExecutorTest, RelationalExplainMemoryLimitBranches) {
       "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = b.key "
       "WHERE EXISTS (SELECT 1 FROM SampleTable);";
   {
-    ScopedQueryMemory unlimited(0);
+    // T1794: the default lane reports the process-wide budget that
+    // admission and spills actually size against, labelled as such.
     const std::string plan = RelationalExplain(*rs_, sql);
-    EXPECT_NE(plan.find("QueryMemory limit=unlimited"), std::string::npos)
-        << plan;
+    EXPECT_NE(plan.find("(process;"), std::string::npos) << plan;
   }
   {
-    ScopedQueryMemory kib(2048);
-    const std::string plan = RelationalExplain(*rs_, sql);
-    EXPECT_NE(plan.find("QueryMemory limit=2.0KiB"), std::string::npos) << plan;
+    // The legacy lane keeps reporting the global QueryMemoryBudget; pin
+    // all three branches (unlimited / mid / byte-granular) there.
+    ScopedExecEnv env;
+    (void)setenv("TINYLAMB_EXEC_ENGINE", "legacy", 1);
+    {
+      ScopedQueryMemory unlimited(0);
+      const std::string plan = RelationalExplain(*rs_, sql);
+      EXPECT_NE(plan.find("QueryMemory limit=unlimited (legacy global)"),
+                std::string::npos)
+          << plan;
+    }
+    {
+      ScopedQueryMemory kib(2048);
+      const std::string plan = RelationalExplain(*rs_, sql);
+      EXPECT_NE(plan.find("QueryMemory limit=2.0KiB"), std::string::npos)
+          << plan;
+    }
+    {
+      ScopedQueryMemory bytes(128);
+      const std::string plan = RelationalExplain(*rs_, sql);
+      EXPECT_NE(plan.find("QueryMemory limit=128B"), std::string::npos) << plan;
+    }
   }
-  {
-    ScopedQueryMemory bytes(128);
-    const std::string plan = RelationalExplain(*rs_, sql);
-    EXPECT_NE(plan.find("QueryMemory limit=128B"), std::string::npos) << plan;
-  }
+}
+
+TEST_F(ExecutorTest, RelationalExplainSortLimitAnnotations) {
+  // T2665: the Sort line must render the full ordering contract (key,
+  // direction, NULLS placement), not just a count.  T2659: LIMIT ... WITH
+  // TIES has to be distinguishable from a plain LIMIT.  T2658: the TopN
+  // annotation must reflect the real work set (heap capacity
+  // offset+limit; WITH TIES takes the full-sort route and no heap).
+  // EXISTS keeps the query on the relational renderer.
+  const std::string ties = RelationalExplain(
+      *rs_,
+      "SELECT name FROM SampleTable AS a WHERE EXISTS (SELECT 1 FROM "
+      "SampleTable) ORDER BY name DESC NULLS LAST LIMIT 2 WITH TIES;");
+  EXPECT_NE(ties.find("Sort keys=1: name DESC NULLS LAST"), std::string::npos)
+      << ties;
+  EXPECT_NE(ties.find("Limit count=2 offset=0 with_ties"), std::string::npos)
+      << ties;
+  EXPECT_NE(ties.find("TopN limit=2 with_ties(full_sort)"), std::string::npos)
+      << ties;
+  const std::string paged = RelationalExplain(
+      *rs_,
+      "SELECT name FROM SampleTable AS a WHERE EXISTS (SELECT 1 FROM "
+      "SampleTable) ORDER BY key ASC NULLS LAST LIMIT 10 OFFSET 95;");
+  EXPECT_NE(paged.find("TopN limit=10 offset=95 heap=105"), std::string::npos)
+      << paged;
+  EXPECT_NE(paged.find("Limit count=10 offset=95"), std::string::npos) << paged;
 }
 
 TEST_F(ExecutorTest, RelationalInSubqueryMissingTableThrows) {
@@ -2125,6 +2185,8 @@ TEST_F(ExecutorTest, BlockDistinctUsesCanonicalStringEqualityAndNulls) {
     ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
     const std::vector<Value> strings{Value(),
                                      Value(""),
+                                     Value("A"),
+                                     Value("a"),
                                      Value("4-th avenue"),
                                      Value("4-rd avenue"),
                                      Value("0-12 0 0:0:0"),
@@ -2152,10 +2214,23 @@ TEST_F(ExecutorTest, BlockDistinctUsesCanonicalStringEqualityAndNulls) {
                                         ColumnValueExp(column), true))});
     Row row;
     ASSERT_TRUE(aggregate.Next(&row, nullptr));
-    EXPECT_EQ(row, Row({Value(column == "s" ? 5 : 1)}));
+    EXPECT_EQ(row, Row({Value(column == "s" ? 7 : 1)}));
     EXPECT_TRUE(scan->WasTypedFolded());
     ASSERT_SUCCESS(aggregate.GetStatus());
   }
+  auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 2, 1);
+  Expression collated = FunctionCallExp(
+      "collate", {ColumnValueExp("s"), ConstantValueExp(Value("und:ci"))});
+  AggregationExecutor aggregate(
+      scan, schema,
+      {NamedExpression("d",
+                       AggregateExpressionExp(AggregationType::kCount,
+                                              std::move(collated), true))});
+  Row row;
+  ASSERT_TRUE(aggregate.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(6)}));
+  EXPECT_FALSE(scan->WasTypedFolded());
+  ASSERT_SUCCESS(aggregate.GetStatus());
   ASSERT_SUCCESS(reader.PreCommit());
 }
 

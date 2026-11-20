@@ -282,9 +282,16 @@ TEST_F(SqlCollationTest, CollatedOrderReportsTheCollationInExplain) {
     plan += "\n";
   }
   // The plan still sorts: a case-insensitive order is not a storage order,
-  // so the engine cannot elide the Sort operator.  (EXPLAIN does not render
-  // the ordering's collation, so there is no collation name to assert here.)
+  // so the engine cannot elide the Sort operator.  T2665 made the Sort line
+  // render the key expression itself, so the collation tag is now visible
+  // in EXPLAIN and this guards both the operator's presence and the
+  // ordering metadata.
   EXPECT_NE(plan.find("Sort keys=1"), std::string::npos);
+  // The key expression (and thus its COLLATE spec) is now part of the line
+  // (T2665).  Checked as fragments because the cell text arrives escaped
+  // through Value::AsString.
+  EXPECT_NE(plan.find("Sort keys=1: collate(s,"), std::string::npos) << plan;
+  EXPECT_NE(plan.find("und:ci"), std::string::npos) << plan;
 }
 
 }  // namespace tinylamb

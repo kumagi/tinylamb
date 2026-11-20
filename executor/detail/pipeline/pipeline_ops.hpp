@@ -76,7 +76,15 @@ class SpillableStoreSource final : public PipelineSource {
     (void)ctx;
     active_chunk_.Reset();
     active_row_ = 0;
-    return store_ ? store_->ResetCursor() : Status::kSuccess;
+    // T3511: a null store used to report success while NextBatch() then
+    // treated it as "input exhausted" (false), so a mis-wired OOC source
+    // silently ended the branch with zero rows. Misconfiguration must fail
+    // loudly at the Status boundary.
+    if (store_ == nullptr) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SpillableStoreSource opened without a spill store");
+    }
+    return store_->ResetCursor();
   }
   StatusOr<bool> NextBatch(PipelineContext* ctx, DataChunk* out,
                            size_t max_rows) override;
@@ -98,6 +106,12 @@ class FilterOp final : public PipelineOperator {
   Status Process(PipelineContext* ctx, const DataChunk& input,
                  DataChunk* output, bool* exhausted) override;
   [[nodiscard]] std::string Describe() const override { return "Selection"; }
+  [[nodiscard]] const Expression& Predicate() const noexcept {
+    return predicate_;
+  }
+  [[nodiscard]] const Schema& InputSchema() const noexcept {
+    return input_schema_;
+  }
   void DumpExplain(std::ostream& out, int indent) const override;
 
  private:
@@ -117,6 +131,12 @@ class ProjectOp final : public PipelineOperator {
   Status Process(PipelineContext* ctx, const DataChunk& input,
                  DataChunk* output, bool* exhausted) override;
   [[nodiscard]] std::string Describe() const override { return "Projection"; }
+  [[nodiscard]] const std::vector<NamedExpression>& Expressions() const noexcept {
+    return expressions_;
+  }
+  [[nodiscard]] const Schema& InputSchema() const noexcept {
+    return input_schema_;
+  }
   void DumpExplain(std::ostream& out, int indent) const override;
 
  private:

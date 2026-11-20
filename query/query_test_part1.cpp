@@ -923,12 +923,16 @@ TEST_F(QueryTest, AggregateRewritesPreserveInnerLimitAndDistinctModifiers) {
   ASSERT_EQ(array_rows[0][0].ArrayElements().size(), 1U);
   EXPECT_EQ(array_rows[0][0].ArrayElements()[0], Value(int64_t{100}));
 
-  const auto count_rows =
-      RunSql(ctx, *db_,
-             "SELECT COUNT(DISTINCT v ORDER BY u LIMIT 1) FROM agg_modifiers "
-             "WHERE u > 0;");
-  ASSERT_EQ(count_rows.size(), 1U);
-  EXPECT_EQ(count_rows[0][0], Value(int64_t{1}));
+  // ORDER BY / LIMIT is only meaningful for order-keeping aggregates;
+  // COUNT with those modifiers is rejected (project decision, 2026-11-20).
+  SqlEngine engine(*db_);
+  EXPECT_FALSE(engine
+                   .Prepare(ctx,
+                            "SELECT COUNT(DISTINCT v ORDER BY u LIMIT 1) FROM "
+                            "agg_modifiers WHERE u > 0;")
+                   .HasValue());
+  EXPECT_NE(engine.LastError().find("ORDER BY / LIMIT"), std::string::npos)
+      << engine.LastError();
 }
 
 TEST_F(QueryTest, WindowFilterDoesNotConfuseQualifiedPartitionColumns) {
@@ -1271,11 +1275,13 @@ TEST_F(QueryTest, DmlWhereQuantifiedAndExistsFold) {
       ctx,
       "DELETE FROM t WHERE EXISTS (WITH c AS (SELECT 1 AS a) SELECT * FROM c "
       "UNION ALL SELECT * FROM c);");
-  ASSERT_TRUE(with_dml.HasValue());
-  Row sink;
-  while (with_dml.Value()->Next(&sink, nullptr)) {
+  // The error may surface at Prepare or while the DML result is drained.
+  if (with_dml.HasValue()) {
+    Row sink;
+    while (with_dml.Value()->Next(&sink, nullptr)) {
+    }
+    EXPECT_NE(with_dml.Value()->GetStatus(), Status::kSuccess);
   }
-  EXPECT_NE(with_dml.Value()->GetStatus(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, DmlDoesNotFoldCorrelatedExists) {
@@ -1570,7 +1576,8 @@ TEST_F(QueryTest, SqlEngineInsertValidationErrors) {
   StatusOr<Executor> mismatch =
       engine.Prepare(ctx, "INSERT INTO t (a, b) VALUES (1);");
   EXPECT_FALSE(mismatch.HasValue());
-  EXPECT_EQ(mismatch.GetStatus(), Status::kUnknown);
+  // A column/value count mismatch is a caller error, reported as such.
+  EXPECT_EQ(mismatch.GetStatus(), Status::kInvalidArgument);
   EXPECT_NE(engine.LastError().find("mismatch"), std::string::npos)
       << engine.LastError();
 
@@ -1718,6 +1725,19 @@ TEST_F(QueryTest, SqlEngineAnalyzeEdgeCases) {
   // ParseAnalyze parser before the table name is read.
   ASSERT_TRUE(engine.Prepare(ctx, "ANALYZE t1;  ").HasValue());
 
+  // Act + Assert -- P3555: ANALYZE publishes the declared column types
+  // together with its names. With the types empty, consumers of the
+  // QueryResult (BuildColumnDescriptions on a streamed result, print
+  // paths) had to fall back to first-row sampling, which is absent when
+  // ANALYZE covers zero tables.
+  StatusOr<QueryResult> typed = engine.Execute(ctx, "ANALYZE t1, t2");
+  ASSERT_TRUE(typed.HasValue()) << engine.LastError();
+  EXPECT_EQ(typed.Value().ColumnNames(),
+            (std::vector<std::string>{"command", "table", "rows"}));
+  EXPECT_EQ(typed.Value().ColumnTypes(),
+            (std::vector<ValueType>{ValueType::kVarChar, ValueType::kVarChar,
+                                    ValueType::kInt64}));
+
   // Act + Assert -- a comma-separated table list refreshes both tables.
   StatusOr<Executor> list = engine.Prepare(ctx, "ANALYZE t1, t2");
   ASSERT_TRUE(list.HasValue()) << engine.LastError();
@@ -1732,7 +1752,8 @@ TEST_F(QueryTest, SqlEngineAnalyzeEdgeCases) {
   StatusOr<Executor> missing = engine.Prepare(ctx, "ANALYZE no_such_table");
   EXPECT_FALSE(missing.HasValue());
   EXPECT_EQ(missing.GetStatus(), Status::kNotExists);
-  EXPECT_EQ(engine.LastError(), "ANALYZE failed");
+  EXPECT_EQ(engine.LastError(),
+            "ANALYZE failed: " + missing.GetStatus().GetMessage());
 
   // Act + Assert -- "ANALYZEt" is not the ANALYZE keyword; the boundary check
   // rejects it and the query falls through to the SQL parser.
@@ -1748,9 +1769,8 @@ TEST_F(QueryTest, SqlEngineAnalyzeEdgeCases) {
 }
 
 TEST_F(QueryTest, SqlEngineTemplateCacheEvictsFullShard) {
-  // Arrange -- the process-global template cache has 16 shards of 64 entries.
-  // Prepare thousands of distinct templatable statements so every shard
-  // overflows and the oldest cached template in a shard is evicted.
+  // Arrange -- prepare enough distinct templatable statements to overflow
+  // template-cache shards and force eviction of the oldest entries.
   {
     TransactionContext ctx = db_->BeginContext();
     RunSql(ctx, *db_, "CREATE TABLE tpl_t (a INT64);");

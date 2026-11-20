@@ -16,6 +16,7 @@
 #include "executor/detail/typed_stream_aggregate.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/jit.hpp"
 #include "query/statement.hpp"
 #include "table/lstable_bridge.hpp"
 #include "table/scan_options.hpp"
@@ -33,6 +34,7 @@ namespace tinylamb::relational_detail {
 struct ContainsPrecheck {
   slot_t full_col{0};
   std::string needle;
+  std::optional<JitLiteralSearch> kernel;
 };
 
 struct DictFilterMask {
@@ -76,6 +78,14 @@ bool RowMatchesColPtrs(
     const ColumnarPredicateSet& preds,
     const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
     uint32_t row) noexcept;
+
+// When refine is true, filter strictly increasing candidate indices in place.
+// Otherwise, emit matching row indices for the full decoded block.
+// Returning false requests the ordinary block precheck and row loop.
+bool TryJitContainsRows(
+    const ColumnarPredicateSet& preds,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
+    uint32_t row_count, bool refine, std::vector<uint32_t>* rows);
 
 bool BlockPassesContainsPrecheck(const TlcsFile::DecodedColumnChunk& chunk,
                                  std::string_view needle) noexcept;

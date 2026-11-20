@@ -53,11 +53,22 @@ size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
       return 0;
     }
     if (right_iter_ == right_table_.end()) {
-      if (left_->NextBatch(&left_batch, 1) == 0) {
-        FailWithChildOf(*left_);
-        break;
+      if (left_pos_ >= left_rows_.size()) {
+        // Pull a full batch instead of paying the virtual-dispatch and
+        // DataChunk setup cost once per left row.
+        const size_t got = left_->NextBatch(&left_batch, kDefaultVectorSize);
+        if (got == 0) {
+          FailWithChildOf(*left_);
+          break;
+        }
+        left_rows_.clear();
+        left_rows_.reserve(got);
+        for (size_t i = 0; i < got; ++i) {
+          left_rows_.push_back(left_batch.RowAt(i));
+        }
+        left_pos_ = 0;
       }
-      hold_left_ = left_batch.RowAt(0);
+      hold_left_ = left_rows_[left_pos_++];
       right_iter_ = right_table_.begin();
     }
     destination->Append(hold_left_ + *right_iter_++);

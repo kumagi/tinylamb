@@ -25,7 +25,11 @@
 namespace tinylamb {
 
 PageRef::PageRef(Page* page, std::shared_mutex* page_lock, bool shared)
-    : page_(page) {
+    : PageRef({}, page, page_lock, shared) {}
+
+PageRef::PageRef(std::shared_ptr<Page> owner, Page* page,
+                 std::shared_mutex* page_lock, bool shared)
+    : owner_(std::move(owner)), page_(page) {
   if (page_lock != nullptr) {
     if (shared) {
       shared_page_lock_ = std::shared_lock<std::shared_mutex>(*page_lock);
@@ -38,7 +42,10 @@ PageRef::PageRef(Page* page, std::shared_mutex* page_lock, bool shared)
   }
 }
 
-RowPage& PageRef::GetRowPage() { return page_->body.row_page; }
+RowPage& PageRef::GetRowPage() {
+  assert(page_ != nullptr);
+  return page_->body.row_page;
+}
 
 void PageRef::PageUnlock() {
   if (exclusive_page_lock_.owns_lock()) {
@@ -51,6 +58,7 @@ void PageRef::PageUnlock() {
     shared_page_lock_.unlock();
   }
   page_ = nullptr;
+  owner_.reset();
 }
 
 PageRef::~PageRef() {

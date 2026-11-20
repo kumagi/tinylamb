@@ -198,7 +198,8 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
     GoogleSqlAstNode* raw = node.get();
     if (depth == 0) {
       if (root) {
-        return Status::kUnknown;
+        return StatusError(StatusCode::kInvalidArgument,
+                           "malformed AST dump: multiple root nodes");
       }
       root = std::move(node);
     } else {
@@ -207,7 +208,8 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       // depths 0,1,2,1,3) graft the node onto a stale ancestor two levels
       // up, silently producing a corrupted tree instead of kUnknown.
       if (depth > parents.size() || depth > previous_depth + 1) {
-        return Status::kUnknown;
+        return StatusError(StatusCode::kInvalidArgument,
+                           "malformed AST dump: depth jump");
       }
       parents[depth - 1]->children.push_back(std::move(node));
     }
@@ -219,7 +221,8 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
     previous_depth = depth;
   }
   if (!root) {
-    return Status::kUnknown;
+    return StatusError(StatusCode::kInvalidArgument,
+                       "malformed AST dump: no root node");
   }
   return root;
 }

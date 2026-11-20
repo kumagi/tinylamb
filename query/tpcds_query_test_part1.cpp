@@ -6,6 +6,33 @@
 
 namespace tinylamb {
 
+namespace {
+// Detect a clause at the outermost query level: a raw substring search also
+// matches ORDER BY / LIMIT inside a subquery or a string literal.
+bool HasTopLevelClause(std::string_view sql, std::string_view clause) {
+  int depth = 0;
+  bool in_string = false;
+  for (size_t i = 0; i < sql.size(); ++i) {
+    const char c = sql[i];
+    if (in_string) {
+      if (c == '\'') {
+        if (i + 1 < sql.size() && sql[i + 1] == '\'') { ++i; }
+        else { in_string = false; }
+      }
+      continue;
+    }
+    if (c == '\'') { in_string = true; continue; }
+    if (c == '(') { ++depth; continue; }
+    if (c == ')') { --depth; continue; }
+    if (depth == 0 && sql.substr(i, clause.size()) == clause) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+
 TEST(TpcdsManifestTest, RegisteredSubsetIsUniqueAndStable) {
   std::vector<std::string> expected{
       "q1",  "q10", "q11", "q12", "q13",  "q15", "q16", "q17", "q18", "q19",
@@ -57,16 +84,14 @@ TEST_F(TpcdsQueryTest, AllQueriesExecuteDeterministically) {
   for (const tpcds::TpcdsQuery& query : tpcds::kQueries) {
     const bool content_jitter = query.name == "q67" || query.name == "q65";
     const std::vector<Row> first = RunSql(query.sql);
-    if (query.name != "q54") {
-      ASSERT_FALSE(first.empty()) << query.name << " returned no rows";
-    }
+    ASSERT_FALSE(first.empty()) << query.name << " returned no rows";
     const std::vector<Row> second = RunSql(query.sql);
     ASSERT_EQ(first.size(), second.size())
         << query.name << " returned different row counts";
     if (first.empty()) {
       continue;
     }
-    if (query.sql.find("ORDER BY") != std::string_view::npos) {
+    if (HasTopLevelClause(query.sql, "ORDER BY")) {
       if (!query.total_order) {
         ASSERT_LT(query.order_key_index, first.front().values_.size());
         const auto respects_partial_order = [&](const std::vector<Row>& rows) {
@@ -294,7 +319,11 @@ TEST_F(TpcdsQueryTest, AllQueriesAvoidCrossProducts) {
   for (const tpcds::TpcdsQuery& query : tpcds::kQueries) {
     // EXPLAIN carries per-node row estimates (the executor Dump does not),
     // which the unbounded-product check below keys on.
-    const std::string plan = ExplainSql(query.sql);
+    // T3850: Prepare only sees EXPLAIN through the string prefix
+    // (SqlEngine::ParseExplain); passing the bare SELECT drained every query
+    // for real rows and grepped the FIRST RESULT COLUMN for "CrossJoin",
+    // keeping this whole check dead. Prefix it like the sibling call sites.
+    const std::string plan = ExplainSql("EXPLAIN " + std::string(query.sql));
     SCOPED_TRACE(query.name);
     EXPECT_EQ(plan.find("CrossJoin"), std::string::npos) << plan;
     size_t position = 0;
@@ -304,8 +333,13 @@ TEST_F(TpcdsQueryTest, AllQueriesAvoidCrossProducts) {
       const size_t estimate = plan.find("estimated rows:", position);
       ASSERT_NE(estimate, std::string::npos) << plan;
       ASSERT_LT(estimate, line_end) << plan;
-      const long long rows =
-          std::strtoll(plan.c_str() + estimate + 15, nullptr, 10);
+      const std::string estimate_text = plan.substr(estimate + 15, line_end);
+      char* end = nullptr;
+      errno = 0;
+      const long long rows = std::strtoll(estimate_text.c_str(), &end, 10);
+      ASSERT_EQ(errno, 0) << plan;
+      ASSERT_NE(end, estimate_text.c_str()) << plan;
+      ASSERT_EQ(*end, '\0') << plan;
       EXPECT_LT(rows, 100000LL) << "unbounded cross product\n"
                                 << plan.substr(position, 200);
       position = line_end;
@@ -346,8 +380,8 @@ TEST_F(TpcdsQueryTest, LimitedQueriesUseBoundedFinishPath) {
   // LIMITs of UNION / EXCEPT operands execute under the operand recursion
   // and are bounded by the operand machinery, not this path.
   for (const tpcds::TpcdsQuery& query : tpcds::kQueries) {
-    if (query.sql.find("ORDER BY") == std::string_view::npos ||
-        query.sql.find("LIMIT") == std::string_view::npos) {
+    if (!HasTopLevelClause(query.sql, "ORDER BY") ||
+        !HasTopLevelClause(query.sql, "LIMIT")) {
       continue;
     }
     const std::string plan = DumpSql(query.sql);

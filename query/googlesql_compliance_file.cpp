@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <ranges>
 #include <sstream>
 #include <string>
@@ -21,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/string_util.hpp"
 #include "type/date.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -45,9 +47,8 @@ std::string Trim(std::string_view text) {
 }
 
 std::string ToLower(std::string text) {
-  std::ranges::transform(text, text.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
+  std::ranges::transform(text, text.begin(),
+                         [](char c) { return AsciiToLower(c); });
   return text;
 }
 
@@ -175,7 +176,6 @@ constexpr auto kIgnoredOptionKeys = std::to_array<std::string_view>({
     "labels",
     "extract_labels",
     "global_labels",
-    "forbidden_features",
     "load_proto_files",
     "load_proto_names",
     "load_enum_names",
@@ -197,9 +197,9 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
   const std::string body = trimmed.substr(1, trimmed.size() - 2);
   const size_t eq = body.find('=');
   const std::string key =
-      ToLower(eq == std::string::npos ? body : body.substr(0, eq));
+      ToLower(Trim(eq == std::string::npos ? body : body.substr(0, eq)));
   const std::string value =
-      eq == std::string::npos ? std::string() : body.substr(eq + 1);
+      eq == std::string::npos ? std::string() : Trim(body.substr(eq + 1));
   if (key == "name") {
     out->name = value;
     return true;
@@ -215,6 +215,19 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
       feature = Trim(feature);
       if (!feature.empty()) {
         out->required_features.push_back(feature);
+      }
+    }
+    return true;
+  }
+  if (key == "forbidden_features" || key == "forbidden_feature") {
+    // The case is only valid while the engine LACKS every listed capability
+    // (reference-driver contract); the runner gates on the parsed set.
+    std::string feature;
+    std::istringstream features(value);
+    while (std::getline(features, feature, ',')) {
+      feature = Trim(feature);
+      if (!feature.empty()) {
+        out->forbidden_features.push_back(feature);
       }
     }
     return true;
@@ -263,8 +276,8 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
         const std::string name = Trim(s.substr(as_pos + 4));
         if (!name.empty() && !expr.empty()) {
           out->parameters.emplace_back(name, expr);
+          continue;
         }
-        continue;
       }
       // Compact "<value> <name>" form (e.g. "1 param", "NULL param").  A
       // trailing identifier wins over any embedded " AS ": expressions such
@@ -279,6 +292,11 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
         }
         continue;
       }
+      // Neither "<expr> AS <name>" nor "<expr> <name>" parsed: the item would
+      // be dropped silently, leaving a literal @name unsubstituted in the
+      // SQL. Record it so the runner can fail the case instead of passing on
+      // an unbound parameter.
+      out->unparseable_parameters.push_back(s);
     }
     return true;
   }
@@ -391,12 +409,12 @@ bool ParseStructRow(std::string_view text, size_t* offset,
 }
 
 void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
-  const std::string lower = ToLower(std::string(result));
   // An `[unknown_order]` option line may already have set the flag; the
-  // `unknown order:` phrase in the expectation is the other spelling and
-  // must not clear it.
-  out->unknown_order =
-      out->unknown_order || lower.find("unknown order") != std::string::npos;
+  // `unknown order:` phrase in the expectation is the other spelling. It is
+  // only honored at the ordering-annotation slot (right where an element
+  // would start inside the top-level '['), never as a substring of the
+  // payload — a VARCHAR golden containing the words must not flip the
+  // comparison to unordered.
   const size_t array_open = result.find('[');
   if (array_open == std::string_view::npos) {
     return;
@@ -418,6 +436,7 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
     const std::string lower_rest =
         ToLower(std::string(result.substr(offset, 14)));
     if (lower_rest.starts_with("unknown order:")) {
+      out->unknown_order = true;
       offset += 14;
     } else if (lower_rest.starts_with("known order:")) {
       offset += 12;
@@ -502,22 +521,80 @@ std::string NormalizeCommentEscapes(std::string sql) {
 std::string ApplyParameters(
     std::string sql,
     const std::vector<std::pair<std::string, std::string>>& parameters) {
-  for (const auto& [name, expr] : parameters) {
-    const std::string target = "@" + name;
-    size_t pos = 0;
-    while ((pos = sql.find(target, pos)) != std::string::npos) {
-      const size_t end = pos + target.size();
-      if (end < sql.size() &&
-          ((std::isalnum(static_cast<unsigned char>(sql[end])) != 0) ||
-           sql[end] == '_')) {
-        pos = end;
-        continue;
+  if (parameters.empty()) {
+    return sql;
+  }
+  auto is_ident = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+  };
+  std::string out;
+  out.reserve(sql.size());
+  const size_t n = sql.size();
+  size_t i = 0;
+  while (i < n) {
+    const char c = sql[i];
+    // Comments and quoted regions are copied verbatim: a parameter-looking
+    // token inside them must never be rewritten.
+    if (c == '-' && i + 1 < n && sql[i + 1] == '-') {
+      const size_t eol = sql.find('\n', i);
+      const size_t end = eol == std::string::npos ? n : eol;
+      out.append(sql, i, end - i);
+      i = end;
+      continue;
+    }
+    if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+      const size_t close = sql.find("*/", i + 2);
+      const size_t end = close == std::string::npos ? n : close + 2;
+      out.append(sql, i, end - i);
+      i = end;
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`') {
+      const char quote = c;
+      size_t j = i + 1;
+      while (j < n) {
+        if (sql[j] == '\\' && j + 1 < n) {
+          j += 2;
+          continue;
+        }
+        if (sql[j] == quote) {
+          if (j + 1 < n && sql[j + 1] == quote) {
+            j += 2;  // doubled-quote escape
+            continue;
+          }
+          ++j;
+          break;
+        }
+        ++j;
       }
-      sql.replace(pos, target.size(), "(" + expr + ")");
-      pos += expr.size() + 2;
+      out.append(sql, i, j - i);
+      i = j;
+      continue;
+    }
+    bool replaced = false;
+    if (c == '@' && (i == 0 || (!is_ident(sql[i - 1]) && sql[i - 1] != '@'))) {
+      for (const auto& [name, expr] : parameters) {
+        if (name.empty()) {
+          continue;
+        }
+        const std::string target = "@" + name;
+        if (sql.compare(i, target.size(), target) == 0 &&
+            (i + target.size() >= n || !is_ident(sql[i + target.size()]))) {
+          out += '(';
+          out += expr;
+          out += ')';
+          i += target.size();
+          replaced = true;
+          break;
+        }
+      }
+    }
+    if (!replaced) {
+      out += c;
+      ++i;
     }
   }
-  return sql;
+  return out;
 }
 
 // Option blocks such as multi-line `[parameters=...]` span several physical
@@ -594,6 +671,13 @@ GoogleSqlComplianceCase ParseSegment(
       in_options = false;
     }
     if (LineIsSeparator(line, "--")) {
+      if (sql.empty()) {
+        // A '--' before any query text cannot separate query from results;
+        // upstream corpus carries a stray one (struct_queries.test
+        // struct_equality_different_field_names). Skip it so the real query
+        // still parses instead of fabricating an empty-SQL case.
+        continue;
+      }
       std::ostringstream rest;
       rest << stream.rdbuf();
       ParseResult(rest.str(), &test_case);
@@ -807,7 +891,17 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
       }
     }
     if (test_case.sql.empty() && !test_case.prepare_database) {
-      continue;
+      // A segment can carry an expected result yet no SQL (a stray '--'
+      // separator, or a malformed entry). Dropping it silently lets a whole
+      // expectation vanish; keep any case that still has a result or an
+      // expected error so the runner fails it loudly. Plan-assertion-only
+      // stubs (the optimizer fixtures' "Future:" placeholders) carry no
+      // executable expectation and stay dropped.
+      const bool verifiable =
+          !test_case.expected_rows.empty() || test_case.expect_error;
+      if (!verifiable) {
+        continue;
+      }
     }
     cases.push_back(std::move(test_case));
   }
@@ -1125,7 +1219,9 @@ std::string CanonicalizeProtoValue(const std::string& value) {
   if (trimmed.size() >= 2 &&
       ((trimmed.front() == '\'' && trimmed.back() == '\'') ||
        (trimmed.front() == '"' && trimmed.back() == '"'))) {
-    return ToLower("\"" + trimmed.substr(1, trimmed.size() - 2) + "\"");
+    // Quoted payloads are case-sensitive string data: keep the inner text
+    // verbatim; only bare tokens (enum/bool/field-name side) casefold.
+    return "\"" + trimmed.substr(1, trimmed.size() - 2) + "\"";
   }
   return ToLower(NormalizeWsText(trimmed));
 }
@@ -1202,6 +1298,205 @@ Value ParseEmbeddedComplianceValue(std::string token) {
 }
 
 }  // namespace
+
+bool ComplianceErrorTextMatches(std::string_view expected,
+                                std::string_view actual,
+                                std::string_view observed_code) {
+  // Folds case and every non-alphanumeric run to single spaces so
+  // punctuation, quoting style and "[at L:C]" position suffixes never
+  // decide the match.
+  auto normalize = [](std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    bool pending_space = false;
+    for (const char ch : text) {
+      const auto u = static_cast<unsigned char>(ch);
+      if (std::isalnum(u) != 0) {
+        if (pending_space && !out.empty()) {
+          out.push_back(' ');
+        }
+        pending_space = false;
+        out.push_back(static_cast<char>(std::tolower(u)));
+      } else {
+        pending_space = true;
+      }
+    }
+    return out;
+  };
+  // Sorted-unique alphanumeric tokens of length >= 4: the content words two
+  // differently-worded messages can still agree on.
+  auto significant = [](const std::string& text) {
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < text.size()) {
+      while (i < text.size() && text[i] == ' ') {
+        ++i;
+      }
+      size_t j = i;
+      while (j < text.size() && text[j] != ' ') {
+        ++j;
+      }
+      if (j - i >= 4) {
+        tokens.push_back(text.substr(i, j - i));
+      }
+      i = j;
+    }
+    std::sort(tokens.begin(), tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+    return tokens;
+  };
+  auto shared_count = [](const std::vector<std::string>& a,
+                         const std::vector<std::string>& b) {
+    size_t shared = 0;
+    size_t i = 0;
+    size_t j = 0;
+    while (i < a.size() && j < b.size()) {
+      if (a[i] == b[j]) {
+        ++shared;
+        ++i;
+        ++j;
+      } else if (a[i] < b[j]) {
+        ++i;
+      } else {
+        ++j;
+      }
+    }
+    return shared;
+  };
+  // StatusCode names as spelled by common/constants.hpp ToString; used to
+  // recover the engine's error category from "<Name>: message" reports.
+  auto is_status_code_name = [](std::string_view name) {
+    static constexpr std::string_view kNames[] = {  // NOLINT(modernize-avoid-c-arrays)
+        // NOLINT(modernize-avoid-c-arrays)
+        "Unknown",
+        "Success",
+        "NoSpace",
+        "Conflicts",
+        "Duplicates",
+        "UnknownType",
+        "NotExists",
+        "NotImplemented",
+        "TooBigData",
+        "AmbiguousQuery",
+        "IsInfinity",
+        "Deleted",
+        "Corrupt",
+        "IOError",
+        "InvalidArgument",
+        "RuntimeError",
+        "MemoryLimitExceeded",
+    };
+    for (const std::string_view n :  // NOLINT(readability-use-anyofallof)
+         kNames) {  // NOLINT(readability-use-anyofallof)
+      if (n == name) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // GoogleSQL generic::<code> is the stable semantic signal; tinylamb renders
+  // the same failure classes under its own StatusCode vocabulary. Each entry
+  // lists the StatusCode names accepted for that absl code.
+  auto code_allowed = [](std::string_view generic, std::string_view observed) {
+    std::string_view allowed;
+    if (generic == "invalid_argument") {
+      allowed =
+          "InvalidArgument|Duplicates|NotExists|AmbiguousQuery|UnknownType|"
+          "NotImplemented";
+    } else if (generic == "out_of_range") {
+      allowed =
+          "IsInfinity|InvalidArgument|TooBigData|RuntimeError|"
+          "UnknownType";
+    } else if (generic == "unimplemented") {
+      allowed = "NotImplemented|InvalidArgument|Unknown";
+    } else if (generic == "not_found") {
+      allowed = "NotExists|InvalidArgument";
+    } else if (generic == "already_exists") {
+      allowed = "Duplicates|InvalidArgument";
+    } else if (generic == "failed_precondition") {
+      allowed = "InvalidArgument|RuntimeError|Duplicates|Conflicts";
+    } else if (generic == "internal") {
+      allowed = "Unknown|RuntimeError|Corrupt";
+    } else if (generic == "resource_exhausted") {
+      allowed = "MemoryLimitExceeded|NoSpace|TooBigData|RuntimeError";
+    } else if (generic == "aborted") {
+      allowed = "Conflicts|RuntimeError";
+    } else if (generic == "data_loss") {
+      allowed = "Corrupt";
+    } else {
+      return false;
+    }
+    size_t start = 0;
+    while (start <= allowed.size()) {
+      const size_t bar = allowed.find('|', start);
+      const std::string_view tok = allowed.substr(
+          start, bar == std::string_view::npos ? bar : bar - start);
+      if (tok == observed) {
+        return true;
+      }
+      if (bar == std::string_view::npos) {
+        break;
+      }
+      start = bar + 1;
+    }
+    return false;
+  };
+  std::string_view msg = expected;
+  std::string_view generic_code;
+  // GoogleSQL goldens spell errors as "generic::<code>: <message> [at L:C]";
+  // keep the code for category matching and only the message for text.
+  if (msg.starts_with("generic::")) {
+    const size_t colon = msg.find(':', std::string_view("generic::").size());
+    if (colon != std::string_view::npos) {
+      generic_code = msg.substr(std::string_view("generic::").size(),
+                                colon - std::string_view("generic::").size());
+      msg = msg.substr(colon + 1);
+    }
+  }
+  const size_t at_pos = msg.find("[at ");
+  if (at_pos != std::string_view::npos) {
+    msg = msg.substr(0, at_pos);
+  }
+  const std::string want = normalize(msg);
+  if (want.empty()) {
+    return true;
+  }
+  const std::string got = normalize(actual);
+  // The engine's error category: a "<Name>:" prefix inside the reported text
+  // wins (executor errors embed ToString(status)); otherwise fall back to
+  // the caller-supplied Status code name (prepare errors carry no prefix).
+  std::string_view observed = observed_code;
+  {
+    const size_t colon = actual.find(':');
+    if (colon != std::string_view::npos &&
+        is_status_code_name(actual.substr(0, colon))) {
+      observed = actual.substr(0, colon);
+    }
+  }
+  if (got.empty()) {
+    // No message to compare: only a matching error category can vouch.
+    return !generic_code.empty() && code_allowed(generic_code, observed);
+  }
+  if (got.find(want) != std::string::npos) {
+    return true;
+  }
+  // Reverse containment covers goldens more verbose than the engine's own
+  // wording ("... in MOD", argument positions); require the observed message
+  // to be comparably sized so a terse unrelated error cannot pass.
+  if (got.size() * 2 >= want.size() && want.find(got) != std::string::npos) {
+    return true;
+  }
+  // GoogleSQL and tinylamb word the same failures differently; accept when
+  // the messages still share content words — one word suffices alongside a
+  // matching generic code, two otherwise.
+  const std::vector<std::string> want_tokens = significant(want);
+  const std::vector<std::string> got_tokens = significant(got);
+  const size_t shared = shared_count(want_tokens, got_tokens);
+  if (!generic_code.empty() && code_allowed(generic_code, observed)) {
+    return want_tokens.empty() || shared >= 1;
+  }
+  return shared >= 2;
+}
 
 bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   const std::string want = Trim(expected);
@@ -1407,18 +1702,57 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     if (parsed == 0.0) {
       return got == 0.0;
     }
-    if (std::fabs(parsed) < 1e-300) {
-      return std::fabs(got - parsed) <= 1e-5 * std::fabs(parsed);
+    const double scale = std::max(  // NOLINT(modernize-min-max-use-initializer-list)
+        std::max(
+            std::fabs(got),
+            std::fabs(
+                parsed)),  // NOLINT(modernize-min-max-use-initializer-list)
+        std::numeric_limits<double>::min());
+    // A few-ULP relative bound: goldens produced by the same IEEE-754
+    // computation agree to the last bits, so a looser tolerance hides real
+    // discrepancies in the 7th significant digit. The DBL_MIN floor keeps
+    // subnormal doubles comparable at a few subnormal ULPs.
+    if (std::fabs(got - parsed) <=
+        8.0 * std::numeric_limits<double>::epsilon() * scale) {
+      return true;
     }
-    // Purely relative: an absolute floor would let a golden like 1e-6 pass
-    // with a 100% relative error.
-    return std::fabs(got - parsed) <= 1e-6 * std::fabs(parsed);
+    // FLOAT columns surface as DOUBLE carrying a widened float32; when the
+    // observed value is exactly float32-representable the column is FLOAT
+    // and the golden only needs to agree at float32 precision.
+    if (static_cast<double>(static_cast<float>(got)) == got &&
+        static_cast<float>(got) == static_cast<float>(parsed)) {
+      return true;
+    }
+    return false;
   }
 
   if (actual.type == ValueType::kVarChar) {
     if (want.size() >= 3 && (want[0] == 'b' || want[0] == 'B') &&
         want[1] == '"' && want.back() == '"') {
       return std::string(actual.value.varchar_value) == Unquote(want.substr(1));
+    }
+    // A bare numeric golden (2, -3.5, 1e3) declares an INT64/DOUBLE
+    // expectation; a VARCHAR actual carrying the same digits is a type-tag
+    // confusion, not a match. Quoted goldens ("2") and complex shapes
+    // ({...}, ARRAY<...>, proto text) stay comparable below.
+    if (want.size() < 2 || want.front() != '"' || want.back() != '"') {
+      size_t consumed = 0;
+      try {
+        std::stoll(want, &consumed);
+        if (consumed == want.size()) {
+          return false;
+        }
+      } catch (  // NOLINT(bugprone-empty-catch)
+          ...) {  // NOLINT(bugprone-empty-catch) non-numeric golden is expected
+      }
+      try {
+        std::stod(want, &consumed);
+        if (consumed == want.size()) {
+          return false;
+        }
+      } catch (  // NOLINT(bugprone-empty-catch)
+          ...) {  // NOLINT(bugprone-empty-catch) non-numeric golden is expected
+      }
     }
     const std::string unquoted = Unquote(want);
     const std::string actual_str = std::string(actual.value.varchar_value);
@@ -1695,6 +2029,50 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       }
       return elem;
     };
+    // Canonical "name=value" member form for the order-insensitive struct
+    // multiset below: keeps the field name so swapped or renamed fields
+    // cannot compare equal, while the value side keeps the drop_key
+    // normalizations (including the NULL-typed array collapse).
+    auto member_pair = [](std::string elem) -> std::string {
+      int depth = 0;
+      bool in_str = false;
+      char quote = '\0';
+      for (size_t i = 0; i < elem.size(); ++i) {
+        const char c = elem[i];
+        if (in_str) {
+          if (c == '\\' && i + 1 < elem.size()) {
+            ++i;
+          } else if (c == quote) {
+            in_str = false;
+          }
+          continue;
+        }
+        if (c == '"' || c == '\'') {
+          in_str = true;
+          quote = c;
+        } else if (c == '<' || c == '[' || c == '(' || c == '{') {
+          ++depth;
+        } else if (c == '>' || c == ']' || c == ')' || c == '}') {
+          if (depth > 0) {
+            --depth;
+          }
+        } else if (c == ':' && depth == 0 && i + 1 < elem.size()) {
+          const std::string name = ToLower(Trim(elem.substr(0, i)));
+          std::string val = Trim(elem.substr(i + 1));
+          const std::string lower_val = ToLower(val);
+          if (lower_val.starts_with("array<") &&
+              lower_val.ends_with("(null)")) {
+            val = "NULL";
+          }
+          if (name.empty()) {
+            return val;
+          }
+          return name + "=" +  // NOLINT(performance-inefficient-string-concatenation)
+                 val;  // NOLINT(performance-inefficient-string-concatenation)
+        }
+      }
+      return elem;
+    };
     if (!want.empty() && want.front() == '{' && want.back() == '}' &&
         !norm_actual.empty() && norm_actual.front() == '{' &&
         norm_actual.back() == '}') {
@@ -1705,7 +2083,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         std::vector<std::string> out;
         out.reserve(parts.size());
         for (std::string& p : parts) {
-          std::string elem = drop_key(Trim(p));
+          std::string elem = member_pair(Trim(p));
           const std::string lower_elem = ToLower(elem);
           if (lower_elem.starts_with("array<") &&
               lower_elem.ends_with("(null)")) {

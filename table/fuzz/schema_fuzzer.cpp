@@ -177,7 +177,15 @@ std::string GenString(Lcg& rng, int policy, int64_t i, size_t max_len) {
   }
 }
 
-Value MakeValue(Lcg& rng, const ColSpec& c, int64_t i, size_t max_len) {
+Value MakeValue(Lcg& rng, const ColSpec& c, int64_t i, size_t max_len,
+                bool allow_null = true) {
+  // Exercise nullable-column encodings (null bitmap, sparse/pbit/byte-slice,
+  // NULL-aware memcomparable keys) rather than only the non-NULL fast paths.
+  // The key column stays non-NULL: point lookups and the key-range oracle
+  // below read it as an INT64.
+  if (allow_null && rng.Below(8) == 0) {
+    return Value();  // NOLINT(modernize-return-braced-init-list)
+  }
   if (c.type == ValueType::kInt64) {
     return Value(GenInt(rng, c.policy, i));
   }
@@ -188,6 +196,10 @@ Value MakeValue(Lcg& rng, const ColSpec& c, int64_t i, size_t max_len) {
 }
 
 bool SameField(const Value& a, const Value& b, ValueType t) {
+  // Generated rows now carry NULLs; compare them before the typed accessors.
+  if (a.IsNull() || b.IsNull()) {
+    return a.IsNull() && b.IsNull();
+  }
   if (a.type != b.type) {
     return false;
   }
@@ -253,9 +265,15 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
   }
 
   try {
+    // T4245: only data[0..7] ever reached the LCG, so libFuzzer mutations
+    // of the remaining 56+ bytes were unobservable -- column count, types,
+    // key position and row counts all derive from this seed. Fold the WHOLE
+    // input (FNV-1a) so every byte can change the generated schema.
     Lcg rng([&] {
-      uint64_t s = 0;
-      std::memcpy(&s, data, 8);
+      uint64_t s = 1469598103934665603ULL;
+      for (size_t i = 0; i < size; ++i) {
+        s = (s ^ data[i]) * 1099511628211ULL;
+      }
       return s | 1;
     }());
 
@@ -308,8 +326,10 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
     for (int i = 0; i < nrows; ++i) {
       std::vector<Value> vals;
       vals.reserve(specs.size());
-      for (const auto& c : specs) {
-        vals.push_back(MakeValue(rng, c, i, max_len));
+      for (size_t ci = 0; ci < specs.size(); ++ci) {
+        vals.push_back(MakeValue(rng, specs[ci], i, max_len,
+                                 /*allow_null=*/ci !=
+                                     static_cast<size_t>(key_idx)));
       }
       Row r(vals);
       std::string key = r.EncodeKeyMemcomparableFormat(sc);

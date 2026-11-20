@@ -96,9 +96,8 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
         provided[i].name) {
       return false;
     }
-    if (ascending[i] != scan_ascending) {
-      return false;
-    }
+    // The requested NULL placement already encodes the direction check for
+    // memcomparable keys (NULL is smallest); do not re-check ascending here.
   }
   return true;
 }
@@ -190,7 +189,17 @@ Schema IndexOnlyScanPlan::OutputSchema() const {
     cols.push_back(table_.GetSchema().GetColumn(key));
   }
   for (const auto& included : index_.sc_.include_) {
-    cols.push_back(table_.GetSchema().GetColumn(included));
+    // A slot present in both key_ and include_ must appear only once.
+    bool duplicate = false;
+    for (const auto& key : index_.sc_.key_) {
+      if (key == included) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) {
+      cols.push_back(table_.GetSchema().GetColumn(included));
+    }
   }
   return {"", cols};
 }
@@ -246,14 +255,14 @@ bool IndexOnlyScanPlan::ContainsParameterSlots() const {
 }
 
 bool IndexOnlyScanPlan::InstallParameterSlots(
-    const std::vector<Value>& parameters, size_t* cursor,
+    const std::vector<Value>& /*parameters*/, size_t* /*cursor*/,
     std::vector<Expression>* slots) {
   for (NamedExpression& column : select_) {
-    if (!SlotizeInPlace(&column.expression, parameters, cursor, slots)) {
+    if (!CollectParameterSlots(&column.expression, slots)) {
       return false;
     }
   }
-  return SlotizeInPlace(&where_, parameters, cursor, slots);
+  return CollectParameterSlots(&where_, slots);
 }
 
 }  // namespace tinylamb

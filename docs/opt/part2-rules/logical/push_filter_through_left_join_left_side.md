@@ -30,7 +30,7 @@ graph TD
 ## 適用条件
 
 パターンは `Selection(OuterJoin(Any("left"), Any("right"), "join"))` です。
-DSL の `LeftOuterJoin`(型をパターンで固定するヘルパ)ではなく素の
+DSL の `LeftOuterJoin`(型をパターンで固定するヘルパー)ではなく素の
 `OuterJoin` を使っており、**join_type の検査は変換ラムダ側**で行います。
 guard は次の 5 つです。
 

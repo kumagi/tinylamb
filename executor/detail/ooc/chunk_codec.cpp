@@ -16,9 +16,9 @@ namespace {
 
 template <typename T>
 void AppendPod(T val, std::string* dst) {
-  const size_t off = dst->size();
-  dst->resize(off + sizeof(T));
-  std::memcpy(dst->data() + off, &val, sizeof(T));
+  // append() writes the bytes once; resize() would zero-fill then memcpy.
+  const char* bytes = reinterpret_cast<const char*>(&val);
+  dst->append(bytes, sizeof(T));
 }
 
 template <typename T>
@@ -227,6 +227,23 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
   RETURN_IF_FAIL(ReadPod(src, &col_count));
   RETURN_IF_FAIL(ReadPod(src, &has_positions));
 
+  // Validate the in-frame dimensions against the remaining payload before
+  // using them as allocation sizes: every column carries at least a 2-byte
+  // (type, flags) header, and row_count is capped far above any legitimate
+  // spill frame (frames are byte-capped by the staging/grace flush limits).
+  // Without these checks a corrupted header drives multi-GiB resize /
+  // Initialize calls whose std::bad_alloc / std::length_error escapes the
+  // Status boundary (project invariant 1).
+  constexpr uint32_t kMaxFrameRows = 1U << 22;
+  if (static_cast<size_t>(col_count) * 2 > src->size()) {
+    return StatusError(StatusCode::kCorrupt,
+                       "col_count exceeds DataChunk frame payload");
+  }
+  if (row_count > kMaxFrameRows) {
+    return StatusError(StatusCode::kCorrupt,
+                       "row_count exceeds DataChunk frame limit");
+  }
+
   std::vector<RowPosition> positions;
   if (has_positions != 0 && row_count > 0) {
     const size_t pos_bytes =
@@ -280,6 +297,11 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
     }
 
     if (use_fallback) {
+      // Every fallback value consumes at least one tag byte.
+      if (static_cast<size_t>(row_count) > src->size()) {
+        return StatusError(StatusCode::kCorrupt,
+                           "truncated fallback values in DataChunk frame");
+      }
       for (uint32_t r = 0; r < row_count; ++r) {
         ASSIGN_OR_RETURN(Value, v, DecodeSpillValue(src));
         col.Append(v);
@@ -331,6 +353,12 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
         break;
       }
       case ValueType::kVarChar: {
+        // Every cell carries at least a 4-byte length prefix (null cells
+        // encode a zero length), so the scratch cannot exceed the payload.
+        if (static_cast<size_t>(row_count) * 4 > src->size()) {
+          return StatusError(StatusCode::kCorrupt,
+                             "truncated varchar column in DataChunk frame");
+        }
         sv_scratch.resize(row_count);
         for (uint32_t r = 0; r < row_count; ++r) {
           uint32_t slen = 0;
@@ -406,7 +434,7 @@ Status WriteRowRange(SpillSegmentWriter* writer, const DataChunk& chunk,
     payload = &chunk;
   } else {
     for (size_t r = begin; r < end; ++r) {
-      sub.Append(chunk, r);
+      sub.AppendFrom(chunk, r);
     }
     payload = &sub;
   }
@@ -429,6 +457,9 @@ Status WriteRowRange(SpillSegmentWriter* writer, const DataChunk& chunk,
 
 }  // namespace
 
+// Spill frames carry only a length header; no magic/version. Spill files are
+// process-local temporaries, so format drift cannot mix readers/writers across
+// binaries; corruption relies on the payload decoder's own end checks.
 Status WriteDataChunk(SpillSegmentWriter* writer, const DataChunk& chunk,
                       std::string* scratch_buffer, size_t max_frame_bytes) {
   if (writer == nullptr) {

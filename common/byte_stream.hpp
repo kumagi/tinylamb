@@ -11,12 +11,15 @@
 
 namespace tinylamb {
 
-// Bounded byte reader over a libFuzzer input buffer.  Every read past the end
-// returns zero so truncated inputs always execute safely; that makes prefix
-// truncation a valid mutation (a shorter operation stream) and keeps single
-// byte edits correlated with single parameter changes, which is what lets the
-// coverage-guided mutator steer an operation sequence instead of falling back
-// to blind random search.
+// Bounded byte reader over a libFuzzer input buffer.  Every scalar read
+// (U8/U16/U32/U64/Varint) past the end returns zero so truncated inputs
+// always execute safely; Bytes() instead returns a short (possibly empty)
+// view of only the bytes actually present, so callers must check its size
+// rather than assume zero padding.  That makes prefix truncation a valid
+// mutation (a shorter operation stream) and keeps single byte edits
+// correlated with single parameter changes, which is what lets the
+// coverage-guided mutator steer an operation sequence instead of falling
+// back to blind random search.
 class ByteStream {
  public:
   ByteStream(const uint8_t* data, size_t size) : data_(data), size_(size) {}

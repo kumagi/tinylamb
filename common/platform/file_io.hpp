@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 
 namespace tinylamb::platform {
@@ -53,6 +54,12 @@ int CloseFile(int fd);
 // other POSIX uses `mkstemp` + `unlink`; Windows uses DELETE_ON_CLOSE.
 // Returns fd >= 0 on success, or -1 with errno set on failure.
 int OpenUnlinkedTempFile(const std::filesystem::path& dir = {});
+
+// Wraps a descriptor from OpenFile / OpenUnlinkedTempFile in a stdio stream
+// (`fdopen` on POSIX, `_fdopen` on Windows).  On success the returned stream
+// owns the descriptor (fclose closes it); on failure the descriptor is
+// closed and nullptr is returned with errno preserved.
+std::FILE* FdOpenStream(int fd, const char* mode);
 
 // Duplicates `oldfd` onto `newfd` (dup2 semantics: returns `newfd` on success
 // and -1 with errno set on failure, even on Windows where _dup2 returns 0).

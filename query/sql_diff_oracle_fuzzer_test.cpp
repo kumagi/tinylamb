@@ -10,7 +10,7 @@
 
 namespace tinylamb {
 
-TEST(DiffOracleFuzzer, TqsBitmapAgreesAndRoundTrips) {
+TEST(SqlDiffOracleFuzzer, TqsBitmapAgreesAndRoundTrips) {
   for (uint32_t seed = 0; seed < 16; ++seed) {
     std::mt19937 rng(seed);
     DiffOracleStats stats;
@@ -38,7 +38,7 @@ TEST(DiffOracleFuzzer, TqsBitmapAgreesAndRoundTrips) {
   EXPECT_NE(mismatch.find("[TQS MISMATCH]"), std::string::npos) << mismatch;
 }
 
-TEST(DiffOracleFuzzer, SubsetAndExpressionRewriteHold) {
+TEST(SqlDiffOracleFuzzer, SubsetAndExpressionRewriteHold) {
   int checks = 0;
   for (uint32_t seed = 0; seed < 24; ++seed) {
     std::mt19937 rng(seed + 20);
@@ -52,7 +52,7 @@ TEST(DiffOracleFuzzer, SubsetAndExpressionRewriteHold) {
   EXPECT_GT(checks, 24);
 }
 
-TEST(DiffOracleFuzzer, DqpPathsAgree) {
+TEST(SqlDiffOracleFuzzer, DqpPathsAgree) {
   int compared = 0;
   for (uint32_t seed = 0; seed < 12; ++seed) {
     std::mt19937 rng(seed + 100);
@@ -60,12 +60,14 @@ TEST(DiffOracleFuzzer, DqpPathsAgree) {
     DiffOracleTrace trace;
     const std::string report = RunDqpIteration(rng, false, &stats, &trace);
     ASSERT_EQ(report, "") << "seed " << seed << "\n" << report;
+    EXPECT_EQ(ReplayDiffOracleTrace(trace), "")
+        << "generated trace fails to replay (seed " << seed << ")";
     compared += stats.dqp_queries;
   }
   EXPECT_GT(compared, 0);
 }
 
-TEST(DiffOracleFuzzer, RadarInstancesAgree) {
+TEST(SqlDiffOracleFuzzer, RadarInstancesAgree) {
   int compared = 0;
   for (uint32_t seed = 0; seed < 12; ++seed) {
     std::mt19937 rng(seed + 200);
@@ -77,7 +79,7 @@ TEST(DiffOracleFuzzer, RadarInstancesAgree) {
   EXPECT_EQ(compared, 12 * 4);
 }
 
-TEST(DiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
+TEST(SqlDiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
   // A ScopedDb creation failure (disk-quota pressure) runs no query at all.
   // The report is "" there, so an arm that would bulk-add its whole query set
   // on an empty report has to be told it was skipped instead -- otherwise a

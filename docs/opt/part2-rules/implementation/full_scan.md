@@ -77,7 +77,7 @@ graph TD
 
 ### 2. コストと推定行数
 ```cpp
-    auto local_cost = static_cast<double>(full_scan->AccessRowCount());
+    auto local_cost = 16.0 + static_cast<double>(full_scan->AccessRowCount());
     if (required.access_method == cascades::AccessMethod::kPreferIndex &&
         table.IndexCount() > 0) {
       local_cost *= 2.0;

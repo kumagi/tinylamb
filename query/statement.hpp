@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "common/set_operation.hpp"
+#include "common/status_or.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
@@ -120,6 +122,8 @@ enum class StatementType : uint8_t {
   kCreateView,
   kDropView,
   kCreateIndex,
+  kCreateFunction,
+  kCreateConstant,
 };
 
 // ALTER TABLE action.  v1 carries the catalog-level actions (table rename,
@@ -135,6 +139,7 @@ struct AlterTableAction {
   // [1] = new column name.
   std::string new_name;
   std::string old_column;
+  bool if_exists{false};
 };
 
 inline std::string StatementTypeName(StatementType t) {
@@ -167,6 +172,10 @@ inline std::string StatementTypeName(StatementType t) {
       return "DropView";
     case StatementType::kCreateIndex:
       return "CreateIndex";
+    case StatementType::kCreateFunction:
+      return "CreateFunction";
+    case StatementType::kCreateConstant:
+      return "CreateConstant";
   }
   return "Unknown";
 }
@@ -295,6 +304,15 @@ class CreateTableStatement : public Statement {
   [[nodiscard]] bool IfNotExists() const { return if_not_exists_; }
   [[nodiscard]] bool OrReplace() const { return or_replace_; }
 
+  // P557/596: storage-engine name from `CREATE TABLE ... ENGINE=...` /
+  // `USING ...` / `OPTIONS (engine=...)` (frontend-normalized).  The visitor
+  // validates the name and transcribes it so the DDL round-trips faithfully;
+  // every accepted name currently selects the single built-in storage layout
+  // (no per-table engine exists yet) and the executor ignores the value.
+  // Empty = the clause was not given.
+  void SetEngine(std::string engine) { engine_ = std::move(engine); }
+  [[nodiscard]] const std::string& Engine() const { return engine_; }
+
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_;
     if (if_not_exists_) {
@@ -302,6 +320,9 @@ class CreateTableStatement : public Statement {
     }
     if (or_replace_) {
       o << " or_replace";
+    }
+    if (!engine_.empty()) {
+      o << " engine=" << engine_;
     }
     if (as_query_) {
       o << " AS SELECT";
@@ -341,13 +362,14 @@ class CreateTableStatement : public Statement {
   std::shared_ptr<SelectStatement> as_query_;
   bool if_not_exists_ = false;
   bool or_replace_ = false;
+  std::string engine_;
 };
 
 // CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS <query>.  The result is
 // materialized into a catalog table of the same name; the defining query
-// text rides along in the catalog so the view can be refreshed by re-running
-// it.  Staleness is manual (BigQuery-style automatic incremental refresh is
-// out of scope): queries read the stored rows until an explicit refresh.
+// text is stored in the catalog for DDL round-tripping. There is no REFRESH
+// statement: recreate with DROP + CREATE. Queries read the stored rows until
+// the materialized view is recreated.
 class CreateMaterializedViewStatement : public Statement {
  public:
   CreateMaterializedViewStatement(std::string view_name, bool if_not_exists,
@@ -381,25 +403,30 @@ class CreateMaterializedViewStatement : public Statement {
 
 // CREATE VIEW: the defining query persists as text (Database view records)
 // and expands at FROM-reference time through the session ViewRegistry.  The
-// visitor registers the parsed query immediately so same-transaction
+// the DDL executor registers the parsed query on execution so same-transaction
 // references resolve; execution persists the definition for later sessions.
 class CreateViewStatement : public Statement {
  public:
   CreateViewStatement(std::string view_name, bool or_replace,
-                      std::string query_text, bool if_not_exists = false)
+                      std::string query_text, bool if_not_exists = false,
+                      bool is_temp = false)
       : Statement(StatementType::kCreateView),
         view_name_(std::move(view_name)),
         or_replace_(or_replace),
         query_text_(std::move(query_text)),
-        if_not_exists_(if_not_exists) {}
+        if_not_exists_(if_not_exists),
+        is_temp_(is_temp) {}
 
   [[nodiscard]] const std::string& ViewName() const { return view_name_; }
   [[nodiscard]] bool OrReplace() const { return or_replace_; }
   [[nodiscard]] bool IfNotExists() const { return if_not_exists_; }
+  // Issue 2553: CREATE TEMP VIEW is a session object and may capture a
+  // session-local SQL UDF; only PERSISTENT views get the capture check.
+  [[nodiscard]] bool IsTemp() const { return is_temp_; }
   [[nodiscard]] const std::string& QueryText() const { return query_text_; }
   void Dump(std::ostream& o) const override {
-    o << "view=" << view_name_ << (or_replace_ ? " or_replace" : "") << " AS "
-      << query_text_;
+    o << "view=" << view_name_ << (or_replace_ ? " or_replace" : "")
+      << (is_temp_ ? " temp" : "") << " AS " << query_text_;
   }
 
  private:
@@ -407,6 +434,7 @@ class CreateViewStatement : public Statement {
   bool or_replace_;
   std::string query_text_;
   bool if_not_exists_{false};
+  bool is_temp_{false};
 };
 
 class DropViewStatement : public Statement {
@@ -427,6 +455,39 @@ class DropViewStatement : public Statement {
   bool if_exists_;
 };
 
+// T2552: CREATE FUNCTION / CREATE CONSTANT statements.  The AST visitor
+// parses the declaration and folds constant values, but the registry side
+// effect (thread_local RegisterUdf / SessionConstantExpressions writes) is
+// deferred into `side_effect` and run only when the statement executes
+// (PrepareStatement dispatch), mirroring CREATE VIEW's documented contract
+// that a failed, aborted, or EXPLAINed CREATE leaves no session-registry
+// entry behind.  The original CREATE used to return a dummy constant
+// SelectStatement; ResultProjection preserves its shape (function: one
+// unnamed INT64 0 row; constant: one "constant" name row) as a literal row
+// emitted by a ConstantExecutor at execute time.
+class CreateObjectStatement : public Statement {
+ public:
+  CreateObjectStatement(StatementType kind, std::function<Status()> side_effect,
+                        std::vector<NamedExpression> result_projection)
+      : Statement(kind),
+        side_effect_(std::move(side_effect)),
+        result_projection_(std::move(result_projection)) {}
+
+  Status RunSideEffect() const {  // NOLINT(modernize-use-nodiscard)
+    return side_effect_ ? side_effect_() : Status::kSuccess;
+  }
+  [[nodiscard]] const std::vector<NamedExpression>& ResultProjection() const {
+    return result_projection_;
+  }
+  void Dump(std::ostream& o) const override {
+    o << "create_object=" << StatementTypeName(Type());
+  }
+
+ private:
+  std::function<Status()> side_effect_;
+  std::vector<NamedExpression> result_projection_;
+};
+
 class DropMaterializedViewStatement : public Statement {
  public:
   explicit DropMaterializedViewStatement(std::string view_name,
@@ -438,7 +499,8 @@ class DropMaterializedViewStatement : public Statement {
   [[nodiscard]] const std::string& ViewName() const { return view_name_; }
   [[nodiscard]] bool IfExists() const { return if_exists_; }
   void Dump(std::ostream& o) const override {
-    o << "view=" << view_name_ << (if_exists_ ? " if_exists" : "");
+    o << "view=" << view_name_ << (if_exists_ ? " if_exists" : "")
+      << " [materialized]";
   }
 
  private:
@@ -706,6 +768,17 @@ class SelectStatement : public Statement {
     union_all_.clear();
     set_operation_kinds_.clear();
     set_operation_matches_.clear();
+    runtime_id_.Bump();
+  }
+  // P388: ClearUnionAll alone left `union_distinct_`/`union_by_name_` set on
+  // a statement whose set-operation was flattened into a single query.  The
+  // stale pair keeps readers that test `UnionDistinct()` alone (static
+  // schema resolution, LIMIT-cap gates, plan-cache fingerprints) seeing a
+  // union that no longer exists.  Only valid together with flattening the
+  // DISTINCT semantics into the plain statement (e.g. SetDistinct(true)).
+  void ClearUnionDistinct() {
+    union_distinct_ = false;
+    union_by_name_ = false;
     runtime_id_.Bump();
   }
   void MarkComplex() {

@@ -501,7 +501,9 @@ void EvaluateScalarDoubleNeon(const double* data, size_t count,
 void SimdComparisonKernel::CompareInt64(const int64_t* data, size_t count,
                                         BinaryOperation op, int64_t target,
                                         ValidityBitmap* out_mask) {
-  assert(out_mask != nullptr);
+  if (out_mask == nullptr) {
+    return;
+  }
 #if defined(__x86_64__) || defined(__i386__)
   if (HasAvx2()) {
     EvaluateScalarInt64Avx2(data, count, op, target, out_mask);
@@ -543,7 +545,9 @@ void SimdComparisonKernel::CompareInt64(const int64_t* data, size_t count,
 void SimdComparisonKernel::CompareDouble(const double* data, size_t count,
                                          BinaryOperation op, double target,
                                          ValidityBitmap* out_mask) {
-  assert(out_mask != nullptr);
+  if (out_mask == nullptr) {
+    return;
+  }
 #if defined(__x86_64__) || defined(__i386__)
   if (HasAvx2()) {
     EvaluateScalarDoubleAvx2(data, count, op, target, out_mask);
@@ -586,7 +590,9 @@ void SimdComparisonKernel::CompareString(const std::string_view* data,
                                                size_t count, BinaryOperation op,
                                                std::string_view target,
                                                ValidityBitmap* out_mask) {
-  assert(out_mask != nullptr);
+  if (out_mask == nullptr) {
+    return;
+  }
   switch (op) {
     case BinaryOperation::kEquals:
       EvaluateScalarComparison(data, count, target, std::equal_to<>(),
@@ -620,7 +626,9 @@ void SimdComparisonKernel::CompareInt64Vectors(const int64_t* lhs,
                                                const int64_t* rhs, size_t count,
                                                BinaryOperation op,
                                                ValidityBitmap* out_mask) {
-  assert(out_mask != nullptr);
+  if (out_mask == nullptr) {
+    return;
+  }
 #if defined(__x86_64__) || defined(__i386__)
   if (HasAvx2()) {
     EvaluateVectorInt64Avx2(lhs, rhs, count, op, out_mask);
@@ -661,7 +669,9 @@ void SimdComparisonKernel::CompareDoubleVectors(const double* lhs,
                                                 const double* rhs, size_t count,
                                                 BinaryOperation op,
                                                 ValidityBitmap* out_mask) {
-  assert(out_mask != nullptr);
+  if (out_mask == nullptr) {
+    return;
+  }
   switch (op) {
     case BinaryOperation::kEquals:
       EvaluateVectorComparison(lhs, rhs, count, std::equal_to<>(), out_mask);

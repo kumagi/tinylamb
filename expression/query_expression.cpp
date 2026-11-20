@@ -24,6 +24,16 @@ StatusOr<Value> TryEvaluateQuantifiedComparison(
     BinaryOperation op, QuantifierMode mode, const Value& test,
     const std::vector<Value>& rows) {
   const bool is_all = mode == QuantifierMode::kAll;
+  // Explicit collation conflict (e.g. `binary` vs `und:ci`) rejects, the
+  // same gate the IN arm applies: silently folding both sides to CI would
+  // contradict the ambiguity-rejects contract in type/collation.hpp.
+  for (const Value& candidate : rows) {
+    if (HaveConflictingCollations(test, candidate)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Collation conflict between the quantified "
+                         "comparison operands");
+    }
+  }
   // Collation resolution: an explicit case-insensitive collator on any
   // operand (test value or row) applies to the whole comparison set.
   bool any_ci = test.IsCaseInsensitive();
@@ -100,7 +110,7 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema) const {
 }
 
 // Canonical subquery semantics, evaluated against the abstract context
-// (improvement3.md A1).  The shapes share one projection:
+//.  The shapes share one projection:
 //   EXISTS        : emptiness of the projection (never UNKNOWN)
 //   test IN (...) : SQL three-valued membership; a NULL test value or a NULL
 //                   row value turns a miss into UNKNOWN, and negation applies
@@ -153,7 +163,10 @@ StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
       return TryEvaluateQuantifiedComparison(op_, mode_, test_value, values);
     }
     bool found = false;
-    bool saw_null = test_value.IsNull();
+    // An empty candidate set is decisive (matches the relational path and
+    // the DML folder): x IN () is FALSE / x NOT IN () is TRUE even when x
+    // itself is NULL. Do not seed saw_null from the probe for that case.
+    bool saw_null = values.empty() ? false : test_value.IsNull();
     for (const Value& candidate : values) {
       if (found) {
         break;

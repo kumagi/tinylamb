@@ -168,15 +168,6 @@ struct OracleTrace {
   std::vector<std::string> unnest;         // UNNEST query
   std::vector<std::string> unnest_expect;  // ordered or multiset
   bool unnest_ordered{false};              // WITH OFFSET: compare verbatim
-  // Guarded-division conjunct oracle: WHERE clauses pairing a possibly
-  // erroring conjunct ((b / a) <op> c) with a sibling that may reject the
-  // row first.  Every permutation must agree; when no conjunct cleanly
-  // rejects a row the error must surface.  `guard_error` = the mirror
-  // expects the engine to fail, otherwise `guard_expected` is the rendered
-  // sorted u multiset.
-  std::vector<std::string> guard_probes;
-  std::string guard_expected;
-  bool guard_error{false};
   // Cross-mode / cross-engine differential probes: composite queries (multi-way
   // JOIN + GROUP BY / ROLLUP / GROUPING SETS + HAVING, sibling derived
   // aggregate fusion, shared-CTE restriction pushdown, Window + QUALIFY,

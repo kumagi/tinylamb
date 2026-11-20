@@ -1,4 +1,4 @@
-# Out-of-core fuzzing (`sql_ooc_fuzzer`)
+# Out-of-Core fuzzing (`sql_ooc_fuzzer`)
 
 The OOC session fuzzer shrinks the process memory knobs until a database of a
 few MiB is many times larger than the buffer pool and every operator budget,

@@ -191,6 +191,7 @@ class AccumulatorChunks {
 
    private:
     std::byte* EnsureSlot(size_t index) {
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized byte segment
       std::unique_ptr<std::byte[]>& segment = segments_[index / kSegmentSlots];
       if (segment == nullptr) {
         // NOLINTNEXTLINE(modernize-avoid-c-arrays)
@@ -201,6 +202,7 @@ class AccumulatorChunks {
              ((index % kSegmentSlots) * sizeof(AggregateAccumulator));
     }
 
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized byte segments
     std::vector<std::unique_ptr<std::byte[]>> segments_;
     size_t committed_segments_{0};
     size_t constructed_{0};
@@ -838,7 +840,11 @@ inline int64_t CanonicalDistinctDoubleBits(double value) {
     return 0;
   }
   if (std::isnan(value)) {
-    value = std::numeric_limits<double>::quiet_NaN();
+    // Fixed canonical NaN peer key: must match CanonicalDistinctIntKey /
+    // CanonicalDoubleBits in typed_stream_aggregate_partitioned.cpp so the
+    // slim and partitioned COUNT(DISTINCT double) paths share one key space
+    // on every platform (quiet_NaN()'s bit pattern is implementation-defined).
+    return int64_t{0x7ff8000000000000LL};
   }
   return std::bit_cast<int64_t>(value);
 }
@@ -1081,9 +1087,11 @@ inline bool ApplySlimCell(TypedWorkerGroups* local, size_t group_index,
       }
       return true;
     case SlimAggKind::kCountDistinctInt64:
-      if (cell_type == ValueType::kInt64 || cell_type == ValueType::kDate) {
+      if ((cell_type == ValueType::kInt64 || cell_type == ValueType::kDate) &&
+          !cell_unsigned) {
         static_cast<void>(local->SlimInsertDistinct(group_index, i, cell));
       } else {
+        // The raw-bit distinct set cannot tell signed -1 from UINT64_MAX.
         *handled = false;
       }
       return true;
@@ -1173,7 +1181,16 @@ inline bool MergeSlimCell(TypedWorkerGroups* dst, size_t dst_group,
         }
         dst->SlimIntTotal(dst_group, i) = updated;
       }
-      dst->SlimDoubleTotal(dst_group, i) += src.SlimDoubleTotal(src_group, i);
+      const double sv = src.SlimDoubleTotal(src_group, i);
+      double& dv = dst->SlimDoubleTotal(dst_group, i);
+      dv += sv;
+      // Partial sums can reach +/-inf from finite inputs; adding opposite
+      // signs then yields NaN. Mark it as an overflow so the finalizer raises
+      // like the row-order canonical path instead of returning NaN.
+      if (std::isnan(dv) && !std::isnan(sv)) {
+        dv = std::numeric_limits<double>::infinity();
+        dst->SlimFlags(dst_group, i) |= 1;
+      }
       dst->SlimFlags(dst_group, i) |= src.SlimFlags(src_group, i);
       dst->SlimCount(dst_group, i) += sc;
       return true;
@@ -1248,6 +1265,13 @@ inline bool FinishSlimCell(const TypedWorkerGroups& groups, size_t group,
       const bool mixed =
           !groups.mixed_numeric_sums.empty() && groups.mixed_numeric_sums[i];
       if (mixed && (groups.SlimFlags(group, i) & 2) == 0) {
+        // T4903 (reviewed): per-group dynamic tagging is the CANONICAL
+        // semantics here, not a slim-path artifact: the reference
+        // AggregateAccumulator::Finalize (aggregate_accumulator.cpp, kSum
+        // arm "if (!total_is_double && total == 0.0)") also returns kInt64
+        // for a group that never saw a DOUBLE input. SlimFlags bit2 mirrors
+        // total_is_double exactly, and the split is pinned by
+        // RelationalRegressionTest.GroupingSetsPreserveDynamicSumTypesAndOverflow.
         *out = Value(groups.SlimIntTotal(group, i));
         return true;
       }
@@ -1268,9 +1292,16 @@ inline bool FinishSlimCell(const TypedWorkerGroups& groups, size_t group,
                                 static_cast<double>(count));
       return true;
     case SlimAggKind::kCountDistinctDouble:
-    case SlimAggKind::kCountDistinctInt64:
-      *out = Value(static_cast<int64_t>(groups.SlimDistinctTotal(group, i)));
+    case SlimAggKind::kCountDistinctInt64: {
+      const size_t total = groups.SlimDistinctTotal(group, i);
+      if (total > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        *error = StatusError(StatusCode::kIsInfinity,
+                             "COUNT(DISTINCT) overflow: result exceeds INT64");
+        return false;
+      }
+      *out = Value(static_cast<int64_t>(total));
       return true;
+    }
     case SlimAggKind::kMinInt64:
     case SlimAggKind::kMaxInt64:
       *out = count == 0 ? Value() : Value(groups.SlimIntTotal(group, i));
@@ -1518,7 +1549,8 @@ struct DictionaryCaseInput {
 
 std::shared_ptr<const LSTableStore> SnapshotColumnStore(
     TransactionContext& context, const Table& table,
-    const std::vector<slot_t>& projection, size_t column_count);
+    const std::vector<slot_t>& projection, size_t column_count,
+    bool allow_lazy_build = true);
 
 StatusOr<std::optional<Relation>> TryUniqueGroupLimit(
     const LSTableStore& store, const TypedAggregationPlan& plan,
@@ -1549,22 +1581,10 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
 
 inline uint32_t ReadDictionaryCode(const LSTableColumnDictionary& dictionary,
                                    size_t row) noexcept {
-  if (dictionary.active) {
-    return dictionary.narrow_codes[row];
-  }
-  if (dictionary.packed_code_bits != 0) {
-    return dictionary.DictionaryCodeAt(row);
-  }
-  const auto* data =
-      dictionary.wide_codes.data() + (row * dictionary.wide_code_bytes);
-  if (dictionary.wide_code_bytes == 2) {
-    uint16_t code = 0;
-    std::memcpy(&code, data, sizeof(code));
-    return code;
-  }
-  uint32_t code = 0;
-  std::memcpy(&code, data, sizeof(code));
-  return code;
+  // Route through DictionaryCodeAt so the active/packed/wide streams all
+  // honor the zero-copy *_codes_view accessors and the row bound check;
+  // reading the owned vectors directly would bypass mmap-backed stores.
+  return dictionary.DictionaryCodeAt(row);
 }
 
 struct EncodedDictionaryPredicate {

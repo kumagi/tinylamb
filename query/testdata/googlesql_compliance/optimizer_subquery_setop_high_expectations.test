@@ -130,8 +130,8 @@ ARRAY<STRUCT<n INT64>>[{1}, {2}, {3}, {4}]
 
 # Set-operation routing migrated to the Cascades route (executor-level fold).
 # The relational planner's Append / HashDistinct / SemiHashJoin / AntiHashJoin
-# plan-shape rewrites are not reimplemented on the new route yet; see
-# docs/optimizer_todo.md.  The cases below keep their result contracts.
+# plan-shape rewrites are not reimplemented on the new route yet (tracked in
+# the root TODO.md).  The cases below keep their result contracts.
 [name=union_all_uses_append]
 SELECT n FROM opt_numbers WHERE n <= 2
 UNION ALL

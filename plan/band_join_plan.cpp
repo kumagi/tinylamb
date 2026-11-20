@@ -87,7 +87,11 @@ BandJoinPlan::BandJoinPlan(Plan left, std::vector<ColumnName> left_keys,
 }
 
 size_t BandJoinPlan::AccessRowCount() const {
-  return left_->AccessRowCount() + right_->AccessRowCount();
+  const size_t l = left_->AccessRowCount();
+  const size_t r = right_->AccessRowCount();
+  return l > std::numeric_limits<size_t>::max() - r
+             ? std::numeric_limits<size_t>::max()
+             : l + r;
 }
 
 size_t BandJoinPlan::EmitRowCount() const { return stats_.Rows(); }
@@ -113,10 +117,10 @@ bool BandJoinPlan::IsOrderedBy(
 }
 
 void BandJoinPlan::Dump(std::ostream& o, int indent) const {
-  o << ToString() << ": keys=1\n" << Indent(static_cast<size_t>(indent) + 2);
-  left_->Dump(o, indent + 2);
+  o << ToString() << "\n" << Indent(static_cast<size_t>(indent) + 2);
+  DumpChild(o, *left_, indent + 2);
   o << "\n" << Indent(static_cast<size_t>(indent) + 2);
-  right_->Dump(o, indent + 2);
+  DumpChild(o, *right_, indent + 2);
 }
 
 std::string BandJoinPlan::ToString() const {
@@ -139,7 +143,7 @@ bool BandJoinPlan::InstallParameterSlots(const std::vector<Value>& parameters,
                                          std::vector<Expression>* slots) {
   return left_->InstallParameterSlots(parameters, cursor, slots) &&
          right_->InstallParameterSlots(parameters, cursor, slots) &&
-         SlotizeInPlace(&predicate_, parameters, cursor, slots);
+         CollectParameterSlots(&predicate_, slots);
 }
 
 }  // namespace tinylamb

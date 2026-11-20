@@ -17,9 +17,11 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/memory_budget.hpp"
 #include "common/status_or.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
+#include "type/row_block_codec.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -33,6 +35,65 @@ std::string UpdateKeyString(const Value& value) {
   return value.AsString();
 }
 
+// P652/689: budget-bounded cache of before-images keyed by RowPosition.  A
+// full-table UPDATE used to decode each target row two or three times: the
+// FK/PK verification passes re-read the row by position through
+// pending.ForEach, and Table::Update then read the before-image once more
+// for its index diff / failure-restore image.  The first reader stores the
+// row here; later verification passes and the apply loop consume that copy
+// (the apply loop hands it to the before-image-taking Table::Update
+// overload).  When the query-pool budget refuses an entry, Get falls back to
+// the caller's scratch row and the apply loop transparently lets
+// Table::Update read the image itself -- exactly the old behaviour.
+class UpdatePreimageCache {
+ public:
+  UpdatePreimageCache() = default;
+  UpdatePreimageCache(const UpdatePreimageCache&) = delete;
+  UpdatePreimageCache& operator=(const UpdatePreimageCache&) = delete;
+  UpdatePreimageCache(UpdatePreimageCache&&) = delete;
+  UpdatePreimageCache& operator=(UpdatePreimageCache&&) = delete;
+  ~UpdatePreimageCache() = default;
+
+  // Returns a pointer to the before-image at `pos`.  The pointee lives in
+  // the cache (or in `scratch` for an over-budget miss) and stays valid for
+  // the rest of the statement.
+  StatusOr<const Row*> Get(const Table& target, Transaction& txn,
+                           const RowPosition& pos, Row* scratch) {
+    const auto found = entries_.find(pos);
+    if (found != entries_.end()) {
+      return &found->second;
+    }
+    StatusOr<Row> read = target.Read(txn, pos);
+    if (!read.HasValue()) {
+      return read.GetStatus();
+    }
+    Row image = read.MoveValue();
+    if (!charge_.TryAdd(EstimateRowMemoryBytes(image))) {
+      *scratch = std::move(image);
+      return scratch;
+    }
+    return &entries_.emplace(pos, std::move(image)).first->second;
+  }
+
+  // Moves the cached image into `*out` and evicts the entry (each position
+  // is updated at most once per statement).  Returns false on a cache miss;
+  // the apply loop then lets Table::Update fetch the before-image itself.
+  bool Take(const RowPosition& pos, Row* out) {
+    const auto found = entries_.find(pos);
+    if (found == entries_.end()) {
+      return false;
+    }
+    *out = std::move(found->second);
+    charge_.Release(EstimateRowMemoryBytes(*out));
+    entries_.erase(found);
+    return true;
+  }
+
+ private:
+  std::unordered_map<RowPosition, Row> entries_;
+  ProcessMemoryCharge charge_{MemoryPoolKind::kQuery, 0, false};
+};
+
 }  // namespace
 
 bool Update::Execute(Row* dst, RowPosition* rp) {
@@ -41,6 +102,7 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
   }
   uint64_t pull_steps = 0;
   SpillablePendingUpdateList pending;
+  UpdatePreimageCache preimages;
   DataChunk batch;
   while (src_->NextBatch(&batch) != 0) {
     for (size_t i = 0; i < batch.Size(); ++i) {
@@ -91,15 +153,17 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
           if ((++pk_action_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
             RETURN_IF_FAIL(txn_->CheckStatementTimeout());
           }
-          StatusOr<Row> current = target_->Read(*txn_, pos);
+          Row scratch;
+          StatusOr<const Row*> current =
+              preimages.Get(*target_, *txn_, pos, &scratch);
           if (!current.HasValue()) {
             return current.GetStatus();
           }
-          if (current.Value().values_.empty()) {
+          if (current.Value()->values_.empty()) {
             return StatusError(StatusCode::kCorrupt,
                                "primary-key update read an empty row");
           }
-          const std::string old_key = UpdateKeyString(current.Value()[0]);
+          const std::string old_key = UpdateKeyString((*current.Value())[0]);
           auto found = live_keys.find(old_key);
           if (found != live_keys.end()) {
             if (--found->second == 0) {
@@ -155,11 +219,13 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
             if ((++fk_action_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
               RETURN_IF_FAIL(txn_->CheckStatementTimeout());
             }
-            StatusOr<Row> old = target_->Read(*txn_, row_position);
+            Row scratch;
+            StatusOr<const Row*> old =
+                preimages.Get(*target_, *txn_, row_position, &scratch);
             if (!old.HasValue()) {
               return old.GetStatus();
             }
-            const Row& old_row = old.Value();
+            const Row& old_row = *old.Value();
             for (size_t c = 0; c < fk_checks_.size(); ++c) {
               const ForeignKeyCheck& check = fk_checks_[c];
               if (check.child_offset >= updated_row.values_.size() ||
@@ -207,11 +273,13 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
                 supplied_keys.insert(
                     ForeignKeyString(updated_row[check.parent_offset]));
               }
-              StatusOr<Row> old = target_->Read(*txn_, pos);
+              Row scratch;
+              StatusOr<const Row*> old =
+                  preimages.Get(*target_, *txn_, pos, &scratch);
               if (!old.HasValue()) {
                 return old.GetStatus();
               }
-              const Row& old_row = old.Value();
+              const Row& old_row = *old.Value();
               if (check.parent_offset >= updated_row.values_.size() ||
                   check.parent_offset >= old_row.values_.size()) {
                 return Status::kSuccess;
@@ -244,11 +312,13 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
                   return pending.ForEach(
                       [&](const Row& updated_row,
                           const RowPosition& row_position) -> Status {
-                        StatusOr<Row> old = target_->Read(*txn_, row_position);
+                        Row scratch;
+                        StatusOr<const Row*> old = preimages.Get(
+                            *target_, *txn_, row_position, &scratch);
                         if (!old.HasValue()) {
                           return old.GetStatus();
                         }
-                        const Row& old_row = old.Value();
+                        const Row& old_row = *old.Value();
                         if (check.parent_offset >= updated_row.values_.size() ||
                             check.parent_offset >= old_row.values_.size()) {
                           return Status::kSuccess;
@@ -339,7 +409,14 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
             return ts;
           }
         }
-        StatusOr<RowPosition> p = target_->Update(*txn_, row_position, row);
+        // P652/689: consume a before-image cached by a verification pass
+        // (saving Table::Update's own decode); without one, Update reads the
+        // image exactly as before.
+        Row preimage;
+        StatusOr<RowPosition> p =
+            preimages.Take(row_position, &preimage)
+                ? target_->Update(*txn_, row_position, row, std::move(preimage))
+                : target_->Update(*txn_, row_position, row);
         if (p.GetStatus() != Status::kSuccess) {
           // Preserve the cause: constraint, storage and missing-row failures
           // are not all retryable writer conflicts. Do not report a partial

@@ -71,8 +71,9 @@ class LimitPlan final : public PlanBase {
     return limit_count == limit_count_ && limit_offset == limit_offset_;
   }
   [[nodiscard]] bool EnforcesDistinct() const override {
-    // Zero is the unbounded sentinel used by OFFSET-only execution.
-    return limit_count_ == 1 || src_->EnforcesDistinct();
+    // A limit of exactly one row is trivially distinct; zero (unbounded /
+    // OFFSET-only) is not a distinct proof and is handled by the source.
+    return limit_count_ == 1;
   }
   [[nodiscard]] const Plan& Src() const { return src_; }
   [[nodiscard]] size_t LimitCount() const { return limit_count_; }

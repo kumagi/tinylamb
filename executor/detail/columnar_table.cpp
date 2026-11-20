@@ -15,9 +15,11 @@
 
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
+#include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/unary_expression.hpp"
 
 namespace tinylamb::relational_detail {
 
@@ -33,12 +35,9 @@ bool IdentifierEqualsIgnoreCase(std::string_view left, std::string_view right) {
     if (lhs == rhs) {
       continue;
     }
-    if (lhs >= 0x80 || rhs >= 0x80) {
-      if (std::tolower(lhs) != std::tolower(rhs)) {
-        return false;
-      }
-      continue;
-    }
+    // Fold ASCII only. std::tolower on a UTF-8 byte in the C locale is a
+    // no-op anyway; using it here only suggested non-ASCII identifiers were
+    // folded when they are not (FoldCaseForCollation is ASCII-only too).
     const unsigned char folded_left =
         lhs >= 'A' && lhs <= 'Z' ? lhs + ('a' - 'A') : lhs;
     const unsigned char folded_right =
@@ -149,8 +148,13 @@ bool ColumnarColumn::AnyNonNull(size_t row_count) const noexcept {
       return false;
     }
     case Encoding::kFrameOfReference:
-      if (!has_null || borrowed_nulls == nullptr) {
+      if (!has_null) {
         return borrowed_count > 0;
+      }
+      if (borrowed_nulls == nullptr) {
+        // NULLs are known to exist but the bitmap is not bound; no reliable
+        // non-NULL evidence.
+        return false;
       }
       for (size_t r = 0; r < std::min(row_count, borrowed_count); ++r) {
         if (borrowed_nulls[r] == 0) {
@@ -1280,7 +1284,12 @@ std::string_view SliceUtf8SubstringView(std::string_view s, int64_t start,
     for (size_t i = 0; i < s.size(); i += Utf8CodepointStep(s, i)) {
       ++total_cps;
     }
-    const int64_t signed_start = static_cast<int64_t>(total_cps) + start;
+    // total_cps (>= 0) + start is UB only when start == INT64_MIN; in that
+    // case the effective start is before the string, so clamp to the head.
+    const int64_t signed_start =
+        start == std::numeric_limits<int64_t>::min()
+            ? std::numeric_limits<int64_t>::min()
+            : static_cast<int64_t>(total_cps) + start;
     actual_start = signed_start > 0 ? static_cast<size_t>(signed_start) : 0;
   }
   if (actual_start >= s.size()) {
@@ -1519,8 +1528,85 @@ CompiledColumnarProjection CompiledColumnarProjection::Compile(
       plan.items.push_back(std::move(item));
       continue;
     }
+    auto try_compile_null_coalesce = [&](const Expression& primary,
+                                         const Expression& fallback_expr) -> bool {
+      if (!primary || !fallback_expr ||
+          primary->Type() != TypeTag::kColumnValue ||
+          fallback_expr->Type() != TypeTag::kColumnValue) {
+        return false;
+      }
+      const auto off0 = ResolveScalarColumnOffset(
+          input_schema, primary->AsColumnValue().GetColumnName());
+      const auto off1 = ResolveScalarColumnOffset(
+          input_schema, fallback_expr->AsColumnValue().GetColumnName());
+      if (!off0.has_value() || !off1.has_value() ||
+          *off0 >= input_schema.ColumnCount() ||
+          *off1 >= input_schema.ColumnCount()) {
+        return false;
+      }
+      const Column& c0 = input_schema.GetColumn(*off0);
+      const Column& c1 = input_schema.GetColumn(*off1);
+      if (c0.Type() != c1.Type() || c0.IsUnsigned() != c1.IsUnsigned() ||
+          c0.IsInterval() != c1.IsInterval() ||
+          (c0.Type() != ValueType::kInt64 && c0.Type() != ValueType::kDate &&
+           c0.Type() != ValueType::kDouble &&
+           c0.Type() != ValueType::kVarChar)) {
+        return false;
+      }
+      // Lean proof: lean/TinylambOpt/BranchlessJitCodegen.lean
+      // (branchless_coalesce_sound)
+      item.kind = Kind::kNullCoalesce;
+      item.src_col = static_cast<slot_t>(*off0);
+      item.alt_col = static_cast<slot_t>(*off1);
+      mark_col(item.src_col);
+      mark_col(item.alt_col);
+      plan.items.push_back(std::move(item));
+      return true;
+    };
+    if (expr->Type() == TypeTag::kCaseExp) {
+      const CaseExpression& ce = expr->AsCaseExpression();
+      if (ce.when_clauses_.size() == 1 && ce.else_clause_ &&
+          ce.when_clauses_[0].first &&
+          ce.when_clauses_[0].first->Type() == TypeTag::kUnaryExp) {
+        const UnaryExpression& u =
+            ce.when_clauses_[0].first->AsUnaryExpression();
+        if (u.Child() && u.Child()->Type() == TypeTag::kColumnValue) {
+          const auto cond_off = ResolveScalarColumnOffset(
+              input_schema, u.Child()->AsColumnValue().GetColumnName());
+          if (cond_off.has_value()) {
+            if (u.Op() == UnaryOperation::kIsNotNull &&
+                ce.when_clauses_[0].second &&
+                ce.when_clauses_[0].second->Type() == TypeTag::kColumnValue &&
+                ResolveScalarColumnOffset(
+                    input_schema,
+                    ce.when_clauses_[0].second->AsColumnValue().GetColumnName()) ==
+                    cond_off &&
+                try_compile_null_coalesce(ce.when_clauses_[0].second,
+                                          ce.else_clause_)) {
+              continue;
+            }
+            if (u.Op() == UnaryOperation::kIsNull && ce.else_clause_->Type() ==
+                                                         TypeTag::kColumnValue &&
+                ResolveScalarColumnOffset(
+                    input_schema,
+                    ce.else_clause_->AsColumnValue().GetColumnName()) ==
+                    cond_off &&
+                try_compile_null_coalesce(ce.else_clause_,
+                                          ce.when_clauses_[0].second)) {
+              continue;
+            }
+          }
+        }
+      }
+    }
     if (expr->Type() == TypeTag::kFunctionCallExp) {
       const FunctionCallExpression& fn = expr->AsFunctionCallExpression();
+      if ((IdentifierEqualsIgnoreCase(fn.FuncName(), "coalesce") ||
+           IdentifierEqualsIgnoreCase(fn.FuncName(), "ifnull")) &&
+          fn.Args().size() == 2 &&
+          try_compile_null_coalesce(fn.Args()[0], fn.Args()[1])) {
+        continue;
+      }
       if ((fn.FuncName() == "substr" || fn.FuncName() == "substring") &&
           (fn.Args().size() == 2 || fn.Args().size() == 3)) {
         const Expression& a0 = fn.Args()[0];
@@ -1613,20 +1699,127 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
       }
     }
   }
-  std::vector<ColumnarChunk> out_chunks(nchunks);
+  const size_t max_workers =
+      input.total_rows >= 4096
+          ? std::min<size_t>(
+                QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+                input.total_rows / 2048)
+          : 1;
+  bool slice_single_flat_chunk =
+      (nchunks == 1 && max_workers > 1 && input.chunks[0].rows >= 16384);
+  if (slice_single_flat_chunk) {
+    for (const ColumnarColumn& sc : input.chunks[0].columns) {
+      if (!sc.is_uniform ||
+          (!sc.IsFlat() &&
+           sc.encoding != ColumnarColumn::Encoding::kGathered)) {
+        slice_single_flat_chunk = false;
+        break;
+      }
+    }
+  }
+  const size_t out_chunk_count = slice_single_flat_chunk ? max_workers : nchunks;
+  std::vector<ColumnarChunk> out_chunks(out_chunk_count);
   std::atomic<bool> abort_flag{false};
   std::atomic<uint8_t> unsupported_flag{0};
   std::vector<Status> worker_errors;
 
-  const auto eval_chunk = [&](size_t ci, Status* err_out) {
-    if (abort_flag.load(std::memory_order_relaxed)) {
+  const auto copy_flat_subrange = [](ColumnarColumn& dst_col,
+                                     const ColumnarColumn& sc, size_t row_off,
+                                     size_t row_cnt) {
+    dst_col.Init(sc.type, sc.is_unsigned, sc.is_interval, row_cnt);
+    if (!sc.IsFlat()) {
+      bool sub_null = false;
+      std::vector<uint8_t> out_nulls;
+      if (sc.has_null) {
+        out_nulls.resize(row_cnt, 0);
+      }
+      switch (sc.type) {
+        case ValueType::kInt64:
+        case ValueType::kDate:
+          dst_col.ints.resize(row_cnt);
+          for (size_t i = 0; i < row_cnt; ++i) {
+            if (sc.IsNull(row_off + i)) {
+              out_nulls[i] = 1;
+              sub_null = true;
+              dst_col.ints[i] = 0;
+            } else {
+              dst_col.ints[i] = sc.IntAt(row_off + i);
+            }
+          }
+          break;
+        case ValueType::kDouble:
+          dst_col.doubles.resize(row_cnt);
+          for (size_t i = 0; i < row_cnt; ++i) {
+            if (sc.IsNull(row_off + i)) {
+              out_nulls[i] = 1;
+              sub_null = true;
+              dst_col.doubles[i] = 0.0;
+            } else {
+              dst_col.doubles[i] = sc.DoubleAt(row_off + i);
+            }
+          }
+          break;
+        case ValueType::kVarChar:
+          dst_col.strings.resize(row_cnt);
+          for (size_t i = 0; i < row_cnt; ++i) {
+            if (sc.IsNull(row_off + i)) {
+              out_nulls[i] = 1;
+              sub_null = true;
+            } else {
+              dst_col.strings[i] = sc.StringAt(row_off + i);
+            }
+          }
+          break;
+        default:
+          break;
+      }
+      if (sub_null) {
+        dst_col.has_null = true;
+        dst_col.nulls = std::move(out_nulls);
+      }
+      return;
+    }
+    if (sc.has_null && !sc.nulls.empty()) {
+      bool sub_null = false;
+      for (size_t i = 0; i < row_cnt; ++i) {
+        if (sc.nulls[row_off + i] != 0) {
+          sub_null = true;
+          break;
+        }
+      }
+      if (sub_null) {
+        dst_col.has_null = true;
+        dst_col.nulls.assign(sc.nulls.data() + row_off,
+                             sc.nulls.data() + row_off + row_cnt);
+      }
+    }
+    switch (sc.type) {
+      case ValueType::kInt64:
+      case ValueType::kDate:
+        dst_col.ints.assign(sc.ints.data() + row_off,
+                            sc.ints.data() + row_off + row_cnt);
+        break;
+      case ValueType::kDouble:
+        dst_col.doubles.assign(sc.doubles.data() + row_off,
+                               sc.doubles.data() + row_off + row_cnt);
+        break;
+      case ValueType::kVarChar:
+        dst_col.strings.assign(sc.strings.data() + row_off,
+                               sc.strings.data() + row_off + row_cnt);
+        break;
+      default:
+        break;
+    }
+  };
+
+  const auto eval_range = [&](size_t ci, size_t row_off, size_t row_cnt,
+                              size_t out_idx, Status* err_out) {
+    if (abort_flag.load(std::memory_order_relaxed) || row_cnt == 0) {
       return;
     }
     const ColumnarChunk& src = input.chunks[ci];
-    if (src.rows == 0) {
-      return;
-    }
-    ColumnarChunk& dst = out_chunks[ci];
+    ColumnarChunk& dst = out_chunks[out_idx];
+    const bool full_chunk = (row_off == 0 && row_cnt == src.rows);
     dst.InitFromSchema(plan.output_schema, 0);
     if (src.string_arena != nullptr) {
       dst.AppendKeepaliveUnique(src.string_arena);
@@ -1644,9 +1837,13 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
           if (item.src_col < src.columns.size()) {
             const ColumnarColumn& sc = src.columns[item.src_col];
             dst.RetainColumnOwners(sc);
-            col.AppendSliceFrom(sc, nullptr, src.rows, nullptr, 0);
+            if (full_chunk) {
+              col.AppendSliceFrom(sc, nullptr, row_cnt, nullptr, 0);
+            } else {
+              copy_flat_subrange(col, sc, row_off, row_cnt);
+            }
           } else {
-            col.AppendConstant(Value(), src.rows, nullptr, 0);
+            col.AppendConstant(Value(), row_cnt, nullptr, 0);
           }
           break;
         }
@@ -1655,17 +1852,165 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
                                      item.constant.type == ValueType::kVarChar)
                                         ? dst.EnsureArena()
                                         : nullptr;
-          col.AppendConstant(item.constant, src.rows, arena, 0);
+          col.AppendConstant(item.constant, row_cnt, arena, 0);
+          break;
+        }
+        case CompiledColumnarProjection::Kind::kNullCoalesce: {
+          if (item.src_col >= src.columns.size() ||
+              item.alt_col >= src.columns.size()) {
+            unsupported_flag.store(1, std::memory_order_relaxed);
+            abort_flag.store(true, std::memory_order_relaxed);
+            return;
+          }
+          const ColumnarColumn& c0 = src.columns[item.src_col];
+          const ColumnarColumn& c1 = src.columns[item.alt_col];
+          const Column& out_col_schema = plan.output_schema.GetColumn(k);
+          const ValueType vt = out_col_schema.Type();
+          if (c0.type != vt || c1.type != vt ||
+              c0.is_unsigned != out_col_schema.IsUnsigned() ||
+              c1.is_unsigned != out_col_schema.IsUnsigned() ||
+              c0.is_interval != out_col_schema.IsInterval() ||
+              c1.is_interval != out_col_schema.IsInterval()) {
+            unsupported_flag.store(1, std::memory_order_relaxed);
+            abort_flag.store(true, std::memory_order_relaxed);
+            return;
+          }
+          dst.RetainColumnOwners(c0);
+          dst.RetainColumnOwners(c1);
+          if (!c0.has_null && c0.type != ValueType::kNull) {
+            if (full_chunk) {
+              col.AppendSliceFrom(c0, nullptr, row_cnt, nullptr, 0);
+            } else {
+              copy_flat_subrange(col, c0, row_off, row_cnt);
+            }
+            break;
+          }
+          col.Init(vt, out_col_schema.IsUnsigned(), out_col_schema.IsInterval(),
+                   row_cnt);
+          const bool both_flat =
+              c0.IsFlat() && c0.is_uniform && c1.IsFlat() && c1.is_uniform;
+          bool any_out_null = false;
+          std::vector<uint8_t> out_nulls;
+          if (c1.has_null) {
+            out_nulls.resize(row_cnt, 0);
+          }
+          if (both_flat && (vt == ValueType::kInt64 || vt == ValueType::kDate)) {
+            col.ints.resize(row_cnt);
+            const uint8_t* n0 =
+                c0.nulls.empty() ? nullptr : (c0.nulls.data() + row_off);
+            const uint8_t* n1 = (c1.has_null && !c1.nulls.empty())
+                                    ? (c1.nulls.data() + row_off)
+                                    : nullptr;
+            const int64_t* v0 = c0.ints.data() + row_off;
+            const int64_t* v1 = c1.ints.data() + row_off;
+            int64_t* out_v = col.ints.data();
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const bool is_n0 = (n0 != nullptr && n0[i] != 0);
+              out_v[i] = is_n0 ? v1[i] : v0[i];
+              if (is_n0 && n1 != nullptr && n1[i] != 0) {
+                out_nulls[i] = 1;
+                any_out_null = true;
+              }
+            }
+          } else if (both_flat && vt == ValueType::kDouble) {
+            col.doubles.resize(row_cnt);
+            const uint8_t* n0 =
+                c0.nulls.empty() ? nullptr : (c0.nulls.data() + row_off);
+            const uint8_t* n1 = (c1.has_null && !c1.nulls.empty())
+                                    ? (c1.nulls.data() + row_off)
+                                    : nullptr;
+            const double* v0 = c0.doubles.data() + row_off;
+            const double* v1 = c1.doubles.data() + row_off;
+            double* out_v = col.doubles.data();
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const bool is_n0 = (n0 != nullptr && n0[i] != 0);
+              out_v[i] = is_n0 ? v1[i] : v0[i];
+              if (is_n0 && n1 != nullptr && n1[i] != 0) {
+                out_nulls[i] = 1;
+                any_out_null = true;
+              }
+            }
+          } else if (both_flat && vt == ValueType::kVarChar) {
+            col.strings.resize(row_cnt);
+            const uint8_t* n0 =
+                c0.nulls.empty() ? nullptr : (c0.nulls.data() + row_off);
+            const uint8_t* n1 = (c1.has_null && !c1.nulls.empty())
+                                    ? (c1.nulls.data() + row_off)
+                                    : nullptr;
+            const std::string_view* v0 = c0.strings.data() + row_off;
+            const std::string_view* v1 = c1.strings.data() + row_off;
+            std::string_view* out_v = col.strings.data();
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const bool is_n0 = (n0 != nullptr && n0[i] != 0);
+              out_v[i] = is_n0 ? v1[i] : v0[i];
+              if (is_n0 && n1 != nullptr && n1[i] != 0) {
+                out_nulls[i] = 1;
+                any_out_null = true;
+              }
+            }
+          } else if (c0.is_uniform && c1.is_uniform &&
+                     (vt == ValueType::kInt64 || vt == ValueType::kDate)) {
+            col.ints.resize(row_cnt);
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const size_t r = row_off + i;
+              if (!c0.IsNull(r)) {
+                col.ints[i] = c0.IntAt(r);
+              } else if (!c1.IsNull(r)) {
+                col.ints[i] = c1.IntAt(r);
+              } else {
+                col.ints[i] = 0;
+                out_nulls[i] = 1;
+                any_out_null = true;
+              }
+            }
+          } else if (c0.is_uniform && c1.is_uniform &&
+                     vt == ValueType::kDouble) {
+            col.doubles.resize(row_cnt);
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const size_t r = row_off + i;
+              if (!c0.IsNull(r)) {
+                col.doubles[i] = c0.DoubleAt(r);
+              } else if (!c1.IsNull(r)) {
+                col.doubles[i] = c1.DoubleAt(r);
+              } else {
+                col.doubles[i] = 0.0;
+                out_nulls[i] = 1;
+                any_out_null = true;
+              }
+            }
+          } else if (c0.is_uniform && c1.is_uniform &&
+                     vt == ValueType::kVarChar) {
+            col.strings.resize(row_cnt);
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const size_t r = row_off + i;
+              if (!c0.IsNull(r)) {
+                col.strings[i] = c0.StringAt(r);
+              } else if (!c1.IsNull(r)) {
+                col.strings[i] = c1.StringAt(r);
+              } else {
+                out_nulls[i] = 1;
+                any_out_null = true;
+              }
+            }
+          } else {
+            unsupported_flag.store(1, std::memory_order_relaxed);
+            abort_flag.store(true, std::memory_order_relaxed);
+            return;
+          }
+          if (any_out_null) {
+            col.has_null = true;
+            col.nulls = std::move(out_nulls);
+          }
           break;
         }
         case CompiledColumnarProjection::Kind::kSubstring: {
           if (item.src_col >= src.columns.size()) {
-            col.AppendConstant(Value(), src.rows, nullptr, 0);
+            col.AppendConstant(Value(), row_cnt, nullptr, 0);
             break;
           }
           const ColumnarColumn& sc = src.columns[item.src_col];
           dst.RetainColumnOwners(sc);
-          if (!col.AppendSubstringFrom(sc, 0, nullptr, src.rows,
+          if (!col.AppendSubstringFrom(sc, row_off, nullptr, row_cnt,
                                        item.substr_start, item.substr_length,
                                        item.substr_has_length, 0)) {
             unsupported_flag.store(1, std::memory_order_relaxed);
@@ -1683,8 +2028,21 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
                   bytecode_needed_col[c] != 0) {
                 const ColumnarColumn& sc = src.columns[c];
                 dst.RetainColumnOwners(sc);
-                views[c] =
-                    sc.ToBytecodeView(src.rows, &view_scratches[c], nullptr);
+                if (full_chunk) {
+                  views[c] =
+                      sc.ToBytecodeView(src.rows, &view_scratches[c], nullptr);
+                } else if (sc.IsFlat()) {
+                  BytecodeColumnView v = sc.AsBytecodeView();
+                  if (v.nulls != nullptr) v.nulls += row_off;  // NOLINT(readability-braces-around-statements)
+                  if (v.ints != nullptr) v.ints += row_off;  // NOLINT(readability-braces-around-statements)
+                  if (v.doubles != nullptr) v.doubles += row_off;  // NOLINT(readability-braces-around-statements)
+                  if (v.strings != nullptr) v.strings += row_off;  // NOLINT(readability-braces-around-statements)
+                  if (v.fallback != nullptr) v.fallback += row_off;  // NOLINT(readability-braces-around-statements)
+                  views[c] = v;
+                } else {
+                  copy_flat_subrange(view_scratches[c], sc, row_off, row_cnt);
+                  views[c] = view_scratches[c].AsBytecodeView();
+                }
               } else {
                 views[c] = BytecodeColumnView{};
               }
@@ -1692,16 +2050,16 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
           }
           const Column& out_col_schema = plan.output_schema.GetColumn(k);
           col.Init(out_col_schema.Type(), out_col_schema.IsUnsigned(),
-                   out_col_schema.IsInterval(), src.rows);
+                   out_col_schema.IsInterval(), row_cnt);
           BytecodeColumnSink sink = col.AsBytecodeSink(0);
           Status eval_err{Status::kSuccess};
           const auto st = item.bytecode->TryEvaluateColumnarBatch(
-              views, nullptr, src.rows, &sink, &eval_err);
+              views, nullptr, row_cnt, &sink, &eval_err);
           if (st == BytecodeProgram::FastEval::kDone) {
             col.SyncFromBytecodeSink(
                 sink,
                 sink.may_borrow_constant_strings ? dst.EnsureArena() : nullptr,
-                src.rows);
+                row_cnt);
           } else if (st == BytecodeProgram::FastEval::kError) {
             *err_out = std::move(eval_err);
             abort_flag.store(true, std::memory_order_relaxed);
@@ -1719,37 +2077,16 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
           return;
       }
     }
-    dst.rows = src.rows;
+    dst.rows = row_cnt;
   };
 
-  const size_t workers =
-      input.total_rows >= 4096
-          ? std::min<size_t>(
-                {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
-                 nchunks, input.total_rows / 2048})
-          : 1;
-  if (workers <= 1) {
-    Status err{Status::kSuccess};
-    for (size_t ci = 0; ci < nchunks; ++ci) {
-      eval_chunk(ci, &err);
-      if (!err.ok()) {
-        return err;
-      }
-      if (unsupported_flag.load(std::memory_order_relaxed) != 0) {
-        return std::optional<std::shared_ptr<ColumnarTable>>(std::nullopt);
-      }
-    }
-  } else {
-    worker_errors.assign(workers, Status::kSuccess);
-    Status p_st = RunParallelTasks(workers, [&](size_t w) {
-      const size_t lo = (nchunks * w) / workers;
-      const size_t hi = (nchunks * (w + 1)) / workers;
-      for (size_t ci = lo; ci < hi; ++ci) {
-        eval_chunk(ci, &worker_errors[w]);
-        if (abort_flag.load(std::memory_order_relaxed)) {
-          break;
-        }
-      }
+  if (slice_single_flat_chunk) {
+    const size_t total = input.chunks[0].rows;
+    worker_errors.assign(max_workers, Status::kSuccess);
+    Status p_st = RunParallelTasks(max_workers, [&](size_t w) {
+      const size_t lo = (total * w) / max_workers;
+      const size_t hi = (total * (w + 1)) / max_workers;
+      eval_range(0, lo, hi - lo, w, &worker_errors[w]);
     });
     RETURN_IF_FAIL(p_st);
     for (const Status& st : worker_errors) {
@@ -1757,6 +2094,39 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
     }
     if (unsupported_flag.load(std::memory_order_relaxed) != 0) {
       return std::optional<std::shared_ptr<ColumnarTable>>(std::nullopt);
+    }
+  } else {
+    const size_t workers = std::min<size_t>(max_workers, nchunks);
+    if (workers <= 1) {
+      Status err{Status::kSuccess};
+      for (size_t ci = 0; ci < nchunks; ++ci) {
+        eval_range(ci, 0, input.chunks[ci].rows, ci, &err);
+        if (!err.ok()) {
+          return err;
+        }
+        if (unsupported_flag.load(std::memory_order_relaxed) != 0) {
+          return std::optional<std::shared_ptr<ColumnarTable>>(std::nullopt);
+        }
+      }
+    } else {
+      worker_errors.assign(workers, Status::kSuccess);
+      Status p_st = RunParallelTasks(workers, [&](size_t w) {
+        const size_t lo = (nchunks * w) / workers;
+        const size_t hi = (nchunks * (w + 1)) / workers;
+        for (size_t ci = lo; ci < hi; ++ci) {
+          eval_range(ci, 0, input.chunks[ci].rows, ci, &worker_errors[w]);
+          if (abort_flag.load(std::memory_order_relaxed)) {
+            break;
+          }
+        }
+      });
+      RETURN_IF_FAIL(p_st);
+      for (const Status& st : worker_errors) {
+        RETURN_IF_FAIL(st);
+      }
+      if (unsupported_flag.load(std::memory_order_relaxed) != 0) {
+        return std::optional<std::shared_ptr<ColumnarTable>>(std::nullopt);
+      }
     }
   }
   for (ColumnarChunk& c : out_chunks) {
@@ -1944,6 +2314,7 @@ Status MaterializeColumnarTableToRows(const ColumnarTable& table,
     if (uniform_ok != nullptr) {
       *uniform_ok = false;
     }
+    // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
     return st;
   }
   return Status::kSuccess;

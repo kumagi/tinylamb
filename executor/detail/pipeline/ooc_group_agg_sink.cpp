@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,7 +23,9 @@ uint64_t HashGroupKeyRow(const Row& key) { return std::hash<Row>{}(key); }
 
 // Streams finished aggregate rows lazily from PartitionLeafSet one leaf at a
 // time so working memory stays <= B_op throughout Finalize -> NextBatch.
-class GroupAggLeafSource final : public PipelineSource {
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+// non-copyable by design
+class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguidelines-special-member-functions)
  public:
   GroupAggLeafSource(
       SpillStore* store, PartitionLeafSet leaves, Schema input_schema,
@@ -141,7 +144,11 @@ class GroupAggLeafSource final : public PipelineSource {
             64;
         if (!leaf_grant_cache_->Reserve(group_cost)) {
           fallback_to_skew = true;
-          return {StatusCode::kMemoryLimitExceeded};
+          return StatusError(
+              StatusCode::kMemoryLimitExceeded,
+              "OOC group-agg leaf grant exhausted: cannot reserve " +
+                  std::to_string(group_cost) +
+                  " bytes for a distinct group (pool=query)");
         }
         return Status::kSuccess;
       };
@@ -280,9 +287,10 @@ class GroupAggLeafSource final : public PipelineSource {
     if (leaf_grant_cache_.has_value()) {
       leaf_grant_cache_->ReleaseAll();
     }
-    // ExternalSorter registers its own ActiveConsumerGuard when opts.grant is
-    // provided, so release ours while skew_sorter_ is active.
-    consumer_guard_.reset();
+    // Keep our ActiveConsumerGuard active for the skew sorter: ExternalSorter
+    // does not register one of its own (it only consults the grant), and
+    // dropping ours would undercount the active consumers.
+    // consumer_guard_ stays alive through skew_sorter_ usage.
     const size_t gcnt = group_keys_.size();
     std::vector<OocSortKey> sort_keys;
     if (partial_mode_) {
@@ -303,6 +311,13 @@ class GroupAggLeafSource final : public PipelineSource {
       // key_0..g-1]
       // (+ optional distinct_val column for O(1) skewed COUNT(DISTINCT)).
       const size_t raw_width = input_schema_.ColumnCount();
+      // T4853: the raw suffix indexes land in OocSortKey::column_index
+      // (uint16); reject wrap-around instead of silently aliasing a low
+      // input column (same rule as the ooc_sort_distinct_sink sites).
+      if (raw_width + gcnt > std::numeric_limits<slot_t>::max()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "sort key column index out of range");
+      }
       for (size_t i = 0; i < gcnt; ++i) {
         sort_keys.push_back(
             OocSortKey{.column_index = static_cast<slot_t>(raw_width + i)});
@@ -418,7 +433,8 @@ class GroupAggLeafSource final : public PipelineSource {
         }
       } else if (UseSingleCountDistinctSort()) {
         // Sorted by (group_key, distinct_val): deduplicate adjacent equal
-        // distinct_vals in O(1) memory instead of materializing a distinct-value set!
+        // distinct_vals in O(1) memory instead of materializing a
+        // distinct-value set!
         const Value& dval = sorted_row[skew_raw_width_ + gcnt];
         if (!dval.IsNull()) {
           if (!have_prev_distinct_ || !relational_detail::DistinctValueEqual{}(
@@ -535,7 +551,10 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
     if (group_keys_[i] && group_keys_[i]->Type() == TypeTag::kColumnValue) {
       const int offset =
           input_schema_.Offset(group_keys_[i]->AsColumnValue().GetColumnName());
-      if (offset >= 0) {
+      // T4853: schema offsets also feed slot_t; keep a too-wide schema
+      // column out of the fast-path slot list rather than wrapping it.
+      if (offset >= 0 &&
+          static_cast<uint64_t>(offset) <= std::numeric_limits<slot_t>::max()) {  // NOLINT(modernize-use-integer-sign-comparison)
         group_key_slots_[i] = static_cast<slot_t>(offset);
       }
     }
@@ -577,7 +596,9 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
       aggregates_[0]->Child()->Type() == TypeTag::kColumnValue) {
     const int off = input_schema_.Offset(
         aggregates_[0]->Child()->AsColumnValue().GetColumnName());
-    if (off >= 0) {
+    // T4853: same uint16 bound as the group-key slots above.
+    if (off >= 0 &&
+        static_cast<uint64_t>(off) <= std::numeric_limits<slot_t>::max()) {  // NOLINT(modernize-use-integer-sign-comparison)
       single_distinct_child_slot_ = static_cast<slot_t>(off);
     }
   }
@@ -807,11 +828,17 @@ StatusOr<std::shared_ptr<PipelineSource>> OocGroupAggSink::Finalize(
     PipelineContext* ctx) {
   if (!spilled_) {
     if (!all_combinable_) {
-      for (const Row& row : raw_rows_) {
+      // P689: release each buffered row as its fold consumes it.  The
+      // accumulators own every value they keep (DISTINCT sets, collection
+      // buffers, concatenated strings are copied in), so holding all raw
+      // rows until the whole fold finished double-charged the peak: raw
+      // bytes (up to budget_bytes_) plus the fully grown agg_table_.
+      for (Row& row : raw_rows_) {
         Row key;
         RETURN_IF_FAIL(ExtractCanonicalGroupKeys(row, &key));
         ASSIGN_OR_RETURN(size_t, gid, agg_table_->FindOrCreate(std::move(key)));
         RETURN_IF_FAIL(agg_table_->Accumulate(gid, row));
+        row = Row();
       }
       raw_rows_.clear();
       raw_rows_.shrink_to_fit();

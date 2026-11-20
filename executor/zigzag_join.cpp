@@ -1,3 +1,4 @@
+/** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/zigzag_join.hpp"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include "executor/detail/scan_filter.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
+#include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -43,7 +45,8 @@ bool SupportedOperation(BinaryOperation operation) {
 
 ZigZagJoin::ZigZagJoin(Executor left, slot_t left_key, Executor right,
                        slot_t right_key, BinaryOperation operation,
-                       Expression predicate, Schema output_schema)
+                       Expression predicate, Schema residual_schema,
+                       Schema output_schema)
     : left_(std::move(left)),
       right_(std::move(right)),
       left_key_(left_key),
@@ -51,30 +54,39 @@ ZigZagJoin::ZigZagJoin(Executor left, slot_t left_key, Executor right,
       operation_(operation),
       predicate_(std::move(predicate)),
       predicate_conjuncts_(SplitConjuncts(predicate_)),
+      residual_schema_(std::move(residual_schema)),
       output_schema_(std::move(output_schema)) {
   CHECK_MSG(left_ != nullptr && right_ != nullptr,
             "ZigZagJoin requires non-null inputs");
   CHECK_MSG(SupportedOperation(operation_),
             "ZigZagJoin requires an ordered comparison");
   CHECK_MSG(predicate_ != nullptr, "ZigZagJoin requires a predicate");
+  if (residual_schema_.ColumnCount() == 0 && output_schema_.ColumnCount() > 0) {
+    residual_schema_ = output_schema_;
+  }
 }
 
 ZigZagJoin::ZigZagJoin(Executor left, const std::vector<slot_t>& left_keys,
                        Executor right, const std::vector<slot_t>& right_keys,
                        BinaryOperation operation, Expression predicate,
-                       Schema output_schema)
+                       Schema residual_schema, Schema output_schema)
     : ZigZagJoin(std::move(left), SingleSlot(left_keys), std::move(right),
                  SingleSlot(right_keys), operation, std::move(predicate),
-                 std::move(output_schema)) {}
+                 std::move(residual_schema), std::move(output_schema)) {}
 
 bool ZigZagJoin::LoadLeft() {
-  DataChunk batch;
   while (true) {
-    if (left_->NextBatch(&batch, 1) == 0) {
-      break;
+    if (left_batch_pos_ >= left_batch_.Size()) {
+      left_batch_.Reset();
+      left_batch_pos_ = 0;
+      if (left_->NextBatch(&left_batch_) == 0) {
+        break;
+      }
     }
-    PositionedRow candidate{.row = batch.RowAt(0),
-                            .position = batch.PositionAt(0)};
+    PositionedRow candidate{
+        .row = left_batch_.RowAt(left_batch_pos_),
+        .position = left_batch_.PositionAt(left_batch_pos_)};
+    ++left_batch_pos_;
     if (!candidate.row.IsValid()) {
       return FailWith(
           StatusError(StatusCode::kCorrupt,
@@ -119,6 +131,11 @@ bool ZigZagJoin::LoadRight() {
   }
   DataChunk batch;
   while (right_->NextBatch(&batch) != 0) {
+    if (const Status st = Transaction::CheckThreadStatementTimeout();
+        st != Status::kSuccess) {
+      FailWith(st);
+      return false;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       PositionedRow candidate{.row = batch.RowAt(i),
                               .position = batch.PositionAt(i)};
@@ -151,6 +168,8 @@ bool ZigZagJoin::LoadRight() {
                                     "ZigZagJoin right input is not ordered"));
       }
       right_order_.previous = key;
+      right_charge_.Add(EstimateRowBytes(candidate.row) +
+                        sizeof(RowPosition));
       right_rows_.push_back(std::move(candidate));
     }
   }
@@ -169,11 +188,17 @@ void ZigZagJoin::ClearLeft() {
   right_cursor_ = 0;
 }
 
-StatusOr<bool> ZigZagJoin::PairPasses(const Row& left, const Row& right) const {
-  const Row combined = left + right;
+StatusOr<bool> ZigZagJoin::BuildAndTest(const Row& left, const Row& right,
+                                        Row* combined) const {
+  combined->values_.clear();
+  combined->values_.reserve(left.values_.size() + right.values_.size());
+  combined->values_.insert(combined->values_.end(), left.values_.begin(),
+                           left.values_.end());
+  combined->values_.insert(combined->values_.end(), right.values_.begin(),
+                           right.values_.end());
   return relational_detail::EvaluateConjunctsTolerant(
       predicate_conjuncts_, [&](const Expression& conjunct) {
-        return conjunct->TryEvaluate(combined, output_schema_);
+        return conjunct->TryEvaluate(*combined, residual_schema_);
       });
 }
 
@@ -194,6 +219,8 @@ std::pair<size_t, size_t> ZigZagJoin::CandidateRange(int64_t left) const {
     case BinaryOperation::kEquals:
       return {lower_index, upper_index};
     case BinaryOperation::kLessThan:
+      // left < right needs strictly greater keys; skip the equal-key run.
+      return {upper_index, right_rows_.size()};
     case BinaryOperation::kLessThanEquals:
       return {lower_index, right_rows_.size()};
     case BinaryOperation::kGreaterThan:
@@ -215,12 +242,15 @@ bool ZigZagJoin::NextRow(Row* destination, RowPosition* position) {
   for (;;) {
     if (have_left_ && right_cursor_ < right_end_) {
       const PositionedRow& right = right_rows_[right_cursor_++];
-      StatusOr<bool> passes = PairPasses(current_left_.row, right.row);
+      // The residual predicate already needs a concatenated row; build it
+      // straight into the output buffer and move it on a match, rather than
+      // building one for the test and a second copy for the result.
+      StatusOr<bool> passes =
+          BuildAndTest(current_left_.row, right.row, destination);
       if (!passes.HasValue()) {
         return FailWith(passes.GetStatus());
       }
       if (passes.Value()) {
-        *destination = current_left_.row + right.row;
         if (position != nullptr) {
           *position = current_left_.position;
         }

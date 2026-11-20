@@ -154,7 +154,7 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
                                         const Row& prev_key) {
   if (prefix_cols_ == 0 || prefix_cols_ >= index_.sc_.key_.size()) {
     // Distinct on the entire index key:
-    // Advancing the BPlusTreeIterator jumps directly past all duplicate rows
+    // Advancing the LsmIndexIterator jumps directly past all duplicate rows
     // stored under this key entry!
     if (ascending_) {
       ++iter_;
@@ -182,7 +182,7 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       if (!prefix_equal) {
         break;
       }
-      // Same prefix, seek past this prefix using BPlusTree seek with prefix
+      // Same prefix, seek past this prefix using LsmIndex seek with prefix
       // upper bound!
       std::vector<Value> prefix_values;
       for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count();

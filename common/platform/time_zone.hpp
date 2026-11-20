@@ -24,7 +24,8 @@ namespace tinylamb::platform {
 
 // Access to the system IANA time-zone database. Linux uses the C++20 tzdb
 // (std::chrono::locate_zone); Apple's libc++ does not ship it, so macOS
-// queries CoreFoundation (CFTimeZone), which reads the same tzdata.
+// queries CoreFoundation (CFTimeZone), backed by ICU zone data (validated
+// against the system zoneinfo tree); Windows uses the C++20 tzdb too.
 
 // Whether `name` is a known IANA zone identifier (exact, case-sensitive).
 bool IsKnownTimeZone(std::string_view name);

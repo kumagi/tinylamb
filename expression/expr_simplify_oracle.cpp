@@ -59,7 +59,22 @@ class Gen {
   std::mt19937& rng_;
 };
 
-Value MakeIntLeaf(Gen& g) {
+Value MakeIntLeaf(Gen& g, bool extended) {
+  // P561: extended mode adds unsigned-tagged INT64s (collation tag 3), the
+  // values the tag-dropping bug families (P555/P618/P779) tripped over.
+  // Drawn only when extended so the default RNG stream — and every pinned
+  // seed's S-expression — stays bit-identical.  The pool avoids the
+  // wrap-adjacent bit patterns (-1 / INT64_MIN): the unsigned ↔ signed
+  // rejection asymmetry around `-x` folds is a separate engine finding
+  // (surfaced by seed 9894 during this hardening) and stays for its own bug.
+  // ConstantSql serializes these leaves as CAST(<n> AS UINT64) so the SQL
+  // round-trip keeps the tag (the earlier bare-literal round-trip made the
+  // AST reference and the engine evaluate *different* inputs — reported as
+  // the bogus 5037 "FastEval tag loss").
+  if (extended && g.Chance(20)) {
+    const std::array<int64_t, 3> bits = {0, 1, kInt64Max};
+    return Value(bits[static_cast<size_t>(g.Pick(0, 2))]).WithUnsigned();
+  }
   switch (g.Pick(0, 9)) {
     case 0:
       return Value(int64_t{0});
@@ -84,10 +99,13 @@ Value MakeIntLeaf(Gen& g) {
   }
 }
 
-Value MakeFloatLeaf(Gen& g) {
+Value MakeFloatLeaf(Gen& g, bool extended) {
   switch (g.Pick(0, 9)) {
     case 0:
-      return Value(0.0);
+      // P561: extended mode mixes in -0.0 so rewrites that fabricate +0.0
+      // (or fold away the sign) are caught; default mode keeps the pinned
+      // RNG stream unchanged (no extra draw).
+      return Value(extended && g.Chance(50) ? -0.0 : 0.0);
     case 1:
       return Value(1.0);
     case 2:
@@ -110,10 +128,10 @@ Value MakeFloatLeaf(Gen& g) {
 std::string MakeStringLeaf(Gen& g, bool extended) {
   // Small alphabet plus LIKE metacharacters; space added in extended mode for
   // trim rewrites.
-  static constexpr std::string_view kAlphabet = "ab%_ ";
+  static constexpr std::string_view kAlphabet = "ab%_ '\\\t\n";
   const int len = g.Pick(0, 3);
   std::string s;
-  const int max_char_idx = extended ? 4 : 3;
+  const int max_char_idx = extended ? 9 : 6;
   for (int i = 0; i < len; ++i) {
     s.push_back(kAlphabet[static_cast<size_t>(g.Pick(0, max_char_idx))]);
   }
@@ -126,9 +144,12 @@ TypedExpr GenLeaf(Gen& g, GenType type, const ExprGenConfig& config) {
   }
   switch (type) {
     case GenType::kInt:
-      return {.expr = ConstantValueExp(MakeIntLeaf(g)), .type = type};
+      return {.expr =
+                  ConstantValueExp(MakeIntLeaf(g, config.extended_ops)),
+              .type = type};
     case GenType::kFloat:
-      return {.expr = ConstantValueExp(MakeFloatLeaf(g)), .type = type};
+      return {.expr = ConstantValueExp(MakeFloatLeaf(g, config.extended_ops)),
+              .type = type};
     case GenType::kBool:
       return {.expr = ConstantValueExp(Value(g.Chance(50))), .type = type};
     case GenType::kString: {
@@ -309,7 +330,7 @@ TypedExpr GenNumeric(Gen& g, int depth, const ExprGenConfig& config) {
               .type = GenType::kInt};
     }
     case 10: {
-      // Bit shifts: __shift_left, __shift_right with safe shift amount (0..63)
+      // Bit shifts: __shift_left, __shift_right with shift amounts around the valid/error boundary
       const char* fn = g.Chance(50) ? "__shift_left" : "__shift_right";
       TypedExpr left = GenTyped(g, GenType::kInt, depth - 1, config);
       if (left.type != GenType::kInt) {
@@ -820,6 +841,20 @@ std::string QuoteString(const std::string& s) {
   return out;
 }
 
+// SQL literal spelling: GoogleSQL string literals treat backslash as the
+// escape character, so a raw '\\' would read back as a single backslash.
+std::string SqlQuoteString(const std::string& s) {
+  std::string out = "'";
+  for (char c : s) {
+    if (c == '\\' || c == '\'') {
+      out += '\\';
+    }
+    out += c;
+  }
+  out += "'";
+  return out;
+}
+
 std::string FormatDouble(double d) {
   std::array<char, 64> buffer{};
   auto [ptr, ec] =
@@ -886,6 +921,12 @@ bool SimplifyValuesEqual(const Value& a, const Value& b) {
     }
     if (std::isinf(x) && std::isinf(y)) {
       return (x > 0) == (y > 0);
+    }
+    // P561: +0.0 and -0.0 compare equal under ==, but a rewrite that drops
+    // or fabricates the sign is observable (signbit, 1/x, x || y text) and
+    // rewrite equivalence is bit-level semantics here, not SQL =.
+    if (x == y && x == 0.0) {
+      return std::signbit(x) == std::signbit(y);
     }
     return x == y;
   }
@@ -1011,7 +1052,9 @@ GenType InferType(const Expression& expr) {
           name == "acos" || name == "asin" || name == "atan" ||
           name == "atan2" || name == "cosh" || name == "sinh" ||
           name == "tanh" || name == "pi" || name == "radians" ||
-          name == "degrees" || name == "ieee_divide" || name == "safe_divide") {
+          name == "degrees" || name == "ieee_divide" || name == "safe_divide" ||
+          name == "csc" || name == "sec" || name == "cot" || name == "sech" ||
+          name == "csch" || name == "coth") {
         return GenType::kFloat;
       }
       if (name == "greatest" || name == "least") {
@@ -1092,6 +1135,13 @@ std::string ConstantSql(const Value& v, GenType type) {
     return NullSql(type);
   }
   if (v.type == ValueType::kInt64) {
+    // P668/5037 harness fidelity: an unsigned-tagged (collation tag 3) leaf
+    // must round-trip through SQL text, otherwise the engine path evaluates
+    // a plain INT64 literal while the AST reference evaluated the tagged
+    // value — a serializer artifact, not an engine divergence.
+    if (v.IsUnsigned()) {
+      return "CAST(" + std::to_string(v.value.int_value) + " AS UINT64)";
+    }
     if (v.value.int_value == kInt64Min) {
       return "(-9223372036854775807 - 1)";
     }
@@ -1115,7 +1165,7 @@ std::string ConstantSql(const Value& v, GenType type) {
     return text;
   }
   if (v.type == ValueType::kVarChar) {
-    return QuoteString(std::string(v.value.varchar_value));
+    return SqlQuoteString(std::string(v.value.varchar_value));
   }
   // Bools are stored as INT64 0/1.
   if (type == GenType::kBool) {
@@ -1635,7 +1685,16 @@ struct EvalOutcome {
 EvalOutcome EvaluateTree(const Expression& expr) {
   EvalOutcome outcome;
   try {
-    outcome.value = expr->Evaluate(Row(), Schema());
+    // TryEvaluate (not the throwing Evaluate) so a failed Status keeps its
+    // code: ToString(Status) is "Code: message", which is what makes the
+    // throw-detail comparison below catch code-only swaps (P558 family).
+    StatusOr<Value> result = expr->TryEvaluate(Row(), Schema());
+    if (result.HasValue()) {
+      outcome.value = result.MoveValue();
+    } else {
+      outcome.threw = true;
+      outcome.error = std::string(ToString(result.GetStatus()));
+    }
   } catch (const std::exception& error) {
     outcome.threw = true;
     outcome.error = error.what();
@@ -1686,6 +1745,32 @@ std::string CheckSimplifyEquivalence(const Expression& expr) {
     return "rewriter threw an unknown exception\noriginal: " + expr->ToString();
   }
   const EvalOutcome simplified = EvaluateTree(rewritten);
+  // P561: both throwing was an unconditional pass, so a rewrite that kept
+  // the throw but swapped the status code (the P558 family) or the message
+  // was structurally invisible.  EvaluateTree records "Code: message", so
+  // string equality checks both — except the integer-overflow family, where
+  // the engine runs two intended canonical domains (operator overflow raises
+  // kInvalidArgument "integer overflow on '<op>'"; function-style overflow —
+  // SUM/ABS/unary minus — raises kIsInfinity "integer overflow in ...") and
+  // legal algebraic folds (`x + -c -> x - c`, `x * -1 -> -x`) move a raise
+  // between the domains.  Same-domain for every other error still catches
+  // code and message swaps.
+  auto normalize_error = [](std::string error) {
+    if (error.find("integer overflow") != std::string::npos) {
+      return std::string("integer overflow");
+    }
+    return error;
+  };
+  if (original.threw && simplified.threw &&
+      normalize_error(original.error) != normalize_error(simplified.error)) {
+    std::ostringstream detail;
+    detail << "throw-detail mismatch\noriginal: " << expr->ToString()
+           << "\nrewritten: " << rewritten->ToString()
+           << "\noriginal threw: " << original.error
+           << "\nrewritten threw: " << simplified.error << "\nsql: SELECT "
+           << ToSimplifySql(expr) << "\nsexpr: " << ToSimplifySExpr(expr);
+    return detail.str();
+  }
   if (original.threw != simplified.threw) {
     std::ostringstream detail;
     detail << "throw mismatch\noriginal: " << expr->ToString()

@@ -1,9 +1,12 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include "query/sql_plancache_fuzzer.hpp"
+#include "query/sql_plan_cache_fuzzer.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <utility>
@@ -15,9 +18,16 @@ namespace tinylamb {
 TEST(SqlPlanCacheFuzzer, SeededPhasesAgree) {
   int compared = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations =
-      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
-                         : 32;
+  int kIterations = 32;
+  if (scale != nullptr) {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(scale, &end, 10);
+    if (errno == 0 && end != scale && *end == '\0' && parsed > 0 &&
+        parsed <= std::numeric_limits<int>::max()) {
+      kIterations = static_cast<int>(parsed);
+    }
+  }
   for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     std::mt19937 rng(seed);
     PlanCacheStats stats;
@@ -26,6 +36,35 @@ TEST(SqlPlanCacheFuzzer, SeededPhasesAgree) {
     compared += stats.queries_compared;
   }
   EXPECT_GT(compared, kIterations * 4) << "differential barely ran";
+}
+
+TEST(SqlPlanCacheFuzzer, ReplayCommittedRegressionFiles) {
+  const char* dir = std::getenv("TINYLAMB_PLANCACHE_REGRESSION_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << "skipped";
+  }
+  std::vector<std::string> paths;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().extension() == ".test") {
+      paths.push_back(entry.path().string());
+    }
+  }
+  std::sort(paths.begin(), paths.end());
+  EXPECT_FALSE(paths.empty()) << "no .test files in " << dir;
+  for (const std::string& path : paths) {
+    std::ifstream file(path);
+    std::string text((std::istreambuf_iterator<char>(file)),
+                     std::istreambuf_iterator<char>());
+    ASSERT_TRUE(file.good()) << path;
+    uint64_t seed = 0;
+    PlanCacheTrace trace;
+    std::string summary;
+    ASSERT_TRUE(ParsePlanCacheTest(text, &seed, &trace, &summary))
+        << "malformed regression file: " << path;
+    EXPECT_EQ(ReplayPlanCacheTrace(trace, false), "")
+        << "regression " << path << " still reproduces:\n"
+        << summary;
+  }
 }
 
 TEST(SqlPlanCacheFuzzer, TestFileRoundTrip) {

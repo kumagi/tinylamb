@@ -36,6 +36,11 @@ std::filesystem::path SpillFile::TempDirectory() {
   std::filesystem::path dir = ProcessMemoryBudget::ResolveTempDirectory();
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
+  if (ec) {
+    // The caller will fail OpenForWrite with an unclear path; surface the
+    // real cause (permissions / not-a-directory) here instead.
+    return {};
+  }
   return dir;
 }
 
@@ -101,21 +106,45 @@ SpillFile::~SpillFile() {
   }
 }
 
+namespace {
+// Issue 357/5033: a failed direct write()/open() on the spill stream leaves
+// the true cause in errno, which used to be dropped -- every disk-full
+// (ENOSPC) event surfaced as the bare "spill write failed: <path>" the TPC-DS
+// benchmark logged.  Map quota/space errors to kNoSpace with an actionable
+// hint and embed errno in the remaining IOError text (same classification as
+// common/spill/spill_store.cpp's ErrnoToSpillStatus).
+Status SpillWriteStatus(const char* context,
+                        const std::filesystem::path& path) {
+  const int err = errno;
+  std::string msg(context);
+  msg += ": ";
+  msg += path.string();
+  if (err == ENOSPC || err == EDQUOT) {
+    msg +=
+        " (no space left on the spill filesystem; free space or point "
+        "TINYLAMB_TEMP at a filesystem with headroom)";
+    return StatusError(StatusCode::kNoSpace, std::move(msg));
+  }
+  if (err != 0) {
+    msg += " (errno=" + std::to_string(err) + ": " + std::strerror(err) + ")";
+  }
+  return StatusError(StatusCode::kIOError, std::move(msg));
+}
+}  // namespace
+
 Status SpillFile::OpenForWrite() {
   if (writing_) {
     return Status::kSuccess;
   }
   stream_.open(path_, std::ios::binary | std::ios::out | std::ios::trunc);
   if (!stream_) {
-    return StatusError(StatusCode::kIOError,
-                       "failed to create spill file: " + path_.string());
+    return SpillWriteStatus("failed to create spill file", path_);
   }
   // Placeholder for count; rewritten in FinishWriting.
   const uint64_t zero = 0;
   stream_.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
   if (!stream_) {
-    return StatusError(StatusCode::kIOError,
-                       "spill write failed: " + path_.string());
+    return SpillWriteStatus("spill write failed", path_);
   }
   writing_ = true;
   return Status::kSuccess;
@@ -135,8 +164,7 @@ Status SpillFile::Append(const Row& row) {
   Encoder enc(stream_);
   enc << row;
   if (!stream_) {
-    return StatusError(StatusCode::kIOError,
-                       "spill write failed: " + path_.string());
+    return SpillWriteStatus("spill write failed", path_);
   }
   ++count_;
   return Status::kSuccess;
@@ -156,8 +184,7 @@ Status SpillFile::Append(const Row& row, const RowPosition& position) {
   Encoder enc(stream_);
   enc << row << position;
   if (!stream_) {
-    return StatusError(StatusCode::kIOError,
-                       "spill write failed: " + path_.string());
+    return SpillWriteStatus("spill write failed", path_);
   }
   ++count_;
   return Status::kSuccess;
@@ -277,8 +304,7 @@ Status SpillFile::EnsureReader() {
   }
   stream_.open(path_, std::ios::binary | std::ios::in);
   if (!stream_) {
-    return StatusError(StatusCode::kIOError,
-                       "failed to open spill file: " + path_.string());
+    return SpillWriteStatus("failed to open spill file", path_);
   }
   return Status::kSuccess;
 }
@@ -300,6 +326,8 @@ StatusOr<uint64_t> SpillFile::ReadStoredCount() {
 }
 
 StatusOr<std::vector<Row>> SpillFile::ReadAllRows() {
+  // An empty spill has no layout yet (nothing fixed has_positions_), so it
+  // reads as empty under either reader, like ForEachRow/ForEachPositioned.
   if (count_ == 0) {
     return std::vector<Row>{};
   }

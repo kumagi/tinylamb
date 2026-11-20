@@ -55,6 +55,9 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
   }
   if (expression->Type() == TypeTag::kColumnValue) {
     const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    if (multiplier != nullptr) {
+      *multiplier = 1;  // bare column leaves the affine multiplier at 1
+    }
     return !(column.name != target.name || column.schema != target.schema);
   }
   if (expression->Type() != TypeTag::kBinaryExp) {
@@ -277,6 +280,13 @@ bool IndexScanPlan::DoubleKeyOrderIsSound() const noexcept {
   if (provided_order_.empty() || index_.sc_.key_.empty()) {
     return true;
   }
+  // The NaN-freedom checks below only inspect the FIRST order key. With a
+  // composite ORDER BY, a NaN in a later DOUBLE key would break the
+  // canonical (NaN-before-numbers) order even when this key is bounded;
+  // stay conservative and let the parent keep its Sort.
+  if (provided_order_.size() > 1) {
+    return false;
+  }
   size_t key_pos = index_.sc_.key_.size();
   for (size_t k = 0; k < index_.sc_.key_.size(); ++k) {
     if (table_.GetSchema().GetColumn(index_.sc_.key_[k]).Name() ==
@@ -361,7 +371,7 @@ std::string IndexScanPlan::ToString() const {
 
 void IndexSkipScanPlan::Dump(std::ostream& o, int indent) const {
   o << Indent(static_cast<size_t>(indent)) << "IndexSkipScan\n";
-  inner_->Dump(o, indent + 2);
+  DumpChild(o, *inner_, indent + 2);
 }
 
 std::string IndexSkipScanPlan::ToString() const { return "IndexSkipScan"; }
@@ -370,10 +380,10 @@ bool IndexScanPlan::ContainsParameterSlots() const {
   return ContainsParameterSlot(where_);
 }
 
-bool IndexScanPlan::InstallParameterSlots(const std::vector<Value>& parameters,
-                                          size_t* cursor,
-                                          std::vector<Expression>* slots) {
-  return SlotizeInPlace(&where_, parameters, cursor, slots);
+bool IndexScanPlan::InstallParameterSlots(
+    const std::vector<Value>& /*parameters*/, size_t* /*cursor*/,
+    std::vector<Expression>* slots) {
+  return CollectParameterSlots(&where_, slots);
 }
 
 namespace {

@@ -66,7 +66,7 @@ class WindowFunctionCallExpression : public ExpressionBase {
   bool ignore_nulls{false};
 
   WindowFunctionCallExpression() = default;
-  [[nodiscard]] TypeTag Type() const override {
+  [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kWindowFunctionExp;
   }
   [[nodiscard]] StatusOr<Value> TryEvaluate(
@@ -74,6 +74,11 @@ class WindowFunctionCallExpression : public ExpressionBase {
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
+                                          const Schema& right) const override {  // NOLINT(misc-unused-parameters)
+    (void)right;
+    return ResultType(left);
+  }
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override { o << ToString(); }

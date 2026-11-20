@@ -648,10 +648,14 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
 
   // Stats are only populated after execution (Dump does not execute).
   prepared.Value()->Dump(plan, 0);
-  EXPECT_NE(plan.str().find("hash_joins=2"), std::string::npos) << plan.str();
+  // customer contributes no column and every o_custkey matches exactly one
+  // c_custkey, so the snapshot-proven join elimination drops it: only the
+  // orders x lineitem hash join remains (still no nested loops / cartesian
+  // materialization).
+  EXPECT_NE(plan.str().find("hash_joins=1"), std::string::npos) << plan.str();
   EXPECT_NE(plan.str().find("nested_loop_joins=0"), std::string::npos)
       << plan.str();
-  EXPECT_NE(plan.str().find("join_comparisons=512"), std::string::npos)
+  EXPECT_NE(plan.str().find("join_comparisons=256"), std::string::npos)
       << plan.str();
 
   StatusOr<Executor> correlated = engine.Prepare(

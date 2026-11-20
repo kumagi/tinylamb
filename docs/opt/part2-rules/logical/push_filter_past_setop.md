@@ -2,7 +2,7 @@
 
 - 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(`built.Add(Rule("push_filter_past_setop", …)`)
-  登録式。ヘルパは `TouchedColumns` / `EnsureDerivedGroup`。
+  登録式。ヘルパーは `TouchedColumns` / `EnsureDerivedGroup`。
 
 ## 概要
 

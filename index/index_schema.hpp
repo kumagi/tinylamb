@@ -21,6 +21,7 @@
 #ifndef TINYLAMB_INDEX_SCHEMA_HPP
 #define TINYLAMB_INDEX_SCHEMA_HPP
 
+#include <algorithm>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -75,7 +76,22 @@ class IndexSchema {
       : name_(name),
         key_(std::move(key)),
         include_(std::move(include)),
-        mode_(mode) {}
+        mode_(mode) {
+    // A key column listed again under INCLUDE/STORING (or an include listed
+    // twice) adds nothing but a duplicate output column: an index-only scan
+    // would then emit [c2, c2] for `SELECT DISTINCT c2`. Keep the first
+    // occurrence only. (Decoded schemas keep their stored layout.)
+    std::vector<slot_t> unique_include;
+    unique_include.reserve(include_.size());
+    for (const slot_t slot : include_) {
+      if (std::find(key_.begin(), key_.end(), slot) == key_.end() &&
+          std::find(unique_include.begin(), unique_include.end(), slot) ==
+              unique_include.end()) {
+        unique_include.push_back(slot);
+      }
+    }
+    include_ = std::move(unique_include);
+  }
   IndexSchema(const IndexSchema&) = default;
   IndexSchema(IndexSchema&&) = default;
   IndexSchema& operator=(const IndexSchema&) = default;

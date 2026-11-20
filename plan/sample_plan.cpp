@@ -33,7 +33,10 @@ std::optional<double> ConstantNumber(const Expression& expression) {
     return std::nullopt;
   }
   if (value.type == ValueType::kInt64) {
-    return static_cast<double>(value.value.int_value);
+    return value.IsUnsigned()
+                    ? static_cast<double>(
+                          static_cast<uint64_t>(value.value.int_value))
+                    : static_cast<double>(value.value.int_value);
   }
   if (value.type == ValueType::kDouble) {
     return value.value.double_value;
@@ -96,14 +99,12 @@ bool SamplePlan::ContainsParameterSlots() const {
 bool SamplePlan::InstallParameterSlots(const std::vector<Value>& parameters,
                                        size_t* cursor,
                                        std::vector<Expression>* slots) {
-  return SlotizeInPlace(&spec_.size, parameters, cursor, slots) &&
+  return CollectParameterSlots(&spec_.size, slots) &&
          ((!spec_.repeatable_seed ||
-           SlotizeInPlace(&*spec_.repeatable_seed, parameters, cursor,
-                          slots)) &&
+           CollectParameterSlots(&*spec_.repeatable_seed, slots)) &&
           std::ranges::all_of(spec_.partition_by,
                               [&](Expression& partition) {
-                                return SlotizeInPlace(&partition, parameters,
-                                                      cursor, slots);
+                                return CollectParameterSlots(&partition, slots);
                               }) &&
           child_->InstallParameterSlots(parameters, cursor, slots));
 }
@@ -113,7 +114,7 @@ void SamplePlan::Dump(std::ostream& o, int indent) const {
   spec_.Dump(o);
   o << " (estimated rows: " << EmitRowCount() << ")\n"
     << Indent(static_cast<size_t>(indent) + 2);
-  child_->Dump(o, indent + 2);
+  DumpChild(o, *child_, indent + 2);
 }
 
 std::string SamplePlan::ToString() const {

@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -107,6 +108,37 @@ TEST(QueryGrantTest, CoordinatorAdmitsWaitsWakesAndTimesOut) {
   EXPECT_EQ(g2.Value().GrantedBytes(), 500U);
 
   g2.Value().ReleaseGrant();
+  b.ResetForTest(0);
+}
+
+// P1842 (stress/TSan pin): ~QueryMemoryCoordinator must stay safe against
+// an in-flight release listener holding the stale registration copy. The
+// listener now captures a weak_ptr to a heap-owned condition_variable, so a
+// late notify locks nothing instead of touching the freed object. With the
+// old raw [this] capture TSan builds report the race/UAF on this loop; plain
+// builds exercise it as a never-crash guard.
+TEST(QueryGrantTest, CoordinatorDestroyedWhileReleaseListenersFire) {
+  ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
+  b.ResetForTest(/*limit_bytes=*/1U << 20, /*storage_limit_bytes=*/0,
+                 /*columnar_limit_bytes=*/0, /*check_rss_pressure=*/false);
+  std::atomic<bool> stop{false};
+  std::thread churn([&] {
+    // Come and go repeatedly while registered on the shared budget: each
+    // death unregisters, but a concurrent release may already hold a copy of
+    // the previous listener view.
+    while (!stop.load(std::memory_order_relaxed)) {
+      QueryMemoryCoordinator coord(&b);
+      (void)coord.AcquireGrant(0);
+    }
+  });
+  QueryMemoryCoordinator keeper(&b);
+  for (int i = 0; i < 20000; ++i) {
+    auto grant = keeper.AcquireGrant(1024, 1024, /*wait_timeout_ms=*/5000);
+    ASSERT_TRUE(grant.HasValue()) << "iteration " << i;
+    grant.Value().ReleaseGrant();  // runs NotifyReleaseListeners()
+  }
+  stop.store(true, std::memory_order_relaxed);
+  churn.join();
   b.ResetForTest(0);
 }
 

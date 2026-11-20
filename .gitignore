@@ -15,7 +15,6 @@ repro-drs-*/
 ironlamb-compliance-*
 
 googlesql_compliance-*
-ironlamb-compliance-*
 *.db
 *.log
 # WAL segment metadata sidecars next to the ignored *.log files; aborted
@@ -30,3 +29,4 @@ ironlamb-compliance-*
 __pycache__/
 .freebuff/
 benchmark/comparison/results/
+AGENTS.local.md

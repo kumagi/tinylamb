@@ -5,16 +5,20 @@ namespace tinylamb::relational_detail {
 
 std::shared_ptr<const LSTableStore> SnapshotColumnStore(
     TransactionContext& context, const Table& table,
-    const std::vector<slot_t>& projection, size_t column_count) {
+    const std::vector<slot_t>& projection, size_t column_count,
+    bool allow_lazy_build) {
   std::vector<slot_t> needed = projection;
   if (projection.empty()) {
-    needed.reserve(column_count);
+    needed.reserve(std::max<size_t>(1, column_count));
     for (size_t c = 0; c < column_count; ++c) {
       needed.push_back(static_cast<slot_t>(c));
     }
+    if (needed.empty() && table.GetSchema().ColumnCount() > 0) {
+      needed.push_back(0);
+    }
   }
   std::shared_ptr<const LSTableStore> store =
-      GetOrBuildLSTableStore(context.txn_, table, true, &needed);
+      GetOrBuildLSTableStore(context.txn_, table, allow_lazy_build, &needed);
   if (store != nullptr &&
       store->layout_generation == table.LayoutGeneration() &&
       store->first_pid == table.FirstPageId()) {
@@ -39,6 +43,19 @@ std::shared_ptr<const LSTableStore> SnapshotColumnStore(
   return nullptr;
 }
 
+// These dictionary / top-N shapes emit only bare keys, aggregates and
+// constants. A composite item (ROUND(SUM(x), 2)) must take the general path,
+// which evaluates its post-aggregate expression.
+namespace {
+bool HasPostAggItem(const TypedAggregationPlan& plan) {
+  const auto composite = [](const TypedEmitItem& item) {
+    return item.post_agg != nullptr;
+  };
+  return std::ranges::any_of(plan.emit_items, composite) ||
+         std::ranges::any_of(plan.order_items, composite);
+}
+}  // namespace
+
 // A proven unique grouping key makes every group a singleton. COUNT(*) is
 // then constant, so ordering exclusively by it (and constants) cannot change
 // the LIMIT tie boundary. Only direct, non-throwing inputs may skip unseen
@@ -48,6 +65,9 @@ StatusOr<std::optional<Relation>> TryUniqueGroupLimit(
     const LSTableStore& store, const TypedAggregationPlan& plan,
     const SelectStatement& statement, const std::vector<slot_t>& projection,
     const Schema& schema, ExecutionRuntime* runtime) try {
+  if (HasPostAggItem(plan)) {
+    return std::optional<Relation>{};
+  }
   if (!statement.HasLimit() || statement.WithTies() || statement.Distinct() ||
       statement.Having() || !plan.dependent_key_programs.empty() ||
       !plan.filter_programs.empty() || !plan.filter_disjunctions.empty() ||
@@ -298,6 +318,9 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
     const LSTableStore& store, const TypedAggregationPlan& plan,
     const SelectStatement& statement, const std::vector<slot_t>& projection,
     const Schema& schema, ExecutionRuntime* runtime) try {
+  if (HasPostAggItem(plan)) {
+    return std::optional<Relation>{};
+  }
   if (std::getenv("TINYLAMB_DISABLE_PARTITIONED_NUMERIC_AGG") != nullptr ||
       plan.key_offsets.empty() || !plan.dependent_key_programs.empty() ||
       !plan.filter_programs.empty() || !plan.filter_disjunctions.empty() ||
@@ -672,9 +695,9 @@ class PagedDomainAccumulator {
   // Dense page containing `index`, or nullptr when it was never touched.
   [[nodiscard]] const T* Page(size_t index) const {
     const uint32_t mapped = page_of_[index >> kPageBits];
-    return mapped == 0 ? nullptr
-                       : &values_[(static_cast<size_t>(mapped - 1)
-                                   << kPageBits)];
+    return mapped == 0
+               ? nullptr
+               : &values_[(static_cast<size_t>(mapped - 1) << kPageBits)];
   }
 
  private:
@@ -694,6 +717,9 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
     const Schema& schema, ExecutionRuntime* runtime,
     const std::function<StatusOr<Value>(size_t)>* transform_key,
     const UtcTimestampTruncUnit* temporal_unit) try {
+  if (HasPostAggItem(plan)) {
+    return std::optional<Relation>{};
+  }
   if ((!statement.HasLimit() &&
        std::getenv("TINYLAMB_DISABLE_UNBOUNDED_DICTIONARY_AGG") != nullptr) ||
       plan.key_offsets.size() != 1 || !plan.filter_programs.empty() ||
@@ -1172,7 +1198,8 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
       // Each merge worker owns a contiguous range; probe only the pages a
       // source worker actually materialized instead of scanning `domain`
       // entries times `workers`.
-      for (size_t page = code_begin >> PagedDomainAccumulator<GroupSlot>::kPageBits;
+      for (size_t page =
+               code_begin >> PagedDomainAccumulator<GroupSlot>::kPageBits;
            code_begin < code_end &&
            (page << PagedDomainAccumulator<GroupSlot>::kPageBits) < code_end;
            ++page) {
@@ -1180,10 +1207,9 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
                 page << PagedDomainAccumulator<GroupSlot>::kPageBits)) {
           const size_t from = std::max(
               code_begin, page << PagedDomainAccumulator<GroupSlot>::kPageBits);
-          const size_t to =
-              std::min(code_end,
-                       (page + 1)
-                           << PagedDomainAccumulator<GroupSlot>::kPageBits);
+          const size_t to = std::min(
+              code_end, (page + 1)
+                            << PagedDomainAccumulator<GroupSlot>::kPageBits);
           for (size_t code = from; code < to; ++code) {
             const GroupSlot& slot =
                 slots[code & PagedDomainAccumulator<GroupSlot>::kPageMask];
@@ -1193,7 +1219,8 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
           }
         }
       }
-      for (size_t page = cell_begin >> PagedDomainAccumulator<int64_t>::kPageBits;
+      for (size_t page =
+               cell_begin >> PagedDomainAccumulator<int64_t>::kPageBits;
            cell_begin < cell_end &&
            (page << PagedDomainAccumulator<int64_t>::kPageBits) < cell_end;
            ++page) {
@@ -1201,10 +1228,9 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
                 page << PagedDomainAccumulator<int64_t>::kPageBits)) {
           const size_t from = std::max(
               cell_begin, page << PagedDomainAccumulator<int64_t>::kPageBits);
-          const size_t to =
-              std::min(cell_end,
-                       (page + 1)
-                           << PagedDomainAccumulator<int64_t>::kPageBits);
+          const size_t to = std::min(
+              cell_end, (page + 1)
+                            << PagedDomainAccumulator<int64_t>::kPageBits);
           for (size_t cell = from; cell < to; ++cell) {
             merged.sums[cell] +=
                 sums[cell & PagedDomainAccumulator<int64_t>::kPageMask];
@@ -1640,6 +1666,9 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
     const std::vector<std::optional<DictionaryCaseInput>>* cases,
     const std::vector<std::optional<UtcTimestampTruncUnit>>* extracts,
     bool require_selective) try {
+  if (HasPostAggItem(plan)) {
+    return std::optional<Relation>{};
+  }
   if ((!statement.HasLimit() &&
        std::getenv("TINYLAMB_DISABLE_UNBOUNDED_DICTIONARY_AGG") != nullptr) ||
       plan.key_offsets.empty() ||
@@ -2536,10 +2565,14 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryExpressions(
           return Value(*value);
         }
       }
-      representative[offset] =
-          code == dictionary->entries.size()
-              ? Value()
-              : Value(std::string(dictionary->entries[code]));
+      // T4546: reuse the representative cell's owned string buffer across
+      // dictionary codes (Value::CopyFromStringView assigns in place) instead
+      // of allocating a fresh owned Value per code before re-parsing the key.
+      if (code == dictionary->entries.size()) {
+        representative[offset] = Value();
+      } else {
+        representative[offset].CopyFromStringView(dictionary->entries[code]);
+      }
       const Scope scope{.row = &representative, .schema = &schema};
       return TryEvaluate(key, scope, nullptr, context, ctes);
     };
@@ -3253,7 +3286,9 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
   // morsels: long strings must not strand one statically assigned worker.
   // Workers never access the transaction or its runtime counters. A value
   // that does not fit the retained staging budget uses the serial callback.
-  struct PartialGroup {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct PartialGroup {  // NOLINT(cppcoreguidelines-special-member-functions)
     Row row;
     Value key;
     std::vector<AggregateAccumulator> states;
@@ -3262,7 +3297,7 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
     // vector must never fall back to copying on reallocation.
     PartialGroup() = default;
     PartialGroup(PartialGroup&&) = default;
-    PartialGroup& operator=(PartialGroup&&)  noexcept = default;
+    PartialGroup& operator=(PartialGroup&&) noexcept = default;
   };
   struct LocalGroups {
     GroupKeyMap offsets;

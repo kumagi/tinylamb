@@ -2,7 +2,7 @@
 
 - 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(`built.Add(Rule("right_to_left_outer_join", …)`)
-  登録式。依存ヘルパなし。
+  登録式。依存ヘルパーなし。
 
 ## 概要
 

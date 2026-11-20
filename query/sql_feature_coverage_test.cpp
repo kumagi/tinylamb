@@ -210,6 +210,9 @@ TEST_F(SqlFeatureCoverageTest, OuterJoinShapesPadWithNulls) {
       Column("SELECT 1 FROM f FULL OUTER JOIN (SELECT 9 AS k) g ON f.k = g.k")
           .size(),
       5U);
+  EXPECT_EQ(Scalar("SELECT COUNT(*) FROM (SELECT g.s AS s FROM f LEFT JOIN "
+                   "(SELECT 1 AS k, 'r' AS s) g USING (k)) q WHERE s IS NULL"),
+            Value(int64_t{3}));
   // IS NOT DISTINCT FROM joins match through NULLs.
   EXPECT_EQ(Scalar("SELECT COUNT(*) FROM f a JOIN f b "
                    "ON a.s IS NOT DISTINCT FROM b.s WHERE a.k = 3"),
@@ -262,8 +265,9 @@ TEST_F(SqlFeatureCoverageTest, WindowFrameAggregation) {
   EXPECT_EQ(ranks[0], Value(int64_t{1}));
   EXPECT_EQ(ranks[1], Value(int64_t{2}));
   EXPECT_EQ(ranks[3], Value(int64_t{4}));
-  EXPECT_EQ(Column("SELECT LAG(v) OVER (ORDER BY k) FROM f WHERE k = 1").size(),
-            1U);
+  const auto lags = Column("SELECT LAG(v) OVER (ORDER BY k) FROM f WHERE k = 1");
+  ASSERT_EQ(lags.size(), 1U);
+  EXPECT_TRUE(lags[0].IsNull());
 }
 
 // ----------------------------------------------------------------- UNNEST ---

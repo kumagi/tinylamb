@@ -512,7 +512,7 @@ TEST_F(SqlFunctionCoverageTest, RegexpFamilyBranches) {
   ExpectScalar("SELECT REGEXP_REPLACE('abcabc', 'b', 'X')", Value("aXcaXc"));
   ExpectScalar("SELECT REGEXP_INSTR('abc123def', '[0-9]+')", Value(4));
   ExpectScalar("SELECT REGEXP_INSTR('a1b2c3', '[0-9]', 1, 2)", Value(4));
-  ExpectScalar("SELECT REGEXP_INSTR('abc123', '[0-9]+', 1, 1, 1)", Value(6));
+  ExpectScalar("SELECT REGEXP_INSTR('abc123', '[0-9]+', 1, 1, 1)", Value(7));
   ExpectScalar("SELECT REGEXP_INSTR('abc', '[0-9]+')", Value(0));
   auto hits = ExpectArray(
       "SELECT x FROM UNNEST(REGEXP_EXTRACT_ALL('a1b2', '[a-z]')) AS x", 2);
@@ -535,15 +535,13 @@ TEST_F(SqlFunctionCoverageTest, RegexpFamilyBranches) {
 // ---------------------------------------------------------------------------
 
 TEST_F(SqlFunctionCoverageTest, HashFamilyBranches) {
-  // KNOWN DIVERGENCE: GoogleSQL's MD5/SHA* return BYTES and LENGTH(BYTES)
-  // counts bytes (16/20/32/64).  Tinylamb has no BYTES value type, so the
-  // raw digest rides in a STRING value and LENGTH counts UTF-8 code points
-  // (12/18/27/51).  These constants pin that the digests are present and
-  // NULL-propagating; they are not a statement that the counts are correct.
+  // GoogleSQL's MD5/SHA* return BYTES and LENGTH(BYTES) counts bytes. The
+  // frontend knows these functions yield BYTES and binds LENGTH to the
+  // byte-counting form (reference: 16/20/32/64).
   ExpectRow(
       "SELECT LENGTH(MD5('abc')), LENGTH(SHA1('abc')), "
       "LENGTH(SHA256('abc')), LENGTH(SHA512('abc'))",
-      Row({Value(12), Value(18), Value(27), Value(51)}));
+      Row({Value(16), Value(20), Value(32), Value(64)}));
   ExpectNullScalar("SELECT MD5(NULL)");
   ExpectNullScalar("SELECT SHA1(NULL)");
   ExpectNullScalar("SELECT SHA256(NULL)");
@@ -582,7 +580,7 @@ TEST_F(SqlFunctionCoverageTest, IfErrorIsErrorBranches) {
   ExpectError("SELECT NULLIFERROR()");
 }
 
-TEST_F(SqlFunctionCoverageTest, CoalesceIfNullNullIfBranches) {
+TEST_F(SqlFunctionCoverageTest, CoalesceIfNull_NullIfBranches) {
   ExpectRow(
       "SELECT COALESCE(NULL, NULL, 3), COALESCE(1, 2), IFNULL(NULL, 5), "
       "IFNULL(4, 5)",
@@ -886,8 +884,9 @@ TEST_F(SqlFunctionCoverageTest, BinaryLikeBranches) {
   ExpectNullScalar("SELECT NULL LIKE 'a'");
   ExpectError("SELECT 1 LIKE 'a'");
   ExpectError("SELECT 'a' LIKE 1");
-  // Coercion path: ENDS_WITH over integers reads their text form.
-  ExpectScalar("SELECT ENDS_WITH(1, 2)", Value(false));
+  // Strict argument typing: non-STRING input is a type error, not an
+  // implicit AsString() coercion.
+  ExpectError("SELECT ENDS_WITH(1, 2)");
 }
 
 TEST_F(SqlFunctionCoverageTest, BinaryUnsignedMixedBranches) {
@@ -1069,7 +1068,8 @@ TEST_F(SqlFunctionCoverageTest, FormatSpecifierMatrix) {
   ExpectScalar("SELECT FORMAT('%t', 'str')", Value("str"));
   ExpectScalar("SELECT FORMAT('%T', 'str')", Value(R"sql("str")sql"));
   ExpectScalar("SELECT FORMAT('%t', 12)", Value("12"));
-  ExpectScalar("SELECT FORMAT('%t', 1.5)", Value("1.500000"));
+  // %t is the shortest round-trip text (reference GoogleSQL: "1.5").
+  ExpectScalar("SELECT FORMAT('%t', 1.5)", Value("1.5"));
   ExpectNullScalar("SELECT FORMAT('%t', CAST(NULL AS INT64))");
 }
 
@@ -1203,7 +1203,8 @@ TEST_F(SqlFunctionCoverageTest, StringOverloadShapes) {
   ExpectScalar("SELECT INITCAP('hello big world')", Value("Hello Big World"));
   ExpectScalar("SELECT CODE_POINTS_TO_STRING([65, 66])", Value("AB"));
   ExpectScalar("SELECT CODE_POINTS_TO_BYTES([65, 66])", Value("AB"));
-  ExpectScalar("SELECT REGEXP_EXTRACT('a1b2', '[0-9]', 1, 2)", Value("1"));
+  // position 1, occurrence 2: the second digit (reference GoogleSQL: '2').
+  ExpectScalar("SELECT REGEXP_EXTRACT('a1b2', '[0-9]', 1, 2)", Value("2"));
   ExpectScalar("SELECT REGEXP_INSTR('abc', 'b')", Value(2));
   ExpectScalar("SELECT REGEXP_EXTRACT_ALL('a1b2', '[0-9]')",
                Value::Array({Value("1"), Value("2")}, "STRING"));
@@ -1213,6 +1214,164 @@ TEST_F(SqlFunctionCoverageTest, StringOverloadShapes) {
   ExpectError("SELECT CODE_POINTS_TO_STRING([-1])");
   ExpectError("SELECT CHR(9999999)");
   ExpectError("SELECT SUBSTR('hello', 1, -1)");
+}
+
+// T2245: reciprocal trig family. Exact values are the corpus expected results
+// (query/testdata/googlesql_compliance/safe_function.test) without the SAFE.
+// prefix; identity comparisons keep the pins libm-independent.
+TEST_F(SqlFunctionCoverageTest, ReciprocalTrigFunctions) {
+  ExpectScalar("SELECT SEC(0)", Value(1.0));
+  ExpectScalar("SELECT SECH(0)", Value(1.0));
+  ExpectScalar("SELECT COT(1) = COS(1) / SIN(1)", Value(true));
+  ExpectScalar("SELECT CSC(1) = 1 / SIN(1)", Value(true));
+  ExpectScalar("SELECT CSCH(1) = 1 / SINH(1)", Value(true));
+  ExpectScalar("SELECT SECH(1) = 1 / COSH(1)", Value(true));
+  ExpectScalar("SELECT CSC(CAST(NULL AS DOUBLE))", Value());
+  ExpectScalar("SELECT COTH(1) = COSH(1) / SINH(1)", Value(true));
+  ExpectError("SELECT COTH(0)");  // sinh(0) == 0 -> division by zero
+  // cot(pi/2) -> cos == 0 -> 0, not an error (sin != 0 there).
+  ExpectScalar("SELECT ABS(COT(PI() / 2)) < 1e-15", Value(true));
+}
+
+// T2232: SAFE.<fn> is sugar for NULLIFERROR(<fn>): errors anywhere in the
+// wrapped call collapse to NULL while successful calls keep their values.
+TEST_F(SqlFunctionCoverageTest, SafePrefixSuppressesErrorsToNull) {
+  // Plain calls error; SAFE. calls return NULL instead.
+  ExpectScalar("SELECT SAFE.CSC(0)", Value());
+  ExpectScalar("SELECT SAFE.COT(0)", Value());
+  ExpectScalar("SELECT SAFE.ABS(-9223372036854775808)", Value());
+  ExpectScalar("SELECT SAFE.PARSE_DATE('%Y', 'not-a-date')", Value());
+  // Non-error results pass through unchanged (types included).
+  ExpectScalar("SELECT SAFE.ASCII('A')", Value(int64_t{65}));
+  ExpectScalar("SELECT SAFE.CSC(1) = 1 / SIN(1)", Value(true));
+  ExpectScalar("SELECT SAFE.CONCAT('a', 'b')", Value("ab"));
+  ExpectScalar("SELECT SAFE.UPPER('ab')", Value("AB"));
+  // NULL arguments keep propagating NULL (not an error).
+  ExpectScalar("SELECT SAFE.CSC(CAST(NULL AS DOUBLE))", Value());
+  // The plain forms still error, proving the rewrite is what absorbs them.
+  ExpectError("SELECT CSC(0)");
+  ExpectError("SELECT PARSE_DATE('%Y', 'not-a-date')");
+}
+
+// T2242: GENERATE_TIMESTAMP_ARRAY — the TIMESTAMP sibling of
+// GENERATE_DATE_ARRAY (epoch-microsecond stepping, canonical "+00" text).
+TEST_F(SqlFunctionCoverageTest, GenerateTimestampArray) {
+  ExpectScalar(
+      "SELECT GENERATE_TIMESTAMP_ARRAY('2016-01-01', '2016-01-03', "
+      "INTERVAL 1 DAY)",
+      Value::Array(
+          {Value("2016-01-01 00:00:00+00"), Value("2016-01-02 00:00:00+00"),
+           Value("2016-01-03 00:00:00+00")},
+          "TIMESTAMP"));
+  // Sub-day steps iterate microseconds (fractional seconds rendered).
+  ExpectScalar(
+      "SELECT GENERATE_TIMESTAMP_ARRAY('2016-01-01 00:00:00.5', "
+      "'2016-01-01 00:00:01.5', INTERVAL 500000 MICROSECOND)",
+      Value::Array({Value("2016-01-01 00:00:00.500000+00"),
+                    Value("2016-01-01 00:00:01+00"),
+                    Value("2016-01-01 00:00:01.500000+00")},
+                   "TIMESTAMP"));
+  // Descending step walks backwards; a forward step over a reversed range
+  // yields the empty array (both like GENERATE_DATE_ARRAY).
+  ExpectScalar(
+      "SELECT GENERATE_TIMESTAMP_ARRAY('2016-01-02', '2016-01-01', "
+      "INTERVAL -1 DAY)",
+      Value::Array(
+          {Value("2016-01-02 00:00:00+00"), Value("2016-01-01 00:00:00+00")},
+          "TIMESTAMP"));
+  ExpectScalar(
+      "SELECT GENERATE_TIMESTAMP_ARRAY('2016-01-03', '2016-01-01', "
+      "INTERVAL 1 DAY)",
+      Value::Array({}, "TIMESTAMP"));
+  // STEP = 0 is the corpus's out-of-range error; MONTH steps belong to the
+  // date array only; NULL inputs propagate.
+  ExpectError(
+      "SELECT GENERATE_TIMESTAMP_ARRAY('2016-01-01', '2017-01-01', "
+      "INTERVAL 0 DAY)");
+  ExpectError(
+      "SELECT GENERATE_TIMESTAMP_ARRAY('2016-01-01', '2016-02-01', "
+      "INTERVAL 1 MONTH)");
+  ExpectScalar(
+      "SELECT GENERATE_TIMESTAMP_ARRAY(CAST(NULL AS TIMESTAMP), "
+      "'2016-01-01', INTERVAL 1 DAY)",
+      Value());
+}
+
+// T2236: REGEXP_EXTRACT_GROUPS — per-match capture entries (ARRAY<STRING>
+// standing in for the GoogleSQL per-match STRUCT), named groups required.
+TEST_F(SqlFunctionCoverageTest, RegexpExtractGroups) {
+  ExpectScalar(
+      "SELECT REGEXP_EXTRACT_GROUPS('2024-01-15 and 2024-12-01', "
+      "'(?P<year>\\\\d{4})-(?P<month>\\\\d{2})-(?P<day>\\\\d{2})')",
+      Value::Array(
+          {Value::Array({Value("2024"), Value("01"), Value("15")}, "STRING"),
+           Value::Array({Value("2024"), Value("12"), Value("01")}, "STRING")},
+          "ARRAY<STRING>"));
+  // occurrence = 1 selects only the first match; (?<name>) spelling works.
+  ExpectScalar(
+      "SELECT REGEXP_EXTRACT_GROUPS('a1 b2', '(?<letter>[a-z])(?<digit>[0-9])'"
+      ", 1, 1)",
+      Value::Array({Value::Array({Value("a"), Value("1")}, "STRING")},
+                   "ARRAY<STRING>"));
+  // A group that did not participate is NULL, not ''.
+  ExpectScalar("SELECT REGEXP_EXTRACT_GROUPS('ab xy', '(?P<x>a)?(?P<y>[a-z])')",
+               Value::Array({Value::Array({Value("a"), Value("b")}, "STRING"),
+                             Value::Array({Value(), Value("x")}, "STRING"),
+                             Value::Array({Value(), Value("y")}, "STRING")},
+                            "ARRAY<STRING>"));
+  // No named groups is an error (GoogleSQL contract); no match is empty.
+  ExpectError("SELECT REGEXP_EXTRACT_GROUPS('abc', '[a-z]+')");
+  ExpectScalar("SELECT REGEXP_EXTRACT_GROUPS('abc', '(?P<w>[0-9]+)')",
+               Value::Array({}, "ARRAY<STRING>"));
+  ExpectScalar("SELECT REGEXP_EXTRACT_GROUPS(CAST(NULL AS STRING), '(?P<w>a)')",
+               Value());
+}
+
+// T2237: CONTAINS_SUBSTR — case-insensitive search over STRING and ARRAY
+// leaves with the json_scope argument accepted positionally.
+TEST_F(SqlFunctionCoverageTest, ContainsSubstr) {
+  ExpectScalar("SELECT CONTAINS_SUBSTR('Hello World', 'LO wo')", Value(true));
+  ExpectScalar("SELECT CONTAINS_SUBSTR('Hello', 'xyz')", Value(false));
+  // Array search matches any STRING leaf; NULL leaves never match.
+  ExpectScalar("SELECT CONTAINS_SUBSTR(['abc', 'def'], 'BC')", Value(true));
+  ExpectScalar("SELECT CONTAINS_SUBSTR(['abc', CAST(NULL AS STRING)], 'qq')",
+               Value(false));
+  // json_scope accepted (validation only; engine JSON layer has no paths).
+  ExpectScalar("SELECT CONTAINS_SUBSTR('abc', 'B', 'JSON_VALUE')", Value(true));
+  ExpectError("SELECT CONTAINS_SUBSTR('abc', 'b', 'JSON_BOGUS')");
+  ExpectScalar("SELECT CONTAINS_SUBSTR(CAST(NULL AS STRING), 'b')", Value());
+  ExpectScalar("SELECT CONTAINS_SUBSTR('abc', CAST(NULL AS STRING))", Value());
+  // Case folding is Unicode-aware: 'STRASSE' vs 'straße' fold together.
+  ExpectScalar("SELECT CONTAINS_SUBSTR('DIE STRASSE', 'stra\303\237e')",
+               Value(true));
+}
+
+// T2234/T2238: TO_CODE_POINTS (inverse of CODE_POINTS_TO_STRING) and
+// EDIT_DISTANCE over code points with the optional max_distance clamp.
+TEST_F(SqlFunctionCoverageTest, ToCodePointsAndEditDistance) {
+  ExpectScalar(
+      "SELECT TO_CODE_POINTS('h\xe2\x82\xac')",
+      Value::Array({Value(int64_t{104}), Value(int64_t{8364})}, "INT64"));
+  ExpectScalar("SELECT TO_CODE_POINTS('')", Value::Array({}, "INT64"));
+  ExpectScalar("SELECT TO_CODE_POINTS(CAST(NULL AS STRING))", Value());
+  // BYTES round-trip: CODE_POINTS_TO_BYTES output decodes byte-per-element
+  // again (invalid UTF-8 bytes pass through; the parser rejects a raw 0xFF
+  // literal, so build the BYTES value through the inverse function).
+  ExpectScalar(
+      "SELECT TO_CODE_POINTS(CODE_POINTS_TO_BYTES([97, 255]))",
+      Value::Array({Value(int64_t{97}), Value(int64_t{255})}, "INT64"));
+  ExpectScalar("SELECT EDIT_DISTANCE('kitten', 'sitting')", Value(int64_t{3}));
+  ExpectScalar("SELECT EDIT_DISTANCE('abc', 'abc')", Value(int64_t{0}));
+  // Exceeding max_distance reports max_distance + 1 (GoogleSQL contract).
+  ExpectScalar("SELECT EDIT_DISTANCE('kitten', 'sitting', 2)",
+               Value(int64_t{3}));
+  ExpectScalar("SELECT EDIT_DISTANCE('kitten', 'sitting', 5)",
+               Value(int64_t{3}));
+  // Code points, not bytes: 'h\u20ac' vs 'hx' differ by one character.
+  ExpectScalar("SELECT EDIT_DISTANCE('h\xe2\x82\xac', 'hx')",
+               Value(int64_t{1}));
+  ExpectScalar("SELECT EDIT_DISTANCE(CAST(NULL AS STRING), 'x')", Value());
+  ExpectError("SELECT EDIT_DISTANCE('a', 'b', -1)");
 }
 
 }  // namespace tinylamb

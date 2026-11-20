@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/digest.hpp"
 #include "common/memory_budget.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
@@ -68,8 +69,9 @@ bool ParseI64(std::string_view s, int64_t* out) {
   }
   char* end = nullptr;
   const std::string tmp(s);
+  errno = 0;
   const long long v = std::strtoll(tmp.c_str(), &end, 10);
-  if (end == nullptr || *end != '\0') {
+  if (errno != 0 || end == nullptr || end == tmp.c_str() || *end != '\0') {
     return false;
   }
   *out = static_cast<int64_t>(v);
@@ -101,6 +103,7 @@ std::string Shorten(std::string_view s, size_t n = 80) {
 }
 
 // Tag column domain: index 0 is NULL.
+// NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
 constexpr std::string_view kTags[] = {"", "a", "bb", "ccc", "dddd"};
 constexpr int kTagCount = 5;
 
@@ -948,6 +951,7 @@ class OocSession {
                               const SqlOutcome& o, bool big_rows) {
     const StatusCode code = o.status.GetCode();
     bool tolerated = false;
+    // NOLINTNEXTLINE(bugprone-branch-clone) distinct intent in each branch
     if (injecting_ && o.why.find("injected") != std::string::npos) {
       // The engine reports the injected fault itself (whatever the code).
       tolerated = true;
@@ -991,6 +995,7 @@ class OocSession {
   template <typename Fn>
   std::string RunDml(const std::string& what, const std::string& sql,
                      int64_t expected_rows, bool big_rows, Fn&& mutate) {
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     SqlOutcome o = RunSql(*ctx_, sql);
     if (!o.ok) {
       std::string finding = ClassifyFailure(what, sql, o, big_rows);
@@ -1054,6 +1059,7 @@ class OocSession {
     const std::string sql =
         "CREATE TABLE " + tok[1] +
         " (k INT64, g INT64, v INT64, t VARCHAR(8), pad VARCHAR(65535));";
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     SqlOutcome o = RunSql(*ctx_, sql);
     if (!o.ok) {
       std::string finding = ClassifyFailure("CREATE TABLE", sql, o, false);
@@ -1076,6 +1082,7 @@ class OocSession {
       return "malformed drop op\n";
     }
     const std::string sql = "DROP TABLE " + tok[1] + ";";
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     SqlOutcome o = RunSql(*ctx_, sql);
     if (!o.ok) {
       std::string finding = ClassifyFailure("DROP TABLE", sql, o, false);
@@ -1105,6 +1112,7 @@ class OocSession {
     } else {
       return "malformed index op\n";
     }
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     SqlOutcome o = RunSql(*ctx_, spec + ";");
     if (!o.ok) {
       // Wide pad keys may exceed the index entry limit.
@@ -1216,6 +1224,7 @@ class OocSession {
     }
     const std::string sql =
         "INSERT INTO " + t->name + " VALUES (" + I(k) + ", 0, 0, 'a', 'dup');";
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     SqlOutcome o = RunSql(*ctx_, sql);
     if (o.ok) {
       return "unique-violating INSERT accepted: " + sql + "\n";
@@ -1226,6 +1235,7 @@ class OocSession {
              "\n  " + o.why + "\n";
     }
     // A rejected statement must leave no trace in the open transaction.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     return QuickCheck(*t, *ctx_, "post-duplicate-reject");
   }
 
@@ -1304,6 +1314,7 @@ class OocSession {
       return "malformed analyze op\n";
     }
     const std::string sql = "ANALYZE " + tok[1] + ";";
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     SqlOutcome o = RunSql(*ctx_, sql);
     if (!o.ok) {
       std::string finding = ClassifyFailure("ANALYZE", sql, o, false);
@@ -1315,6 +1326,7 @@ class OocSession {
   // ---- transaction / storage boundaries ----------------------------------
 
   std::string OpCommit() {
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     const Status st = ctx_->PreCommit();
     if (st != Status::kSuccess) {
       if (injecting_ && TolerableUnderInjection(st.GetCode())) {
@@ -1330,8 +1342,10 @@ class OocSession {
 
   // True when every table of `tables` answers its count/sum probe exactly.
   bool ImageMatches(const std::vector<MTable>& tables) {
+    // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer here
     for (const MTable& t : tables) {
       CheckSpec spec = CountSpec(t);
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
       SqlOutcome o = RunSql(*ctx_, spec.sql);
       if (!o.ok || o.rows != spec.expected) {
         return false;
@@ -1345,6 +1359,7 @@ class OocSession {
   std::string ResolveAmbiguousCommit(const Status& st) {
     DisarmAndDetect();
     Bump(&OocStats::tolerated_failures);
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     std::ignore = ctx_->txn_.Abort();
     ctx_.emplace(db_->BeginContext());
     // The ambiguous-commit probes must run with relaxed knobs: under the
@@ -1353,6 +1368,7 @@ class OocSession {
     // not match" and report a bogus torn transaction.
     const Knobs session = CurrentKnobs();
     SetKnobs(Knobs{});
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
     struct RestoreKnobs {
       OocSession* self;
       Knobs knobs;
@@ -1373,6 +1389,7 @@ class OocSession {
   }
 
   std::string OpAbort(const std::string& label) {
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     if (ctx_->txn_.Abort() != Status::kSuccess) {
       return label + ": Abort failed\n";
     }
@@ -1415,6 +1432,7 @@ class OocSession {
   std::string OpReopen() {
     CloseSnapshot();
     // An open transaction is rolled back before the clean shutdown.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     if (ctx_->txn_.Abort() != Status::kSuccess) {
       return "reopen: Abort failed\n";
     }
@@ -1451,6 +1469,7 @@ class OocSession {
     if (tok.size() != 2 || !ParseI64(tok[1], &target) || target < 0) {
       return "malformed evict op\n";
     }
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     PageManager* pm = ctx_->txn_.GetPageManager();
     if (pm == nullptr) {
       return "";
@@ -1474,6 +1493,7 @@ class OocSession {
     if (std::string r = OpCommit(); !r.empty()) {
       return r;
     }
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     const Status st = db_->CompactTableToTlcs(*ctx_, t->name);
     if (st != Status::kSuccess) {
       if ((injecting_ || TempCapped()) &&
@@ -1490,6 +1510,7 @@ class OocSession {
     if (std::string r = OpCommit(); !r.empty()) {
       return "after compaction: " + r;
     }
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     return QuickCheck(*FindTable(work_, tok[1]), *ctx_, "post-compact");
   }
 
@@ -1503,6 +1524,7 @@ class OocSession {
       snap_tables_ = committed_;
       // Pin the snapshot with a first read of every table.
       for (const MTable& t : snap_tables_) {
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
         if (std::string r = QuickCheck(t, *snap_, "snapshot-open");
             !r.empty()) {
           return r;
@@ -1579,6 +1601,7 @@ class OocSession {
 
   std::string QuickCheckAll(const std::string& label) {
     for (const MTable& t : work_) {
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
       if (std::string r = QuickCheck(t, *ctx_, label); !r.empty()) {
         return r;
       }
@@ -1592,9 +1615,16 @@ class OocSession {
     SqlOutcome o = RunSql(ctx, spec.sql);
     if (!o.ok) {
       const StatusCode code = o.status.GetCode();
+      // ADR-0004 rule 9: a row wider than a quarter of the operator budget
+      // fails with kTooBigData by design. The sweep arm already tolerates
+      // that once a stored pad can reach the quarter; checks must agree.
+      const size_t opmem =
+          ProcessMemoryBudget::Global().OpMemoryOverrideBytes();
+      const bool row_over_quarter = code == StatusCode::kTooBigData &&
+                                    opmem > 0 && MaxPadLen() * 4 >= opmem;
       if (((injecting_ || TempCapped()) && TolerableUnderInjection(code)) ||
           (injecting_ && o.why.find("injected") != std::string::npos) ||
-          code == StatusCode::kMemoryLimitExceeded) {
+          code == StatusCode::kMemoryLimitExceeded || row_over_quarter) {
         Bump(&OocStats::tolerated_failures);
         NoteFailedRead(ctx);
         return "";
@@ -1618,6 +1648,7 @@ class OocSession {
       return "malformed check op\n";
     }
     std::vector<MTable>& tables = snapshot ? snap_tables_ : work_;
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) intentional in this code
     TransactionContext& ctx = snapshot ? *snap_ : *ctx_;
     const std::string& kind = tok[1];
     const MTable* t = FindTable(tables, tok[2]);
@@ -1994,6 +2025,7 @@ class OocSession {
     for (const auto& [gk, members] : groups) {
       const auto m = static_cast<int64_t>(members.size());
       // Rows per tag, so RANK is O(1) per row even for one huge partition.
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
       int64_t per_tag[kTagCount] = {0, 0, 0, 0, 0};
       for (const auto& member : members) {
         ++per_tag[member.second->tag];
@@ -2337,6 +2369,7 @@ class OocSession {
       DropPending();
       return "malformed q op\n";
     }
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
     TransactionContext& ctx = snap != 0 ? *snap_ : *ctx_;
     const Knobs session = CurrentKnobs();
     // Whatever happens below, hand the session its knobs back.
@@ -2379,6 +2412,7 @@ class OocSession {
     for (int64_t i = 0; i < nv; ++i) {
       Knobs k = session;
       if (i > 0 || k == relaxed) {
+        // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
         static constexpr size_t kBudgets[] = {
             size_t{4} << 10,   size_t{16} << 10, size_t{64} << 10,
             size_t{256} << 10, size_t{1} << 20,  0};
@@ -2594,10 +2628,12 @@ class OocSession {
         if (r.starts_with("malformed")) {
           return r;
         }
-        return label + "with failure #" + I(n) + ": " + r;
+        return label + "with failure #" + I(n) + ": " + r;  // NOLINT(performance-inefficient-string-concatenation)
+      // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
       }
       if (std::string leak = LeakCheck(inner); !leak.empty()) {
-        return label + "with failure #" + I(n) + ": " + leak;
+        return label + "with failure #" + I(n) + ": " + leak;  // NOLINT(performance-inefficient-string-concatenation)
+      // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
       }
       if (!fired) {
         break;  // the op makes fewer than n calls: every point was visited
@@ -2607,7 +2643,8 @@ class OocSession {
         // The statement survived the fault (spill fallback).  Undo it so the
         // next attempt starts from the same image.
         if (std::string a = OpAbort("sweep rollback"); !a.empty()) {
-          return label + "after surviving failure #" + I(n) + ": " + a;
+          return label + "after surviving failure #" + I(n) + ": " + a;  // NOLINT(performance-inefficient-string-concatenation)
+        // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
         }
       }
     }
@@ -2699,10 +2736,12 @@ class OocSession {
   void StartEvictThread() {
     {
       std::scoped_lock lk(evict_mu_);
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
       evict_pm_ = ctx_->txn_.GetPageManager();
     }
     evict_stop_.store(false);
     evict_thread_ = std::thread([this]() {
+      // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp) deterministic fuzz replay
       std::mt19937 rng(12345);
       while (!evict_stop_.load(std::memory_order_acquire)) {
         {
@@ -2780,6 +2819,7 @@ struct Flavor {
   int rows_factor;  // multiplier on the row cap of narrow tables
 };
 
+// NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
 constexpr Flavor kFlavors[] = {
     // name     ins val cpy dup  upd  del  chk  qry com abo cra reo ckp evi cmp
     //          knb inj swp snp idx ana ddl skew wide narrow tiny rows
@@ -3473,7 +3513,8 @@ std::string GenerateSession(Gen& g, OocSession& s, OocTrace& trace,
   for (size_t ti = 0; ti < s.Tables().size(); ++ti) {
     int64_t target = g.Pick(150, 900) * scale;
     if (Driver::Narrow(s.Tables()[ti])) {
-      target *= g.Pick(2, 4 * f.rows_factor);
+      target *= g.Pick(2, 4 * f.rows_factor);  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
+    // NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result) operands bounded
     }
     while (ti < s.Tables().size() &&
            std::cmp_less(s.Tables()[ti].rows.size(), target) &&
@@ -3779,7 +3820,9 @@ bool IgnoredSignature(std::string_view report) {
   while (!list.empty()) {
     const size_t semi = list.find(';');
     const std::string_view item = list.substr(0, semi);
-    if (!item.empty() && signature.find(item) != std::string::npos) {
+    // Require a meaningful token length; a 1-character ignore entry would
+    // suppress nearly every finding by substring coincidence.
+    if (item.size() >= 8 && signature.find(item) != std::string::npos) {
       return true;
     }
     if (semi == std::string_view::npos) {
@@ -4158,6 +4201,21 @@ OocTrace MinimizeOocTrace(const OocTrace& trace, std::string_view report,
   return best;
 }
 
+// Digest over the seed, profile and op lines. The seed alone cannot regenerate
+// the original libFuzzer `data` bytes, so an integrity digest is what actually
+// lets replay/minimize detect a hand-edited or merge-corrupted trace.
+std::string OocTraceDigest(uint64_t seed, std::string_view profile_text,  // NOLINT(misc-use-internal-linkage)
+                           const std::vector<std::string>& ops) {
+  std::string canonical = std::to_string(seed) + "\n";
+  canonical += profile_text;
+  canonical += "\n";
+  for (const std::string& op : ops) {
+    canonical += op;
+    canonical += "\n";
+  }
+  return digest::ToHex(digest::Sha256Digest(canonical));
+}
+
 std::string SerializeOocHeader(uint64_t seed, const OocProfile& profile) {
   return "-- sql_ooc_fuzzer regression\n-- seed: " + std::to_string(seed) +
          "\n-- profile: " + ProfileText(profile) + "\n";
@@ -4165,7 +4223,12 @@ std::string SerializeOocHeader(uint64_t seed, const OocProfile& profile) {
 
 std::string SerializeOocTest(uint64_t seed, const OocTrace& trace,
                              const std::string& failure_summary) {
-  std::string out = SerializeOocHeader(seed, trace.profile);
+  std::string out = "-- sql_ooc_fuzzer regression\n";
+  out += "-- seed: " + std::to_string(seed) + "\n";
+  const std::string profile_text = ProfileText(trace.profile);
+  out += "-- trace-digest: " + OocTraceDigest(seed, profile_text, trace.ops) +
+         "\n";
+  out += "-- profile: " + profile_text + "\n";
   out += "-- failure: " + failure_summary + "\n";
   for (const std::string& op : trace.ops) {
     out += op + "\n";
@@ -4178,6 +4241,8 @@ bool ParseOocTest(std::string_view text, uint64_t* seed, OocTrace* trace,
   *trace = OocTrace{};
   failure_summary->clear();
   bool saw_profile = false;
+  std::string expected_digest;
+  std::string profile_text;
   size_t p = 0;
   while (p < text.size()) {
     size_t nl = text.find('\n', p);
@@ -4193,8 +4258,22 @@ bool ParseOocTest(std::string_view text, uint64_t* seed, OocTrace* trace,
       continue;
     }
     if (line.starts_with("-- seed: ")) {
-      *seed = std::strtoull(std::string(line.substr(9)).c_str(), nullptr, 10);
+      // Strict parse like the other fuzzers: reject trailing junk / overflow
+      // instead of silently mapping a corrupt regression to 0/ULLONG_MAX.
+      const std::string seed_text(line.substr(9));
+      try {
+        size_t used = 0;
+        *seed = std::stoull(seed_text, &used);
+        if (used != seed_text.size()) {
+          return false;
+        }
+      } catch (const std::exception&) {
+        return false;
+      }
+    } else if (line.starts_with("-- trace-digest: ")) {
+      expected_digest = std::string(line.substr(17));
     } else if (line.starts_with("-- profile: ")) {
+      profile_text = std::string(line.substr(12));
       if (!ParseProfile(line.substr(12), &trace->profile)) {
         return false;
       }
@@ -4207,7 +4286,16 @@ bool ParseOocTest(std::string_view text, uint64_t* seed, OocTrace* trace,
       trace->ops.emplace_back(line);
     }
   }
-  return saw_profile && !trace->ops.empty();
+  if (!saw_profile || trace->ops.empty()) {
+    return false;
+  }
+  if (!expected_digest.empty() &&
+      expected_digest != OocTraceDigest(*seed, profile_text, trace->ops)) {
+    // A committed trace whose ops/profile were edited after generation no
+    // longer matches its recorded seed/digest: refuse to call it a replay.
+    return false;
+  }
+  return true;
 }
 
 void OocFuzzTry(const uint8_t* data, size_t size, bool verbose) {

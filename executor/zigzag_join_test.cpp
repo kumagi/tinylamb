@@ -116,7 +116,7 @@ class FailingSource final : public ExecutorBase {
 
 class ErrorExpression final : public ExpressionBase {
  public:
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kInvalid; }
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInvalid; }
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
                                const Schema& /*schema*/) const override {
     return {};
@@ -151,7 +151,7 @@ TEST(ZigZagJoinTest, EqualityIsLeftMajorAndPreservesDuplicateMultiplicity) {
       std::make_shared<PositionedSource>(left_rows, left_positions), 0,
       std::make_shared<PositionedSource>(right_rows, right_positions), 0,
       BinaryOperation::kEquals, Comparison(BinaryOperation::kEquals),
-      output_schema);
+      output_schema, output_schema);
 
   std::vector<Row> output;
   std::vector<RowPosition> positions;
@@ -213,7 +213,7 @@ TEST(ZigZagJoinTest, EveryIntegerRangeMatchesNestedLoopSemantics) {
       }
     }
     ZigZagJoin join(Source(left_rows), 0, Source(right_rows), 0, operation,
-                    Comparison(operation), output_schema);
+                    Comparison(operation), output_schema, output_schema);
     EXPECT_EQ(Drain(&join), expected_rows) << static_cast<int>(operation);
     EXPECT_EQ(join.GetStatus(), Status::kSuccess)
         << static_cast<int>(operation);
@@ -231,7 +231,7 @@ TEST(ZigZagJoinTest, EmptyAndBatchPathsAreStable) {
   const auto make_join = [&]() {
     return std::make_shared<ZigZagJoin>(
         Source(left_rows), 0, Source(right_rows), 0, BinaryOperation::kLessThan,
-        Comparison(BinaryOperation::kLessThan), output_schema);
+        Comparison(BinaryOperation::kLessThan), output_schema, output_schema);
   };
   auto row_join = make_join();
   const std::vector<Row> row_output = Drain(row_join.get());
@@ -253,12 +253,14 @@ TEST(ZigZagJoinTest, EmptyAndBatchPathsAreStable) {
 
   ZigZagJoin empty_left(Source({}), 0, Source(right_rows), 0,
                         BinaryOperation::kLessThan,
-                        Comparison(BinaryOperation::kLessThan), output_schema);
+                        Comparison(BinaryOperation::kLessThan), output_schema,
+                        output_schema);
   EXPECT_TRUE(Drain(&empty_left).empty());
   EXPECT_EQ(empty_left.GetStatus(), Status::kSuccess);
   ZigZagJoin empty_right(Source(left_rows), 0, Source({}), 0,
                          BinaryOperation::kLessThan,
-                         Comparison(BinaryOperation::kLessThan), output_schema);
+                         Comparison(BinaryOperation::kLessThan), output_schema,
+                         output_schema);
   EXPECT_TRUE(Drain(&empty_right).empty());
   EXPECT_EQ(empty_right.GetStatus(), Status::kSuccess);
 }
@@ -272,7 +274,8 @@ TEST(ZigZagJoinTest, UnsupportedTypeUnsortedInputAndPredicateErrorFail) {
 
   ZigZagJoin unsorted(Source({Row({Value(2)}), Row({Value(1)})}), 0,
                       Source({Row({Value(2)})}), 0, BinaryOperation::kEquals,
-                      Comparison(BinaryOperation::kEquals), output_schema);
+                      Comparison(BinaryOperation::kEquals), output_schema,
+                      output_schema);
   while (unsorted.Next(&row, &position)) {
   }
   EXPECT_EQ(unsorted.GetStatus(), Status::kInvalidArgument);
@@ -284,7 +287,8 @@ TEST(ZigZagJoinTest, UnsupportedTypeUnsortedInputAndPredicateErrorFail) {
       ColumnValueExp(ColumnName("r", "k")));
   ZigZagJoin unsupported(
       Source({Row({Value(1.0)})}), 0, Source({Row({Value(1.0)})}), 0,
-      BinaryOperation::kEquals, double_predicate, double_left + double_right);
+      BinaryOperation::kEquals, double_predicate, double_left + double_right,
+      double_left + double_right);
   EXPECT_FALSE(unsupported.Next(&row, &position));
   EXPECT_EQ(unsupported.GetStatus(), Status::kInvalidArgument);
 
@@ -293,13 +297,27 @@ TEST(ZigZagJoinTest, UnsupportedTypeUnsortedInputAndPredicateErrorFail) {
       std::make_shared<ErrorExpression>());
   ZigZagJoin predicate_error(
       Source({Row({Value(1)})}), 0, Source({Row({Value(1)})}), 0,
-      BinaryOperation::kEquals, error_predicate, output_schema);
+      BinaryOperation::kEquals, error_predicate, output_schema, output_schema);
   EXPECT_FALSE(predicate_error.Next(&row, &position));
   EXPECT_EQ(predicate_error.GetStatus(), Status::kInvalidArgument);
 
+  // T3510: the residual predicate is compiled against the CONCATENATED
+  // input schemas. Evaluating it against the (possibly renamed) output
+  // schema made qualified references unresolvable / mis-slotted.
+  const Schema renamed_output(
+      "out", {Column("v1", ValueType::kInt64), Column("v2", ValueType::kInt64)});
+  ZigZagJoin combined_domain(
+      Source({Row({Value(1)}), Row({Value(3)})}), 0,
+      Source({Row({Value(1)}), Row({Value(3)})}), 0, BinaryOperation::kEquals,
+      Comparison(BinaryOperation::kEquals), output_schema, renamed_output);
+  const std::vector<Row> matched = Drain(&combined_domain);
+  EXPECT_EQ(combined_domain.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(matched.size(), 2U);
+
   ZigZagJoin child_error(std::make_shared<FailingSource>(), 0,
                          Source({Row({Value(1)})}), 0, BinaryOperation::kEquals,
-                         Comparison(BinaryOperation::kEquals), output_schema);
+                         Comparison(BinaryOperation::kEquals), output_schema,
+                         output_schema);
   EXPECT_FALSE(child_error.Next(&row, &position));
   EXPECT_EQ(child_error.GetStatus(), Status::kRuntimeError);
 }
@@ -387,7 +405,7 @@ TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
   const auto plan =
       std::dynamic_pointer_cast<ZigZagJoinPlan>(alternatives.front().plan);
   ASSERT_NE(plan, nullptr);
-  EXPECT_EQ(plan->Operation(), BinaryOperation::kEquals);
+  EXPECT_EQ(plan->Comparison(), BinaryOperation::kEquals);
   EXPECT_TRUE(plan->IsOrderedBy({ColumnValueExp(left_key)}, {true}));
 
   Executor executor = plan->EmitExecutor(read_context);
@@ -433,7 +451,7 @@ TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
   ASSERT_NE(swapped_plan, nullptr);
   EXPECT_EQ(swapped_plan->LeftKey(), right_key);
   EXPECT_EQ(swapped_plan->RightKey(), left_key);
-  EXPECT_EQ(swapped_plan->Operation(), BinaryOperation::kGreaterThanEquals);
+  EXPECT_EQ(swapped_plan->Comparison(), BinaryOperation::kGreaterThanEquals);
   Executor swapped_executor = swapped_plan->EmitExecutor(read_context);
   const std::vector<Row> swapped_output = Drain(swapped_executor.get());
   ASSERT_EQ(swapped_output.size(), 7U);

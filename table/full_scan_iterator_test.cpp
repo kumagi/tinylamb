@@ -98,7 +98,18 @@ class FullScanIteratorTest : public ::testing::Test {
   std::unique_ptr<Database> db_;
 };
 
-TEST_F(FullScanIteratorTest, Construct_Default_Succeeds) {}
+TEST_F(FullScanIteratorTest, Construct_Default_Succeeds) {
+  // T4521: the body was empty, so the contract behind the name had no
+  // guard. FullScanIterator's ctors are private (Table is the friend), so
+  // the default-options construction path is Table::BeginFullScan. Pin it:
+  // a fresh scan over the fixture's empty SampleTable constructs, reports
+  // no error, starts exhausted, and destroys clean.
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+  Iterator it = table.BeginFullScan(ctx.txn_);
+  EXPECT_EQ(it.GetStatus(), Status::kSuccess);
+  EXPECT_FALSE(it.IsValid());
+}
 
 // A non-empty columnar store built before a committed row mutation is stale,
 // not a reason to keep declining rebuilds: columnar acceleration must come
@@ -155,7 +166,7 @@ TEST(LSTableIntegerRunsTest, ExactGapsConcurrentReuseAndBudgetedLifetime) {
     store.column_is_monotonic = {1};
     std::vector<std::future<std::shared_ptr<const LSTableIntegerRuns>>> readers;
     readers.reserve(4);
-for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i) {
       readers.push_back(
           std::async(std::launch::async, [&] { return store.IntegerRuns(0); }));
     }
@@ -164,7 +175,7 @@ for (int i = 0; i < 4; ++i) {
     EXPECT_EQ(retained->max_run_rows, 3);
     for (size_t i = 1; i < readers.size(); ++i) {
       EXPECT_EQ(readers[i].get(), retained);
-}
+    }
     for (int64_t key = -5; key <= 6; ++key) {
       const auto [begin, end] = retained->Find(key);
       const auto& values = store.integer_columns[0];
@@ -173,7 +184,7 @@ for (int i = 0; i < 4; ++i) {
       EXPECT_EQ(end - begin, static_cast<size_t>(last - first));
       if (begin != end) {
         EXPECT_EQ(begin, static_cast<size_t>(first - values.begin()));
-}
+      }
     }
     EXPECT_GT(budget.ColumnarUsed(), before);
   }
@@ -205,11 +216,12 @@ TEST(LSTableIntegerRunsTest, MaximumRunBoundsIncludeSkewAndEndpoints) {
     for (int64_t key : keys) {
       expected = std::max(expected, static_cast<uint32_t>(std::count(
                                         keys.begin(), keys.end(), key)));
-}
+    }
     EXPECT_EQ(index->max_run_rows, expected);
     uint32_t runs = 1;
-    for (size_t i = 1; i < keys.size(); ++i) { runs += static_cast<uint32_t>(keys[i] != keys[i - 1]);
-}
+    for (size_t i = 1; i < keys.size(); ++i) {
+      runs += static_cast<uint32_t>(keys[i] != keys[i - 1]);
+    }
     EXPECT_EQ(index->run_count, runs);
   }
 }
@@ -231,7 +243,9 @@ TEST(LSTableIntegerRunsTest, RefusesUnprovenSparseAndUnbudgetedInputs) {
   EXPECT_EQ(store.IntegerRuns(0), nullptr);
   store.integer_columns[0] = {0, 0, 1};
   auto& budget = ProcessMemoryBudget::Global();
-  struct RestoreLimit {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct RestoreLimit {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t old = ProcessMemoryBudget::Global().ColumnarPoolLimit();
     ~RestoreLimit() {
       ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(old);
@@ -261,20 +275,21 @@ TEST(LSTableIntegerRunsTest, RunBoundsKeepExactExtremaAndBudgetedLifetime) {
       std::vector<std::future<std::shared_ptr<const LSTableIntegerRunBounds>>>
           readers;
       readers.reserve(4);
-for (int i = 0; i < 4; ++i) {
+      for (int i = 0; i < 4; ++i) {
         readers.push_back(std::async(
             std::launch::async, [&] { return store.IntegerRunBounds(0, 1); }));
-}
+      }
       retained = readers[0].get();
       ASSERT_NE(retained, nullptr);
       for (size_t i = 1; i < readers.size(); ++i) {
         EXPECT_EQ(readers[i].get(), retained);
-}
+      }
       for (int64_t key : {-3, 0, 4}) {
         int64_t lo = INT64_MAX, hi = INT64_MIN;
         for (size_t r = 0; r < store.total_rows; ++r) {
-          if (store.integer_columns[0][r] != key) { continue;
-}
+          if (store.integer_columns[0][r] != key) {
+            continue;
+          }
           lo = std::min(lo, store.integer_columns[1][r]);
           hi = std::max(hi, store.integer_columns[1][r]);
         }
@@ -288,10 +303,10 @@ for (int i = 0; i < 4; ++i) {
         EXPECT_FALSE(retained->MayOverlap(key, hi, lo - (lo != INT64_MIN)));
         if (lo != INT64_MIN) {
           EXPECT_FALSE(retained->MayOverlap(key, INT64_MIN, lo - 1));
-}
+        }
         if (hi != INT64_MAX) {
           EXPECT_FALSE(retained->MayOverlap(key, hi + 1, INT64_MAX));
-}
+        }
         EXPECT_FALSE(retained->MayExceed(key, hi));
         EXPECT_TRUE(retained->MayExceed(key, hi - 1));
       }
@@ -338,7 +353,7 @@ TEST(LSTableIntegerRunsTest, SparseRunBoundsKeepHolesRanksAndEndpoints) {
     EXPECT_FALSE(bounds->MayOverlap(base + 4401, INT64_MIN, INT64_MAX));
     if (base != INT64_MIN) {
       EXPECT_FALSE(bounds->MayOverlap(base - 1, INT64_MIN, INT64_MAX));
-}
+    }
   }
 }
 
@@ -357,7 +372,9 @@ TEST(LSTableIntegerRunsTest, CoarseRunBoundsNeverRejectMatchingRows) {
     store.column_is_monotonic = {1, 0};
     ASSERT_NE(store.IntegerRuns(0), nullptr);
     auto& budget = ProcessMemoryBudget::Global();
-    struct RestoreLimit {
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+    // non-copyable by design
+    struct RestoreLimit {  // NOLINT(cppcoreguidelines-special-member-functions)
       size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
       ~RestoreLimit() {
         ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
@@ -377,8 +394,9 @@ TEST(LSTableIntegerRunsTest, CoarseRunBoundsNeverRejectMatchingRows) {
       const int64_t key = store.integer_columns[0][row];
       const int64_t value = store.integer_columns[1][row];
       EXPECT_TRUE(bounds->MayOverlap(key, value, value));
-      if (value != INT64_MIN) { EXPECT_TRUE(bounds->MayExceed(key, value - 1));
-}
+      if (value != INT64_MIN) {
+        EXPECT_TRUE(bounds->MayExceed(key, value - 1));
+      }
       const auto [lo, hi] = bounds->ValueBounds(bounds->BoundsOffset(key));
       EXPECT_LE(lo, value);
       EXPECT_GE(hi, value);
@@ -386,10 +404,10 @@ TEST(LSTableIntegerRunsTest, CoarseRunBoundsNeverRejectMatchingRows) {
       EXPECT_LE(hi, base + 65535);
       if (lo != INT64_MIN) {
         EXPECT_FALSE(bounds->MayOverlap(key, INT64_MIN, lo - 1));
-}
+      }
       if (hi != INT64_MAX) {
         EXPECT_FALSE(bounds->MayOverlap(key, hi + 1, INT64_MAX));
-}
+      }
       EXPECT_FALSE(bounds->MayOverlap(key, 1, 0));
       EXPECT_FALSE(bounds->MayOverlap(key + 1, INT64_MIN, INT64_MAX));
     }
@@ -410,7 +428,9 @@ TEST(LSTableIntegerRunsTest, RunBoundsRefuseNullWideAndUnbudgetedColumns) {
       EXPECT_EQ(store.IntegerRunBounds(0, 1), nullptr);
       continue;
     }
-    struct RestoreLimit {
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+    // non-copyable by design
+    struct RestoreLimit {  // NOLINT(cppcoreguidelines-special-member-functions)
       size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
       ~RestoreLimit() {
         ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
@@ -443,7 +463,7 @@ TEST_F(FullScanIteratorTest,
   for (int64_t i = 0; i < 9000; ++i) {
     ASSERT_SUCCESS(
         table.Insert(load.txn_, Row({Value(i), Value(-i)})).GetStatus());
-}
+  }
   ASSERT_SUCCESS(load.PreCommit());
   auto reader = db_->BeginReadOnlyContext();
   table.RejectLSTableCapacity(table.LayoutGeneration());
@@ -451,14 +471,18 @@ TEST_F(FullScanIteratorTest,
   auto original = GetOrBuildLSTableStore(reader.txn_, table, true, &first);
   ASSERT_NE(original, nullptr);
   auto& budget = ProcessMemoryBudget::Global();
-  constexpr size_t cap = 2 * 1024 * 1024;
+  // NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result)
+  // operands bounded
+  constexpr size_t cap = 2 * 1024 * 1024;  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
   ASSERT_LT(budget.ColumnarUsed(), cap - 65536);
   // Model a large old image without putting MiB of row payload in a unit test.
   ASSERT_TRUE(
       original->memory_charge->TryAdd(cap - 65536 - budget.ColumnarUsed()));
   std::weak_ptr<const LSTableStore> old_image = original;
   original.reset();
-  struct RestoreLimit {
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct RestoreLimit {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
     ~RestoreLimit() {
       ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
@@ -485,7 +509,7 @@ TEST_F(FullScanIteratorTest, IntegerRunIndexStaysWithItsLayoutImage) {
       db_->CreateTable(ctx, Schema("Runs", {Column("k", ValueType::kInt64)})));
   for (int64_t k : {-3, -3, 0, 4, 4}) {
     ASSERT_SUCCESS(table.Insert(ctx.txn_, Row({Value(k)})).GetStatus());
-}
+  }
   const auto original = BuildLSTableStore(ctx.txn_, table);
   ASSERT_NE(original, nullptr);
   const auto old_index = original->IntegerRuns(0);

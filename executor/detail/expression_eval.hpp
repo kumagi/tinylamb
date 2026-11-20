@@ -299,6 +299,9 @@ struct AggregateAccumulator {
   mutable int64_t sketch_precision_ = 0;
   // PERCENTILE_CONT inputs and the group-wide percentile parameter.
   mutable std::vector<double> percentile_values_;
+  // T2243: PERCENTILE_DISC must return an actual input element (type
+  // preserved), so keep the original Values next to the double projection.
+  mutable std::vector<Value> percentile_originals_;
   double percentile_p_ = 0;
   bool percentile_p_valid_ = false;
   // APPROX_COUNT_DISTINCT distinct-value tracking (exact within engine).

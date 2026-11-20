@@ -54,7 +54,7 @@ OOC修正後の性能再測定でQ28が2倍を超えたため、範囲条件の�
 [検証記録](../../build/benchmarks/tpcds-sf1-sequential-20261117/validation/verification.json)。
 
 ```sh
-/var/tmp/tinylamb-comparison-venv/bin/python benchmark/comparison/tpcds.py \
+/var/tmp/tinylamb-tpcds-venv/bin/python benchmark/comparison/tpcds.py \
   --dataset build/benchmarks/tpcds-sf1-scaling-fixture-20261111/dataset \
   --fixture build/benchmarks/tpcds-sf1-sequential-20261117/native \
   --binary build-tpcds-release/tinylamb_tpcds_compare \

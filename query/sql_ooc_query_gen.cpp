@@ -15,8 +15,11 @@ namespace {
 std::string I(int64_t x) { return std::to_string(x); }
 
 const std::vector<std::string>& TagLits() {
-  static const std::vector<std::string> kLits = {"'a'", "'bb'", "'ccc'",
-                                                 "'dddd'"};
+  // Include empty, upper-case and non-ASCII literals so VARCHAR predicates
+  // exercise collation, length boundaries and UTF-8 paths, not only the
+  // four ASCII lowercase tags GenRow happens to insert.
+  static const std::vector<std::string> kLits = {
+      "'a'", "'bb'", "'ccc'", "'dddd'", "''", "'A'", "'\xC3\x84'"};
   return kLits;
 }
 
@@ -1088,7 +1091,9 @@ class Builder {
   OocGenQuery Band() {
     const OocGenTable& ta = T();
     const OocGenTable& tb = T();
+    // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
     int64_t cap_a = ta.rows + 1;
+    // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
     int64_t cap_b = tb.rows + 1;
     std::string on;
     std::string shape;

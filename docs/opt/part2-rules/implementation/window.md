@@ -1,6 +1,6 @@
 # window
 
-- 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft / 執筆基準リビジョン: `72ad60a` (2026-11-19)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内（登録名 `"window"`、パターンは `cascades::dsl::Window()`、対応論理演算子は `LogicalOperator::kWindow`）
 
 ## 概要
@@ -59,9 +59,9 @@ graph TD
 `plan/implementation_rules.cpp` は `WindowPlan` のメモリ形状を `WindowPolicyForRows(rows)`（`plan/window_plan.hpp`）で選択します。推定行数が既定 64 MiB 予算内に収まる場合は buffered 形、超える場合（かつ全ウィンドウ呼び出しが共通の `PARTITION BY` キーを持つ場合）はパーティション分割スピル形（`WindowExecutor::Options` または既定パイプライン実行時は `OocWindowSink`）を用います。
 
 ```cpp
-          Plan window = std::make_shared<WindowPlan>(children[0].plan,
-                                                     logical.target_list);
           const double rows = children[0].estimated_rows;
+          Plan window = std::make_shared<WindowPlan>(
+              children[0].plan, logical.target_list, WindowPolicyForRows(rows));
           const double cost = rows * std::log2(std::max(2.0, rows));
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(window),
@@ -83,7 +83,7 @@ graph TD
 - `split_window`: 異なる `PARTITION BY` / `ORDER BY` 仕様を持つ複数のウィンドウ関数を個別の `kWindow` ノードへと分割し、本 Rule の適用前提を整える論理 Rule。
 - `merge_adjacent_windows`: 同一のパーティション仕様を持つ連続した `kWindow` ノードを 1 つにマージする論理 Rule。
 - `no_op_window_elimination`: 空のウィンドウノードを消去する論理 Rule。
-- `merge_adjacent_windows`: フレーム間のソートを共有して実行負荷を削減する論理 Rule。
+- `share_frame_sort`: フレーム間のソートを共有して実行負荷を削減する論理 Rule。
 - `sort`: 本 Rule と同一の $N \log_2 N$ コスト式を持つ物理ソート実装 Rule。
 
 ## 検証テスト

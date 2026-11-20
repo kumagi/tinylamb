@@ -6,7 +6,7 @@
 #ifndef TINYLAMB_PLAN_CACHE_HPP
 #define TINYLAMB_PLAN_CACHE_HPP
 
-// Phase 2-1: compiled-plan cache ("prepared plans"), docs/next-actions.md.
+// Phase 2-1: compiled-plan cache ("prepared plans"), the compiled-plan cache design notes.
 //
 // Key:    SQL fingerprint + database schema/statistics epoch.
 // Value:  a CompiledPlan, one of
@@ -138,11 +138,15 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
                                 unary.Op());
     }
     case TypeTag::kAggregateExp: {
-      const auto& aggregate = expression->AsAggregateExpression();
-      return AggregateExpressionExp(
-          aggregate.GetType(),
-          CloneWithPreparedValues(aggregate.Child(), values),
-          aggregate.Distinct());
+      // P295: rebuild every attribute ContainsParameterSlot descends into
+      // (WHERE filter, HAVING, inner ORDER BY / GROUP BY, secondary and
+      // trailing args), not just (type, child, distinct).
+      return RebuildAggregateAttributes(
+          expression,
+          [&](const Expression& inner) {
+            return CloneWithPreparedValues(inner, values);
+          },
+          /*ok=*/nullptr);
     }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
@@ -196,7 +200,7 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
 }
 
 // True when evaluating `expression` per row could yield different results
-// between executions of the same cached artifact (currently CURRENT_TIMESTAMP;
+// between executions of the same cached artifact (e.g. CURRENT_TIMESTAMP;
 // function names arrive lowercased from the frontend).
 inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
     const Expression& expression) {
@@ -407,7 +411,7 @@ inline bool& CurrentVolatileFingerprintsSaturated() {
 }
 
 // A reused SELECT is planned again when a later execution is slower than
-// 50ms and at least 8x the first replay. Point lookups stay cached. A plan
+// 50ms and more than 8x the first replay. Point lookups stay cached. A plan
 // that becomes pathologically slow for a new literal is dropped.
 inline constexpr uint64_t kSelectReuseLatencyFloorNs = 50'000'000ULL;
 inline constexpr uint64_t kSelectReuseLatencyFactor = 8;
@@ -538,6 +542,7 @@ class PreparedPlanCache {
     if (found != shard.index.end()) {
       found->second->plan = std::move(plan);
       shard.lru.splice(shard.lru.begin(), shard.lru, found->second);
+      PlanCacheStats().fills.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     shard.lru.push_front(

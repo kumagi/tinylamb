@@ -39,7 +39,7 @@ def compare(baseline, following, max_loss=10, inclusive=False):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--baseline', type=Path, default=Path(__file__).parent / 'results/2026-10-29-gap-plan/gaps.json')
+    p.add_argument('--baseline', type=Path, default=None, help='Path to a committed gaps.json baseline; no default (results/ is gitignored).')
     p.add_argument('--run', action='append', required=True, help='profile=directory; later runs replace matching conditions')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--reference-engine', choices=('postgresql', 'mysql'), default='postgresql')

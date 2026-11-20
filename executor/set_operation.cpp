@@ -72,25 +72,6 @@ StatusOr<ValueType> CommonSetValueType(ValueType left, ValueType right) {
                      "set operation inputs have incompatible types");
 }
 
-struct HashedRowRef {
-  const Row* row{nullptr};
-  uint64_t hash{0};
-};
-
-struct HashedRowRefHash {
-  size_t operator()(const HashedRowRef& ref) const noexcept {
-    return static_cast<size_t>(ref.hash);
-  }
-};
-
-struct HashedRowRefEqual {
-  bool operator()(const HashedRowRef& left,
-                  const HashedRowRef& right) const noexcept {
-    return left.hash == right.hash &&
-           SetOperationRowEqual{}(*left.row, *right.row);
-  }
-};
-
 }  // namespace
 
 bool SetOperationRowEqual::operator()(const Row& left, const Row& right) const {
@@ -323,7 +304,7 @@ Status SetOperationExecutor::MaterializeRows(
   if (operation_ != SetOperationKind::kUnionAll && workers > 1) {
     constexpr size_t kShards = 64;
     struct ShardItem {
-      uint32_t row_idx{0};
+      size_t row_idx{0};
       uint64_t hash{0};
     };
     const size_t num_sources = rows.size();
@@ -343,12 +324,12 @@ Status SetOperationExecutor::MaterializeRows(
           const uint64_t h = hasher(src[i].row);
           const size_t shard = (h ^ (h >> 29)) & (kShards - 1);
           bins[shard].push_back(
-              ShardItem{.row_idx = static_cast<uint32_t>(i), .hash = h});
+              ShardItem{.row_idx = i, .hash = h});
         }
       }
     }));
 
-    std::array<std::vector<std::pair<uint32_t, uint32_t>>, kShards> shard_picks;
+    std::array<std::vector<std::pair<size_t, size_t>>, kShards> shard_picks;
     const SetOperationKind op = operation_;
     RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
       for (size_t shard = w; shard < kShards; shard += workers) {
@@ -534,7 +515,7 @@ Status SetOperationExecutor::MaterializeRows(
     RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
       local_shards[w].clear();
       for (size_t shard = w; shard < kShards; shard += workers) {
-        std::vector<std::pair<uint32_t, uint32_t>>().swap(shard_picks[shard]);
+        std::vector<std::pair<size_t, size_t>>().swap(shard_picks[shard]);
       }
       for (auto& src : rows) {
         const size_t lo = (src.size() * w) / workers;
@@ -686,8 +667,9 @@ void SetOperationExecutor::AppendAll(const std::vector<Positioned>& source) {
 
 void SetOperationExecutor::AppendDistinct(const std::vector<Positioned>& source,
                                           SetOperationRowSet* seen) {
+  const SetOperationRowHash hasher;
   for (const Positioned& item : source) {
-    if (seen->insert(item.row).second) {
+    if (seen->emplace(HashedRowRef{.row = &item.row, .hash = hasher(item.row)}).second) {
       output_.push_back(item);
     }
   }
@@ -698,14 +680,15 @@ void SetOperationExecutor::AppendIntersection(
   if (rows.empty()) {
     return;
   }
+  const SetOperationRowHash hasher;
   SetOperationRowMap counts;
   for (const Positioned& item : rows[0]) {
-    ++counts[item.row];
+    ++counts[HashedRowRef{.row = &item.row, .hash = hasher(item.row)}];
   }
   for (size_t source = 1; source < rows.size(); ++source) {
     SetOperationRowMap current;
     for (const Positioned& item : rows[source]) {
-      ++current[item.row];
+      ++current[HashedRowRef{.row = &item.row, .hash = hasher(item.row)}];
     }
     for (auto iter = counts.begin(); iter != counts.end();) {
       const auto found = current.find(iter->first);
@@ -719,16 +702,17 @@ void SetOperationExecutor::AppendIntersection(
   }
   SetOperationRowSet emitted;
   for (const Positioned& item : rows[0]) {
-    const auto found = counts.find(item.row);
+    const HashedRowRef ref{.row = &item.row, .hash = hasher(item.row)};
+    const auto found = counts.find(ref);
     if (found == counts.end() || found->second == 0) {
       continue;
     }
-    if (!all && !emitted.insert(item.row).second) {
+    if (!all && !emitted.emplace(ref).second) {
       continue;
     }
     output_.push_back(item);
-    if (--counts[item.row] == 0) {
-      counts.erase(item.row);
+    if (--counts[ref] == 0) {
+      counts.erase(ref);
     }
   }
 }
@@ -738,15 +722,17 @@ void SetOperationExecutor::AppendExcept(
   if (rows.empty()) {
     return;
   }
+  const SetOperationRowHash hasher;
   SetOperationRowMap removed;
   for (size_t source = 1; source < rows.size(); ++source) {
     for (const Positioned& item : rows[source]) {
-      ++removed[item.row];
+      ++removed[HashedRowRef{.row = &item.row, .hash = hasher(item.row)}];
     }
   }
   SetOperationRowSet emitted;
   for (const Positioned& item : rows[0]) {
-    const auto found = removed.find(item.row);
+    const HashedRowRef ref{.row = &item.row, .hash = hasher(item.row)};
+    const auto found = removed.find(ref);
     if (found != removed.end() && found->second != 0) {
       // EXCEPT DISTINCT removes the value as a set, regardless of how many
       // copies occur on the left. EXCEPT ALL consumes one right-hand copy per
@@ -763,7 +749,7 @@ void SetOperationExecutor::AppendExcept(
       }
       continue;
     }
-    if (!all && !emitted.insert(item.row).second) {
+    if (!all && !emitted.emplace(ref).second) {
       continue;
     }
     output_.push_back(item);
@@ -859,8 +845,8 @@ size_t SetOperationExecutor::NextBatch(DataChunk* destination,
     }
   }
   while (destination->Size() < max_rows && output_offset_ < output_.size()) {
-    const Positioned& item = output_[output_offset_++];
-    destination->Append(item.row, item.position);
+    Positioned& item = output_[output_offset_++];
+    destination->Append(std::move(item.row), item.position);
   }
   return destination->Size();
 }

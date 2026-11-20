@@ -1,7 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
 // ParallelIndexScan: the ParallelIndexScan consumer.  The requested key
-// range is partitioned at B+Tree leaf boundaries and scanned by workers; the
+// range is partitioned at virtual LSM key-count boundaries and scanned by workers; the
 // morsel-ordered handoff must reproduce the serial IndexScan's rows (and
 // their row positions) exactly, including keys whose duplicates span leaf
 // boundaries.

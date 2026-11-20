@@ -52,11 +52,17 @@ bool SendAll(int fd, const std::string& bytes) {
   return true;
 }
 
-std::string StartupMessage() {
+std::string StartupMessage(size_t application_name_bytes = 0) {
   std::string message;
   pgwire::AppendUint32(&message, 0);
   pgwire::AppendUint32(&message, pgwire::kProtocolVersion30);
-  message.append("user\0test\0database\0test\0\0", 25);
+  message.append("user\0test\0database\0test\0", 24);
+  if (application_name_bytes != 0) {
+    message.append("application_name\0", 17);
+    message.append(application_name_bytes, 'x');
+    message.push_back('\0');
+  }
+  message.push_back('\0');
   const auto size = static_cast<uint32_t>(message.size());
   message[0] = static_cast<char>((size >> 24U) & 0xffU);
   message[1] = static_cast<char>((size >> 16U) & 0xffU);
@@ -121,7 +127,7 @@ char ReadyForQueryStatus(const std::string& wire) {
   return '?';
 }
 
-int ConnectClient(uint16_t port) {
+int ConnectClient(uint16_t port, size_t application_name_bytes = 0) {
   const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   if (client < 0) {
     return -1;
@@ -132,11 +138,26 @@ int ConnectClient(uint16_t port) {
   if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1 ||
       connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
           0 ||
-      !SendAll(client, StartupMessage()) || ReadUntilReady(client).empty()) {
+      !SendAll(client, StartupMessage(application_name_bytes)) ||
+      ReadUntilReady(client).empty()) {
     close(client);
     return -1;
   }
   return client;
+}
+
+// T4979: DirectReplyCount is bumped on the worker side after its reply
+// bytes are handed to the socket layer; a client that already read the
+// reply does not prove the counter moved. Under ctest -j load the worker's
+// bookkeeping can lag a 1s wall-clock wait, so poll with a generous
+// deadline and let the caller's assertion decide.
+void WaitForDirectReplyAbove(const PostgresServer& server, uint64_t before) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (server.DirectReplyCount() <= before &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 // Requests a clean server shutdown on scope exit.
@@ -243,7 +264,7 @@ TEST(PostgresServerExtraTest, PendingDurableRepliesDoNotOccupySqlWorkers) {
       ASSERT_GE(writers.back(), 0);
     }
     SyncGate gate;
-    for (int i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < 8; ++i) {
       ASSERT_TRUE(
           SendAll(writers[i], QueryMessage("INSERT INTO durable_rows VALUES (" +
                                            std::to_string(i) + ", 10)")));
@@ -329,7 +350,12 @@ TEST(PostgresServerExtraTest, FailedDurabilityNeverAcknowledgesCommit) {
   gate.Release();
   const auto response = ReadUntilReady(client);
   EXPECT_EQ(response.find("COMMIT"), std::string::npos);
-  EXPECT_NE(response.find("40001"), std::string::npos);
+  // A durability failure happens after the commit was published: retrying the
+  // statement would double-apply it, so this must NOT be 40001 (serialization
+  // failure / "rolled back, safe to retry"). It uses the non-retryable
+  // internal-error SQLSTATE instead.
+  EXPECT_EQ(response.find("40001"), std::string::npos);
+  EXPECT_NE(response.find("XX000"), std::string::npos);
   EXPECT_EQ(ReadyForQueryStatus(response), 'I');
   close(client);
 }
@@ -586,6 +612,60 @@ TEST(PostgresServerExtraTest, DistinctKeyChurnKeepsOtherSessionsIndependent) {
   database->DeleteAll();
 }
 
+TEST(PostgresServerExtraTest, AcceptsStartupAtPostgresPacketLimit) {
+  PostgresServerOptions options;
+  options.port = 0;
+  PostgresServer server("postgres_large_startup-" + RandomString(), options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
+  StopGuard stop(&server);
+
+  constexpr size_t name_bytes = 10004 - 51;
+  ASSERT_EQ(StartupMessage(name_bytes).size(), 10004U);
+  const int fd = ConnectClient(server.BoundPort(), name_bytes);
+  ASSERT_GE(fd, 0);
+  ASSERT_TRUE(SendAll(fd, QueryMessage("SELECT 42")));
+  EXPECT_NE(ReadUntilReady(fd).find(pgwire::DataRow(Row({Value(42)}))),
+            std::string::npos);
+  close(fd);
+  EXPECT_EQ(ConnectClient(server.BoundPort(), name_bytes + 1), -1);
+}
+
+TEST(PostgresServerExtraTest,
+     RowDescriptionUsesDeclaredTypesForNullAndEmptyResults) {
+  PostgresServerOptions options;
+  options.port = 0;
+  PostgresServer server("postgres_null_types-" + RandomString(), options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
+  StopGuard stop(&server);
+  const int fd = ConnectClient(server.BoundPort());
+  ASSERT_GE(fd, 0);
+  for (const std::string sql : {"CREATE TABLE typed_rows (id INT64)",
+                                "INSERT INTO typed_rows VALUES (7), (NULL)"}) {
+    ASSERT_TRUE(SendAll(fd, QueryMessage(sql)));
+    ASSERT_NE(ReadUntilReady(fd).find(pgwire::CommandComplete(
+                  sql.starts_with("CREATE") ? "CREATE TABLE" : "INSERT 0 2")),
+              std::string::npos);
+  }
+  for (const std::string sql :
+       {"SELECT CAST(NULL AS INT64) AS id",
+        "SELECT CAST(NULL AS INT64) AS id FROM typed_rows",
+        "SELECT SAFE_CAST('bad' AS INT64) AS id",
+        "SELECT id FROM typed_rows ORDER BY id NULLS FIRST",
+        "SELECT id FROM typed_rows WHERE FALSE",
+        "SELECT CAST(NULL AS INT64) AS id UNION ALL SELECT NULL"}) {
+    SCOPED_TRACE(sql);
+    ASSERT_TRUE(SendAll(fd, QueryMessage(sql)));
+    const std::string reply = ReadUntilReady(fd);
+    EXPECT_TRUE(
+        reply.starts_with(pgwire::RowDescription({{"id", ValueType::kInt64}})));
+  }
+  close(fd);
+}
+
 TEST(PostgresServerExtraTest, AuditStartupAdvertisesBackslashEscapes) {
   const std::string path = "postgres_server_extra_test-" + RandomString();
   PostgresServerOptions options;
@@ -629,9 +709,10 @@ TEST(PostgresServerExtraTest, AuditCommitStartsAnotherImplicitBlock) {
       SendAll(fd, QueryMessage("CREATE TABLE audit_blocks (id INT64)")));
   ASSERT_NE(ReadUntilReady(fd).find(pgwire::CommandComplete("CREATE TABLE")),
             std::string::npos);
-  for (const std::string& boundary : {"COMMIT", "ROLLBACK"}) {
+  for (const std::string_view boundary : {"COMMIT", "ROLLBACK"}) {
     ASSERT_TRUE(SendAll(
-        fd, QueryMessage("INSERT INTO audit_blocks VALUES (1); " + boundary +
+        fd, QueryMessage("INSERT INTO audit_blocks VALUES (1); " +
+                         std::string(boundary) +
                          "; INSERT INTO audit_blocks VALUES (2); SELECT "
                          "missing FROM audit_blocks")));
     EXPECT_EQ(ReadyForQueryStatus(ReadUntilReady(fd)), 'I');
@@ -856,6 +937,101 @@ TEST(PostgresServerExtraTest, LiteralRepliesKeepExactSqlAndTransactionState) {
   close(fd);
 }
 
+// The read-only stream continuation used to run every remaining statement of
+// one Query message inline on the event loop: a burst of statements stalled
+// accept and every other connection, and kept executing after the client
+// died. The continuation now re-arms one statement per event-loop turn; the
+// wire sequence must be unchanged (one CommandComplete and one DataRow per
+// statement, exactly one trailing ReadyForQuery - the re-arm markers must
+// never emit duplicate CommandCompletes).
+TEST(PostgresServerExtraTest, MultiStatementReadOnlyChainYieldsPerStatement) {
+  const std::string path = "postgres_multi_stmt_yield-" + RandomString();
+  PostgresServerOptions options;
+  options.port = 0;
+  PostgresServer server(path, options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
+  StopGuard stop{&server};
+  const int fd = ConnectClient(server.BoundPort());
+  ASSERT_GE(fd, 0);
+  std::string chain;
+  constexpr int kStatements = 32;
+  for (int i = 0; i < kStatements; ++i) {
+    chain += "SELECT " + std::to_string(i) + " AS n;";
+  }
+  ASSERT_TRUE(SendAll(fd, QueryMessage(chain)));
+  const std::string wire = ReadUntilReady(fd);
+  ASSERT_EQ(ReadyForQueryStatus(wire), 'I');
+  size_t cursor = 0;
+  int completes = 0;
+  int data_rows = 0;
+  int readies = 0;
+  std::string last_complete;
+  while (cursor + 5 <= wire.size()) {
+    const uint32_t length = pgwire::ReadUint32(wire, cursor + 1).Value();
+    if (length < 4 || cursor + 1 + length > wire.size()) {
+      break;
+    }
+    const char type = wire[cursor];
+    if (type == 'C') {
+      ++completes;
+      // Payload is length - 4 bytes after the length field; drop its NUL.
+      last_complete = wire.substr(cursor + 5, length - 4 - 1);
+    } else if (type == 'D') {
+      ++data_rows;
+    } else if (type == 'Z') {
+      ++readies;
+    }
+    cursor += 1 + length;
+  }
+  EXPECT_EQ(completes, kStatements);
+  EXPECT_EQ(data_rows, kStatements);
+  EXPECT_EQ(readies, 1);
+  // CommandComplete carries the row count, not the statement text: the
+  // last statement (SELECT 31 AS n) returned one row.
+  EXPECT_EQ(last_complete, "SELECT 1");
+  close(fd);
+}
+
+// The exact-SQL literal reply cache belongs to the connection that produced
+// it: a literal answer can embed session state (a session constant's value),
+// so it must never be replayed to another connection.
+TEST(PostgresServerExtraTest, LiteralRepliesStayInsideTheirConnection) {
+  const std::string path = "postgres_literal_replies_scoped-" + RandomString();
+  PostgresServerOptions options;
+  options.port = 0;
+  options.read_worker_threads = 2;
+  PostgresServer server(path, options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
+  StopGuard stop{&server};
+  const int first = ConnectClient(server.BoundPort());
+  ASSERT_GE(first, 0);
+  const int second = ConnectClient(server.BoundPort());
+  ASSERT_GE(second, 0);
+  const auto query = [](int fd, const std::string& sql) {
+    EXPECT_TRUE(SendAll(fd, QueryMessage(sql)));
+    return ReadUntilReady(fd);
+  };
+  const std::string sql = "SELECT 4242 AS answer";
+  const auto cold = query(first, sql);
+  ASSERT_EQ(ReadyForQueryStatus(cold), 'I');
+  const auto before = server.CachedLiteralReplyCount();
+  // The second connection computes its own answer: no cached reply crosses
+  // the session boundary.
+  const auto other = query(second, sql);
+  EXPECT_EQ(ReadyForQueryStatus(other), 'I');
+  EXPECT_EQ(server.CachedLiteralReplyCount(), before);
+  EXPECT_EQ(other, cold);
+  // The first connection still replays its own cached reply.
+  EXPECT_EQ(query(first, sql), cold);
+  EXPECT_EQ(server.CachedLiteralReplyCount(), before + 1);
+  close(first);
+  close(second);
+}
+
 TEST(PostgresServerExtraTest, DirectReplyRestartsIdleTimeout) {
   const std::string path = "postgres_direct_idle-" + RandomString();
   PostgresServerOptions options;
@@ -897,6 +1073,11 @@ TEST(PostgresServerExtraTest, DirectReplyRestartsIdleTimeout) {
   ASSERT_TRUE(SendAll(fd, QueryMessage("SELECT id FROM idle_rows")));
   EXPECT_NE(ReadUntilReady(fd).find(pgwire::DataRow(Row({Value(2)}))),
             std::string::npos);
+  // T4979: DirectReplyCount is bumped by the worker after its reply bytes
+  // are handed out; the client having read them does not prove the counter
+  // moved yet. Wait it out (generously -- it lands in microseconds unless
+  // the machine is oversubscribed) instead of failing on ctest -j load.
+  WaitForDirectReplyAbove(server, before);
   EXPECT_GT(server.DirectReplyCount(), before);
   close(fd);
   close(control);
@@ -944,12 +1125,7 @@ TEST(PostgresServerExtraTest,
   EXPECT_NE(wire.find(pgwire::DataRow(Row({Value(303)})), rolled_back + 1),
             std::string::npos);
   EXPECT_EQ(ReadyForQueryStatus(wire), 'I');
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(1);
-  while (server.DirectReplyCount() <= before &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
+  WaitForDirectReplyAbove(server, before);  // T4979
   EXPECT_GT(server.DirectReplyCount(), before);
   close(fd);
 }
@@ -978,7 +1154,10 @@ TEST(PostgresServerExtraTest,
   EXPECT_NE(cold.find(pgwire::DataRow(Row({Value(7)}))), std::string::npos);
   EXPECT_EQ(server.PeakConcurrentReadQueries(), 0U);
   EXPECT_EQ(query(sql), cold);
-  EXPECT_GE(server.PeakConcurrentReadQueries(), 1U);
+  // WITH statements are never certified as snapshot reads: a data-modifying
+  // CTE would be written on the first execution and then fail forever on a
+  // read-only worker. They stay on the normal path, so no read query is used.
+  EXPECT_EQ(server.PeakConcurrentReadQueries(), 0U);
   EXPECT_EQ(ReadyForQueryStatus(query("UPDATE w SET id = 8")), 'I');
   EXPECT_NE(query(sql).find(pgwire::DataRow(Row({Value(8)}))),
             std::string::npos);
@@ -1065,14 +1244,23 @@ TEST(PostgresServerExtraTest,
   // DDL on another session must honor the documented quiescence admission:
   // retry only that transient SQLSTATE, never syntax/execution failures.
   const auto catalog_query = [&](const std::string& sql) {
+    // T4980: 5s was short enough that a busy worker schedule under ctest -j
+    // turned this retry into a false failure, and a timeout left only the
+    // raw response as evidence. 15s plus an explicit timeout diagnostic
+    // separates "quiescence never cleared" from a genuine DDL failure.
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
     for (;;) {
       std::string response = query(admin, sql);
       if (!response.starts_with("E") ||
-          response.find("C55006") == std::string::npos ||
-          std::chrono::steady_clock::now() >= deadline) {
+          response.find("C55006") == std::string::npos) {
         EXPECT_FALSE(response.starts_with("E")) << response;
+        return response;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        ADD_FAILURE() << "catalog quiescence (C55006) did not clear within "
+                         "15s for: "
+                      << sql << " -- last response: " << response;
         return response;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1252,6 +1440,51 @@ TEST(PostgresServerExtraTest, RunRestoresCallingThreadCpuAffinity) {
   ASSERT_TRUE(SendAll(fd, QueryMessage("SELECT 7")));
   EXPECT_EQ(ReadyForQueryStatus(ReadUntilReady(fd)), 'I');
   close(fd);
+}
+
+// T691: shedding a connection past max_connections must not be a silent
+// RST: the client first receives the PG-canonical FATAL 53300 ErrorResponse
+// (fire-and-forget) and only then sees the close.
+TEST(PostgresServerExtraTest, ShedConnectionReceivesTooManyConnectionsFatal) {
+  const std::string path = "postgres_server_extra_test-" + RandomString();
+  PostgresServerOptions options;
+  options.port = 0;
+  options.max_connections = 1;
+  PostgresServer server(path, options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread server_thread([&] { server.Run(&error); });
+  StopGuard guard(&server);
+
+  const int first = ConnectClient(server.BoundPort());
+  ASSERT_GE(first, 0);
+  // The handshake above proves the server registered the first client, so
+  // the next accepted connection exceeds max_connections. The shed is a
+  // raw connect: the server closes at accept time, before any startup
+  // handshake could complete.
+  const int second = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
+  ASSERT_GE(second, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server.BoundPort());
+  ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &address.sin_addr));
+  ASSERT_EQ(0, connect(second, reinterpret_cast<sockaddr*>(&address),
+                       sizeof(address)));
+  std::string wire;
+  while (true) {
+    char buffer[256];  // NOLINT(modernize-avoid-c-arrays)
+    const ssize_t got = recv(second, buffer, sizeof(buffer), 0);
+    if (got <= 0) {
+      break;
+    }
+    wire.append(buffer, static_cast<size_t>(got));
+  }
+  EXPECT_EQ(wire.find('E'), 0U) << wire;
+  EXPECT_NE(wire.find("FATAL"), std::string::npos);
+  EXPECT_NE(wire.find("53300"), std::string::npos);
+  EXPECT_NE(wire.find("too many connections"), std::string::npos);
+  close(second);
+  close(first);
 }
 
 }  // namespace tinylamb

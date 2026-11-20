@@ -17,7 +17,8 @@ namespace tinylamb::relational_detail {
 
 enum class UtcTimestampTruncUnit : uint8_t { kSecond, kMinute, kHour, kDay };
 
-// Only constant units and a UTC session/target zone are compiled. Other
+// Only units spelled as a VARCHAR constant or a bare token (delivered as a
+// column name, e.g. DAY) and a UTC session/target zone are compiled. Other
 // signatures retain ordinary evaluation, including its NULL/error rules.
 std::optional<UtcTimestampTruncUnit> CompileUtcTimestampTrunc(
     const FunctionCallExpression& call);

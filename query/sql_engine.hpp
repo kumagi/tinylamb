@@ -184,6 +184,8 @@ class SqlEngine {
       TransactionContext& ctx, const DropMaterializedViewStatement& drop);
   StatusOr<Executor> ExecuteCreateView(TransactionContext& ctx,
                                        const CreateViewStatement& create);
+  StatusOr<Executor> ExecuteCreateObject(TransactionContext& ctx,
+                                         const CreateObjectStatement& create);
   StatusOr<Executor> ExecuteDropView(TransactionContext& ctx,
                                      const DropViewStatement& drop);
   StatusOr<Executor> ExecuteCreateIndex(TransactionContext& ctx,
@@ -194,9 +196,9 @@ class SqlEngine {
   // DML statement execution methods (implemented in
   // query/sql_engine_statements.cpp)
   StatusOr<Executor> ExecuteInsert(TransactionContext& ctx,
-                                   const InsertStatement& insert);
+                                   InsertStatement& insert);
   StatusOr<Executor> ExecuteUpdate(TransactionContext& ctx,
-                                   const UpdateStatement& update);
+                                   UpdateStatement& update);
   StatusOr<Executor> ExecuteDelete(TransactionContext& ctx,
                                    const DeleteStatement& remove);
 
@@ -219,7 +221,7 @@ class SqlEngine {
   // Correlated or failing inner statements stay untouched (fallback
   // behaviour), never a wrong answer produced from this helper itself.
   StatusOr<Expression> DecorateDmlWhere(TransactionContext& ctx,
-                                        const Expression& expressionssion);
+                                        const Expression& expression);
 
   // `x op ANY/ALL (SELECT ...)` non-correlated fold; see the definition.
   StatusOr<Expression> FoldQuantifiedComparison(TransactionContext& ctx,
@@ -312,7 +314,9 @@ class SqlEngine {
 
   // Re-registers persisted view definitions into the session ViewRegistry
   // when the catalog's schema epoch moved (CREATE/DROP VIEW bump it).  The
-  // per-engine epoch cache keeps a quiet statement's cost at one compare.
+  // registry is thread_local, so the "registered at (database, epoch)" stamp
+  // is per-thread (T485): a quiet statement's cost stays one compare, no
+  // matter how many SqlEngine wrappers that thread constructs.
   void EnsureViewsRegistered(TransactionContext& ctx);
 
   Database* database_;
@@ -335,7 +339,6 @@ class SqlEngine {
   bool force_relational_fallback_{false};
   ForUpdateWaitMode for_update_wait_mode_{ForUpdateWaitMode::kWait};
   std::vector<SharedGroupingCore> shared_grouping_cores_;
-  uint64_t views_registered_epoch_{~uint64_t{0}};
 
   // DML subquery folding prepares the inner SELECT recursively. That nested
   // prepare would otherwise leave `last_statement_type_` and the result
@@ -367,8 +370,10 @@ class SqlEngine {
           parameters_(engine.plan_cache_parameters_) {}
     NestedPrepareState(const NestedPrepareState&) = delete;
     NestedPrepareState& operator=(const NestedPrepareState&) = delete;
+    NestedPrepareState(NestedPrepareState&&) = delete;
+    NestedPrepareState& operator=(NestedPrepareState&&) = delete;
     ~NestedPrepareState() {
-      engine_.last_statement_type_ = std::move(statement_type_);
+      engine_.last_statement_type_ = statement_type_;
       engine_.last_query_is_literal_constant_ = query_is_literal_constant_;
       engine_.last_dml_table_ = std::move(dml_table_);
       engine_.result_column_names_ = std::move(column_names_);

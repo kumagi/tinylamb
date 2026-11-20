@@ -154,8 +154,11 @@ TEST(PaxChunkCodecsTest, AuditLanePredicateWithEmptyLaneKeepsOtherLaneOnly) {
   }
   auto encoded = codec_benchmark::EncodeInt64Block(Scheme::kLane, values);
   ASSERT_TRUE(encoded.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
   ASSERT_EQ(encoded->scheme, Scheme::kLane);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
   auto chunk = AuditSingleColumnChunk(Scheme::kLane, kRows, encoded->bytes,
+                                      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
                                       encoded->param);
 
   ReducePlan plan;

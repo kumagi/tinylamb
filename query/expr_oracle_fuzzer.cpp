@@ -246,7 +246,9 @@ std::string ReplayExprOracleTrace(const ExprOracleTrace& trace, bool verbose) {
   // seed packs the uint32 generator seed into both halves.
   const auto seed32 = static_cast<uint32_t>(trace.seed);
   std::mt19937 rng(seed32);
-  GeneratedExpr regenerated = GenerateSimplifyExpr(rng);
+  ExprGenConfig config;
+  config.extended_ops = trace.extended_ops;
+  GeneratedExpr regenerated = GenerateSimplifyExpr(rng, config);
   const std::string expected_sql = "SELECT " + regenerated.sql + ";";
   if (regenerated.sexpr != trace.sexpr || expected_sql != trace.sql) {
     return "tampered trace: sql/sexpr do not match seed " +
@@ -254,10 +256,11 @@ std::string ReplayExprOracleTrace(const ExprOracleTrace& trace, bool verbose) {
   }
   ExprOracleTrace fresh;
   fresh.seed = trace.seed;
+  fresh.extended_ops = trace.extended_ops;
   // Fresh RNG at the same seed reproduces the same expression; run the live
   // oracles and compare against the recorded outcome.
   std::mt19937 rng2(seed32);
-  std::string report = RunExprOracleIteration(rng2, verbose, &fresh);
+  std::string report = RunExprOracleIteration(rng2, verbose, &fresh, config);
   if (trace.engine_ran && !fresh.engine_ran) {
     // The recorded run executed the engine; the replay did not (missing
     // parser binary, resource pressure, unexpected result shape). Passing
@@ -289,6 +292,8 @@ std::string SerializeExprOracleTest(const ExprOracleTrace& trace) {
   out += "-- actual: " + trace.actual + "\n";
   out += std::string("-- engine_ran: ") +
          (trace.engine_ran ? "true" : "false") + "\n";
+  out += std::string("-- extended_ops: ") +
+         (trace.extended_ops ? "true" : "false") + "\n";
   if (!trace.failure.empty()) {
     out += "-- failure: " + trace.failure + "\n";
   }
@@ -326,7 +331,15 @@ bool ParseExprOracleTest(std::string_view text, ExprOracleTrace* trace) {
     };
     std::string value;
     if (consume("-- seed: ", &value)) {
-      trace->seed = std::stoull(value);
+      size_t used = 0;
+      try {
+        trace->seed = std::stoull(value, &used);
+      } catch (const std::exception&) {
+        return false;
+      }
+      if (used != value.size()) {
+        return false;
+      }
     } else if (consume("-- sql: ", &value)) {
       trace->sql = value;
     } else if (consume("-- sexpr: ", &value)) {
@@ -340,6 +353,11 @@ bool ParseExprOracleTest(std::string_view text, ExprOracleTrace* trace) {
         return false;
       }
       trace->engine_ran = (value == "true");
+    } else if (consume("-- extended_ops: ", &value)) {
+      if (value != "true" && value != "false") {
+        return false;
+      }
+      trace->extended_ops = (value == "true");
     } else if (consume("-- failure: ", &value)) {
       trace->failure = value;
     } else if (consume("-- cross-check: ", &value)) {
@@ -358,26 +376,40 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   }
   const auto seed32 = static_cast<uint32_t>(seed ^ (seed >> 32));
   std::mt19937 rng(seed32);
+  // P612: dedicate input-derived bits to the extended_ops generation domain
+  // (bit 4 for the scalar oracle, bit 5 for the row oracle; bits 0-1 already
+  // gate the row-oracle run) so libFuzzer can actually reach the extended
+  // operators (choice_limit 19/12/33 arms).  The mode is recorded in the
+  // trace and restored on replay.
+  ExprGenConfig config;
+  config.extended_ops = (seed32 & 0x10U) != 0;
   ExprOracleTrace trace;
   trace.seed = (static_cast<uint64_t>(seed32) << 32) | seed32;
+  trace.extended_ops = config.extended_ops;
   // RunExprOracleIteration consumes the RNG; replay derives its own RNG from
   // the stored seed, so re-seed an identical stream for the checked run.
   std::mt19937 run_rng(seed32);
-  std::string report = RunExprOracleIteration(run_rng, verbose, &trace);
+  std::string report = RunExprOracleIteration(run_rng, verbose, &trace, config);
   if (report.empty()) {
     const char* row_env = std::getenv("TINYLAMB_EXPR_ROW_ORACLE");
     const bool run_row_oracle = (row_env != nullptr)
                                     ? (std::string_view(row_env) != "0")
                                     : ((seed32 & 3U) == 0U);
     if (run_row_oracle) {
+      ExprGenConfig row_config;
+      row_config.extended_ops = (seed32 & 0x20U) != 0;
       std::mt19937 row_rng(seed32);
       RowExprOracleTrace row_trace;
       row_trace.seed = trace.seed;
+      row_trace.extended_ops = row_config.extended_ops;
       std::string row_report =
-          RunRowExprOracleIteration(row_rng, verbose, &row_trace);
+          RunRowExprOracleIteration(row_rng, verbose, &row_trace, row_config);
       if (!row_report.empty()) {
         std::string row_text = "-- tinylamb-row-expr-oracle-test v1\n";
         row_text += "-- seed: " + std::to_string(row_trace.seed) + "\n";
+        row_text += "-- extended_ops: " +
+                    std::string(row_trace.extended_ops ? "true" : "false") +
+                    "\n";
         row_text += "-- predicate_sql: " + row_trace.predicate_sql + "\n";
         row_text += "-- predicate_ast: " + row_trace.predicate_ast + "\n";
         row_text += "-- failure: " +
@@ -1210,16 +1242,19 @@ std::string ReplayRowExprOracleTrace(const RowExprOracleTrace& trace,
                                      bool verbose) {
   const auto seed32 = static_cast<uint32_t>(trace.seed);
   std::mt19937 rng(seed32);
+  ExprGenConfig config;
+  config.extended_ops = trace.extended_ops;
   const auto [schema, rows] = BuildRowFuzzDataset(rng);
-  const RowGenPred pred = GenRowPred(rng);
+  const RowGenPred pred = GenRowPred(rng, 0, config);
   if (pred.sql != trace.predicate_sql || rows.size() != trace.total_rows) {
     return "tampered trace: predicate_sql does not match seed " +
            std::to_string(trace.seed);
   }
   RowExprOracleTrace fresh;
   fresh.seed = trace.seed;
+  fresh.extended_ops = trace.extended_ops;
   std::mt19937 rng2(seed32);
-  std::string report = RunRowExprOracleIteration(rng2, verbose, &fresh);
+  std::string report = RunRowExprOracleIteration(rng2, verbose, &fresh, config);
   if (fresh.matched_ids != trace.matched_ids) {
     return "tampered trace: matched_ids do not match regenerated run";
   }

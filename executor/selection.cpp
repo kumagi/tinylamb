@@ -232,28 +232,38 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
       // The operand fields are only meaningful once the opcodes match;
       // reading them before validation would index the constant pool with
       // a garbage uint16_t.
-      const bool simple_int_cmp =
-          instructions.size() == 3 &&
+      // The bytecode compiler emits operands left-to-right, so a literal on
+      // the left ("5 < x") is LoadConstant->LoadColumn. Accept both orders
+      // like the zone-map and SIMD gates above, flipping the operation.
+      const bool column_first =
           instructions[0].opcode == BytecodeOp::kLoadColumn &&
-          instructions[1].opcode == BytecodeOp::kLoadConstant &&
+          instructions[1].opcode == BytecodeOp::kLoadConstant;
+      const bool constant_first =
+          instructions[0].opcode == BytecodeOp::kLoadConstant &&
+          instructions[1].opcode == BytecodeOp::kLoadColumn;
+      const size_t column_insn = column_first ? 0 : 1;
+      const size_t constant_insn = column_first ? 1 : 0;
+      const bool simple_int_cmp =
+          instructions.size() == 3 && (column_first || constant_first) &&
           instructions[2].opcode == BytecodeOp::kBinaryInt64 &&
-          instructions[1].operand < bytecode_->Constants().size() &&
-          bytecode_->Constants()[instructions[1].operand].type ==
+          instructions[constant_insn].operand < bytecode_->Constants().size() &&
+          bytecode_->Constants()[instructions[constant_insn].operand].type ==
               ValueType::kInt64;
       // The JIT kernel compares with signed integer semantics. Any unsigned
       // involvement (UINT64 column or constant) must stay on the
       // unsigned-aware bytecode path (cf. the aggregation SUM guard).
       const bool constant_unsigned =
           simple_int_cmp &&
-          bytecode_->Constants()[instructions[1].operand].IsUnsigned();
+          bytecode_->Constants()[instructions[constant_insn].operand].IsUnsigned();
       const bool column_unsigned =
-          simple_int_cmp && instructions[0].operand < schema_.ColumnCount() &&
-          schema_.GetColumn(instructions[0].operand).IsUnsigned();
+          simple_int_cmp && instructions[column_insn].operand < schema_.ColumnCount() &&
+          schema_.GetColumn(instructions[column_insn].operand).IsUnsigned();
       if (simple_int_cmp && !constant_unsigned && !column_unsigned) {
-        jit_column_ = instructions[0].operand;
+        jit_column_ = instructions[column_insn].operand;
         jit_constant_ =
-            bytecode_->Constants()[instructions[1].operand].value.int_value;
-        jit_operation_ = instructions[2].binary;
+            bytecode_->Constants()[instructions[constant_insn].operand].value.int_value;
+        jit_operation_ = constant_first ? Flip(instructions[2].binary)
+                                        : instructions[2].binary;
         jit_filter_ = JitInt64Kernels::CompileFilter(jit_operation_);
       }
       // Lean proof: lean/TinylambOpt/BranchlessJitCodegen.lean

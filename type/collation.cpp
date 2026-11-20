@@ -1,15 +1,16 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "type/collation.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <optional>
 #include <string>
 #include <string_view>
 
+#include "common/string_util.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
-namespace {
-
 // The compliance catalog orders its synthetic ENUM members by a fixed table
 // (NEGATIVE, then the numeric members ascending) rather than lexically, and
 // stores them in the compact VARCHAR representation. Every member is between 9
@@ -36,8 +37,6 @@ int EnumRank(std::string_view value) {
   return -1;
 }
 
-}  // namespace
-
 std::string_view CollationName(Collation collation) {
   switch (collation) {
     case Collation::kBinary:
@@ -51,21 +50,35 @@ std::string_view CollationName(Collation collation) {
 }
 
 Collation CollationFromName(std::string_view spec) {
-  return spec.empty() ? Collation::kNone : CollationOfSpec(spec);
+  if (spec.empty()) {
+    return Collation::kNone;
+  }
+  const auto resolved = CollationOfSpec(spec);
+  return resolved ? *resolved : Collation::kCaseInsensitive;
 }
 
-Collation CollationOfSpec(std::string_view spec) {
+std::optional<Collation> CollationOfSpec(std::string_view spec) {
   std::string lowered(spec);
   for (char& c : lowered) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    c = AsciiToLower(c);
   }
-  return lowered == "binary" ? Collation::kBinary : Collation::kCaseInsensitive;
+  if (lowered == "binary") {
+    return Collation::kBinary;
+  }
+  if (lowered == "und:ci") {
+    return Collation::kCaseInsensitive;
+  }
+  return std::nullopt;
 }
 
 Collation ResolveCollation(const Value& left, const Value& right) {
   return ResolveCollation(CollationOf(left), CollationOf(right));
 }
 
+// NOTE: case folding here is ASCII-only (A-Z -> a-z). "und:ci" therefore
+// folds only ASCII letters; non-ASCII Unicode case pairs (e.g. Ä/ä, Σ/σ)
+// compare as distinct. Document this explicitly so callers do not assume
+// full Unicode simple case folding from the collation name.
 std::string FoldCaseForCollation(std::string_view s) {
   std::string out;
   out.reserve(s.size());
@@ -123,10 +136,27 @@ int CompareVarCharForOrderBy(std::string_view left, std::string_view right,
     }
   }
   if (case_insensitive) {
-    const std::string folded_left = FoldCaseForCollation(left);
-    const std::string folded_right = FoldCaseForCollation(right);
-    return folded_left < folded_right ? -1
-                                      : (folded_right < folded_left ? 1 : 0);
+    // T4487: fold per-byte during the comparison instead of materializing
+    // two scratch strings per call -- this comparator runs O(n log n) times
+    // from TopN WITH TIES, columnar TLCS scans and ExternalSorter merges.
+    // FoldCaseForCollation is a per-byte ASCII map, so byte-wise folded
+    // lexicographic comparison is identical to folding both sides first.
+    const auto fold = [](char c) {
+      const auto uc = static_cast<unsigned char>(c);
+      return uc >= 'A' && uc <= 'Z' ? static_cast<char>(uc - 'A' + 'a') : c;
+    };
+    const size_t n = std::min(left.size(), right.size());
+    for (size_t i = 0; i < n; ++i) {
+      const auto lc = static_cast<unsigned char>(fold(left[i]));
+      const auto rc = static_cast<unsigned char>(fold(right[i]));
+      // unsigned ordering matches std::string's memcmp semantics for bytes
+      // >= 0x80 (non-ASCII inputs rely on it -- see CollationTest).
+      if (lc != rc) {
+        return lc < rc ? -1 : 1;
+      }
+    }
+    return left.size() == right.size() ? 0
+                                       : (left.size() < right.size() ? -1 : 1);
   }
   return left < right ? -1 : (right < left ? 1 : 0);
 }

@@ -44,8 +44,8 @@ rule 6; the reverse acquisition remains forbidden.
   latching the target `RowPage` so contended row waits park latch-free.
   `RowPage::Insert` probes free slots under the page latch with non-blocking
   `TryAddWriteSet` and unlocks the page before `IndexInsert`.
-- **Index gate before LSM tree mutex**: DDL takes all affected index-gate shards
-  in sorted order before destroying LSM trees; readers hold a shared gate for
+- **Index gate before LSM-Tree mutex**: DDL takes all affected index-gate shards
+  in sorted order before destroying LSM-Trees; readers hold a shared gate for
   their cursor lifetime.
 - **Logger record atomicity (D1, `docs/design.md`)**: `AddLog` holds the
   enqueue latch until the whole record has landed in the ring buffer.  When
@@ -101,8 +101,11 @@ workflow's `lock-order` job does this (advisory until its baseline is clean).
   `TlcsFile::dir_cache_mu_`, `TlcsFile::resident_mu_`). Inside
   `blocks_mu_` or a `PageRef` latch, use non-reclaiming `TryReserve` (or
   `ReserveEmergency` for unavoidable small metadata).
-- Reclaim callbacks registered on `ProcessMemoryBudget` (`ReclaimStage::kColumnar`,
-  `kCleanStorage`, `kSpillableQuery`) **must never block**: `ProcessMemoryBudget::hooks_mu_`
+- Reclaim callbacks registered on `ProcessMemoryBudget` (`ReclaimStage::kColumnar`
+  on the `TlcsFile` decoded-block cache, `ReclaimStage::kCleanStorage` on
+  `PageManager`'s evicted-page table; `ReclaimStage::kSpillableQuery` exists in
+  the enum but currently registers no hook -- query-side release goes through
+  the `QueryMemoryCoordinator` grant path) **must never block**: `ProcessMemoryBudget::hooks_mu_`
   snapshots hooks before invoking callbacks outside the lock, and `QueryMemoryCoordinator::mu_`
   coordinates grant waits without holding page or version locks. Every mutex/latch
   acquisition inside a reclaim hook must use `std::try_to_lock` (`try_lock`) and

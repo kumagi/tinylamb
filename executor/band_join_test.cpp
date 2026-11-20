@@ -89,7 +89,7 @@ class FailingSource final : public ExecutorBase {
 
 class ErrorExpression final : public ExpressionBase {
  public:
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kInvalid; }
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInvalid; }
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
                                const Schema& /*schema*/) const override {
     return {};

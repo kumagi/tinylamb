@@ -113,9 +113,10 @@ TEST_F(SqlEngineTpccTest, ExecutesAllTransactionQueryShapes) {
       "(100, 1, 1, 2, 2, 5, 25.0, NULL);");
 
   // New-Order: reads, district sequence update, stock CASE update and inserts.
-  EXPECT_EQ(Run(*database_, context,
-                "SELECT w_tax FROM warehouse WHERE w_id = 1;")[0][0],
-            Value(0.1));
+  const auto w_tax = Run(*database_, context,
+                         "SELECT w_tax FROM warehouse WHERE w_id = 1;");
+  ASSERT_EQ(w_tax.size(), 1U);
+  EXPECT_EQ(w_tax[0][0], Value(0.1));
   Run(*database_, context,
       "UPDATE district SET d_next_o_id = d_next_o_id + 1 "
       "WHERE d_w_id = 1 AND d_id = 1;");

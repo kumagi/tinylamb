@@ -80,7 +80,7 @@ graph TD
 ## 最適化効果
 
 - **メモリ使用量の有界化**: 全タプルを蓄積するソートバッファが不要となり、最大でも $\text{OFFSET} + \text{LIMIT}$ 行分のヒープ領域のみで処理が完了します。
-- **Top-K 下位伝播による I/O 削減**: 探索エンジン（`SearchEngine::RequiredChildProperties`）がキー順序と `limit_hint` を子ノードへ引き渡すことで、下流の B+Tree インデックススキャンが先頭 $K$ 件を読み込んだ時点で即座にスキャンを終了できます。
+- **Top-K 下位伝播による I/O 削減**: 探索エンジン（`SearchEngine::RequiredChildProperties`）がキー順序と `limit_hint` を子ノードへ引き渡すことで、下流の LsmIndex インデックススキャンが先頭 $K$ 件を読み込んだ時点で即座にスキャンを終了できます。
 
 ## 関連 Rule との相互作用
 

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -133,8 +135,8 @@ TEST_F(LoggerTest, AppendOne) {
   EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
   std::ifstream file;
   file.open(log_name_);
-  std::string file_data;
-  file >> file_data;
+  std::string file_data((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
 
   // Assert -- file content equals the serialized LogRecord
   ASSERT_EQ(file_data, l.Serialize());
@@ -167,8 +169,8 @@ TEST_F(LoggerTest, AppendTwo) {
   EXPECT_EQ(std::filesystem::file_size(log_name_), d1.size() + d2.size());
   std::ifstream file;
   file.open(log_name_);
-  std::string file_data;
-  file >> file_data;
+  std::string file_data((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
 
   // Assert -- file content equals d1+d2 concatenated
   ASSERT_EQ(file_data, d1 + d2);
@@ -226,8 +228,8 @@ TEST_F(LoggerTest, Verify) {
   WaitForCommit(written_log.size());
   std::ifstream file;
   file.open(log_name_);
-  std::string file_data;
-  file >> file_data;
+  std::string file_data((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
 
   // Assert -- file content equals the written_log payload
   ASSERT_EQ(file_data, written_log);
@@ -520,6 +522,100 @@ TEST_F(LoggerTest, TryCopyBufferedServesResidentWindow) {
   EXPECT_EQ(logger->Finish(), Status::kSuccess);
 }
 
+// P424/473: the segment pre-roll memsets its padding gap into the ring
+// BEFORE advancing buffered_lsn_, so a tail scanner whose copy window
+// overlaps the zeroed span used to pass the buffered re-verify (after ==
+// pre-roll value) and receive zeroed bytes as a complete read while the
+// disk held the real record.  Ring geometry below makes every roll zero
+// exactly the oldest resident 2288 bytes -- the window the probe reads.
+TEST_F(LoggerTest, RingPrerollZeroingNeverServesZeroedBytes) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  constexpr size_t kRing = 4096;
+  constexpr size_t kSegment = 12288;  // == 3 * kRing
+  constexpr size_t kRecord = 10000;   // roll with a 2288-byte gap every record
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, logger,
+                        Logger::Create(log_name_, kRing, 60'000, kSegment));
+  ASSERT_TRUE(logger != nullptr);
+  const auto payload = [](lsn_t lsn, size_t len) {
+    std::string out(len, '\0');
+    for (size_t i = 0; i < len; ++i) {
+      out[i] = static_cast<char>('a' + ((lsn + i) % 26));
+    }
+    return out;
+  };
+  std::atomic<bool> stop{false};
+  std::atomic<int> mismatches{0};
+  std::atomic<int> zeros{0};
+  std::atomic<int> probes{0};
+  std::thread tail_scanner([&] {
+    std::string ring(256, '\0');
+    std::string disk(256, '\0');
+    // Cached read fd keeps every probe iteration sub-microsecond so the
+    // copy window sweeps across the memset-to-store gap at high rate.
+    int fd = -1;
+    lsn_t fd_segment = -1;
+    while (!stop.load(std::memory_order_relaxed)) {
+      const lsn_t durable = logger->DurableLSN();
+      if (durable <= static_cast<lsn_t>(kRing)) {
+        continue;
+      }
+      const lsn_t at = durable - kRing + 128;
+      if ((at % kSegment) + ring.size() > kSegment) {
+        continue;  // keep the probe inside one segment file
+      }
+      if (!logger->TryCopyBuffered(at, ring.data(), ring.size())) {
+        continue;
+      }
+      const lsn_t segment = at / kSegment;
+      if (fd >= 0 && segment != fd_segment) {
+        platform::CloseFile(fd);
+        fd = -1;
+      }
+      if (fd < 0) {
+        fd = platform::OpenFile(Logger::SegmentPath(log_name_, segment),
+                                platform::OpenFlags{});
+        if (fd < 0) {
+          continue;  // segment not materialized yet
+        }
+        fd_segment = segment;
+      }
+      const ssize_t got = platform::Pread(fd, disk.data(), disk.size(),
+                                          static_cast<int64_t>(at % kSegment));
+      if (!std::cmp_equal(got, disk.size())) {
+        continue;
+      }
+      ++probes;
+      if (ring.find_first_not_of('\0') == std::string::npos) {
+        ++zeros;
+      }
+      if (ring != disk) {
+        ++mismatches;
+      }
+    }
+    if (fd >= 0) {
+      platform::CloseFile(fd);
+    }
+  });
+  // 1500 rolls keep the race window dense (each record forces a pre-roll
+  // with a 2288-byte gap) while holding the unit well under the 60 s
+  // budget even when the box is saturated.
+  for (int i = 0; i < 1500; ++i) {
+    const lsn_t lsn = logger->BufferedLSN();
+    ASSERT_SUCCESS(logger->AddLog(payload(lsn, kRecord)).GetStatus());
+    ASSERT_SUCCESS(logger->WaitForDurable(logger->BufferedLSN()));
+  }
+  stop.store(true, std::memory_order_relaxed);
+  tail_scanner.join();
+  std::printf("probes=%d zeros=%d mismatches=%d\n", probes.load(),
+              zeros.load(),  // NOLINT
+              mismatches.load());
+  EXPECT_GT(probes.load(), 0) << "probe never served from the ring";
+  EXPECT_EQ(mismatches.load(), 0)
+      << "TryCopyBuffered served bytes the pre-roll zeroing rewrote";
+  ASSERT_SUCCESS(logger->Finish());
+}
+
 // A logger reopened over an existing WAL serves nothing from its zeroed
 // ring: every byte below the open-time end lives only in the segment files.
 TEST_F(LoggerTest, TryCopyBufferedNeverServesPreopenBytes) {
@@ -573,7 +669,7 @@ TEST_F(LoggerTest, FixedSegmentsRetainLogicalEndAndPersistedGeometry) {
   ASSERT_SUCCESS(reopened->Finish());
   std::ifstream input(log_name_, std::ios::binary);
   std::string prefix(19, '\0');
-  input.read(prefix.data(), prefix.size());
+  input.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
   EXPECT_EQ(prefix, "durable-prefix-more");
   EXPECT_EQ(std::filesystem::file_size(log_name_), kSegment + 64);
 }
@@ -606,6 +702,44 @@ TEST_F(LoggerTest, FixedSegmentsRollAndLogicalTruncateWithoutChangingSize) {
   EXPECT_EQ(reopened->BufferedLSN(), 141);
 }
 
+// P425/390: a power loss between the roll's CreateFile and the frame's
+// materialization + footer sync leaves a zero-length segment. It holds no
+// record bytes by construction, so a force-free reopen must repair it
+// (re-initialize) instead of failing the whole open with kCorrupt, matching
+// the legacy WAL's zero-length exemption.
+TEST_F(LoggerTest, ZeroLengthSegmentFromCrashedInitReopensWithoutForce) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  constexpr size_t kSegment = 128;
+  const std::string payload(100, 'x');
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        std::unique_ptr<Logger>, fixed,
+        Logger::Create(log_name_, 32, 60'000, kSegment, true));
+    ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), 0);
+    ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), kSegment);
+    ASSERT_SUCCESS(fixed->WaitForDurable(fixed->BufferedLSN()));
+    ASSERT_SUCCESS(fixed->Finish());
+  }
+  const auto corpse = Logger::SegmentPath(log_name_, 2);
+  {
+    std::ofstream zero(corpse, std::ios::binary);
+  }
+  ASSERT_EQ(std::filesystem::file_size(corpse), 0U);
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, reopened,
+                        Logger::Create(log_name_, 32, 60'000, kSegment));
+  EXPECT_TRUE(reopened->FixedSizeSegments());
+  // LSNs are segment-strided: recovery positions on the re-initialized
+  // corpse segment, so the next append LSN (and durable position) is the
+  // segment-2 base, skipping segment 1's unused tail.
+  EXPECT_EQ(reopened->DurableLSN(), 2 * kSegment);
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 2, kSegment), 0);
+  EXPECT_EQ(std::filesystem::file_size(corpse), kSegment + 64);
+  ASSERT_SUCCESS_AND_EQ(reopened->AddLog("post-crash"), 2 * kSegment);
+  ASSERT_SUCCESS(reopened->WaitForDurable((2 * kSegment) + 10));
+  ASSERT_SUCCESS(reopened->Finish());
+}
+
 TEST_F(LoggerTest, PreallocationRequestNeverConvertsExistingRawSeries) {
   ASSERT_SUCCESS(l_->AddLog("legacy").GetStatus());
   ASSERT_SUCCESS(l_->Finish());
@@ -634,10 +768,10 @@ TEST_F(LoggerTest, FixedSegmentsRejectEitherDamagedSlotAndForcedScanKeepsBody) {
     }
     std::fstream frame(log_name_,
                        std::ios::binary | std::ios::in | std::ios::out);
-    frame.seekg(damage_offset);
+    frame.seekg(static_cast<std::streamoff>(damage_offset));
     char original = 0;
     frame.get(original);
-    frame.seekp(damage_offset);
+    frame.seekp(static_cast<std::streamoff>(damage_offset));
     frame.put(static_cast<char>(original ^ 0x5a));
     frame.close();
     EXPECT_FALSE(Logger::SegmentLogicalSize(log_name_, 0, kSegment).HasValue());
@@ -649,7 +783,7 @@ TEST_F(LoggerTest, FixedSegmentsRejectEitherDamagedSlotAndForcedScanKeepsBody) {
     EXPECT_EQ(forced->BufferedLSN(), kSegment);
     std::ifstream body(log_name_, std::ios::binary);
     std::string prefix(12, '\0');
-    body.read(prefix.data(), prefix.size());
+    body.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
     EXPECT_EQ(prefix, "acknowledged");
     ASSERT_SUCCESS(forced->TruncateTo(12));
     ASSERT_SUCCESS(forced->Finish());
@@ -688,10 +822,13 @@ TEST_F(LoggerTest, FixedSegmentsSyncFailureNeverAdvancesDurableEnd) {
   fixed->SetCommitDrivenSync(true);
   ASSERT_SUCCESS(fixed->AddLog("first").GetStatus());
   ASSERT_SUCCESS(fixed->WaitForDurable(5));
+  // Always clear the process-global hook, even on an early ASSERT return.
+  struct ClearHook {  // NOLINT(cppcoreguidelines-special-member-functions)
+    ~ClearHook() { Logger::SetBeforeSyncHookForTest({}); }
+  } clear_hook;
   Logger::SetBeforeSyncHookForTest([](int) { return EIO; });
   ASSERT_SUCCESS(fixed->AddLog("unacknowledged").GetStatus());
   const Status status = fixed->WaitForDurable(fixed->BufferedLSN());
-  Logger::SetBeforeSyncHookForTest({});
   EXPECT_NE(status, Status::kSuccess);
   EXPECT_EQ(fixed->DurableLSN(), 5);
   EXPECT_NE(fixed->Finish(), Status::kSuccess);

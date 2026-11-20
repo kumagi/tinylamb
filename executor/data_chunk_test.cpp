@@ -87,8 +87,8 @@ TEST(DataChunkTest, TransfersKeepZoneMapsSoundForUnsignedAndCollatedValues) {
     SCOPED_TRACE(path);
     DataChunk output(schema, 2);
     if (path == 0) {
-      output.Append(source, 0);
-      output.Append(source, 1);
+      output.AppendFrom(source, 0);
+      output.AppendFrom(source, 1);
     } else if (path == 1) {
       const std::array<uint32_t, 2> selected = {0, 1};
       output.AppendGather(source, selected.data(), selected.size());
@@ -149,7 +149,7 @@ TEST(DataChunkTest, Append_FromAnotherChunk_CopiesSelectedRows) {
   input.Append(Row({Value(1), Value("drop")}));
   input.Append(Row({Value(2), Value("keep")}));
   DataChunk output;
-  output.Append(input, 1);
+  output.AppendFrom(input, 1);
   ASSERT_EQ(output.Size(), 1);
   EXPECT_EQ(output.RowAt(0), Row({Value(2), Value("keep")}));
 }
@@ -327,7 +327,9 @@ TEST(DataChunkTest, Append_ChunkWidthMismatch_Throws) {
       std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
   source.Append(Row({Value(1), Value("x")}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
-  EXPECT_DEATH(target.Append(source, 0), ".*");
+  // T4838: pin the diagnosis, not just the death (site pattern matches the
+  // "type mismatch" pins at :281/:496).
+  EXPECT_DEATH(target.AppendFrom(source, 0), "data chunk width mismatch");
 }
 
 TEST(DataChunkTest, Append_LvalueRowWithPositions_StoresCorrectly) {
@@ -436,7 +438,9 @@ TEST(DataChunkTest, AppendRowFromColumns_WidthMismatch_Throws) {
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
   std::vector<const ColumnVector*> sources = {&input.ColumnAt(0),
                                               &input.ColumnAt(1)};
-  EXPECT_DEATH(target.AppendRowFromColumns(sources, 0), ".*");
+  // T4838: pin the diagnosis, not just the death.
+  EXPECT_DEATH(target.AppendRowFromColumns(sources, 0),
+               "data chunk row width mismatch");
 }
 
 TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
@@ -445,8 +449,8 @@ TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
   input.Append(Row({Value(4), Value("b"), Value::DateFromDays(9)}));
   input.Append(Row({Value(), Value("a"), Value()}));
   DataChunk output;
-  output.Append(input, 1);
-  output.Append(input, 0);
+  output.AppendFrom(input, 1);
+  output.AppendFrom(input, 0);
   ASSERT_EQ(output.Size(), 2);
   EXPECT_EQ(output.ColumnAt(0).Type(), ValueType::kInt64);
   EXPECT_TRUE(output.ColumnAt(0).IsNull(0));
@@ -493,7 +497,7 @@ TEST(DataChunkTest,
   DataChunk source(std::vector<ValueType>{ValueType::kDouble});
   source.Append(Row({Value(1.5)}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
-  EXPECT_DEATH(target.Append(source, 0), "type mismatch");
+  EXPECT_DEATH(target.AppendFrom(source, 0), "type mismatch");
 }
 
 TEST(ValidityBitmapTest, BasicOperationsAndBitwiseOps) {
@@ -591,8 +595,8 @@ TEST(SimdComparisonKernelTest, IntegerDoubleStringComparison) {
   std::vector<std::string_view> strings = {"apple", "banana", "cherry", "date"};
   ValidityBitmap str_mask;
   SimdComparisonKernel::CompareString(strings.data(), strings.size(),
-                                            BinaryOperation::kEquals, "banana",
-                                            &str_mask);
+                                      BinaryOperation::kEquals, "banana",
+                                      &str_mask);
   EXPECT_EQ(str_mask.CountValid(), 1);
   EXPECT_TRUE(str_mask.Get(1));
 }
@@ -691,14 +695,122 @@ TEST(DataChunkTest, AuditAllNullColumnsRetainZoneNullCounts) {
   input.Append(Row({Value()}));
   input.Append(Row({Value()}));
   DataChunk copied;
-  copied.Append(input, 1);
-  copied.Append(input, 0);
+  copied.AppendFrom(input, 1);
+  copied.AppendFrom(input, 0);
   EXPECT_EQ(copied.ZoneMapAt(0).NullCount(), 2U);
   DataChunk projected;
   const std::vector<const ColumnVector*> columns{&input.ColumnAt(0)};
   projected.AppendRowFromColumns(columns, 0);
   projected.AppendRowFromColumns(columns, 1);
   EXPECT_EQ(projected.ZoneMapAt(0).NullCount(), 2U);
+}
+
+// T4171: ZoneMap::AddString now reuses the stored extremum's string buffer
+// on every improvement; min/max must stay correct across repeated new
+// extremes (and the stored Values stay readable).
+TEST(DataChunkTest, ZoneMapStringExtremesStayCorrectUnderBufferReuse) {
+  ZoneMap map;
+  const std::string long_hi(48, 'z');
+  map.AddString("mm");
+  map.AddString("aa");
+  map.AddString("bb");
+  map.AddString("zz");
+  map.AddString(long_hi);
+  map.AddString("cc");
+  ASSERT_TRUE(map.Minimum().has_value());
+  ASSERT_TRUE(map.Maximum().has_value());
+  EXPECT_EQ(map.Minimum()->value.varchar_value, "aa");  // NOLINT(bugprone-unchecked-optional-access)
+  EXPECT_EQ(map.Maximum()->value.varchar_value, long_hi);  // NOLINT(bugprone-unchecked-optional-access)
+  EXPECT_EQ(map.ValueCount(), 6U);
+}
+
+// T1938: the batch append APIs must not dereference a null value buffer.
+// nulls == nullptr legitimately means "no nulls"; values == nullptr with
+// count > 0 is a contract violation and becomes a defined no-op instead of
+// memcpy/read UB.
+TEST(DataChunkTest, BatchAppendsTreatNullValuesBufferAsNoOp) {
+  ColumnVector ints(ValueType::kInt64);
+  ints.AppendIntBatch(ValueType::kInt64, false, nullptr, nullptr, 3);
+  EXPECT_EQ(ints.Size(), 0U);
+  ColumnVector doubles(ValueType::kDouble);
+  doubles.AppendDoubleBatch(nullptr, nullptr, 3);
+  EXPECT_EQ(doubles.Size(), 0U);
+  ColumnVector strings(ValueType::kVarChar);
+  strings.AppendStringViewBatch(nullptr, nullptr, 3);
+  EXPECT_EQ(strings.Size(), 0U);
+  ColumnVector bools(ValueType::kInt64);
+  bools.AppendBoolBatch(nullptr, 3);
+  EXPECT_EQ(bools.Size(), 0U);
+  // A real batch after the no-op still lands.
+  const int64_t vals[2] = {7, 8};  // NOLINT(modernize-avoid-c-arrays)
+  ints.AppendIntBatch(ValueType::kInt64, false, vals, nullptr, 2);
+  EXPECT_EQ(ints.Size(), 2U);
+}
+
+// T1940: CommitBatchAppend advances size_ only up to the rows the columns
+// actually hold, so a miscounted caller cannot leave size_ ahead of
+// ColumnVector::Size() (which made RowAt/ValueAt read out-of-bounds cells).
+TEST(DataChunkTest, CommitBatchAppendClampsToColumnStorage) {
+  DataChunk chunk(std::vector<ValueType>{ValueType::kInt64});
+  const int64_t vals[2] = {1, 2};  // NOLINT(modernize-avoid-c-arrays)
+  chunk.ColumnAt(0).AppendIntBatch(ValueType::kInt64, false, vals, nullptr, 2);
+  chunk.CommitBatchAppend(5);
+  EXPECT_EQ(chunk.Size(), 2U);
+  EXPECT_EQ(chunk.ColumnAt(0).Size(), 2U);
+  const Row row = chunk.RowAt(1);
+  EXPECT_EQ(row, Row({Value(int64_t{2})}));
+  // Committing with no column growth advances nothing at all.
+  chunk.CommitBatchAppend(3);
+  EXPECT_EQ(chunk.Size(), 2U);
+}
+
+// T1935: AddIntRange / AddDateRange / AddStringRange used to store a
+// reversed envelope (mn > mx) as-is, and MayMatch then pruned every
+// constant -- silently dropping live rows.  A reversed interval must fall
+// back to the unbounded (never-prune) envelope, like AddDoubleRange did.
+TEST(ZoneMapTest, ReversedRangesNeverPrune) {
+  ZoneMap ints;
+  ints.AddIntRange(/*mn=*/100, /*mx=*/5, /*count=*/8);
+  EXPECT_TRUE(ints.MayMatch(BinaryOperation::kEquals, Value(50)));
+  EXPECT_TRUE(ints.MayMatch(BinaryOperation::kGreaterThan, Value(0)));
+  EXPECT_FALSE(ints.Minimum().has_value()) << "envelope must not persist";
+
+  ZoneMap dates;
+  dates.AddDateRange(/*mn=*/9000, /*mx=*/1000, /*count=*/2);
+  EXPECT_TRUE(dates.MayMatch(BinaryOperation::kLessThan, Value(0)));
+
+  ZoneMap strings;
+  strings.AddStringRange("zz", "aa", /*count=*/4);
+  EXPECT_TRUE(strings.MayMatch(BinaryOperation::kEquals, Value("mm")));
+
+  // Well-ordered ranges keep pruning (guard does not over-disable):
+  ZoneMap ordered;
+  ordered.AddIntRange(10, 20, /*count=*/4);
+  EXPECT_FALSE(ordered.MayMatch(BinaryOperation::kEquals, Value(99)));
+  EXPECT_TRUE(ordered.MayMatch(BinaryOperation::kEquals, Value(15)));
+}
+
+// T1621: one NaN row disabled zone-map pruning for the whole batch.  The
+// AST ground truth decides EVERY comparison against NaN FALSE (IEEE
+// unordered -- binary_expression.cpp), so a NaN row can never satisfy a
+// MayMatch predicate and the NaN-free envelope AddDouble maintains stays
+// sound for the entire zone.
+TEST(ZoneMapTest, NanRowsNoLongerDisableFiniteEnvelope) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  ZoneMap z;
+  z.AddDouble(1.0);
+  z.AddDouble(nan);
+  z.AddDouble(5.0);
+  EXPECT_FALSE(z.MayMatch(BinaryOperation::kGreaterThan, Value(10.0)));
+  EXPECT_FALSE(z.MayMatch(BinaryOperation::kLessThan, Value(-5.0)));
+  EXPECT_TRUE(z.MayMatch(BinaryOperation::kGreaterThan, Value(3.0)));
+  EXPECT_TRUE(z.MayMatch(BinaryOperation::kEquals, Value(5.0)));
+
+  // A zone whose envelope holds nothing but NaN keeps every row.
+  ZoneMap nan_only;
+  nan_only.AddDouble(nan);
+  EXPECT_TRUE(nan_only.MayMatch(BinaryOperation::kEquals, Value(1.0)));
+  EXPECT_TRUE(nan_only.MayMatch(BinaryOperation::kGreaterThan, Value(1.0)));
 }
 
 }  // namespace tinylamb

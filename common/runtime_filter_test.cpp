@@ -306,7 +306,7 @@ TEST(RuntimeFilterTest, SparseBloomDomainUsesBothProbes) {
   }
   // A fixed offset between probes makes a collision at the first bit collide
   // at the second as well. This sparse domain cannot use an exact dense map
-  // to hide the resulting roughly 7% false-positive rate.
+  // to hide the resulting elevated false-positive rate (kept below 4%).
   EXPECT_LT(false_positives, static_cast<size_t>(kCount / 25));
 }
 

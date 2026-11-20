@@ -30,15 +30,6 @@ enum class PageType : uint8_t {
   kRowPage = 1,
 };
 
-inline std::string PageTypeString(enum PageType type) {
-  switch (type) {
-    case PageType::kRowPage:
-      return "RowPage";
-    default:
-      return "(unknown)";
-  }
-}
-
 std::ostream& operator<<(std::ostream& o, const PageType& type);
 Encoder& operator<<(Encoder& e, const PageType& type);
 Decoder& operator>>(Decoder& d, PageType& type);

@@ -275,7 +275,7 @@ TEST(ExprOracleFuzzer, ReplayPinnedModuloDoubleZeroRegression) {
 // Oracle-found regression pin (seed 0x16b15447): the executor's MOD computed
 // fmod for two FLOAT64 arguments, but GoogleSQL MOD is integer-only and the
 // AST reference raises "unsupported binary operation".
-TEST(ExprOracleFuzzer, ReplayPinnedModuloDoubleDoubleRegression) {
+TEST(ExprOracleFuzzer, ReplayPinnedModuloTwoFloat64ArgsRegression) {
   static const char* kTrace =
       "-- tinylamb-expr-oracle-test v1\n"
       "-- seed: 1635809587224612903\n"
@@ -381,9 +381,16 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations =
-      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
-                         : 64;
+  int kIterations = 64;
+  if (scale != nullptr) {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(scale, &end, 10);
+    if (errno == 0 && end != scale && *end == '\0' && parsed > 0 &&
+        parsed <= std::numeric_limits<int>::max()) {
+      kIterations = static_cast<int>(parsed);
+    }
+  }
   for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     const auto seed32 = seed;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
@@ -413,9 +420,16 @@ TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations =
-      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
-                         : 200;
+  int kIterations = 200;
+  if (scale != nullptr) {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(scale, &end, 10);
+    if (errno == 0 && end != scale && *end == '\0' && parsed > 0 &&
+        parsed <= std::numeric_limits<int>::max()) {
+      kIterations = static_cast<int>(parsed);
+    }
+  }
   ExprGenConfig config;
   config.extended_ops = true;
   for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
@@ -470,9 +484,16 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
 
 TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations =
-      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
-                         : 64;
+  int kIterations = 64;
+  if (scale != nullptr) {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(scale, &end, 10);
+    if (errno == 0 && end != scale && *end == '\0' && parsed > 0 &&
+        parsed <= std::numeric_limits<int>::max()) {
+      kIterations = static_cast<int>(parsed);
+    }
+  }
   int null_reject_verified_count = 0;
   int engine_ran_count = 0;
 

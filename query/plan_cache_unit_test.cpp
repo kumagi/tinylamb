@@ -62,7 +62,7 @@ TEST(VolatileFingerprintTest, SaturationIsBoundedAndCannotReviveStalePlans) {
   EXPECT_FALSE(IsVolatileSpecializedPlan("temporary"));
 }
 
-TEST(ParameterSlotTest, EvaluateReturnsSlotValue) {
+TEST(PlanCacheParameterSlotTest, EvaluateReturnsSlotValue) {
   auto values = Vals({Value(int64_t{7}), Value(std::string("s"))});
   const ParameterSlot slot(1, ValueType::kVarChar, values);
 
@@ -82,7 +82,7 @@ TEST(ParameterSlotTest, EvaluateReturnsSlotValue) {
   EXPECT_EQ(dump.str(), "<?1>");
 }
 
-TEST(ParameterSlotTest, ResultTypeCoversAllValueTypes) {
+TEST(PlanCacheParameterSlotTest, ResultTypeCoversAllValueTypes) {
   auto values = Vals({});
   const std::vector<std::pair<ValueType, TypeTag>> cases = {
       {ValueType::kInt64, TypeTag::kBigInt},
@@ -100,7 +100,7 @@ TEST(ParameterSlotTest, ResultTypeCoversAllValueTypes) {
   }
 }
 
-TEST(ParameterSlotTest, BindUpdatesSniffedValue) {
+TEST(PlanCacheParameterSlotTest, BindUpdatesSniffedValue) {
   ParameterSlot slot(0, Value(int64_t{1}));
   Row row({});
   EXPECT_EQ(slot.Evaluate(row, Schema("t", {})), Value(int64_t{1}));
@@ -120,7 +120,7 @@ TEST(SelectReuseThresholdTest, RetiresOnlyExtremeRegressions) {
       SelectReuseExceededThreshold(6'000'000'000ULL, 5'000'000'000ULL));
 }
 
-TEST(ParameterSlotTest, RebindPointsAtNewValues) {
+TEST(PlanCacheParameterSlotTest, RebindPointsAtNewValues) {
   auto first = Vals({Value(int64_t{1})});
   auto second = Vals({Value(int64_t{2})});
   const ParameterSlot slot(0, ValueType::kInt64, first);
@@ -130,7 +130,7 @@ TEST(ParameterSlotTest, RebindPointsAtNewValues) {
   EXPECT_EQ(rebound->Evaluate(row, Schema("t", {})), Value(int64_t{2}));
 }
 
-TEST(ParameterSlotTest, IsBindableLiteralClassifiesValueTypes) {
+TEST(PlanCacheParameterSlotTest, IsBindableLiteralClassifiesValueTypes) {
   EXPECT_TRUE(IsBindableLiteral(Value(int64_t{1})));
   EXPECT_TRUE(IsBindableLiteral(Value(1.5)));
   EXPECT_TRUE(IsBindableLiteral(Value(std::string("s"))));
@@ -139,7 +139,7 @@ TEST(ParameterSlotTest, IsBindableLiteralClassifiesValueTypes) {
   EXPECT_FALSE(IsBindableLiteral(Value::Array({Value(int64_t{1})}, "INT64")));
 }
 
-TEST(ParameterSlotTest, ContainsParameterSlotWalksEveryNodeKind) {
+TEST(PlanCacheParameterSlotTest, ContainsParameterSlotWalksEveryNodeKind) {
   auto values = Vals({Value(int64_t{1})});
   Schema schema("t", {Column("a", ValueType::kInt64)});
 
@@ -180,7 +180,7 @@ TEST(ParameterSlotTest, ContainsParameterSlotWalksEveryNodeKind) {
                           BinaryOperation::kAdd, ColumnValueExp("a"))));
 }
 
-TEST(ParameterSlotTest, CloneWithPreparedValuesRewritesSlotsInPlace) {
+TEST(PlanCacheParameterSlotTest, CloneWithPreparedValuesRewritesSlotsInPlace) {
   auto values = Vals({Value(int64_t{42})});
   Schema schema("t", {Column("a", ValueType::kInt64)});
   Row row({Value(int64_t{1})});
@@ -219,6 +219,50 @@ TEST(ParameterSlotTest, CloneWithPreparedValuesRewritesSlotsInPlace) {
   // Trees without slots are returned untouched.
   Expression plain = ConstantValueExp(Value(int64_t{3}));
   EXPECT_EQ(CloneWithPreparedValues(plain, values), plain);
+}
+
+// P295: ContainsParameterSlot descends into the WHERE filter, HAVING
+// condition, inner ORDER BY / GROUP BY, and secondary/trailing arguments of
+// an aggregate, but CloneWithPreparedValues rebuilt aggregates as
+// (type, child, distinct) only.  A slot sitting in one of those attributes
+// was reported as present and then silently deleted together with the
+// attribute; every attribute must survive the rebuild and rebind.
+TEST(PlanCacheParameterSlotTest,
+     CloneWithPreparedValuesKeepsAggregateAttributes) {
+  auto values = Vals({Value(int64_t{0})});
+  const auto slot = [&values] {
+    return std::make_shared<ParameterSlot>(0, ValueType::kInt64, values);
+  };
+
+  auto aggregate = std::make_shared<AggregateExpression>(
+      AggregationType::kSum, ColumnValueExp("a"), false);
+  aggregate->SetIgnoreNulls(true);
+  aggregate->SetWhereFilter(BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kGreaterThan, slot()));
+  aggregate->SetHaving(AggregateHavingModifier::kMax, slot());
+  WindowOrderTerm term;
+  term.expression = slot();
+  aggregate->SetInnerOrderBy({term});
+  aggregate->SetInnerGroupBy({ColumnValueExp("a")});
+  ASSERT_TRUE(ContainsParameterSlot(Expression{aggregate}));
+
+  Expression cloned = CloneWithPreparedValues(Expression{aggregate}, values);
+  ASSERT_TRUE(cloned->Type() == TypeTag::kAggregateExp);
+  const auto& out = cloned->AsAggregateExpression();
+  EXPECT_TRUE(out.IgnoreNulls());
+  ASSERT_TRUE(out.HasWhereFilter());
+  ASSERT_TRUE(out.WhereFilter()->Type() == TypeTag::kBinaryExp);
+  const Expression& bound_filter_rhs =
+      out.WhereFilter()->AsBinaryExpression().Right();
+  const auto* rhs_slot =
+      dynamic_cast<const ParameterSlot*>(bound_filter_rhs.get());
+  ASSERT_TRUE(rhs_slot != nullptr);
+  EXPECT_EQ(rhs_slot->Evaluate(Row(), Schema()), Value(int64_t{0}));
+  EXPECT_TRUE(out.Having() == AggregateHavingModifier::kMax);
+  EXPECT_TRUE(out.HavingCondition() != nullptr);
+  EXPECT_EQ(out.InnerOrderBy().size(), 1U);
+  EXPECT_TRUE(out.InnerOrderBy()[0].expression != nullptr);
+  EXPECT_EQ(out.InnerGroupBy().size(), 1U);
 }
 
 }  // namespace tinylamb

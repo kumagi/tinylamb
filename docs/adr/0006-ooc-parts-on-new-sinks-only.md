@@ -7,7 +7,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P2/P3a/P3b 実装済み: `exec
 
 ## 背景
 
-元の Out-of-Core 設計（`ooca-v2.md`）は、旧 `ExecutorBase` 木の演算子を 10 種以上書き直して
+元の out-of-core 設計（`ooca-v2.md`）は、旧 `ExecutorBase` 木の演算子を 10 種以上書き直して
 メモリを入力に依存させない形にする計画だった。一方 `TODO.md` は、Executor を
 「パイプライン IR ＋ シンク契約」に置き換え、S10 で旧演算子と手書き融合形を削除する。
 両方を進めると同じ演算子を 2 回書くことになる。
@@ -20,7 +20,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P2/P3a/P3b 実装済み: `exec
    （ワーカー別の `Sink` → `Combine` → `Finalize`）とソースに合わせる。
 3. 新しいシンク（`SortSink`、`HashBuildSink`、`GroupAggSink`、`WindowSink` など）は、
    最初からこの部品の上に作る。入力を全て溜める実装を先に作って後から直すことはしない。
-4. **旧演算子、`Relation`、`ColumnarTable`、`SpillFile`、手書き融合形には手を入れない。**
+4. **旧演算子・`Relation`・`SpillFile`・手書き融合形には原則として手を入れない（P2/P3a/P3b の実装で一部移行済み）。**
    出力を `rows_` / `output_` に溜め直す問題も、旧演算子では直さない。
 5. 規模のゲートは `TINYLAMB_EXEC_ENGINE=pipeline` で、`legacy_source_ms` が 0 のクエリだけを
    対象にする。対象になったクエリの割合を毎回記録する。

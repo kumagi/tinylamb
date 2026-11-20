@@ -39,16 +39,9 @@ constexpr size_t kCaseCount = kSchemeCaseCount;
 
 PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
   *ok = false;
-  static std::array<int, kCaseCount> cache;
-  static bool cache_init = false;
-  if (!cache_init) {
-    cache.fill(-1);
-    cache_init = true;
-  }
-  const auto idx = static_cast<size_t>(&c - kCases);
-  int& slot = cache[idx];
-  const int first = slot >= 0 ? slot : 0;
-  for (int s = first; std::cmp_less(s, c.nshapes); ++s) {
+  // Always try all shapes: a process-static "first successful shape" cache
+  // collapses the four distributions into one and hides data-dependent bugs.
+  for (int s = 0; std::cmp_less(s, c.nshapes); ++s) {
     setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
     PaxChunk chunk =
         PaxChunk::BuildFromSortedRun(
@@ -57,15 +50,10 @@ PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
     unsetenv("TINYLAMB_FORCE_SCHEME");
     const auto& enc = chunk.GetFooter().encodings;
     if (!enc.empty() && enc[c.col] == static_cast<uint8_t>(c.expected)) {
-      slot = s;
       *ok = true;
       return chunk;
     }
-    if (slot < 0 && s == 0) {
-      slot = 0;
-    }
   }
-  slot = static_cast<int>(c.nshapes);
   return PaxChunk{};
 }
 

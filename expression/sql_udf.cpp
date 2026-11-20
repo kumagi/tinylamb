@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "expression/expression.hpp"
+#include "type/collation.hpp"
 #include "type/column.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -81,9 +82,7 @@ StatusOr<SqlUdfBinding> BindSqlUdfArguments(const SqlScalarFunction& function,
   std::vector<Column> columns;
   columns.reserve(function.params.size());
   for (size_t i = 0; i < function.params.size(); ++i) {
-    columns.emplace_back(function.params[i], i < arguments.size()
-                                                 ? arguments[i].type
-                                                 : ValueType::kNull);
+    columns.emplace_back(function.params[i], arguments[i].type);
   }
   return SqlUdfBinding{.row = Row(std::move(arguments)),
                        .schema = Schema("", std::move(columns))};
@@ -126,11 +125,6 @@ std::string EncodeStructJson(
     return out;
   };
 
-  bool any_ci = false;
-  for (const auto& [name, value] : fields) {
-    any_ci = any_ci || value.IsCaseInsensitive();
-  }
-
   std::string json_out = "{";
   bool first = true;
   for (const auto& [name, value] : fields) {
@@ -148,10 +142,10 @@ std::string EncodeStructJson(
     switch (value.type) {
       case ValueType::kVarChar: {
         text = std::string(value.value.varchar_value);
-        if (any_ci) {
-          for (char& c : text) {
-            c = c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-          }
+        // Fold only fields that actually carry a case-insensitive tag;
+        // a CI sibling field must not change a binary field's text.
+        if (value.IsCaseInsensitive()) {
+          text = FoldCaseForCollation(text);
         }
         // Proto value-table cells use the generic VARCHAR channel.  Keep
         // proto text as a quoted payload here: the compliance matcher
@@ -161,7 +155,9 @@ std::string EncodeStructJson(
         break;
       }
       case ValueType::kInt64:
-        text = std::to_string(value.value.int_value);
+        // AsString() respects the unsigned tag (UINT64_MAX must not fold to
+        // "-1" in a STRUCT literal's text form).
+        text = value.AsString();
         break;
       case ValueType::kDouble:
         // Shortest round-trip representation so whole numbers render as "3"

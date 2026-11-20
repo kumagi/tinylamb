@@ -93,24 +93,47 @@ class AggregateGroupTable {
 
   [[nodiscard]] size_t size() const { return keys_.size(); }
   [[nodiscard]] bool empty() const { return keys_.empty(); }
-  [[nodiscard]] const Row& Key(size_t group) const { return keys_[group]; }
+  [[nodiscard]] const Row& Key(size_t group) const { return *keys_[group]; }
   [[nodiscard]] size_t AggregateCount() const { return aggregates_->size(); }
   // The accumulator state of one (group, aggregate) pair; the positional fast
   // path feeds it directly.
   [[nodiscard]] relational_detail::AggregateAccumulator& StateFor(
       size_t group, size_t index) {
-    return states_[(group * aggregates_->size()) + index];
+    return StateAt((group * aggregates_->size()) + index);
   }
   void Clear();
 
  private:
-  void AddGroup(Row key);
+  void AppendGroupStates();
+  [[nodiscard]] relational_detail::AggregateAccumulator& StateAt(size_t flat);
+  [[nodiscard]] const relational_detail::AggregateAccumulator& StateAt(
+      size_t flat) const;
+  // P48: append one accumulator to the chunked state arena.  Blocks are
+  // reserved to full capacity on creation, so references handed out by
+  // StateAt/StateFor stay valid while later groups append (the property the
+  // old std::deque provided at one malloc per 880-byte element).
+  template <typename... Args>
+  void EmplaceState(Args&&... args) {
+    if (states_.empty() || states_.back()->size() == kStateBlockElements) {
+      auto block =
+          std::make_unique<std::vector<relational_detail::AggregateAccumulator>>();
+      block->reserve(kStateBlockElements);
+      states_.push_back(std::move(block));
+    }
+    states_.back()->emplace_back(std::forward<Args>(args)...);
+  }
 
   const Schema* input_schema_;
   const std::vector<const AggregateExpression*>* aggregates_;
   relational_detail::GroupKeyMap index_{};
-  std::vector<Row> keys_;
-  std::deque<relational_detail::AggregateAccumulator> states_{};
+  // P50: one key copy lives in the `index_` node; `keys_` points at it
+  // (unordered_map nodes keep addresses stable across rehash), so the group
+  // key -- vector<Value> plus per-VARCHAR payloads -- is not retained twice.
+  std::vector<const Row*> keys_;
+  static constexpr size_t kStateBlockElements = 512;
+  std::vector<std::unique_ptr<
+      std::vector<relational_detail::AggregateAccumulator>>>
+      states_;
 };
 
 // Shared output cursor: every shape materializes its group rows first and then

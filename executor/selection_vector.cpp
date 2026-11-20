@@ -113,7 +113,9 @@ ValidityBitmap& ValidityBitmap::operator|=(const ValidityBitmap& other) {
 }
 
 void ValidityBitmap::ToSelectionVector(SelectionVector* sel) const {
-  assert(sel != nullptr);
+  if (sel == nullptr) {
+    return;
+  }
   sel->Clear();
   sel->Reserve(CountValid());
   for (size_t word_idx = 0; word_idx < words_.size(); ++word_idx) {

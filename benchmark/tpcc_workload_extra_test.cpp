@@ -19,7 +19,7 @@ namespace tinylamb {
 
 TEST(TpccLastNameTest, FollowsTheSpecSyllableTable) {
   // Clause 4.3.2.2 syllables: BAR OUGHT ABLE PRI PRES ESE ANTI CALLY ATION
-  // EING; n = 0 -> BARBARBAR, n = 123 -> ABLEOUGHTABLE.
+  // EING; n = 0 -> BARBARBAR, n = 123 -> OUGHTABLEPRI.
   EXPECT_EQ(TpccLastName(0), "BARBARBAR");
   EXPECT_EQ(TpccLastName(123), "OUGHTABLEPRI");
   EXPECT_EQ(TpccLastName(999), "EINGEINGEING");

@@ -45,6 +45,13 @@ class Page {
     page_id_ = pid;
     page_lsn_ = 0;
     recovery_lsn_ = 0;
+    evicted_.store(false, std::memory_order_release);
+    referenced_.store(false, std::memory_order_relaxed);
+    // A reused Page object must not inherit the previous generation's
+    // eviction/accounting state.
+    in_eviction_queue_ = false;
+    accounted_bytes_ = 0;
+    accounted_emergency_bytes_ = 0;
     body.row_page.Initialize();
   }
 
@@ -64,23 +71,19 @@ class Page {
 
   [[nodiscard]] slot_t RowCount() const { return body.row_page.RowCount(); }
 
-  Status SetNextPageId(Transaction& txn, page_id_t next) {
+  Status SetNextPage(Transaction& txn, page_id_t next) {
     return body.row_page.SetNextPage(page_id_, txn, next);
   }
-  Status SetPrevPageId(Transaction& txn, page_id_t prev) {
-    return body.row_page.SetPrevPage(page_id_, txn, prev);
-  }
-  Status SetNextPage(Transaction& txn, page_id_t next) {
-    return SetNextPageId(txn, next);
-  }
   Status SetPrevPage(Transaction& txn, page_id_t prev) {
-    return SetPrevPageId(txn, prev);
+    return body.row_page.SetPrevPage(page_id_, txn, prev);
   }
 
   [[nodiscard]] PageType Type() const { return type_; }
   [[nodiscard]] page_id_t PageID() const { return page_id_; }
   [[nodiscard]] lsn_t PageLSN() const { return page_lsn_; }
-  [[nodiscard]] lsn_t RecoveryLSN() const { return recovery_lsn_; }
+  // LSN fields are read by checkpoint liveness snapshots (max_dirty_lsn).
+  // Callers must hold the owning PageRef's latch while using these setters;
+  // the fields are deliberately plain (not atomic) and are not self-synchronized.
   void SetPageLSN(lsn_t new_lsn) { page_lsn_ = new_lsn; }
   void SetRecLSN(lsn_t new_lsn) {
     if (recovery_lsn_ == 0) {
@@ -89,8 +92,9 @@ class Page {
       recovery_lsn_ = std::min(recovery_lsn_, new_lsn);
     }
   }
-  void ResetRecLSN(lsn_t new_lsn) { recovery_lsn_ = new_lsn; }
-  void SetChecksum() {}
+  // recLSN is monotonic (SetRecLSN keeps the minimum); no reset accessor.
+  // Note: integrity CRCs live on the serialized block (page_manager.cpp), not
+  // on the in-memory Page; there is no page-level SetChecksum API.
   [[nodiscard]] bool IsValid() const { return type_ == PageType::kRowPage; }
   [[nodiscard]] std::shared_mutex* Latch() const { return &latch_; }
   void SetExclusiveOwner(std::thread::id id) const {
@@ -110,10 +114,26 @@ class Page {
     return o;
   }
 
+  [[nodiscard]] bool IsEvicted() const noexcept {
+    return evicted_.load(std::memory_order_acquire);
+  }
+  void SetEvicted(bool evicted) noexcept {
+    evicted_.store(evicted, std::memory_order_release);
+  }
+  void MarkReferenced() noexcept {
+    referenced_.store(true, std::memory_order_relaxed);
+  }
+  bool TakeReferenced() noexcept {
+    return referenced_.exchange(false, std::memory_order_relaxed);
+  }
+
   PageType type_{PageType::kUnknown};
   page_id_t page_id_{0};
   lsn_t page_lsn_{0};
   lsn_t recovery_lsn_{0};
+  size_t accounted_bytes_{0};
+  size_t accounted_emergency_bytes_{0};
+  bool in_eviction_queue_{false};
 
   struct Body {
     RowPage row_page;
@@ -122,6 +142,8 @@ class Page {
  private:
   mutable std::shared_mutex latch_;
   mutable std::atomic<std::thread::id> exclusive_owner_{};
+  std::atomic<bool> evicted_{false};
+  std::atomic<bool> referenced_{false};
 };
 
 }  // namespace tinylamb

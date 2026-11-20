@@ -405,7 +405,7 @@ SELECT LAG(row_id, @offset) OVER test_window
 FROM TestTable
 WINDOW test_window AS (ORDER BY row_id)
 --
-ERROR: generic::out_of_range: The offset to the function LAG must not be null
+ERROR: generic::out_of_range: The offset to the function LAG must not be NULL
 ==
 
 [name=lag_bool]

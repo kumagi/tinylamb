@@ -26,6 +26,12 @@ namespace tinylamb {
     throw;
   } catch (const std::bad_alloc&) {
     return Status::kMemoryLimitExceeded;
+  } catch (const std::invalid_argument& error) {
+    return StatusError(StatusCode::kInvalidArgument, error.what());
+  } catch (const std::out_of_range& error) {
+    return StatusError(StatusCode::kInvalidArgument, error.what());
+  } catch (const std::length_error& error) {
+    return StatusError(StatusCode::kTooBigData, error.what());
   } catch (const std::exception& error) {
     return StatusError(StatusCode::kRuntimeError, error.what());
   } catch (...) {

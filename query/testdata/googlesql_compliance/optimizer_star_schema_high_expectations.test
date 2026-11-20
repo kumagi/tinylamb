@@ -34,7 +34,7 @@ ARRAY<STRUCT<x INT64>>[]
 [mode=explain]
 [plan_contains=JoinElimination]
 [plan_not_contains=opt_dim_customer]
-[name=unused_dimension_join_eliminated_by_foreign_key]
+[name=unused_dimension_join_estimate]
 SELECT f.sale_id, f.revenue
 FROM opt_fact_sales f JOIN opt_dim_customer c
 ON f.customer_id = c.customer_id
@@ -135,7 +135,7 @@ ARRAY<STRUCT<sale_id INT64, tier STRING, revenue INT64>>[
 # fixture happens to contain matching keys.
 [mode=explain]
 [plan_contains=HashJoin]
-[name=all_unused_dimensions_eliminated]
+[name=unused_dimension_joins_retained]
 SELECT COUNT(*) AS n
 FROM opt_fact_sales f
 JOIN opt_dim_customer c ON f.customer_id = c.customer_id

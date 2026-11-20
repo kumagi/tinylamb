@@ -9,6 +9,9 @@ Each layer directory has its own `AGENTS.md`. **Before touching code in
 a layer, read that directory's `AGENTS.md` first.** This file covers only
 project-wide invariants, layering, and workflows.
 
+If `AGENTS.local.md` exists in the repository root, read it as well — it
+contains machine-specific rules and local workflows for this environment.
+
 ---
 
 ## 1. Layered Architecture & Dependency Rules
@@ -51,7 +54,7 @@ plain `add_library` targets.
 2. **`PageRef` RAII** (`page/page_ref.hpp`): latches the in-memory `Page` on
    construct and unlocks on destroy (`PageUnlock()` releases early). Never hold
    a raw `Page*` across latch release (`PagePool` is retired; pages live in RAM
-   under `PageManager` and persist to `<db>.db` on LSM compaction / shutdown).
+   under `PageManager` and persist to `<db>.db` on LSM compaction or explicit `WriteCheckpoint` (no final snapshot is written at shutdown; the WAL is replayed on next open)).
 3. **Expression ground truth**: AST `Expression::Evaluate` is the semantic
    reference. New operators go AST-first, then Bytecode; JIT only mirrors
    narrow INT64 kernels. `expression/differential_test.cpp` must pass.
@@ -83,8 +86,15 @@ plain `add_library` targets.
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ctest --test-dir build --output-on-failure -j$(nproc)
-python3 scripts/check_layering.py   # must exit 0
+python3 scripts/check_layering.py       # must exit 0
+python3 scripts/check_ooc_invariants.py # must exit 0
 ```
+
+- **Unit-test concurrency & duration contract**:
+  - Every `TEST`/`TEST_F` unit must be safe to run concurrently alongside any other test under `ctest --test-dir <dir> --output-on-failure -j$(nproc)` (no shared mutable filesystem paths, ports, or process-global fixtures across tests — derive unique filenames per test, e.g. `RandomString()`).
+  - Every individual test unit must finish in **at most 60 seconds** (`add_simple_test` enforces `TIMEOUT 60` in `CMakeLists.txt`). Do not raise test timeouts in CMake; shard heavy suites into independent `TEST`/`TEST_F` cases or keep per-case input sizes bounded so every unit completes well under 60s even in Debug builds.
+  - Exception: `scale`-labeled tests (`add_scale_test`, `TIMEOUT 600`, e.g. GiB-scale spill/sort baselines that cannot fit 60s) are opt-in via `ctest -L scale` and are excluded from default runs (`ctest -LE scale`; CI uses the exclusion). Do not add new scale tests without rethinking sharding first.
+  - Always invoke tests with `-j` (`ctest --test-dir <dir> --output-on-failure -j$(nproc)`, adding `-R <regex>` when filtering). Avoid serial full-suite runs.
 
 - Throwaway `.db`/`.log` files: every test binary links
   `database/test_workspace_cleanup_env.cpp`, a gtest environment that
@@ -98,8 +108,9 @@ python3 scripts/check_layering.py   # must exit 0
   iteration — the disk-quota guard that keeps long sweeps from turning
   `Database::Create` failures into bogus crashes.
 
-- Single test: `./build/<name>_test` (e.g. `differential_test`,
-  `sql_engine_tpch_test`). Tests link `tinylamb::sql` + `tinylamb::test_util`.
+- Filtered test run: `ctest --test-dir build --output-on-failure -j$(nproc) -R 'Suite\.Case'` (always keep `-j`; avoid running full unsharded binaries serially). Most tests link `tinylamb::sql` + `tinylamb::test_util`; the fuzz replay
+tests (added via `add_replay_test`) instead link `tinylamb::sql` /
+`tinylamb::postgres_server` directly and do not use `tinylamb::test_util`.
 - Format: `clang-format -i` on touched `*.hpp`/`*.cpp`.
 - Unit test per bugfix/feature in the same layer dir (`*_test.cpp`).
 - Benchmarks: TPC-H (`tinylamb_tpch_benchmark`) and
@@ -112,7 +123,9 @@ python3 scripts/check_layering.py   # must exit 0
   cross-check), `griffin_fuzzer_libfuzzer` (catalog-guided SQL sessions,
   AST-vs-bytecode/JIT differential), `sql_session_fuzzer_libfuzzer`
   (state-tracking sessions: a C++ row-level mirror is compared against a
-  full-table dump after every statement, across PreCommit boundaries).
+  full-table dump after every statement, across PreCommit boundaries),
+  `sql_ooc_fuzzer_libfuzzer` (budget/eviction/spill-invariant oracle across
+  queries and memory limits).
   Build with
   `cmake -S . -B build-fuzz -DTINYLAMB_ENABLE_FUZZ=ON` and run e.g.
   `./build-fuzz/sql_oracle_fuzzer_libfuzzer -max_total_time=3600` in a scratch
@@ -122,18 +135,38 @@ python3 scripts/check_layering.py   # must exit 0
   `SqlOracleFuzzer.ReplayCommittedRegressionFiles` replays every `.test` in
   `TINYLAMB_ORACLE_REGRESSION_DIR` (expr/griffin traces replay through
   `ReplayExprOracleTrace` / `ReplayGriffinTrace` in their `*_fuzzer_test`;
-  session traces through `SqlSessionFuzzer.ReplayCommittedRegressionFiles`
+  session traces through `SqlSessionFuzzer.ReplayCommittedRegressionFilesShard0..3`
   over `TINYLAMB_SESSION_REGRESSION_DIR`, wired in CMake to
-  `query/testdata/session_regressions/`).
+  `query/testdata/session_regressions/`; OOC traces through
+  `SqlOocFuzzer.ReplayCommittedRegressionFilesShard0..3` over
+  `TINYLAMB_OOC_REGRESSION_DIR`, wired in CMake to
+  `query/testdata/ooc_regressions/`).
   Logic bugs (wrong results), not just crashes, fail the run; run them long
   after touching optimizer/executor/expression code.
+- Out-of-Core bug hunting: `sql_ooc_fuzzer` (`query/sql_ooc_fuzzer.*`,
+  `query/sql_ooc_query_gen.*`) shrinks the memory knobs so a few MiB of data
+  is many times the buffer pool, then holds the engine to exact results with
+  a C++ mirror, a budget-invariance oracle (the same random query with the
+  knobs relaxed vs. tiny budgets / always-spill / early-closed cursors),
+  exhaustive failure-injection sweeps and leak checks. Run campaigns
+  out-of-process so crashes and hangs are captured and minimized too:
+  `ninja -C build sql_ooc_fuzz && scripts/ooc_fuzz.py run --bin
+  build/sql_ooc_fuzz --out /tmp/ooc --minutes 30 --minimize` (findings are
+  bucketed by signature under `<out>/findings/`; `--ignore` /
+  `TINYLAMB_OOC_FUZZ_SKIP_OPS` step over known ones). After touching
+  `executor/detail/ooc/`, `executor/detail/pipeline/ooc_*`, `common/spill/`,
+  `common/memory_budget.*` or `page/page_manager.*`, run it long. Workflow
+  (signatures, filing a finding, promoting a fixed one to a regression test):
+  [`docs/ooc_fuzzing.md`](docs/ooc_fuzzing.md).
+- Pipeline & OOC execution default: `SqlEngine` lowers SELECT queries through `PipelineLowering` (`executor/pipeline_lowering.hpp`) + OOC spillable sinks (`executor/detail/pipeline/`) unless `TINYLAMB_EXEC_ENGINE=legacy`; grouped queries also use `TryLowerGroupedStatementToPipeline` (`query/grouped_pipeline_lowering.hpp`). See [`docs/environment_variables.md`](docs/environment_variables.md) and [`ooca-v2.md`](ooca-v2.md).
 
 ## 4. Guidelines for Making Changes
 
 1. Read the target layer's `AGENTS.md`, then place new code in the lowest
-   fitting layer and re-run `check_layering.py`.
+   fitting layer and re-run `check_layering.py` and `check_ooc_invariants.py`
+   (and `python3 scripts/run_clang_tidy.py` when checking static analysis).
 2. Preserve semantic equivalence (`expression/differential_test.cpp`).
-3. Check ADRs: [`docs/review/`](docs/review/),
-   [`docs/adr-proposal.md`](docs/adr-proposal.md), [`docs/adr/`](docs/adr/),
-   [`ARCHITECTURE.md`](ARCHITECTURE.md). Improvement backlog:
-   [`docs/next-actions.md`](docs/next-actions.md).
+3. Check ADRs and design/plan records: [`docs/design.md`](docs/design.md),
+   [`docs/review/`](docs/review/), [`docs/adr/`](docs/adr/),
+   [`ARCHITECTURE.md`](ARCHITECTURE.md). Improvement plans:
+   [`TODO.md`](TODO.md) and [`ooca-v2.md`](ooca-v2.md).

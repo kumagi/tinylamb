@@ -58,9 +58,13 @@ namespace {
 
 // TLSTATS + v3. v3 appends the table's row-layout generation (the clustering
 // proof stamp); v2 payloads are still readable and simply carry no proof.
+// The trailing 0x02 byte is a historical marker; the authoritative version
+// is kStatisticsVersion (currently 3), carried as an explicit field.
 constexpr uint64_t kStatisticsMagic = 0x544C535441545302ULL;
 constexpr uint64_t kStatisticsVersion = 3;
 constexpr uint64_t kStatisticsVersionWithoutProof = 2;
+// Shared by encoder and decoder so a record we write can always be read back.
+constexpr uint64_t kMaxStatisticsColumns = 4096;
 constexpr size_t kStoredStringPrefixLength = 32;
 // Reservoir size per column: a multiple of the histogram bucket count so
 // every bucket rests on >=256 sampled values.  Populations up to this size
@@ -72,8 +76,14 @@ Value CompactValue(const Value& value) {
       value.value.varchar_value.size() <= kStoredStringPrefixLength) {
     return value;
   }
+  // Carry the collation/unsigned/INTERVAL tag across truncation: dropping
+  // it made stored boundaries and MCVs bare VARCHARs, so comparisons with
+  // tagged query values fell into the tag-mismatch arms of Value equality
+  // instead of the ordinary prefix comparison the compaction implies.
   return Value(std::string(
-      value.value.varchar_value.substr(0, kStoredStringPrefixLength)));
+                   value.value.varchar_value.substr(
+                       0, kStoredStringPrefixLength)))
+      .WithCollation(value.Collation());
 }
 
 void CompactFrequencies(std::vector<ValueFrequency>* frequencies) {
@@ -1178,6 +1188,36 @@ TableStatistics::TableStatistics(const Schema& schema) : row_count_(0) {
   }
 }
 
+namespace {
+// T4493: istream window over borrowed bytes. The Decoder only pulls
+// characters through the streambuf, so decoding a persisted stats blob no
+// longer needs (a) the owned std::string copy nor (b) the stringstream's
+// second internal copy of the payload.
+class ViewStreambuf : public std::streambuf {
+ public:
+  explicit ViewStreambuf(std::string_view view) {
+    char* begin = const_cast<char*>(view.data());  // NOLINT(readability)
+    setg(begin, begin, begin + view.size());
+  }
+};
+}  // namespace
+
+std::optional<std::vector<ColumnStats>> DecodeTlcsColumnStats(
+    std::string_view encoded, size_t column_count) {
+  if (encoded.empty()) {
+    return std::nullopt;
+  }
+  ViewStreambuf buffer(encoded);
+  std::istream stream(&buffer);
+  Decoder decoder(stream);
+  std::vector<ColumnStats> columns;
+  decoder >> columns;
+  if (decoder.Failed() || !decoder.AtEnd() || columns.size() != column_count) {
+    return std::nullopt;
+  }
+  return columns;
+}
+
 Status TableStatistics::Update(Transaction& txn, const Table& target) {
   const Schema& schema = target.GetSchema();
   // The generation window brackets the whole scan: a writer that enters or
@@ -1190,16 +1230,10 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     if (encoded.empty() || generation == 0 || target.RowsRewrittenInPlace()) {
       return false;
     }
-    std::string stats_buf(encoded);
-    std::stringstream ss(stats_buf);
-    Decoder dec(ss);
-    std::vector<ColumnStats> decoded;
-    dec >> decoded;
-    if (!dec.Failed() && dec.AtEnd() &&
-        decoded.size() == schema.ColumnCount() &&
-        target.LayoutGeneration() == generation) {
+    auto decoded = DecodeTlcsColumnStats(encoded, schema.ColumnCount());
+    if (decoded && target.LayoutGeneration() == generation) {
       row_count_ = static_cast<size_t>(total_rows);
-      stats_ = std::move(decoded);
+      stats_ = std::move(*decoded);
       layout_generation_ = generation;
       return true;
     }
@@ -1212,7 +1246,7 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
       try_load_tlcs_stats(tlcs->serialized_column_stats, tlcs->total_rows)) {
     return Status::kSuccess;
   }
-  if (std::shared_ptr<const TlcsFile> tlcs_file = target.GetBackingTLCSStore();
+  if (std::shared_ptr<const TlcsFile> tlcs_file = target.GetBackingTlcsStore();
       tlcs_file != nullptr && tlcs_file->LayoutGeneration() == generation &&
       tlcs_file->FirstPageId() == target.FirstPageId() &&
       try_load_tlcs_stats(tlcs_file->SerializedColumnStats(),
@@ -1488,6 +1522,8 @@ Decoder& operator>>(Decoder& decoder, ColumnStats& stats) {
 }
 
 Encoder& operator<<(Encoder& encoder, const TableStatistics& stats) {
+  // Callers must keep stats_.size() <= kMaxStatisticsColumns: the decoder
+  // enforces that bound on readback and Encoder has no failure channel.
   encoder << kStatisticsMagic << kStatisticsVersion
           << static_cast<uint64_t>(stats.row_count_) << stats.stats_
           << stats.layout_generation_;
@@ -1517,7 +1553,6 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
     // last column it sees layout_generation_).
     uint64_t column_count = 0;
     decoder >> column_count;
-    constexpr uint64_t kMaxStatisticsColumns = 4096;
     if (column_count > kMaxStatisticsColumns) {
       decoder.Fail();
       return decoder;
@@ -1624,9 +1659,18 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
 }
 
 std::ostream& operator<<(std::ostream& out, const ColumnStats& stats) {
-  out << "Type: " << static_cast<int>(stats.type_)
-      << " NonNull: " << stats.non_null_count_ << " Null: " << stats.null_count_
-      << " Distinct: " << stats.distinct_count_ << " Histogram: [";
+  // T2112: the old render printed the raw ValueType integer and three
+  // counters, dropping exactly the fields the optimizer judges with:
+  // Unmeasured() (both counters zero means "never measured", NOT "empty"),
+  // correlation / clustering, and the boundary / most-common value lists.
+  out << "Type: " << ValueTypeToString(stats.type_);
+  if (stats.Unmeasured()) {
+    out << " UNMEASURED";
+  }
+  out << " NonNull: " << stats.non_null_count_ << " Null: " << stats.null_count_
+      << " Distinct: " << stats.distinct_count_
+      << " Correlation: " << stats.correlation_
+      << " Clustering: " << stats.ClusteringStrength() << " Histogram: [";
   for (size_t i = 0; i < stats.histogram_.size(); ++i) {
     if (i > 0) {
       out << ", ";
@@ -1636,13 +1680,33 @@ std::ostream& operator<<(std::ostream& out, const ColumnStats& stats) {
         << bucket.distinct;
   }
   out << "]";
+  auto render_values = [&out](std::string_view label,
+                              const std::vector<ValueFrequency>& values) {
+    if (values.empty()) {
+      return;
+    }
+    out << " " << label << ": [";
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (i > 0) {
+        out << ", ";
+      }
+      out << values[i].value << ":" << values[i].count;
+    }
+    out << "]";
+  };
+  render_values("Lowest", stats.lowest_values_);
+  render_values("Highest", stats.highest_values_);
+  render_values("MostCommon", stats.most_common_values_);
   return out;
 }
 
 std::ostream& operator<<(std::ostream& out, const TableStatistics& stats) {
   out << "Rows: " << stats.row_count_ << "\n";
-  for (const ColumnStats& column : stats.stats_) {
-    out << column << "\n";
+  // T2112: ColumnStats carries no column identity (no Schema here), so at
+  // least label each line with its ordinal -- previously a 20-column dump
+  // could only be read by counting lines against a catalog.
+  for (size_t i = 0; i < stats.stats_.size(); ++i) {
+    out << "col" << i << ": " << stats.stats_[i] << "\n";
   }
   return out;
 }

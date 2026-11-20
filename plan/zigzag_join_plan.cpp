@@ -41,7 +41,16 @@ size_t DefaultEstimatedRows(const Plan& left, const Plan& right,
   if (operation == BinaryOperation::kEquals) {
     return std::min(left->EmitRowCount(), right->EmitRowCount());
   }
-  return std::max(left->EmitRowCount(), right->EmitRowCount());
+  // Non-equality zigzag joins can match one row to many on the other side;
+  // saturate a conservative upper bound rather than claiming max(l,r).
+  const size_t l = left->EmitRowCount();
+  const size_t r = right->EmitRowCount();
+  if (l == 0 || r == 0) {
+    return 0;
+  }
+  return l > std::numeric_limits<size_t>::max() / r
+             ? std::numeric_limits<size_t>::max()
+             : l * r;
 }
 
 }  // namespace
@@ -107,9 +116,9 @@ bool ZigZagJoinPlan::IsOrderedBy(
 
 void ZigZagJoinPlan::Dump(std::ostream& output, int indent) const {
   output << ToString() << "\n" << Indent(static_cast<size_t>(indent) + 2);
-  left_->Dump(output, indent + 2);
+  DumpChild(output, *left_, indent + 2);
   output << "\n" << Indent(static_cast<size_t>(indent) + 2);
-  right_->Dump(output, indent + 2);
+  DumpChild(output, *right_, indent + 2);
 }
 
 std::string ZigZagJoinPlan::ToString() const {
@@ -129,7 +138,7 @@ bool ZigZagJoinPlan::InstallParameterSlots(const std::vector<Value>& parameters,
                                            std::vector<Expression>* slots) {
   return left_->InstallParameterSlots(parameters, cursor, slots) &&
          right_->InstallParameterSlots(parameters, cursor, slots) &&
-         SlotizeInPlace(&predicate_, parameters, cursor, slots);
+         CollectParameterSlots(&predicate_, slots);
 }
 
 }  // namespace tinylamb

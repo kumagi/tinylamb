@@ -30,6 +30,7 @@
 #include <thread>
 
 #include "common/constants.hpp"
+#include "common/memory_budget.hpp"
 #include "common/status_or.hpp"
 
 namespace tinylamb {
@@ -47,22 +48,30 @@ class Logger final {
     uint64_t nanoseconds;
   };
   [[nodiscard]] SyncStats GetSyncStats() const {
-    return {.count = sync_count_.load(std::memory_order_relaxed),
-            .nanoseconds = sync_ns_.load(std::memory_order_relaxed)};
+    // Seqlock: a single flush worker publishes count+ns as a pair; retry if a
+    // sync landed between the two loads so the ratio stays coherent.
+    for (;;) {
+      const uint64_t before = sync_seq_.load(std::memory_order_acquire);
+      if ((before & 1U) != 0) {
+        continue;
+      }
+      const SyncStats snapshot{  // NOLINT(modernize-use-designated-initializers)
+          sync_count_.load(std::memory_order_relaxed),
+          sync_ns_.load(std::memory_order_relaxed)};
+      if (sync_seq_.load(std::memory_order_acquire) == before) {
+        return snapshot;
+      }
+    }
   }
 
-  // D1: a WAL record must stay within the bound the recovery reader accepts
-  // (RecoveryManager parses records whose declared length is at most 64 MiB;
-  // the serialized record carries magic/version/header/CRC overhead on top
-  // of the payload).  AddLog rejects anything larger instead of writing
-  // bytes that could never be replayed.  The 16 MiB ceiling is a deliberate
-  // margin below the reader's 64 MiB limit.
+  // Shared by AddLog and recovery. The limit includes the serialized
+  // record header and CRC and leaves room below the default segment size.
   static constexpr size_t kMaxRecordSize =
       (size_t{16} << 20) - (size_t{64} << 10);
 
   // The WAL is cut into fixed-size segment files named
   // `<logfile>.<20-digit index>`; a record's absolute LSN maps to
-  // `index = lsn / kLogSegmentSize`, `offset = lsn % kLogSegmentSize`.
+  // `index = lsn / the segment size constant`, `offset = lsn % the segment size constant`.
   // Segmenting is what makes recycling possible: after a durable checkpoint,
   // CheckpointManager deletes whole segments whose records can no longer be
   // needed (see docs/wal_format.md), so a long-running database stops
@@ -112,7 +121,8 @@ class Logger final {
   Logger& operator=(Logger&&) = delete;
   ~Logger();
 
-  // Drains the worker and reports a write failure, if one occurred.
+  // Stops the worker (no further AddLog accepted), drains pending writes,
+  // and reports a write failure, if one occurred.
   Status Finish();
 
   // A synchronous commit coordinator explicitly requests every acknowledged
@@ -197,9 +207,10 @@ class Logger final {
   // that byte (i+1) * segment_size starts a record: a legacy record may
   // straddle a segment boundary, and deleting the segment holding its head
   // would orphan its tail. Call only once the checkpoint anchored at >=
-  // floor is durably recorded in the master record AND every page image the
-  // recycled records could rebuild is durably flushed (see
-  // CheckpointManager::WriteCheckpoint). Returns the new lowest retained
+  // floor is durable (WaitForDurable on the WAL) AND the fuzzy checkpoint
+  // snapshot covering those records was durably written to <db>.db (there is
+  // no .last_checkpoint master record; see CheckpointManager::WriteCheckpoint,
+  // which waits for durability first and then recycles). Returns the new lowest retained
   // byte (the end of the highest removed segment), or 0 when nothing was
   // removed. A segment that cannot be unlinked is logged and left in place.
   lsn_t RecycleUpTo(lsn_t floor);
@@ -230,13 +241,15 @@ class Logger final {
     o << "Logger(committed_lsn=" << l.flushed_lsn_.load()
       << ", durable_lsn=" << l.durable_lsn_.load()
       << ", buffered_lsn=" << l.buffered_lsn_.load()
-      << ", finish=" << l.finish_.load() << ")";
+      << ", finish=" << l.finish_.load()
+      << ", failed=" << l.Failed() << ", errno=" << l.ErrorNumber() << ")";
     return o;
   }
 
  private:
   int SyncSegment(size_t logical_end = static_cast<size_t>(-1));
   int WriteFixedTail(size_t logical_end);
+  std::atomic<uint64_t> sync_seq_{0};  // odd while a sync is updating stats
   std::atomic<uint64_t> sync_count_{0};
   std::atomic<uint64_t> sync_ns_{0};
   // Only Create() may construct; use it so open/stat/thread-start failures
@@ -264,7 +277,8 @@ class Logger final {
   void SetFailed(int err);
   // Returns a failure Status when Failed(), success otherwise.
   [[nodiscard]] Status CheckFailed() const;
-  // Signals the worker to quit and joins it. Never throws.
+  // Signals the worker to quit and joins it. std::system_error from join()
+  // is translated to a failed Status by callers.
   void DrainAndStopWorker();
 
   std::filesystem::path base_path_;
@@ -311,6 +325,8 @@ class Logger final {
   // sampling ring occupancy -- occupancy snapshots race the producer's
   // park/progress and once lost the wakeup for an unbounded wait.
   int full_buffer_waiters_{0};
+  ProcessMemoryCharge wal_buffer_charge_{MemoryPoolKind::kTx};
+  bool wal_buffer_emergency_{false};
   std::string buffer_;
   std::chrono::milliseconds sync_interval_{1};
   std::atomic<bool> commit_driven_sync_{false};
@@ -329,6 +345,18 @@ class Logger final {
   // ring starts zeroed -- the file bytes below this LSN are not in it) and
   // advanced on TruncateTo. TryCopyBuffered never serves below it.
   alignas(64) std::atomic<lsn_t> ring_floor_lsn_{0};
+  // P424/473: the segment pre-roll memsets its padding gap into the ring
+  // BEFORE advancing buffered_lsn_, and the zeroed positions are exactly the
+  // OLDEST still-window-resident bytes (the write cursor is the oldest slot).
+  // Until the store lands, TryCopyBuffered could serve those zeroed bytes as
+  // a complete read while the disk holds real record bytes. The producer
+  // raises this flag ahead of the memset and clears it only after the
+  // buffered store; TryCopyBuffered refuses the window while it is set. The
+  // flag and buffered_lsn_ form a Dekker pair: both sides keep seq_cst
+  // ordering between the two variables, so a read that starts before the
+  // bump and re-checks after the store fails the `after < lsn + cap` window
+  // test, and a read fully inside the window sees the flag.
+  alignas(64) std::atomic<bool> ring_zeroing_{false};
   std::thread worker_;
 };
 

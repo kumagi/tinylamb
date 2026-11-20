@@ -255,8 +255,12 @@ bool CanBorrowJoinKeys(const Relation& a, const Relation& b,
         if (value.IsNull()) {
           continue;
         }
+        // INTERVAL-tagged VARCHAR needs canonical interval equality (hash
+        // normalises it but BorrowedJoinKey::operator== compares raw bytes),
+        // so keep such rows on the general join path.
         if (value.type != input.schema.GetColumn(columns[k]).Type() ||
-            value.IsUnsigned() || value.IsCaseInsensitive()) {
+            value.IsUnsigned() || value.IsCaseInsensitive() ||
+            value.IsInterval()) {
           return false;
         }
         int64_t biased = 0;
@@ -290,7 +294,37 @@ bool CanBorrowJoinKeys(const Relation& a, const Relation& b,
     }
     return ok.load(std::memory_order_relaxed);
   };
-  return uniform(a, a_columns, a_biases) && uniform(b, b_columns, b_biases);
+  // The same relation is probed once per join shape; memoise the per-column
+  // uniformity check so repeated calls do not re-scan all rows.
+  struct UniformMemo {
+    const Relation* rel{nullptr};
+    size_t rows{0};
+    std::vector<slot_t> columns;
+    std::vector<int64_t> biases;
+    bool ok{false};
+  };
+  static thread_local std::vector<UniformMemo> memo;
+  const auto memoized_uniform = [&](const Relation& rel,
+                                    const std::vector<slot_t>& columns,
+                                    const std::vector<int64_t>& biases) {
+    for (const auto& entry : memo) {
+      if (entry.rel == &rel && entry.rows == rel.rows.size() &&
+          entry.columns == columns && entry.biases == biases) {
+        return entry.ok;
+      }
+    }
+    const bool ok = uniform(rel, columns, biases);
+    if (memo.size() < 16) {
+      memo.push_back(UniformMemo{.rel = &rel,
+                                 .rows = rel.rows.size(),
+                                 .columns = columns,
+                                 .biases = biases,
+                                 .ok = ok});
+    }
+    return ok;
+  };
+  return memoized_uniform(a, a_columns, a_biases) &&
+         memoized_uniform(b, b_columns, b_biases);
 }
 
 void AppendMemcomparableVarChar(std::string_view input, std::string* output) {
@@ -325,7 +359,10 @@ void AppendMemcomparableDouble(double d, std::string* output) {
   }
   const size_t offset = output->size();
   AppendBigEndian(output, bits, sizeof(bits));
-  if (!std::isnan(d) && !(d < 0.0)) {
+  // NaN takes the non-negative flag too, exactly like
+  // Value::EncodeMemcomparableFormat: join keys and row keys must be the same
+  // bytes for the same value.
+  if (!(d < 0.0)) {
     (*output)[offset] ^= static_cast<char>(0x80);
   }
 }
@@ -382,6 +419,7 @@ void AppendMemcomparableValue(const Value& value, std::string* output) {
   }
 }
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
 static void EncodeJoinKeyIntoBuffer(const Row& row,
                                     const std::vector<slot_t>& columns,
                                     bool null_safe, bool fold_zero,

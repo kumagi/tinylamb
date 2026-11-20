@@ -113,12 +113,32 @@ enum class ColAggKind : uint8_t {
   kCountDistinctVarChar,
 };
 
+struct ColDoubleArithExpr {
+  enum class Op : uint8_t {
+    kColDouble = 0,
+    kColInt64,
+    kConst,
+    kAdd,
+    kSub,
+    kMul,
+    kNeg,
+  };
+  struct Instruction {
+    Op op{Op::kConst};
+    slot_t full_col{0};
+    double constant{0.0};
+  };
+  std::vector<Instruction> rpn;
+  std::vector<slot_t> referenced_cols;
+};
+
 struct ColAggSpec {
   const AggregateExpression* expr{nullptr};
   ColAggKind kind{ColAggKind::kCountStar};
   slot_t full_col{0};
   bool needs_bytes{false};
   bool needs_lengths_only{false};
+  std::shared_ptr<const ColDoubleArithExpr> double_arith;
 };
 
 enum class ColKeyKind : uint8_t {
@@ -147,6 +167,7 @@ struct ColGroupKeySpec {
   // Constant `REGEXP_REPLACE(var_col, pattern, replacement)`.
   std::string regex_pattern;
   std::string regex_replacement;
+  std::optional<JitDelimitedCapture> regex_capture_jit;
   std::string original_expr_str;
 };
 
@@ -173,12 +194,23 @@ struct RuntimeAggState {
   // GoogleSQL MIN/MAX NaN poisoning: any NaN input sets this bit and the
   // emitted MIN/MAX double is NaN, regardless of the stored extreme.
   bool saw_nan{false};
+  // SUM double infinity provenance (P603, same policy as the canonical
+  // accumulator's sum_saw_infinite_input_): set only when an actually
+  // infinite input entered the accumulator.  A kSumDouble result that is
+  // inf while this bit is clear came from finite inputs overflowing, which
+  // GoogleSQL raises instead of returning inf.  Partial sums that overflow
+  // must NOT set it, or MergeAggState would silence the finish-time raise.
+  bool saw_inf{false};
   // Order-preserving / table-owned dictionary tracking for `kMinVarChar` /
   // `kMaxVarChar` (Lean: ClickBenchDiscovery.lean
   // order_preserving_dict_min_code_sound, unsorted_dict_min_code_bug).
   const LSTableColumnDictionary* dict_ptr{nullptr};
   uint8_t dict_code{0};
   bool dict_byte_sorted{false};
+  // Set by paths that count distinct values outside `distinct_ints` (e.g.
+  // the pair-sharded partitioned COUNT(DISTINCT)): `count` then holds the
+  // final distinct count and FinishAggState must report it.
+  bool distinct_count_final{false};
   std::unique_ptr<FlatIntKeyMap<uint8_t>> distinct_ints;
   // Keys are string_views into PagedStringArena storage (interned once per
   // distinct value), so counting distinct VARCHARs does not allocate a
@@ -187,10 +219,16 @@ struct RuntimeAggState {
 };
 
 struct GroupKeySliceHasher {
+  static constexpr uint64_t kSeed = 0x517cc1b727220a95ULL;
+
+  static uint64_t HashSingleVarChar(std::string_view value) noexcept {
+    return MixHash64(kSeed ^ HashView64(value));
+  }
+
   static uint64_t HashTyped(
       const RuntimeKeyCell* cells,
       const std::vector<ColGroupKeySpec>& specs) noexcept {
-    uint64_t h = 0x517cc1b727220a95ULL;
+    uint64_t h = kSeed;
     for (size_t i = 0; i < specs.size(); ++i) {
       const RuntimeKeyCell& c = cells[i];
       uint64_t k = 0;
@@ -298,11 +336,14 @@ class WorkerGroupTable {
   [[nodiscard]] uint64_t HashAt(size_t gid) const noexcept {
     return group_hashes_[gid];
   }
+  // Pointer arithmetic, not operator[]: with zero keys or zero aggregates
+  // (`SELECT c FROM t GROUP BY c`) the backing vector is empty and callers
+  // never dereference the result.
   [[nodiscard]] const RuntimeKeyCell* KeysAt(size_t gid) const noexcept {
-    return &keys_[gid * key_specs_->size()];
+    return keys_.data() + (gid * key_specs_->size());
   }
   [[nodiscard]] RuntimeAggState* AggsAt(size_t gid) noexcept {
-    return &aggs_[gid * agg_specs_->size()];
+    return aggs_.data() + (gid * agg_specs_->size());
   }
   [[nodiscard]] PagedStringArena& Arena() noexcept { return arena_; }
 
@@ -336,7 +377,10 @@ Status FoldRowIntoAggState(
 Status MergeAggState(const ColAggSpec& spec, RuntimeAggState& dst,
                      RuntimeAggState& src, PagedStringArena& arena);
 
-Value FinishAggState(const ColAggSpec& spec, const RuntimeAggState& st);
+// Returns a Status error when a kSumDouble accumulator overflowed to
+// infinity on finite inputs (see RuntimeAggState::saw_inf, P603).
+StatusOr<Value> FinishAggState(const ColAggSpec& spec,
+                               const RuntimeAggState& st);
 
 StatusOr<Value> MaterializeKeyCellValue(const ColGroupKeySpec& spec,
                                         const RuntimeKeyCell& cell);
@@ -861,6 +905,12 @@ inline bool ExtractSingleKeyCell(
     case ColKeyKind::kCaseWhenVarChar:
       return true;
     case ColKeyKind::kRegexReplaceVarChar: {
+      if (ks.regex_capture_jit && !ch->dict_encoded) {
+        const auto key = ks.regex_capture_jit->Replace(ch->VarcharAt(row));
+        out_cell->str_ptr = key.data();
+        out_cell->str_len = static_cast<uint32_t>(key.size());
+        return true;
+      }
       if (regex_cache != nullptr) {
         std::string_view sv;
         if (!regex_cache->Eval(ks, *ch, row, regex_scratch, &sv, status_out)) {

@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <mutex>
@@ -38,12 +39,17 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/crc32c.hpp"
+#include "common/exception_status.hpp"
 #include "common/log_message.hpp"
+#include "common/memory_budget.hpp"
+#include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
 #include "page/page_manager.hpp"
 #include "page/row_page.hpp"
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
+#include "recovery/recovery_manager.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -90,8 +96,9 @@ int64_t TransactionManager::WriteIntentWaitLimitMsFromEnv() {
     return kDefaultMs;
   }
   char* end = nullptr;
+  errno = 0;
   const long long parsed = std::strtoll(env, &end, 10);
-  if (end == env || *end != '\0' || parsed <= 0) {
+  if (errno != 0 || end == env || *end != '\0' || parsed <= 0) {
     return kDefaultMs;
   }
   return static_cast<int64_t>(parsed);
@@ -131,6 +138,23 @@ TransactionManager::~TransactionManager() {
         txn->transaction_manager_ = nullptr;
       }
     }
+  }
+  for (VersionShard& shard : version_shards_) {
+    std::scoped_lock lock(shard.mutex);
+    for (const auto& [rp, chain] : shard.versions) {
+      ReleaseChainPayloadBytes(chain);
+    }
+    shard.versions.clear();
+  }
+  {
+    std::scoped_lock spill_lk(version_spill_mu_);
+    active_version_segment_.reset();
+    active_version_segment_bytes_ = 0;
+  }
+  const size_t remaining_ktx =
+      version_payload_kTx_charged_.exchange(0, std::memory_order_relaxed);
+  if (remaining_ktx > 0) {
+    ProcessMemoryBudget::Global().Release(MemoryPoolKind::kTx, remaining_ktx);
   }
 }
 
@@ -298,7 +322,10 @@ void TransactionManager::DeadlockDetectorLoop() {
       path.clear();
       txn_id_t cur = start;
       bool found_cycle = false;
-      for (int safety = 0; safety < 64; ++safety) {
+      // A wait chain can be longer than 64 under high contention; walking at
+      // most the number of wait edges guarantees we can reach any cycle.
+      const size_t max_hops = waits_for.size() + 1;
+      for (size_t safety = 0; safety < max_hops; ++safety) {
         if (!visited.insert(cur).second) {
           // Found a cycle. Truncate path back to the first visit.
           auto dup = std::find(path.begin(), path.end(), cur);
@@ -453,6 +480,7 @@ Status TransactionManager::PreCommit(Transaction& txn,
                             !txn.recycled_page_allocations_.empty());
   if (needs_commit_record) {
     LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
+    lsn_t commit_start = 0;
     lsn_t commit_end = 0;
     bool append_failed = true;
     Status append_status = Status::kSuccess;
@@ -473,7 +501,8 @@ Status TransactionManager::PreCommit(Transaction& txn,
       commit_log.SerializeTo(txn.serialization_scratch_);
       StatusOr<lsn_t> appended = logger_->AddLog(txn.serialization_scratch_);
       if (appended.HasValue()) {
-        txn.prev_lsn_ = appended.MoveValue();
+        commit_start = appended.MoveValue();
+        txn.prev_lsn_ = commit_start;
         // AddLog returns the LSN *before* the payload; durable point is end
         // of the buffered commit record.
         commit_end = logger_->BufferedLSN();
@@ -500,9 +529,7 @@ Status TransactionManager::PreCommit(Transaction& txn,
       // (e.g. std::bad_alloc while restoring an image), and PreCommit's
       // callers only understand a Status. Finish the cleanup regardless.
       try {
-        if (page_manager_ != nullptr && !txn.staged_records_.empty()) {
-          page_manager_->ApplyTransactionAbort(txn.ID(), txn.staged_records_);
-        }
+        ApplyTransactionAbortRecords(txn);
       } catch (const std::exception& error) {
         LOG(ERROR) << "commit-failure undo threw for transaction " << txn.ID()
                    << ": " << error.what();
@@ -510,7 +537,6 @@ Status TransactionManager::PreCommit(Transaction& txn,
           fail_stop_.store(true, std::memory_order_release);
         }
       }
-      txn.staged_records_.clear();
       RemoveWaitForEdgesOf(txn.ID());
       try {
         AbortVersions(txn);
@@ -529,12 +555,11 @@ Status TransactionManager::PreCommit(Transaction& txn,
         CommitRecycledPageAllocation(txn, pid);
       }
       txn.recycled_page_allocations_.clear();
-      if (page_manager_ != nullptr && !txn.staged_records_.empty()) {
-        page_manager_->ApplyTransactionCommit(txn.ID(), commit_end,
-                                              txn.staged_records_);
-      }
-      txn.staged_records_.clear();
-      const Status published = CommitVersions(txn, commit_end);
+      const Status applied =
+          ApplyTransactionCommitRecords(txn, commit_start, commit_end);
+      Status published = applied == Status::kSuccess
+                                   ? CommitVersions(txn, commit_end)
+                                   : applied;
       if (published != Status::kSuccess) {
         // Publication could not finish (memory exhaustion).  The versions
         // may already be visible, so the commit stays kCommitted -- but the
@@ -546,7 +571,10 @@ Status TransactionManager::PreCommit(Transaction& txn,
         RemoveWaitForEdgesOf(txn.ID());
         AbortVersions(txn);
         ForgetTransaction(txn);
-        return Status::kRuntimeError;
+        // P2995: propagate the cause (CommitVersions' kNoSpace included);
+        // flattening to kRuntimeError here stripped the reason from the
+        // Status -> SQLSTATE mapping the server performs upstream.
+        return published;
       }
       // The index-undo reservations protected this transaction's right to
       // ABORT; past CommitVersions the commit is irrevocable, no physical
@@ -577,7 +605,7 @@ Status TransactionManager::PreCommit(Transaction& txn,
         const auto wait_start = measure
                                     ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
-        durable = WaitForWALDurable(commit_end);
+        durable = WaitForWalDurable(commit_end);
         if (measure && durable == Status::kSuccess) {
           wal_wait_count_.fetch_add(1, std::memory_order_relaxed);
           wal_wait_ns_.fetch_add(
@@ -596,7 +624,7 @@ Status TransactionManager::PreCommit(Transaction& txn,
         // a read-only transaction is subject to the same barrier.
         const lsn_t dependence = txn.DurabilityDependence();
         if (dependence != 0) {
-          durable = WaitForWALDurable(dependence);
+          durable = WaitForWalDurable(dependence);
         }
       }
       txn.DebugSetPhase(nullptr);
@@ -627,7 +655,9 @@ Status TransactionManager::PreCommit(Transaction& txn,
       RemoveWaitForEdgesOf(txn.ID());
       AbortVersions(txn);
       ForgetTransaction(txn);
-      return Status::kRuntimeError;
+      // P2995: keep the causal code (bad_alloc -> kNoSpace) instead of
+      // flattening to kRuntimeError.
+      return StatusFromCurrentException("PreCommit failed mid-publication");
     } catch (...) {
       LOG(ERROR) << "PreCommit failed mid-publication for transaction "
                  << txn.ID() << " with an unknown exception";
@@ -636,7 +666,8 @@ Status TransactionManager::PreCommit(Transaction& txn,
       RemoveWaitForEdgesOf(txn.ID());
       AbortVersions(txn);
       ForgetTransaction(txn);
-      return Status::kRuntimeError;
+      return StatusError(StatusCode::kRuntimeError,
+                         "PreCommit failed mid-publication");
     }
   } else {
     txn.SetStatus(TransactionStatus::kCommitted);
@@ -654,7 +685,7 @@ Status TransactionManager::PreCommit(Transaction& txn,
     }
     if (dependence != 0) {
       txn.DebugSetPhase("ro-dependency-durable-wait");
-      const Status durable = WaitForWALDurable(dependence);
+      const Status durable = WaitForWalDurable(dependence);
       if (durable != Status::kSuccess) {
         // Nothing was published, but the registry slot and snapshot entry
         // must not outlive this stack-allocated transaction: a later
@@ -682,6 +713,10 @@ Status TransactionManager::Abort(Transaction& txn) {
     return Status::kSuccess;
   }
   if (fail_stop_.load(std::memory_order_acquire)) {
+    // Waiters parked on this transaction's intent must see the abort even
+    // on the fail-stop path, or they sleep until the multi-second escape
+    // hatch while holding a page latch this undo walk needs.
+    txn.MarkAbortStarted();
     RemoveWaitForEdgesOf(txn.ID());
     AbortVersions(txn);
     txn.SetStatus(TransactionStatus::kAborted);
@@ -704,14 +739,29 @@ Status TransactionManager::Abort(Transaction& txn) {
   // included) so the flag never depends on which early return applies.
   txn.MarkAbortStarted();
   if (recovery_ == nullptr) {
-    if (page_manager_ != nullptr && !txn.staged_records_.empty()) {
-      page_manager_->ApplyTransactionAbort(txn.ID(), txn.staged_records_);
+    // Undo can allocate (version arena / staged records); keep exceptions
+    // inside this Status boundary and still finish registry cleanup, just
+    // like the recovery_ != nullptr branch below.
+    Status undo_error = Status::kSuccess;
+    try {
+      ApplyTransactionAbortRecords(txn);
+    } catch (...) {
+      undo_error = StatusError(StatusCode::kRuntimeError,
+                               "abort undo threw without recovery");
+      if (page_manager_ != nullptr) {
+        fail_stop_.store(true, std::memory_order_release);
+      }
     }
-    txn.staged_records_.clear();
     RemoveWaitForEdgesOf(txn.ID());
-    AbortVersions(txn);
+    try {
+      AbortVersions(txn);
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
     txn.SetStatus(TransactionStatus::kAborted);
     ForgetTransaction(txn);
+    if (undo_error != Status::kSuccess) {
+      return undo_error;
+    }
     if (txn.HasLogRecord()) {
       if (page_manager_ != nullptr) {
         fail_stop_.store(true, std::memory_order_release);
@@ -724,10 +774,7 @@ Status TransactionManager::Abort(Transaction& txn) {
   Status undo_status = Status::kSuccess;
   try {
     txn.DebugSetPhase("abort-undo-walk");
-    if (page_manager_ != nullptr && !txn.staged_records_.empty()) {
-      page_manager_->ApplyTransactionAbort(txn.ID(), txn.staged_records_);
-    }
-    txn.staged_records_.clear();
+    ApplyTransactionAbortRecords(txn);
     AbortVersions(txn);
     if (txn.HasLogRecord() && logger_ != nullptr) {
       LogRecord abort_log =
@@ -762,6 +809,18 @@ Status TransactionManager::Abort(Transaction& txn) {
     txn.SetStatus(TransactionStatus::kAborted);
     undo_status = StatusError(StatusCode::kRuntimeError,
                               std::string("abort failed: ") + error.what());
+  } catch (...) {
+    // Non-std exceptions must still leave the registry in a consistent
+    // state (PreCommit has the same catch-all).
+    if (page_manager_ != nullptr && recovery_ != nullptr) {
+      fail_stop_.store(true, std::memory_order_release);
+    }
+    try {
+      AbortVersions(txn);
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+    txn.SetStatus(TransactionStatus::kAborted);
+    undo_status = StatusError(StatusCode::kRuntimeError, "abort failed");
   }
   txn.DebugSetPhase(nullptr);
   ForgetTransaction(txn);
@@ -866,6 +925,15 @@ bool TransactionManager::AcquireWriteIntent(
   // as before, which is the latch-cycle protection the limit exists for.
   auto wait_begin = std::chrono::steady_clock::now();
   auto intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+  // Honor a shorter statement deadline so a timed-out statement does not
+  // block for the full write-intent wait limit.
+  if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+    const auto stmt_tp =
+        std::chrono::steady_clock::time_point(std::chrono::nanoseconds(sd));
+    if (stmt_tp < intent_wait_deadline) {
+      intent_wait_deadline = stmt_tp;
+    }
+  }
   txn_id_t observed_holder = holder_id();
   // The holder has been unwinding for kHolderAbortGiveupDelay without
   // finishing: a live abort releases its intents in far less time, so this
@@ -893,6 +961,13 @@ bool TransactionManager::AcquireWriteIntent(
       if (!kProgressResetDisabled) {
         wait_begin = std::chrono::steady_clock::now();
         intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+        if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+          const auto stmt_tp = std::chrono::steady_clock::time_point(
+              std::chrono::nanoseconds(sd));
+          if (stmt_tp < intent_wait_deadline) {
+            intent_wait_deadline = stmt_tp;
+          }
+        }
       }
     }
   };
@@ -907,15 +982,19 @@ bool TransactionManager::AcquireWriteIntent(
       }
       chain.pending = PendingVersion{.owner = txn.ID(),
                                      .owner_thread = std::this_thread::get_id(),
-                                     .value = std::nullopt,
+                                     .payload = {},
                                      .staged = false};
-      // Install the before-image as the base committed version while the
-      // shard mutex is held: until RegisterVersionWrite stages the new
-      // value, readers must see the old row instead of kNotExists.
-      if (before && chain.committed.empty()) {
-        chain.committed.push_back(
-            {0, std::numeric_limits<uint64_t>::max(),
-             std::optional<std::string>(std::string(*before))});
+      const bool installed_before =
+          chain.committed.empty() && before.has_value()
+              ? InstallBaseBeforeImageLocked(&chain, before)
+              : false;
+      const bool should_spill =
+          installed_before &&
+          version_payload_resident_bytes_.load(std::memory_order_relaxed) >
+              EffectiveVersionSpillThresholdBytes();
+      if (should_spill) {
+        lock.unlock();
+        MaybeSpillColdVersionPayloads();
       }
       return true;
     }
@@ -935,13 +1014,28 @@ bool TransactionManager::AcquireWriteIntent(
         return found == shard.versions.end() || !found->second.pending ||
                found->second.pending->owner == txn.ID() || txn.IsWounded();
       };
-      if (!available() && !shard.write_intent_released.wait_for(
-                              lock, std::chrono::milliseconds(5), available)) {
-        if (measure) {
-          write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+      if (!available()) {
+        if (const Status st = txn.CheckStatementTimeout();
+            st != Status::kSuccess) {
+          if (measure) {
+            write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+          }
+          txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
+          txn.RecordWriteSetFailure(st);
+          return false;
         }
-        txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
-        return false;
+        if (!shard.write_intent_released.wait_for(
+                lock, std::chrono::milliseconds(5), available)) {
+          if (measure) {
+            write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+          }
+          txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
+          if (const Status st2 = txn.CheckStatementTimeout();
+              st2 != Status::kSuccess) {
+            txn.RecordWriteSetFailure(st2);
+          }
+          return false;
+        }
       }
       if (txn.IsWounded()) {
         txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kWounded);
@@ -1009,7 +1103,18 @@ bool TransactionManager::AcquireWriteIntent(
             write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
           }
           txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
+          if (const Status st = txn.CheckStatementTimeout();
+              st != Status::kSuccess) {
+            txn.RecordWriteSetFailure(st);
+          }
           return false;
+        }
+        if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+          const auto stmt_tp = std::chrono::steady_clock::time_point(
+              std::chrono::nanoseconds(sd));
+          if (stmt_tp < intent_wait_deadline) {
+            intent_wait_deadline = stmt_tp;
+          }
         }
         shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
       }
@@ -1084,7 +1189,18 @@ bool TransactionManager::AcquireWriteIntent(
             write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
           }
           txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
+          if (const Status st = txn.CheckStatementTimeout();
+              st != Status::kSuccess) {
+            txn.RecordWriteSetFailure(st);
+          }
           return false;
+        }
+        if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+          const auto stmt_tp = std::chrono::steady_clock::time_point(
+              std::chrono::nanoseconds(sd));
+          if (stmt_tp < intent_wait_deadline) {
+            intent_wait_deadline = stmt_tp;
+          }
         }
         shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
       }
@@ -1095,7 +1211,7 @@ bool TransactionManager::AcquireWriteIntent(
       break;
     }
     case DeadlockPolicy::kDeadlockDetect: {
-      // Permit unrestricted waiting.  Register a wait-for edge so the
+      // Bounded, detector-assisted waiting.  Register a wait-for edge so the
       // background detector can break any cycle it finds. The detector
       // either wounds this transaction (Wound()) or removes the edge when
       // the holder moves on.
@@ -1150,7 +1266,18 @@ bool TransactionManager::AcquireWriteIntent(
             write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
           }
           txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
+          if (const Status st = txn.CheckStatementTimeout();
+              st != Status::kSuccess) {
+            txn.RecordWriteSetFailure(st);
+          }
           return false;
+        }
+        if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+          const auto stmt_tp = std::chrono::steady_clock::time_point(
+              std::chrono::nanoseconds(sd));
+          if (stmt_tp < intent_wait_deadline) {
+            intent_wait_deadline = stmt_tp;
+          }
         }
         shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
       }
@@ -1174,10 +1301,17 @@ bool TransactionManager::AcquireWriteIntent(
     // before-image (TryAddWriteSet); the actual update now supplies one.
     // Install it so concurrent snapshots keep reading the pre-update value
     // instead of falling back to the (soon overwritten) heap image.
-    if (ours && before && chain.committed.empty()) {
-      chain.committed.push_back(
-          {0, std::numeric_limits<uint64_t>::max(),
-           std::optional<std::string>(std::string(*before))});
+    const bool installed_before =
+        (ours && before && chain.committed.empty())
+            ? InstallBaseBeforeImageLocked(&chain, before)
+            : false;
+    const bool should_spill =
+        installed_before &&
+        version_payload_resident_bytes_.load(std::memory_order_relaxed) >
+            EffectiveVersionSpillThresholdBytes();
+    if (should_spill) {
+      lock.unlock();
+      MaybeSpillColdVersionPayloads();
     }
     return ours;
   }
@@ -1187,12 +1321,19 @@ bool TransactionManager::AcquireWriteIntent(
   // first-updater-wins abort.
   chain.pending = PendingVersion{.owner = txn.ID(),
                                  .owner_thread = std::this_thread::get_id(),
-                                 .value = std::nullopt,
+                                 .payload = {},
                                  .staged = false};
-  if (before && chain.committed.empty()) {
-    chain.committed.push_back(
-        {0, std::numeric_limits<uint64_t>::max(),
-         std::optional<std::string>(std::string(*before))});
+  const bool installed_before =
+      before && chain.committed.empty()
+          ? InstallBaseBeforeImageLocked(&chain, before)
+          : false;
+  const bool should_spill =
+      installed_before &&
+      version_payload_resident_bytes_.load(std::memory_order_relaxed) >
+          EffectiveVersionSpillThresholdBytes();
+  if (should_spill) {
+    lock.unlock();
+    MaybeSpillColdVersionPayloads();
   }
   return true;
 }
@@ -1273,6 +1414,13 @@ Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
   AddWaitForEdge(txn.ID(), initial_holder, rp);
   auto wait_begin = std::chrono::steady_clock::now();
   auto intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+  if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+    const auto stmt_tp =
+        std::chrono::steady_clock::time_point(std::chrono::nanoseconds(sd));
+    if (stmt_tp < intent_wait_deadline) {
+      intent_wait_deadline = stmt_tp;
+    }
+  }
   txn_id_t observed_holder = initial_holder;
   auto available = [&] {
     if (txn.IsWounded()) {
@@ -1294,6 +1442,25 @@ Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
       }
       wait_begin = std::chrono::steady_clock::now();
       intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+      if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+        const auto stmt_tp =
+            std::chrono::steady_clock::time_point(std::chrono::nanoseconds(sd));
+        if (stmt_tp < intent_wait_deadline) {
+          intent_wait_deadline = stmt_tp;
+        }
+      }
+    }
+    // Same latch-cycle escape as the AcquireWriteIntent loops: if the
+    // holder has been aborting for the grace delay, it is stuck on a latch
+    // this waiter holds. Give up now instead of riding the 5s/60s hatch.
+    if (std::chrono::steady_clock::now() - wait_begin >=
+            kHolderAbortGiveupDelay &&
+        IsAborting(holder_id())) {
+      RecordHolderAbortGiveup();
+      RemoveWaitForEdge(txn.ID());
+      txn.RecordIntentWaitFailure(
+          Transaction::IntentWaitFailure::kHolderAborting);
+      return Status::kConflicts;
     }
     const auto now = std::chrono::steady_clock::now();
     if (now >= intent_wait_deadline &&
@@ -1303,7 +1470,18 @@ Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
       txn.DebugSetPhase(nullptr);
       RecordIntentWaitTimeout(txn, rp);
       txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
+      if (const Status st = txn.CheckStatementTimeout();
+          st != Status::kSuccess) {
+        return st;
+      }
       return Status::kConflicts;
+    }
+    if (const int64_t sd = txn.StatementDeadlineNs(); sd != 0) {
+      const auto stmt_tp =
+          std::chrono::steady_clock::time_point(std::chrono::nanoseconds(sd));
+      if (stmt_tp < intent_wait_deadline) {
+        intent_wait_deadline = stmt_tp;
+      }
     }
     shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
   }
@@ -1316,7 +1494,7 @@ Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
   return Status::kSuccess;
 }
 
-Status TransactionManager::WaitForWALDurable(lsn_t lsn) {
+Status TransactionManager::WaitForWalDurable(lsn_t lsn) {
   DurabilityBarrierGuard guard(*this);
   return logger_->WaitForDurable(lsn);
 }
@@ -1453,7 +1631,7 @@ bool TransactionManager::SnapshotSeesRow(const Transaction& txn,
   for (const auto& version : std::ranges::reverse_view(chain.committed)) {
     if (version.begin_ts <= txn.SnapshotTimestamp() &&
         txn.SnapshotTimestamp() < version.end_ts) {
-      return version.value.has_value();
+      return version.payload.has_value;
     }
   }
   return false;
@@ -1472,6 +1650,7 @@ bool TransactionManager::ReleaseWriteIntent(Transaction& txn,
       chain.pending->staged) {
     return false;
   }
+  ReleaseVersionPayloadBytes(chain.pending->payload.InlineBytes());
   chain.pending.reset();
   shard.write_intent_released.notify_all();
   if (chain.committed.empty()) {
@@ -1492,17 +1671,25 @@ std::string TransactionManager::DebugDumpVersionChains(page_id_t pid) const {
       out += "    chain {" + std::to_string(rp.page_id) + "," +
              std::to_string(rp.slot) + "} committed=[";
       for (const CommittedVersion& v : chain.committed) {
+        std::string desc = "null";
+        if (v.payload.has_value) {
+          desc =
+              v.payload.spilled
+                  ? ("spilled:" + std::to_string(v.payload.spill_length) + "B")
+                  : ("row:" + std::to_string(v.payload.inline_data.size()) +
+                     "B");
+        }
         out += "{" + std::to_string(v.begin_ts) + "," +
-               std::to_string(v.end_ts) + "," +
-               (v.value ? "row:" + std::to_string(v.value->size()) + "B"
-                        : "null") +
-               "}";
+               std::to_string(v.end_ts) + "," + desc + "}";
       }
       out += "]";
       if (chain.pending) {
+        const char* pdesc =
+            !chain.pending->payload.has_value
+                ? "/null"
+                : (chain.pending->payload.spilled ? "/spilled" : "/row");
         out += " pending=txn" + std::to_string(chain.pending->owner) +
-               (chain.pending->staged ? "/staged" : "/unstaged") +
-               (chain.pending->value ? "/row" : "/null");
+               (chain.pending->staged ? "/staged" : "/unstaged") + pdesc;
       }
       out += "\n";
     }
@@ -1572,6 +1759,17 @@ TransactionRuntimeStats TransactionManager::RuntimeStats() const {
           index_only_visible_serves_.load(std::memory_order_relaxed),
       .index_scan_prefetch_pages =
           index_scan_prefetch_pages_.load(std::memory_order_relaxed),
+      .wal_reread_activations =
+          wal_reread_activations_.load(std::memory_order_relaxed),
+      .wal_reread_bytes = wal_reread_bytes_.load(std::memory_order_relaxed),
+      .write_set_spills = write_set_spills_.load(std::memory_order_relaxed),
+      .write_set_spilled_bytes =
+          write_set_spilled_bytes_.load(std::memory_order_relaxed),
+      .version_spills = version_spills_.load(std::memory_order_relaxed),
+      .version_spill_bytes =
+          version_spill_bytes_.load(std::memory_order_relaxed),
+      .version_payload_resident_bytes =
+          version_payload_resident_bytes_.load(std::memory_order_relaxed),
   };
 }
 
@@ -1589,84 +1787,97 @@ StatusOr<std::optional<std::string>> TransactionManager::ReadVersion(
                       std::memory_order_acquire) == 0) {
     return std::optional<std::string>();
   }
-  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
-  std::scoped_lock lock(shard.mutex);
-  const auto found = shard.versions.find(rp);
-  if (found == shard.versions.end()) {
-    if (!physical) {
+  struct SpilledReadRequest {
+    bool active{false};
+    std::shared_ptr<const SpilledVersionSegment> segment;
+    uint64_t offset{0};
+    uint32_t length{0};
+    uint32_t crc32{0};
+  };
+  auto resolve_payload = [](const VersionPayload& payload,
+                            std::unique_lock<std::mutex>* lock,
+                            SpilledReadRequest* spilled_req)
+      -> StatusOr<std::optional<std::string>> {
+    if (!payload.has_value) {
       return Status::kNotExists;
     }
-    // nullopt = the latched page image is the authoritative version; the
-    // caller may serve a view of it instead of copying the row body per
-    // read (a full scan of chain-bearing pages otherwise pays one string
-    // allocation + copy per row for a value equal to the image it holds).
+    if (!payload.spilled) {
+      return std::optional<std::string>(payload.inline_data);
+    }
+    spilled_req->active = true;
+    spilled_req->segment = payload.spilled_segment;
+    spilled_req->offset = payload.spill_offset;
+    spilled_req->length = payload.spill_length;
+    spilled_req->crc32 = payload.spill_crc32;
+    lock->unlock();
     return std::optional<std::string>();
-  }
-  const VersionChain& chain = found->second;
-  if (chain.pending && chain.pending->owner == txn.ID() &&
-      chain.pending->staged) {
-    if (!chain.pending->value) {
-      return Status::kNotExists;
+  };
+
+  SpilledReadRequest spilled_req;
+  {
+    VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+    std::unique_lock<std::mutex> lock(shard.mutex);
+    const auto found = shard.versions.find(rp);
+    if (found == shard.versions.end()) {
+      if (!physical) {
+        return Status::kNotExists;
+      }
+      // nullopt = the latched page image is the authoritative version; the
+      // caller may serve a view of it instead of copying the row body per
+      // read (a full scan of chain-bearing pages otherwise pays one string
+      // allocation + copy per row for a value equal to the image it holds).
+      return std::optional<std::string>();
     }
-    return *chain.pending->value;
-  }
-  // An empty committed list means the chain carries no snapshot-relevant
-  // version: either GC collected a chain made redundant by the heap image
-  // (leaving at most an unstaged intent shell), or the intent was acquired
-  // without a before-image on a row whose chain no longer exists. In both
-  // cases the physical image is authoritative for every snapshot that could
-  // reach this branch -- any newer value is still uncommitted and any older
-  // value was already proven equal to the physical image when GC dropped
-  // the chain. Without this fallback the row reads back as kNotExists and
-  // silently disappears from scans after a commit+GC+re-intent cycle.
-  // (A bare INSERT intent also produces an empty committed list; updates
-  // keep their before-image in `committed` via AcquireWriteIntent so this
-  // fallback is never what serves a stale post-update heap image.)
-  if (chain.committed.empty()) {
-    if (!physical) {
-      return Status::kNotExists;
-    }
-    return std::optional<std::string>();
-  }
-  // A writer that waited for a predecessor implements strict write locking,
-  // not first-updater-wins snapshot isolation: its SET expression must see
-  // the predecessor's committed result.  The newest committed entry is kept
-  // while this unstaged intent exists.  When GC removed a redundant chain
-  // before the intent was acquired, the heap is the authoritative latest
-  // image and the physical fallback below is equivalent.
-  if (resolve_head && chain.pending && chain.pending->owner == txn.ID()) {
-    if (!chain.committed.empty()) {
+    const VersionChain& chain = found->second;
+    if (chain.pending && chain.pending->owner == txn.ID() &&
+        chain.pending->staged) {
+      auto res = resolve_payload(chain.pending->payload, &lock, &spilled_req);
+      if (!spilled_req.active) {
+        return res;
+      }
+    } else if (chain.committed.empty()) {
+      // An empty committed list means the chain carries no snapshot-relevant
+      // version: fall back to the authoritative physical heap image.
+      if (!physical) {
+        return Status::kNotExists;
+      }
+      return std::optional<std::string>();
+    } else if (resolve_head && chain.pending &&
+               chain.pending->owner == txn.ID()) {
       const CommittedVersion& latest = chain.committed.back();
       // D4 (docs/design.md): a writer reading a predecessor's committed
       // result depends on that commit's durability.
       if (latest.commit_lsn != 0) {
         txn.RecordDurabilityDependence(latest.commit_lsn);
       }
-      if (!latest.value) {
+      auto res = resolve_payload(latest.payload, &lock, &spilled_req);
+      if (!spilled_req.active) {
+        return res;
+      }
+    } else {
+      bool matched = false;
+      StatusOr<std::optional<std::string>> matched_res = Status::kNotExists;
+      for (const auto& version : std::ranges::reverse_view(chain.committed)) {
+        if (version.begin_ts <= txn.SnapshotTimestamp() &&
+            txn.SnapshotTimestamp() < version.end_ts) {
+          if (version.commit_lsn != 0) {
+            txn.RecordDurabilityDependence(version.commit_lsn);
+          }
+          matched_res = resolve_payload(version.payload, &lock, &spilled_req);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
         return Status::kNotExists;
       }
-      return *latest.value;
-    }
-    if (physical) {
-      return std::optional<std::string>();
+      if (!spilled_req.active) {
+        return matched_res;
+      }
     }
   }
-  for (const auto& version : std::ranges::reverse_view(chain.committed)) {
-    if (version.begin_ts <= txn.SnapshotTimestamp() &&
-        txn.SnapshotTimestamp() < version.end_ts) {
-      // D4 (docs/design.md): record the commit that made this version
-      // visible as a durability dependency; PreCommit waits for it before
-      // the result reaches the user (read-only included).
-      if (version.commit_lsn != 0) {
-        txn.RecordDurabilityDependence(version.commit_lsn);
-      }
-      if (!version.value) {
-        return Status::kNotExists;
-      }
-      return *version.value;
-    }
-  }
-  return Status::kNotExists;
+  return ReadSpilledVersionPayload(spilled_req.segment, spilled_req.offset,
+                                   spilled_req.length, spilled_req.crc32);
 }
 
 StatusOr<std::optional<std::string>> TransactionManager::ReadLatestVersion(
@@ -1680,37 +1891,50 @@ StatusOr<std::optional<std::string>> TransactionManager::ReadLatestVersion(
                       std::memory_order_acquire) == 0) {
     return std::optional<std::string>();
   }
-  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
-  std::scoped_lock lock(shard.mutex);
-  const auto found = shard.versions.find(rp);
-  if (found == shard.versions.end()) {
-    if (!physical) {
+  std::shared_ptr<const SpilledVersionSegment> spilled_seg;
+  uint64_t spill_offset = 0;
+  uint32_t spill_length = 0;
+  uint32_t spill_crc32 = 0;
+  {
+    VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+    std::unique_lock<std::mutex> lock(shard.mutex);
+    const auto found = shard.versions.find(rp);
+    if (found == shard.versions.end()) {
+      if (!physical) {
+        return Status::kNotExists;
+      }
+      return std::optional<std::string>();
+    }
+    const VersionChain& chain = found->second;
+    const VersionPayload* selected = nullptr;
+    if (chain.pending && chain.pending->owner == txn.ID() &&
+        chain.pending->staged) {
+      selected = &chain.pending->payload;
+    } else if (!chain.committed.empty()) {
+      const CommittedVersion& latest = chain.committed.back();
+      if (latest.commit_lsn != 0) {
+        txn.RecordDurabilityDependence(latest.commit_lsn);
+      }
+      selected = &latest.payload;
+    } else {
+      if (!physical) {
+        return Status::kNotExists;
+      }
+      return std::optional<std::string>();
+    }
+    if (!selected->has_value) {
       return Status::kNotExists;
     }
-    return std::optional<std::string>();
-  }
-  const VersionChain& chain = found->second;
-  if (chain.pending && chain.pending->owner == txn.ID() &&
-      chain.pending->staged) {
-    if (!chain.pending->value) {
-      return Status::kNotExists;
+    if (!selected->spilled) {
+      return std::optional<std::string>(selected->inline_data);
     }
-    return *chain.pending->value;
+    spilled_seg = selected->spilled_segment;
+    spill_offset = selected->spill_offset;
+    spill_length = selected->spill_length;
+    spill_crc32 = selected->spill_crc32;
   }
-  if (!chain.committed.empty()) {
-    const CommittedVersion& latest = chain.committed.back();
-    if (latest.commit_lsn != 0) {
-      txn.RecordDurabilityDependence(latest.commit_lsn);
-    }
-    if (!latest.value) {
-      return Status::kNotExists;
-    }
-    return *latest.value;
-  }
-  if (!physical) {
-    return Status::kNotExists;
-  }
-  return std::optional<std::string>();
+  return ReadSpilledVersionPayload(spilled_seg, spill_offset, spill_length,
+                                   spill_crc32);
 }
 
 bool TransactionManager::HasVersionChain(const RowPosition& rp) const {
@@ -1751,6 +1975,7 @@ void TransactionManager::InvalidatePageVersions(page_id_t pid,
     bool erased = false;
     for (auto it = shard.versions.begin(); it != shard.versions.end();) {
       if (it->first.page_id == pid) {
+        ReleaseChainPayloadBytes(it->second);
         ForgetVersionChain(it->first);
         it = shard.versions.erase(it);
         erased = true;
@@ -1795,10 +2020,14 @@ void TransactionManager::CommitRecycledPageAllocation(Transaction& txn,
         continue;
       }
       if (it->second.pending && it->second.pending->owner == txn.ID()) {
+        for (const CommittedVersion& v : it->second.committed) {
+          ReleaseVersionPayloadBytes(v.payload.InlineBytes());
+        }
         it->second.committed.clear();
         ++it;
         continue;
       }
+      ReleaseChainPayloadBytes(it->second);
       ForgetVersionChain(it->first);
       it = shard.versions.erase(it);
       erased = true;
@@ -1820,6 +2049,17 @@ bool TransactionManager::IsActive(txn_id_t id) const {
   return active_transactions_.contains(id);
 }
 
+bool TransactionManager::IsRunningUncommitted(txn_id_t id) const {
+  if (id == 0) {
+    return false;
+  }
+  std::scoped_lock lk(transaction_table_lock);
+  const auto found = active_transactions_.find(id);
+  return found != active_transactions_.end() && found->second != nullptr &&
+         found->second->status_.load(std::memory_order_acquire) !=
+             TransactionStatus::kCommitted;
+}
+
 bool TransactionManager::IsAborting(txn_id_t id) const {
   if (id == 0) {
     return false;
@@ -1837,34 +2077,43 @@ void TransactionManager::RegisterVersionWrite(
     Transaction& txn, const RowPosition& rp,
     std::optional<std::string_view> before,
     std::optional<std::string_view> after) {
-  (void)txn;
   std::optional<std::string> before_copy =
       before ? std::optional<std::string>(std::string(*before)) : std::nullopt;
   std::optional<std::string> after_copy =
       after ? std::optional<std::string>(std::string(*after)) : std::nullopt;
-  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
-  std::scoped_lock lock(shard.mutex);
-  VersionChain& chain = GetOrCreateVersionChain(shard, rp);
-  if (chain.committed.empty()) {
-    chain.committed.push_back(
-        {0, std::numeric_limits<uint64_t>::max(), std::move(before_copy)});
+  bool should_spill = false;
+  {
+    VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+    std::scoped_lock lock(shard.mutex);
+    VersionChain& chain = GetOrCreateVersionChain(shard, rp);
+    if (chain.committed.empty()) {
+      CommittedVersion base;
+      base.begin_ts = 0;
+      base.end_ts = std::numeric_limits<uint64_t>::max();
+      AssignInlinePayload(&base.payload, std::move(before_copy));
+      chain.committed.push_back(std::move(base));
+    }
+    // AddWriteSet reserves the pending slot before the physical image changes.
+    // Reaching this function without that reservation is an invariant breach.
+    if (!chain.pending.has_value()) {
+      LOG(ERROR) << "RegisterVersionWrite without reserved write intent";
+      assert(false);
+      return;
+    }
+    if (chain.pending->owner != txn.ID()) {
+      LOG(ERROR) << "RegisterVersionWrite intent owner mismatch";
+      assert(false);
+      return;
+    }
+    AssignInlinePayload(&chain.pending->payload, std::move(after_copy));
+    chain.pending->staged = true;
+    should_spill =
+        version_payload_resident_bytes_.load(std::memory_order_relaxed) >
+        EffectiveVersionSpillThresholdBytes();
   }
-  // AddWriteSet reserves the pending slot before the physical image changes.
-  // Reaching this function without that reservation is an invariant breach.
-  // assert() alone vanishes in NDEBUG builds, silently dropping the write;
-  // keep a loud log on every build so the breach is diagnosable.
-  if (!chain.pending.has_value()) {
-    LOG(ERROR) << "RegisterVersionWrite without reserved write intent";
-    assert(false);
-    return;
+  if (should_spill) {
+    MaybeSpillColdVersionPayloads();
   }
-  if (chain.pending->owner != txn.ID()) {
-    LOG(ERROR) << "RegisterVersionWrite intent owner mismatch";
-    assert(false);
-    return;
-  }
-  chain.pending->value = std::move(after_copy);
-  chain.pending->staged = true;
 }
 
 void TransactionManager::MarkPendingIndexMutation(page_id_t index_root) {
@@ -1902,7 +2151,7 @@ void TransactionManager::TrackIndexKeyMutation(txn_id_t owner,
         history.pending_keys >= kMaxPendingKeys ||
         (pending == history.pending.end() &&
          history.pending.size() >= kMaxPendingOwners)) {
-      history.Disable();
+      history.Disable(ForgetThroughTsForDisable());
       return;
     }
     if (pending == history.pending.end()) {
@@ -1913,7 +2162,7 @@ void TransactionManager::TrackIndexKeyMutation(txn_id_t owner,
     history.pending_bytes += key.size();
     ++history.pending_keys;
   } catch (const std::bad_alloc&) {
-    history.Disable();
+    history.Disable(ForgetThroughTsForDisable());
   }
 }
 
@@ -1933,7 +2182,7 @@ void TransactionManager::FinishIndexKeyChanges(
     if (pending == history.pending.end()) {
       // Unknown-key callers already revoke manager-wide precision. A missing
       // registration from any other path must also remain conservative.
-      history.Disable();
+      history.Disable(ForgetThroughTsForDisable());
       return;
     }
     constexpr size_t kMaxHistoryKeys = 512;
@@ -1958,7 +2207,7 @@ void TransactionManager::FinishIndexKeyChanges(
   } catch (const std::bad_alloc&) {
     // Version publication may already have released write intents. Optional
     // precision must never turn that irreversible commit into a failure.
-    history.Disable();
+    history.Disable(ForgetThroughTsForDisable());
   }
 }
 
@@ -2214,78 +2463,90 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
   // commit path, buying atomicity the timestamp protocol already provides.)
   // A bad_alloc inside one entry's publication leaves that entry unfinished
   // -- the pending intent is still ours -- and the loop retries the
-  // unfinished suffix; earlier entries are done and never revisited. The
-  // commit_ts therefore either fully publishes or stays registered as
-  // unpublished (snapshots stall conservatively), never half-exposes.
-  auto position = txn.write_set_.begin();
-  const auto end = txn.write_set_.end();
-  const size_t entry_count = txn.write_set_.size();
+  // unfinished suffix; earlier entries are done and never revisited. If the
+  // suffix cannot be published we still release commit_ts below: the caller
+  // fail-stops the engine and recovery replays the durable COMMIT record, so
+  // leaving the timestamp registered as unpublished would only pin
+  // stable_timestamp_ at commit_ts-1 for the process lifetime -- and because
+  // Begin still serves snapshots under fail-stop, pin active_snapshots_/GC
+  // forever.
   const uint64_t commit_ts = AllocatePendingCommit();
+  const size_t entry_count = txn.write_set_.size();
   size_t next = 0;
-  bool retried_bad_alloc = false;
-  while (position != end) {
-    try {
-      const RowPosition& rp = *position;
-      VersionShard& shard = version_shards_[VersionShardIndex(rp)];
-      const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
-      const auto wait_start = measure ? std::chrono::steady_clock::now()
-                                      : std::chrono::steady_clock::time_point{};
-      std::scoped_lock lock(shard.mutex);
-      if (measure) {
-        commit_shard_mutex_wait_ns_.fetch_add(
-            static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - wait_start)
-                    .count()),
-            std::memory_order_relaxed);
-      }
-      const auto found = shard.versions.find(rp);
-      if (found == shard.versions.end()) {
-        ++position;
-        ++next;
-        continue;
-      }
-      VersionChain& chain = found->second;
-      if (!chain.pending || chain.pending->owner != txn.ID()) {
-        ++position;
-        ++next;
-        continue;
-      }
-      if (!chain.pending->staged) {
-        chain.pending.reset();
-        shard.write_intent_released.notify_all();
-        ++position;
-        ++next;
-        continue;
-      }
-      if (!chain.committed.empty()) {
-        chain.committed.back().end_ts = commit_ts;
-      }
-      // Copy (not move) the staged value: a push_back failure inside the
-      // bad_alloc retry loop must leave the pending value intact for the
-      // retried attempt -- a moved-out optional would publish an empty
-      // string on the retry. The pending reset below discards the copy
-      // source on success.
-      chain.committed.push_back({commit_ts,
-                                 std::numeric_limits<uint64_t>::max(),
-                                 chain.pending->value, commit_lsn});
-      chain.pending.reset();
-      shard.write_intent_released.notify_all();
-      ++position;
-      ++next;
-    } catch (const std::bad_alloc&) {
-      if (retried_bad_alloc) {
-        // Second allocation failure: the commit_ts stays registered as
-        // unpublished and the caller fail-stops the engine.
-        return Status::kNoSpace;
-      }
-      retried_bad_alloc = true;
-      // Transient allocation failure mid-publication: retry the suffix. The
-      // partial state is safe -- every completed entry is a valid committed
-      // version invisible to snapshots until PublishCommit below.
-      LOG(ERROR) << "commit publication hit bad_alloc at entry " << next
-                 << " of " << entry_count << ", retrying";
-    }
+  const Status iter_status =
+      txn.write_set_.ForEach([&](const RowPosition& rp) -> Status {
+        bool retried_bad_alloc = false;
+        while (true) {
+          try {
+            VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+            const bool measure =
+                metrics_enabled_.load(std::memory_order_relaxed);
+            const auto wait_start =
+                measure ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+            std::scoped_lock lock(shard.mutex);
+            if (measure) {
+              commit_shard_mutex_wait_ns_.fetch_add(
+                  static_cast<uint64_t>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - wait_start)
+                          .count()),
+                  std::memory_order_relaxed);
+            }
+            const auto found = shard.versions.find(rp);
+            if (found == shard.versions.end()) {
+              ++next;
+              return Status::kSuccess;
+            }
+            VersionChain& chain = found->second;
+            if (!chain.pending || chain.pending->owner != txn.ID()) {
+              ++next;
+              return Status::kSuccess;
+            }
+            if (!chain.pending->staged) {
+              ReleaseVersionPayloadBytes(chain.pending->payload.InlineBytes());
+              chain.pending.reset();
+              shard.write_intent_released.notify_all();
+              ++next;
+              return Status::kSuccess;
+            }
+            // Pre-reserve before moving `pending->payload` so a bad_alloc
+            // retry leaves pending completely intact and moving transfers
+            // inline or spilled state with zero copy or net byte delta.
+            chain.committed.reserve(chain.committed.size() + 1);
+            if (!chain.committed.empty()) {
+              chain.committed.back().end_ts = commit_ts;
+            }
+            CommittedVersion committed;
+            committed.begin_ts = commit_ts;
+            committed.end_ts = std::numeric_limits<uint64_t>::max();
+            committed.payload = std::move(chain.pending->payload);
+            committed.commit_lsn = commit_lsn;
+            chain.committed.push_back(std::move(committed));
+            chain.pending.reset();
+            shard.write_intent_released.notify_all();
+            ++next;
+            return Status::kSuccess;
+          } catch (const std::bad_alloc&) {
+            if (retried_bad_alloc) {
+              return Status::kNoSpace;
+            }
+            retried_bad_alloc = true;
+            LOG(ERROR) << "commit publication hit bad_alloc at entry " << next
+                       << " of " << entry_count << ", retrying";
+          }
+        }
+      });
+  if (iter_status != Status::kSuccess) {
+    // Drop the timestamp reserved by AllocatePendingCommit. Otherwise it
+    // stays the smallest entry in unpublished_commits_ and permanently caps
+    // every later PublishCommit at commit_ts-1 via the min()-1 rule. The
+    // commit is not acknowledged and the engine is fail-stopped here, so
+    // recovery re-applies the WAL COMMIT record; no live reader may be served
+    // a snapshot pinned to this abandoned timestamp.
+    PublishCommit(commit_ts);
+    // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
+    return iter_status;
   }
   uint64_t observed_commit_ts =
       max_committed_begin_ts_.load(std::memory_order_relaxed);
@@ -2295,26 +2556,738 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
              std::memory_order_relaxed)) {
   }
   CommitIndexMutations(txn, commit_ts);
-  // From here on every snapshot >= commit_ts observes this publication.  If
-  // the (allocation-free in practice) publication above ever throws,
-  // commit_ts stays registered as unpublished: correct (snapshots stall at
-  // the previous stable point), just conservatively slow.
+  // From here on every snapshot >= commit_ts observes this publication.
   PublishCommit(commit_ts);
+  txn.write_set_.clear();
+  if (version_payload_resident_bytes_.load(std::memory_order_relaxed) >
+      EffectiveVersionSpillThresholdBytes()) {
+    MaybeSpillColdVersionPayloads();
+  }
   return Status::kSuccess;
 }
 
 void TransactionManager::AbortVersions(Transaction& txn) {
-  for (const RowPosition& rp : txn.write_set_) {
-    VersionShard& shard = version_shards_[VersionShardIndex(rp)];
-    std::scoped_lock lock(shard.mutex);
-    const auto found = shard.versions.find(rp);
-    if (found != shard.versions.end() && found->second.pending &&
-        found->second.pending->owner == txn.ID()) {
-      found->second.pending.reset();
-      shard.write_intent_released.notify_all();
+  // Release this txn's pending intent on a chain, if it still owns one.
+  // Returns true when an intent was actually dropped so the caller can wake
+  // waiters. Spilled payloads are freed by the SpilledVersionSegment
+  // shared_ptr destructor when pending.reset() drops the last reference.
+  const auto release_owned_pending = [&](VersionChain& chain) {
+    if (chain.pending && chain.pending->owner == txn.ID()) {
+      ReleaseVersionPayloadBytes(chain.pending->payload.InlineBytes());
+      chain.pending.reset();
+      return true;
+    }
+    return false;
+  };
+  const Status st =
+      txn.write_set_.ForEach([&](const RowPosition& rp) -> Status {
+        VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+        std::scoped_lock lock(shard.mutex);
+        const auto found = shard.versions.find(rp);
+        if (found != shard.versions.end() &&
+            release_owned_pending(found->second)) {
+          shard.write_intent_released.notify_all();
+        }
+        return Status::kSuccess;
+      });
+  if (st != Status::kSuccess) {
+    LOG(ERROR) << "AbortVersions failed streaming spilled write set for txn "
+               << txn.ID() << ": " << st
+               << "; sweeping version shards to release orphaned intents";
+    // ForEach's disk-spill arm drops the spill segment on the first read
+    // error (its UnwindGuard), so every entry past the failure point is gone
+    // and will never be visited. Clearing the write set here without releasing
+    // those intents would pin them to this now-finishing txn forever: GC only
+    // reclaims chains with no pending, and every later AcquireWriteIntent on
+    // those rows would wait on a dead owner (riding the escape hatch each
+    // time). Abort must always free its intents, so sweep every shard and drop
+    // any pending still owned by this txn. One leaf shard mutex at a time, the
+    // same lock footprint the GC sweep already uses.
+    for (VersionShard& shard : version_shards_) {
+      std::scoped_lock lock(shard.mutex);
+      bool released = false;
+      for (auto& entry : shard.versions) {
+        if (release_owned_pending(entry.second)) {
+          released = true;
+        }
+      }
+      if (released) {
+        shard.write_intent_released.notify_all();
+      }
     }
   }
   ClearPendingIndexMutations(txn);
+  txn.write_set_.clear();
+}
+
+size_t TransactionManager::EffectiveWalRereadThresholdBytes() const noexcept {
+  size_t cap = wal_reread_threshold_bytes_.load(std::memory_order_acquire);
+  const size_t pool_max =
+      ProcessMemoryBudget::Global().EffectivePoolMaxBytes(MemoryPoolKind::kTx);
+  if (pool_max > 0) {
+    cap = std::min(cap, std::max<size_t>(size_t{4} << 10, pool_max / 4));
+  }
+  return cap;
+}
+
+size_t TransactionManager::EffectiveWriteSetSpillThresholdEntries()
+    const noexcept {
+  size_t cap =
+      write_set_spill_threshold_entries_.load(std::memory_order_acquire);
+  const size_t pool_max =
+      ProcessMemoryBudget::Global().EffectivePoolMaxBytes(MemoryPoolKind::kTx);
+  if (pool_max > 0) {
+    const size_t by_bytes = std::max<size_t>(16, (pool_max / 8) / 40);
+    cap = std::min(cap, by_bytes);
+  }
+  return cap;
+}
+
+std::shared_ptr<SpillStore>
+TransactionManager::GetOrCreateWriteSetSpillStore() {
+  std::scoped_lock lk(write_set_spill_mu_);
+  if (write_set_spill_store_ == nullptr) {
+    write_set_spill_store_ = std::make_shared<SpillStore>();
+  }
+  return write_set_spill_store_;
+}
+
+TransactionManager::SpilledVersionSegment::SpilledVersionSegment(
+    std::shared_ptr<SpillStore> s, uint64_t id)
+    : store(std::move(s)), segment_id(id) {
+  static_assert(std::is_same_v<SpillSegmentId, uint64_t>);
+}
+
+TransactionManager::SpilledVersionSegment::~SpilledVersionSegment() {
+  if (store != nullptr && segment_id != kInvalidSpillSegmentId) {
+    store->DropSegment(segment_id);
+  }
+}
+
+size_t TransactionManager::EffectiveVersionSpillThresholdBytes()
+    const noexcept {
+  size_t cap = version_spill_threshold_bytes_.load(std::memory_order_acquire);
+  const size_t pool_max =
+      ProcessMemoryBudget::Global().EffectivePoolMaxBytes(MemoryPoolKind::kTx);
+  if (pool_max > 0) {
+    cap = std::min(cap, std::max<size_t>(size_t{4} << 10, pool_max / 4));
+  }
+  return cap;
+}
+
+void TransactionManager::AddVersionPayloadBytes(size_t bytes) noexcept {
+  if (bytes == 0) {
+    return;
+  }
+  version_payload_resident_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  if (ProcessMemoryBudget::Global().TryReserve(MemoryPoolKind::kTx, bytes,
+                                               /*respect_soft_limit=*/false)) {
+    version_payload_kTx_charged_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+}
+
+void TransactionManager::ReleaseVersionPayloadBytes(size_t bytes) noexcept {
+  if (bytes == 0) {
+    return;
+  }
+  uint64_t prev =
+      version_payload_resident_bytes_.load(std::memory_order_relaxed);
+  while (prev > 0) {
+    const uint64_t next = prev > bytes ? prev - bytes : 0;
+    if (version_payload_resident_bytes_.compare_exchange_weak(
+            prev, next, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  size_t charged = version_payload_kTx_charged_.load(std::memory_order_relaxed);
+  while (charged > 0) {
+    const size_t rel = std::min(charged, bytes);
+    if (version_payload_kTx_charged_.compare_exchange_weak(
+            charged, charged - rel, std::memory_order_relaxed)) {
+      ProcessMemoryBudget::Global().Release(MemoryPoolKind::kTx, rel);
+      break;
+    }
+  }
+}
+
+void TransactionManager::AssignInlinePayload(
+    VersionPayload* dst, std::optional<std::string> value) noexcept {
+  ReleaseVersionPayloadBytes(dst->InlineBytes());
+  dst->spilled = false;
+  dst->spilled_segment.reset();
+  dst->spill_offset = 0;
+  dst->spill_length = 0;
+  dst->spill_crc32 = 0;
+  dst->seq = next_version_payload_seq_.fetch_add(1, std::memory_order_relaxed);
+  if (!value) {
+    dst->has_value = false;
+    std::string().swap(dst->inline_data);
+    return;
+  }
+  dst->has_value = true;
+  dst->inline_data = std::move(*value);
+  AddVersionPayloadBytes(dst->inline_data.size());
+}
+
+void TransactionManager::AssignInlinePayloadView(
+    VersionPayload* dst, std::optional<std::string_view> value) {
+  std::optional<std::string> copy =
+      value ? std::optional<std::string>(std::string(*value)) : std::nullopt;
+  AssignInlinePayload(dst, std::move(copy));
+}
+
+bool TransactionManager::InstallBaseBeforeImageLocked(
+    VersionChain* chain, std::optional<std::string_view> before) {
+  if (!before || !chain->committed.empty()) {
+    return false;
+  }
+  CommittedVersion base;
+  base.begin_ts = 0;
+  base.end_ts = std::numeric_limits<uint64_t>::max();
+  AssignInlinePayloadView(&base.payload, before);
+  chain->committed.push_back(std::move(base));
+  return true;
+}
+
+StatusOr<std::optional<std::string>>
+TransactionManager::ReadSpilledVersionPayload(
+    const std::shared_ptr<const SpilledVersionSegment>& segment,
+    uint64_t offset, uint32_t length, uint32_t crc32) {
+  if (segment == nullptr || segment->store == nullptr) {
+    return StatusError(StatusCode::kCorrupt,
+                       "missing spill store for spilled MVCC version");
+  }
+  // `length` is untrusted spill metadata. Bound it before allocating so a
+  // corrupt length cannot trigger a huge reserve / bad_alloc at this Status
+  // boundary before CRC validation.
+  constexpr uint32_t kMaxSpilledPayloadBytes = 64U << 20;
+  if (length > kMaxSpilledPayloadBytes) {
+    return StatusError(StatusCode::kCorrupt,
+                       "spilled MVCC version length out of range");
+  }
+  std::string out(length, '\0');
+  const Status read_st =
+      segment->store->Read(segment->segment_id, offset, out.data(), length);
+  if (read_st != Status::kSuccess) {
+    return read_st;
+  }
+  if (Crc32cOf(out.data(), out.size()) != crc32) {
+    return StatusError(StatusCode::kCorrupt,
+                       "CRC mismatch reading spilled MVCC version");
+  }
+  return std::optional<std::string>(std::move(out));
+}
+
+void TransactionManager::ReleaseChainPayloadBytes(
+    const VersionChain& chain) noexcept {
+  if (chain.pending) {
+    ReleaseVersionPayloadBytes(chain.pending->payload.InlineBytes());
+  }
+  for (const CommittedVersion& v : chain.committed) {
+    ReleaseVersionPayloadBytes(v.payload.InlineBytes());
+  }
+}
+
+void TransactionManager::ResetActiveVersionSegmentIfIdle() noexcept {
+  std::scoped_lock lk(version_spill_mu_);
+  active_version_segment_.reset();
+  active_version_segment_bytes_ = 0;
+}
+
+void TransactionManager::MaybeSpillColdVersionPayloads() {
+  if (version_payload_resident_bytes_.load(std::memory_order_relaxed) <=
+      EffectiveVersionSpillThresholdBytes()) {
+    return;
+  }
+  if (version_spill_running_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  struct Guard {
+    explicit Guard(std::atomic<bool>& flag_in) : flag(flag_in) {}
+    Guard(const Guard&) = delete;
+    Guard& operator=(const Guard&) = delete;
+    Guard(Guard&&) = delete;
+    Guard& operator=(Guard&&) = delete;
+    ~Guard() { flag.store(false, std::memory_order_release); }
+    std::atomic<bool>& flag;
+  } guard{version_spill_running_};
+  SpillColdVersionPayloadsLockedSweep();
+}
+
+void TransactionManager::SpillColdVersionPayloadsLockedSweep() {
+  const size_t threshold = EffectiveVersionSpillThresholdBytes();
+  const size_t target_bytes = (threshold * 3) / 4;
+  constexpr size_t kMaxBatchItems = 64;
+  constexpr size_t kMaxBatchBytes = 256ULL << 10;
+
+  struct SpillCandidate {
+    RowPosition rp;
+    bool is_pending{false};
+    uint64_t begin_ts{0};
+    txn_id_t pending_owner{0};
+    uint64_t seq{0};
+    std::string data;
+  };
+  struct WrittenSpill {
+    SpillCandidate meta;
+    std::shared_ptr<const SpilledVersionSegment> segment;
+    uint64_t offset{0};
+    uint32_t length{0};
+    uint32_t crc32{0};
+  };
+
+  for (int pass = 0; pass < 2; ++pass) {
+    if (version_payload_resident_bytes_.load(std::memory_order_relaxed) <=
+        target_bytes) {
+      break;
+    }
+    const size_t start_shard =
+        version_spill_shard_cursor_.fetch_add(kVersionShardCount,
+                                              std::memory_order_relaxed) %
+        kVersionShardCount;
+    for (size_t i = 0; i < kVersionShardCount; ++i) {
+      if (version_payload_resident_bytes_.load(std::memory_order_relaxed) <=
+          target_bytes) {
+        return;
+      }
+      VersionShard& shard =
+          version_shards_[(start_shard + i) % kVersionShardCount];
+      std::vector<SpillCandidate> batch;
+      size_t batch_bytes = 0;
+      {
+        std::scoped_lock lock(shard.mutex);
+        for (const auto& [rp, chain] : shard.versions) {
+          if (pass == 0) {
+            // Tier 1: spill historical committed versions superseded by newer
+            // commits first; preserve the head committed version if possible.
+            for (size_t idx = 0; idx + 1 < chain.committed.size(); ++idx) {
+              const CommittedVersion& v = chain.committed[idx];
+              if (!v.payload.has_value || v.payload.spilled ||
+                  v.payload.inline_data.empty()) {
+                continue;
+              }
+              batch_bytes += v.payload.inline_data.size();
+              batch.push_back(SpillCandidate{
+                  .rp = rp,
+                  .is_pending = false,
+                  .begin_ts = v.begin_ts,
+                  .pending_owner = 0,
+                  .seq = v.payload.seq,
+                  .data = v.payload.inline_data,
+              });
+              if (batch.size() >= kMaxBatchItems ||
+                  batch_bytes >= kMaxBatchBytes) {
+                break;
+              }
+            }
+          } else {
+            // Tier 2: still over target -- spill latest committed versions and
+            // staged pending versions.
+            if (!chain.committed.empty()) {
+              const CommittedVersion& v = chain.committed.back();
+              if (v.payload.has_value && !v.payload.spilled &&
+                  !v.payload.inline_data.empty()) {
+                batch_bytes += v.payload.inline_data.size();
+                batch.push_back(SpillCandidate{
+                    .rp = rp,
+                    .is_pending = false,
+                    .begin_ts = v.begin_ts,
+                    .pending_owner = 0,
+                    .seq = v.payload.seq,
+                    .data = v.payload.inline_data,
+                });
+              }
+            }
+            if (chain.pending && chain.pending->staged &&
+                chain.pending->payload.has_value &&
+                !chain.pending->payload.spilled &&
+                !chain.pending->payload.inline_data.empty() &&
+                batch.size() < kMaxBatchItems && batch_bytes < kMaxBatchBytes) {
+              batch_bytes += chain.pending->payload.inline_data.size();
+              batch.push_back(SpillCandidate{
+                  .rp = rp,
+                  .is_pending = true,
+                  .begin_ts = 0,
+                  .pending_owner = chain.pending->owner,
+                  .seq = chain.pending->payload.seq,
+                  .data = chain.pending->payload.inline_data,
+              });
+            }
+          }
+          if (batch.size() >= kMaxBatchItems || batch_bytes >= kMaxBatchBytes) {
+            break;
+          }
+        }
+      }
+      if (batch.empty()) {
+        continue;
+      }
+
+      std::vector<WrittenSpill> written;
+      written.reserve(batch.size());
+      Status io_status = Status::kSuccess;
+      {
+        std::scoped_lock spill_lk(version_spill_mu_);
+        if (version_spill_store_ == nullptr) {
+          version_spill_store_ = std::make_shared<SpillStore>();
+        }
+        for (SpillCandidate& cand : batch) {
+          if (active_version_segment_ == nullptr ||
+              (active_version_segment_bytes_ > 0 &&
+               active_version_segment_bytes_ + cand.data.size() >
+                   kVersionSpillSegmentBytes)) {
+            auto seg_or = version_spill_store_->AllocateSegment();
+            if (seg_or.GetStatus() != Status::kSuccess) {
+              io_status = seg_or.GetStatus();
+              break;
+            }
+            active_version_segment_ = std::make_shared<SpilledVersionSegment>(
+                version_spill_store_, seg_or.Value());
+            active_version_segment_bytes_ = 0;
+          }
+          const uint64_t offset = active_version_segment_bytes_;
+          const Status st = active_version_segment_->store->Append(
+              active_version_segment_->segment_id, cand.data.data(),
+              cand.data.size());
+          if (st != Status::kSuccess) {
+            io_status = st;
+            break;
+          }
+          const auto len = static_cast<uint32_t>(cand.data.size());
+          const uint32_t crc = Crc32cOf(cand.data.data(), cand.data.size());
+          active_version_segment_bytes_ += len;
+          std::string().swap(cand.data);
+          written.push_back(WrittenSpill{
+              .meta = std::move(cand),
+              .segment = active_version_segment_,
+              .offset = offset,
+              .length = len,
+              .crc32 = crc,
+          });
+        }
+      }
+
+      if (!written.empty()) {
+        uint64_t newly_spilled = 0;
+        uint64_t newly_spilled_bytes = 0;
+        {
+          std::scoped_lock lock(shard.mutex);
+          for (const WrittenSpill& w : written) {
+            auto chain_it = shard.versions.find(w.meta.rp);
+            if (chain_it == shard.versions.end()) {
+              continue;
+            }
+            VersionChain& chain = chain_it->second;
+            VersionPayload* target = nullptr;
+            if (w.meta.is_pending) {
+              if (chain.pending && chain.pending->staged &&
+                  chain.pending->owner == w.meta.pending_owner) {
+                target = &chain.pending->payload;
+              }
+            } else {
+              for (CommittedVersion& v : chain.committed) {
+                if (v.begin_ts == w.meta.begin_ts) {
+                  target = &v.payload;
+                  break;
+                }
+              }
+            }
+            if (target == nullptr || !target->has_value || target->spilled ||
+                target->seq != w.meta.seq) {
+              continue;
+            }
+            const size_t freed = target->inline_data.size();
+            std::string().swap(target->inline_data);
+            target->spilled = true;
+            target->spilled_segment = w.segment;
+            target->spill_offset = w.offset;
+            target->spill_length = w.length;
+            target->spill_crc32 = w.crc32;
+            ReleaseVersionPayloadBytes(freed);
+            ++newly_spilled;
+            newly_spilled_bytes += w.length;
+          }
+        }
+        if (newly_spilled > 0) {
+          version_spills_.fetch_add(newly_spilled, std::memory_order_relaxed);
+          version_spill_bytes_.fetch_add(newly_spilled_bytes,
+                                         std::memory_order_relaxed);
+        }
+      }
+
+      if (io_status != Status::kSuccess) {
+        const int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        int64_t prev_ms =
+            last_version_spill_warn_ms_.load(std::memory_order_relaxed);
+        if (now_ms - prev_ms >= 60'000 &&
+            last_version_spill_warn_ms_.compare_exchange_weak(prev_ms,
+                                                              now_ms)) {
+          LOG(WARN) << "MVCC version payload spill hit error (keeping payload "
+                       "resident): "
+                    << io_status;
+        }
+        return;
+      }
+    }
+  }
+}
+
+bool TransactionManager::HoldsWriteIntent(const Transaction& txn,
+                                          const RowPosition& rp) const {
+  if (page_chain_counts_[PageChainShardIndex(rp.page_id)].load(
+          std::memory_order_acquire) == 0) {
+    return false;
+  }
+  const VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  const auto found = shard.versions.find(rp);
+  return found != shard.versions.end() && found->second.pending &&
+         found->second.pending->owner == txn.ID();
+}
+
+bool TransactionManager::ReadWalRecordAt(lsn_t lsn, LogRecord* dst,
+                                         size_t* bytes_read_out) const {
+  if (logger_ != nullptr) {
+    std::array<char, 8> hdr{};
+    if (logger_->TryCopyBuffered(lsn, hdr.data(), hdr.size())) {
+      uint16_t magic = 0;
+      uint16_t version = 0;
+      uint32_t total_len = 0;
+      std::memcpy(&magic, hdr.data(), sizeof(magic));
+      std::memcpy(&version, hdr.data() + 2, sizeof(version));
+      std::memcpy(&total_len, hdr.data() + 4, sizeof(total_len));
+      if (magic == LogRecord::kLogRecordMagic &&
+          version == LogRecord::kCurrentVersion && total_len >= 30 &&
+          total_len <= Logger::kMaxRecordSize) {
+        std::string buf(total_len, '\0');
+        if (logger_->TryCopyBuffered(lsn, buf.data(), total_len) &&
+            dst->Deserialize(buf.data(), total_len) == total_len) {
+          if (bytes_read_out != nullptr) {
+            *bytes_read_out = total_len;
+          }
+          return true;
+        }
+      }
+    }
+  }
+  if (recovery_ != nullptr && recovery_->ReadLog(lsn, dst)) {
+    if (bytes_read_out != nullptr) {
+      *bytes_read_out = dst->Size();
+    }
+    return true;
+  }
+  return false;
+}
+
+void TransactionManager::ApplyTransactionAbortRecords(Transaction& txn) {
+  if (page_manager_ == nullptr) {
+    txn.staged_records_.clear();
+    txn.staged_charge_.ReleaseAll();
+    txn.staged_bytes_ = 0;
+    txn.wal_reread_mode_ = false;
+    return;
+  }
+  if (!txn.IsWalRereadMode()) {
+    if (!txn.staged_records_.empty()) {
+      page_manager_->ApplyTransactionAbort(txn.ID(), txn.staged_records_);
+    }
+    txn.staged_records_.clear();
+    txn.staged_charge_.ReleaseAll();
+    txn.staged_bytes_ = 0;
+    return;
+  }
+  page_manager_->BeginTransactionAbort(txn.ID());
+  lsn_t cur = txn.PrevLSN();
+  const lsn_t first = txn.FirstLSN();
+  LogRecord record;
+  while (txn.HasLogRecord() && cur != 0 && cur >= first) {
+    size_t bytes_read = 0;
+    if (!ReadWalRecordAt(cur, &record, &bytes_read)) {
+      LOG(ERROR) << "WAL re-read abort failed reading record at LSN " << cur
+                 << " for txn " << txn.ID();
+      fail_stop_.store(true, std::memory_order_release);
+      break;
+    }
+    RecordWalRereadBytes(bytes_read);
+    if (record.owner == txn.ID() && record.type != LogType::kBegin &&
+        record.type != LogType::kCommit && record.type != LogType::kAbort &&
+        record.type != LogType::kBeginCheckpoint &&
+        record.type != LogType::kEndCheckpoint) {
+      page_manager_->ApplyTransactionAbortRecord(txn.ID(), record);
+    }
+    if (record.prev_lsn == 0 || record.prev_lsn >= cur) {
+      break;
+    }
+    cur = record.prev_lsn;
+  }
+  page_manager_->FinishTransactionAbort(txn.ID());
+  txn.staged_records_.clear();
+  txn.staged_charge_.ReleaseAll();
+  txn.staged_bytes_ = 0;
+  txn.wal_reread_mode_ = false;
+}
+
+bool TransactionManager::WalkWalRecordsForward(
+    txn_id_t owner, lsn_t first_lsn, lsn_t end_lsn,
+    const std::function<void(lsn_t, LogRecord&)>& on_record,
+    const char* caller_name) const {
+  lsn_t cur = first_lsn;
+  LogRecord record;
+  while (cur < end_lsn) {
+    lsn_t next_cur = 0;
+    size_t bytes_read = 0;
+    if (ReadWalRecordAt(cur, &record, &bytes_read)) {
+      next_cur = cur + static_cast<lsn_t>(bytes_read);
+      RecordWalRereadBytes(bytes_read);
+      if (record.owner == owner) {
+        on_record(cur, record);
+      }
+    } else if (recovery_ != nullptr) {
+      const auto step =
+          recovery_->ReadWalRecordForward(cur, &record, &next_cur);
+      if (step == RecoveryManager::WalScanStep::kRecord) {
+        RecordWalRereadBytes(record.Size());
+        if (record.owner == owner) {
+          on_record(cur, record);
+        }
+      } else if (step != RecoveryManager::WalScanStep::kPaddingSkip) {
+        // T4225: name corruption explicitly so operators can locate and
+        // retire the damaged segment instead of guessing from a generic
+        // walk failure.
+        LOG(ERROR) << caller_name
+                   << (step == RecoveryManager::WalScanStep::kCorrupt
+                           ? " hit corrupt WAL record"
+                           : " failed")
+                   << " at LSN " << cur << " (end=" << end_lsn << ") for txn "
+                   << owner;
+        return false;
+      }
+    } else {
+      return false;
+    }
+    if (next_cur <= cur) {
+      return false;
+    }
+    cur = next_cur;
+  }
+  return true;
+}
+
+Status TransactionManager::ApplyTransactionCommitRecords(Transaction& txn,
+                                                         lsn_t commit_start,
+                                                         lsn_t commit_end) {
+  if (page_manager_ == nullptr) {
+    txn.staged_records_.clear();
+    txn.staged_charge_.ReleaseAll();
+    txn.staged_bytes_ = 0;
+    txn.wal_reread_mode_ = false;
+    return Status::kSuccess;
+  }
+  if (!txn.IsWalRereadMode()) {
+    if (!txn.staged_records_.empty()) {
+      RETURN_IF_FAIL(page_manager_->ApplyTransactionCommit(
+          txn.ID(), commit_end, txn.staged_records_));
+    }
+    txn.staged_records_.clear();
+    txn.staged_charge_.ReleaseAll();
+    txn.staged_bytes_ = 0;
+    return Status::kSuccess;
+  }
+  page_manager_->BeginTransactionCommit(txn.ID());
+  PageManager::TransactionCommitState state;
+  Status applied = Status::kSuccess;
+  if (txn.HasLogRecord() &&
+      !WalkWalRecordsForward(
+          txn.ID(), txn.FirstLSN(), commit_start,
+          [&](lsn_t rec_lsn, LogRecord& record) {
+            if (record.type != LogType::kBegin &&
+                record.type != LogType::kCommit &&
+                record.type != LogType::kAbort &&
+                record.type != LogType::kBeginCheckpoint &&
+                record.type != LogType::kEndCheckpoint) {
+              record.record_lsn = rec_lsn;
+              if (applied == Status::kSuccess) {
+                applied = page_manager_->ApplyTransactionCommitRecord(
+                    txn.ID(), commit_end, record, &state);
+              }
+            }
+          },
+          "WAL re-read commit scan")) {
+    return StatusError(StatusCode::kIOError, "WAL re-read commit scan failed");
+  }
+  RETURN_IF_FAIL(applied);
+  page_manager_->FinishTransactionCommit(txn.ID(), state);
+  txn.staged_records_.clear();
+  txn.staged_charge_.ReleaseAll();
+  txn.staged_bytes_ = 0;
+  txn.wal_reread_mode_ = false;
+  return Status::kSuccess;
+}
+
+bool TransactionManager::FindPendingLsmWriteViaWal(const Transaction& txn,
+                                                   page_id_t root,
+                                                   std::string_view key,
+                                                   std::string* value,
+                                                   bool* deleted) const {
+  lsn_t cur = 0;
+  lsn_t first = 0;
+  bool has_log = false;
+  {
+    std::scoped_lock guard(txn.chain_mu_);
+    cur = txn.PrevLSN();
+    first = txn.FirstLSN();
+    has_log = txn.HasLogRecord();
+  }
+  LogRecord record;
+  while (has_log && cur != 0 && cur >= first) {
+    size_t bytes_read = 0;
+    if (!ReadWalRecordAt(cur, &record, &bytes_read)) {
+      return false;
+    }
+    RecordWalRereadBytes(bytes_read);
+    if (record.owner == txn.ID() && record.pid == root && record.key == key &&
+        (record.type == LogType::kLsmPut ||
+         record.type == LogType::kLsmDelete)) {
+      *deleted = record.type == LogType::kLsmDelete;
+      *value = *deleted ? std::string() : record.redo_data;
+      return true;
+    }
+    if (record.prev_lsn == 0 || record.prev_lsn >= cur) {
+      break;
+    }
+    cur = record.prev_lsn;
+  }
+  return false;
+}
+
+void TransactionManager::ForEachPendingLsmWriteViaWal(
+    const Transaction& txn, page_id_t root, std::string_view key,
+    const std::function<void(const LogRecord&)>& fn) const {
+  lsn_t cur = 0;
+  lsn_t end_lsn = 0;
+  bool has_log = false;
+  {
+    std::scoped_lock guard(txn.chain_mu_);
+    cur = txn.FirstLSN();
+    end_lsn = txn.PrevRecordEndLSN();
+    has_log = txn.HasLogRecord();
+  }
+  if (!has_log) {
+    return;
+  }
+  (void)WalkWalRecordsForward(
+      txn.ID(), cur, end_lsn,
+      [&](lsn_t /*rec_lsn*/, LogRecord& record) {
+        if (record.pid == root && record.key == key &&
+            (record.type == LogType::kLsmPut ||
+             record.type == LogType::kLsmDelete)) {
+          fn(record);
+        }
+      },
+      "WAL re-read pending LSM scan");
 }
 
 void TransactionManager::MoveActiveTransaction(Transaction* from,
@@ -2337,17 +3310,20 @@ int TransactionManager::ReservationBisectMode() {
   // TINYLAMB_DISABLE_INDEX_RESERVATION): 0=on, 1=off, 2=no shared map,
   // 3=no per-transaction vector, 4=registration on but admission discount
   // off, 5=discount on but the tree-level drain retry off.
-  static const int mode = [] {
-    const char* env = std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION");
-    if (env == nullptr) {
-      return 0;
-    }
-    char* parsed_end = nullptr;
-    const long parsed = std::strtol(env, &parsed_end, 10);
-    return parsed_end == env || *parsed_end != '\0' ? 0
-                                                    : static_cast<int>(parsed);
-  }();
-  return mode;
+  // Read per call: diagnostics toggle this env at runtime and a function-local
+  // static would keep the startup value.
+  const char* env = std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION");
+  if (env == nullptr) {
+    return 0;
+  }
+  char* parsed_end = nullptr;
+  errno = 0;
+  const long parsed = std::strtol(env, &parsed_end, 10);
+  if (errno != 0 || parsed_end == env || *parsed_end != '\0' ||
+      parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+    return 0;
+  }
+  return static_cast<int>(parsed);
 }
 
 void TransactionManager::ReserveIndexUndoBytes(Transaction& txn, page_id_t pid,
@@ -2369,6 +3345,7 @@ void TransactionManager::ReserveIndexUndoBytes(Transaction& txn, page_id_t pid,
     auto [owner, inserted] = shard.bytes[pid].try_emplace(txn.ID(), 0);
     if (inserted) {
       ++shard.owner_pages[txn.ID()];
+      index_reservation_owner_entries_.fetch_add(1, std::memory_order_relaxed);
     }
     owner->second += bytes;
   }
@@ -2432,6 +3409,12 @@ Status TransactionManager::WaitForIndexReservationDrain(
 }
 
 bool TransactionManager::HasForeignIndexReservations(txn_id_t self) const {
+  // Fast path: drained reservations need no shard locks at all. This is the
+  // common re-evaluation outcome for drain waiters (every 25 ms slice plus
+  // the deadline check), and previously cost 64 mutex acquisitions.
+  if (index_reservation_owner_entries_.load(std::memory_order_relaxed) == 0) {
+    return false;
+  }
   for (const IndexReservationShard& shard : index_reservations_) {
     std::scoped_lock lock(shard.mutex);
     if (shard.owner_pages.size() > 1 ||
@@ -2461,7 +3444,19 @@ Status TransactionManager::WaitForAllIndexReservationsDrain(
   std::unique_lock drain_lock(reservation_drain_mu_);
   const auto wait_started = std::chrono::steady_clock::now();
   bool diagnosed = false;
-  while (HasForeignIndexReservations(self)) {
+  // Single predicate evaluation per iteration: the loop head re-checks the
+  // drain state, so a release that lands exactly on the deadline still
+  // succeeds on the next pass instead of needing a second scan.
+  while (true) {
+    if (!HasForeignIndexReservations(self)) {
+      return Status::kSuccess;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      // Deadline with the foreign reservations still held: give up and let
+      // the caller surface its honest kNoSpace.
+      return StatusError(StatusCode::kConflicts,
+                         "index-undo reservation drain timed out");
+    }
     // Diagnostic (round 9): a drain that outlives 200 ms is a stall
     // precursor -- every waiter parked here holds its own row intents, so
     // its queue multiplies the damage. Name the foreign owners once per
@@ -2492,19 +3487,7 @@ Status TransactionManager::WaitForAllIndexReservationsDrain(
                            "transaction wounded during reservation drain");
       }
     }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      // Deadline with the foreign reservations still held: give up and let
-      // the caller surface its honest kNoSpace. Reservations that drained
-      // exactly at the deadline are the success case -- the caller's retry
-      // would now fit, so failing it here turns a transient contention
-      // window into a statement failure.
-      return HasForeignIndexReservations(self)
-                 ? StatusError(StatusCode::kConflicts,
-                               "index-undo reservation drain timed out")
-                 : Status::kSuccess;
-    }
   }
-  return Status::kSuccess;
 }
 
 std::string TransactionManager::DebugDumpIndexReservations(
@@ -2514,7 +3497,10 @@ std::string TransactionManager::DebugDumpIndexReservations(
   std::scoped_lock lock(shard.mutex);
   const auto found = shard.bytes.find(pid);
   if (found == shard.bytes.end()) {
-    return "(none)";
+    // T2110: the sister DebugDumpVersionChains renders "no state for this
+    // page" as an empty string (and its test pins that); "(none)" split one
+    // debug convention across two dumps.  Empty means empty everywhere.
+    return {};
   }
   std::string out;
   for (const auto& [owner, bytes] : found->second) {
@@ -2559,7 +3545,7 @@ std::string TransactionManager::DebugDumpAllIndexReservations(
       }
     }
   }
-  return out.empty() ? "(no foreign reservations; cleared during wait)"
+  return out.empty() ? "(no foreign reservations)"
                      : out + " entries=" + std::to_string(foreign_entries);
 }
 
@@ -2584,10 +3570,14 @@ void TransactionManager::ReleaseIndexUndoReservations(Transaction& txn) {
     } else {
       page->second.erase(owner);
       const auto summary = shard.owner_pages.find(txn.ID());
-      assert(summary != shard.owner_pages.end() && summary->second > 0);
-      if (--summary->second == 0) {
+      if (summary == shard.owner_pages.end() || summary->second == 0) {
+        // assert() disappears in NDEBUG builds; silently dereferencing end()
+        // or underflowing the counter would corrupt the accounting.
+        LOG(ERROR) << "missing index-undo owner summary on release";
+      } else if (--summary->second == 0) {
         shard.owner_pages.erase(summary);
       }
+      index_reservation_owner_entries_.fetch_sub(1, std::memory_order_relaxed);
       if (page->second.empty()) {
         shard.bytes.erase(page);
       }
@@ -2671,6 +3661,7 @@ void TransactionManager::GarbageCollectVersions() {
       if (!chain.pending && latest_commit_durable &&
           (!oldest_snapshot || chain.committed.empty() ||
            chain.committed.back().begin_ts <= *oldest_snapshot)) {
+        ReleaseChainPayloadBytes(chain);
         ForgetVersionChain(chain_iter->first);
         chain_iter = shard.versions.erase(chain_iter);
         continue;
@@ -2678,6 +3669,8 @@ void TransactionManager::GarbageCollectVersions() {
       if (oldest_snapshot) {
         while (chain.committed.size() > 1 &&
                chain.committed[1].begin_ts <= *oldest_snapshot) {
+          ReleaseVersionPayloadBytes(
+              chain.committed.front().payload.InlineBytes());
           chain.committed.erase(chain.committed.begin());
         }
       }
@@ -2712,7 +3705,18 @@ void TransactionManager::GarbageCollectVersions() {
   for (size_t i = 0; i < shards_this_pass; ++i) {
     collect_shard(version_shards_[(begin_shard + i) % kVersionShardCount]);
   }
-  MaybeWarnGcPin(oldest_snapshot, oldest_snapshot_txn, total_chains);
+  uint64_t remaining_chains = 0;
+  for (const auto& count : page_chain_counts_) {
+    remaining_chains +=
+        static_cast<uint64_t>(count.load(std::memory_order_relaxed));
+  }
+  if (remaining_chains == 0) {
+    ResetActiveVersionSegmentIfIdle();
+  } else if (version_payload_resident_bytes_.load(std::memory_order_relaxed) >
+             EffectiveVersionSpillThresholdBytes()) {
+    MaybeSpillColdVersionPayloads();
+  }
+  MaybeWarnGcPin(oldest_snapshot, oldest_snapshot_txn, remaining_chains);
 }
 
 // Rate-limited warning for the one MVCC condition that can silently consume
@@ -2724,12 +3728,14 @@ void TransactionManager::GarbageCollectVersions() {
 void TransactionManager::MaybeWarnGcPin(
     const std::optional<uint64_t>& oldest_snapshot,
     txn_id_t oldest_snapshot_txn, uint64_t total_chains) {
-  if (!oldest_snapshot || total_chains <= kGcFullScanChainLimit) {
+  const uint64_t chain_limit =
+      gc_pin_warn_chain_limit_.load(std::memory_order_relaxed);
+  if (!oldest_snapshot || total_chains <= chain_limit) {
     return;
   }
   const uint64_t age =
       commit_timestamp_.load(std::memory_order_relaxed) - *oldest_snapshot;
-  if (age < kGcPinWarnAgeCommits) {
+  if (age < gc_pin_warn_age_commits_.load(std::memory_order_relaxed)) {
     return;
   }
   const int64_t now_ms =
@@ -2737,11 +3743,12 @@ void TransactionManager::MaybeWarnGcPin(
           std::chrono::steady_clock::now().time_since_epoch())
           .count();
   int64_t last = last_gc_pin_warn_ms_.load(std::memory_order_relaxed);
-  if (now_ms - last < kGcPinWarnInterval.count() ||
-      !last_gc_pin_warn_ms_.compare_exchange_weak(last, now_ms,
-                                                  std::memory_order_relaxed)) {
+  if ((last != 0 && now_ms - last < kGcPinWarnInterval.count()) ||
+      !last_gc_pin_warn_ms_.compare_exchange_weak(
+          last, now_ms == 0 ? 1 : now_ms, std::memory_order_relaxed)) {
     return;
   }
+  gc_pin_warn_count_.fetch_add(1, std::memory_order_relaxed);
   LOG(WARN) << "MVCC version GC is pinned: " << total_chains
             << " chains retained for snapshot ts " << *oldest_snapshot
             << " (transaction " << oldest_snapshot_txn << ", " << age

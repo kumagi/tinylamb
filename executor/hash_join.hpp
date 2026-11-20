@@ -48,6 +48,11 @@ class JoinHashIndex {
  public:
   static constexpr size_t kNil = ~size_t{0};
   enum class KeyMode : uint8_t { kInt64, kBytes };
+  struct Int64Slots {
+    const size_t* heads;
+    const int64_t* keys;
+    size_t mask;
+  };
 
   void Init(KeyMode mode, size_t expected_entries);
   void Insert(uint64_t hash, int64_t int_key, std::string_view byte_key,
@@ -56,6 +61,9 @@ class JoinHashIndex {
                             std::string_view byte_key) const;
   [[nodiscard]] size_t ChainNext(size_t entry) const;
   [[nodiscard]] size_t RowIndex(size_t entry) const;
+  // Available on a finalized INT64 index until the index is released.
+  [[nodiscard]] Int64Slots ViewInt64Slots() const;
+  void PrefetchInt64(uint64_t hash) const;
 
   [[nodiscard]] static uint64_t HashInt64(int64_t key);
   [[nodiscard]] static uint64_t HashBytes(std::string_view key);
@@ -88,19 +96,24 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
  public:
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols,
-           size_t worker_count = std::thread::hardware_concurrency());
+           size_t worker_count = std::thread::hardware_concurrency(),
+           size_t hybrid_partitions = 0);
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols, HashJoinMode mode,
-           size_t worker_count = std::thread::hardware_concurrency());
+           size_t worker_count = std::thread::hardware_concurrency(),
+           size_t hybrid_partitions = 0);
   // Semi/anti variants (decorrelated IN / EXISTS / NOT EXISTS). The probe
   // side is always the left child: matching emits that row once (semi) or
   // not at all (anti), and its row position survives for UPDATE/DELETE.
   // Outer/single joins require the null-supplying input's width when that
   // input is empty; omitted widths are inferred only from actual input rows.
+  // `hybrid_partitions` (0 = kHybridPartitions default) lets the planner wire
+  // HybridPartitionCount(build_estimate) through to MaterializeHybrid (1824).
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols, HashJoinMode mode, JoinKind kind,
            size_t worker_count = std::thread::hardware_concurrency(),
-           size_t right_width = 0, size_t left_width = 0);
+           size_t right_width = 0, size_t left_width = 0,
+           size_t hybrid_partitions = 0);
   HashJoin(const HashJoin&) = delete;
   HashJoin(HashJoin&&) = delete;
   HashJoin& operator=(const HashJoin&) = delete;
@@ -124,6 +137,14 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
 
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
   [[nodiscard]] HashJoinMode Mode() const { return mode_; }
+  // Spill partition count used when the ctor receives hybrid_partitions == 0
+  // (the historical fixed value, 1824).
+  static constexpr size_t kDefaultHybridPartitions = 32;
+  // Effective spill partition count for the hybrid mode (1824).
+  [[nodiscard]] size_t HybridPartitions() const {
+    return hybrid_partitions_ != 0 ? hybrid_partitions_
+                                   : kDefaultHybridPartitions;
+  }
   [[nodiscard]] JoinKind Kind() const {
     return kind_;
   }  // Non-null only when a join key is null-safe; parallels left_cols_/
@@ -185,7 +206,6 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   // joins ignore it, and a run-time guard (the domain cap) falls back to the
   // unrestricted intake without changing any result either.
   void EnableSemiReduction() { semi_reduction_ = true; }
-  [[nodiscard]] bool SemiReductionEnabled() const { return semi_reduction_; }
   // True when the reduced intake actually ran (an inner/outer kind, or a
   // disabled reduction, leaves this false even when it was requested).
   [[nodiscard]] bool SemiReductionActive() const {
@@ -218,7 +238,6 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   // exercise the fallback without materializing a million distinct keys.
   static void SetSemiReductionMaxDomainKeysForTest(size_t keys);
   static size_t SemiReductionMaxDomainKeysForTest();
-  [[nodiscard]] bool DynamicFilterEnabled() const { return dynamic_filter_; }
   [[nodiscard]] bool DynamicFilterPublished() const {
     return dynamic_filter_published_;
   }
@@ -294,6 +313,8 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   size_t right_width_{0};
   size_t left_width_{0};
   size_t worker_count_;
+  // Planner-wired hybrid spill partition count (1824); 0 = default.
+  size_t hybrid_partitions_{0};
   bool materialized_{false};
   bool materialize_failed_{false};
   Status materialize_error_{Status::kSuccess};
@@ -316,8 +337,12 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   static constexpr size_t kNestedLoopProbeLimit = 4;
   bool runtime_filter_active_{false};
   size_t runtime_filter_keys_{0};
-  std::atomic<size_t> probe_rows_rejected_{0};
-  std::atomic<size_t> probe_rows_null_rejected_{0};
+  // T1235: this serial operator's Next() cursor is the only writer (the
+  // shared-build parallel variant keeps its own counters) and Dump the only
+  // reader, so per-rejected-row seq_cst RMW was pure overhead: plain
+  // counters, same cache line as their siblings.
+  size_t probe_rows_rejected_{0};
+  size_t probe_rows_null_rejected_{0};
   // Dynamic join filter state (see EnableDynamicFilter).
   bool dynamic_filter_{false};
   bool dynamic_filter_build_left_{false};

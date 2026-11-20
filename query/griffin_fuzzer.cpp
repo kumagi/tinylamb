@@ -631,6 +631,10 @@ std::string SubstituteIdentifiers(const std::string& sql,
   }
   std::string out;
   out.reserve(sql.size() + 16);
+  // Decide once per distinct identifier. Flipping an independent coin on each
+  // occurrence can keep the FROM alias while rewriting only the ON-clause
+  // reference, producing invalid SQL and false oracle MISMATCHes.
+  std::unordered_map<std::string, std::string> substitution_cache;
   size_t i = 0;
   while (i < sql.size()) {
     const char c = sql[i];
@@ -653,6 +657,13 @@ std::string SubstituteIdentifiers(const std::string& sql,
         ++end;
       }
       const std::string token = sql.substr(i, end - i);
+      if (auto cached = substitution_cache.find(token);
+          cached != substitution_cache.end()) {
+        out += cached->second;
+        i = end;
+        continue;
+      }
+      const size_t out_before = out.size();
       bool substituted = false;
       for (const std::string& table : meta.tables) {
         if (token == table && !meta.tables.empty()) {
@@ -687,6 +698,7 @@ std::string SubstituteIdentifiers(const std::string& sql,
       if (!substituted) {
         out += token;
       }
+      substitution_cache.emplace(token, out.substr(out_before));
       i = end;
       continue;
     }
@@ -1124,7 +1136,20 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
   return report;
 }
 
-std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose) {
+std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose,
+                               bool* skipped_out) {
+  if (skipped_out != nullptr) {
+    *skipped_out = false;
+  }
+  // Generated seeds duplicate the 32-bit RNG seed in both halves; a trace
+  // whose upper half was edited must not pass the tamper check by replaying
+  // only the lower half.
+  if ((trace.seed >> 32) != (trace.seed & 0xffffffffULL)) {
+    if (skipped_out != nullptr) {
+      *skipped_out = true;
+    }
+    return "tampered trace: seed halves disagree";
+  }
   // Regenerate from the seed: the built-in pool makes the iteration fully
   // deterministic, so a tampered statement list must not match the seed.
   const auto seed32 = static_cast<uint32_t>(trace.seed);
@@ -1146,6 +1171,9 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose) {
   // whether the failure still reproduces. "" means fixed or flaky-clean.
   ScopedDb db_holder("griffin_replay");
   if (db_holder.get() == nullptr) {
+    if (skipped_out != nullptr) {
+      *skipped_out = true;
+    }
     return "";  // resource pressure: replay skipped, not a mismatch
   }
   Database& db = *db_holder;
@@ -1204,7 +1232,15 @@ bool ParseGriffinTest(std::string_view text, GriffinTrace* trace) {
     };
     std::string value;
     if (consume("-- seed: ", &value)) {
-      trace->seed = std::stoull(value);
+      try {
+        size_t used = 0;
+        trace->seed = std::stoull(value, &used);
+        if (used != value.size()) {
+          return false;
+        }
+      } catch (const std::exception&) {
+        return false;
+      }
     } else if (consume("-- stmt: ", &value)) {
       trace->statements.push_back(value);
     } else if (consume("-- ran_select: ", &value)) {
@@ -1244,8 +1280,13 @@ void GriffinFuzzTry(const uint8_t* data, size_t size, bool verbose) {
     verify = "internal error: serialized test does not parse";
   } else if (!(parsed == trace)) {
     verify = "internal error: serialized test does not round-trip";
-  } else if (ReplayGriffinTrace(parsed, false).empty()) {
-    verify = "internal error: serialized test replay holds (flaky mismatch)";
+  } else {
+    bool replay_skipped = false;
+    const std::string replay_report =
+        ReplayGriffinTrace(parsed, false, &replay_skipped);
+    if (!replay_skipped && replay_report.empty()) {
+      verify = "internal error: serialized test replay holds (flaky mismatch)";
+    }
   }
 
   const std::string path =

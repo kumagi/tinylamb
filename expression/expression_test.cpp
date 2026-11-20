@@ -440,6 +440,58 @@ TEST(ExpressionTest, UnaryExpression_Evaluate_ComputesExpectedResults) {
       Value(-1.1).value.double_value);
 }
 
+// P461/501: aggregate result-type declarations come from the canonical table
+// (CanonicalAggregateResultKind in type/value.cpp) and must match what
+// AggregateAccumulator::Finalize actually returns.  Pin the previously
+// drifted arms: HLL_MERGE yields an INT64 cardinality (not DOUBLE, not sketch
+// bytes); COUNTIF/APPROX_COUNT_DISTINCT yield INT64 regardless of child type;
+// sketch init/merge_partial yield serialized VARCHAR; array-valued aggregates
+// declare ARRAY; child-typed aggregates (SUM/MIN/MAX/PERCENTILE_DISC) still
+// follow their child.
+TEST(ExpressionTest, AggregateResultTypeFollowsCanonicalTable) {
+  Schema schema;
+  const Expression i64_child = ConstantValueExp(Value(int64_t{7}));
+  const Expression str_child = ConstantValueExp(Value(std::string("x")));
+  const auto tag_of = [&schema](AggregationType t, const Expression& child) {
+    return AggregateExpressionExp(t, child)->ResultType(schema).GetType();
+  };
+  for (const AggregationType t :
+       {AggregationType::kCount, AggregationType::kCountIf,
+        AggregationType::kRegrCount, AggregationType::kApproxCountDistinct,
+        AggregationType::kHllMerge}) {
+    EXPECT_EQ(tag_of(t, str_child), TypeTag::kBigInt)
+        << "aggregate type " << static_cast<int>(t);
+  }
+  for (const AggregationType t :
+       {AggregationType::kAvg, AggregationType::kVarSamp,
+        AggregationType::kStddevPop, AggregationType::kCorr,
+        AggregationType::kPercentileCont, AggregationType::kRegrR2}) {
+    EXPECT_EQ(tag_of(t, i64_child), TypeTag::kDouble)
+        << "aggregate type " << static_cast<int>(t);
+  }
+  for (const AggregationType t :
+       {AggregationType::kHllInit, AggregationType::kHllMergePartial,
+        AggregationType::kKllMergePartial, AggregationType::kStringAgg}) {
+    EXPECT_EQ(tag_of(t, str_child), TypeTag::kVarChar)
+        << "aggregate type " << static_cast<int>(t);
+  }
+  for (const AggregationType t :
+       {AggregationType::kArrayAgg, AggregationType::kArrayConcatAgg,
+        AggregationType::kElementwiseSum, AggregationType::kApproxQuantiles,
+        AggregationType::kApproxTopCount, AggregationType::kApproxTopSum}) {
+    EXPECT_EQ(tag_of(t, i64_child), TypeTag::kArray)
+        << "aggregate type " << static_cast<int>(t);
+  }
+  EXPECT_EQ(tag_of(AggregationType::kSum, i64_child), TypeTag::kBigInt);
+  EXPECT_EQ(tag_of(AggregationType::kMin, str_child), TypeTag::kVarChar);
+  EXPECT_EQ(tag_of(AggregationType::kPercentileDisc, i64_child),
+            TypeTag::kBigInt);
+  EXPECT_EQ(AggregateExpressionExp(AggregationType::kHllMerge, str_child)
+                ->ResultType(schema, schema)
+                .GetType(),
+            TypeTag::kBigInt);
+}
+
 TEST(ExpressionTest, AggregateExpression_ToString_RendersSqlSyntax) {
   Row dummy({});
   Schema dummy_schema;
@@ -662,7 +714,7 @@ class BareExpression : public ExpressionBase {
  public:
   using ExpressionBase::Evaluate;
   using ExpressionBase::ResultType;
-  [[nodiscard]] TypeTag Type() const override {
+  [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kConstantValue;
   }
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
@@ -740,8 +792,8 @@ TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsRuntimeError) {
   EXPECT_EQ(count->ResultType(schema, schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(avg->ResultType(schema, schema).GetType(), TypeTag::kDouble);
 
-  // The no-exception migration keeps the direct-evaluation misuse observable
-  // as a runtime_error through the deprecated Evaluate shim.
+  // Direct evaluation of a non-scalar expression surfaces a runtime_error
+  // through the throwing Evaluate wrapper.
   EXPECT_THROW(static_cast<void>(count->Evaluate(row, schema)),
                std::runtime_error);
   EXPECT_EQ(count->ToString(), "COUNT(amount)");
@@ -849,11 +901,12 @@ TEST(ExpressionTest,
             Value("0-0 3 0:0:0").WithInterval());
   EXPECT_EQ(interval->ResultType(schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ResultType(schema, schema).GetType(), TypeTag::kVarChar);
-  EXPECT_EQ(interval->ToString(), "INTERVAL 0-0 3 0:0:0");
+  // T2105: the numeric spelling round-trips (was the canonical "0-0 3 0:0:0").
+  EXPECT_EQ(interval->ToString(), "INTERVAL 3 day");
 
   std::ostringstream oss;
   interval->Dump(oss);
-  EXPECT_EQ(oss.str(), "INTERVAL 0-0 3 0:0:0");
+  EXPECT_EQ(oss.str(), "INTERVAL 3 day");
 
   const auto& interval_expression = interval->AsIntervalExpression();
   EXPECT_EQ(interval_expression.Amount(), 3);
@@ -1109,11 +1162,12 @@ TEST(ExpressionTest, FunctionCall_CoalesceAndConcat_EvaluatesCorrectly) {
   EXPECT_TRUE(all_null->Evaluate(row, schema).IsNull());
   EXPECT_EQ(concat->Evaluate(row, schema), Value("abc"));
   EXPECT_TRUE(concat_null->Evaluate(row, schema).IsNull());
-  EXPECT_THROW(static_cast<void>(
-                   FunctionCallExp("concat", {ConstantValueExp(Value(1)),
-                                              ConstantValueExp(Value("a"))})
-                       ->Evaluate(row, schema)),
-               std::runtime_error);
+  // GoogleSQL implicitly casts scalar arguments to STRING (same as the batch
+  // evaluator): the AST must agree with SELECT / INSERT ... VALUES.
+  EXPECT_EQ(FunctionCallExp("concat", {ConstantValueExp(Value(1)),
+                                       ConstantValueExp(Value("a"))})
+                ->Evaluate(row, schema),
+            Value("1a"));
 }
 
 TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
@@ -1334,6 +1388,32 @@ TEST(ExpressionTest, DateBinaryArithmetic_InterAndUnaryShapes) {
                                        ConstantValueExp(Value())))
                   .IsNull());
 
+  // T381 (bug 444): negating INT64_MIN is UB in C++, so DATE - <INT64_MIN
+  // offset> must route through checked negation and surface the explicit
+  // range error (pre-fix the raw `-x` only *appeared* right on wrapping
+  // two's-complement hardware).
+  const auto expect_offset_range = [&](const Expression& e) {
+    try {
+      (void)e->Evaluate(row, schema);
+      FAIL() << "expected DATE offset range error";
+    } catch (const std::exception& ex) {
+      EXPECT_NE(std::string(ex.what()).find("DATE arithmetic offset"),
+                std::string::npos)
+          << ex.what();
+    }
+  };
+  expect_offset_range(BinaryExpressionExp(
+      dt, BinaryOperation::kSubtract,
+      ConstantValueExp(Value(std::numeric_limits<int64_t>::min()))));
+  IntervalValue min_months;
+  min_months.months = std::numeric_limits<int64_t>::min();
+  ASSERT_TRUE(min_months.TryToString().HasValue());
+  std::string min_month_text = min_months.TryToString().Value();
+  const Value min_month_interval(std::move(min_month_text));
+  expect_offset_range(
+      BinaryExpressionExp(dt, BinaryOperation::kSubtract,
+                          ConstantValueExp(min_month_interval.WithInterval())));
+
   // Result types follow the runtime values.
   const Schema date_schema(
       "t", {Column("dt", ValueType::kDate), Column("n", ValueType::kInt64)});
@@ -1350,7 +1430,7 @@ TEST(ExpressionTest, DateBinaryArithmetic_InterAndUnaryShapes) {
       TypeTag::kBigInt);
 
   // Signatures that do not exist stay errors: DATE + DATE, INT64 - DATE,
-  // DATE * anything, DATE + unparseable text.
+  // DATE * anything, DATE + unparsable text.
   EXPECT_THROW(static_cast<void>(eval(BinaryExpressionExp(
                    dt, BinaryOperation::kAdd,
                    ConstantValueExp(Value::Date("2020-01-01"))))),
@@ -1396,6 +1476,22 @@ TEST(ExpressionTest, ColumnValue_ResultType_InfersCorrectType) {
   EXPECT_EQ(ColumnValueExp("n")->ResultType(sc).GetType(), TypeTag::kInvalid);
   EXPECT_THROW(static_cast<void>(ColumnValueExp("zzz")->ResultType(sc)),
                std::runtime_error);
+  // T371 (bug 372): the type-resolution failure must name the column, in
+  // both the single-schema overload and the two-schema one that delegates.
+  try {
+    (void)ColumnValueExp("zzz")->ResultType(sc);
+    FAIL() << "expected std::runtime_error";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("zzz"), std::string::npos) << e.what();
+  }
+  Schema other("o", {Column("q", ValueType::kInt64)});
+  try {
+    (void)ColumnValueExp("missing_col")->ResultType(sc, other);
+    FAIL() << "expected std::runtime_error";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("missing_col"), std::string::npos)
+        << e.what();
+  }
 }
 
 TEST(ExpressionTest, ColumnValue_EvaluateWithTwoSchemas_ResolvesCorrectSchema) {
@@ -1511,7 +1607,7 @@ TEST(ExpressionTest,
       std::runtime_error);
 }
 
-// bugreview #181: an UNSIGNED shift count >= 2^63 is a huge positive amount
+//  an UNSIGNED shift count >= 2^63 is a huge positive amount
 // (result 0), not a "negative offset" error; only a signed count can be
 // negative. The __shift_* function path already behaved this way.
 TEST(ExpressionTest, UnsignedHugeShiftCountYieldsZeroInOperatorPath) {
@@ -1528,7 +1624,7 @@ TEST(ExpressionTest, UnsignedHugeShiftCountYieldsZeroInOperatorPath) {
             Value(8).WithUnsigned());
 }
 
-// bugreview #97 (reopened): mixed INT64/UINT64 add/sub/mul whose exact result
+//  mixed INT64/UINT64 add/sub/mul whose exact result
 // is negative must not wrap to a huge UINT64 on the AST fast path.
 TEST(ExpressionTest, MixedSignednessArithmeticKeepsNegativeResults) {
   const Value neg5(-5);
@@ -1706,6 +1802,38 @@ TEST(ExpressionTest, NamedExpression_OutputOperator_StreamsExpectedFormat) {
   std::ostringstream same_as_expr;
   same_as_expr << NamedExpression("1", ConstantValueExp(Value(1)));
   EXPECT_EQ(same_as_expr.str(), "1");
+
+  // T2108: placeholder carriers hold a null expression (every consumer loop
+  // guards it); the stream form used to dereference it and crash.
+  std::ostringstream nulls;
+  nulls << NamedExpression("ph", Expression());
+  EXPECT_EQ(nulls.str(), "<null> AS ph");
+
+  // T2107: EXCEPT / REPLACE must not dump as a bare star.
+  StarModifiers mods;
+  mods.except_columns = {"b"};
+  mods.replace_items = {StarReplaceItem{.column = "c", .expression = ConstantValueExp(Value(9))}};
+  NamedExpression star("s", ColumnValueExp("*"));
+  star.star_modifiers = std::make_shared<const StarModifiers>(std::move(mods));
+  std::ostringstream star_out;
+  star_out << star;
+  EXPECT_EQ(star_out.str(), "* AS s EXCEPT (b) REPLACE (9 AS c)");
+}
+
+// T2104: the stream form dropped the INTERVAL tag that ToString()/Dump()
+// render (Value::operator<< is a bare AsString()), so one constant printed
+// two different ways depending on the debug path.
+TEST(ExpressionTest, ConstantValueIntervalStreamMatchesToString) {
+  Expression interval = ConstantValueExp(Value("0-0 3 0:0:0").WithInterval());
+  std::ostringstream oss;
+  oss << interval->AsConstantValue();
+  EXPECT_EQ(oss.str(), interval->AsConstantValue().ToString());
+  EXPECT_EQ(oss.str().rfind("INTERVAL ", 0), 0U);
+
+  Expression plain = ConstantValueExp(Value("x"));
+  std::ostringstream pos;
+  pos << plain->AsConstantValue();
+  EXPECT_EQ(pos.str(), plain->AsConstantValue().ToString());
 }
 
 TEST(ExpressionTest, FunctionCall_EvaluateWithTwoRows_ResolvesBothRows) {
@@ -1952,6 +2080,38 @@ TEST(ExpressionTest, QueryExpression_EvaluateWithContext_ExecutesSubquery) {
             Value(true));
 }
 
+TEST(ExpressionTest, UnaryExpression_EvaluateWithContext_ThreadsContext) {
+  // P437: without a context-aware TryEvaluate override the base default
+  // drops the context into the plain 2-arg evaluator, so a subquery under
+  // NOT / IS NULL failed with "query expression requires relational
+  // evaluation" even at a context root.
+  Schema schema("s", {Column("i", ValueType::kInt64)});
+  Row row({Value(int64_t{7})});
+  auto statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("v")},
+      std::vector<std::string>{"t"}, nullptr);
+
+  FakeEvaluationContext filled_ctx({{Value(int64_t{7})}});
+  const Expression not_exists =
+      UnaryExpressionExp(QueryExpressionExp(statement, nullptr, true, false),
+                         UnaryOperation::kNot);
+  const StatusOr<Value> not_result =
+      not_exists->TryEvaluate(row, schema, filled_ctx);
+  ASSERT_TRUE(not_result.HasValue()) << ToString(not_result.GetStatus());
+  EXPECT_EQ(not_result.Value(), Value(false));
+  EXPECT_EQ(filled_ctx.subquery_calls_, 1);
+
+  FakeEvaluationContext empty_ctx;
+  const Expression scalar_is_null =
+      UnaryExpressionExp(QueryExpressionExp(statement, nullptr, false, false),
+                         UnaryOperation::kIsNull);
+  const StatusOr<Value> is_null_result =
+      scalar_is_null->TryEvaluate(row, schema, empty_ctx);
+  ASSERT_TRUE(is_null_result.HasValue())
+      << ToString(is_null_result.GetStatus());
+  EXPECT_EQ(is_null_result.Value(), Value(true));
+}
+
 TEST(ExpressionTest, Expression_EvaluateWithContext_MatchesPlainEvaluator) {
   Schema schema("s", {Column("i", ValueType::kInt64)});
   Row row({Value(int64_t{5})});
@@ -2013,6 +2173,28 @@ TEST(ExpressionTest, CastExpression_EvaluateAndResultType_HandlesTimestamps) {
   EXPECT_EQ(ts_cast->ResultType(dummy_schema, dummy_schema).GetType(),
             TypeTag::kVarChar);
   EXPECT_FALSE(ts_cast->ToString().empty());
+}
+
+TEST(ExpressionTest, CivilCastUsesTheSessionOffsetAtTheConvertedInstant) {
+  struct RestoreZone {  // NOLINT(cppcoreguidelines-special-member-functions)
+    std::string previous = GetDefaultTimeZone();
+    ~RestoreZone() { SetDefaultTimeZone(previous); }
+  } restore;
+  const auto cast = [](const char* input, const char* target) {
+    return CastExpressionExp(ConstantValueExp(Value(input)), target)
+        ->Evaluate(Row(), Schema());
+  };
+
+  SetDefaultTimeZone("America/Los_Angeles");
+  EXPECT_EQ(cast("0001-01-01 00:00:01.5", "TIMESTAMP"),
+            Value("0001-01-01 07:52:59.500+00"));
+  // At the UTC instant 08:30, the first 01:30 is still in summer time.
+  EXPECT_EQ(cast("2026-11-01 08:30:00+0000", "DATETIME"),
+            Value("2026-11-01 01:30:00"));
+
+  SetDefaultTimeZone("+09:00");
+  EXPECT_EQ(cast("2026-01-02 23:45:00 UTC", "DATE"), Value::Date("2026-01-03"));
+  EXPECT_EQ(cast("2026-01-02 23:45:00", "DATE"), Value::Date("2026-01-02"));
 }
 
 TEST(ExpressionTest, BinaryExpression_SpecialOperations_EvaluatesCorrectly) {
@@ -2203,6 +2385,21 @@ TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
       eval("format_timestamp",
            {Value("%Y-%m-%d"), Value("2023-06-15 10:00:00"), Value("UTC")}),
       Value("2023-06-15"));
+  // FORMAT_TIMESTAMP resolves the zone's offset at the TIMESTAMP instant,
+  // not at its UTC fields read as local wall time: 2020-03-08 06:30 UTC is
+  // still before the 10:00 UTC PST->PDT transition, so America/Los_Angeles
+  // is PST (-08:00) and the render is 22:30 on 03-07 (an instant, unlike a
+  // local 06:30 which would already be PDT).
+  EXPECT_EQ(
+      eval("format_timestamp", {Value("%F %T"), Value("2020-03-08 06:30:00+00"),
+                                Value("America/Los_Angeles")}),
+      Value("2020-03-07 22:30:00"));
+  // The PDT->PST fall-back on 2020-11-01 is symmetric: 08:30 UTC is still
+  // PDT (-07:00), so the render is 01:30, not 00:30.
+  EXPECT_EQ(
+      eval("format_timestamp", {Value("%F %T"), Value("2020-11-01 08:30:00+00"),
+                                Value("America/Los_Angeles")}),
+      Value("2020-11-01 01:30:00"));
   EXPECT_EQ(eval("format_datetime",
                  {Value("%Y/%m/%d"), Value("2023-06-15 10:00:00")}),
             Value("2023/06/15"));
@@ -2769,6 +2966,88 @@ TEST(ExpressionTest, IferrorJoinContextOverloadNormalizesBranchesToDouble) {
   EXPECT_EQ(single_eval.Value().type, ValueType::kDouble);
   EXPECT_EQ(join_eval.Value().type, ValueType::kDouble);
   EXPECT_EQ(single_eval.Value(), join_eval.Value());
+}
+
+TEST(ExpressionTest, TimestampShapedTextIsNotIntervalArithmetic) {
+  Row row;
+  Schema schema;
+  const Expression ts = ConstantValueExp(Value("2020-01-01 00:00:00"));
+  // A timestamp spelling also has '-' before ' ', but it is not an interval.
+  // With two untagged operands the VARCHAR+VARCHAR add/sub fast path used to
+  // misparse both as intervals and return an interval-tagged value instead of
+  // reporting the unsupported operation.
+  for (const BinaryOperation op :
+       {BinaryOperation::kAdd, BinaryOperation::kSubtract}) {
+    EXPECT_THROW(
+        static_cast<void>(
+            BinaryExpressionExp(ts, op, ts)->Evaluate(row, schema)),
+        std::runtime_error);
+  }
+}
+
+// P369: an explicit collation conflict must reject, not silently fold both
+// sides to CI.  The IN arm had the gate; ANY/ALL shared the quantified kernel
+// without it.
+TEST(ExpressionTest, QuantifiedComparisonRejectsExplicitCollationConflict) {
+  const Value probe =
+      Value(std::string("A")).WithCollation(static_cast<uint8_t>(1));
+  const Value ci =
+      Value(std::string("a")).WithCollation(static_cast<uint8_t>(2));
+  const Value plain = Value(std::string("a"));
+
+  const StatusOr<Value> conflict_any = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kEquals, QuantifierMode::kAny, probe, {ci});
+  ASSERT_FALSE(conflict_any.HasValue());
+  EXPECT_NE(conflict_any.GetStatus().GetMessage().find("Collation conflict"),
+            std::string::npos);
+  const StatusOr<Value> conflict_all = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kNotEquals, QuantifierMode::kAll, probe, {ci, plain});
+  EXPECT_FALSE(conflict_all.HasValue());
+
+  // Unchanged behaviour: one-sided CI still resolves to case-insensitive,
+  // and no-CI comparisons stay binary.
+  const StatusOr<Value> folded = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kEquals, QuantifierMode::kAny, plain, {ci});
+  ASSERT_TRUE(folded.HasValue()) << ToString(folded.GetStatus());
+  EXPECT_TRUE(folded.Value().Truthy());
+  const StatusOr<Value> binary = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kEquals, QuantifierMode::kAny, plain,
+      {Value(std::string("A"))});
+  ASSERT_TRUE(binary.HasValue());
+  EXPECT_FALSE(binary.Value().Truthy());
+}
+
+// Issue 1314: TypeTag carries both SQL type tags and expression node kinds;
+// the canonical node-kind accessor is NodeKind(), and the legacy Type()
+// alias must keep answering the same dispatch (engine-wide `->Type()` call
+// sites depend on it).  ResultType() remains the SQL-type accessor.
+TEST(ExpressionTest, NodeKindIsCanonicalAndTypeAliasAgrees) {
+  Expression constant = ConstantValueExp(Value(1));
+  Expression column = ColumnValueExp("score");
+  Expression binary =
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(2)));
+  Expression unary =
+      UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kIsNull);
+
+  EXPECT_EQ(constant->NodeKind(), TypeTag::kConstantValue);
+  EXPECT_EQ(column->NodeKind(), TypeTag::kColumnValue);
+  EXPECT_EQ(binary->NodeKind(), TypeTag::kBinaryExp);
+  EXPECT_EQ(unary->NodeKind(), TypeTag::kUnaryExp);
+
+  // Alias equivalence: every legacy `->Type()` answer is the NodeKind.
+  EXPECT_EQ(constant->Type(), constant->NodeKind());
+  EXPECT_EQ(column->Type(), column->NodeKind());
+  EXPECT_EQ(binary->Type(), binary->NodeKind());
+  EXPECT_EQ(unary->Type(), unary->NodeKind());
+
+  // Node kinds are the tree-shape domain, NOT the data-type domain: the
+  // data type of these expressions comes from ResultType() and never
+  // collides with a node-kind tag.
+  Schema schema;
+  const tinylamb::Type result_type = binary->ResultType(schema);
+  EXPECT_EQ(result_type.GetType(), TypeTag::kBigInt);
+  EXPECT_NE(result_type.GetType(), binary->NodeKind());
 }
 
 }  // namespace tinylamb

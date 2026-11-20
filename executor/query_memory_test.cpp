@@ -1,7 +1,9 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/query_memory.hpp"
 
+#include <atomic>
 #include <cstdlib>
+#include <thread>
 // setenv/unsetenv below are POSIX APIs that <cstdlib> does not declare.
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <stdlib.h>
@@ -9,13 +11,19 @@
 #include <string>
 #include <utility>
 
+#include "executor/detail/relation.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
 
-TEST(QueryMemoryTest, QueryMemoryBudget_ReserveAndRelease_TracksUsage) {
+class QueryMemoryTest : public ::testing::Test {
+ protected:
+  void TearDown() override { QueryMemoryBudget::Global().ResetForTest(0); }
+};
+
+TEST_F(QueryMemoryTest, QueryMemoryBudget_ReserveAndRelease_TracksUsage) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   EXPECT_FALSE(budget.Unlimited());
@@ -29,7 +37,7 @@ TEST(QueryMemoryTest, QueryMemoryBudget_ReserveAndRelease_TracksUsage) {
   EXPECT_EQ(budget.Used(), 60U);
 }
 
-TEST(QueryMemoryTest, CanReserve_PastSoftLimit_RejectsReservation) {
+TEST_F(QueryMemoryTest, CanReserve_PastSoftLimit_RejectsReservation) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   // Soft limit is 80% (800): reserving up to and including 800 is allowed,
@@ -43,7 +51,7 @@ TEST(QueryMemoryTest, CanReserve_PastSoftLimit_RejectsReservation) {
   EXPECT_TRUE(budget.Unlimited());
 }
 
-TEST(QueryMemoryTest,
+TEST_F(QueryMemoryTest,
      EstimateRowBytes_SampleRowAndValues_ReturnsExpectedEstimates) {
   Row row({Value(1), Value("hello")});
   EXPECT_GT(EstimateRowBytes(row), 0U);
@@ -51,7 +59,7 @@ TEST(QueryMemoryTest,
   EXPECT_GT(EstimateValueBytes(Value(1)), 0U);
 }
 
-TEST(QueryMemoryTest, RowEstimateIncludesNestedArraysAndScalarPayloads) {
+TEST_F(QueryMemoryTest, RowEstimateIncludesNestedArraysAndScalarPayloads) {
   const Value nested = Value::Array(
       {Value(1), Value(), Value::Array({Value("abc")}, "STRING")}, "JSON");
   const size_t nested_bytes = 32 + 4 + 40 + 32 + 32 + 6 + 35;
@@ -61,14 +69,16 @@ TEST(QueryMemoryTest, RowEstimateIncludesNestedArraysAndScalarPayloads) {
   EXPECT_EQ(EstimateRowBytes(row), 64 + 32 + 40 + 40 + 40 + 37 + nested_bytes);
 }
 
-TEST(QueryMemoryTest, Global_MultipleCalls_ReturnsSameInstance) {
+TEST_F(QueryMemoryTest, Global_MultipleCalls_ReturnsSameInstance) {
   QueryMemoryBudget& a = QueryMemoryBudget::Global();
   QueryMemoryBudget& b = QueryMemoryBudget::Global();
   EXPECT_EQ(&a, &b);
   a.ResetForTest(0);
 }
 
-TEST(QueryMemoryTest, ResetForTest_WithEnvVar_MaintainsCorrectLimit) {
+TEST_F(QueryMemoryTest, ResetForTest_WithEnvVar_MaintainsCorrectLimit) {
+  const char* previous = std::getenv("TINYLAMB_QUERY_MEMORY_BYTES");
+  const std::string saved = previous != nullptr ? previous : "";
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   setenv("TINYLAMB_QUERY_MEMORY_BYTES", "424242", 1);
   budget.ResetForTest(1024);
@@ -79,11 +89,15 @@ TEST(QueryMemoryTest, ResetForTest_WithEnvVar_MaintainsCorrectLimit) {
   setenv("TINYLAMB_QUERY_MEMORY_BYTES", "0", 1);
   budget.ResetForTest(1024);
   EXPECT_EQ(budget.Limit(), 1024U);
-  unsetenv("TINYLAMB_QUERY_MEMORY_BYTES");
+  if (previous != nullptr) {
+    setenv("TINYLAMB_QUERY_MEMORY_BYTES", saved.c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_QUERY_MEMORY_BYTES");
+  }
   budget.ResetForTest(0);
 }
 
-TEST(QueryMemoryTest, Remaining_WhenUnlimited_ReturnsMaxSize) {
+TEST_F(QueryMemoryTest, Remaining_WhenUnlimited_ReturnsMaxSize) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(0);
   EXPECT_TRUE(budget.Unlimited());
@@ -95,7 +109,7 @@ TEST(QueryMemoryTest, Remaining_WhenUnlimited_ReturnsMaxSize) {
   EXPECT_EQ(budget.Remaining(), static_cast<size_t>(-1));
 }
 
-TEST(QueryMemoryTest, Remaining_WhenExceedingLimit_ClampsAtZero) {
+TEST_F(QueryMemoryTest, Remaining_WhenExceedingLimit_ClampsAtZero) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(100);
   EXPECT_EQ(budget.Remaining(), 100U);
@@ -106,7 +120,7 @@ TEST(QueryMemoryTest, Remaining_WhenExceedingLimit_ClampsAtZero) {
   EXPECT_EQ(budget.Remaining(), 0U);
 }
 
-TEST(QueryMemoryTest, CanReserve_AtBoundaries_ReturnsExpectedBoolean) {
+TEST_F(QueryMemoryTest, CanReserve_AtBoundaries_ReturnsExpectedBoolean) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   EXPECT_TRUE(budget.CanReserve(0));
@@ -118,7 +132,7 @@ TEST(QueryMemoryTest, CanReserve_AtBoundaries_ReturnsExpectedBoolean) {
   EXPECT_TRUE(budget.CanReserve(0));  // bytes==0 is always allowed
 }
 
-TEST(QueryMemoryTest,
+TEST_F(QueryMemoryTest,
      ReserveForcedAndRelease_VariousAmounts_ClampsUsageCorrectly) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
@@ -133,7 +147,7 @@ TEST(QueryMemoryTest,
   EXPECT_EQ(budget.Used(), 0U);
 }
 
-TEST(QueryMemoryTest, EstimateValueBytes_AllTypes_ReturnsExpectedByteSizes) {
+TEST_F(QueryMemoryTest, EstimateValueBytes_AllTypes_ReturnsExpectedByteSizes) {
   EXPECT_EQ(EstimateValueBytes(Value()), 32U);
   EXPECT_EQ(EstimateValueBytes(Value(1)), 40U);
   EXPECT_EQ(EstimateValueBytes(Value(2.5)), 40U);
@@ -144,7 +158,7 @@ TEST(QueryMemoryTest, EstimateValueBytes_AllTypes_ReturnsExpectedByteSizes) {
             64U + 40U + 34U);
 }
 
-TEST(QueryMemoryTest, QueryMemoryCharge_RaiiScope_AcquiresAndReleasesMemory) {
+TEST_F(QueryMemoryTest, QueryMemoryCharge_RaiiScope_AcquiresAndReleasesMemory) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(0);
   EXPECT_EQ(budget.Used(), 0U);
@@ -166,7 +180,7 @@ TEST(QueryMemoryTest, QueryMemoryCharge_RaiiScope_AcquiresAndReleasesMemory) {
   EXPECT_EQ(default_ctor.Bytes(), 0U);
 }
 
-TEST(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {
+TEST_F(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(0);
   QueryMemoryCharge a(100);
@@ -200,7 +214,7 @@ TEST(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {
   EXPECT_EQ(budget.Used(), 0U);
 }
 
-TEST(
+TEST_F(
     QueryMemoryTest,
     ResetForTest_PreservesProcessLinkageByDefaultAndSupportsExplicitIsolation) {
   ProcessMemoryBudget& proc = ProcessMemoryBudget::Global();
@@ -231,6 +245,56 @@ TEST(
 
   budget.ResetForTest(0);
   proc.ResetForTest(0);
+}
+
+TEST_F(QueryMemoryTest, TryReserveQueryMemory_IsAtomicUnderContention) {
+  // T3724: two concurrent 500-byte charges against an 800-byte soft limit
+  // must yield exactly one winner.  The old implementation checked
+  // CanReserve() and then force-reserved inside the QueryMemoryCharge
+  // constructor, so both threads could pass the pre-check and each push
+  // used_ past the soft limit.
+  auto& budget = QueryMemoryBudget::Global();
+  budget.ResetForTest(1000, /*isolate_from_process=*/true);
+  int total_winners = 0;
+  for (int round = 0; round < 64; ++round) {
+    std::atomic<int> winners{0};
+    std::atomic<int> ready{0};
+    std::atomic<int> attempted{0};
+    std::atomic<bool> go{false};
+    const auto worker = [&] {
+      ready.fetch_add(1);
+      while (!go.load()) {
+        std::this_thread::yield();
+      }
+      auto charge = relational_detail::TryReserveQueryMemory(500);
+      if (charge) {
+        winners.fetch_add(1);
+      }
+      // Hold the charge until BOTH threads finished their attempt: only
+      // then do the two reservations genuinely coexist, and an early
+      // release would let the loser reserve into the freed headroom.
+      attempted.fetch_add(1);
+      while (attempted.load() < 2) {
+        std::this_thread::yield();
+      }
+    };
+    std::thread a(worker);
+    std::thread b(worker);
+    while (ready.load() < 2) {
+      std::this_thread::yield();
+    }
+    go.store(true);
+    a.join();
+    b.join();
+    total_winners += winners.load();
+    // Every charge is RAII-released by the worker scope, so each round must
+    // hand the budget back fully even when both threads raced to reserve.
+    EXPECT_EQ(budget.Used(), 0U);
+  }
+  // Fixed code: exactly one winner per round.  The racy pre-check produced
+  // two winners whenever the threads overlapped.
+  EXPECT_EQ(total_winners, 64);
+  budget.ResetForTest(0);
 }
 
 }  // namespace tinylamb

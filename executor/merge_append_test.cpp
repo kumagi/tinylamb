@@ -287,11 +287,14 @@ TEST(MergeAppendExecutorTest, IncompatibleKeyTypesFailTheExecutor) {
       std::vector<Row>{Row(std::vector<Value>{Value(int64_t{1})}),
                        Row(std::vector<Value>{Value("not a number")})}));
   MergeAppendExecutor ex(std::move(sources), {schema}, schema, std::move(keys));
-  // The first row passes through; the incompatible key surfaces when the
-  // offending row becomes a merge head.
+  // The incompatible key fails the executor once the offending row is read
+  // (sources are pulled batch-wise, so that may precede the first row).
   Row row;
-  ASSERT_TRUE(ex.Next(&row, nullptr));
-  EXPECT_FALSE(ex.Next(&row, nullptr));
+  size_t produced = 0;
+  while (ex.Next(&row, nullptr)) {
+    ++produced;
+  }
+  EXPECT_LE(produced, 1U);
   EXPECT_NE(ex.GetStatus(), Status::kSuccess);
 }
 

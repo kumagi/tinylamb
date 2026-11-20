@@ -43,12 +43,14 @@ struct RowDecodePlan {
   std::vector<ValueType> stored_types;  // per stored column
   std::vector<size_t> stored_slot;     // per stored column: kept slot / kNoSlot
   std::vector<uint8_t> slot_unsigned;  // per kept slot
+  std::vector<uint8_t> slot_interval;  // per kept slot (VARCHAR + interval tag)
   // Plan-shape flags the decode loop reads once per row instead of
   // re-deriving per cell.  all_fixed: every stored column has a fixed-width
-  // image; has_unsigned: any kept slot applies the unsigned tag (the per-cell
-  // check only runs when it can fire).
+  // image; has_unsigned/has_interval: any kept slot applies that tag (the
+  // per-cell check only runs when it can fire).
   bool all_fixed{false};
   bool has_unsigned{false};
+  bool has_interval{false};
 };
 
 struct Row {

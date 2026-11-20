@@ -32,6 +32,10 @@ std::vector<std::string> RunOnBothRoutes(SqlEngine* engine,
                                          TransactionContext* context,
                                          std::string_view sql) {
   std::vector<std::string> result;
+  // T4446: the loop used to clear() and overwrite `result` per route and
+  // return only the last (relational) run, so the documented "identical
+  // results" contract was never checked -- a wrong answer on the compiled
+  // (AST) route was invisible. Keep each route's rows and compare.
   for (const bool relational : {false, true}) {
     engine->SetForceRelationalFallback(relational);
     StatusOr<Executor> prepared = engine->Prepare(*context, sql);
@@ -41,13 +45,19 @@ std::vector<std::string> RunOnBothRoutes(SqlEngine* engine,
       engine->SetForceRelationalFallback(false);
       return result;
     }
-    result.clear();
+    std::vector<std::string> route_result;
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
       EXPECT_EQ(row.values_.size(), 1U);
-      result.push_back(row[0].AsString());
+      route_result.push_back(row[0].AsString());
     }
     EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
+    if (!relational) {
+      result = std::move(route_result);
+    } else {
+      EXPECT_EQ(route_result, result) << "route divergence for: " << sql;
+      result = std::move(route_result);
+    }
   }
   engine->SetForceRelationalFallback(false);
   return result;

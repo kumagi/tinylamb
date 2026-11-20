@@ -351,7 +351,7 @@ TEST_F(TpccWorkloadTest, InitializeBeyondThousandCustomersUsesNurandLastName) {
             Status::kSuccess)
       << error;
 
-  // Assert -- every customer row landed with a well-formed last name.
+  // Assert -- the customer count and two boundary rows have well-formed last names.
   const std::vector<Row> count = Run("SELECT COUNT(*) FROM customer;");
   ASSERT_EQ(count.size(), 1);
   EXPECT_EQ(count[0][0], Value(1005));
@@ -434,7 +434,7 @@ TEST_F(TpccWorkloadTest, PaymentNameLookupAndBcCreditUpdate) {
 
   // Act -- run payments with a variety of seeds. The 60% name-based lookup
   // path and the BC-credit c_data rewrite are chosen by the workload RNG, so
-  // several seeds are tried until a BC-credit update is observed.
+  // 60 seeds are tried (without early exit) before checking for a BC-credit update.
   const std::vector<Row> bc_customers =
       Run("SELECT COUNT(*) FROM customer WHERE c_credit = 'BC';");
   ASSERT_EQ(bc_customers.size(), 1);

@@ -16,10 +16,12 @@
 
 #include "recovery/checkpoint_manager.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -201,12 +203,118 @@ TEST_F(CheckpointManagerTest,
 }
 
 TEST_F(CheckpointManagerTest, RapidConstructAndStopDoesNotLoseWakeup) {
+  const auto begin = std::chrono::steady_clock::now();
   for (int i = 0; i < 64; ++i) {
+    SCOPED_TRACE(i);
     CheckpointManager transient(prefix_ + "_transient.db", tm_.get(), pm_.get(),
                                 5);
     transient.Start();
     transient.Stop();
+    // Stop() must return promptly: a lost wakeup would park the worker and
+    // reappear as a multi-second hang instead of an assertion failure.
+    EXPECT_LT(std::chrono::steady_clock::now() - begin,
+              std::chrono::seconds(10));
   }
+}
+
+TEST_F(CheckpointManagerTest,
+       WalRetentionWarningFiresWhenPinnedAboveThreshold) {
+  cm_->SetWalRetentionWarnBytesForTest(256);
+
+  // An uncommitted active transaction that wrote a WAL record pins the
+  // checkpoint replay anchor at its FirstLSN.
+  Transaction pinner = tm_->Begin();
+  ASSERT_TRUE(pinner.AddWriteSet(RowPosition(1, 0), "before"));
+  ASSERT_SUCCESS(
+      pinner.UpdateLog(1, 0, std::string(128, 'a'), std::string(128, 'b'))
+          .GetStatus());
+
+  // Subsequent commits advance DurableLSN while LowestRetainedLSN remains
+  // pinned.
+  for (int i = 0; i < 8; ++i) {
+    Transaction t = tm_->Begin();
+    const RowPosition rp(2, static_cast<slot_t>(i));
+    ASSERT_TRUE(t.AddWriteSet(rp, "old"));
+    ASSERT_SUCCESS(
+        t.UpdateLog(2, static_cast<slot_t>(i), "old", std::string(200, 'x'))
+            .GetStatus());
+    t.RegisterVersionWrite(rp, "old", "new");
+    ASSERT_SUCCESS(t.PreCommit());
+  }
+
+  ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
+  ASSIGN_OR_ASSERT_FAIL(lsn_t, anchor, cm_->WriteCheckpoint());
+  EXPECT_LE(anchor, pinner.FirstLSN());
+  EXPECT_EQ(cm_->WalRetentionWarnCountForTest(), 1U);
+
+  // Second checkpoint within the rate-limit window does not spam warnings.
+  ASSERT_SUCCESS(cm_->WriteCheckpoint().GetStatus());
+  EXPECT_EQ(cm_->WalRetentionWarnCountForTest(), 1U);
+
+  ASSERT_SUCCESS(pinner.Abort());
+}
+
+TEST_F(CheckpointManagerTest,
+       IntervalWatchdogCheckpointsWalLagWithoutCompaction) {
+  // T4262: the worker wakes every interval_seconds_ and checkpoints retained
+  // WAL above the lag threshold even when no compaction callback fires;
+  // previously the interval was only an enable/disable boolean and the WAL
+  // grew unboundedly without LSM activity.
+  CheckpointManager watchdog(prefix_ + "_lag.db.last_checkpoint", tm_.get(),
+                             pm_->GetPool(), 1);
+  watchdog.SetWalLagCheckpointBytesForTest(1);
+  watchdog.Start();
+  for (int i = 0; i < 8; ++i) {
+    Transaction t = tm_->Begin();
+    const RowPosition rp(3, static_cast<slot_t>(i));
+    ASSERT_TRUE(t.AddWriteSet(rp, "old"));
+    ASSERT_SUCCESS(
+        t.UpdateLog(3, static_cast<slot_t>(i), "old", std::string(200, 'y'))
+            .GetStatus());
+    t.RegisterVersionWrite(rp, "old", "new");
+    ASSERT_SUCCESS(t.PreCommit());
+  }
+  ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
+  const uint64_t before = watchdog.WorkerCheckpointsForTest();
+  for (int wait_ms = 0;
+       wait_ms < 15000 && watchdog.WorkerCheckpointsForTest() == before;
+       wait_ms += 50) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_GT(watchdog.WorkerCheckpointsForTest(), before)
+      << "interval watchdog never checkpointed the WAL lag";
+  watchdog.Stop();
+}
+
+TEST_F(CheckpointManagerTest, StopThenStartRestartsWorker) {
+  // T3687: Stop() joins the worker thread out of existence; Start() must
+  // re-arm and spawn a fresh worker.  Before the fix Start() after Stop()
+  // was a silent no-op and this checkpoint never arrived.
+  CheckpointManager manager(prefix_ + "_restart.db.last_checkpoint", tm_.get(),
+                            pm_->GetPool(), 1);
+  manager.SetWalLagCheckpointBytesForTest(1);
+  manager.Start();
+  manager.Stop();
+  manager.Start();
+  for (int i = 0; i < 8; ++i) {
+    Transaction t = tm_->Begin();
+    const RowPosition rp(4, static_cast<slot_t>(i));
+    ASSERT_TRUE(t.AddWriteSet(rp, "old"));
+    ASSERT_SUCCESS(
+        t.UpdateLog(4, static_cast<slot_t>(i), "old", std::string(200, 'z'))
+            .GetStatus());
+    t.RegisterVersionWrite(rp, "old", "new");
+    ASSERT_SUCCESS(t.PreCommit());
+  }
+  ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
+  for (int wait_ms = 0;
+       wait_ms < 15000 && manager.WorkerCheckpointsForTest() == 0;
+       wait_ms += 50) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_GE(manager.WorkerCheckpointsForTest(), 1U)
+      << "worker did not resume after Stop() -> Start()";
+  manager.Stop();
 }
 
 }  // namespace

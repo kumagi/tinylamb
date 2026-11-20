@@ -1,6 +1,6 @@
 # batch_nested_loop_semi
 
-- 状態: draft   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft   /   執筆基準リビジョン: `72ad60a` (2026-11-19)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の登録 `"batch_nested_loop_semi"`（パターンは `cascades::dsl::SemiJoin()`、共有ヘルパー `BatchNestedLoopFor(..., SemiJoinKind(), /*wrap_selection=*/false)` に委譲）
 
 ## 概要

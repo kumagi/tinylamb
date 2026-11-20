@@ -100,7 +100,7 @@ class IndexScanIteratorTest : public ::testing::Test {
   // condition, so tests that need the fast path to fire wait here first.
   void WaitForChainFreePages() const {
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (db_->TransactionStats().version_chains != 0) {
       ASSERT_LT(std::chrono::steady_clock::now(), deadline)
           << "background GC did not drop version chains";
@@ -118,6 +118,32 @@ TEST_F(IndexScanIteratorTest, Construct) {
   // Arrange -- nothing to set up; default database created by SetUp()
   // Act -- nothing to execute; default constructed via SetUp()
   // Assert -- nothing to verify; gtest green on pass, death on crash
+}
+
+// T2116: the scan dump must carry the index mode (UNIQUE vs NON_UNIQUE was
+// invisible) and resolve key/include slots against the table schema it
+// already holds; a mode value outside the enum (corrupt record) must render
+// kInvalid(n) instead of nothing.
+TEST_F(IndexScanIteratorTest, DumpShowsModeAndColumnNames) {
+  auto read = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        read.GetTable(kTableName));
+  IndexScanIterator iterator(*table, table->GetIndex(1), read.txn_, Value("a"),
+                             Value("z"));
+  std::ostringstream oss;
+  iterator.Dump(oss, 0);
+  const std::string text = oss.str();
+  EXPECT_NE(text.find("NameIdx (NonUnique)"), std::string::npos) << text;
+  EXPECT_NE(text.find("1:SampleTable.col2"), std::string::npos) << text;
+  EXPECT_NE(text.find("2:SampleTable.col3"), std::string::npos) << text;
+
+  std::ostringstream broken;
+  broken << IndexSchema("Broken", {0}, {}, static_cast<IndexMode>(200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): exercise unknown persisted mode
+  EXPECT_NE(broken.str().find("kInvalid(200)"), std::string::npos)
+      << broken.str();
+  std::ostringstream pk;
+  pk << IndexSchema("PK", {0});
+  EXPECT_NE(pk.str().find(" Unique]"), std::string::npos) << pk.str();
 }
 
 TEST_F(IndexScanIteratorTest, ProjectedDecodeCanRebindWithoutChangingPosition) {
@@ -433,7 +459,7 @@ TEST_F(IndexScanIteratorTest, DirectScanConstDereferenceAndAccessors) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
-// Regression for improvements2.md 4.11: a cleared iterator must report
+// Regression: a cleared iterator must report
 // invalid (and an invalid Position) instead of leaking a valid-looking
 // {0,0} row position to IndexScan::Next.
 TEST_F(IndexScanIteratorTest, ClearInvalidatesTheIterator) {
@@ -718,7 +744,7 @@ TEST_F(IndexScanIteratorTest, ReadVersionFailureTerminatesScanSticky) {
 
 // ---------------------------------------------------------------------------
 // Index-only visibility map: a non-retained index entry on a page with no
-// version chains is served straight from the B+Tree image (key + INCLUDE
+// version chains is served straight from the index image (key + INCLUDE
 // payload) without the heap fetch.  See IndexScanIterator::TryReadIndexOnly.
 // ---------------------------------------------------------------------------
 

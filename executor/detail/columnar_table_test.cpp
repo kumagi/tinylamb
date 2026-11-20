@@ -106,6 +106,7 @@ TEST(ColumnarTableTest,
   auto projected_or = relational_detail::TryProjectColumnarTable(plan, *input);
   ASSERT_TRUE(projected_or.HasValue()) << projected_or.GetStatus();
   ASSERT_TRUE(projected_or.Value().has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
   std::shared_ptr<ColumnarTable> projected = *projected_or.MoveValue();
   input.reset();
 
@@ -145,7 +146,7 @@ TEST(ColumnarTableTest, NullTypedSchemaColumnPreservesVarcharValues) {
   EXPECT_EQ(direct.ValueAt(1), Value("direct_non_empty"));
 }
 
-TEST(ColumnarTableTest, GatheredSliceChecksChunksLengthMatch) {
+TEST(ColumnarTableTest, GatheredSliceFallsBackWhenChunksShorterThanRows) {
   auto base = std::make_shared<ColumnarTable>();
   Schema schema("t", {Column("id", ValueType::kInt64)});
   {

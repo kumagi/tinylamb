@@ -8,6 +8,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <ratio>
 #include <string>
 #include <string_view>

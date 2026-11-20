@@ -27,6 +27,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -81,11 +82,27 @@ Volatility GetFunctionVolatility(std::string_view func_name) {
   return Volatility::kImmutable;
 }
 
+namespace {
+// Defined with the ScopedActiveRewriteSchema guard below.
+const Schema* ActiveRewriteSchema();
+}  // namespace
+
 // Reducing x + x to x * 2 must not change the number of evaluations of a
-// volatile expression or a subquery. Immutable scalar trees are safe.
+// volatile expression or a subquery. An immutable expression can still raise
+// an evaluation error (e.g. `1/0`, `CAST('abc' AS INT64)`); duplicating or
+// fanning it out changes which branch raises first.  That error-freedom proof
+// needs column types, so it is applied when a schema is in scope
+// (SafeToReduceEvaluationCountWithSchema).  Without one, every column
+// comparison would count as "may throw" and the schema-free Cascades rules
+// (filter pushdown through unnest/window/aggregate/semi join, ...) could never
+// fire; those rules carry their own error-freedom guards where it matters.
 bool SafeToReduceEvaluationCount(  // NOLINT(misc-no-recursion)
     const Expression& expression) {
   if (!expression) {
+    return false;
+  }
+  if (ActiveRewriteSchema() != nullptr &&
+      !ExpressionCannotThrowForPlanner(expression)) {
     return false;
   }
   if (expression->Type() == TypeTag::kQueryExp ||
@@ -198,21 +215,32 @@ Value EvaluateJsonFunction(std::string_view func_name,
   return Value(std::string(cur->canonical()));
 }
 
-std::vector<Expression> SplitDisjuncts(  // NOLINT(misc-no-recursion)
-    const Expression& expression) {
-  if (!expression) {
-    return {};
+std::vector<Expression> SplitDisjuncts(const Expression& expression) {
+  // T2405: iterative flattening.  The old left/right recursion made stack
+  // use proportional to the OR-chain length -- and rewrite.cpp's 512-level
+  // kMaxRewriteDepth guards TryRewriteOnce only, not this helper (which
+  // scan_filter.cpp also mirrors and calls directly).  CombineDisjuncts
+  // below rebuilds a left-deep chain of exactly the length Split consumes,
+  // so Split->Combine->Split round-trips grew the stack every pass.
+  // Right is pushed before Left, so the stack pops Left first and `parts`
+  // keeps the left-to-right leaf order the recursion produced.
+  std::vector<Expression> parts;
+  std::vector<Expression> pending{expression};
+  while (!pending.empty()) {
+    const Expression node = std::move(pending.back());
+    pending.pop_back();
+    if (!node) {
+      continue;
+    }
+    if (node->Type() == TypeTag::kBinaryExp &&
+        node->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+      pending.push_back(node->AsBinaryExpression().Right());
+      pending.push_back(node->AsBinaryExpression().Left());
+    } else {
+      parts.push_back(node);
+    }
   }
-  if (expression->Type() == TypeTag::kBinaryExp &&
-      expression->AsBinaryExpression().Op() == BinaryOperation::kOr) {
-    std::vector<Expression> left =
-        SplitDisjuncts(expression->AsBinaryExpression().Left());
-    std::vector<Expression> right =
-        SplitDisjuncts(expression->AsBinaryExpression().Right());
-    left.insert(left.end(), right.begin(), right.end());
-    return left;
-  }
-  return {expression};
+  return parts;
 }
 
 Expression CombineDisjuncts(const std::vector<Expression>& expressions) {
@@ -265,7 +293,455 @@ bool Same(const Expression& left, const Expression& right) {
 }
 
 bool IsConstant(const Expression& expression) {
-  return expression && expression->Type() == TypeTag::kConstantValue;
+  return expression && expression->Type() == TypeTag::kConstantValue &&
+         !ContainsParameterSlot(expression);
+}
+
+struct SchemaBoundExprType {
+  ValueType type{ValueType::kNull};
+  bool is_unsigned{false};
+  bool is_interval{false};
+  Collation collation{Collation::kNone};
+  bool is_constant{false};
+  Value const_val{};
+};
+
+bool SchemaExprNameEquals(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SchemaTypesComparableNonThrowing(const SchemaBoundExprType& a,
+                                      const SchemaBoundExprType& b) {
+  if (a.is_interval || b.is_interval) {
+    return false;
+  }
+  if (a.collation != Collation::kNone && b.collation != Collation::kNone &&
+      a.collation != b.collation) {
+    return false;
+  }
+  if (a.type == ValueType::kNull || b.type == ValueType::kNull) {
+    return true;
+  }
+  if ((a.type == ValueType::kInt64 || a.type == ValueType::kDouble) &&
+      (b.type == ValueType::kInt64 || b.type == ValueType::kDouble)) {
+    return true;
+  }
+  if (a.type == ValueType::kDate && b.type == ValueType::kDate &&
+      !a.is_unsigned && !b.is_unsigned) {
+    return true;
+  }
+  if (a.type == ValueType::kDate && !a.is_unsigned && b.is_constant &&
+      b.type == ValueType::kVarChar) {
+    return TryEvaluateBinary(BinaryOperation::kEquals, Value::DateFromDays(0),
+                             b.const_val)
+        .HasValue();
+  }
+  if (b.type == ValueType::kDate && !b.is_unsigned && a.is_constant &&
+      a.type == ValueType::kVarChar) {
+    return TryEvaluateBinary(BinaryOperation::kEquals, a.const_val,
+                             Value::DateFromDays(0))
+        .HasValue();
+  }
+  if (a.type == ValueType::kVarChar && b.type == ValueType::kVarChar) {
+    return true;
+  }
+  return false;
+}
+
+std::optional<SchemaBoundExprType> MakeConstantSchemaBoundType(
+    const Value& val) {
+  if (val.IsNull()) {
+    return SchemaBoundExprType{
+        .type = ValueType::kNull,
+        .is_constant = true,
+        .const_val = val,
+    };
+  }
+  if (val.type == ValueType::kInt64 || val.type == ValueType::kDouble ||
+      val.type == ValueType::kDate || val.type == ValueType::kVarChar) {
+    return SchemaBoundExprType{
+        .type = val.type,
+        .is_unsigned = val.IsUnsigned(),
+        .is_interval = val.IsInterval(),
+        .collation =
+            val.type == ValueType::kVarChar ? CollationOf(val) : Collation::kNone,
+        .is_constant = true,
+        .const_val = val,
+    };
+  }
+  return std::nullopt;
+}
+
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (closed_const_non_throwing_eval_independent_of_row,
+//    trap_throwing_closed_const_not_droppable)
+std::optional<SchemaBoundExprType>
+TryResolveSchemaBoundNonThrowingType(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Schema& schema, size_t depth = 0) {
+  if (!expr || depth > 128) {
+    return std::nullopt;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kConstantValue: {
+      if (ContainsParameterSlot(expr)) {
+        return std::nullopt;
+      }
+      return MakeConstantSchemaBoundType(expr->AsConstantValue().GetValue());
+    }
+    case TypeTag::kColumnValue: {
+      const ColumnName& col = expr->AsColumnValue().GetColumnName();
+      if (col.name.empty() || col.name == "*") {
+        return std::nullopt;
+      }
+      size_t hits = 0;
+      size_t matched = 0;
+      for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+        const Column& c = schema.GetColumn(i);
+        if (!SchemaExprNameEquals(c.Name().name, col.name)) {
+          continue;
+        }
+        if (!col.schema.empty() &&
+            !SchemaExprNameEquals(c.Name().schema, col.schema)) {
+          continue;
+        }
+        matched = i;
+        ++hits;
+        if (hits > 1) {
+          return std::nullopt;
+        }
+      }
+      if (hits != 1) {
+        return std::nullopt;
+      }
+      const Column& c = schema.GetColumn(matched);
+      if (c.IsInterval()) {
+        return std::nullopt;
+      }
+      if (c.Type() == ValueType::kInt64 || c.Type() == ValueType::kDouble ||
+          c.Type() == ValueType::kDate || c.Type() == ValueType::kVarChar) {
+        return SchemaBoundExprType{
+            .type = c.Type(),
+            .is_unsigned = c.IsUnsigned(),
+        };
+      }
+      return std::nullopt;
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& unary = expr->AsUnaryExpression();
+      const auto ct =
+          TryResolveSchemaBoundNonThrowingType(unary.Child(), schema, depth + 1);
+      if (!ct.has_value()) {
+        return std::nullopt;
+      }
+      if (ct->is_constant) {
+        StatusOr<Value> ev = TryEvaluateUnary(unary.Op(), ct->const_val);
+        if (ev.HasValue()) {
+          return MakeConstantSchemaBoundType(ev.Value());
+        }
+        return std::nullopt;
+      }
+      switch (unary.Op()) {
+        case UnaryOperation::kIsNull:
+        case UnaryOperation::kIsNotNull:
+        case UnaryOperation::kNot:
+          return SchemaBoundExprType{.type = ValueType::kInt64};
+        case UnaryOperation::kIsTrue:
+        case UnaryOperation::kIsNotTrue:
+        case UnaryOperation::kIsFalse:
+        case UnaryOperation::kIsNotFalse:
+          if (ct->type == ValueType::kInt64 || ct->type == ValueType::kNull) {
+            return SchemaBoundExprType{.type = ValueType::kInt64};
+          }
+          return std::nullopt;
+        case UnaryOperation::kMinus:
+          if (ct->type == ValueType::kDouble || ct->type == ValueType::kNull) {
+            return SchemaBoundExprType{.type = ct->type};
+          }
+          return std::nullopt;
+        case UnaryOperation::kBitwiseNot:
+          if (ct->type == ValueType::kInt64 || ct->type == ValueType::kNull) {
+            return SchemaBoundExprType{.type = ct->type,
+                                       .is_unsigned = ct->is_unsigned};
+          }
+          return std::nullopt;
+      }
+      return std::nullopt;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& bin = expr->AsBinaryExpression();
+      const auto lt =
+          TryResolveSchemaBoundNonThrowingType(bin.Left(), schema, depth + 1);
+      const auto rt =
+          TryResolveSchemaBoundNonThrowingType(bin.Right(), schema, depth + 1);
+      if (!lt.has_value() || !rt.has_value()) {
+        return std::nullopt;
+      }
+      if (lt->is_constant && rt->is_constant) {
+        StatusOr<Value> ev =
+            TryEvaluateBinary(bin.Op(), lt->const_val, rt->const_val);
+        if (ev.HasValue()) {
+          return MakeConstantSchemaBoundType(ev.Value());
+        }
+        return std::nullopt;
+      }
+      switch (bin.Op()) {
+        case BinaryOperation::kAnd:
+        case BinaryOperation::kOr:
+        case BinaryOperation::kXor:
+          return SchemaBoundExprType{.type = ValueType::kInt64};
+        case BinaryOperation::kEquals:
+        case BinaryOperation::kNotEquals:
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+        case BinaryOperation::kIsDistinctFrom:
+        case BinaryOperation::kIsNotDistinctFrom:
+          if (SchemaTypesComparableNonThrowing(*lt, *rt)) {
+            return SchemaBoundExprType{.type = ValueType::kInt64};
+          }
+          return std::nullopt;
+        case BinaryOperation::kLike:
+        case BinaryOperation::kNotLike:
+          if (!lt->is_interval && !rt->is_interval &&
+              (lt->type == ValueType::kVarChar ||
+               lt->type == ValueType::kNull) &&
+              (rt->type == ValueType::kVarChar ||
+               rt->type == ValueType::kNull) &&
+              lt->collation != Collation::kCaseInsensitive &&
+              rt->collation != Collation::kCaseInsensitive) {
+            return SchemaBoundExprType{.type = ValueType::kInt64};
+          }
+          return std::nullopt;
+        case BinaryOperation::kSubtract:
+          if (lt->type == ValueType::kDate && rt->type == ValueType::kDate &&
+              !lt->is_unsigned && !rt->is_unsigned) {
+            return SchemaBoundExprType{.type = ValueType::kInt64};
+          }
+          return std::nullopt;
+        default:
+          return std::nullopt;
+      }
+    }
+    case TypeTag::kInExp: {
+      const auto& in = expr->AsInExpression();
+      const auto ct =
+          TryResolveSchemaBoundNonThrowingType(in.child_, schema, depth + 1);
+      if (!ct.has_value()) {
+        return std::nullopt;
+      }
+      for (const Expression& item : in.list_) {
+        const auto it =
+            TryResolveSchemaBoundNonThrowingType(item, schema, depth + 1);
+        if (!it.has_value() || !SchemaTypesComparableNonThrowing(*ct, *it)) {
+          return std::nullopt;
+        }
+      }
+      return SchemaBoundExprType{.type = ValueType::kInt64};
+    }
+    case TypeTag::kCaseExp: {
+      const auto& c = expr->AsCaseExpression();
+      std::optional<SchemaBoundExprType> result_type;
+      auto merge_branch = [&](const SchemaBoundExprType& bt) -> bool {
+        if (bt.type == ValueType::kNull) {
+          return true;
+        }
+        if (!result_type.has_value()) {
+          result_type = SchemaBoundExprType{
+              .type = bt.type,
+              .is_unsigned = bt.is_unsigned,
+              .is_interval = bt.is_interval,
+              .collation = bt.collation,
+          };
+          return true;
+        }
+        return result_type->type == bt.type &&
+               result_type->is_unsigned == bt.is_unsigned &&
+               result_type->is_interval == bt.is_interval &&
+               result_type->collation == bt.collation;
+      };
+      for (const auto& [cond, val] : c.when_clauses_) {
+        if (!TryResolveSchemaBoundNonThrowingType(cond, schema, depth + 1)
+                 .has_value()) {
+          return std::nullopt;
+        }
+        const auto vt =
+            TryResolveSchemaBoundNonThrowingType(val, schema, depth + 1);
+        if (!vt.has_value() || !merge_branch(*vt)) {
+          return std::nullopt;
+        }
+      }
+      if (c.else_clause_) {
+        const auto et = TryResolveSchemaBoundNonThrowingType(
+            c.else_clause_, schema, depth + 1);
+        if (!et.has_value() || !merge_branch(*et)) {
+          return std::nullopt;
+        }
+      }
+      return result_type.value_or(SchemaBoundExprType{.type = ValueType::kNull});
+    }
+    case TypeTag::kFunctionCallExp: {
+      const auto& fn = expr->AsFunctionCallExpression();
+      if (GetFunctionVolatility(fn.FuncName()) != Volatility::kImmutable) {
+        return std::nullopt;
+      }
+      std::string name = fn.FuncName();
+      for (char& ch : name) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      }
+      std::vector<SchemaBoundExprType> arg_types;
+      arg_types.reserve(fn.Args().size());
+      for (const Expression& arg : fn.Args()) {
+        const auto at =
+            TryResolveSchemaBoundNonThrowingType(arg, schema, depth + 1);
+        if (!at.has_value()) {
+          return std::nullopt;
+        }
+        arg_types.push_back(*at);
+      }
+      if ((name == "coalesce" || name == "ifnull") && !arg_types.empty()) {
+        if (name == "ifnull" && arg_types.size() != 2) {
+          return std::nullopt;
+        }
+        std::optional<SchemaBoundExprType> res;
+        for (const auto& at : arg_types) {
+          if (at.type == ValueType::kNull) {
+            continue;
+          }
+          if (!res.has_value()) {
+            res = SchemaBoundExprType{.type = at.type,
+                                      .is_unsigned = at.is_unsigned,
+                                      .is_interval = at.is_interval,
+                                      .collation = at.collation};
+          } else if (res->type != at.type ||
+                     res->is_unsigned != at.is_unsigned ||
+                     res->is_interval != at.is_interval ||
+                     res->collation != at.collation) {
+            return std::nullopt;
+          }
+        }
+        return res.value_or(SchemaBoundExprType{.type = ValueType::kNull});
+      }
+      if (name == "nullif" && arg_types.size() == 2) {
+        if (SchemaTypesComparableNonThrowing(arg_types[0], arg_types[1])) {
+          return SchemaBoundExprType{.type = arg_types[0].type,
+                                     .is_unsigned = arg_types[0].is_unsigned,
+                                     .is_interval = arg_types[0].is_interval,
+                                     .collation = arg_types[0].collation};
+        }
+        return std::nullopt;
+      }
+      if ((name == "substr" || name == "substring") &&
+          (arg_types.size() == 2 || arg_types.size() == 3)) {
+        if (!arg_types[0].is_interval &&
+            (arg_types[0].type == ValueType::kVarChar ||
+             arg_types[0].type == ValueType::kNull) &&
+            !arg_types[1].is_unsigned &&
+            (arg_types[1].type == ValueType::kInt64 ||
+             arg_types[1].type == ValueType::kNull) &&
+            (arg_types.size() == 2 ||
+             (!arg_types[2].is_unsigned &&
+              (arg_types[2].type == ValueType::kInt64 ||
+               arg_types[2].type == ValueType::kNull)))) {
+          return SchemaBoundExprType{.type = ValueType::kVarChar,
+                                     .collation = arg_types[0].collation};
+        }
+        return std::nullopt;
+      }
+      if ((name == "lower" || name == "upper" || name == "trim" ||
+           name == "ltrim" || name == "rtrim") &&
+          arg_types.size() == 1 && !arg_types[0].is_interval &&
+          (arg_types[0].type == ValueType::kVarChar ||
+           arg_types[0].type == ValueType::kNull)) {
+        return SchemaBoundExprType{.type = ValueType::kVarChar,
+                                   .collation = arg_types[0].collation};
+      }
+      if ((name == "length" || name == "char_length" ||
+           name == "character_length" || name == "byte_length" ||
+           name == "octet_length") &&
+          arg_types.size() == 1 && !arg_types[0].is_interval &&
+          (arg_types[0].type == ValueType::kVarChar ||
+           arg_types[0].type == ValueType::kNull)) {
+        return SchemaBoundExprType{.type = ValueType::kInt64};
+      }
+      if ((name == "starts_with" || name == "ends_with") &&
+          arg_types.size() == 2 && !arg_types[0].is_interval &&
+          !arg_types[1].is_interval &&
+          (arg_types[0].type == ValueType::kVarChar ||
+           arg_types[0].type == ValueType::kNull) &&
+          (arg_types[1].type == ValueType::kVarChar ||
+           arg_types[1].type == ValueType::kNull) &&
+          arg_types[0].collation != Collation::kCaseInsensitive &&
+          arg_types[1].collation != Collation::kCaseInsensitive) {
+        return SchemaBoundExprType{.type = ValueType::kInt64};
+      }
+      if ((name == "extract_year" || name == "extract_month" ||
+           name == "extract_day" || name == "extract_quarter" ||
+           name == "extract_dayofweek" || name == "extract_dayofyear") &&
+          arg_types.size() == 1 &&
+          (arg_types[0].type == ValueType::kDate ||
+           arg_types[0].type == ValueType::kNull)) {
+        if (arg_types[0].is_constant && !ContainsParameterSlot(expr) &&
+            expr->TouchedColumns().empty()) {
+          StatusOr<Value> ev = expr->TryEvaluate(Row{}, Schema{});
+          if (ev.HasValue()) {
+            return MakeConstantSchemaBoundType(ev.Value());
+          }
+        }
+        return SchemaBoundExprType{.type = ValueType::kInt64};
+      }
+      if (std::ranges::all_of(arg_types,
+                              [](const SchemaBoundExprType& a) {
+                                return a.is_constant;
+                              }) &&
+          !ContainsParameterSlot(expr) && expr->TouchedColumns().empty()) {
+        StatusOr<Value> ev = expr->TryEvaluate(Row{}, Schema{});
+        if (ev.HasValue()) {
+          return MakeConstantSchemaBoundType(ev.Value());
+        }
+      }
+      return std::nullopt;
+    }
+    case TypeTag::kCastExp: {
+      const auto ct = TryResolveSchemaBoundNonThrowingType(
+          expr->AsCastExpression().Child(), schema, depth + 1);
+      if (ct.has_value() && ct->is_constant && !ContainsParameterSlot(expr) &&
+          expr->TouchedColumns().empty()) {
+        StatusOr<Value> ev = expr->TryEvaluate(Row{}, Schema{});
+        if (ev.HasValue()) {
+          return MakeConstantSchemaBoundType(ev.Value());
+        }
+      }
+      return std::nullopt;
+    }
+    case TypeTag::kIntervalExp: {
+      const auto children = ExpressionChildren(expr);
+      const bool all_const = std::ranges::all_of(children, [&](const Expression& ch) {
+        const auto cht =
+            TryResolveSchemaBoundNonThrowingType(ch, schema, depth + 1);
+        return cht.has_value() && cht->is_constant;
+      });
+      if (all_const && !ContainsParameterSlot(expr) &&
+          expr->TouchedColumns().empty()) {
+        StatusOr<Value> ev = expr->TryEvaluate(Row{}, Schema{});
+        if (ev.HasValue()) {
+          return MakeConstantSchemaBoundType(ev.Value());
+        }
+      }
+      return std::nullopt;
+    }
+    default:
+      return std::nullopt;
+  }
 }
 
 // Conservative error-freedom test: true only when evaluating `expression`
@@ -275,6 +751,13 @@ bool IsConstant(const Expression& expression) {
 bool ExpressionCannotThrow(const Expression& expression) {  // NOLINT
   if (!expression) {
     return false;
+  }
+  if (const Schema* active_schema = ActiveRewriteSchema();
+      active_schema != nullptr && active_schema->ColumnCount() > 0) {
+    if (TryResolveSchemaBoundNonThrowingType(expression, *active_schema)
+            .has_value()) {
+      return true;
+    }
   }
   switch (expression->Type()) {
     case TypeTag::kConstantValue:
@@ -493,7 +976,14 @@ bool StaticallyInt64(const Expression& expression) {
     return false;
   }
   try {
-    return expression->ResultType(Schema()).GetType() == TypeTag::kBigInt;
+    // Resolve against the active rewrite schema like the sibling probes
+    // (StaticallyNumeric / StaticallyDouble / StaticallyNonNumeric): with
+    // an empty Schema() every column reference throws and the INT64-only
+    // guards below (reassociate_* / double_bitwise_negation) could never
+    // fire on the column chains they exist for.
+    const Schema* schema = ActiveRewriteSchema();
+    return expression->ResultType(schema != nullptr ? *schema : Schema())
+               .GetType() == TypeTag::kBigInt;
   } catch (const std::exception&) {
     return false;
   }
@@ -509,7 +999,9 @@ bool StaticallyNonNumeric(const Expression& expression) {
            val.type != ValueType::kDouble;
   }
   try {
-    const TypeTag type = expression->ResultType(Schema()).GetType();
+    const Schema* schema = ActiveRewriteSchema();
+    const TypeTag type =
+        expression->ResultType(schema != nullptr ? *schema : Schema()).GetType();
     return type != TypeTag::kBigInt && type != TypeTag::kDouble &&
            type != TypeTag::kInvalid;
   } catch (const std::exception&) {
@@ -526,7 +1018,9 @@ bool StaticallyNumeric(const Expression& expression) {
     return false;
   }
   try {
-    const TypeTag type = expression->ResultType(Schema()).GetType();
+    const Schema* schema = ActiveRewriteSchema();
+    const TypeTag type =
+        expression->ResultType(schema != nullptr ? *schema : Schema()).GetType();
     return type == TypeTag::kBigInt || type == TypeTag::kDouble;
   } catch (const std::exception&) {
     return false;
@@ -540,7 +1034,25 @@ bool StaticallyDouble(const Expression& expression) {
     return false;
   }
   try {
-    return expression->ResultType(Schema()).GetType() == TypeTag::kDouble;
+    const Schema* schema = ActiveRewriteSchema();
+    return expression->ResultType(schema != nullptr ? *schema : Schema())
+               .GetType() == TypeTag::kDouble;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// Opposite-direction guard for rewrites that must abort when the operand
+// *could* be DOUBLE (e.g. `nullif(a, a) -> NULL`, unsound for NaN). Type
+// resolution is schema-free here, so a column reference throws and must be
+// treated as "not proven non-double" rather than "not double" -- otherwise
+// the guard fails open and folds a DOUBLE column's NaN row into NULL.
+bool StaticallyProvesNonDouble(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  try {
+    return expression->ResultType(Schema()).GetType() != TypeTag::kDouble;
   } catch (const std::exception&) {
     return false;
   }
@@ -588,11 +1100,12 @@ bool StaticallyNonBoolean(const Expression& expression) {
   if (expression->Type() == TypeTag::kFunctionCallExp) {
     const std::string& name = expression->AsFunctionCallExpression().FuncName();
     static const std::unordered_set<std::string> kNonBooleanFuncs = {
-        "abs",          "sign",     "round",       "trunc",
-        "truncate",     "ceil",     "ceiling",     "floor",
-        "safe_negate",  "length",   "char_length", "character_length",
-        "byte_length",  "strpos",   "instr",       "div",
-        "__bit_and",    "__bit_or", "__bit_xor",   "__shift_left",
+        "abs",           "sign",          "round",       "trunc",
+        "truncate",      "ceil",          "ceiling",     "floor",
+        "safe_negate",   "mod",           "safe_add",    "safe_subtract",
+        "safe_multiply", "length",        "char_length", "character_length",
+        "byte_length",   "strpos",        "instr",       "div",
+        "__bit_and",     "__bit_or",      "__bit_xor",   "__shift_left",
         "__shift_right"};
     if (kNonBooleanFuncs.contains(name) || name.starts_with("extract_")) {
       return true;
@@ -824,24 +1337,26 @@ namespace {
 // resolve column types (see set_schema). Null outside a rewrite.
 thread_local const Schema* g_active_rewrite_schema = nullptr;
 
-class ScopedActiveRewriteSchema {
- public:
-  explicit ScopedActiveRewriteSchema(const Schema* schema)
-      : saved_(g_active_rewrite_schema) {
-    g_active_rewrite_schema = schema;
-  }
-  ~ScopedActiveRewriteSchema() { g_active_rewrite_schema = saved_; }
-  ScopedActiveRewriteSchema(const ScopedActiveRewriteSchema&) = delete;
-  ScopedActiveRewriteSchema& operator=(const ScopedActiveRewriteSchema&) =
-      delete;
-  ScopedActiveRewriteSchema(ScopedActiveRewriteSchema&&) = delete;
-  ScopedActiveRewriteSchema& operator=(ScopedActiveRewriteSchema&&) = delete;
-
- private:
-  const Schema* saved_;
-};
-
 const Schema* ActiveRewriteSchema() { return g_active_rewrite_schema; }
+
+}  // namespace
+
+ScopedActiveRewriteSchema::ScopedActiveRewriteSchema(const Schema* schema)
+    : saved_(g_active_rewrite_schema) {
+  g_active_rewrite_schema = schema;
+}
+
+ScopedActiveRewriteSchema::~ScopedActiveRewriteSchema() {
+  g_active_rewrite_schema = saved_;
+}
+
+bool SafeToReduceEvaluationCountWithSchema(const Expression& expression,
+                                           const Schema& schema) {
+  const ScopedActiveRewriteSchema schema_guard(&schema);
+  return SafeToReduceEvaluationCount(expression);
+}
+
+namespace {
 
 bool SideCanBeDouble(const Expression& side, const Schema& schema);
 
@@ -873,6 +1388,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
   static const ExpressionRuleSet rules = [] {
     using namespace expression_dsl;
     ExpressionRuleSet built;
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (boolean_identity_short_circuit_sound)
     built.Add(ExpressionRule(
         "fold_binary",
         AnyBinary(Is(TypeTag::kConstantValue, "left"),
@@ -891,6 +1408,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (boolean_identity_short_circuit_sound)
     built.Add(ExpressionRule(
         "fold_unary", AnyUnary(Is(TypeTag::kConstantValue, "child")),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -905,6 +1424,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (in_and_join_notnull_rules_sound)
     built.Add(ExpressionRule(
         "fold_in", Is(TypeTag::kInExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -924,6 +1445,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (greatest_concat_array_cast_cse_sound)
     built.Add(ExpressionRule(
         "fold_function", Is(TypeTag::kFunctionCallExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -950,6 +1473,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (in_and_join_notnull_rules_sound)
     built.Add(ExpressionRule(
         "singleton_in", Is(TypeTag::kInExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -973,6 +1498,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return BinaryExpressionExp(in.child_, BinaryOperation::kEquals,
                                      in.list_.front());
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (canonicalize_comparison_and_boolean_sound)
     built.Add(ExpressionRule(
         "canonicalize_comparison", AnyBinary(Any("left"), Any("right")),
         [](const Expression& expression, const ExpressionBindings& bindings) {
@@ -985,6 +1512,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      FlipComparison(binary.Op()),
                                      bindings.at("left"));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (boolean_identity_short_circuit_sound)
     built.Add(ExpressionRule(
         "boolean_identity", AnyBinary(Any("left"), Any("right")),
         [](const Expression& expression, const ExpressionBindings& bindings) {
@@ -1042,6 +1571,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ThreeValued.lean (double_negation_sound)
     built.Add(ExpressionRule(
         "double_negation",
         Unary(UnaryOperation::kNot, Unary(UnaryOperation::kNot, Any("child"))),
@@ -1052,6 +1582,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return child;
         }));
+    // Lean proof: lean/TinylambOpt/ThreeValued.lean
+    //   (de_morgan_and_sound, de_morgan_or_sound)
     built.Add(ExpressionRule(
         "de_morgan",
         Unary(UnaryOperation::kNot,
@@ -1069,6 +1601,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                                  : BinaryOperation::kAnd,
               UnaryExpressionExp(bindings.at("right"), UnaryOperation::kNot));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (case_and_if_pushdown_rules_sound)
     built.Add(ExpressionRule(
         "simplify_case", Is(TypeTag::kCaseExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -1097,6 +1631,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return CaseExpressionExp(std::move(clauses), std::move(otherwise));
         }));
+    // Lean proof: lean/TinylambOpt/ThreeValued.lean
+    //   (not_comparison_unsound_on_nan)
     built.Add(ExpressionRule(
         "not_comparison",
         Unary(UnaryOperation::kNot,
@@ -1147,6 +1683,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      NegateComparison(operation),
                                      bindings.at("right"));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "not_like",
         Unary(UnaryOperation::kNot,
@@ -1156,6 +1694,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kNotLike,
                                      bindings.at("right"));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "not_not_like",
         Unary(UnaryOperation::kNot,
@@ -1165,6 +1705,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kLike,
                                      bindings.at("right"));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "not_is_null",
         Unary(UnaryOperation::kNot,
@@ -1173,6 +1715,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return UnaryExpressionExp(bindings.at("child"),
                                     UnaryOperation::kIsNotNull);
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "not_is_not_null",
         Unary(UnaryOperation::kNot,
@@ -1181,6 +1725,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return UnaryExpressionExp(bindings.at("child"),
                                     UnaryOperation::kIsNull);
         }));
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (xor_rules_three_valued_sound)
     built.Add(ExpressionRule(
         "xor_boolean_identity",
         Binary(BinaryOperation::kXor, Any("left"), Any("right")),
@@ -1214,6 +1760,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ThreeValued.lean (and_idempotent_sound)
     built.Add(ExpressionRule(
         "and_idempotent", Binary(BinaryOperation::kAnd, Any("x"), Any("x")),
         [](const Expression&, const ExpressionBindings& bindings) {
@@ -1223,6 +1770,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
+    // Lean proof: lean/TinylambOpt/ThreeValued.lean (or_idempotent_sound)
     built.Add(ExpressionRule(
         "or_idempotent", Binary(BinaryOperation::kOr, Any("x"), Any("x")),
         [](const Expression&, const ExpressionBindings& bindings) {
@@ -1239,6 +1787,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // INT64) <= c) OR NULL`) must not be erased.  Fire only if y is total.
     // Furthermore, x must be safe to reduce evaluations and cannot be
     // non-boolean.
+    // Lean proof: lean/TinylambOpt/ThreeValued.lean (absorption_and_sound)
     built.Add(ExpressionRule(
         "absorption_and",
         Binary(BinaryOperation::kAnd, Any("x"),
@@ -1251,6 +1800,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
+    // Lean proof: lean/TinylambOpt/ThreeValued.lean (absorption_and_sound)
     built.Add(ExpressionRule(
         "absorption_and_reversed",
         Binary(BinaryOperation::kAnd,
@@ -1263,6 +1813,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "absorption_or",
         Binary(BinaryOperation::kOr, Any("x"),
@@ -1275,6 +1827,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "absorption_or_reversed",
         Binary(BinaryOperation::kOr,
@@ -1287,6 +1841,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "identity_add_zero",
         Binary(BinaryOperation::kAdd, Any("left"), Any("right")),
@@ -1312,6 +1868,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "identity_subtract_zero",
         Binary(BinaryOperation::kSubtract, Any("left"), Any("right")),
@@ -1324,6 +1882,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return bindings.at("left");
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "identity_multiply_one",
         Binary(BinaryOperation::kMultiply, Any("left"), Any("right")),
@@ -1344,6 +1904,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "identity_divide_one",
         Binary(BinaryOperation::kDivide, Any("left"), Any("right")),
@@ -1358,6 +1920,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return bindings.at("left");
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "canonicalize_add_negative_constant",
         Binary(BinaryOperation::kAdd, Any("left"),
@@ -1375,6 +1939,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kSubtract,
                                      ConstantValueExp(Value(-*value)));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "canonicalize_subtract_negative_constant",
         Binary(BinaryOperation::kSubtract, Any("left"),
@@ -1391,6 +1957,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return BinaryExpressionExp(bindings.at("left"), BinaryOperation::kAdd,
                                      ConstantValueExp(Value(-*value)));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "multiply_by_negative_one",
         Binary(BinaryOperation::kMultiply, Any("left"), Any("right")),
@@ -1412,6 +1980,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "combine_repeated_addend",
         Binary(BinaryOperation::kAdd, Any("left"), Any("right")),
@@ -1421,17 +1991,21 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               !SafeToReduceEvaluationCount(left)) {
             return Expression{};
           }
-          // INT64 `x + x` and `x * 2` disagree at the overflow boundary in
-          // this engine (addition crosses into UINT64 wraparound, while
-          // multiplication raises), so collapsing a DYNAMIC integer addition
-          // can turn a value into a throw (oracle-found: col_i = INT64_MIN)
-          // or erase one. Exact doubles have no such boundary.
+          // This guard is conservative: the rule also sees untyped and
+          // scalar shapes where `x + x` and `x * 2` can end in different
+          // overflow diagnostics (the operator symbol differs even when both
+          // raise). RewriteTypedArithmetic applies the same rewrite only to
+          // statically numeric COLUMN operands, for which the current binary
+          // evaluator treats doubling identically under either spelling; that
+          // narrower rule is intentional, not a bypass of this one.
           if (!StaticallyDouble(left) && !IsInt64Constant(left)) {
             return Expression{};
           }
           return BinaryExpressionExp(left, BinaryOperation::kMultiply,
                                      ConstantValueExp(Value(2)));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "double_negation_arithmetic",
         Unary(UnaryOperation::kMinus,
@@ -1469,6 +2043,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return child;
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "double_bitwise_negation",
         Unary(UnaryOperation::kBitwiseNot,
@@ -1483,6 +2059,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return Expression{};
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_reassociate_all_four_rules_sound,
+    //    int64_reassoc_opposite_sign_overflow_bug)
     built.Add(ExpressionRule(
         "reassociate_add_constants",
         Binary(BinaryOperation::kAdd,
@@ -1525,6 +2104,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kAdd,
                                      ConstantValueExp(folded.MoveValue()));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_reassociate_all_four_rules_sound)
     built.Add(ExpressionRule(
         "reassociate_subtract_constants",
         Binary(BinaryOperation::kSubtract,
@@ -1563,6 +2144,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kSubtract,
                                      ConstantValueExp(folded.MoveValue()));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (in_and_join_notnull_rules_sound)
     built.Add(ExpressionRule(
         "dedupe_in_list", Is(TypeTag::kInExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -1597,6 +2180,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return InExpressionExp(in.child_, std::move(items));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (case_and_if_pushdown_rules_sound)
     built.Add(ExpressionRule(
         "uniform_case_result", Is(TypeTag::kCaseExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -1629,6 +2214,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return source.else_clause_;
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "like_equality",
         Binary(BinaryOperation::kLike, Any("left"),
@@ -1651,6 +2238,14 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
             return Expression{};
           }
+          // Issue 5038: an INTERVAL-flagged constant makes LIKE and `=`
+          // answer differently -- LIKE ignores the interval flag, while the
+          // string comparison guard raises "INTERVAL/STRING type mismatch"
+          // when exactly one side carries it.  Folding would add an error
+          // the ground-truth LIKE never produces.
+          if (pattern.IsInterval()) {
+            return Expression{};
+          }
           if (HasLikeWildcard(pattern.value.varchar_value) ||
               TimestampShapedConstant(pattern.value.varchar_value)) {
             return Expression{};
@@ -1659,6 +2254,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kEquals,
                                      bindings.at("pattern"));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "not_like_equality",
         Binary(BinaryOperation::kNotLike, Any("left"),
@@ -1677,6 +2274,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
             return Expression{};
           }
+          // Issue 5038: interval-flagged constants answer differently under
+          // LIKE vs. string comparison (see like_equality).
+          if (pattern.IsInterval()) {
+            return Expression{};
+          }
           if (HasLikeWildcard(pattern.value.varchar_value) ||
               TimestampShapedConstant(pattern.value.varchar_value)) {
             return Expression{};
@@ -1685,6 +2287,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kNotEquals,
                                      bindings.at("pattern"));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "is_null_of_null_check",
         Unary(UnaryOperation::kIsNull, Is(TypeTag::kUnaryExp, "inner")),
@@ -1701,6 +2305,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return ConstantValueExp(Value(false));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "is_not_null_of_null_check",
         Unary(UnaryOperation::kIsNotNull, Is(TypeTag::kUnaryExp, "inner")),
@@ -1717,6 +2323,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return ConstantValueExp(Value(true));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_reassociate_all_four_rules_sound)
     built.Add(ExpressionRule(
         "reassociate_subtract_add_constants",
         Binary(BinaryOperation::kAdd,
@@ -1757,6 +2365,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                      BinaryOperation::kAdd,
                                      ConstantValueExp(folded.MoveValue()));
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (greatest_concat_array_cast_cse_sound)
     built.Add(ExpressionRule(
         "collapse_nested_identical_cast", Is(TypeTag::kCastExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -1771,11 +2381,15 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return outer.Child();
         }));
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "factor_or_common_and", AnyBinary(Any("left"), Any("right")),
         [](const Expression& expression, const ExpressionBindings&) {
           return FactorCommonAndImpl(expression);
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_reassociate_all_four_rules_sound)
     built.Add(ExpressionRule(
         "reassociate_add_subtract_constants",
         Binary(BinaryOperation::kSubtract,
@@ -1821,6 +2435,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // UNKNOWN on the left side but FALSE on the right).
 
     // nullif(a, b) -> CASE WHEN a = b THEN NULL ELSE a END
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (coalesce_and_nullif_rules_sound)
     built.Add(ExpressionRule(
         "nullif_to_case", Is(TypeTag::kFunctionCallExp, "expr"),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -1847,7 +2463,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             // nullif(a, a) -> NULL drops a; only sound when a cannot raise,
             // is not volatile, and cannot evaluate to NaN (NaN = NaN is false
             // in SQL).
-            if (StaticallyDouble(fn.Args()[0]) ||
+            if (!StaticallyProvesNonDouble(fn.Args()[0]) ||
                 !ExpressionCannotThrow(fn.Args()[0]) ||
                 !SafeToReduceEvaluationCount(fn.Args()[0])) {
               return Expression{};
@@ -1882,6 +2498,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // three-valued logic.  `x = NULL` is UNKNOWN for every row, so the
     // honest constant result is the NULL (unknown) value; the old rewrite
     // made `WHERE x = NULL` return exactly the rows with x IS NULL.)
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (not_in_null_semantics_sound)
     built.Add(ExpressionRule(
         "contradiction_from_null_eq", AnyBinary(Any("left"), Any("right")),
         [](const Expression& expression, const ExpressionBindings& bindings) {
@@ -1909,6 +2527,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // greatest(greatest(a, b), c) -> greatest(a, b, c)
     // least(least(a, b), c) -> least(a, b, c)
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (greatest_concat_array_cast_cse_sound)
     built.Add(ExpressionRule(
         "greatest_least_fold", Is(TypeTag::kFunctionCallExp, "expr"),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -1944,6 +2564,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // x IN (NULL) -> NULL, but only when x cannot raise: evaluating the
     // left operand precedes the NULL comparison in the AST reference
     // (oracle-found: `(INT64_MIN / 0) IN (NULL)` folded to NULL).
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (not_in_null_semantics_sound)
     built.Add(ExpressionRule(
         "in_single_null", Is(TypeTag::kInExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -1966,6 +2588,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // not_in_null_semantics: x NOT IN (c1, ..., NULL) -> CASE WHEN x IN (c1,
     // ...) THEN FALSE ELSE NULL END
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (not_in_null_semantics_sound)
     built.Add(ExpressionRule(
         "not_in_null_semantics",
         Unary(UnaryOperation::kNot, Is(TypeTag::kInExp, "in")),
@@ -2004,6 +2628,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }));
 
     // concat(concat(a, b), c) -> concat(a, b, c)
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (greatest_concat_array_cast_cse_sound)
     built.Add(ExpressionRule(
         "concat_flatten", Is(TypeTag::kFunctionCallExp, "expr"),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -2037,13 +2663,17 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // array_flatten_optimization: Optimize ARRAY_CONCAT, ARRAY_FLATTEN, and
     // nested array construction.
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (greatest_concat_array_cast_cse_sound)
     built.Add(ExpressionRule(
         "array_flatten_optimization", Is(TypeTag::kFunctionCallExp, "expr"),
         [](const Expression& expression,
            const ExpressionBindings&) -> Expression {
           const auto& fn = expression->AsFunctionCallExpression();
           std::string func_lower = fn.FuncName();
-          std::ranges::transform(func_lower, func_lower.begin(), ::tolower);
+          std::ranges::transform(func_lower, func_lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+          });
           if (func_lower == "array_concat") {
             if (fn.Args().empty()) {
               return Expression{};
@@ -2055,7 +2685,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 const auto& inner = arg->AsFunctionCallExpression();
                 std::string inner_lower = inner.FuncName();
                 std::ranges::transform(inner_lower, inner_lower.begin(),
-                                       ::tolower);
+                                       [](unsigned char c) {
+                                         return static_cast<char>(std::tolower(c));
+                                       });
                 if (inner_lower == "array_concat") {
                   for (const Expression& inner_arg : inner.Args()) {
                     flattened_args.push_back(inner_arg);
@@ -2077,13 +2709,32 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               }
             }
             if (all_arrays && !flattened_args.empty()) {
-              std::vector<Expression> merged;
+              // A single ArrayExpression carries one declared element type.
+              // Only merge when every contributor agrees on it; mixing e.g.
+              // INT64 and STRING literals would silently re-label the result
+              // and change equality/casting behaviour. On a conflict keep the
+              // original function call so the evaluator applies its own rules.
               std::string elem_type;
+              bool type_conflict = false;
+              for (const auto& arg : flattened_args) {
+                const std::string& declared =
+                    arg->AsArrayExpression().ElementSqlType();
+                if (declared.empty()) {
+                  continue;
+                }
+                if (elem_type.empty()) {
+                  elem_type = declared;
+                } else if (elem_type != declared) {
+                  type_conflict = true;
+                  break;
+                }
+              }
+              if (type_conflict) {
+                return Expression{};
+              }
+              std::vector<Expression> merged;
               for (const auto& arg : flattened_args) {
                 const auto& arr = arg->AsArrayExpression();
-                if (elem_type.empty() && !arr.ElementSqlType().empty()) {
-                  elem_type = arr.ElementSqlType();
-                }
                 for (const auto& el : arr.Elements()) {
                   merged.push_back(el);
                 }
@@ -2136,13 +2787,30 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 }
               }
               if (all_inners) {
-                std::vector<Expression> flattened;
+                // Same contract as array_concat: one merged array can only
+                // carry one declared element type. Bail out on a mismatch so
+                // the evaluator keeps the original ARRAY_FLATTEN semantics.
                 std::string elem_type;
+                bool type_conflict = false;
+                for (const auto& elem : outer.Elements()) {
+                  const std::string& declared =
+                      elem->AsArrayExpression().ElementSqlType();
+                  if (declared.empty()) {
+                    continue;
+                  }
+                  if (elem_type.empty()) {
+                    elem_type = declared;
+                  } else if (elem_type != declared) {
+                    type_conflict = true;
+                    break;
+                  }
+                }
+                if (type_conflict) {
+                  return Expression{};
+                }
+                std::vector<Expression> flattened;
                 for (const auto& elem : outer.Elements()) {
                   const auto& inner = elem->AsArrayExpression();
-                  if (elem_type.empty() && !inner.ElementSqlType().empty()) {
-                    elem_type = inner.ElementSqlType();
-                  }
                   for (const auto& el : inner.Elements()) {
                     flattened.push_back(el);
                   }
@@ -2157,6 +2825,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // a XOR b -> (a OR b) AND NOT(a AND b)
     // Safe under SQL three-valued logic.
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (xor_rules_three_valued_sound)
     built.Add(ExpressionRule(
         "xor_to_or_and_not",
         Binary(BinaryOperation::kXor, Any("left"), Any("right")),
@@ -2194,6 +2864,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // x = FALSE -> NOT x (for boolean-typed column references)
     // Conservative: only apply when right side is an IS TRUE / IS FALSE check
     // or a literal 1/0 that came from a boolean context.
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (boolean_eq_true_false_three_valued_sound)
     built.Add(ExpressionRule(
         "boolean_eq_true_false_three_valued",
         AnyBinary(Any("left"), Any("right")),
@@ -2266,6 +2938,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // coalesce_and_nullif_simplification: Simplify COALESCE when leading
     // arguments are non-null constants, eliminate trailing and redundant NULL
     // literals, and simplify NULLIF.
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (coalesce_and_nullif_rules_sound)
     built.Add(ExpressionRule(
         "coalesce_and_nullif_simplification",
         Is(TypeTag::kFunctionCallExp, "expr"),
@@ -2278,7 +2952,10 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           if (name == "coalesce") {
             if (fn.Args().empty()) {
-              return ConstantValueExp(Value());
+              // Zero-argument COALESCE is an arity error in the AST
+              // evaluator; leave the call intact so the error survives
+              // instead of fabricating a NULL constant.
+              return Expression{};
             }
             std::vector<Expression> new_args;
             bool changed = false;
@@ -2365,7 +3042,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               // nullif(a, a) -> NULL drops a; only sound when a cannot raise,
               // is not volatile, and cannot evaluate to NaN (NaN = NaN is false
               // in SQL).
-              if (StaticallyDouble(a) || !ExpressionCannotThrow(a) ||
+              if (!StaticallyProvesNonDouble(a) || !ExpressionCannotThrow(a) ||
                   !SafeToReduceEvaluationCount(a)) {
                 return Expression{};
               }
@@ -2426,6 +3103,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // IF(condition, then, else) -> CASE WHEN condition THEN then ELSE else END
     // Only for 3-argument IF. Canonical form for further rewrite.
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (case_and_if_pushdown_rules_sound)
     built.Add(ExpressionRule(
         "if_to_case", Is(TypeTag::kFunctionCallExp, "expr"),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -2438,6 +3117,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }));
 
     // empty IN list -> FALSE
+    // Lean proof: lean/TinylambOpt/CppRuleAudit.lean (cpp_empty_in_isFalse_bug)
     built.Add(ExpressionRule(
         "empty_in_list", Is(TypeTag::kInExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -2469,7 +3149,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               name == "JSON_EXTRACT_ARRAY" || name == "JSON_QUERY_ARRAY" ||
               name == "JSON_VALUE_ARRAY" ||
               name == "JSON_EXTRACT_STRING_ARRAY") {
-            if (fn.Args().empty() || !fn.Args()[0] ||
+            // The evaluator accepts only 1 or 2 arguments; folding a
+            // wider call would silently erase its arity error.
+            if (fn.Args().empty() || fn.Args().size() > 2 || !fn.Args()[0] ||
                 fn.Args()[0]->Type() != TypeTag::kConstantValue) {
               return Expression{};
             }
@@ -2526,6 +3208,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // numeric_widening_cast: Nested widening numeric casts like CAST(CAST(x AS
     // INT32) AS INT64) -> CAST(x AS INT64) or CAST(constant AS type) folded.
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (greatest_concat_array_cast_cse_sound)
     built.Add(ExpressionRule(
         "numeric_widening_cast", Is(TypeTag::kCastExp),
         [](const Expression& expression,
@@ -2562,6 +3246,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // or_of_ranges_to_in: (x = 1 OR x = 2 OR x = 3) -> x IN (1, 2, 3)
     // and combining multiple equality OR conjuncts into a single IN list.
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (in_and_join_notnull_rules_sound)
     built.Add(ExpressionRule(
         "or_of_ranges_to_in",
         Binary(BinaryOperation::kOr, Any("left"), Any("right")),
@@ -2743,6 +3429,42 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                     overflowed = true;
                   }
                   if (!overflowed) {
+                    // The raw fast path must respect the interval domain
+                    // (~ +/-106751 days / +/-3558 years) that the Try* paths
+                    // enforce via TryTotalNanos; otherwise a folded literal
+                    // becomes a value the runtime evaluator rejects.
+                    IntervalValue probe{};
+                    const std::string& unit = l_iv.Unit();
+                    if (unit == "DAY" || unit == "day") {
+                      probe.days = folded;
+                    } else if (unit == "HOUR" || unit == "hour") {
+                      if (__builtin_mul_overflow(folded, 3600LL * 1000000000LL,
+                                                 &probe.nanos)) {
+                        return Expression{};
+                      }
+                    } else if (unit == "MINUTE" || unit == "minute") {
+                      if (__builtin_mul_overflow(folded, 60LL * 1000000000LL,
+                                                 &probe.nanos)) {
+                        return Expression{};
+                      }
+                    } else if (unit == "SECOND" || unit == "second") {
+                      if (__builtin_mul_overflow(folded, 1000000000LL,
+                                                 &probe.nanos)) {
+                        return Expression{};
+                      }
+                    } else if (unit == "MONTH" || unit == "month") {
+                      probe.months = folded;
+                    } else if (unit == "YEAR" || unit == "year") {
+                      if (__builtin_mul_overflow(folded, int64_t{12},
+                                                 &probe.months)) {
+                        return Expression{};
+                      }
+                    } else {
+                      return Expression{};  // unknown unit: stay unfolded
+                    }
+                    if (!probe.TryTotalNanos().HasValue()) {
+                      return Expression{};
+                    }
                     return IntervalExpressionExp(folded, l_iv.Unit());
                   }
                   return Expression{};
@@ -2755,9 +3477,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 if (binary.Op() == BinaryOperation::kAdd ||
                     binary.Op() == BinaryOperation::kSubtract) {
                   StatusOr<IntervalValue> folded_iv =
-                      binary.Op() == BinaryOperation::kAdd
-                          ? iv1.TryPlus(iv2)
-                          : iv1.TryMinus(iv2);
+                      binary.Op() == BinaryOperation::kAdd ? iv1.TryPlus(iv2)
+                                                           : iv1.TryMinus(iv2);
                   if (!folded_iv.HasValue()) {
                     return Expression{};
                   }
@@ -2779,8 +3500,22 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                           left->AsIntervalExpression().Amount(), k, &scaled)) {
                     return Expression{};
                   }
-                  return IntervalExpressionExp(
-                      scaled, left->AsIntervalExpression().Unit());
+                  // The (scaled, unit) ctor runs the throwing
+                  // IntervalValue::Parse; validate first so a product that
+                  // fits INT64 but is not a valid interval (e.g. a YEAR
+                  // amount whose x12 month conversion overflows) bails to
+                  // the runtime instead of escaping TryRewrite's contract.
+                  StatusOr<IntervalValue> prod = IntervalValue::TryParse(
+                      std::to_string(scaled),
+                      left->AsIntervalExpression().Unit());
+                  if (!prod.HasValue()) {
+                    return Expression{};
+                  }
+                  StatusOr<std::string> text = prod.Value().TryToString();
+                  if (!text.HasValue()) {
+                    return Expression{};
+                  }
+                  return IntervalExpressionExp(0, "", text.MoveValue());
                 }
                 StatusOr<IntervalValue> prod =
                     left->AsIntervalExpression().GetIntervalValue().TryMultiply(
@@ -2805,12 +3540,23 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                           right->AsIntervalExpression().Amount(), k, &scaled)) {
                     return Expression{};
                   }
-                  return IntervalExpressionExp(
-                      scaled, right->AsIntervalExpression().Unit());
+                  // See the mirror arm above (T637): validate the scaled
+                  // amount against the interval domain before constructing.
+                  StatusOr<IntervalValue> prod = IntervalValue::TryParse(
+                      std::to_string(scaled),
+                      right->AsIntervalExpression().Unit());
+                  if (!prod.HasValue()) {
+                    return Expression{};
+                  }
+                  StatusOr<std::string> text = prod.Value().TryToString();
+                  if (!text.HasValue()) {
+                    return Expression{};
+                  }
+                  return IntervalExpressionExp(0, "", text.MoveValue());
                 }
-                StatusOr<IntervalValue> prod =
-                    right->AsIntervalExpression().GetIntervalValue().TryMultiply(
-                        k);
+                StatusOr<IntervalValue> prod = right->AsIntervalExpression()
+                                                   .GetIntervalValue()
+                                                   .TryMultiply(k);
                 if (!prod.HasValue()) {
                   return Expression{};
                 }
@@ -2822,48 +3568,39 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               }
             }
           }
-          if (expression->Type() == TypeTag::kUnaryExp) {
-            const auto& unary = expression->AsUnaryExpression();
-            if (unary.Op() == UnaryOperation::kMinus && unary.Child() &&
-                unary.Child()->Type() == TypeTag::kIntervalExp) {
-              const auto& child = unary.Child()->AsIntervalExpression();
-              if (child.RawAmount().empty()) {
-                // INT64_MIN negation is UB on int64; leave it to the runtime
-                // path which throws like the AST ground truth.
-                if (child.Amount() == std::numeric_limits<int64_t>::min()) {
-                  return Expression{};
-                }
-                return IntervalExpressionExp(-child.Amount(), child.Unit());
-              }
-              StatusOr<IntervalValue> neg = child.GetIntervalValue().TryNegate();
-              if (!neg.HasValue()) {
-                return Expression{};
-              }
-              StatusOr<std::string> text = neg.Value().TryToString();
-              if (!text.HasValue()) {
-                return Expression{};
-              }
-              return IntervalExpressionExp(0, "", text.MoveValue());
-            }
-          }
+          // `-INTERVAL ...` is rejected by the canonical AST evaluator
+          // (UnaryExpression::Evaluate kMinus accepts only numbers). Do not
+          // fold it into a value: leaving it unfolded lets the runtime raise
+          // the same error the AST ground truth does.
           if (expression->Type() == TypeTag::kFunctionCallExp) {
             const auto& fn = expression->AsFunctionCallExpression();
             if (fn.Args().size() == 1 && fn.Args()[0] &&
                 fn.Args()[0]->Type() == TypeTag::kIntervalExp) {
               const auto& iv =
                   fn.Args()[0]->AsIntervalExpression().GetIntervalValue();
+              // Use the Status-returning variants: the throwing wrappers
+              // would escape TryRewrite's StatusOr boundary on overflow.
+              std::optional<IntervalValue> justified;
               if (fn.FuncName() == "justify_hours") {
-                return IntervalExpressionExp(0, "",
-                                             iv.JustifyHours().ToString());
+                auto r = iv.TryJustifyHours();
+                if (r.HasValue()) justified = r.MoveValue();  // NOLINT(readability-braces-around-statements)
+              } else if (fn.FuncName() == "justify_days") {
+                auto r = iv.TryJustifyDays();
+                if (r.HasValue()) justified = r.MoveValue();  // NOLINT(readability-braces-around-statements)
+              } else if (fn.FuncName() == "justify_interval") {
+                auto r = iv.TryJustifyInterval();
+                if (r.HasValue()) justified = r.MoveValue();  // NOLINT(readability-braces-around-statements)
+              } else {
+                return Expression{};
               }
-              if (fn.FuncName() == "justify_days") {
-                return IntervalExpressionExp(0, "",
-                                             iv.JustifyDays().ToString());
+              if (!justified.has_value()) {
+                return Expression{};
               }
-              if (fn.FuncName() == "justify_interval") {
-                return IntervalExpressionExp(0, "",
-                                             iv.JustifyInterval().ToString());
+              StatusOr<std::string> text = justified->TryToString();
+              if (!text.HasValue()) {
+                return Expression{};
               }
+              return IntervalExpressionExp(0, "", text.MoveValue());
             }
           }
           return Expression{};
@@ -2872,6 +3609,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // predicate_pushdown_case: Safely push predicates into CASE branches
     // (p(CASE WHEN c1 THEN v1 ELSE v2 END) -> CASE WHEN c1 THEN p(v1) ELSE
     // p(v2) END).
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (case_and_if_pushdown_rules_sound)
     built.Add(ExpressionRule(
         "predicate_pushdown_case", Any(),
         [](const Expression& expression,
@@ -2997,6 +3736,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // inner_join_not_null_inference: Infer x IS NOT NULL and y IS NOT NULL
     // from inner join equality condition x = y in conjunctions.
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (in_and_join_notnull_rules_sound)
     built.Add(ExpressionRule(
         "inner_join_not_null_inference",
         Binary(BinaryOperation::kAnd, Any("left"), Any("right")),
@@ -3078,6 +3819,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // regexp_prefix_extraction: Extract literal prefix from regular expression
     // patterns (e.g. ^abc.* -> prefix 'abc' for LIKE/range scan candidate).
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (null_and_like_rules_sound)
     built.Add(ExpressionRule(
         "regexp_prefix_extraction", Any(),
         [](const Expression& expression,
@@ -3088,29 +3831,50 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (expression->Type() == TypeTag::kFunctionCallExp) {
             const auto& fn = expression->AsFunctionCallExpression();
             const std::string& name = fn.FuncName();
+            // REGEXP_MATCH is anchored at both ends (std::regex_match), so
+            // an empty remainder means literal equality, not a prefix.
+            const bool full_match = name == "regexp_match";
             if ((name == "regexp_contains" || name == "regexp_like" ||
-                 name == "regexp_match") &&
+                 full_match) &&
                 fn.Args().size() == 2 && fn.Args()[0] &&
                 IsConstant(fn.Args()[1])) {
               const Value pat_val = fn.Args()[1]->AsConstantValue().GetValue();
-              if (pat_val.type == ValueType::kVarChar) {
+              const Expression& input = fn.Args()[0];
+              // `=` and LIKE fold operands under a case-insensitive
+              // collation tag while REGEXP_* compares AsString() bytes;
+              // LIKE also rejects and `=` coerces non-varchar operands.
+              // Refuse inputs whose static form proves either hazard: an
+              // explicit COLLATE() argument or a constant that is
+              // CI-tagged or a non-null non-varchar.
+              const bool unsafe_input =
+                  pat_val.IsCaseInsensitive() ||
+                  CollationOfExpression(input) == Collation::kCaseInsensitive ||
+                  (IsConstant(input) &&
+                   (input->AsConstantValue().GetValue().IsCaseInsensitive() ||
+                    (!input->AsConstantValue().GetValue().IsNull() &&
+                     input->AsConstantValue().GetValue().type !=
+                         ValueType::kVarChar)));
+              if (pat_val.type == ValueType::kVarChar && !unsafe_input) {
                 std::string prefix;
                 std::string remainder;
                 if (ExtractRegexPrefix(pat_val.value.varchar_value, prefix,
                                        remainder)) {
-                  if (remainder == "$" &&
+                  if ((remainder == "$" || (full_match && remainder.empty())) &&
                       // `=` coerces timestamp-shaped varchars to epoch
-                      // comparison; REGEXP_LIKE compares bytes.  Refuse the
+                      // comparison; REGEXP_* compares bytes.  Refuse the
                       // rewrite for timestamp-shaped matches.
                       !TimestampShapedConstant(prefix)) {
                     return BinaryExpressionExp(
-                        fn.Args()[0], BinaryOperation::kEquals,
+                        input, BinaryOperation::kEquals,
                         ConstantValueExp(Value(std::string(prefix))));
                   }
-                  if (remainder == ".*" || remainder == ".*$" ||
-                      remainder.empty()) {
+                  // '%' and '_' are literal in the regex but wildcards in
+                  // the emitted LIKE — refuse prefixes containing them.
+                  if ((remainder == ".*" || remainder == ".*$" ||
+                       (!full_match && remainder.empty())) &&
+                      !HasLikeWildcard(prefix)) {
                     return BinaryExpressionExp(
-                        fn.Args()[0], BinaryOperation::kLike,
+                        input, BinaryOperation::kLike,
                         ConstantValueExp(Value(std::string(prefix + "%"))));
                   }
                 }
@@ -3130,6 +3894,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // deterministic_function_cse: Detect identical deterministic function calls
     // within the same expression tree and eliminate redundant computations.
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (greatest_concat_array_cast_cse_sound)
     built.Add(ExpressionRule(
         "deterministic_function_cse", Any(),
         [](const Expression& expression,
@@ -3185,7 +3951,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 if (IsConstant(fn.Args()[0])) {
                   // Constant folding handles constant cases.
                 } else if (Same(fn.Args()[0], fn.Args()[1]) &&
-                           !StaticallyDouble(fn.Args()[0]) &&
+                           StaticallyProvesNonDouble(fn.Args()[0]) &&
                            ExpressionCannotThrow(fn.Args()[0]) &&
                            SafeToReduceEvaluationCount(fn.Args()[0])) {
                   return ConstantValueExp(Value());
@@ -3232,6 +3998,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // boolean_filter_pullup: Pull up common conditions out of disjunctions
     // (A AND B) OR (A AND C) -> A AND (B OR C).
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "boolean_filter_pullup", AnyBinary(Any("left"), Any("right")),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -3239,6 +4007,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }));
 
     // ---- ours (master) rules re-added after soundness review ----
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "abs_of_abs", Is(TypeTag::kFunctionCallExp, "expr"),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -3256,6 +4026,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return fn.Args()[0];
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (canonicalize_comparison_and_boolean_sound)
     built.Add(ExpressionRule(
         "canonicalize_boolean", Any(),
         [](const Expression& expression,
@@ -3266,6 +4038,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           const auto& binary = expression->AsBinaryExpression();
           if (binary.Op() != BinaryOperation::kEquals &&
               binary.Op() != BinaryOperation::kNotEquals) {
+            return Expression{};
+          }
+          if (!binary.Left() || !binary.Right()) {
             return Expression{};
           }
           const bool is_equals = binary.Op() == BinaryOperation::kEquals;
@@ -3333,6 +4108,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return UnaryExpressionExp(*boolean_side, UnaryOperation::kNot);
         }));
+    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "distribute_or_over_and_budgeted",
         Binary(BinaryOperation::kOr, Any("left"), Any("right")),
@@ -3386,6 +4163,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return CombineConjuncts(distributed);
         }));
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (int64_identities_negation_and_abs_sound)
     built.Add(ExpressionRule(
         "pow_identities", Any(),
         [](const Expression& expression,
@@ -3409,7 +4188,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           } else if (exponent.type == ValueType::kDouble) {
             is_one = exponent.value.double_value == 1.0;
           }
-          if (is_one) {
+          if (is_one && StaticallyNumeric(fn.Args()[0])) {
+            // POW on a non-numeric base is an error in the AST evaluator.
+            // CAST would silently accept strings, so only fold bases whose
+            // numeric type is already proven at rewrite time (a schema-free
+            // column cannot be proven here — leave the call intact for it).
             return CastExpressionExp(fn.Args()[0], "FLOAT64");
           }
           return Expression{};
@@ -3438,15 +4221,16 @@ StatusOr<Expression> ExpressionRewriter::TryRewrite(
     }
     current = std::move(next);
   }
-  static std::atomic<bool> warned{false};
-  if (!warned.exchange(true, std::memory_order_relaxed)) {
+  static std::atomic<uint64_t> occurrences{0};
+  const uint64_t nth = occurrences.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (nth == 1 || nth % 1000 == 0) {
     LOG(ERROR) << "expression rewrite did not converge within " << pass_limit
-               << " passes; returning the last stable form (D6)";
+               << " passes (occurrence " << nth
+               << "); returning the last stable form (D6)";
   }
   return current;
 }
 
-// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 Expression ExpressionRewriter::Rewrite(const Expression& expression) const {
   return ExcShimUnwrap(TryRewrite(expression), "ExpressionRewriter::Rewrite");
 }
@@ -3469,12 +4253,23 @@ StatusOr<Expression> ExpressionRewriter::TryRewriteOnce(
   bool children_changed = false;
   for (Expression& child : children) {
     ASSIGN_OR_RETURN(Expression, rewritten, TryRewriteOnce(child, depth + 1));
-    children_changed |= !Same(child, rewritten);
+    // P186: "changed" only gates rebuilding the parent node; rules return the
+    // input pointer when they do not fire, so pointer identity answers in
+    // O(1).  The old Same() call paid a full ToString() of both subtrees for
+    // every rewritten child on every pass.
+    children_changed |= rewritten.get() != child.get();
     child = std::move(rewritten);
   }
   Expression current =
       children_changed ? WithExpressionChildren(expression, std::move(children))
                        : expression;
+  // Hand-built or rewrite-damaged nodes can carry null children; the rules
+  // assume complete nodes and dereference operands freely, so treat a
+  // damaged node as opaque (its children were still visited above).
+  if (std::ranges::any_of(ExpressionChildren(current),
+                          [](const Expression& child) { return !child; })) {
+    return current;
+  }
   if (ContainsParameterSlot(current)) {
     return current;
   }
@@ -3778,7 +4573,9 @@ bool IsMinusOne(const Expression& expression) {
     return false;
   }
   if (constant.type == ValueType::kInt64) {
-    return constant.value.int_value == -1;
+    // UINT64_MAX shares the raw -1 bit pattern but is a different number;
+    // treating it as -1 would rewrite `x * UINT64_MAX` into `-x`.
+    return !constant.IsUnsigned() && constant.value.int_value == -1;
   }
   if (constant.type == ValueType::kDouble) {
     return constant.value.double_value == -1.0;
@@ -3791,7 +4588,10 @@ bool IsInt64Constant(const Expression& expression, int64_t* value) {
     return false;
   }
   const Value constant = expression->AsConstantValue().GetValue();
-  if (constant.type != ValueType::kInt64 || constant.IsNull()) {
+  // UINT64 shares the raw kInt64 bit pattern; reassociating it as signed would
+  // change the value (and overflow semantics). Only true signed constants.
+  if (constant.type != ValueType::kInt64 || constant.IsNull() ||
+      constant.IsUnsigned()) {
     return false;
   }
   *value = constant.value.int_value;
@@ -3826,7 +4626,9 @@ bool IsNumericOperand(const Expression& expression, const Schema& schema) {
 // Splits `tree` (whose root must be kBinaryExp) into a column leaf and an
 // accumulated INT64 constant when it is a +-chain of one column and integer
 // constants. Returns false for anything else, including trees whose
-// constant accumulation overflows INT64.
+// constant accumulation overflows INT64 and chains whose steps do not all
+// share a sign (a mixed-sign chain has an intermediate operation that can
+// raise on its own, so collapsing it would elide an AST-evaluator overflow).
 bool ColumnPlusConstantChain(const Expression& tree, const Schema& schema,
                              BinaryOperation* root_op, Expression* column,
                              int64_t* constant) {
@@ -3878,6 +4680,16 @@ bool ColumnPlusConstantChain(const Expression& tree, const Schema& schema,
       inner_op == BinaryOperation::kAdd ? inner_constant : -inner_constant;
   const int64_t outer_step =
       op == BinaryOperation::kAdd ? right_constant : -right_constant;
+  // Overflow monotonicity: the chain may only resolve into one accumulated
+  // constant when every step applied to the column shares a sign (the inner
+  // chain's own mixed pairs were refused by the recursion, so `inner_step`
+  // carries the common sign here). A mixed-sign chain such as
+  // `((x - 5) + 3) - 2` underflows on its `x - 5` intermediate for
+  // x = INT64_MIN + 4 where the collapsed `x - 4` would not, so resolving it
+  // as a whole would silently elide an AST-evaluator error (invariant 3).
+  if ((inner_step >= 0) != (outer_step >= 0)) {
+    return false;
+  }
   int64_t accumulated = 0;
   if (__builtin_add_overflow(inner_step, outer_step, &accumulated)) {
     return false;
@@ -3901,12 +4713,19 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
   bool children_changed = false;
   for (Expression& child : children) {
     Expression rewritten = RewriteTypedArithmetic(child, input_schema);
-    children_changed |= !Same(child, rewritten);
+    // P186: O(1) pointer-identity "changed" check (see TryRewriteOnce).
+    children_changed |= rewritten.get() != child.get();
     child = std::move(rewritten);
   }
   Expression current =
       children_changed ? WithExpressionChildren(expression, std::move(children))
                        : expression;
+  // Same damaged-node treatment as TryRewriteOnce: rules below dereference
+  // operands freely and must not meet null children.
+  if (std::ranges::any_of(ExpressionChildren(current),
+                          [](const Expression& child) { return !child; })) {
+    return current;
+  }
   if (ContainsParameterSlot(current)) {
     return current;
   }
@@ -3959,7 +4778,13 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
       Same(binary.Left(), binary.Right()) &&
       binary.Left()->Type() == TypeTag::kColumnValue &&
       IsNumericOperand(binary.Left(), input_schema)) {
-    // x + x -> x * 2. Exact doubling for integers and IEEE doubles.
+    // x + x -> x * 2. Exact doubling for integers and IEEE doubles. Unlike
+    // the schema-free combine_repeated_addend rule, this typed form deliberately
+    // includes dynamic INT64 columns: for a statically numeric column the
+    // current evaluator gives both spellings the same result (including the
+    // wraparound at the overflow boundary), so only the operator name in a
+    // hypothetical overflow diagnostic could differ. Test
+    // ExpressionRewriteTest.TypedSignAbsorptionAndRepeatedAddend pins this.
     return BinaryExpressionExp(
         binary.Left(), BinaryOperation::kMultiply,
         ConstantValueExp(Value(static_cast<int64_t>(2))));
@@ -3973,7 +4798,10 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
   // reassociate steps that share a sign: with opposite signs the original
   // intermediate operation can overflow (x = INT64_MAX in `(x + 5) - 8`
   // raises on `x + 5`) while the folded `x - 3` would not, silently eliding
-  // an AST-evaluator error (invariant 3).
+  // an AST-evaluator error (invariant 3). ColumnPlusConstantChain applies
+  // the same sign discipline inside multi-level chains, so `inner_step`
+  // carries the chain's common sign and the check below compares it with
+  // the outer step.
   const BinaryOperation op = binary.Op();
   if (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract) {
     int64_t outer_constant = 0;
@@ -4062,21 +4890,25 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
       std::move(typed_zero));
 }
 
-std::vector<Expression> SplitConjuncts(  // NOLINT(misc-no-recursion)
-    const Expression& expression) {
-  if (!expression) {
-    return {};
+std::vector<Expression> SplitConjuncts(const Expression& expression) {
+  // T2405: iterative flattening, see SplitDisjuncts above for the rationale.
+  std::vector<Expression> parts;
+  std::vector<Expression> pending{expression};
+  while (!pending.empty()) {
+    const Expression node = std::move(pending.back());
+    pending.pop_back();
+    if (!node) {
+      continue;
+    }
+    if (node->Type() == TypeTag::kBinaryExp &&
+        node->AsBinaryExpression().Op() == BinaryOperation::kAnd) {
+      pending.push_back(node->AsBinaryExpression().Right());
+      pending.push_back(node->AsBinaryExpression().Left());
+    } else {
+      parts.push_back(node);
+    }
   }
-  if (expression->Type() == TypeTag::kBinaryExp &&
-      expression->AsBinaryExpression().Op() == BinaryOperation::kAnd) {
-    std::vector<Expression> left =
-        SplitConjuncts(expression->AsBinaryExpression().Left());
-    std::vector<Expression> right =
-        SplitConjuncts(expression->AsBinaryExpression().Right());
-    left.insert(left.end(), right.begin(), right.end());
-    return left;
-  }
-  return {expression};
+  return parts;
 }
 
 Expression CombineConjuncts(const std::vector<Expression>& expressions) {
@@ -4197,6 +5029,15 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
     case TypeTag::kCastExp:
       return ContainsNotOfOrderedDoubleComparison(
           expression->AsCastExpression().Child(), schema);
+    case TypeTag::kWindowFunctionExp:
+      // Window partition/order keys, arguments and frame offsets can all
+      // hide a NOT(ordered double comparison); inspect every child the
+      // same way the aggregate arm does.
+      return std::ranges::any_of(ExpressionChildren(expression),
+                                 [&schema](const Expression& child) {
+                                   return ContainsNotOfOrderedDoubleComparison(
+                                       child, schema);
+                                 });
     default:
       return false;
   }
@@ -4291,6 +5132,8 @@ ExtractWindowCalls(const Expression& expression, size_t* counter,
   return std::make_pair(std::move(*rewritten), std::move(specs));
 }
 
+// Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+//   (repairedIsStrict_sound, cpp_empty_in_isFalse_bug)
 bool IsNullStrictWhere(
     const Expression& expression,  // NOLINT(misc-no-recursion)
     const std::function<bool(const ColumnName&)>& match_column,
@@ -4332,10 +5175,11 @@ bool IsNullStrictWhere(
       }
       return false;
     }
-    case TypeTag::kInExp:
-      return in_exp_is_strict &&
-             IsNullStrictWhere(expression->AsInExpression().child_,
-                               match_column, in_exp_is_strict);
+    case TypeTag::kInExp: {
+      const auto& in = expression->AsInExpression();
+      return in_exp_is_strict && !in.list_.empty() &&
+             IsNullStrictWhere(in.child_, match_column, in_exp_is_strict);
+    }
     case TypeTag::kFunctionCallExp: {
       const auto& function = expression->AsFunctionCallExpression();
       const std::string& name = function.FuncName();

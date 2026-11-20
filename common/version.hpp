@@ -28,10 +28,10 @@ namespace tinylamb {
 // MVCC read alignment: each memtable flush / per-row write can be stamped with
 // a version taken from this counter, so versions are COMPARABLE ACROSS all
 // partitions and tables (unlike MemTable's per-instance generation_ counter,
-// which is only meaningful within one table's read path). An executor that
-// pins a global read version V can then read every partition at V
-// concurrently, giving a consistent cross-partition snapshot without blocking
-// writers.
+// which is only meaningful within one table's read path). A future executor
+// could pin a global read version V to read every partition at V; that
+// cross-partition snapshot path is not yet wired up (global version mode has
+// no callers).
 inline uint64_t NextGlobalVersion() {
   static std::atomic<uint64_t> counter{0};
   return counter.fetch_add(1, std::memory_order_relaxed) + 1;

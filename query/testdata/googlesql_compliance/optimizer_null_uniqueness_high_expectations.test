@@ -139,7 +139,7 @@ ARRAY<STRUCT<parent_id INT64, label STRING>>[
 
 [mode=explain]
 [plan_contains=JoinElimination]
-[name=foreign_key_join_eliminated_when_parent_columns_unused]
+[name=join_elimination_when_parent_columns_unused]
 SELECT c.child_id, c.value
 FROM opt_unique_child c JOIN opt_unique_parent p
 ON c.parent_id = p.parent_id
@@ -235,7 +235,7 @@ ARRAY<STRUCT<INT64>>[{1}]
 [plan_contains=JoinElimination]
 [plan_not_contains=opt_unique_parent]
 [plan_not_contains=opt_unique_child]
-[name=multi_hop_foreign_key_join_eliminated]
+[name=multi_hop_join_elimination]
 SELECT gc.gc_id, gc.note
 FROM opt_unique_grandchild gc
 JOIN opt_unique_child c ON gc.child_id = c.child_id

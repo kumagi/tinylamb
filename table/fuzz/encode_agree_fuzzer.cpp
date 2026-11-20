@@ -63,21 +63,40 @@ constexpr size_t kForceCount = kForceNames.size();
 
 class ForceGuard {
  public:
+  // T4270: save/restore the previous TINYLAMB_FORCE_SCHEME (ScopedEnvVar
+  // style) instead of blanket-unsetting, so nesting or an externally set
+  // scheme survives the guard.
   explicit ForceGuard(const char* name) {
+    const char* prev = std::getenv("TINYLAMB_FORCE_SCHEME");
+    if (prev != nullptr) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
     if (name != nullptr) {
       setenv("TINYLAMB_FORCE_SCHEME", name, 1);
     } else {
       unsetenv("TINYLAMB_FORCE_SCHEME");
     }
   }
-  ~ForceGuard() { unsetenv("TINYLAMB_FORCE_SCHEME"); }
+  ~ForceGuard() {
+    if (had_prev_) {
+      setenv("TINYLAMB_FORCE_SCHEME", prev_.c_str(), 1);
+    } else {
+      unsetenv("TINYLAMB_FORCE_SCHEME");
+    }
+  }
   ForceGuard(const ForceGuard&) = delete;
   ForceGuard& operator=(const ForceGuard&) = delete;
   ForceGuard(ForceGuard&&) = delete;
   ForceGuard& operator=(ForceGuard&&) = delete;
+
+ private:
+  bool had_prev_{false};
+  std::string prev_;
 };
 
-std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
+std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n,
+                          uint8_t salt) {
   std::vector<Row> rows;
   rows.reserve(n);
   const bool narrow = (shape & 1) != 0;
@@ -90,7 +109,9 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
   for (uint32_t i = 0; i < n; ++i) {
     std::vector<Value> vals;
     vals.reserve(sc.ColumnCount());
-    vals.emplace_back(static_cast<int64_t>(i));
+    // Salt from data[3] keeps rows sorted while making later input bytes
+    // observable to the fuzzer (they previously did nothing).
+    vals.emplace_back((static_cast<int64_t>(i) << 8) | salt);
     for (slot_t c = 1; c < sc.ColumnCount(); ++c) {
       switch (sc.GetColumn(c).Type()) {
         case ValueType::kVarChar: {
@@ -187,7 +208,7 @@ int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size) {
   const uint32_t n = kCounts[data[2] % kCounts.size()];
 
   const Schema sc = MakeStorageSchema();
-  const std::vector<Row> rows = MakeRows(sc, shape, n);
+  const std::vector<Row> rows = MakeRows(sc, shape, n, data[3]);
   PaxChunk chunk;
   {
     ForceGuard guard(force);

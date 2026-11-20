@@ -81,8 +81,10 @@ class FunctionCallExpression : public ExpressionBase {
  public:
   FunctionCallExpression(std::string func_name, std::vector<Expression> args)
       : func_name_(std::move(func_name)), args_(std::move(args)) {
-    std::ranges::transform(func_name_, func_name_.begin(), [](unsigned char c) {
-      return static_cast<char>(std::tolower(c));
+    // ASCII-only lowering: std::tolower follows the global C locale, so a
+    // non-C locale could mangle built-in function names (e.g. Turkish 'I').
+    std::ranges::transform(func_name_, func_name_.begin(), [](char c) {
+      return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
     });
   }
 
@@ -112,7 +114,7 @@ class FunctionCallExpression : public ExpressionBase {
   [[nodiscard]] const std::vector<Expression>& Args() const { return args_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
-  [[nodiscard]] TypeTag Type() const override {
+  [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kFunctionCallExp;
   }
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;

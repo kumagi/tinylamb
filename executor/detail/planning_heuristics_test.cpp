@@ -211,7 +211,6 @@ TEST(PlanningHeuristicsTest,
   hop2_idx->source_table = hop1_tbl;
   hop2_idx->src_chunks = {0, 0, 0, 0};
   hop2_idx->src_rows = {1, 0, 2, 0};
-  hop2_idx->src_chunks[1] = 0;
   hop2_idx->src_rows[1] = relational_detail::ChunkGatherIndex::kNullRow;
   hop2_idx->has_null = true;
 

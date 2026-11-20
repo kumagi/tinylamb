@@ -1,6 +1,6 @@
 # empty
 
-- 状態: draft   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft   /   執筆基準リビジョン: `72ad60a` (2026-11-19)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の登録 `"empty"`（パターンは `cascades::dsl::Empty()`）
 
 ## 概要
@@ -51,14 +51,22 @@ if (children.size() != 1) {
 また、0 行のリレーションは数学的にあらゆる順序要求や一意性要求を自明に満たすため、以下のプロパティ充足契約を持ちます。
 
 ```cpp
-[[nodiscard]] bool IsOrderedBy(
-    const std::vector<Expression>& /*expressions*/,
-    const std::vector<bool>& /*ascending*/) const override {
-  // An empty relation satisfies every ordering requirement.
-  return true;
-}
-[[nodiscard]] bool EnforcesLimit() const override { return true; }
-[[nodiscard]] bool EnforcesDistinct() const override { return true; }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& /*expressions*/,
+      const std::vector<bool>& /*ascending*/) const override {
+    return true;
+  }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& /*expressions*/,
+      const std::vector<bool>& /*ascending*/,
+      const std::vector<std::optional<bool>>& /*nulls_first*/) const override {
+    return true;
+  }
+  [[nodiscard]] bool EnforcesLimit(size_t /*limit_count*/,
+                                   size_t /*limit_offset*/) const override {
+    return true;
+  }
+  [[nodiscard]] bool EnforcesDistinct() const override { return true; }
 ```
 
 この契約により、上位演算子からの順序要求（`ordering`）や行制限要求（`limit`）、重複排除要求（`distinct`）に対して、追加のソートや集約ノードを挿入することなく即座に要求を充足させます。

@@ -187,6 +187,16 @@ tinylamb::Expression RewriteCse(  // NOLINT(misc-no-recursion)
 
 namespace tinylamb {
 
+std::optional<Projection::Int64Affine> Projection::ResolveInt64Affine(
+    const Expression& expression, const Schema& input_schema) {
+  Int64Affine result;
+  if (!expression || !Affine(expression, input_schema, &result.column,
+                             &result.multiplier, &result.addend)) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 Projection::Projection(std::vector<NamedExpression> expressions,
                        Schema input_schema, Executor src,
                        size_t jit_threshold_rows)
@@ -250,6 +260,7 @@ Projection::Projection(std::vector<NamedExpression> expressions,
                             &state.column, &state.multiplier, &state.addend);
     state.branchless_eligible =
         BytecodeEnabled() && bytecodes_[index].has_value() &&
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
         bytecodes_[index]->ResultType() == ValueType::kInt64;
   }
 }
@@ -420,25 +431,30 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
         for (size_t r = 0; r < inputs.size(); ++r) {
           int64_t product = 0;
           int64_t projected = 0;
-          if (__builtin_mul_overflow(inputs[r], jit.multiplier, &product) ||
-              __builtin_add_overflow(product, jit.addend, &projected)) {
-            FailWith(StatusError(StatusCode::kIsInfinity,
-
+          // T560: the canonical INT64 overflow raise is
+          // kInvalidArgument "integer overflow on '<op>'" (type/value.cpp);
+          // report the operator that actually overflowed instead of
+          // blaming '*' for a combined mul||add test.
+          if (__builtin_mul_overflow(inputs[r], jit.multiplier, &product)) {
+            FailWith(StatusError(StatusCode::kInvalidArgument,
                                  "integer overflow on '*'"));
+            return 0;
+          }
+          if (__builtin_add_overflow(product, jit.addend, &projected)) {
+            FailWith(StatusError(StatusCode::kInvalidArgument,
+                                 "integer overflow on '+'"));
             return 0;
           }
           output[r] = projected;
         }
       }
       if (mul_overflow) {
-        FailWith(StatusError(StatusCode::kIsInfinity,
-
+        FailWith(StatusError(StatusCode::kInvalidArgument,
                              "integer overflow on '*'"));
         return 0;
       }
       if (add_overflow) {
-        FailWith(StatusError(StatusCode::kIsInfinity,
-
+        FailWith(StatusError(StatusCode::kInvalidArgument,
                              "integer overflow on '+'"));
         return 0;
       }

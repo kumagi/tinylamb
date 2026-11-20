@@ -135,28 +135,30 @@ Value CanonicalDistinctValue(const Value& value) {
   return value;
 }
 
+namespace {
+// Single source of truth for group-key cell equality (NaN peers, -0/+0).
+bool GroupKeyCellEqual(const Value& x, const Value& y) {
+  if (x.type != y.type) {
+    return false;
+  }
+  if (x.type == ValueType::kDouble) {
+    const double p = x.value.double_value;
+    const double q = y.value.double_value;
+    if (std::isnan(p) && std::isnan(q)) {
+      return true;
+    }
+    return p == q;
+  }
+  return x == y;
+}
+}  // namespace
+
 bool GroupKeyEqual::operator()(const Row& a, const Row& b) const {
   if (a.values_.size() != b.values_.size()) {
     return false;
   }
   for (size_t i = 0; i < a.values_.size(); ++i) {
-    const Value& x = a.values_[i];
-    const Value& y = b.values_[i];
-    if (x.type != y.type) {
-      return false;
-    }
-    if (x.type == ValueType::kDouble) {
-      const double p = x.value.double_value;
-      const double q = y.value.double_value;
-      if (std::isnan(p) && std::isnan(q)) {
-        continue;
-      }
-      if (!(p == q)) {
-        return false;
-      }
-      continue;
-    }
-    if (!(x == y)) {
+    if (!GroupKeyCellEqual(a.values_[i], b.values_[i])) {
       return false;
     }
   }
@@ -186,7 +188,7 @@ bool GroupKeyTransparentEqual::operator()(const std::vector<Value>& a,
     return false;
   }
   for (size_t i = 0; i < a.size(); ++i) {
-    if (!(a[i] == b.values_[i])) {
+    if (!GroupKeyCellEqual(a[i], b.values_[i])) {
       return false;
     }
   }
@@ -374,7 +376,21 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
   if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
     return false;
   }
-  const std::string needle = "\"" + std::string(key) + "\":";
+  // Build the search key on the stack for typical short field names; only
+  // unusually long keys fall back to a heap allocation.
+  char needle_buf[256];  // NOLINT(modernize-avoid-c-arrays)
+  std::string needle_owned;
+  std::string_view needle;
+  if (key.size() + 3 <= sizeof(needle_buf)) {
+    needle_buf[0] = '"';
+    std::memcpy(needle_buf + 1, key.data(), key.size());
+    needle_buf[key.size() + 1] = '"';
+    needle_buf[key.size() + 2] = ':';
+    needle = std::string_view(needle_buf, key.size() + 3);
+  } else {
+    needle_owned = "\"" + std::string(key) + "\":";
+    needle = needle_owned;
+  }
   auto top_level_prefix = [](std::string_view text) {
     int depth = 0;
     bool in_string = false;
@@ -674,6 +690,8 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
         return std::to_string(v.value.int_value);
       case ValueType::kDouble:
         return FormatDoubleShortest(v.value.double_value);
+      case ValueType::kDate:
+        return "\"__tinylamb_date__:" + FormatDateDays(v.value.int_value) + "\"";
       case ValueType::kVarChar:
         if (v.value.varchar_value.size() >= 2 &&
             ((v.value.varchar_value.front() == '{' &&
@@ -686,7 +704,7 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
           return "{" + NormalizeProtoText(v.value.varchar_value).value_or("") +
                  "}";
         }
-        return "\"" + std::string(v.value.varchar_value) + "\"";
+        return json_text::EncodeJsonString(v.value.varchar_value);
       case ValueType::kArray: {
         std::string inner;
         const std::vector<Value>& elements = v.ArrayElements();
@@ -706,7 +724,13 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
               inner += FormatDoubleShortest(element.value.double_value);
               break;
             case ValueType::kVarChar:
-              inner += "\"" + std::string(element.value.varchar_value) + "\"";
+              inner += json_text::EncodeJsonString(element.value.varchar_value);
+              break;
+            case ValueType::kDate:
+              // ScalarFromText decodes this marker back to a DATE; without it
+              // a row-encoded DATE is read back as a plain INT64 day count.
+              inner += "\"__tinylamb_date__:" +
+                       FormatDateDays(element.value.int_value) + "\"";
               break;
             default:
               inner += element.AsString();
@@ -719,6 +743,9 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
     }
   };
   std::string json = "{";
+  // One append chain per field instead of several temporary concatenations,
+  // and a capacity hint to avoid repeated full-string reallocations.
+  json.reserve(2 + row.values_.size() * 32);  // NOLINT(readability-math-missing-parentheses)
   for (size_t i = 0; i < row.values_.size(); ++i) {
     if (i > 0) {
       json += ",";
@@ -730,7 +757,10 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
     if (key.empty()) {
       key = "f" + std::to_string(i + 1);
     }
-    json += "\"" + key + "\":" + scalar_to_json(row.values_[i]);
+    json.push_back('"');
+    json.append(key);
+    json.append("\":");
+    json.append(scalar_to_json(row.values_[i]));
   }
   json += "}";
   return Value(std::move(json));
@@ -1375,10 +1405,11 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
                                      &field)) {
               return field;
             }
-            // A one-column value table's alias denotes the value itself, not
-            // a synthetic STRUCT keyed by the physical column name.
-            if (candidate.value.varchar_value.empty() ||
-                !candidate.value.varchar_value.starts_with("{")) {
+            // A one-column PROTO/value table's alias denotes the value itself
+            // when the single cell is a proto-text scalar. A plain VARCHAR
+            // column must still resolve as a one-field row STRUCT: returning
+            // the raw cell lets `alias` silently substitute for `alias.col`.
+            if (LooksLikeProtoText(candidate.value.varchar_value)) {
               return candidate;
             }
           }
@@ -1502,14 +1533,23 @@ bool Like(std::string_view value, std::string_view pattern) {
     if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
       wildcard = pattern_pos++;
       retry = value_pos;
+    } else if (pattern_pos < pattern.size() && pattern[pattern_pos] == '_') {
+      // '_' matches one whole UTF-8 character, not one byte (matching the
+      // canonical expression/binary_expression.cpp Like implementation).
+      value_pos += std::min(
+          Utf8SequenceLength(static_cast<unsigned char>(value[value_pos])),
+          value.size() - value_pos);
+      ++pattern_pos;
     } else if (pattern_pos < pattern.size() &&
-               (pattern[pattern_pos] == '_' ||
-                pattern[pattern_pos] == value[value_pos])) {
+               pattern[pattern_pos] == value[value_pos]) {
       ++value_pos;
       ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
       pattern_pos = wildcard + 1;
-      value_pos = ++retry;
+      retry += std::min(
+          Utf8SequenceLength(static_cast<unsigned char>(value[retry])),
+          value.size() - retry);
+      value_pos = retry;
     } else {
       return false;
     }
@@ -1607,10 +1647,23 @@ Status ValidateExpressionColumnsInScope(const Expression& expression,
   return Status::kSuccess;
 }
 
+// Rewrites can deepen expression trees past the parser bound; Bytecode/JIT
+// reject overly deep trees, so the AST fallback must too.
+constexpr size_t kMaxEvalDepth = 512;
+thread_local size_t tls_eval_depth = 0;
+struct EvalDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+  EvalDepthGuard() { ++tls_eval_depth; }
+  ~EvalDepthGuard() { --tls_eval_depth; }
+};
+
 StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
     const Expression& expression, const Scope& scope,
     const AggregateResultMap* aggregates, TransactionContext& context,
     const CteMap& ctes) {
+  if (tls_eval_depth >= kMaxEvalDepth) {
+    return Status::kInvalidArgument;
+  }
+  EvalDepthGuard depth_guard;
   switch (expression->Type()) {
     case TypeTag::kColumnValue: {
       const ColumnName& name = expression->AsColumnValue().GetColumnName();
@@ -1754,7 +1807,13 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       const auto& array = expression->AsArrayExpression();
       std::vector<Value> elements;
       elements.reserve(array.Elements().size());
-      std::string inferred_type = array.ElementSqlType();
+      // T3121: track the derived element type as a view; the declared type
+      // (ArrayExpression member, stable for the loop) and every override
+      // literal fit without allocation, so only Value::Array()'s by-value
+      // sink ever copies -- the old eager std::string copy ran per array
+      // evaluation (per row) on top of that sink.
+      std::string_view inferred_type = array.ElementSqlType();
+      std::string nested_type;  // only materialized for ARRAY<...> overrides
       for (const Expression& element : array.Elements()) {
         ASSIGN_OR_RETURN(
             Value, val,
@@ -1768,15 +1827,15 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           } else if (val.type == ValueType::kDate) {
             inferred_type = "DATE";
           } else if (val.IsArray()) {
-            inferred_type = "ARRAY<" + val.ArrayElementSqlType() + ">";
+            nested_type = "ARRAY<" + val.ArrayElementSqlType() + ">";
+            inferred_type = nested_type;
           }
         }
         elements.push_back(std::move(val));
       }
-      if (inferred_type.empty()) {
-        inferred_type = "INT64";
-      }
-      return Value::Array(std::move(elements), inferred_type);
+      return Value::Array(
+          std::move(elements),
+          inferred_type.empty() ? "INT64" : std::string(inferred_type));
     }
     case TypeTag::kCastExp: {
       const auto& cast = expression->AsCastExpression();
@@ -1911,7 +1970,10 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           relation = correlated_apply_result.get();
         }
       }
-      auto& row_source = const_cast<Relation&>(*relation);
+      // ForEachRow is const; no need to strip const here (the previous
+      // const_cast disguised the hidden FinishSpill mutation instead of
+      // serving any mutable call).
+      const Relation& row_source = *relation;
       bool as_struct = value.Query()->AsStruct();
       if (!as_struct && value.Test() && value.Mode() == QuantifierMode::kIn &&
           relation->schema.ColumnCount() != 1) {
@@ -2101,7 +2163,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           if (row.values_.empty()) {
             return;
           }
-          elements.push_back(ProjectSubqueryRow(row, as_struct));
+          elements.push_back(ProjectSubqueryRow(row, as_struct, &subquery_schema));
         });
         std::string element_type = value.ArrayElementSqlType();
         if (element_type.empty()) {

@@ -799,7 +799,7 @@ struct S4Region {
   const char* widths{nullptr};  // nblk width bytes
   const char* lows{nullptr};    // nblk FOR bases, 8B BE each
   const char* ckpt{
-      nullptr};  // nblk-1 words: the value of each block's first row
+      nullptr};  // nblk-1 words: the value of the row BEFORE each block (b>=1)
   const char* payload{nullptr};  // per-block payloads, each byte-aligned
   uint32_t n{0};
   uint32_t nblk{0};
@@ -1612,7 +1612,7 @@ void QppFillRangeMask(const QppRegion& region, ScanOp op, int64_t literal,
 void DecodeQppAll(const QppRegion& region, int64_t* out);
 uint32_t HuffDictLenAtRaw(const uint8_t* lens, uint32_t s);
 uint32_t HuffDictLenAt(const HuffDictRegion& r, uint32_t s);
-int64_t HuffDictDictAt(const HuffDictRegion& r, uint32_t s);
+int64_t HuffDictAt(const HuffDictRegion& r, uint32_t s);
 uint32_t HuffDictFreqAt(const HuffDictRegion& r, uint32_t s);
 void HuffDictBuildTables(const HuffDictRegion& r, HuffDictTables* t);
 uint32_t HuffDictDecodeSym(const HuffDictTables& t, WordBitReader& br);

@@ -456,11 +456,48 @@ struct BaseRelationArena {
   bool published_rowsless{false};
   bool rows_boxed{false};
 
+ private:
+  // column -> index among VARCHAR slots; rebuilt lazily whenever
+  // slot_types changes size (set-once at publish in practice).
+  std::vector<size_t> varchar_ordinal_cache;
+  void BuildVarcharOrdinalCache() {
+    varchar_ordinal_cache.assign(slot_types.size(), 0);
+    size_t ordinal = 0;
+    for (size_t i = 0; i < slot_types.size(); ++i) {
+      varchar_ordinal_cache[i] = ordinal;
+      if (slot_types[i] == ValueType::kVarChar) {
+        ++ordinal;
+      }
+    }
+  }
+
+ public:
+  // Builds the VARCHAR ordinal cache.  Call from a single-threaded phase
+  // (after slot_types is final, before workers read the arena).
+  void PrepareVarcharOrdinals() {
+    if (varchar_ordinal_cache.size() != slot_types.size()) {
+      BuildVarcharOrdinalCache();
+    }
+  }
   [[nodiscard]] bool IsNull(size_t row, size_t column) const {
     return ((null_bits[column][row >> 6] >> (row & 63)) & 1U) != 0U;
   }
-  // VARCHAR ordinal of `column` (its index among VARCHAR slots).
+  // VARCHAR ordinal of `column` (its index among VARCHAR slots).  T2424:
+  // the mapping depends only on slot_types, so it is cached instead of a
+  // linear re-count per call — MaterializeArenaRange and the filter paths
+  // hit this once per VARCHAR cell, which made boxing rows back O(rows x
+  // varchar_columns x stride).
+  //
+  // The cache is a lazily-filled member of a const object that parallel
+  // workers share (MaterializeCacheRowsParallel), so it is only ever built
+  // from a single-threaded phase via PrepareVarcharOrdinals(); a stale cache
+  // here falls back to the linear count instead of writing (TSAN: concurrent
+  // BuildVarcharOrdinalCache from boxing workers).
   [[nodiscard]] size_t VarcharOrdinal(size_t column) const {
+    if (varchar_ordinal_cache.size() == slot_types.size() &&
+        column < varchar_ordinal_cache.size()) {
+      return varchar_ordinal_cache[column];
+    }
     size_t ordinal = 0;
     for (size_t i = 0; i < column; ++i) {
       if (slot_types[i] == ValueType::kVarChar) {
@@ -564,7 +601,17 @@ struct ExecutionRuntime {
     const void* outer_filter_relation{nullptr};
     uint64_t outer_filter_serial{0};
   };
+  // T2426: published sibling-build shares are retained for the whole
+  // execution.  Keys vary with projection + correlation column spellings,
+  // so an unbounded map is a third uncharged retain (same family P244
+  // counted for correlated_apply_results / cached_results): cap the entry
+  // count and the total retained rows.  A build that cannot publish just
+  // keeps its private rows — sharing is a pure optimization, so the cap
+  // can never change results, only memory held after publish.
+  static constexpr size_t kMaxSharedExistsBuilds = 32;
+  static constexpr size_t kMaxSharedExistsRetainedRows = 4'000'000;
   std::unordered_map<std::string, SharedExistsBuild> shared_exists_builds;
+  size_t shared_exists_retained_rows{0};
   size_t shared_exists_build_reuses{0};
   std::unordered_set<const SelectStatement*> unindexable_queries;
   std::unordered_map<const SelectStatement*, RelationPtr> uncorrelated_results;
@@ -847,11 +894,17 @@ class ScopedCorrelatedOuter {
 // Builds a sound pre-decode domain filter for one correlation equality
 // (`source_schema[local_column] = outer_column`) from the distinct non-NULL
 // values of `outer_column` in the registered outer relation.  Returns
-// std::nullopt when no outer context is registered, the outer column does not
-// resolve there, the correlation column is not INT64/DATE, the domain is too
-// large to be worth extracting, or `local_column` does not map into
-// `projection` (the filter binds by projection position).  The filter column
-// indexes the projection layout, matching the LoadSource contract.
+// std::nullopt as an outright bail-out when the feature is disabled via
+// TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER, no outer context is registered,
+// `local_column` is not a column of `source_schema`, the outer column does
+// not resolve in the outer context, the correlation column is not INT64/DATE,
+// or `local_column` does not map into `projection` (the filter binds by
+// projection position).  It also declines (nullopt) after inspecting the
+// outer build side when that side has spilled (a spilled outer is never
+// domain-extracted), holds zero rows or more than 2,000,000 rows, yields an
+// empty or overflowed key builder, or produces more than 1,000,000 distinct
+// keys (a domain too large to be worth extracting).  The filter column indexes
+// the projection layout, matching the LoadSource contract.
 std::optional<ScanRuntimeFilter> CorrelationDomainFilter(
     const Schema& source_schema, slot_t local_column,
     const ColumnName& outer_column, const std::vector<slot_t>& projection,

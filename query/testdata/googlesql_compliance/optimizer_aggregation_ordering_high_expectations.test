@@ -186,7 +186,7 @@ ARRAY<STRUCT<dept_id INT64, n INT64, total INT64>>[
 # conversion and index-order propagation are follow-ups).
 [plan_contains=WindowExecutor(outputs=1)]
 [plan_contains=Selection: ($win0 <= 2)]
-[name=row_number_qualify_uses_partitioned_topn]
+[name=row_number_qualify_plan_shape]
 SELECT dept_id, sale_id, amount
 FROM opt_sales
 QUALIFY ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY amount DESC) <= 2

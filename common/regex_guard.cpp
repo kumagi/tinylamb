@@ -5,13 +5,47 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <new>
+#include <span>
 #include <utility>
+
+#include "common/string_util.hpp"
 #ifdef TINYLAMB_HAVE_RE2
 #include <re2/re2.h>
 #endif
 
 namespace tinylamb {
 namespace {
+
+// P464 test hook: full CompileReplacement() executions (cache misses) on
+// this thread.  Exposed via ReplacementProgramFullCompilesForTest().
+thread_local size_t g_replacement_full_compiles = 0;
+std::string Utf8RegexPattern(std::string_view pattern) {
+  // std::regex searches bytes. An unescaped wildcard in a STRING pattern
+  // consumes a full code point; in a BYTES pattern it consumes one byte.
+  constexpr std::string_view dot =
+      R"((?:[\x00-\x09\x0B-\x7F]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}))";
+  std::string converted;
+  bool in_class = false;
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    const char ch = pattern[i];
+    if (ch == '\\' && i + 1 < pattern.size()) {
+      converted.append(pattern.substr(i, 2));
+      ++i;
+    } else if (ch == '.' && !in_class) {
+      converted.append(dot);
+    } else {
+      converted.push_back(ch);
+      if (ch == '[') {
+        in_class = true;
+      } else if (ch == ']') {
+        in_class = false;
+      }
+    }
+  }
+  return converted;
+}
+
 bool IsAsciiAlphaNumeric(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
          (c >= '0' && c <= '9');
@@ -127,6 +161,45 @@ class LinearPrefixVM {
     }
     captures[0] = input;
     return true;
+  }
+
+  [[nodiscard]] std::optional<DelimitedRegexCapture> DescribeDelimitedCapture(
+      uint8_t capture) const {
+    if (!accept_prefix_ || capture == 0 || steps_.size() < 4) {
+      return std::nullopt;
+    }
+    const size_t end = steps_.size();
+    const Step& open = steps_[end - 4];
+    const Step& run = steps_[end - 3];
+    const Step& close = steps_[end - 2];
+    const Step& stop = steps_[end - 1];
+    if (open.kind != StepKind::kCaptureStart || open.capture_id != capture ||
+        run.kind != StepKind::kCharClassPlus || run.excluded_byte < 0 ||
+        close.kind != StepKind::kCaptureEnd || close.capture_id != capture ||
+        stop.kind != StepKind::kLiteral || stop.literal.size() != 1 ||
+        static_cast<uint8_t>(stop.literal.front()) != run.excluded_byte) {
+      return std::nullopt;
+    }
+    DelimitedRegexCapture description{
+        .prefixes = {""}, .delimiter = static_cast<uint8_t>(run.excluded_byte)};
+    for (const Step& step : std::span(steps_).first(end - 4)) {
+      if (step.kind == StepKind::kLiteral) {
+        for (auto& prefix : description.prefixes) {
+          prefix += step.literal;
+        }
+      } else if (step.kind == StepKind::kOptLiteral &&
+                 description.prefixes.size() < 8) {
+        std::vector<std::string> alternatives;
+        for (const auto& prefix : description.prefixes) {
+          alternatives.push_back(prefix + step.literal);
+          alternatives.push_back(prefix);
+        }
+        description.prefixes = std::move(alternatives);
+      } else {
+        return std::nullopt;
+      }
+    }
+    return description;
   }
 
  private:
@@ -729,9 +802,16 @@ StatusOr<const ReplacementProgram*> LookupOrCompileReplacement(
     std::string pattern;
     std::string replacement;
     ReplacementProgram program;
+    size_t bytes = 0;
   };
+  // P464: the old gate dropped programs over 4096 bytes of pattern *or*
+  // replacement from the cache, forcing a full recompile (nested-repetition
+  // scan + std::regex + RE2) per row for a stable large replacement
+  // template.  Cache any program whose conservative size estimate fits the
+  // per-thread budget, evicting round-robin-oldest entries as needed.
   static thread_local std::array<std::optional<Entry>, 8> cache;
   static thread_local size_t next = 0;
+  static thread_local size_t used = 0;
   for (const auto& entry : cache) {
     if (entry && entry->pattern == pattern &&
         entry->replacement == replacement) {
@@ -740,17 +820,132 @@ StatusOr<const ReplacementProgram*> LookupOrCompileReplacement(
   }
   ASSIGN_OR_RETURN(ReplacementProgram, compiled,
                    CompileReplacement(pattern, replacement));
-  if (pattern.size() <= 4096 && replacement.size() <= 4096) {
-    auto& entry =
-        cache[next].emplace(Entry{.pattern = std::string(pattern),
-                                  .replacement = std::string(replacement),
-                                  .program = std::move(compiled)});
+  ++g_replacement_full_compiles;
+  size_t bytes = pattern.size() + replacement.size() + compiled.format.size() +
+                 (size_t{1} << 10);
+#ifdef TINYLAMB_HAVE_RE2
+  if (compiled.linear != nullptr) {
+    // The compile path caps RE2 at max_mem = 1 MiB; book the full cap.
+    bytes += size_t{1} << 20;
+  }
+#endif
+  // 8 entries x (1 MiB RE2 cap + text) worst case.  The entries outlive any
+  // single query (thread-local), so they are budgeted here rather than
+  // charged to the per-query kQuery pool, which small OOC budgets would
+  // wedge.
+  constexpr size_t kProgramCacheBudget = size_t{8} << 20;
+  if (bytes <= kProgramCacheBudget) {
+    // `next` is the FIFO head; free entries until this one fits.
+    for (;;) {
+      auto& slot = cache[next];
+      if (!slot && used + bytes <= kProgramCacheBudget) {
+        break;
+      }
+      if (slot) {
+        used -= slot->bytes;
+        slot.reset();
+      }
+      next = (next + 1) % cache.size();
+    }
+    auto& entry = cache[next].emplace(
+        Entry{.pattern = std::string(pattern),
+              .replacement = std::string(replacement),
+              .program = std::move(compiled),
+              .bytes = bytes});
+    used += bytes;
     next = (next + 1) % cache.size();
     return &entry.program;
   }
   return &temporary->emplace(std::move(compiled));
 }
 }  // namespace
+
+StatusOr<int64_t> CheckedRegexPosition(std::string_view input,
+                                       std::string_view pattern,
+                                       int64_t position, int64_t occurrence,
+                                       int64_t return_position,
+                                       bool byte_mode) try {
+  if (position <= 0 || occurrence <= 0) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "REGEXP_INSTR position and occurrence must be positive");
+  }
+  if (return_position != 0 && return_position != 1) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "REGEXP_INSTR occurrence_position must be 0 or 1");
+  }
+  if (pattern.empty()) {
+    return int64_t{0};
+  }
+
+  // Validate repetition on the source pattern. The wildcard expansion has
+  // one disjoint, fixed-width alternative for each possible lead byte.
+  ASSIGN_OR_RETURN(
+      std::regex, compiled,
+      byte_mode || pattern.find('.') == std::string_view::npos
+          ? CompileCheckedRegex(std::string(pattern))
+          : regex_guard_detail::CompileCheckedPattern<Utf8RegexPattern>(
+                std::string(pattern)));
+  const size_t group = compiled.mark_count();
+  if (group > 1) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "REGEXP_INSTR supports at most one capturing group");
+  }
+  if (std::cmp_greater(position, input.size())) {
+    return int64_t{0};
+  }
+  auto start = static_cast<size_t>(position - 1);
+  if (!byte_mode) {
+    start = 0;
+    for (int64_t i = 1; i < position && start < input.size(); ++i) {
+      start += Utf8SequenceLength(static_cast<unsigned char>(input[start]));
+    }
+    if (start >= input.size()) {
+      return int64_t{0};
+    }
+  }
+
+  const char* const begin = input.data();
+  std::cregex_iterator current(begin + start, begin + input.size(), compiled);
+  const std::cregex_iterator end;
+  for (; current != end && occurrence > 1; --occurrence) {
+    ++current;
+  }
+  if (current == end || !(*current)[group].matched) {
+    return int64_t{0};
+  }
+  const auto& match = (*current)[group];
+  const char* const boundary =
+      return_position == 0 ? match.first : match.second;
+  if (byte_mode) {
+    return static_cast<int64_t>(boundary - begin) + 1;
+  }
+  return static_cast<int64_t>(std::count_if(
+             begin, boundary,
+             [](char ch) {
+               return (static_cast<unsigned char>(ch) & 0xC0U) != 0x80U;
+             })) +
+         1;
+} catch (const std::bad_alloc&) {
+  return StatusError(StatusCode::kMemoryLimitExceeded,
+                     "REGEXP_INSTR ran out of memory");
+} catch (const std::regex_error&) {
+  return StatusError(StatusCode::kInvalidArgument, "REGEXP_INSTR failed");
+}
+
+StatusOr<std::optional<DelimitedRegexCapture>> DescribeDelimitedRegexCapture(
+    std::string_view pattern, std::string_view replacement) try {
+  std::optional<ReplacementProgram> temporary;
+  ASSIGN_OR_RETURN(
+      const ReplacementProgram*, program,
+      LookupOrCompileReplacement(pattern, replacement, &temporary));
+  if (!program->prefix_vm || !program->single_capture) {
+    return std::nullopt;
+  }
+  return program->prefix_vm->DescribeDelimitedCapture(*program->single_capture);
+} catch (const std::bad_alloc&) {
+  return StatusError(StatusCode::kMemoryLimitExceeded,
+                     "regex capture description ran out of memory");
+}
 
 StatusOr<std::string_view> ReplaceCheckedRegexView(std::string_view input,
                                                    std::string_view pattern,
@@ -818,6 +1013,11 @@ StatusOr<std::string_view> ReplaceCheckedRegexView(std::string_view input,
   std::regex_replace(std::back_inserter(*scratch), input.begin(), input.end(),
                      program->compiled, program->format);
   return std::string_view(*scratch);
+} catch (const std::bad_alloc&) {
+  // T3722 (ADR 0012): an allocation failure is OOM, not an invalid
+  // pattern/replacement; keep the SQLSTATE mapping honest.
+  return StatusError(StatusCode::kMemoryLimitExceeded,
+                     "regular expression replacement ran out of memory");
 } catch (...) {
   return StatusError(StatusCode::kInvalidArgument,
                      "regular expression replacement failed");
@@ -835,9 +1035,20 @@ StatusOr<std::string> ReplaceCheckedRegex(std::string_view input,
     return scratch;
   }
   return std::string(view);
+} catch (const std::bad_alloc&) {
+  // T3722 (ADR 0012): OOM, not a caller error.
+  return StatusError(StatusCode::kMemoryLimitExceeded,
+                     "regular expression replacement ran out of memory");
 } catch (...) {
   return StatusError(StatusCode::kInvalidArgument,
                      "regular expression replacement failed");
+}
+
+// P464 test hook: number of full replacement-program compiles (cache misses)
+// executed on this thread.  Used by the regex_guard tests to pin the
+// budgeted cache behaviour for >4096-byte replacement templates.
+size_t ReplacementProgramFullCompilesForTest() {
+  return g_replacement_full_compiles;
 }
 
 }  // namespace tinylamb

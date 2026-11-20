@@ -57,7 +57,7 @@ graph TD
 
 ```cpp
           const uint64_t within = memo.Get(group).relation_mask;
-          // Phase 7: with a connected join graph, bipartitions whose cut is
+          // Connected join graphs: bipartitions whose cut is
           // not crossed by any conjunct are pure cross products and can be
           // pruned; a fully disconnected graph keeps exhaustive enumeration.
           const bool prune = !memo.JoinGraphDisconnected();

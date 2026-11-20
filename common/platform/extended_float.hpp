@@ -27,6 +27,17 @@
 
 namespace tinylamb::platform {
 
+// T622 (P584): SoftExtended is built on GCC/Clang extensions -- unsigned
+// __int128, __builtin_clzll and __extension__ below -- none of which MSVC's
+// cl.exe provides (and its `long double` is a plain double, so it could not
+// stand in for the widened accumulator either).  Windows builds therefore go
+// through Clang (clang-cl) or GCC (MinGW-w64); fail with one clear message
+// instead of a cascade of extension parse errors.
+#if !defined(__SIZEOF_INT128__) || __SIZEOF_INT128__ < 16
+#error \
+    "common/platform/extended_float.hpp requires 128-bit integers (unsigned __int128): build with GCC or Clang (clang-cl / MinGW-w64); MSVC cl.exe is not supported."
+#endif
+
 // Accumulator type wider than double, for sums whose intermediates exceed
 // double's exponent range (Σx² of 1e304-scale inputs) or need more than 53
 // significand bits (exact int64 differences).

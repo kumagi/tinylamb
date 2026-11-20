@@ -69,6 +69,7 @@ def main():
     cache_end = dict(env['oracle_sga_end'])['Buffer Cache Size'] / 2**20
     allocated = sum(row[1] for row in env['oracle_schema_segments_bytes']) / 2**20
     mysql_cache = int(dict(env['settings']['mysql'])['innodb_buffer_pool_size']) / 2**20
+    data_cache = float(dict(env['args'])['data_cache_mib']) / 2**20 if 'data_cache_mib' in dict(env.get('args', {})) else 1088.0
     version = oracle['version'][0][0].replace('\n', ' / ')
     report = f'''# Oracle Freeを追加した4製品比較（2026-10-31）
 
@@ -81,7 +82,7 @@ OLAPは全行・値・順序がPGと一致し、全OLTP試行で残高・行数�
 - Oracle: {version}。公式Fullイメージをdigestで固定。Free Use Terms配布。
 - [Freeの上限](https://docs.oracle.com/en/database/oracle/oracle-database/26/xeinl/licensing-restrictions.html)は2コア・DB RAM 2GB・ユーザーデータ12GB。この結果はEnterprise Editionの性能を表さない。
 - 全4製品を物理コア0／1に対応する論理CPU 0,1へ固定。負荷は製品ごとに順次実行。
-- Tiny／PGはデータバッファ1,088 MiB。MySQLは同じ1,088 MiB指定に対し、実測値は{mysql_cache:,.0f} MiB。
+- Tiny／PGはデータバッファ{data_cache:,.0f} MiB。MySQLは同じ{data_cache:,.0f} MiB指定に対し、実測値は{mysql_cache:,.0f} MiB。
   Oracleの実Buffer Cacheは開始{cache_start:,.0f}／終了{cache_end:,.0f} MiB。
   SGA内配分・共有プール・PGA・プロセス全体のメモリは同一ではない。全SGA項目を生データへ保存。
 - 共通二次索引あり。salesは10,000／100,000／1,000,000行、accountsは最大10,000行。

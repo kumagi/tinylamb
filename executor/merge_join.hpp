@@ -39,14 +39,15 @@ class MergeJoin final : public ExecutorBase {
 
  private:
   void Materialize();
-  [[nodiscard]] static bool KeyIsNull(const Row& row,
-                                      const std::vector<slot_t>& columns);
   [[nodiscard]] static bool KeyCannotMatch(const Row& row,
                                            const std::vector<slot_t>& columns);
   [[nodiscard]] int CompareKeys(const Row& left, const Row& right) const;
   // Evaluates the optional residual over `left_rows_[i] + right_rows_[j]`;
   // always true when no residual was supplied.
   [[nodiscard]] bool PairPasses(size_t i, size_t j) const;
+  // Reusable concatenation buffer for residual evaluation (one Row per
+  // candidate pair otherwise deep-copies every VARCHAR payload).
+  mutable Row pair_scratch_;
   mutable Status residual_error_{Status::kSuccess};
   [[nodiscard]] Row Concatenate(size_t i, size_t j) const;
 

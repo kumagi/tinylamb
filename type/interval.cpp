@@ -3,9 +3,11 @@
 
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +21,7 @@
 #include <vector>
 
 #include "common/log_message.hpp"
+#include "common/string_util.hpp"
 
 namespace tinylamb {
 
@@ -74,11 +77,15 @@ std::string ToLower(std::string_view s) {
 }  // namespace
 
 void SetSessionConstant(std::string_view name, std::string_view value) {
-  tls_session_constants[std::string(name)] = std::string(value);
+  // Key on the ASCII-folded name, matching SessionConstantExpressions()
+  // (which keys on Lower(name)): the two ledgers must agree about case or a
+  // mixed-case CREATE CONSTANT resolves differently depending on which one
+  // answers first.
+  tls_session_constants[AsciiToLower(name)] = std::string(value);
 }
 
 std::string GetSessionConstant(std::string_view name) {
-  auto it = tls_session_constants.find(std::string(name));
+  auto it = tls_session_constants.find(AsciiToLower(name));
   if (it != tls_session_constants.end()) {
     return it->second;
   }
@@ -86,13 +93,15 @@ std::string GetSessionConstant(std::string_view name) {
 }
 
 bool HasSessionConstant(std::string_view name) {
-  return tls_session_constants.contains(std::string(name));
+  return tls_session_constants.contains(AsciiToLower(name));
 }
 
+void ClearSessionConstants() { tls_session_constants.clear(); }
+
 StatusOr<IntervalValue> IntervalValue::TryJustifyHours() const {
+  // GoogleSQL JUSTIFY_HOURS normalizes hours into [-23,23], carrying whole
+  // days into the `days` component (months/years unchanged).
   constexpr int64_t kDayNanos = 24LL * 3600LL * 1000000000LL;
-  // Overflow-checked: days * kDayNanos previously wrapped silently on large
-  // parseable intervals (e.g. P4000000000D) and produced garbage results.
   int64_t days_part = 0;
   int64_t total_nanos = nanos;
   if (__builtin_mul_overflow(days, kDayNanos, &days_part) ||
@@ -100,14 +109,14 @@ StatusOr<IntervalValue> IntervalValue::TryJustifyHours() const {
     return StatusError(StatusCode::kInvalidArgument,
                        "INTERVAL computation out of range");
   }
-  // Signed quotient/remainder already preserve the input sign, including
-  // INT64_MIN, whose absolute value is not representable.
   return IntervalValue{.months = months,
                        .days = total_nanos / kDayNanos,
                        .nanos = total_nanos % kDayNanos};
 }
 
 StatusOr<IntervalValue> IntervalValue::TryJustifyDays() const {
+  // GoogleSQL JUSTIFY_DAYS normalizes days into [-29,29], carrying whole
+  // months (30 days) into the `months` component.
   int64_t total_days = 0;
   if (__builtin_mul_overflow(months, int64_t{30}, &total_days) ||
       __builtin_add_overflow(total_days, days, &total_days)) {
@@ -286,7 +295,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           std::from_chars(num_begin, num_end, parsed);
       if (parse_ec != std::errc() || parse_end != num_end) {
         std::string message = "'" + s;
-        message += "': invalid numeric component '";
+        message += "': Invalid numeric component '";
         message += num_str;
         message += "'";
         return fail(message);
@@ -362,15 +371,22 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         }
       }
       const auto [ptr, ec] = std::from_chars(begin, end, ival);
+      // Allow an optional leading sign: a negative integral literal must
+      // take this exact path too, otherwise stod rounds beyond 2^53.
+      const size_t sign = (begin < end && (*begin == '-' || *begin == '+')) ? 1 : 0;
       return ec == std::errc() && ptr == end &&
-             std::cmp_equal(digits, end - begin);
+             std::cmp_equal(digits + sign, end - begin);
     }();
     if (!integral) {
-      double dval = 0.0;
-      try {
-        dval = std::stod(s);
-      } catch (...) {
-        dval = 0.0;
+      // Validate the WHOLE token: std::stod(s) accepts trailing garbage
+      // ("3abc" -> 3) and throws on a non-numeric token, which used to be
+      // swallowed as 0. A malformed amount must be an error, never a value.
+      char* parse_end = nullptr;
+      errno = 0;
+      const double dval = std::strtod(s.c_str(), &parse_end);
+      if (parse_end == s.c_str() ||
+          parse_end != s.c_str() + s.size() || errno == ERANGE) {
+        return fail("invalid INTERVAL amount: " + s);
       }
       const auto to_int64 = [&](double v) -> int64_t {
         const double rounded = std::round(v);
@@ -479,9 +495,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
 
   // Composite string (e.g. "1-2 3 4:5:6.789", "0-0 29 24:0:0", "-20 30",
   // "-4:5:6.789", etc.)
+  const bool bare_negative =
+      !s.empty() && s[0] == '-' && s.find('-', 1) == std::string::npos;
   if (u.empty() && s.find(':') == std::string::npos &&
-      s.find('-') == std::string::npos && s.find(' ') == std::string::npos) {
-    // A bare number carries no unit information.
+      s.find(' ') == std::string::npos &&
+      (s.find('-') == std::string::npos || bare_negative)) {
+    // A bare number (positive or just signed) carries no unit information.
     return fail("'" + s + "'");
   }
   std::istringstream iss(s);
@@ -491,6 +510,22 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
     parts.push_back(tok);
   }
 
+  // A single explicit unit scales one numeric value; a composite literal
+  // (H:M:S or Y-M fields) must not silently ignore it and be read with a
+  // different meaning (e.g. '1:2:3' DAY becoming one day). Only a full unit
+  // range ("hour to second") is valid for a composite shape.
+  // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
+  if (!u.empty() && u.find(" to ") == std::string::npos) {
+    for (const std::string& part : parts) {
+      const bool time_shaped = part.find(':') != std::string::npos;
+      const bool ym_shaped =
+          part.find('-') != std::string::npos && !part.starts_with('-');
+      if (time_shaped || ym_shaped) {
+        return fail("'" + s + "': Explicit unit '" + u +  // NOLINT(performance-inefficient-string-concatenation)
+                    "' is not valid for a composite INTERVAL literal");
+      }
+    }
+  }
   IntervalValue iv;
   // Explicit unit ranges ("month to hour", "day to second", ...) assign one
   // component per whitespace-separated number starting at the low unit.
@@ -529,11 +564,16 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           // and apply it below, as the generic composite branch does.
           const bool negative = !p.empty() && p.front() == '-';
           const std::string magnitude = negative ? p.substr(1) : p;
-          // The integer fields cannot report conversion failures, but a
-          // partially parsed time component is rejected by the != 3 check.
+          // sscanf returns 3 even with trailing garbage; %n records the
+          // consumed length so a partially parsed time component is rejected.
+          int consumed = 0;
           // NOLINTNEXTLINE(cert-err34-c)
-          if (sscanf(magnitude.c_str(), "%" SCNd64 ":%" SCNd64 ":%lf", &th,
-                     &tm, &ts) != 3) {
+          const int converted =
+              sscanf(magnitude.c_str(),  // NOLINT(cert-err34-c)
+                     "%" SCNd64 ":%" SCNd64 ":%lf%n", &th, &tm, &ts,
+                     &consumed);
+          if (converted != 3 || consumed <= 0 ||
+              static_cast<size_t>(consumed) != magnitude.size()) {
             ok = false;
             break;
           }
@@ -551,9 +591,9 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
               checked_mul(th, 3600), checked_add(checked_mul(tm, 60), seconds));
           const int64_t component_nanos =
               checked_add(checked_mul(whole_seconds, 1000000000LL), fraction);
-          iv.nanos = checked_add(
-              iv.nanos, negative ? checked_mul(component_nanos, -1)
-                                 : component_nanos);
+          iv.nanos =
+              checked_add(iv.nanos, negative ? checked_mul(component_nanos, -1)
+                                             : component_nanos);
           continue;
         }
         int64_t val = 0;
@@ -699,7 +739,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         } else {
           // The third composite field is H:M:S; a bare number there has no
           // place to go (it used to be dropped silently).
-          return fail("'" + s + "': unexpected component '" + p + "'");
+          std::string msg = "'";
+          msg += s;
+          msg += "': Unexpected component '";
+          msg += p;
+          msg += "'";
+          return fail(msg);
         }
       } else if (parts.size() == 2) {
         if (u == "month to day") {  // NOLINT(bugprone-branch-clone)
@@ -741,7 +786,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           iv.days = checked_add(iv.days, val);
         } else {
           // An unknown unit must not silently become a day count.
-          return fail("'" + s + "': unsupported INTERVAL unit '" + u + "'");
+          std::string msg = "'";
+          msg += s;
+          msg += "': Unsupported INTERVAL unit '";
+          msg += u;
+          msg += "'";
+          return fail(msg);
         }
       }
     }
@@ -766,14 +816,14 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
     const int lo = range_index(u.substr(0, split));
     const int hi = range_index(u.substr(split + 4));
     if (lo < 0 || hi < lo) {
-      return fail("'" + s + "': invalid INTERVAL unit range '" + u + "'");
+      return fail("'" + s + "': Invalid INTERVAL unit range '" + u + "'");
     }
     const bool months_ok = lo <= 1;
     const bool days_ok = lo <= 2 && hi >= 2;
     const bool time_ok = hi >= 3;
     if ((iv.months != 0 && !months_ok) || (iv.days != 0 && !days_ok) ||
         (iv.nanos != 0 && !time_ok)) {
-      return fail("'" + s + "': value does not match INTERVAL " + u);
+      return fail("'" + s + "': Value does not match INTERVAL " + u);
     }
   }
   return checked_return(iv);

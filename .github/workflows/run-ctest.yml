@@ -1,10 +1,21 @@
 name: ctest
 on: [ push, pull_request ]
+permissions:
+  contents: read
 jobs:
   validate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      # AGENTS.md mandatory gates: include-lint and OOC invariant lint must
+      # exit 0 (the same checks scripts/verify_all.sh runs). Pure static
+      # checks -- run them before the expensive build so violations fail fast.
+      - name: layering and OOC invariant lint
+        run: |
+          python3 scripts/check_layering.py
+          python3 scripts/check_ooc_invariants.py
 
       - name: build and test
         run: |
@@ -13,14 +24,18 @@ jobs:
           # The SQL tests assume the GoogleSQL frontend (GoogleSqlFrontend::
           # Available() is baked in at configure time); OFF would fail 300+
           # of them, so keep the default ON here.
-          cmake -S . -B build \
-            -DCMAKE_CXX_FLAGS="-fsanitize=undefined,bounds,address" \
+          CC=clang CXX=clang++ cmake -S . -B build \
+            -DTINYLAMB_ENABLE_SANITIZERS=ON \
             -DCMAKE_BUILD_TYPE=Debug
           cmake --build build -j"$(nproc)"
-          ctest --test-dir build -j"$(nproc)" --output-on-failure
+          # Scale tests (label "scale", TIMEOUT 600) are opt-in via
+          # `ctest -L scale`; the default run excludes them so every
+          # executed unit honors the 60-second contract.
+          ctest --test-dir build -j"$(nproc)" --output-on-failure -LE scale
           python3 scripts/clean_root_artifacts.py
 
-  googlesql-compliance:
+  # Informational only: continue-on-error below means failures do NOT gate CI.
+  googlesql-compliance-non-gating:
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
@@ -34,5 +49,5 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DTINYLAMB_ENABLE_GOOGLESQL=ON
           cmake --build build -j"$(nproc)" --target googlesql_compliance_test
-          ctest --test-dir build -R GoogleSqlCompliance --output-on-failure
+          ctest --test-dir build -R GoogleSqlCompliance --output-on-failure -j"$(nproc)"
           python3 scripts/clean_root_artifacts.py

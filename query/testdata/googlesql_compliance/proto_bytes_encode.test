@@ -1,7 +1,7 @@
 [load_proto_files=googlesql/testdata/test_schema.proto]
 [load_proto_names=googlesql_test.KitchenSinkPB,googlesql_test.KitchenSinkEnumPB,googlesql_test.Proto3KitchenSink,googlesql_test.TestExtraPB]
 
-# message -> BYTES wire encoding (tracker #762): field markers are sniffed on
+# message -> BYTES wire encoding (tracker #763): field markers are sniffed on
 # entry boundaries (a "value:" probe no longer matches inside "str_value:"),
 # KitchenSinkPB carries a double_val fixed64 arm, TestExtraPB and bare
 # required_test_enum payloads route to their own encoders, and enum member
@@ -33,9 +33,9 @@ ARRAY<STRING>["900301"]
 
 [name=bytes_round_trip_preserves_double]
 SELECT CAST(FROM_HEX(TO_HEX(CAST('int64_key_1: 5 double_val: 2.5' AS BYTES)))
-            AS googlesql_test.KitchenSinkPB) AS msg
+            AS googlesql_test.KitchenSinkPB).double_val AS result
 --
-ARRAY<PROTO<googlesql_test.KitchenSinkPB>>[{int64_key_1: 5 double_val: 2.500000 }]
+ARRAY<DOUBLE>[2.5]
 ==
 
 [name=bytes_round_trip_preserves_required_enum]

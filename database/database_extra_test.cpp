@@ -127,7 +127,7 @@ TEST_F(DatabaseExtraTest, DurableWalFrontierWaitsForSuccessfulSync) {
   ASSERT_TRUE(
       RunStatement(&engine, &setup, "CREATE TABLE durable_frontier (k INT64)"));
   ASSERT_SUCCESS(setup.PreCommit());
-  const auto previous = db_->DurableWALLSN();
+  const auto previous = db_->DurableWalLSN();
   auto writer = db_->BeginContext();
   ASSERT_TRUE(RunStatement(&engine, &writer,
                            "INSERT INTO durable_frontier VALUES (1)"));
@@ -159,13 +159,13 @@ TEST_F(DatabaseExtraTest, DurableWalFrontierWaitsForSuccessfulSync) {
     std::unique_lock lock(gate->mutex);
     ASSERT_TRUE(gate->cv.wait_for(lock, std::chrono::seconds(5),
                                   [&] { return gate->entered; }));
-    EXPECT_GE(db_->DurableWALLSN(), previous);
-    EXPECT_LT(db_->DurableWALLSN(), target);
+    EXPECT_GE(db_->DurableWalLSN(), previous);
+    EXPECT_LT(db_->DurableWalLSN(), target);
     gate->released = true;
     gate->cv.notify_all();
   }
   ASSERT_SUCCESS(db_->WaitForCommitDurable(target));
-  EXPECT_GE(db_->DurableWALLSN(), target);
+  EXPECT_GE(db_->DurableWalLSN(), target);
 }
 
 TEST_F(DatabaseExtraTest, SecondLiveDatabaseOpenFailsWithoutChangingFiles) {
@@ -337,5 +337,81 @@ TEST_F(DatabaseExtraTest, MissingWalFailsClosed) {
   std::filesystem::remove(prefix_ + ".log", ec);
   std::filesystem::remove(prefix_ + ".log.meta", ec);
   std::filesystem::remove(prefix_ + ".last_checkpoint", ec);
+}
+TEST_F(DatabaseExtraTest, CleanReopenSkipsNoOpEndOfRecoveryCheckpoint) {
+  SqlEngine engine(*db_);
+  TransactionContext ctx = db_->BeginContext();
+  ASSERT_TRUE(RunStatement(&engine, &ctx, "CREATE TABLE eor_skip (k INT64)"));
+  ASSERT_TRUE(RunStatement(&engine, &ctx, "INSERT INTO eor_skip VALUES (1)"));
+  ASSERT_SUCCESS(ctx.PreCommit());
+
+  // First reopen replays the WAL and writes the EOR checkpoint snapshot.
+  db_->EmulateCrash();
+  db_.reset();
+  db_ = Database::Create(prefix_).MoveValue();
+  const auto db_path = prefix_ + ".db";
+  ASSERT_TRUE(std::filesystem::exists(db_path));
+  const auto before = std::filesystem::last_write_time(db_path);
+
+  // Second reopen has nothing new to replay: the snapshot must not be
+  // serialized/fsynced/renamed again.
+  db_->EmulateCrash();
+  db_.reset();
+  db_ = Database::Create(prefix_).MoveValue();
+  const auto after = std::filesystem::last_write_time(db_path);
+  EXPECT_EQ(after, before);
+
+  SqlEngine reopened(*db_);
+  TransactionContext verify = db_->BeginContext();
+  std::vector<Row> rows;
+  ASSERT_TRUE(
+      RunStatement(&reopened, &verify, "SELECT k FROM eor_skip", &rows));
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+  ASSERT_SUCCESS(verify.PreCommit());
+}
+
+// #1100: the compiled-plan cache probes this instead of a catalog
+// GetTable + full deserialization per retained table per hit.  The
+// binding must be stable across repeated lookups and must break exactly
+// when the identity changes (drop, recreate, unknown name).
+TEST_F(DatabaseExtraTest, IsCurrentIncarnationTracksDdlLifecycle) {
+  TransactionContext setup = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, created,
+      db_->CreateTable(setup,
+                       Schema("probe_t", {Column("v", ValueType::kInt64)})));
+  ASSERT_SUCCESS(setup.PreCommit());
+
+  TransactionContext reader = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, first, db_->GetTable(reader, "probe_t"));
+  const std::shared_ptr<TableIncarnation>& state = first.IncarnationState();
+  ASSERT_NE(state, nullptr);
+  EXPECT_TRUE(db_->IsCurrentIncarnation("probe_t", state));
+  // Repeated lookups bind the same identity object: the plan-cache probe is
+  // answered by pointer equality, no churn across replays.
+  ASSIGN_OR_ASSERT_FAIL(Table, second, db_->GetTable(reader, "probe_t"));
+  EXPECT_EQ(second.IncarnationState(), state);
+  EXPECT_TRUE(db_->IsCurrentIncarnation("probe_t", second.IncarnationState()));
+  EXPECT_FALSE(db_->IsCurrentIncarnation("no_such_table", state));
+  EXPECT_FALSE(db_->IsCurrentIncarnation("probe_t", nullptr));
+  ASSERT_SUCCESS(reader.PreCommit());
+
+  TransactionContext dropper = db_->BeginContext();
+  ASSERT_SUCCESS(db_->DropTable(dropper, "probe_t"));
+  ASSERT_SUCCESS(dropper.PreCommit());
+  EXPECT_FALSE(db_->IsCurrentIncarnation("probe_t", state));
+
+  TransactionContext rebuilder = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, fresh,
+      db_->CreateTable(rebuilder,
+                       Schema("probe_t", {Column("w", ValueType::kInt64)})));
+  ASSERT_SUCCESS(rebuilder.PreCommit());
+  EXPECT_FALSE(db_->IsCurrentIncarnation("probe_t", state));
+  TransactionContext again = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, t3, db_->GetTable(again, "probe_t"));
+  EXPECT_TRUE(db_->IsCurrentIncarnation("probe_t", t3.IncarnationState()));
+  ASSERT_SUCCESS(again.PreCommit());
 }
 }  // namespace tinylamb

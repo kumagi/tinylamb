@@ -198,6 +198,9 @@ class DistinctOutputSource final : public PipelineSource {
         }
         out->Append(std::move(row));
       }
+      if (out->Empty()) {
+        guard_.reset();
+      }
       return !out->Empty();
     }
     while (out->Empty()) {
@@ -239,6 +242,7 @@ class DistinctOutputSource final : public PipelineSource {
         continue;
       }
       if (leaf_idx_ >= leaves_.leaves.size()) {
+        guard_.reset();
         return false;
       }
       const PartitionLeaf& leaf = leaves_.leaves[leaf_idx_++];
@@ -250,6 +254,7 @@ class DistinctOutputSource final : public PipelineSource {
       skew_sorter_ = std::move(sk);
       have_prev_key_ = false;
     }
+    guard_.reset();
     return false;
   }
 
@@ -415,8 +420,14 @@ Status OocSortSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
   size_t extra_idx = 0;
   for (size_t i = 0; i < keys_.size(); ++i) {
     slot_t sort_slot = 0;
-    if (keys_[i].expression &&
-        keys_[i].expression->Type() == TypeTag::kColumnValue) {
+    const auto column_slot = keys_[i].column_slot;
+    if (column_slot.has_value() &&
+        *column_slot < input_schema_.ColumnCount()) {
+      const auto slot = static_cast<slot_t>(*column_slot);
+      direct_slots_[i] = slot;
+      sort_slot = slot;
+    } else if (keys_[i].expression &&
+               keys_[i].expression->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           keys_[i].expression->AsColumnValue().GetColumnName());
       if (offset >= 0) {
@@ -490,8 +501,12 @@ Status OocSortSink::Consume(PipelineContext* /*ctx*/, size_t /*worker_id*/,
       continue;
     }
     Row row = input.RowAt(r);
-    row.values_.reserve(row.Count() + computed_key_indices_.size() +
-                        (limit_.has_value() ? 1U : 0U));
+    // RowAt already reserves exactly Count(); reserve once more only when
+    // trailing computed-key / seq columns will actually be appended.
+    if (!computed_key_indices_.empty() || limit_.has_value()) {
+      row.values_.reserve(row.Count() + computed_key_indices_.size() +
+                          (limit_.has_value() ? 1U : 0U));
+    }
     for (const size_t kidx : computed_key_indices_) {
       ASSIGN_OR_RETURN(
           Value, kv,

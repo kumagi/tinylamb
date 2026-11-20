@@ -38,9 +38,7 @@ class UnnestPlan final : public PlanBase {
     return (child_ ? child_->EmitRowCount() : 1) * 10;
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
-  [[nodiscard]] const Expression& UnnestExpr() const { return unnest_expr_; }
   [[nodiscard]] const std::string& Alias() const { return alias_; }
-  [[nodiscard]] const std::string& OffsetAlias() const { return offset_alias_; }
   // The unnest-produced columns of schema_ (without any prepended child
   // relation columns); what the UnnestExecutor must emit per row.
   [[nodiscard]] const Schema& UnnestSection() const { return unnest_section_; }

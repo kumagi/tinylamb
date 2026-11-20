@@ -39,26 +39,51 @@ StatusOr<Value> TryCoerceArrayElement(Value value, std::string_view sql_type) {
   const std::string type = Upper(std::string(sql_type));
   if (type == "BOOL" || type == "BOOLEAN") {
     if (value.type == ValueType::kInt64) {
-      return value;
+      const int64_t v = value.value.int_value;
+      if (v == 0 || v == 1) {
+        return value;
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ARRAY<BOOL> element must be 0 or 1");
     }
   }
   if (type == "FLOAT" || type == "FLOAT32" || type == "FLOAT64" ||
       type == "DOUBLE") {
     if (value.type == ValueType::kInt64) {
-      return Value(static_cast<double>(value.value.int_value));
+      // An unsigned UINT64 shares the signed bit pattern; read it as uint64
+      // so 2^64-1 becomes 18446744073709551616.0, not -1.0.
+      return Value(value.IsUnsigned()
+                       ? static_cast<double>(
+                             static_cast<uint64_t>(value.value.int_value))
+                       : static_cast<double>(value.value.int_value));
     }
   }
   if (type == "DATE" && value.type == ValueType::kVarChar) {
     return Value::TryDate(value.value.varchar_value);
   }
   if (type.starts_with("ARRAY<") && value.IsArray()) {
+    // An ARRAY<ARRAY<T>> literal must hold arrays (and vice versa); the
+    // outer shape check alone used to accept a nested declaration with
+    // scalar elements, leaving a wrong inner element_sql_type tag.
+    const size_t close = type.rfind('>');
+    if (close != std::string::npos && close > 6) {
+      const std::string inner = type.substr(6, close - 6);
+      const bool inner_is_array = inner.starts_with("ARRAY<");
+      for (const Value& elem : value.ArrayElements()) {
+        if (!elem.IsNull() && inner_is_array != elem.IsArray()) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "array element type does not match the declared element type");
+        }
+      }
+    }
     return value;
   }
   // The inferred/declared element type must actually hold: silently keeping
   // a mismatched storage type would diverge the array's element_sql_type tag
   // from its contents (GoogleSQL rejects these mixes).  Only the
   // unambiguous scalar tags are enforced; parameterized spellings
-  // (STRING(10), NUMERIC(10,2), ...) stay unchecked.
+  // (STRING(10), NUMERIC(10,2), ...) stay unvalidated at rewrite time.
   const std::string bare = type.substr(0, type.find('('));
   std::optional<ValueType> expected;
   if (bare == "INT64" || bare == "INT" || bare == "INTEGER" ||
@@ -100,9 +125,14 @@ StatusOr<Value> TryBuildArray(const std::vector<Expression>& elements,
   std::string inferred_type = declared_type;
   for (const Expression& element : elements) {
     ASSIGN_OR_RETURN(Value, v, element->TryEvaluate(args...));
-    if ((inferred_type.empty() || inferred_type == "INT64") && !v.IsNull()) {
+    if (inferred_type.empty() && !v.IsNull()) {
       if (v.type == ValueType::kVarChar) {
-        inferred_type = "STRING";
+        // INTERVAL is a tagged kVarChar; keep its SQL label instead of
+        // collapsing it to STRING (TryCoerceArrayElement accepts INTERVAL).
+        inferred_type = v.IsInterval() ? "INTERVAL" : "STRING";
+      } else if (v.type == ValueType::kInt64) {
+        // UINT64 shares the INT64 storage tag; preserve its signedness tag.
+        inferred_type = v.IsUnsigned() ? "UINT64" : "INT64";
       } else if (v.type == ValueType::kDouble) {
         inferred_type = "DOUBLE";
       } else if (v.type == ValueType::kDate) {

@@ -768,7 +768,7 @@ bool HuffDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
   uint64_t cnt = 0;
   uint64_t sum = 0;
   for (uint32_t s = 0; s < p.d; ++s) {
-    const int64_t v = HuffDictDictAt(p, s);
+    const int64_t v = HuffDictAt(p, s);
     if (!RleDictMatch(op, v, lit)) {
       continue;
     }
@@ -1003,8 +1003,10 @@ bool TileDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
     TileDictWindowForValue(c, op, lit, &lo, &span, &clamp_pass);
     if (span == 0 && !clamp_pass) {
       // Wholly outside: the bracket skips the tile's codes entirely.
-    } else if (lo == 0 && span == c.d) {
-      // Wholly inside: COUNT is the row count, no code read. SUM still
+    } else if (lo == 0 && span == c.d && (c.w == 0 || clamp_pass)) {
+      // Wholly inside: COUNT is the row count, no code read. Require the
+      // clamp verdict too: a tile of clamp codes (w == 0) is counted only
+      // when the clamp code actually satisfies the predicate. SUM still
       // needs the per-code counts, so it walks the tile once.
       cnt += c.rows;
       if (sum_out != nullptr) {
@@ -1839,10 +1841,9 @@ bool OpDictRangeFold(const EncodedBlock& block, int64_t low, int64_t high,
 
 }  // namespace codec_benchmark
 
-uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
-                                           uint32_t param, uint32_t n,
-                                           const uint8_t* null_bmp,
-                                           CompareOp op, int64_t lit) {
+StatusOr<uint32_t> PaxChunk::ByteSliceNullAwareCount(
+    const char* region, Scheme s, uint32_t param, uint32_t n,
+    const uint8_t* null_bmp, CompareOp op, int64_t lit) {
   // BSI fast path: slice-parallel mask + popcount, no value materialization.
   if (s == Scheme::kByteSlice && n > 0 && n <= 1024) {
     const auto w = static_cast<uint8_t>(region[0]);
@@ -1932,6 +1933,11 @@ uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
       }
       return static_cast<uint32_t>(cnt);
     }
+    // Parse failure: the generic loop below cannot serve kPostings (no
+    // self-described length => Int64RegionAt degrades every row to 0), so
+    // surface corruption instead of counting `0 OP lit`.
+    return StatusError(StatusCode::kCorrupt,
+                       "kPostings COUNT fold failed to decode region");
   }
   // kTileDict fast path: bracket-pruned per-tile fold -- a wholly-outside
   // tile costs nothing, a wholly-inside tile is its row count with zero
@@ -3477,6 +3483,7 @@ void PaxChunk::BuildNullBitmapSummary() {
   footer_.null_any = false;
   footer_.null_uniform_groups = 0;
   footer_.null_uniform_stride = 0;
+  null_rg_offsets_.clear();
   if (!footer_.null_present) {
     footer_.null_summary_valid = true;
     return;
@@ -3506,6 +3513,17 @@ void PaxChunk::BuildNullBitmapSummary() {
   }
   footer_.null_uniform_groups = uniform_groups;
   footer_.null_uniform_stride = first_stride;
+  // The per-group byte offsets into null_bitmaps, so CellNullBits resolves
+  // a (group, column) cell in O(1). The uniform-stride fast path in
+  // RgColNullBits only covers the leading run of equal-size groups; this
+  // prefix covers every group once the layout is proven consistent.
+  null_rg_offsets_.assign(footer_.row_group_count, 0);
+  uint64_t bitmap_off = 0;
+  for (uint32_t g = 0; g < footer_.row_group_count; ++g) {
+    null_rg_offsets_[g] = bitmap_off;
+    bitmap_off += static_cast<uint64_t>(footer_.column_count) *
+                  ((static_cast<uint64_t>(footer_.row_counts[g]) + 7U) / 8U);
+  }
   for (uint8_t byte : footer_.null_bitmaps) {
     if (byte != 0) {
       footer_.null_any = true;
@@ -4221,7 +4239,7 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       // kind == 3 (varchar): serve from the whole-group cache once the bulk
       // fill has landed, replay the per-row decoder otherwise.
       if (cache->valid && loc < cache->by_col[c].size()) {
-        slot.SetStringView(cache->by_col[c][loc]);
+        slot.CopyFromStringView(cache->by_col[c][loc]);
         continue;
       }
       if (cur.scheme == Scheme::kFrontCode) {
@@ -4416,7 +4434,7 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       if (cache != nullptr && cache->valid && local < cache->by_col[c].size()) {
         // Cache hit: the group was decoded once; copy the value instead of
         // replaying the restart chain for this row.
-        slot.SetStringView(cache->by_col[c][local]);
+        slot.CopyFromStringView(cache->by_col[c][local]);
         continue;
       }
       if (s == Scheme::kFrontCode) {
@@ -5596,7 +5614,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
   const bool dbg = std::getenv("TINYLAMB_VALDBG") != nullptr;
   auto trace = [&](int stage, uint64_t v) {
     if (dbg) {
-      std::cerr << "validate: FAIL stage=" << stage << " val=" << v << "\n";
+      std::cerr << "validate trace stage=" << stage << " val=" << v << "\n";
     }
   };
   WalkResult w;

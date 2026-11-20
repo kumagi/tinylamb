@@ -72,6 +72,10 @@ class BitmapIndexScan {
 
 class BitmapHeapScan : public ExecutorBase {
  public:
+  // `positions` must already be sorted by (page_id, slot) and duplicate-free
+  // (T3765): BitmapIndexScan::ScanPositions() and the BitmapAnd/BitmapOr
+  // set algorithms guarantee this, and the constructor trusts it instead of
+  // re-sorting.
   BitmapHeapScan(Transaction& txn, const Table& table,
                  std::vector<RowPosition> positions, Expression where,
                  Schema schema,

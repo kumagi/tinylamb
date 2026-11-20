@@ -24,16 +24,26 @@ namespace tinylamb {
 TEST(OocScaleBaselineTest, ReportsBaselineStructureFootprintsAndPressure) {
   const uint64_t rss = platform::CurrentProcessRssBytes();
   EXPECT_GT(rss, 0U);
-  // Document current per-unit sizes observed in P0:
-  // A non-resident Page still carries the full Page+RowPage shell (> 1 KiB).
-  EXPECT_GT(sizeof(Page), 0U);
-  EXPECT_GT(sizeof(RowPage), 0U);
-  EXPECT_GT(sizeof(TlcsFile::BlockDirEntry), 0U);
-  EXPECT_GT(sizeof(TlcsFile::ColumnMeta), 0U);
+  // Pin the per-unit structure footprints observed in P0 (Linux/x86-64,
+  // libstdc++): the row-page shell is heap-backed (PackedSlots), so a
+  // non-resident Page carries a 432 B shell including the 304 B RowPage,
+  // plus 40 B per block-dir entry and 152 B per column meta.  These lower
+  // bounds make footprint regressions visible instead of the former
+  // vacuous sizeof>0 checks; update them deliberately when layouts change.
+  EXPECT_GE(sizeof(Page), 432U);
+  EXPECT_GE(sizeof(RowPage), 304U);
+  EXPECT_GE(sizeof(TlcsFile::BlockDirEntry), 40U);
+  EXPECT_GE(sizeof(TlcsFile::ColumnMeta), 152U);
 
   ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
   b.ResetPeaks();
-  EXPECT_GE(b.CurrentUnaccountedRssBytes(), 0U);
+  // T4881: the old EXPECT_GE(unaccounted, 0U) was vacuous -- the value is
+  // unsigned AND clamped at 0 by the implementation. Pin the real
+  // invariants: unaccounted can never exceed the observed RSS, and one
+  // observation must have re-armed the high-water peak tracker.
+  const uint64_t unaccounted = b.CurrentUnaccountedRssBytes();
+  EXPECT_LE(unaccounted, platform::CurrentProcessRssBytes());
+  EXPECT_GE(b.PeakUnaccountedRssBytes(), unaccounted);  // NOLINT(clang-diagnostic-error)
 }
 
 TEST(OocScaleBaselineTest, SmallMemoryCapAdmitsValidBudgetQueries) {

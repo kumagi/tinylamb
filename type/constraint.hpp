@@ -49,8 +49,8 @@ struct Constraint {
     kDefault,
     kUnique,
     kPrimaryKey,
-    kForeign,  // Won't implemented.
-    kCheck,    // Won't implemented.
+    kForeign,  // Implemented: compared/serialized like other Constraint kinds.
+    kCheck,    // Implemented: compared/serialized like other Constraint kinds.
     kIndex,
   };
 

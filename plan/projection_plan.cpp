@@ -269,7 +269,7 @@ void ProjectionPlan::Dump(std::ostream& o, int indent) const {
   }
   o << "} (estimated rows: " << EmitRowCount() << ")\n"
     << Indent(static_cast<size_t>(indent) + 2);
-  src_->Dump(o, indent + 2);
+  DumpChild(o, *src_, indent + 2);
 }
 
 std::string ProjectionPlan::ToString() const {
@@ -297,7 +297,7 @@ bool ProjectionPlan::InstallParameterSlots(const std::vector<Value>& parameters,
                                            size_t* cursor,
                                            std::vector<Expression>* slots) {
   for (NamedExpression& column : columns_) {
-    if (!SlotizeInPlace(&column.expression, parameters, cursor, slots)) {
+    if (!CollectParameterSlots(&column.expression, slots)) {
       return false;
     }
   }

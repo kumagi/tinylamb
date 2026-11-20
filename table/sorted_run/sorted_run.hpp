@@ -36,7 +36,8 @@ namespace tinylamb {
 
 // A serialized buffer of row payloads plus a sorted array of
 // (key_offset, row_offset) pointer-entries. Sorting moves only pointers, not
-// row data, so write amplification stays at O(N log N) pointer moves plus one
+// row data, so write amplification stays at O(N log 16) pointer moves (the
+// fixed 16-way merge) plus one
 // final sequential write of the row buffer. The final merge step reads this
 // pointer array in order to emit a PAX chunk.
 class SortedRun final {
@@ -49,8 +50,6 @@ class SortedRun final {
     Entry(uint32_t k, uint32_t r, bool del)
         : key_offset_(k), row_offset_(r), is_deleted_(del) {}
     [[nodiscard]] int Compare(std::string_view rhs,
-                              const std::vector<char>& blob) const;
-    [[nodiscard]] int Compare(const Entry& rhs,
                               const std::vector<char>& blob) const;
     [[nodiscard]] std::string BuildKey(const std::vector<char>& blob) const;
     [[nodiscard]] Row BuildRow(const std::vector<char>& blob,
@@ -67,8 +66,7 @@ class SortedRun final {
 
   class Iterator {
    public:
-    Iterator(const SortedRun* parent, const std::vector<char>& /*blob*/,
-             const Schema& sc, size_t offset = 0)
+    Iterator(const SortedRun* parent, const Schema& sc, size_t offset = 0)
         : parent_(parent), schema_(&sc), offset_(offset) {}
     ~Iterator() = default;
     Iterator(Iterator&&) = default;
@@ -77,7 +75,6 @@ class SortedRun final {
     Iterator& operator=(const Iterator&) = default;
     [[nodiscard]] std::string Key() const;
     [[nodiscard]] Row Value() const;
-    [[nodiscard]] int Compare(const Iterator& rhs) const;
     [[nodiscard]] Entry GetEntry() const { return parent_->GetEntry(offset_); }
     [[nodiscard]] bool IsValid() const { return offset_ < parent_->Size(); }
     Iterator& operator++() {
@@ -90,6 +87,11 @@ class SortedRun final {
     bool operator!=(const Iterator& rhs) const { return !operator==(rhs); }
     [[nodiscard]] size_t Generation() const { return parent_->generation_; }
     [[nodiscard]] bool IsDeleted() const {
+      // An exhausted iterator has no entry; treat it as a non-deleted
+      // sentinel instead of throwing from GetEntry's bounds check.
+      if (!IsValid()) {
+        return false;
+      }
       return parent_->GetEntry(offset_).IsDeleted();
     }
 
@@ -101,7 +103,17 @@ class SortedRun final {
 
   SortedRun() = default;
   SortedRun(std::vector<char> blob, std::vector<Entry> index, size_t gen)
-      : blob_(std::move(blob)), index_(std::move(index)), generation_(gen) {}
+      : blob_(std::move(blob)), index_(std::move(index)), generation_(gen) {
+#ifndef NDEBUG
+    // LowerBound/Find binary-search index_, so an out-of-order entry would
+    // silently return wrong rows. Catch malformed runs in debug builds;
+    // production readers stay O(log n) and rely on the writer contract.
+    for (size_t i = 1; i < index_.size(); ++i) {
+      CHECK_MSG(index_[i - 1].BuildKey(blob_) <= index_[i].BuildKey(blob_),
+                "SortedRun index is not sorted");
+    }
+#endif
+  }
   SortedRun(const SortedRun&) = default;
   SortedRun(SortedRun&&) = default;
   SortedRun& operator=(const SortedRun&) = default;
@@ -121,7 +133,7 @@ class SortedRun final {
   [[nodiscard]] size_t Size() const { return index_.size(); }
   [[nodiscard]] size_t Generation() const { return generation_; }
   [[nodiscard]] Iterator Begin(const Schema& sc) const {
-    return {this, blob_, sc, 0};
+    return {this, sc, 0};
   }
   [[nodiscard]] Entry GetEntry(size_t offset) const {
     if (offset >= index_.size()) {

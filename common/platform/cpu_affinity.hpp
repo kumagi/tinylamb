@@ -40,6 +40,10 @@ class CpuSet {
   }
 
   // The calling thread's allowed CPUs, or nullopt when unsupported/failed.
+  // Costs one sched_getaffinity syscall per call: snapshot once per
+  // RunParallelTasks submission (TaskBatch::affinity), not per task, and
+  // compare with operator== (fixed-size memcmp), which ParallelPool::Work()
+  // relies on being cheap.
   static std::optional<CpuSet> CurrentThread();
 
   // A set containing only `cpu`.

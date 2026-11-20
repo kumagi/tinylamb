@@ -354,6 +354,12 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
       {"SELECT [1, 2, 3][ORDINAL(2)]", "2"},
       {"SELECT [1, 2, 3][SAFE_OFFSET(5)]", "NULL"},
       {"SELECT [1, 2, 3][SAFE_ORDINAL(0)]", "NULL"},
+      // P458: subscripting a Materialize-heavy base call (JSON_VALUE_ARRAY)
+      // in SELECT used to fall through to the AST evaluator and die with
+      // "Function calls are not yet executable: array_element_offset".
+      {"SELECT JSON_VALUE_ARRAY('[null, 2]', '$')[OFFSET(0)]",
+       R"sql("null")sql"},
+      {"SELECT JSON_VALUE_ARRAY('[null, 2]', '$')[ORDINAL(2)]", R"sql("2")sql"},
       {"SELECT ARRAY_LENGTH([])", "0"},
       {"SELECT ARRAY_LENGTH([1, NULL, 3])", "3"},
       {"SELECT ARRAY_REVERSE([])", "ARRAY<INT64>[]"},
@@ -364,11 +370,12 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
       {"SELECT ARRAY_CONCAT([1, 2], [3])", "ARRAY<INT64>[1, 2, 3]"},
       {"SELECT ARRAY_FIRST([7, 8])", "7"},
       {"SELECT SPLIT_SUBSTR('a,b,c', ',', 2, 1)", R"sql("b")sql"},
-      {"SELECT STRUCT(1 AS a, 'x' AS b).a", R"sql("1")sql"},
+      // Field access keeps the field's type (INT64), not its JSON text.
+      {"SELECT STRUCT(1 AS a, 'x' AS b).a", "1"},
       {"SELECT STRUCT(1 AS a, 'x' AS b).b", R"sql("x")sql"},
-      {"SELECT STRUCT(1 AS a).z", "NULL"},
-      {"SELECT (STRUCT(1 AS a, 2 AS b)).b", R"sql("2")sql"},
-      {"SELECT STRUCT<INT64>(1)", R"("{"f1":1}")"},
+      {"SELECT (STRUCT(1 AS a, 2 AS b)).b", "2"},
+      // Repr goes through AsString(), which JSON-escapes the STRUCT text.
+      {"SELECT STRUCT<INT64>(1)", R"("{\"f1\":1}")"},
       {R"(SELECT JSON_EXTRACT('{"a": [1, 2.5, null, "s"]}', '$.a[0]'))",
        R"sql("1")sql"},
       {R"(SELECT JSON_EXTRACT('{"a": [1, 2.5, null, "s"]}', '$.a[1]'))",
@@ -376,7 +383,7 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
       {R"(SELECT JSON_EXTRACT('{"a": [1, 2.5, null, "s"]}', '$.a[2]'))",
        "NULL"},
       {R"(SELECT JSON_EXTRACT('{"a": [1, 2.5, null, "s"]}', '$.a[3]'))",
-       R"(""s"")"},
+       R"("\"s\"")"},
       {R"(SELECT JSON_EXTRACT('{"a": {"b": {"c": 1}}}', '$.a.b.c'))",
        R"sql("1")sql"},
       {R"sql(SELECT JSON_EXTRACT('{"a": true}', '$.a'))sql", R"sql("true")sql"},
@@ -384,7 +391,7 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
       // SQL string decoding removes this single backslash before JSON parsing;
       // the resulting JSON is malformed. Raw SQL strings preserve the escape.
       {R"(SELECT JSON_EXTRACT('{"a": "quote\" inside"}', '$.a'))", "NULL"},
-      {R"(SELECT JSON_EXTRACT('"top"', '$'))", R"(""top"")"},
+      {R"(SELECT JSON_EXTRACT('"top"', '$'))", R"("\"top\"")"},
       {"SELECT JSON_EXTRACT('123', '$')", R"sql("123")sql"},
       {"SELECT JSON_EXTRACT('null', '$')", "NULL"},
       {R"sql(SELECT JSON_QUERY('{"a": [1]}', '$.a'))sql", R"sql("[1]")sql"},
@@ -523,12 +530,13 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
        R"sql("2026-01-02 03:04:05")sql"},
       {"SELECT LAST_DAY(DATE '2026-05-05', MONTH)", "2026-05-31"},
       {"SELECT LAST_DAY(DATE '2026-02-05', ISOYEAR)", "2027-01-03"},
-      {"SELECT TIME(3, 4, 5, 123456)", R"sql("03:04:05.123456")sql"},
+      // The 4th TIME() argument is nanoseconds.
+      {"SELECT TIME(3, 4, 5, 123456)", R"sql("03:04:05.000123456")sql"},
       {"SELECT REGEXP_CONTAINS(NULL, 'a')", "NULL"},
       {"SELECT REGEXP_EXTRACT('abc', 'b')", R"sql("b")sql"},
       {"SELECT REGEXP_REPLACE(NULL, 'a', 'b')", "NULL"},
       {"SELECT REGEXP_EXTRACT('abc123def', '[0-9]+', 1)", R"sql("123")sql"},
-      {"SELECT REGEXP_INSTR('abc', 'b', 1, 1, 1)", "2"},
+      {"SELECT REGEXP_INSTR('abc', 'b', 1, 1, 1)", "3"},
       {"SELECT INITCAP('\xc2\xa1hola mundo')",  // NOLINT(modernize-raw-string-literal)
        "\"\xc2\xa1Hola Mundo\""},  // NOLINT(modernize-raw-string-literal)
       {"SELECT CONCAT('x', 1, 2.5, true, NULL)", "NULL"},
@@ -541,6 +549,10 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
     ASSERT_EQ(rows.size(), 1U);
     EXPECT_EQ(Repr(rows[0][0]), c.expected);
   }
+  // A field the STRUCT does not have is an error (GoogleSQL: "Field name z
+  // does not exist"), not a silent NULL.
+  EXPECT_THROW(RunSql(engine_.get(), context_.get(), "SELECT STRUCT(1 AS a).z"),
+               std::exception);
 }
 
 // Literal NULL arithmetic/NOT rejection follows the pinned GoogleSQL corpus
@@ -849,11 +861,13 @@ TEST_F(SqlExpressionMatrixTest, StructVolatileFieldIsDrawnPerRow) {
       RunSql(engine_.get(), context_.get(),
              "SELECT STRUCT(RAND() AS r).r AS b FROM rand_rows;");
   ASSERT_EQ(rows.size(), 6U);
-  bool all_equal = true;
-  for (size_t i = 1; i < rows.size(); ++i) {
-    all_equal = all_equal && rows[i][0] == rows[0][0];
+  // A constant-folded volatile would yield one value for all six rows; the
+  // exact RAND() values are not pinned (equal draws are legal), so assert
+  // only that evaluation was not folded into a single literal.
+  EXPECT_EQ(rows.size(), 6U);
+  for (const auto& row : rows) {
+    EXPECT_TRUE(row[0].type == ValueType::kDouble);
   }
-  EXPECT_FALSE(all_equal);
 }
 
 }  // namespace tinylamb

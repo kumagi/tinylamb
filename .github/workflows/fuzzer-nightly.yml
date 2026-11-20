@@ -1,11 +1,14 @@
 name: fuzzer-nightly
 on:
+permissions:
+  contents: read
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
 jobs:
   fuzz-smoke:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -22,15 +25,13 @@ jobs:
           cmake --build build-fuzz -j"$(nproc)" --target \
             table_fuzzer value_fuzzer date_interval_fuzzer cast_fuzzer \
             function_fuzzer data_chunk_fuzzer \
-            expression_fuzzer row_page_fuzzer leaf_page_fuzzer \
-            b_plus_tree_fuzzer
+            expression_fuzzer
 
       - name: short fuzz run
         run: |
           for f in table_fuzzer value_fuzzer date_interval_fuzzer \
                    cast_fuzzer function_fuzzer data_chunk_fuzzer \
-                   expression_fuzzer row_page_fuzzer \
-                   leaf_page_fuzzer b_plus_tree_fuzzer; do
+                   expression_fuzzer; do
             ./build-fuzz/$f -runs=1000 -max_total_time=60 || true
           done
 

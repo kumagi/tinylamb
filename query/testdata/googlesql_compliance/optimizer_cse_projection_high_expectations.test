@@ -134,10 +134,10 @@ ARRAY<STRUCT<b INT64, total INT64>>[{2, 10}, {5, 30}, {8, NULL}]
 [mode=explain]
 # Migrated to the Cascades route with the relational-planner cleanup.
 # The index-order-preserving projection (no sort at all) is not implemented
-# on the optimizer path yet; tracked in docs/optimizer_todo.md.  The case
+# on the optimizer path yet (tracked in the root TODO.md).  The case
 # still pins index-based access plus a single ordering node.
 [plan_contains=IndexOnlyScan: opt_metrics]
-[name=monotonic_projection_preserves_index_order]
+[name=monotonic_projection_adds_sort]
 SELECT id + 10 AS shifted FROM opt_metrics ORDER BY shifted
 --
 ARRAY<STRUCT<shifted INT64>>[{11}, {12}, {13}, {14}]

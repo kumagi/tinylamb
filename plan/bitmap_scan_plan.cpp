@@ -71,10 +71,10 @@ bool BitmapScanPlan::ContainsParameterSlots() const {
   return ContainsParameterSlot(where_);
 }
 
-bool BitmapScanPlan::InstallParameterSlots(const std::vector<Value>& parameters,
-                                           size_t* cursor,
-                                           std::vector<Expression>* slots) {
-  return SlotizeInPlace(&where_, parameters, cursor, slots);
+bool BitmapScanPlan::InstallParameterSlots(
+    const std::vector<Value>& /*parameters*/, size_t* /*cursor*/,
+    std::vector<Expression>* slots) {
+  return CollectParameterSlots(&where_, slots);
 }
 
 }  // namespace tinylamb

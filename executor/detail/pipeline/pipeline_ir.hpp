@@ -33,7 +33,10 @@ struct PipelineExecutionMetrics {
   double grant_wait_ms{0.0};
   size_t granted_bytes{0};
   size_t operator_budget_bytes{0};
+  // Worker count the blocking stages are actually driven with (see
+  // PipelineContext::effective_dop), not the grant-permitted DOP.
   size_t effective_dop{1};
+  size_t permitted_dop{1};
   OocTelemetrySnapshot ooc;
 };
 
@@ -56,10 +59,15 @@ class PipelineContext {
   TransactionContext* txn{nullptr};
   SpillStore spill_store;
   QueryMemoryGrant grant;
+  // Workers actually used: ExecuteBlockingStage drives every sink with
+  // Init(ctx, 1) / Consume(ctx, 0, ...), so this stays 1 until per-worker
+  // sink scheduling exists.  EXPLAIN reports this value so `dop=` is honest.
   size_t effective_dop{1};
+  // Upper bound the memory grant would allow (ComputeEffectiveDop); not yet
+  // connected to execution.
+  size_t permitted_dop{1};
   OocQueryMetrics ooc_metrics;
   std::atomic<uint64_t> legacy_source_ns{0};
-  std::atomic<uint64_t> legacy_source_calls{0};
 };
 
 // Pull-based chunk producer starting a pipeline (scan, upstream sink output,
@@ -204,7 +212,9 @@ class DeferredPipelineSource final : public PipelineSource {
   StatusOr<bool> NextBatch(PipelineContext* ctx, DataChunk* out,
                            size_t max_rows) override {
     if (!bound_) {
-      return false;
+      // Reading before Finalize is a lifecycle error, not a clean EOF.
+      return StatusError(StatusCode::kRuntimeError,
+                         "DeferredPipelineSource read before Finalize");
     }
     return bound_->NextBatch(ctx, out, max_rows);
   }

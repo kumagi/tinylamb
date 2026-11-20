@@ -28,10 +28,13 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/lambda_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
@@ -104,19 +107,6 @@ bool SkipBindConstant(const Value& value) {
 // so binding must pass them through verbatim; treating them as bindable
 // literals shifts every later parameter and silently rewrites operator or
 // field-name slots into user data.
-bool IsStructuralCallArg(std::string_view func, size_t index) {
-  if (func == "__quantified__") {
-    return index >= 2;
-  }
-  if (func == "__struct_json__") {
-    return index % 3 != 1;
-  }
-  if (func == "make_interval" || func == "get_field") {
-    return index == 1;
-  }
-  return false;
-}
-
 StatusOr<Expression> BindExpression(const Expression& expression,
                                     const std::vector<Value>& parameters,
                                     size_t* index);
@@ -170,7 +160,10 @@ StatusOr<Expression> BindExpression(
       // same '?' slot. The forward direction is repaired above; the reverse
       // (cached string constant, new SQL carries a date literal) would
       // silently swap the comparison type, so reject it -- the engine falls
-      // back to parsing the statement verbatim.
+      // back to parsing the statement verbatim. ExtractSqlTemplate currently
+      // emits VARCHAR parameters for DATE literals too, so this arm is a
+      // defensive guard for hand-built binding calls, not a normal Prepare
+      // path; keep it in sync if parameter typing changes.
       if (current.type == ValueType::kVarChar &&
           parameter.type == ValueType::kDate) {
         return Status(Status::kInvalidArgument,
@@ -369,11 +362,91 @@ StatusOr<Expression> BindExpression(
       return std::make_shared<CastExpression>(
           std::move(child), cast.TargetTypeName(), cast.ReturnNullOnError());
     }
+    case TypeTag::kWindowFunctionExp: {
+      // P363/432: every sub-expression of a window call appears in SQL text
+      // order below (args, AGG(x WHERE ...), in-call ORDER BY, PARTITION BY,
+      // ORDER BY, frame start, frame end), and the text extractor already
+      // parameterized their literals (frame offsets, LAG(x, 2, 0) ...). The
+      // old default arm shared the subtree consuming zero parameters, so any
+      // statement with a parameterized window literal permanently missed the
+      // template cache (global count check at BindStatementLiterals).
+      const auto& window = expression->AsWindowFunctionCallExpression();
+      auto bound = std::make_shared<WindowFunctionCallExpression>();
+      bound->function = window.function;
+      bound->args.reserve(window.args.size());
+      for (const Expression& arg : window.args) {
+        ASSIGN_OR_RETURN(Expression, bound_arg,
+                         (BindExpression(arg, parameters, index)));
+        bound->args.push_back(std::move(bound_arg));
+      }
+      if (window.where_filter != nullptr) {
+        ASSIGN_OR_RETURN(
+            Expression, bound_filter,
+            (BindExpression(window.where_filter, parameters, index)));
+        bound->where_filter = std::move(bound_filter);
+      }
+      bound->distinct = window.distinct;
+      bound->inner_order_by.reserve(window.inner_order_by.size());
+      for (const WindowOrderTerm& term : window.inner_order_by) {
+        ASSIGN_OR_RETURN(Expression, bound_term,
+                         (BindExpression(term.expression, parameters, index)));
+        bound->inner_order_by.push_back(
+            WindowOrderTerm{.expression = std::move(bound_term),
+                            .ascending = term.ascending,
+                            .nulls_first = term.nulls_first});
+      }
+      bound->inner_limit = window.inner_limit;
+      bound->partition_by.reserve(window.partition_by.size());
+      for (const Expression& key : window.partition_by) {
+        ASSIGN_OR_RETURN(Expression, bound_key,
+                         (BindExpression(key, parameters, index)));
+        bound->partition_by.push_back(std::move(bound_key));
+      }
+      bound->order_by.reserve(window.order_by.size());
+      for (const WindowOrderTerm& term : window.order_by) {
+        ASSIGN_OR_RETURN(Expression, bound_term,
+                         (BindExpression(term.expression, parameters, index)));
+        bound->order_by.push_back(
+            WindowOrderTerm{.expression = std::move(bound_term),
+                            .ascending = term.ascending,
+                            .nulls_first = term.nulls_first});
+      }
+      bound->frame_unit = window.frame_unit;
+      for (size_t side = 0; side < 2; ++side) {
+        const WindowFrameBound& source =
+            side == 0 ? window.frame_start : window.frame_end;
+        WindowFrameBound target;
+        target.type = source.type;
+        if (source.offset != nullptr) {
+          ASSIGN_OR_RETURN(Expression, bound_offset,
+                           (BindExpression(source.offset, parameters, index)));
+          target.offset = std::move(bound_offset);
+        }
+        (side == 0 ? bound->frame_start : bound->frame_end) = std::move(target);
+      }
+      bound->has_frame = window.has_frame;
+      bound->exclusion = window.exclusion;
+      bound->respect_nulls = window.respect_nulls;
+      bound->ignore_nulls = window.ignore_nulls;
+      return Expression{std::move(bound)};
+    }
+    case TypeTag::kLambdaExp: {
+      // P363/432: the extractor parameterizes literals inside the lambda
+      // body (ARRAY_FIND((x) -> x > 5, ...)); bind the body so the
+      // consumption count matches the text.
+      const auto& lambda = expression->AsLambdaExpression();
+      ASSIGN_OR_RETURN(Expression, bound_body,
+                       (BindExpression(lambda.Body(), parameters, index)));
+      return std::make_shared<LambdaExpression>(lambda.Parameters(),
+                                                std::move(bound_body));
+    }
     default:
       // Unhandled expression kinds return the cached tree's subtree SHARED
-      // (not cloned). Invariant: Statement/Expression trees are immutable
-      // after construction -- every consumer must treat them as read-only or
-      // this aliasing silently corrupts the template cache.
+      // (not cloned). Consumers of THIS template tree must treat it as
+      // read-only or the aliasing silently corrupts the cache. Note the
+      // compiled-plan cache uses a separate, thread-local transactionally
+      // bound tree; do not assume "all expression trees are immutable" as a
+      // global invariant when merging the two filling paths.
       return expression;
   }
 }
@@ -598,31 +671,45 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
   // Depth specs are bound with their body (that is where their parameters
   // sit) but applied once `result` exists.
   std::vector<std::pair<std::string, RecursiveDepthSpec>> depths;
-  if (select.WithQueries().size() > 1) {
-    // CTE bodies precede the main SELECT in the text, but WithQueries() is an
-    // unordered_map that lost their declaration order; binding by sorted name
-    // would swap parameters whenever declarations are not alphabetical.
-    // Refuse such statements instead -- the engine falls back to parsing the
-    // SQL verbatim.
+  {
+    // T2540: bind CTE bodies in DECLARATION order.  WithQueries() is an
+    // unordered_map, but the parser records declaration order in
+    // WithQueryOrder(), and ExtractSqlTemplate emits parameters strictly
+    // left-to-right in the text -- where bodies appear in declaration
+    // order.  Binding by sorted name rebuilt with_query_order_
+    // alphabetically, so select_rewrites (which reads WithQueryOrder() as
+    // "deterministic declaration order for reproducible plans") could
+    // lift/inline CTEs differently on a template-cache hit than on the
+    // first execution even though the bound values were correct.
+    std::vector<std::string> names = select.WithQueryOrder();
+    std::erase_if(names, [&](const std::string& name) {
+      return !select.WithQueries().contains(name);
+    });
     for (const auto& [name, query] : select.WithQueries()) {
-      const RecursiveDepthSpec* depth = select.RecursiveDepthOf(name);
-      const bool literal_depth = depth != nullptr && (depth->lower_is_literal ||
-                                                      depth->upper_is_literal);
-      if (SelectHasBindableConstant(*query) || literal_depth) {
-        return Status(Status::kInvalidArgument,
-                      "SQL template cannot recover WITH declaration order");
+      if (std::find(names.begin(), names.end(), name) == names.end()) {
+        // Defensive: a map entry the order vector never saw (hand-built
+        // statement).  Bind it after the ordered ones, deterministically.
+        names.push_back(name);
       }
     }
-  }
-  {
-    // CTE bodies precede the main SELECT in the text; unordered_map gives no
-    // stable order, so bind them by sorted name.
-    std::vector<std::string> names;
-    names.reserve(select.WithQueries().size());
-    for (const auto& [name, query] : select.WithQueries()) {
-      names.push_back(name);
-    }
-    std::ranges::sort(names);
+    std::stable_sort(
+        names.begin(), names.end(),
+        [&](const std::string& left, const std::string& right) {
+          // keep ordered-prefix stable, sort the tail only
+          const auto order = select.WithQueryOrder();  // NOLINT(performance-unnecessary-copy-initialization)
+          const auto li = std::find(order.begin(), order.end(), left);
+          const auto ri = std::find(order.begin(), order.end(), right);
+          if (li == order.end() && ri == order.end()) {
+            return left < right;
+          }
+          if (li == order.end()) {
+            return false;
+          }
+          if (ri == order.end()) {
+            return true;
+          }
+          return li < ri;
+        });
     for (const std::string& name : names) {
       ASSIGN_OR_RETURN(
           std::shared_ptr<SelectStatement>, hv16241_0,
@@ -704,6 +791,14 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
   std::vector<Expression> group;
   group.reserve(select.GroupBy().size());
   for (const Expression& item : select.GroupBy()) {
+    if (select.IsGroupAll()) {
+      // The GROUP BY () key is the visitor's synthesized `0` placeholder
+      // (added after every literal in the SQL text), so the text-driven
+      // extractor has no matching parameter: re-synthesize it instead of
+      // consuming one, and carry the marker (below).
+      group.push_back(ConstantValueExp(Value(int64_t{0})));
+      continue;
+    }
     ASSIGN_OR_RETURN(Expression, hv17214_0,
                      (BindExpression(item, parameters, index)));
     group.push_back(std::move(hv17214_0));
@@ -749,6 +844,10 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
   if (!group.empty()) {
     result->SetGroupBy(std::move(group));
   }
+  // `GROUP BY ()` is a placeholder constant key plus this marker; a re-bind
+  // that dropped it would replay group-all aggregates as 0 rows on empty
+  // input (the visitor's SubstituteInSelect transcribes it too).
+  result->SetGroupAll(select.IsGroupAll());
   if (having) {
     result->SetHaving(std::move(having));
   }
@@ -939,11 +1038,43 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       const bool is_triple = is_triple_single || is_triple_double;
       const char quote = is_triple_double ? '"' : '\'';
       const size_t quote_pos = i;
+      // T2547: resolve the r/B prefix BEFORE scanning.  In a raw literal a
+      // backslash is a plain character; treating it as an escape made the
+      // closing quote of `r'...\'` look escaped, dropping the statement to
+      // a permanent verbatim parse (closed=false → templatable=false).
+      // A b/B prefix (up to two r/B letters, like the visitor's own
+      // DecodeSingleComponent) marks a bytes literal: decoding it as text
+      // would UTF-8-encode its high bytes, so a cache replay bound a
+      // different constant than the first parse evaluated.
+      bool is_raw_prefix = false;
+      bool is_bytes_prefix = false;
+      size_t prefix_end = quote_pos;
+      for (int taken = 0; taken < 2 && 0 < prefix_end; ++taken) {
+        const char p = sql[prefix_end - 1];
+        if (p == 'b' || p == 'B') {
+          is_bytes_prefix = true;
+          --prefix_end;
+        } else if (p == 'r' || p == 'R') {
+          is_raw_prefix = true;
+          --prefix_end;
+        } else {
+          break;
+        }
+      }
+      if (0 < prefix_end) {
+        const char before = sql[prefix_end - 1];
+        if (std::isalnum(static_cast<unsigned char>(before)) != 0 ||
+            before == '_') {
+          // The letters belong to a longer identifier, not a literal prefix.
+          is_bytes_prefix = false;
+          is_raw_prefix = false;
+        }
+      }
       i += is_triple ? 3 : 1;
       std::string raw_literal;
       bool closed = false;
       while (i < sql.size()) {
-        if (sql[i] == '\\' && i + 1 < sql.size()) {
+        if (!is_raw_prefix && sql[i] == '\\' && i + 1 < sql.size()) {
           // Backslash escapes the next character inside a quoted
           // string (the parser decodes \' and the splitter swallows the
           // pair); consume both so a \' does not terminate this scan.
@@ -979,43 +1110,21 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       if (!closed) {
         result.templatable = false;
       }
-      // Decode through the visitor's single escape table so the extracted
-      // parameter equals the constant the first parse produced.  A b/B
-      // prefix (up to two r/B letters, like the visitor's own
-      // DecodeSingleComponent) marks a bytes literal: decoding it as text
-      // would UTF-8-encode its high bytes, so a cache replay bound a
-      // different constant than the first parse evaluated.
-      bool is_raw_prefix = false;
-      bool is_bytes_prefix = false;
-      size_t prefix_end = quote_pos;
-      for (int taken = 0; taken < 2 && 0 < prefix_end; ++taken) {
-        const char p = sql[prefix_end - 1];
-        if (p == 'b' || p == 'B') {
-          is_bytes_prefix = true;
-          --prefix_end;
-        } else if (p == 'r' || p == 'R') {
-          is_raw_prefix = true;
-          --prefix_end;
-        } else {
-          break;
-        }
-      }
-      if (0 < prefix_end) {
-        const char before = sql[prefix_end - 1];
-        if (std::isalnum(static_cast<unsigned char>(before)) != 0 ||
-            before == '_') {
-          // The letters belong to a longer identifier, not a literal prefix.
-          is_bytes_prefix = false;
-          is_raw_prefix = false;
-        }
-      }
       std::string literal = raw_literal;
       if (!is_raw_prefix) {
         auto decoded =
             DecodeStringEscapes(raw_literal, is_bytes_prefix, is_triple, quote);
         if (!decoded.HasValue()) {
+          // T2541: decline templating but keep scanning — an early return
+          // left the fingerprint truncated at this literal, and the
+          // compiled-plan lookup (sql_engine.cpp) still keys on the
+          // fingerprint when parameters is empty.  Record the raw text in
+          // the parameter slot so parameters stay aligned with the '?'
+          // placeholders the fingerprint accumulates.
           result.templatable = false;
-          return result;
+          result.parameters.emplace_back(std::move(literal));
+          result.fingerprint += "'?'";
+          continue;
         }
         literal = decoded.MoveValue();
       }
@@ -1048,15 +1157,18 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       if (is_timestamp_kw &&
           (kw_end == 9 ||
            !IsIdentChar(static_cast<unsigned char>(sql[kw_end - 10])))) {
-        std::optional<std::string> normalized =
-            NormalizeTimestampText(literal);
+        std::optional<std::string> normalized = NormalizeTimestampText(literal);
         if (!normalized.has_value()) {
           // An invalid TIMESTAMP literal must not enter the template cache:
           // a cached slot would rebind the raw text without the visitor's
           // validation.  Decline templating so every run parses verbatim and
-          // surfaces the diagnostic.
+          // surfaces the diagnostic.  T2541: same truncated-fingerprint
+          // hazard as the decode-failure path; finish the scan instead of
+          // returning mid-statement.
           result.templatable = false;
-          return result;
+          result.parameters.emplace_back(std::move(literal));
+          result.fingerprint += "'?'";
+          continue;
         }
         literal = std::move(*normalized);
       }
@@ -1110,6 +1222,35 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         result.fingerprint.push_back(sql[i]);
         ++i;
       }
+      if (keyword_size == 8 && i < sql.size() && sql[i] == '\'') {
+        // P363/432: quoted interval amount (INTERVAL '5 hours' /
+        // INTERVAL '5' DAY). The binder's kIntervalExp arm rebuilds the
+        // interval from AST metadata and cannot tell INTERVAL '5' DAY from
+        // INTERVAL 5 DAY (identical folded nodes), so keep the quoted amount
+        // verbatim in the template instead of emitting a string parameter:
+        // extraction and binding then agree on consuming nothing.
+        result.fingerprint.push_back('\'');
+        ++i;
+        while (i < sql.size()) {
+          if (sql[i] == '\\' && i + 1 < sql.size()) {
+            result.fingerprint.append(sql, i, 2);
+            i += 2;
+            continue;
+          }
+          if (sql[i] == '\'') {
+            if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+              result.fingerprint.append("''");
+              i += 2;
+              continue;
+            }
+            result.fingerprint.push_back('\'');
+            ++i;
+            break;
+          }
+          result.fingerprint.push_back(sql[i]);
+          ++i;
+        }
+      }
       continue;
     }
     if (upper_c == 'A' && KeywordAt(sql, i, "ASSERT_ROWS_MODIFIED")) {
@@ -1134,7 +1275,25 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
     }
     if ((upper_c == 'C' || upper_c == 'D') &&
         (KeywordAt(sql, i, "CREATE") || KeywordAt(sql, i, "DROP"))) {
-      result.templatable = false;
+      // Only a statement-leading CREATE/DROP is DDL. A column, alias or table
+      // named "create"/"drop" inside a SELECT must not disable templating.
+      size_t stmt_begin = 0;
+      for (size_t j = i; j-- > 0;) {
+        if (sql[j] == ';') {
+          stmt_begin = j + 1;
+          break;
+        }
+      }
+      bool only_whitespace = true;
+      for (size_t j = stmt_begin; j < i; ++j) {
+        if (std::isspace(static_cast<unsigned char>(sql[j])) == 0) {
+          only_whitespace = false;
+          break;
+        }
+      }
+      if (only_whitespace) {
+        result.templatable = false;
+      }
     }
     const bool number_start =
         std::isdigit(c) != 0 ||
@@ -1254,7 +1413,17 @@ StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
       // ASSERT_ROWS_MODIFIED into plain inserts.
       bound_insert->SetMode(insert.Mode());
       bound_insert->SetAssertRowsModified(insert.AssertRowsModified());
-      bound_insert->SetQuery(insert.Query());
+      // P363/432: INSERT..SELECT carries literals in the SELECT body; the
+      // extractor parameterized them but the old pass-through consumed zero,
+      // permanently missing the cache for every INSERT..SELECT with a
+      // literal. Bind in text order (VALUES rows above, then the query).
+      if (insert.Query() != nullptr) {
+        ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, bound_query,
+                         (BindSelect(*insert.Query(), parameters, &index)));
+        bound_insert->SetQuery(std::move(bound_query));
+      } else {
+        bound_insert->SetQuery(insert.Query());
+      }
       bound = std::move(bound_insert);
       break;
     }
@@ -1379,6 +1548,8 @@ StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
     case StatementType::kAnalyze:
     case StatementType::kCreateMaterializedView:
     case StatementType::kDropMaterializedView:
+    case StatementType::kCreateFunction:
+    case StatementType::kCreateConstant:
       return Status(Status::kInvalidArgument, "SQL template does not bind DDL");
   }
   if (index != parameters.size()) {

@@ -44,6 +44,10 @@ struct ExprOracleTrace {
   // True when the engine executed the SQL (vs rejecting it as unsupported).
   // Guards against vacuous sweeps where every iteration skips.
   bool engine_ran = false;
+  // Generator mode (ExprGenConfig::extended_ops) the seed was run under.
+  // The libFuzzer path dedicates input-derived bits to it (P612); replay
+  // regenerates with the same mode so tamper checks stay byte-identical.
+  bool extended_ops = false;
 
   bool operator==(const ExprOracleTrace&) const = default;
 };
@@ -91,6 +95,9 @@ struct RowExprOracleTrace {
   bool null_reject_verified = false;
   bool engine_ran = false;
   std::string failure;
+  // Generator mode (ExprGenConfig::extended_ops) the seed was run under;
+  // see ExprOracleTrace::extended_ops (P612).
+  bool extended_ops = false;
 
   bool operator==(const RowExprOracleTrace&) const = default;
 };

@@ -21,6 +21,270 @@
 - フォールバック階層: JIT → bytecode → 式ツリー評価。JIT/bytecode以前にゾーンマップ pruning(BatchMayMatch, NULL count==0 判定)が効く。
 - break_even 約2097万は測定グリッド最大点(LLVM ORC compile 約2.36ms、測定環境依存)。
 
+## 2026-11-20 — ClickBench の SIMD JIT と集約融合
+
+99,997,497 行、CPU 0〜7、8 スレッド、UTC、ウォームアップ 1 回と測定 3 回。
+全 43 件で結果を検証した。Tinylamb のクエリ中央値の合計は **9.794 秒から
+6.737 秒へ短縮（31.2%）**。変更後の DuckDB 2.0.0 は 13.320 秒だった。
+初回の候補観測とコンパイルはウォームアップに含まれる。
+変更前後のバイナリの実行順をクエリごとに交互に入れ替え、各 5 回計測した場合も、
+中央値の合計は **9.145 秒から 6.125 秒へ短縮（33.0%）**。
+
+| クエリ | 変更前 (ms) | 変更後 (ms) |
+|---|---:|---:|
+| Q19 | 818.23 | 363.98 |
+| Q29 | 2,724.95 | 460.79 |
+| Q33 | 1,305.41 | 389.70 |
+| Q34 | 587.94 | 455.93 |
+| Q35 | 576.78 | 457.46 |
+
+全件の一次記録は `build/benchmarks/clickbench-simd-20261120.PWEfcz/` の
+`baseline/`、`final/`、`paired-summary.json` に保存した。
+Q23 は全件測定で 332 ms から 1,145 ms に変動し、交互測定では 332.4 ms から 331.4 ms だった。
+生成コードは同じディレクトリの `jit-objects/` に保存し、`vpcmpeqb`、
+`vpmullq`、`vpgatherqd` の出力を確認した。
+
+- アンカー付き正規表現を、貪欲な順に並べたリテラル接頭辞と非空キャプチャに下ろす。LLVM は区切り位置を SIMD で検索し、元のバイト列へのビューを集約に渡す。
+- `HAVING COUNT` に閾値がある場合、既存の初回走査から得たバケット候補を使い、捕捉・ハッシュ・候補グループの厳密集約を一度の走査で実行する。毎回すべてのバケットの件数を数え、閾値に達し得るバケットが候補に含まれることを確かめる。候補表はテーブルのスナップショットとキーの形にひも付く。
+- ほぼ一意な整数キーでは八レーンでハッシュを計算する。バケットごとの担当に行位置とタグを送り、重複候補と必要な同率グループだけを厳密集約へ渡す。メモリ予算に応じて共有ビットマップに切り替える。
+- 検証済みの UTC タイムスタンプでは、時・分の桁を読み、整数キーとのハッシュを同じ SIMD ループで計算する。文字列の Top-N 件数集計は三つの窓からフィンガープリントを作り、候補の等価性を元の文字列で確認する。
+- AVX-512BW の短いリテラル検索では、各バイトの比較マスクを文字位置だけシフトして交差させ、64バイトのロードから完全一致位置を得る。
+
+Lean で検証した変換は [正規表現キャプチャ](../lean/TinylambOpt/DelimitedCaptureJit.lean)、
+[SIMD ハッシュとリプレイ](../lean/TinylambOpt/SimdGroupHash.lean)、
+[集約候補の件数上界](../lean/TinylambOpt/QuotientFusion.lean)、
+[リテラルマスク](../lean/TinylambOpt/PhysicalJitFusion.lean) に収録した。
+
+## 2026-11-20 — 標準規模の ClickBench と DuckDB
+
+99,997,497 行の同じデータを 8 コア、各エンジン 8 スレッド、UTC で比較。
+ウォームアップ 1 回と測定 3 回を行い、クエリごとの中央値と結果の一致を確認した。
+比較前は 43 件中 16 勝で、中央値の合計は Tinylamb 22.72 秒、DuckDB 2.0.0 は 13.80 秒だった。
+同じ変更後バイナリを通常順と反転順で計測した。どちらも全 43 件で正答し、33 件で上回った。
+
+| 実行順 | Tinylamb の中央値合計 (秒) | DuckDB の中央値合計 (秒) | Tinylamb の勝数 |
+|---|---:|---:|---:|
+| 通常 | 9.78 | 13.34 | 33/43 |
+| 反転 | 10.30 | 14.01 | 33/43 |
+
+| Query | 変更前の Tinylamb (ms) | 変更後の Tinylamb (ms) | 同じ測定の DuckDB (ms) |
+|---|---:|---:|---:|
+| Q07 | 21.96 | 0.12 | 1.09 |
+| Q10 | 1,101.80 | 201.12 | 290.74 |
+| Q22 | 855.40 | 379.90 | 344.88 |
+| Q23 | 2,072.76 | 1,272.61 | 335.49 |
+| Q31 | 2,112.75 | 159.25 | 193.96 |
+| Q32 | 3,437.68 | 232.57 | 232.78 |
+| Q33 | 3,966.00 | 1,342.68 | 1,462.65 |
+
+クエリ別の表は通常順。Q23 は反転順で 342.24 ms 対 333.20 ms だった。
+同一条件で変更前後のバイナリを交互に測ると 352.39 ms 対 344.53 ms で、
+通常順の全件測定で見られた Q23 の遅さは再現しなかった。
+Q22、Q24、Q40 は両順で差が残り、Q32 は順によって勝敗が入れ替わった。
+全件の測定データと固定バイナリは
+`build/benchmarks/clickbench-duck-win-20261120.fxG2Br/verified{,-reverse}/` に保存した。
+
+- TLCS のファイル統計から最小値・最大値・件数を返す。整数辞書や値域が狭い符号付き整数では厳密な頻度を作る。Q10 はこの頻度で上位キーを選び、残りの集約に必要な走査を実行する。頻度表の初回構築はウォームアップに含まれる。
+- 読む列・ストリーム間の空白と read の回数を比較し、まとめ読みと個別読みを切り替える。文字列の空判定はオフセットで行う。
+- 件数降順 Top-N では、ゾーン範囲と上位キーの照合でペイロードの読み出しを絞る。先頭の数値キーがほぼ一意なら、繰り返したキー候補のみを厳密に数え、一度得たフィルタ結果も再利用する。数値キーのペアに頻出グループがある場合は、バケット上界と候補グループの正確な件数を同じループで集計する。サンプルは実行方式と候補の選択に用いる。
+- 文字列 JIT の末尾は、バッファ内に収まるベクトルロードとマスクで検索する。選択率の低い文字列フィルタは、候補行を得てから長さ比較や後続列の読み出しを行う。
+
+変換の正当性は [TLCS 集約](../lean/TinylambOpt/TlcsBoundaryAggregate.lean) と
+[文字列 JIT](../lean/TinylambOpt/PhysicalJitFusion.lean) と
+[バケット集計](../lean/TinylambOpt/QuotientFusion.lean) に収録した。
+
+Q10 の交互測定は 337.2 ms から 201.7 ms。Q31 は同じバイナリでバケット集計を切り替えた
+交互測定で、297.5 ms から 185.9 ms になった。Q23 でフィルタとすべての集約を一度の走査にまとめた試作は、
+二段集約の 547.2 ms に対して 767.0 ms かかったため、二段集約を使用する。
+
+## 2026-11-20 — Adaptive Filter → HashProbe
+
+A resident inner equi-join on one signed INT64 key can consume a probe
+filter comparing an INT64 column to a literal. The filter may include an
+`IS NOT NULL` check on the join key and may be followed by column-only
+projections or aliases. The direct LLVM cursor compares eight rows at a
+time, pops matching lanes in order and probes the resident hash index
+immediately. It stores the unfinished comparison in one machine word.
+The compact route uses a SIMD filter and an ordered array of passing row
+ordinals and hashes so it can prefetch 16 candidates ahead. Both routes
+construct probe output rows only at a hit and hand duplicate chains to
+the existing resumable emitter.
+
+The automatic policy starts after 65,536 eligible input rows. It samples
+16 adjacent predicate values from each quarter of a batch and uses the
+estimated passing fraction, adjacent transitions and hash-slot footprint.
+Mostly rejected batches favor direct probing. Small hash tables also
+favor direct probing on frequently alternating predicates near half
+selectivity. Otherwise the policy uses compact probing. Runtime filters
+published to the scan run upstream. A join-local exact set shares the
+index's domain, so its rejection counts come from the same probe. NULL
+inputs, spill and unsupported shapes use the ordinary pipeline.
+[`FilterHashProbe.lean`](../lean/TinylambOpt/FilterHashProbe.lean) proves
+the equality of the ordered streams, including duplicate chains and
+projection at the hit, and checks the hash and lane-mask arithmetic.
+
+`tinylamb_expression_jit_benchmark --hash-probe` used 1,048,576 input
+rows in tiles of 1,024 on a Ryzen 9 9950X3D. The medians below exclude
+LLVM compilation and include the sampler in the automatic route. Both
+routes produced the same ordered result checksum as the scalar reference
+in all 48 cases.
+
+| Hash-slot footprint | Passing rows | Direct (ms) | Compact (ms) | Automatic (ms) |
+|---:|---|---:|---:|---:|
+| 128 MiB | 1%, clustered | 0.28 | 0.40 | 0.28 |
+| 128 MiB | 10%, clustered | 2.24 | 1.64 | 1.52 |
+| 128 MiB | 50%, shuffled | 15.63 | 10.60 | 10.70 |
+| 128 MiB | 100% | 32.49 | 15.94 | 16.76 |
+| 1 MiB | 50%, shuffled | 8.45 | 8.86 | 8.51 |
+
+The sampler came within 1% of the faster fixed route when summed over
+the matrix. At 5% shuffled selectivity on the 128 MiB hash index it
+missed the crossover often enough to take 1.54 ms versus 1.33 ms for
+always compact. The thresholds are empirical for this machine.
+
+The SQL comparison used one million probe rows from the first ClickBench
+Parquet file, a join key derived from `UserID`, and a generated
+1,024-key build table. Every run returned the same row multiset as DuckDB.
+The first four timing columns use `TINYLAMB_DISABLE_WORKER_SCAN_FILTER=1`
+to keep the predicate in the probe pipeline. The last column leaves worker
+pushdown enabled. All columns use the same binary with eight query workers,
+two warmups and seven timed runs per predicate and mode.
+
+| Predicate | Off (ms) | Direct (ms) | Compact (ms) | Automatic (ms) | Worker pushdown (ms) |
+|---|---:|---:|---:|---:|---:|
+| `ResolutionWidth > 1000` | 159.39 | 112.97 | 100.43 | 99.37 | 132.24 |
+| `ResolutionWidth > 1920` | 40.92 | 36.06 | 40.67 | 35.85 | 25.25 |
+| `AdvEngineID > 1` | 43.48 | 38.96 | 39.29 | 39.28 | 3.04 |
+
+The first query ran 884 batches through automatic probe selection. The
+second ran 115. For the third the scan delivered too few rows to promote
+in automatic mode. With worker pushdown enabled these queries keep their
+existing worker-filtered scan. Raw matrices, optimized LLVM IR, and the
+SQL runner are in `build/benchmarks/filtered-hash-probe-20261120/`.
+
+## 2026-11-20 — LLVM Filter → Project → SUM fusion
+
+The chunk pipeline can lower an INT64 comparison against a literal and a
+signed affine expression into a single LLVM ORC SUM kernel. The kernel
+reads the input columns directly, with no selection or projected-value
+array. It returns the updated sum and the number of matching rows, which
+preserves SQL's NULL result when no rows contribute. Zone maps bound the
+multiply, the add and every prefix of the running sum. NULLs and batches
+that fail the guard use the ordinary filter and projection operators.
+The Lean model is in
+[`FusedAggregateJit.lean`](../lean/TinylambOpt/FusedAggregateJit.lean).
+
+`tinylamb_expression_jit_benchmark --fusion` compares two generated fused
+loops with three split baselines. Both fused loops vectorized to eight
+INT64 lanes on an AMD Ryzen 9 9950X3D. The selected version loads payloads
+unconditionally and masks the contribution. The other version lets LLVM
+use masked payload loads. ORC compilation took about 6.1 ms per variant.
+These 10-million-row medians exclude compilation and use distinct key
+and payload columns.
+
+| Passing rows | Full arrays (ms) | Compacted rows (ms) | 1024-row tiles (ms) | Fused, select (ms) | Fused, conditional load (ms) |
+|---|---:|---:|---:|---:|---:|
+| 50%, shuffled | 7.10 | 28.23 | 2.47 | 1.91 | 3.06 |
+| 1%, clustered | 7.29 | 2.23 | 2.68 | 1.96 | 3.20 |
+
+The compacted route beat the conditional-load fusion when the accepted
+rows clustered at 1% selectivity. The unconditional-load fusion was
+fastest across the 10-million-row cases. Tiling made the split dense
+route competitive by reusing cache-sized intermediates.
+
+A separate SQL run used one million rows from the first ClickBench
+Parquet file, importing `AdvEngineID` and `ResolutionWidth` as INT64.
+`SELECT SUM(x * 3 + 7) FROM fused_source WHERE x > 1000` returned
+4,768,455,814 in both modes, matching DuckDB. The chunk pipeline ran in
+both modes with `TINYLAMB_OP_MEMORY_BYTES=4194304` and
+`TINYLAMB_DISABLE_WORKER_SCAN_FILTER=1`. Using the same binary, two
+warmups and seven measured runs per mode gave medians of 93.08 ms with
+`TINYLAMB_DISABLE_FUSED_SUM_JIT` and 19.25 ms with fusion. The first run
+in each process took 106.67 ms and 38.42 ms respectively.
+`EXPLAIN ANALYZE` reported 885 fused JIT batches. With default settings,
+the scan used the existing specialized scalar aggregation route (0.74 ms
+warm median). Results and optimized LLVM IR are in
+`build/benchmarks/fused-sum-20261120.fhSlYX/`.
+
+## 2026-11-20 — TLCS Top-N count fusion and projected reads
+
+For unfiltered descending `COUNT(*)` Top-N with a single physical VARCHAR
+key, a stratified block sample proposes a mask of candidate buckets. The
+full sweep computes the complete bucket histogram and exact counts for
+keys in the mask together. When the exact `OFFSET + LIMIT` cutoff strictly
+exceeds every outside bucket, the result is complete after that sweep.
+If the certificate fails, the complete histogram drives the existing exact
+replay. Counter bounds are checked once from directory row counts so the
+row loop can increment without testing for saturation. The unfiltered
+sweep drives key extraction directly by row index.
+
+Unfiltered quotient scans with up to four projected columns can read just
+those TLCS streams into the decode buffers. This avoids a coalesced file
+window spanning unrelated columns and an intermediate copy. Q17 and Q19
+still replay but use projected reads in both passes. Q34 and Q35 use both
+projected reads and the single full sweep. See
+[`QuotientFusion.lean`](../lean/TinylambOpt/QuotientFusion.lean).
+
+| Query | Replay and coalesced reads (ms) | Enabled (ms) | Speedup |
+|---|---:|---:|---:|
+| Q17 | 2038.75 | 396.99 | 5.14× |
+| Q19 | 3020.28 | 774.73 | 3.90× |
+| Q34 | 1676.59 | 552.56 | 3.03× |
+| Q35 | 1693.99 | 558.20 | 3.03× |
+
+The 99,997,497-row ClickBench TLCS snapshot ran on CPUs 0–7 with eight
+workers. One warmup and five measured samples per query and mode used the
+same release binary and alternated measurement order. All 48 answers agreed
+with the prior DuckDB-validated results. The comparison switch is
+`TINYLAMB_DISABLE_QUOTIENT_FUSION`. Both modes use the bounded counters and
+row-index scan. A separate Linux `rchar` probe measured bytes delivered to
+the process by reads, including page-cache hits. Q17 fell from 44.46 GB to
+3.92 GB and Q19 from 51.51 GB to 9.08 GB. Q34 and Q35 went from 18.88 GB
+to 9.51 GB each. A separate correctness run verified all 43 ClickBench
+answers. Results, runner and frozen binary are in
+`build/benchmarks/clickbench-lean-fusion-20261120.MQ8Ssi/`.
+
+## 2026-11-20: TLCS literal search and row selection
+
+For a positive bytewise `LIKE '%literal%'`, TLCS can use an ORC kernel
+specialized to the literal. It compares 32 first and last bytes together,
+then verifies the earliest candidate exactly. The scan maps each hit to the
+first exclusive row end above it, rejects boundary-crossing and NULL hits,
+and advances to the next row. The grouped and Top-N paths can use the same
+selection before decoding payload columns.
+
+The kernel admits 2–16 byte literals and is prepared for TLCS files with at
+least 128 blocks. Its process cache is bounded to 32 literals. Dictionary
+blocks, payloads with inconsistent offsets and blocks with more than 64 hit
+rows use the native path. Set `TINYLAMB_DISABLE_LITERAL_SEARCH_JIT=1` for the
+native comparison with the same binary. The Lean model is in
+[`PhysicalJitFusion.lean`](../lean/TinylambOpt/PhysicalJitFusion.lean).
+
+The standard 99,997,497-row ClickBench TLCS snapshot ran on CPUs 0–7 with
+eight workers, one warmup and seven measured repetitions per mode. The two
+workers used the same release binary and alternated measurement order.
+All 64 answers matched the prior DuckDB-validated results, including a
+permitted reorder among equal COUNT ranks. The earlier exploratory run
+overlapped a parallel test suite and had high timing variance.
+
+| Query | Native median (ms) | Literal JIT median (ms) |
+|---|---:|---:|
+| Q21 | 989.72 | 949.61 |
+| Q22 | 1028.92 | 1040.65 |
+| Q23 | 1639.55 | 1600.38 |
+| Q24 | 90.02 | 86.05 |
+
+Q21 and Q24 each improved by about 4% in the median and were faster in five
+of seven pairs. The Q22/Q23 changes were within run-to-run variation.
+A separate sparse byte-buffer diagnostic measured 151.39 ms of thread CPU
+time for `memmem` and 39.25 ms for the generated search over the same buffers.
+The IR and object show the two 32-byte compares, mask AND and trailing-zero
+count.
+
+Raw samples, the runner, the archived binary and the kernel diagnostic are
+under `build/benchmarks/clickbench-lean-jit-20261120.fmXI8R/`. See
+`paired-repeat.jsonl` and `paired-repeat-summary.json` for the final run.
+
 ## 2026-11-13: optimized code versus fused execution
 
 The ORC kernels previously went directly from generated IR to machine code.
@@ -92,8 +356,9 @@ candidate7 took 915.571 ms. Per-query geometric means are 1.454x
 against ClickHouse, 1.288x against eight-core DuckDB and
 1.901x against one-core DuckDB. One-to-eight-core scaling is
 4.452x. Every-query or overwhelming eight-core victory is not achieved.
-Full samples, frozen binaries, perf captures and graphs live under
-`build/benchmarks/clickbench-jit-20261113/` (`report/`, `report-comparison/`).
+Full samples, frozen binaries, perf captures and graphs were generated under
+`build/benchmarks/clickbench-jit-20261113/` (`report/`, `report-comparison/`) and are NOT
+tracked in git; a fresh checkout does not include them.
 
 ## What changed
 

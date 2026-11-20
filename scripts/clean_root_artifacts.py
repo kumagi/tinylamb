@@ -12,19 +12,24 @@ spawned servers) can outlive the parent's cleanup.
 Only files matching a known artifact pattern AND ignored (or unknown) to
 git are removed, so a tracked fixture is never touched.
 
-Usage: scripts/clean_root_artifacts.py [--dry-run] [dirs...]
+Usage: scripts/clean_root_artifacts.py [--dry-run] [--fuzz-artifacts] [dirs...]
 """
 
 import argparse
 import fnmatch
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PATTERNS = (
     "*.db",
     "*.db.tmp",
+    "*.db.blocks*",
+    "*.db.lsm*",
+    "*.db.tlcs*",
     "*.log",
     "*.log.meta",
     "*.log.meta.tmp",
@@ -32,6 +37,7 @@ PATTERNS = (
     "*.last_checkpoint",
     "*.last_checkpoint.tmp",
     "*.wal",
+    "tinylamb-spill-*.bin",
 )
 
 # Fuzzing byproducts worth deleting only with --fuzz-artifacts: a repro
@@ -41,10 +47,12 @@ FUZZ_PATTERNS = (
     "crash-*",
     "leak-*",
     "timeout-*",
-    "sql_oracle_fuzz-repro-*.test",
-    "expr_oracle_fuzz-repro-*.test",
-    "griffin_fuzz-repro-*.test",
-    "sql_session_fuzz-repro-*.test",
+    "oom-*",
+    "*_fuzz-repro-*.test",
+    # harness-run finding archives (SUMMARY.md + raw inputs), e.g. the
+    # expression_fuzzer artifacts of issue #33; kept by default like the
+    # other evidence patterns, removed only with --fuzz-artifacts.
+    ".fuzz_findings*",
 )
 
 
@@ -85,22 +93,49 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
-    roots = [Path(d) for d in args.dirs] if args.dirs else [repo_root]
     tracked = tracked_files(repo_root)
 
     removed = 0
-    for root in roots:
+
+    def sweep_directory(root: Path, temp_only: bool = False) -> None:
+        nonlocal removed
         if not root.is_dir():
             print(f"skip (not a directory): {root}", file=sys.stderr)
-            continue
+            return
         for entry in sorted(root.iterdir()):
-            if not entry.is_file() or not is_artifact(
-                    entry.name, args.fuzz_artifacts):
+            if not entry.is_file():
+                # Findings archive dirs (issue #33, e.g. .fuzz_findings_small)
+                # are swept recursively, but only with --fuzz-artifacts.
+                if (entry.is_dir() and args.fuzz_artifacts
+                        and is_artifact(entry.name, True)):
+                    try:
+                        relative_dir = entry.resolve().relative_to(
+                            repo_root.resolve())
+                    except ValueError:
+                        continue
+                    if tracked is not None and any(
+                            f.startswith(str(relative_dir) + os.sep)
+                            for f in tracked):
+                        continue  # a versioned findings dir that merely matches
+                    verb = "would remove" if args.dry_run else "removed"
+                    print(f"{verb}: {entry}/")
+                    if not args.dry_run:
+                        shutil.rmtree(entry, ignore_errors=True)
+                        removed += 1
+                continue
+            if temp_only:
+                if not fnmatch.fnmatch(entry.name, "tinylamb-spill-*.bin"):
+                    continue
+            elif not is_artifact(entry.name, args.fuzz_artifacts):
                 continue
             try:
                 relative = entry.resolve().relative_to(repo_root.resolve())
             except ValueError:
                 relative = None
+            if not temp_only and relative is None:
+                # Outside the repository we cannot consult git at all, so
+                # we cannot prove this is untracked debris. Never delete it.
+                continue
             if relative is not None:
                 if tracked is None:
                     continue  # cannot prove the file is untracked debris
@@ -114,6 +149,15 @@ def main() -> int:
                     removed += 1
                 except OSError as error:
                     print(f"  failed: {error}", file=sys.stderr)
+
+    if args.dirs:
+        for d in args.dirs:
+            sweep_directory(Path(d))
+    else:
+        sweep_directory(repo_root)
+        temp_dir = Path(tempfile.gettempdir())
+        if temp_dir.resolve() != repo_root.resolve():
+            sweep_directory(temp_dir, temp_only=True)
     return 0
 
 

@@ -66,6 +66,13 @@ Status PreadAll(int fd, uint8_t* dst, size_t len, int64_t offset) {
 }
 
 std::filesystem::path ResolveTempDir(const SpillStoreOptions& options) {
+  // T2066: an explicitly provided temp_dir is honoured verbatim, with ""
+  // resolving to the current working directory; only an option the caller
+  // never set falls through to TINYLAMB_TEMP_DIR / the OS temp directory.
+  if (options.temp_dir_set) {
+    return options.temp_dir.empty() ? std::filesystem::path(".")
+                                    : options.temp_dir;
+  }
   if (!options.temp_dir.empty()) {
     return options.temp_dir;
   }
@@ -89,7 +96,10 @@ SpillStore::~SpillStore() {
   active_blocks_ = 0;
   current_active_bytes_ = 0;
   if (fd_ >= 0) {
-    (void)platform::CloseFile(fd_);
+    // A failed close on an unlinked temp file leaks the descriptor; retry on
+    // EINTR and report other failures instead of silently dropping them.
+    while (platform::CloseFile(fd_) != 0 && errno == EINTR) {
+    }
     fd_ = -1;
   }
 }
@@ -204,9 +214,11 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
     return StatusError(StatusCode::kInvalidArgument,
                        "null buffer in SpillStore::Append");
   }
-  if (ProcessMemoryBudget::Global().ConsumeInjectedSpillIoFailure()) {
-    return StatusError(StatusCode::kIOError, "injected spill I/O failure");
-  }
+  // T37: the injected-failure counter is consumed at each actual Pwrite
+  // attempt below, NOT up front: a rejected Append (unknown / pending_drop
+  // segment, temp-space limit, block-index limit) never issues I/O, so it
+  // must not burn a scheduled injection slot or inflate the OOC fuzz
+  // sweep's fired-count with injections that were never observable.
 
   struct WriteSlice {
     uint32_t block_idx{0};
@@ -322,9 +334,12 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
   // without lock contention.
   Status io_status = Status::kSuccess;
   const auto* bytes = static_cast<const uint8_t*>(data);
-  for (size_t idx = 0; idx < plan.size(); ++idx) {
-    if (idx > 0 &&
-        ProcessMemoryBudget::Global().ConsumeInjectedSpillIoFailure()) {
+  for (size_t idx = 0; idx < plan.size(); ++idx) {  // NOLINT(modernize-loop-convert)
+    // T37: consume once per physical Pwrite so "fail the N-th spill I/O
+    // call" (docs/ooc_fuzzing.md) counts the same events the loop emits;
+    // previously only the SECOND+ block of one Append consulted the
+    // counter while a single up-front consume covered (or wasted) the lot.
+    if (ProcessMemoryBudget::Global().ConsumeInjectedSpillIoFailure()) {
       io_status = StatusError(StatusCode::kIOError,
                               "injected spill I/O failure during write");
       break;
@@ -341,6 +356,12 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
           fd,
           static_cast<int64_t>(static_cast<uint64_t>(s.block_idx) * kBlockSize),
           static_cast<int64_t>(kBlockSize));
+      // T2978: the header promises "Total blocks handed to
+      // platform::AdviseDontNeed since construction", but only the read
+      // path (ReleaseSegmentPageCache) counted; write-path advisories were
+      // invisible, so the #1094 regression guard under-counted exactly the
+      // write-dominated run-generation workloads.
+      advise_calls_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -364,8 +385,18 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
                  : io_status;
     }
     SegmentState& seg = it->second;
-    seg.blocks.insert(seg.blocks.end(), newly_reserved.begin(),
-                      newly_reserved.end());
+    try {
+      seg.blocks.reserve(seg.blocks.size() + newly_reserved.size());
+      seg.blocks.insert(seg.blocks.end(), newly_reserved.begin(),
+                        newly_reserved.end());
+    } catch (const std::bad_alloc&) {
+      // Data was written but cannot be tracked; release the reservation and
+      // clear the in-progress flag so the segment does not wedge forever.
+      ReturnBlocksLocked(newly_reserved);
+      seg.write_in_progress = false;
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "out of memory recording spill blocks");
+    }
     seg.logical_bytes += len;
     seg.write_in_progress = false;
   }
@@ -501,7 +532,7 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
   // boundary per refill); keep that case allocation- and lock-time free.
   std::array<uint32_t, 64> stack_blocks{};
   std::vector<uint32_t> heap_blocks;
-  uint32_t count = 0;
+  size_t count = 0;
   const uint32_t* pending_blocks = nullptr;
   {
     std::scoped_lock lk(mu_);
@@ -520,7 +551,7 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
     }
     fd = fd_;
     const size_t first = seg.advised_blocks;
-    count = static_cast<uint32_t>(completed_blocks - first);
+    count = completed_blocks - first;
     if (count <= stack_blocks.size()) {
       std::copy_n(seg.blocks.begin() + static_cast<ptrdiff_t>(first), count,
                   stack_blocks.begin());
@@ -533,7 +564,7 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
     }
     seg.advised_blocks = completed_blocks;
   }
-  for (uint32_t i = 0; i < count; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     advise_calls_.fetch_add(1, std::memory_order_relaxed);
     platform::AdviseDontNeed(
         fd,
@@ -681,10 +712,12 @@ Status SpillSegmentWriter::Write(const void* data, size_t len) {
     const size_t space = buffer_capacity_ - buffer_.size();
     const size_t take = std::min(rem, space);
     buffer_.insert(buffer_.end(), src, src + take);
+    bytes_written_ += take;
     src += take;
     rem -= take;
-    bytes_written_ += take;
     if (buffer_.size() == buffer_capacity_) {
+      // Flush first: on failure the buffered bytes were not persisted and
+      // must not be counted as written.
       RETURN_IF_FAIL(store_->Append(id_, buffer_.data(), buffer_.size()));
       buffer_.clear();
     }
@@ -712,14 +745,21 @@ StatusOr<SpillSegmentId> SpillSegmentWriter::Finish(bool keep_empty) {
     RETURN_IF_FAIL(Flush());
   }
   buffer_.clear();
-  buffer_.shrink_to_fit();
+  // T3462: shrink_to_fit reallocates and may throw bad_alloc straight out
+  // of this Status-returning path (T2060 only covered Abort's noexcept
+  // route).  Swapping with an empty vector releases the capacity without
+  // any allocation.
+  std::vector<uint8_t>().swap(buffer_);
   finished_ = true;
   return id_;
 }
 
 void SpillSegmentWriter::Abort() noexcept {
   buffer_.clear();
-  buffer_.shrink_to_fit();
+  // shrink_to_fit() may allocate and throw bad_alloc; this is noexcept and
+  // is called from the destructor. Swap with an empty vector instead: the
+  // old buffer is freed by the temporary's destructor without reallocating.
+  std::vector<uint8_t>().swap(buffer_);
   if (!finished_ && store_ != nullptr && id_ != kInvalidSpillSegmentId) {
     SpillStore::DropSegmentIfAlive(store_, store_alive_, id_);
   }
@@ -731,15 +771,20 @@ void SpillSegmentWriter::Abort() noexcept {
 
 SpillSegmentReader::SpillSegmentReader(const SpillStore* store,
                                        SpillSegmentId id, size_t buffer_bytes)
-    : store_(store), id_(id), buffer_capacity_(buffer_bytes) {}
+    : store_(store),
+      store_alive_(store != nullptr ? store->LifetimeToken()
+                                    : std::weak_ptr<const bool>{}),
+      id_(id),
+      buffer_capacity_(buffer_bytes) {}
 
 Status SpillSegmentReader::Open() {
   if (opened_) {
     return Status::kSuccess;
   }
-  if (store_ == nullptr || id_ == kInvalidSpillSegmentId) {
+  if (store_ == nullptr || store_alive_.expired() ||
+      id_ == kInvalidSpillSegmentId) {
     return StatusError(StatusCode::kInvalidArgument,
-                       "invalid SpillSegmentReader arguments");
+                       "invalid or expired SpillSegmentReader arguments");
   }
   ASSIGN_OR_RETURN(uint64_t, size, store_->SegmentSize(id_));
   total_size_ = size;
@@ -759,7 +804,9 @@ Status SpillSegmentReader::Seek(uint64_t offset) {
                        "SpillSegmentReader::Seek past EOF");
   }
   cursor_ = offset;
-  if (offset >= buf_start_ && offset <= buf_start_ + buf_len_) {
+  // The exclusive end of the buffered range is not a buffer hit: treating it
+  // as one skips the last_advised_offset_ rewind on a backward seek.
+  if (offset >= buf_start_ && offset < buf_start_ + buf_len_) {
     buf_pos_ = static_cast<size_t>(offset - buf_start_);
   } else {
     buf_pos_ = 0;
@@ -799,10 +846,10 @@ Status SpillSegmentReader::Refill() {
 }
 
 Status SpillSegmentReader::ReadExact(void* dst, size_t len) {
+  RETURN_IF_FAIL(Open());
   if (len == 0) {
     return Status::kSuccess;
   }
-  RETURN_IF_FAIL(Open());
   if (len > total_size_ - cursor_) {
     return StatusError(StatusCode::kInvalidArgument,
                        "SpillSegmentReader::ReadExact past EOF");

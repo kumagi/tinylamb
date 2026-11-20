@@ -95,7 +95,18 @@ class ExternalSorter {
     size_t row_idx{0};
     std::string scratch;
     bool eof{false};
+    // P34/61: owned copy of the current row's key columns (deep Value
+    // copies; a copied VarChar materializes its data, so scratch reuse
+    // cannot dangle).  The K-way merge compares these compact, contiguous
+    // cells instead of chasing Row -> values_ -> Value per comparison.
+    std::vector<Value> key_cells;
+    std::vector<uint8_t> key_present;  // 1 = cells[i] valid for this row
   };
+
+  // P34/61: loser tree over the merge streams (memory.md §3.4).  Each pop
+  // costs exactly ceil(log2 k) key comparisons (the binary heap did ~2 log2 k)
+  // and compares cached key cells; equal keys break by stream index.
+  struct LoserMerge;
 
   [[nodiscard]] size_t EffectiveBudgetBytes() const noexcept;
   [[nodiscard]] int CompareRows(const Row& lhs, const Row& rhs) const noexcept;
@@ -105,6 +116,9 @@ class ExternalSorter {
   }
 
   [[nodiscard]] Status FlushCurrentRun();
+  [[nodiscard]] int CompareKeyCells(const MergeStream& lhs,
+                                    const MergeStream& rhs) const noexcept;
+  void RefreshStreamKey(MergeStream* stream) noexcept;
   [[nodiscard]] Status WriteSortedRun(std::vector<Row>* rows,
                                       SpillSegmentId* seg_out);
   [[nodiscard]] Status MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
@@ -129,7 +143,7 @@ class ExternalSorter {
 
   std::vector<SpillSegmentId> run_segments_;
   std::vector<MergeStream> final_streams_;
-  std::vector<size_t> final_heap_;  // stream indices
+  std::unique_ptr<LoserMerge> final_merge_;  // stream-idx loser tree
 
   size_t in_mem_cursor_{0};
   uint64_t total_rows_{0};

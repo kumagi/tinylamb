@@ -43,6 +43,12 @@ int SortedRun::Entry::Compare(std::string_view rhs,
   // implementation first built an unused string_view over the remaining
   // blob on every comparison -- dead code, removed.)
   uint32_t my_key_len = 0;
+  // NOTE: out-of-range key lengths below are clamped to the blob end rather
+  // than rejected (unlike PaxChunk::BuildFromSortedRun, which reports
+  // kCorrupt). A clamped key is indistinguishable from a legitimately short
+  // key here, so these read APIs degrade to an empty/truncated key on a
+  // corrupt run instead of surfacing corruption. Callers that need strict
+  // validation should check the run with the build-side decoder first.
   // size_t arithmetic: a hostile key_offset_ near UINT32_MAX wrapped the
   // uint32 sum past blob.size() and read OOB (or the clamp subtraction
   // underflowed).
@@ -60,26 +66,6 @@ int SortedRun::Entry::Compare(std::string_view rhs,
   std::string_view my_key_bytes(blob.data() + key_offset_ + sizeof(uint32_t),
                                 my_key_len);
   return my_key_bytes.compare(rhs);  // neg/0/pos like string_view::compare
-}
-
-int SortedRun::Entry::Compare(const Entry& rhs,
-                              const std::vector<char>& blob) const {
-  // Compare keys: derive key bytes and lengths from both entries using the
-  // 4-byte length prefix at key_offset_.
-  auto key_at = [&blob](uint32_t off) -> std::string_view {
-    if (static_cast<size_t>(off) + sizeof(uint32_t) > blob.size()) {
-      return {};
-    }
-    uint32_t len = 0;
-    memcpy(&len, blob.data() + off, sizeof(uint32_t));
-    len = be32toh(len);
-    if (static_cast<size_t>(off) + sizeof(uint32_t) + len > blob.size()) {
-      len = static_cast<uint32_t>(blob.size() - static_cast<size_t>(off) -
-                                  sizeof(uint32_t));
-    }
-    return {blob.data() + off + sizeof(uint32_t), len};
-  };
-  return key_at(key_offset_).compare(key_at(rhs.key_offset_));
 }
 
 std::string SortedRun::Entry::BuildKey(const std::vector<char>& blob) const {
@@ -210,19 +196,14 @@ Row SortedRun::Iterator::Value() const {
   if (!IsValid()) {
     throw std::invalid_argument("Value() on invalid SortedRun::Iterator");
   }
-  return GetEntry().BuildRow(parent_->Blob(), *schema_);
-}
-
-int SortedRun::Iterator::Compare(const Iterator& rhs) const {
-  // The assert guarded cross-blob misuse in debug only; under NDEBUG the
-  // comparison silently interpreted one run's offsets against the other
-  // run's blob (release UB). Iterator::Compare has no Status channel, so
-  // refuse loudly in release too.
-  if (parent_ != rhs.parent_) {
-    throw std::invalid_argument(
-        "SortedRun::Iterator::Compare across different runs");
+  // A corrupt blob makes DeserializeBounded throw; translate it at this
+  // reader boundary like SortedRun::Lookup() already does.
+  try {
+    return GetEntry().BuildRow(parent_->Blob(), *schema_);
+  } catch (const std::exception&) {
+    // No Status channel on this iterator; an empty row signals a bad entry.
+    return {};
   }
-  return GetEntry().Compare(rhs.GetEntry(), parent_->Blob());
 }
 
 std::ostream& operator<<(std::ostream& o, const SortedRun& s) {

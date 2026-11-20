@@ -56,16 +56,28 @@ class Column {
   void SetInterval(bool value) { interval_ = value; }
   [[nodiscard]] uint8_t IntegerBits() const { return integer_bits_; }
   // Width of the declared integer domain: 8, 16, 32, or 64.
-  void SetIntegerBits(uint8_t bits) { integer_bits_ = bits; }
+  void SetIntegerBits(uint8_t bits) {
+    // Only 8/16/32/64 are representable in the 2-bit serializer; any other
+    // width normalizes to the default 64-bit domain.
+    integer_bits_ = (bits == 8 || bits == 16 || bits == 32) ? bits : 64;
+  }
   [[nodiscard]] bool IntegerValueFits(const Value& value) const;
   void SetUnsigned(bool value) { unsigned_ = value; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
-  [[nodiscard]] AccessHint GetHint() const { return hint_; }
+  [[nodiscard]] AccessHint Hint() const { return hint_; }
   void SetHint(AccessHint h) { hint_ = h; }
   [[nodiscard]] uint8_t Scale() const { return scale_; }
   void SetScale(uint8_t s) { scale_ = s; }
 
-  bool operator==(const Column& rhs) const = default;
+  // hint_ is a runtime access hint and scale_ is a runtime-only decimal
+  // annotation; neither is persisted by Encoder/Decoder, so both are
+  // excluded from equality to keep round-trips value-stable.
+  bool operator==(const Column& rhs) const {
+    return type_ == rhs.type_ && unsigned_ == rhs.unsigned_ &&
+           interval_ == rhs.interval_ && col_name_ == rhs.col_name_ &&
+           constraint_ == rhs.constraint_ &&
+           integer_bits_ == rhs.integer_bits_;
+  }
   friend std::ostream& operator<<(std::ostream& o, const Column& c);
   friend Encoder& operator<<(Encoder& a, const Column& c);
   friend Decoder& operator>>(Decoder& e, Column& c);

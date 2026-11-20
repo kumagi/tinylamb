@@ -82,7 +82,9 @@ uint64_t PeakProcessRssBytes() noexcept;
 // true when a purge actually ran.  No-op on platforms without a hook.
 bool ReleaseFreeHeapToOs() noexcept;
 
-// Total physical memory of the host in bytes, or 0 if unavailable.
+// Total physical memory available to this process in bytes, or 0 if
+// unavailable.  On Linux this is min(host RAM, cgroup memory limit): a
+// container must not size its budgets off the host's RAM (T2630).
 uint64_t PhysicalMemoryBytes() noexcept;
 
 }  // namespace tinylamb::platform

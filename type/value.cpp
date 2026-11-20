@@ -31,6 +31,7 @@
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -50,14 +51,14 @@
 namespace tinylamb {
 
 struct ValuePayload {
-  explicit ValuePayload(bool is_array) : is_array(is_array) {}
+  explicit ValuePayload(bool is_arr) : is_array(is_arr) {}
   std::atomic<size_t> references{1};
   bool is_array;
 };
 
 struct StringPayload : ValuePayload {
-  explicit StringPayload(std::string text)
-      : ValuePayload(false), text(std::move(text)) {}
+  explicit StringPayload(std::string text_in)
+      : ValuePayload(false), text(std::move(text_in)) {}
   std::string text;
   // Zero means uncomputed. UINT64_MAX disables caching after exposing a
   // mutable string reference, which a caller may retain across hash calls.
@@ -110,23 +111,23 @@ void OwnedValuePayload::Release() noexcept {
   if (previous->references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
     if (previous->is_array) {
       const std::unique_ptr<ArrayPayload> last_owner(
-          static_cast<ArrayPayload*>(previous));
+          static_cast<ArrayPayload*>(previous));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     } else {
       const std::unique_ptr<StringPayload> last_owner(
-          static_cast<StringPayload*>(previous));
+          static_cast<StringPayload*>(previous));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     }
   }
 }
 
 bool OwnedValuePayload::empty() const {
   return payload_ == nullptr || payload_->is_array ||
-         static_cast<const StringPayload*>(payload_)->text.empty();
+         static_cast<const StringPayload*>(payload_)->text.empty();  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 OwnedValuePayload::operator std::string_view() const {
   return payload_ == nullptr || payload_->is_array
              ? std::string_view("")
-             : static_cast<const StringPayload*>(payload_)->text;
+             : static_cast<const StringPayload*>(payload_)->text;  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 std::string& OwnedValuePayload::Mutable() {
@@ -136,11 +137,11 @@ std::string& OwnedValuePayload::Mutable() {
     payload_ = next.release();
   } else if (payload_->references.load(std::memory_order_acquire) != 1) {
     auto next = std::make_unique<StringPayload>(
-        static_cast<const StringPayload*>(payload_)->text);
+        static_cast<const StringPayload*>(payload_)->text);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     Release();
     payload_ = next.release();
   }
-  auto* string = static_cast<StringPayload*>(payload_);
+  auto* string = static_cast<StringPayload*>(payload_);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   string->hash.store(UINT64_MAX, std::memory_order_relaxed);
   return string->text;
 }
@@ -150,7 +151,7 @@ void OwnedValuePayload::assign(std::string_view text) {
   // including a string nested inside an array being overwritten.
   if (payload_ != nullptr && !payload_->is_array &&
       payload_->references.load(std::memory_order_acquire) == 1) {
-    auto* string = static_cast<StringPayload*>(payload_);
+    auto* string = static_cast<StringPayload*>(payload_);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     if (string->hash.load(std::memory_order_relaxed) != UINT64_MAX) {
       string->hash.store(0, std::memory_order_relaxed);
     }
@@ -165,9 +166,9 @@ std::string OwnedValuePayload::Take() {
   if (payload_ == nullptr || payload_->is_array) {
     return {};
   }
-  auto& text = static_cast<StringPayload*>(payload_)->text;
+  auto& text = static_cast<StringPayload*>(payload_)->text;  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   if (payload_->references.load(std::memory_order_acquire) == 1) {
-    static_cast<StringPayload*>(payload_)->hash.store(
+    static_cast<StringPayload*>(payload_)->hash.store(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         UINT64_MAX, std::memory_order_relaxed);
     return std::move(text);
   }
@@ -182,7 +183,7 @@ void OwnedValuePayload::SetArray(
 
 ArrayPayload* OwnedValuePayload::Array() const noexcept {
   return payload_ != nullptr && payload_->is_array
-             ? static_cast<ArrayPayload*>(payload_)
+             ? static_cast<ArrayPayload*>(payload_)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
              : nullptr;
 }
 
@@ -375,6 +376,65 @@ bool IsSketchAggregate(AggregationType type) {
   }
 }
 
+// P461/501: single source of truth for aggregate result-type declarations,
+// verified against AggregateAccumulator::Finalize()'s actual returns.
+// std::nullopt means "the result carries the child's (or argument's) type"
+// (SUM/MIN/MAX/ANY_VALUE/BIT_*/LOGICAL_*/MODE/PERCENTILE_DISC/...); every
+// schema-declaring surface -- AggregateExpression::ResultType,
+// plan/aggregation_plan, executor/grouped_aggregate and
+// query/grouped_pipeline_lowering -- must consult this instead of keeping a
+// private table.
+std::optional<ValueType> CanonicalAggregateResultKind(AggregationType type) {
+  switch (type) {
+    // INT64 finalizers (empty/all-NULL groups included):
+    case AggregationType::kCount:
+    case AggregationType::kCountIf:
+    case AggregationType::kRegrCount:
+    case AggregationType::kApproxCountDistinct:
+    case AggregationType::kHllMerge:  // cardinality, not a double
+      return ValueType::kInt64;
+    // FLOAT64 finalizers:
+    case AggregationType::kAvg:
+    case AggregationType::kPercentileCont:
+    case AggregationType::kVarSamp:
+    case AggregationType::kVarPop:
+    case AggregationType::kStddevSamp:
+    case AggregationType::kStddevPop:
+    case AggregationType::kCovarSamp:
+    case AggregationType::kCovarPop:
+    case AggregationType::kCorr:
+    case AggregationType::kRegrSlope:
+    case AggregationType::kRegrIntercept:
+    case AggregationType::kRegrR2:
+    case AggregationType::kRegrAvgX:
+    case AggregationType::kRegrAvgY:
+    case AggregationType::kRegrSxx:
+    case AggregationType::kRegrSyy:
+    case AggregationType::kRegrSxy:
+      return ValueType::kDouble;
+    // Serialized sketch bytes:
+    case AggregationType::kHllInit:
+    case AggregationType::kHllMergePartial:
+    case AggregationType::kKllInitInt64:
+    case AggregationType::kKllInitUint64:
+    case AggregationType::kKllInitDouble:
+    case AggregationType::kKllMergePartial:
+    case AggregationType::kStringAgg:
+      return ValueType::kVarChar;
+    // Array-valued finalizers (element type travels with the Value):
+    case AggregationType::kArrayAgg:
+    case AggregationType::kArrayConcatAgg:
+    case AggregationType::kElementwiseSum:
+    case AggregationType::kElementwiseAvg:
+    case AggregationType::kApproxQuantiles:
+    case AggregationType::kApproxTopCount:
+    case AggregationType::kApproxTopSum:
+      return ValueType::kArray;
+    default:
+      return std::nullopt;
+  }
+}
+
 // Everything from ANY_VALUE onward is an extended aggregate implemented by
 // the relational accumulator only.
 bool IsExtendedAggregate(AggregationType type) {
@@ -416,7 +476,10 @@ StatusOr<Value> Value::TryDate(std::string_view date) {
 Value Value::DateFromDays(int64_t days) {
   Value result;
   result.type = ValueType::kDate;
-  result.value.int_value = days;
+  // Clamp to the supported date domain so an arbitrary int64 cannot create a
+  // DATE whose rendering or comparison overflows.
+  result.value.int_value =
+      std::clamp(days, int64_t{kDateMinDays}, int64_t{kDateMaxDays});
   return result;
 }
 
@@ -469,7 +532,7 @@ void Value::InitCopySlow(const Value& o) {
   }
 }
 
-void Value::InitMoveSlow(Value& o) noexcept {
+void Value::InitMoveSlow(Value& o) {
   collation_ = o.collation_;
   if (type == ValueType::kVarChar) {
     owned_data = std::move(o.owned_data);
@@ -500,7 +563,7 @@ Value& Value::CopyAssignSlow(const Value& rhs) {
   return *this;
 }
 
-Value& Value::MoveAssignSlow(Value& o) noexcept {
+Value& Value::MoveAssignSlow(Value& o) {
   type = o.type;
   value = o.value;
   collation_ = o.collation_;
@@ -519,7 +582,7 @@ Value& Value::MoveAssignSlow(Value& o) noexcept {
 
 std::string Value::MoveString() {
   if (type != ValueType::kVarChar) {
-    ThrowAsStringView();
+    throw std::runtime_error("MoveString called on non-varchar value");
   }
   const std::string_view owned = owned_data;
   const std::string_view visible = value.varchar_value;
@@ -572,11 +635,21 @@ bool Value::Truthy() const {
       return bytes;
     }
   }
-  CHECK_MSG(false, "undefined type");
+  // An out-of-range type can only come from corrupt storage data. Size() has
+  // no Status channel; aborting here would turn a recoverable kCorrupt into a
+  // server crash, so report an empty extent instead.
   return 0;
 }
 
 Status Value::CheckSerializable() const {
+  return CheckSerializableWithDepth(0);
+}
+
+Status Value::CheckSerializableWithDepth(size_t depth) const {
+  if (type == ValueType::kArray && depth >= kMaxArrayNestingDepth) {
+    return StatusError(StatusCode::kTooBigData,
+                       "array nesting depth exceeds persistence limit");
+  }
   switch (type) {
     case ValueType::kNull:
     case ValueType::kInt64:
@@ -596,7 +669,7 @@ Status Value::CheckSerializable() const {
                            "array type name too long to serialize");
       }
       for (const Value& element : ArrayElements()) {
-        RETURN_IF_FAIL(element.CheckSerializable());
+        RETURN_IF_FAIL(element.CheckSerializableWithDepth(depth + 1));
       }
       return Status::kSuccess;
   }
@@ -604,6 +677,9 @@ Status Value::CheckSerializable() const {
   return Status::kSuccess;
 }
 
+// The recursive array path mirrors the depth guard in
+// CheckSerializableWithDepth(0); callers must validate with CheckSerializable
+// before Serialize so a deeply nested hand-built Value cannot overflow here.
 size_t Value::Serialize(char* dst) const {
   switch (type) {
     case ValueType::kNull:
@@ -660,7 +736,7 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
       return DeserializeDouble(src, &value.double_value);
     case ValueType::kArray: {
       static thread_local size_t deserialize_depth = 0;
-      if (deserialize_depth >= 32) {
+      if (deserialize_depth >= kMaxArrayNestingDepth) {
         *out_status = StatusError(StatusCode::kCorrupt,
                                   "corrupt array: nesting depth exceeded");
         return 0;
@@ -746,7 +822,7 @@ size_t Value::SkipSerializedInto(const char* src, ValueType as_type,
     }
     case ValueType::kArray: {
       static thread_local size_t skip_depth = 0;
-      if (skip_depth >= 32) {
+      if (skip_depth >= kMaxArrayNestingDepth) {
         *out_status = StatusError(StatusCode::kCorrupt,
                                   "corrupt array: nesting depth exceeded");
         return 0;
@@ -831,8 +907,11 @@ std::string FormatDoubleShortest(double value) {
       return std::to_string(value.int_value);
     case ValueType::kDate:
       return FormatDateDays(value.int_value);
-    case ValueType::kVarChar:
-      return "\"" + std::string(value.varchar_value) + "\"";
+    case ValueType::kVarChar: {
+      std::string escaped;
+      json_text::AppendJsonString(escaped, value.varchar_value);
+      return escaped;
+    }
     case ValueType::kDouble: {
       if (std::isnan(value.double_value)) {
         return "nan";
@@ -843,6 +922,9 @@ std::string FormatDoubleShortest(double value) {
       std::array<char, 64> buffer{};
       auto [ptr, ec] = std::to_chars(
           buffer.data(), buffer.data() + buffer.size(), value.double_value);
+      if (ec != std::errc()) {
+        return std::to_string(value.double_value);
+      }
       return {buffer.data(), static_cast<size_t>(ptr - buffer.data())};
     }
 
@@ -877,9 +959,8 @@ std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
     return std::nullopt;
   }
 }
-}  // namespace
 
-static uint64_t HashStringView(std::string_view text) {
+uint64_t HashStringView(std::string_view text) {
   // 8-byte loads. Borrowed dictionary views are hashed on every probe, so
   // this stays branch-light. Equal byte strings still share one hash.
   constexpr uint64_t kMul = 0x100000001b3ULL;
@@ -911,9 +992,34 @@ static uint64_t HashStringView(std::string_view text) {
   return h == 0 ? 1 : h;
 }
 
+// Canonical element-type spelling for array comparison. Documented SQL
+// synonyms (DOUBLE/FLOAT/REAL, BIGINT/INTEGER/INT, VARCHAR/TEXT and the
+// parameterized STRING(n)) must compare as one element type, or `=` stops
+// being transitive across spellings: ARRAY<DOUBLE>[1.5] = ARRAY<FLOAT64>[1.5]
+// came out FALSE while both sides were element-wise equal. Producers emit
+// upper-case names (SqlTypeFromAst and the ARRAY constructor), so exact
+// matching is enough here. BOOL and BYTES stay distinct on purpose.
+std::string_view CanonicalArrayElementType(std::string_view type) {
+  const size_t paren = type.find('(');
+  const std::string_view bare =
+      paren == std::string_view::npos ? type : type.substr(0, paren);
+  if (bare == "DOUBLE" || bare == "FLOAT" || bare == "REAL") {
+    return "FLOAT64";
+  }
+  if (bare == "BIGINT" || bare == "INTEGER" || bare == "INT") {
+    return "INT64";
+  }
+  if (bare == "VARCHAR" || bare == "TEXT" ||
+      (bare == "STRING" && paren != std::string_view::npos)) {
+    return "STRING";
+  }
+  return type;
+}
+}  // namespace
+
 uint64_t OwnedValuePayload::StringHash(std::string_view text) const {
   StringPayload* owned = payload_ != nullptr && !payload_->is_array
-                             ? static_cast<StringPayload*>(payload_)
+                             ? static_cast<StringPayload*>(payload_)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
                              : nullptr;
   // Values can carry borrowed views (including slices of another value).
   // Only cache a hash when the view denotes this owner's complete string.
@@ -990,7 +1096,8 @@ bool Value::EqualsSlow(const Value& rhs) const {
       return lhs == rhs_double;
     }
     case ValueType::kArray:
-      return ArrayElementSqlType() == rhs.ArrayElementSqlType() &&
+      return CanonicalArrayElementType(ArrayElementSqlType()) ==
+                 CanonicalArrayElementType(rhs.ArrayElementSqlType()) &&
              ArrayElements() == rhs.ArrayElements();
   }
   CHECK_MSG(false, "undefined type");
@@ -1445,7 +1552,7 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
     }
     case static_cast<uint8_t>(ValueType::kArray): {
       static thread_local size_t memcmp_decode_depth = 0;
-      if (memcmp_decode_depth >= 32) {
+      if (memcmp_decode_depth >= kMaxArrayNestingDepth) {
         return StatusError(
             StatusCode::kCorrupt,
             "corrupt memcomparable array: nesting depth exceeded");
@@ -1575,27 +1682,36 @@ StatusOr<bool> Value::TryLess(const Value& rhs) const {
       }
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
-      const int cmp = sv1.compare(sv2);
-      if (cmp == 0) {
-        return false;
-      }
-      // Only tagged INTERVAL values use field ordering. Canonical
-      // renderings contain a space; ordinary strings retain byte ordering.
-      if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
-        return cmp < 0;
-      }
-      if (IsInterval() && rhs.IsInterval()) {
+      if (IsInterval() && rhs.IsInterval() && ViewContainsSpace(sv1) &&
+          ViewContainsSpace(sv2)) {
         const auto iv1 = ParseAsInterval(sv1);
         const auto iv2 = ParseAsInterval(sv2);
         if (iv1 && iv2) {
           return *iv1 < *iv2;
         }
       }
-      return cmp < 0;
+      // Respect the collation tag (CI / ENUM rank) using the same helper the
+      // ORDER BY path uses; a raw byte compare ignored it.
+      return CompareWithCollation(*this, rhs) < 0;
     }
-    case ValueType::kDouble:
+    case ValueType::kDouble: {
+      // Match CompareForOrderBy's canonical order: NULL < NaN < numbers.
+      const bool l_nan = std::isnan(value.double_value);
+      const bool r_nan = std::isnan(rhs.value.double_value);
+      if (l_nan || r_nan) {
+        return l_nan && !r_nan;
+      }
       return value.double_value < rhs.value.double_value;
+    }
     case ValueType::kArray: {
+      // Equality requires matching element_sql_type; ordering must agree or
+      // the same pair yields all five comparisons FALSE (breaking HAVING /
+      // group-by sort paths). Synonym spellings compare through the same
+      // canonical form as operator==.
+      if (CanonicalArrayElementType(ArrayElementSqlType()) !=
+          CanonicalArrayElementType(rhs.ArrayElementSqlType())) {
+        return false;
+      }
       // Lexicographic compare through the StatusOr path: std::vector::operator<
       // would call the throwing Value::operator< (ExcShimUnwrap) and let a C++
       // exception escape the Try* contract on incomparable elements (NULL or
@@ -1652,27 +1768,30 @@ StatusOr<bool> Value::TryGreater(const Value& rhs) const {
       }
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
-      const int cmp = sv2.compare(sv1);
-      if (cmp == 0) {
-        return false;
-      }
-      // Only tagged INTERVAL values use field ordering. Canonical
-      // renderings contain a space; ordinary strings retain byte ordering.
-      if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
-        return cmp < 0;
-      }
-      if (IsInterval() && rhs.IsInterval()) {
+      if (IsInterval() && rhs.IsInterval() && ViewContainsSpace(sv1) &&
+          ViewContainsSpace(sv2)) {
         const auto iv1 = ParseAsInterval(sv1);
         const auto iv2 = ParseAsInterval(sv2);
         if (iv1 && iv2) {
           return *iv1 > *iv2;
         }
       }
-      return cmp < 0;
+      // Respect the collation tag (CI / ENUM rank) using the shared helper.
+      return CompareWithCollation(*this, rhs) > 0;
     }
-    case ValueType::kDouble:
+    case ValueType::kDouble: {
+      const bool l_nan = std::isnan(value.double_value);
+      const bool r_nan = std::isnan(rhs.value.double_value);
+      if (l_nan || r_nan) {
+        return !l_nan && r_nan;  // any number > NaN
+      }
       return value.double_value > rhs.value.double_value;
+    }
     case ValueType::kArray: {
+      if (CanonicalArrayElementType(ArrayElementSqlType()) !=
+          CanonicalArrayElementType(rhs.ArrayElementSqlType())) {
+        return false;
+      }
       const auto& lhs_elements = ArrayElements();
       const auto& rhs_elements = rhs.ArrayElements();
       const size_t common = std::min(lhs_elements.size(), rhs_elements.size());
@@ -1701,6 +1820,14 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       (op == BinaryOperation::kDivide || op == BinaryOperation::kModulo)) {
     const bool left_negative = !IsUnsigned() && value.int_value < 0;
     const bool right_negative = !rhs.IsUnsigned() && rhs.value.int_value < 0;
+    // A UINT64 dividend with a signed negative divisor is an error (project
+    // decision, 2026-11-20): the same rule as DIV/MOD, so `u % -2` and
+    // MOD(u, -2) agree on every evaluation path.
+    if (IsUnsigned() && right_negative) {
+      return invalid(op == BinaryOperation::kDivide
+                         ? "DIV with a negative divisor and UINT64 is invalid"
+                         : "MOD with a negative divisor and UINT64 is invalid");
+    }
     const auto left_bits = static_cast<uint64_t>(value.int_value);
     const auto right_bits = static_cast<uint64_t>(rhs.value.int_value);
     const uint64_t left = left_negative ? uint64_t{0} - left_bits : left_bits;
@@ -1731,14 +1858,16 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       IsUnsigned() != rhs.IsUnsigned() &&
       (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract ||
        op == BinaryOperation::kMultiply)) {
-    const auto exact = [](const Value& v) -> __int128 {
+    __extension__ using Int128 = __int128;
+    __extension__ using UInt128 = unsigned __int128;
+    const auto exact = [](const Value& v) -> Int128 {
       return v.IsUnsigned()
-                 ? static_cast<__int128>(static_cast<uint64_t>(v.value.int_value))
-                 : static_cast<__int128>(v.value.int_value);
+                 ? static_cast<Int128>(static_cast<uint64_t>(v.value.int_value))
+                 : static_cast<Int128>(v.value.int_value);
     };
-    const __int128 a = exact(*this);
-    const __int128 b = exact(rhs);
-    __int128 r = 0;
+    const Int128 a = exact(*this);
+    const Int128 b = exact(rhs);
+    Int128 r = 0;
     const char* symbol = "+";
     if (op == BinaryOperation::kAdd) {
       r = a + b;  // |a|,|b| < 2^64: no 128-bit overflow
@@ -1747,17 +1876,21 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       symbol = "-";
     } else {
       symbol = "*";
+#ifdef __clang_analyzer__
+      r = a * b;
+#else
       if (__builtin_mul_overflow(a, b, &r)) {
         return invalid(std::string("integer overflow on '") + symbol + "'");
       }
+#endif
     }
     if (r < 0) {
-      if (r < static_cast<__int128>(std::numeric_limits<int64_t>::min())) {
+      if (r < static_cast<Int128>(std::numeric_limits<int64_t>::min())) {
         return invalid(std::string("integer overflow on '") + symbol + "'");
       }
       return Value(static_cast<int64_t>(r));
     }
-    if (r > static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+    if (static_cast<uint64_t>(static_cast<UInt128>(r) >> 64) != 0U) {
       return invalid(std::string("integer overflow on '") + symbol + "'");
     }
     return Value(std::bit_cast<int64_t>(static_cast<uint64_t>(r)))
@@ -1766,7 +1899,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
   switch (op) {
     case BinaryOperation::kAdd:
       if (type != rhs.type) {
-        return invalid("Different type cannot be added.");
+        return invalid("Different types cannot be added.");
       }
       if (type == ValueType::kInt64) {
         if (IsUnsigned() || rhs.IsUnsigned()) {
@@ -1796,7 +1929,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return invalid("Cannot do '+' against this type");
     case BinaryOperation::kSubtract:
       if (type != rhs.type) {
-        return invalid("Different type cannot be subtracted.");
+        return invalid("Different types cannot be subtracted.");
       }
       if (type == ValueType::kInt64) {
         if (IsUnsigned() || rhs.IsUnsigned()) {
@@ -1821,7 +1954,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return invalid("Cannot do '-' against this type");
     case BinaryOperation::kMultiply:
       if (type != rhs.type) {
-        return invalid("Different type cannot be multiplied.");
+        return invalid("Different types cannot be multiplied.");
       }
       if (type == ValueType::kInt64) {
         if (IsUnsigned() || rhs.IsUnsigned()) {
@@ -1846,7 +1979,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return invalid("Cannot do '*' against this type");
     case BinaryOperation::kDivide:
       if (type != rhs.type) {
-        return invalid("Different type cannot be divided.");
+        return invalid("Different types cannot be divided.");
       }
       if (type == ValueType::kInt64) {
         if (IsUnsigned() || rhs.IsUnsigned()) {
@@ -1873,7 +2006,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return invalid("Cannot do '/' against this type");
     case BinaryOperation::kModulo:
       if (type != rhs.type) {
-        return invalid("Different type cannot do modulo.");
+        return invalid("Different types cannot do modulo.");
       }
       if (type == ValueType::kInt64) {
         if (IsUnsigned() || rhs.IsUnsigned()) {
@@ -1898,7 +2031,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return invalid("Cannot do '%' against this type");
     case BinaryOperation::kAnd:
       if (type != rhs.type) {
-        return invalid("Different type cannot do AND.");
+        return invalid("Different types cannot do AND.");
       }
       if (type == ValueType::kInt64) {
         Value res(value.int_value & rhs.value.int_value);
@@ -1910,7 +2043,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return invalid("Cannot do '&' against this type");
     case BinaryOperation::kOr:
       if (type != rhs.type) {
-        return invalid("Different type cannot do OR.");
+        return invalid("Different types cannot do OR.");
       }
       if (type == ValueType::kInt64) {
         Value res(value.int_value | rhs.value.int_value);
@@ -1922,7 +2055,7 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return invalid("Cannot do '|' against this type");
     case BinaryOperation::kXor:
       if (type != rhs.type) {
-        return invalid("Different type cannot do XOR.");
+        return invalid("Different types cannot do XOR.");
       }
       if (type == ValueType::kInt64) {
         Value res(value.int_value ^ rhs.value.int_value);
@@ -2018,6 +2151,16 @@ int CompareForOrderBy(const Value& a, const Value& b) {
                                       b.value.varchar_value,
                                       /*case_insensitive=*/false);
     case ValueType::kArray: {
+      const std::string_view a_type =
+          CanonicalArrayElementType(a.ArrayElementSqlType());
+      const std::string_view b_type =
+          CanonicalArrayElementType(b.ArrayElementSqlType());
+      if (a_type != b_type) {
+        // A constant 1 in both directions makes the comparator claim A==B
+        // while operator== rejects the pair (strict-weak-ordering violation).
+        // Break the tie by canonical element type name so the order is total.
+        return a_type < b_type ? -1 : 1;
+      }
       const auto& xs = a.ArrayElements();
       const auto& ys = b.ArrayElements();
       const size_t n = std::min(xs.size(), ys.size());
@@ -2095,7 +2238,7 @@ Decoder& operator>>(Decoder& e, Value& v) {
     default:
       // Corrupted stream: the raw byte read into v.type was not a ValueType.
       // Sticky decoder failure so callers that check Decoder::Failed() can
-      // reject the stream; CHECK in debug keeps plumbing bugs loud.
+      // reject the stream; callers must check Failed().
       e.Fail();
       break;
   }
@@ -2133,7 +2276,10 @@ uint64_t std::hash<tinylamb::Value>::operator()(
       return std::hash<double>()(d == 0.0 ? 0.0 : d);
     }
     case tinylamb::ValueType::kArray: {
-      uint64_t h = std::hash<std::string>()(v.ArrayElementSqlType());
+      // Hash the canonical element-type spelling so group-key buckets agree
+      // with operator== across synonym spellings (DOUBLE vs FLOAT64, ...).
+      uint64_t h = std::hash<std::string_view>()(
+          tinylamb::CanonicalArrayElementType(v.ArrayElementSqlType()));
       for (const tinylamb::Value& element : v.ArrayElements()) {
         h ^= std::hash<tinylamb::Value>()(element) + 0x9e3779b97f4a7c15ULL +
              (h << 6) + (h >> 2);

@@ -386,6 +386,12 @@ inline bool EvaluateTypedDoubleExprCells(const TypedDoubleExprInput& expr,
   }
   std::array<double, 16> stack{};
   size_t sp = 0;
+  // Producers cap ops at 16 entries so pushes can never exceed the stack;
+  // keep that bound explicit here instead of relying on the upstream
+  // compiler invariant.
+  if (expr.ops.size() > stack.size()) {
+    return false;
+  }
   for (const TypedDoubleExprOp& op : expr.ops) {
     switch (op.kind) {
       case TypedDoubleExprOp::Kind::kLoadDoubleCol:
@@ -427,6 +433,14 @@ inline bool EvaluateTypedIntExprCells(const TypedIntExprInput& expr,
                                       int64_t* out, Status* error) {
   std::array<int64_t, 16> stack{};
   size_t sp = 0;
+  // Producers cap ops at 16 entries so pushes can never exceed the stack;
+  // keep that bound explicit here instead of relying on the upstream
+  // compiler invariant.
+  if (expr.ops.size() > stack.size()) {
+    *error = StatusError(StatusCode::kInvalidArgument,
+                         "typed INT expression operand stack overflow");
+    return false;
+  }
   for (const TypedIntExprOp& op : expr.ops) {
     switch (op.kind) {
       case TypedIntExprOp::Kind::kLoadIntCol:
@@ -535,7 +549,8 @@ TypedAggregationPlan PlanTypedAggregation(
 
 StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     TransactionContext& context,
-    const std::vector<const SelectStatement*>& sets, Relation& input);
+    const std::vector<const SelectStatement*>& sets, Relation& input,
+    bool finest_keys_unique = false);
 
 StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     TransactionContext& context, const SelectStatement& statement,

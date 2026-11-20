@@ -21,7 +21,8 @@ bool SortPlan::IsOrderedBy(const std::vector<Expression>& expressions,
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (keys_[i].ascending != ascending[i] ||
+    if (keys_[i].ascending != ascending[i] || !keys_[i].expression ||
+        !expressions[i] ||
         keys_[i].expression->ToString() != expressions[i]->ToString()) {
       return false;
     }
@@ -38,7 +39,8 @@ bool SortPlan::IsOrderedBy(
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (keys_[i].ascending != ascending[i] ||
+    if (keys_[i].ascending != ascending[i] || !keys_[i].expression ||
+        !expressions[i] ||
         keys_[i].expression->ToString() != expressions[i]->ToString()) {
       return false;
     }
@@ -75,6 +77,14 @@ std::string SortPlan::KeysToString() const {
     }
     output << keys_[i].expression->ToString()
            << (keys_[i].ascending ? " ASC" : " DESC");
+    // T2668: the 3-argument IsOrderedBy compares nulls placement, so the
+    // render must not hide it either.  Explicit spellings print their NULLS
+    // clause (unspecified keys keep the engine default and the historical
+    // rendering -- old EXPLAIN goldens stay byte-identical).
+    const auto nulls_first = keys_[i].nulls_first;
+    if (nulls_first.has_value()) {
+      output << (*nulls_first ? " NULLS FIRST" : " NULLS LAST");
+    }
   }
   return output.str();
 }
@@ -85,7 +95,7 @@ void SortPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << StrategyName() << ": ["
          << KeysToString() << "]" << MemorySuffix() << "\n"
          << Indent(static_cast<size_t>(indent) + 2);
-  child_->Dump(output, indent + 2);
+  DumpChild(output, *child_, indent + 2);
 }
 
 std::string SortPlan::ToString() const {
@@ -133,7 +143,7 @@ bool SortPlan::InstallParameterSlots(const std::vector<Value>& parameters,
     return false;
   }
   for (SortKey& key : keys_) {
-    if (!SlotizeInPlace(&key.expression, parameters, cursor, slots)) {
+    if (!CollectParameterSlots(&key.expression, slots)) {
       return false;
     }
   }

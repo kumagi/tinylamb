@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "expression/constant_value.hpp"
@@ -63,16 +64,17 @@ StatusOr<Value> Eval(const char* name, const std::vector<Value>& args) {
 TEST(FunctionCallAstEdges, HashAndEncodingFunctions) {
   auto md5 = Eval("md5", {Str("abc")});
   ASSERT_TRUE(md5.HasValue());
-  // The digest returns as a quoted binary string: 2 quote bytes + digest.
-  EXPECT_EQ(md5.Value().AsString().size(), 18);
+  // The digest returns as a raw binary string (AsString() would JSON-escape
+  // the non-printable digest bytes, so measure the payload itself).
+  EXPECT_EQ(md5.Value().AsStringView().size(), 16);
 
   auto sha1 = Eval("sha1", {Str("abc")});
   ASSERT_TRUE(sha1.HasValue());
-  EXPECT_EQ(sha1.Value().AsString().size(), 22);
+  EXPECT_EQ(sha1.Value().AsStringView().size(), 20);
 
   auto sha256 = Eval("sha256", {Str("abc")});
   ASSERT_TRUE(sha256.HasValue());
-  EXPECT_EQ(sha256.Value().AsString().size(), 34);
+  EXPECT_EQ(sha256.Value().AsStringView().size(), 32);
 
   EXPECT_FALSE(Eval("md5", {}).HasValue());
   EXPECT_FALSE(Eval("sha256", {Str("a"), Str("b")}).HasValue());
@@ -167,7 +169,7 @@ TEST(FunctionCallAstEdges, StructJsonRoundTrip) {
   auto json = Eval("__struct_json__",
                    {Str("a"), Value(int64_t{1}), Str("b"), Str("x")});
   ASSERT_TRUE(json.HasValue());
-  EXPECT_EQ(json.Value().AsString(), R"("{"a":1,"b":"x"}")");
+  EXPECT_EQ(json.Value().AsStringView(), R"({"a":1,"b":"x"})");
 
   // NULL field values flow through as an explicit JSON null.
   auto null_field = Eval("__struct_json__", {Str("a"), Value()});
@@ -175,7 +177,7 @@ TEST(FunctionCallAstEdges, StructJsonRoundTrip) {
 }
 
 TEST(FunctionCallSqlEdges, ScalarBatteryOverTable) {
-  auto db = Database::Create("function_call_ast_edges");
+  auto db = Database::Create("function_call_ast_edges-" + RandomString());
   ASSERT_TRUE(db.HasValue());
   Database& database = *db.MoveValue();
   SqlEngine engine(database);
@@ -243,7 +245,7 @@ TEST(FunctionCallSqlEdges, ScalarBatteryOverTable) {
       {"SELECT generate_date_array(DATE '2026-01-01', DATE '2026-01-03') "
        "FROM t WHERE x = 9",
        true},
-      {"SELECT make_interval(1, 'DAY', 3) FROM t WHERE x = 9", true},
+      {"SELECT make_interval(1, 'DAY') FROM t WHERE x = 9", true},
       {"SELECT unix_date(DATE '2026-01-02') FROM t WHERE x = 9", true},
       {"SELECT format_date('%Y', DATE '2026-01-02') FROM t WHERE x = 9", true},
       {"SELECT parse_timestamp('%Y-%m-%d', '2026-01-02') FROM t WHERE x = 9",

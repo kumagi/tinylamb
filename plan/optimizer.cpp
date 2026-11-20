@@ -167,7 +167,8 @@ StatusOr<std::vector<NamedExpression>> ExpandSelect(
 }
 
 bool IsAggregate(const NamedExpression& expression) {
-  return expression.expression->Type() == TypeTag::kAggregateExp;
+  return expression.expression != nullptr &&
+         expression.expression->Type() == TypeTag::kAggregateExp;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +256,6 @@ std::vector<NamedExpression> RewriteNotNullCounts(
             const Table& table = *tables.find(*relations.begin())->second;
             const int offset =
                 table.GetSchema().Offset(ColumnName("", column.name));
-            if (std::getenv("TINYLAMB_DBG_CNT") != nullptr) {
-            }
             if (offset >= 0) {
               const Constraint& constraint =
                   table.GetSchema()
@@ -510,6 +509,10 @@ RelationRef TouchedRelations(
   return ref;
 }
 
+// Containment proof uses Value's raw-byte hash/equality. CI-tagged VARCHARs,
+// +/-0.0 and distinct NaN payloads therefore count as distinct keys: a proof
+// may fail conservatively (an unnecessary join survives), never wrongly
+// succeed. Keep this as a real check rather than assuming semantic equality.
 using JoinKeySet = std::unordered_set<Value>;
 
 std::optional<QueryData> TryEliminateUnusedJoins(
@@ -712,6 +715,11 @@ std::optional<QueryData> TryEliminateUnusedJoins(
           dim_values.insert(cell);
         }
       }
+      // A failed page read ends the scan like EOF: an incomplete key set
+      // proves nothing.
+      if (!iterator.GetStatus().ok()) {
+        proof_failed = true;
+      }
       if (!proof_failed) {
         auto kept_iterator = kept_table->second->BeginFullScan(
             ctx.txn_, TableScanOptions{.projection = std::vector<slot_t>{
@@ -729,6 +737,9 @@ std::optional<QueryData> TryEliminateUnusedJoins(
             proof_failed = true;
             break;
           }
+        }
+        if (!kept_iterator.GetStatus().ok()) {
+          proof_failed = true;
         }
       }
     }
@@ -786,6 +797,9 @@ bool SnapshotContainsKeys(const Table& outer_table, int outer_offset,
         inner_values.insert(cell);
       }
     }
+    if (!iterator.GetStatus().ok()) {
+      return false;  // truncated scan: no proof
+    }
   }
   {
     auto iterator = outer_table.BeginFullScan(
@@ -800,6 +814,9 @@ bool SnapshotContainsKeys(const Table& outer_table, int outer_offset,
       if (cell.IsNull() || !inner_values.contains(cell)) {
         return false;
       }
+    }
+    if (!iterator.GetStatus().ok()) {
+      return false;
     }
   }
   return true;
@@ -1277,7 +1294,8 @@ std::vector<Expression> NormalizeOrderingForOutput(
   for (const Expression& expression : ordering) {
     const auto found =
         std::ranges::find_if(outputs, [&](const NamedExpression& output) {
-          return output.expression->ToString() == expression->ToString();
+          return output.expression != nullptr &&
+                 output.expression->ToString() == expression->ToString();
         });
     if (found != outputs.end() && !found->name.empty()) {
       normalized.push_back(ColumnValueExp(found->name));
@@ -1383,6 +1401,24 @@ Expression RewritePrefixLike(const Expression& expression) {
   const std::string_view text = pattern.value.varchar_value;
   if (text.size() < 2 || text.back() != '%' ||
       text.find_first_of("%_\\", 0) != text.size() - 1) {
+    return expression;
+  }
+  // The storage-side range comparison has no collation contract; matching
+  // LikePrefixBounds, only pure-ASCII prefixes can be safely upper-bounded.
+  // Also leave a CI-tagged left operand on the LIKE path.
+  for (char c : text.substr(0, text.size() - 1)) {
+    if (static_cast<unsigned char>(c) >= 0x80) {
+      return expression;
+    }
+  }
+  if (binary.Left()->Type() == TypeTag::kConstantValue &&
+      binary.Left()->AsConstantValue().GetValue().IsCaseInsensitive()) {
+    return expression;
+  }
+  // The rewrite evaluates the left operand twice (>= lower AND < upper). A
+  // volatile, throwing or subquery-bearing operand must stay as a single LIKE
+  // evaluation: duplicating it changes results and error behaviour.
+  if (!SafeToReduceEvaluationCount(binary.Left())) {
     return expression;
   }
 
@@ -3103,6 +3139,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       input_schema = input_schema + recursive_schema;
     }
   }
+  const ScopedActiveRewriteSchema active_schema_guard(&input_schema);
   // Window calls bypass scalar rewriting (same rationale as the SELECT-list
   // skip above); a window-bearing predicate keeps the relational path
   // downstream, where it fails loudly like today instead of tripping the
@@ -3575,6 +3612,16 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                                         statistics->EstimateSelectivity(
                                             schema, CombineConjuncts(local)));
   }
+  // Lifted CTE cells hold their materialized rows already: register the
+  // exact size instead of leaving the RelationRows default (1.0), which
+  // mis-ranks them as the smallest relation when GreedyConnectedSplit
+  // picks its peel pivot (cost-only input). Recursive leaves keep the
+  // default -- the fixpoint size is unknown until execution.
+  for (const auto& [alias, cell] : query.lifted_ctes_.cells) {
+    if (cell != nullptr) {
+      relation_rows.emplace(alias, static_cast<double>(cell->rows.size()));
+    }
+  }
   memo.SetRelationRows(std::move(relation_rows));
 
   cascades::GroupId search_root = cascades::kInvalidGroup;
@@ -3669,16 +3716,12 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // Publish table schemas (including unique constraints) so join-elimination
   // rules can prove key uniqueness instead of trusting column names.
   {
+    // Reuse the tables resolved into rule_context.tables instead of a second
+    // catalog lookup per relation (which could also observe a different
+    // schema than the rules saw if DDL raced with this optimization).
     std::unordered_map<std::string, Schema> table_schemas;
-    for (const std::string& relation : query.from_) {
-      const auto aliased = query.aliases_.find(relation);
-      const std::string& physical =
-          aliased == query.aliases_.end() ? relation : aliased->second;
-      StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
-      if (!found.HasValue()) {
-        continue;
-      }
-      table_schemas.emplace(relation, found.Value()->GetSchema());
+    for (const auto& [relation, table] : rule_context.tables) {
+      table_schemas.emplace(relation, table->GetSchema());
     }
     memo.SetTableSchemas(table_schemas);
   }

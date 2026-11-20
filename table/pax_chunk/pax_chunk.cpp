@@ -133,7 +133,7 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
     }
     case Scheme::kDict: {
       // The 2-byte code-count header must be inside the region BEFORE the
-      // read (the kConst/kFsst arms above and every sibling kDict decoder
+      // read (the kConst arm above / kFsst arm below and every sibling kDict decoder
       // gate the same way; a 1-byte cell at the data-area end would
       // otherwise read its ncodes from the footer's first byte).
       if (r + 2 > region_end) {
@@ -621,7 +621,11 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       // Codes >= d decode to "" (clamp bucket), same as the decoder.
       pass[d] = p.Eval(std::string_view()) ? 1 : 0;
       std::vector<int64_t> codes(n, 0);
-      DecodeInnerI64All(creg, cs, cparam, n, pool_hdr, codes.data());
+      if (!DecodeInnerI64All(creg, cs, cparam, n, pool_hdr, codes.data())) {
+        // A malformed/truncated code region leaves codes at their zero
+        // initial value; treating that as data would fabricate matches.
+        return std::nullopt;  // caller falls back to the generic rescan
+      }
       uint64_t cnt = 0;
       for (uint32_t i = 0; i < n; ++i) {
         const auto code = static_cast<uint64_t>(codes[i]);

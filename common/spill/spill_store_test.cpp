@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <numeric>
 #include <string>
@@ -26,7 +27,14 @@ struct TempDirGuard {
     std::error_code ec;
     path = std::filesystem::temp_directory_path(ec) /
            (std::string(prefix) + "_" + RandomString());
+    if (ec) {
+      throw std::runtime_error("cannot create temp dir: " + ec.message());
+    }
     std::filesystem::create_directories(path, ec);
+    if (ec) {
+      throw std::runtime_error("cannot create temp dir " + path.string() +
+                               ": " + ec.message());
+    }
   }
   TempDirGuard(const TempDirGuard&) = delete;
   TempDirGuard& operator=(const TempDirGuard&) = delete;
@@ -309,12 +317,18 @@ TEST(SpillStoreTest, ConcurrentDropAndClearDeferWhileAppendInFlight) {
     });
 
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!writer_done.load(std::memory_order_acquire) &&
-           store.Stats().current_active_bytes <= SpillStore::kBlockSize &&
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    // Wait for the writer to reach the contending state, not for it to finish:
+    // including writer_done here lets a fast writer make the test pass
+    // vacuously before Drop/Clear ever overlaps with the append.
+    while (store.Stats().current_active_bytes <= SpillStore::kBlockSize &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::yield();
     }
+    // If the writer never reached the contending state, the Clear/Drop below
+    // cannot exercise the race and the test would pass vacuously.
+    EXPECT_LT(std::chrono::steady_clock::now(), deadline)
+        << "writer did not reach the contending state in time";
     if (use_clear) {
       store.Clear();
     } else {
@@ -395,6 +409,103 @@ TEST(SpillStoreTest, SequentialReadAdvisesEachBlockExactlyOnce) {
   }
   EXPECT_EQ(out, data);
   EXPECT_EQ(store.AdviseDontNeedCalls(), baseline + kBlocks - 1);
+}
+
+// T37: the injected spill-I/O failure is consumed only at an actual Pwrite
+// attempt.  A rejected Append (unknown / dropped segment, space limit)
+// issues no I/O, so it must neither swallow the scheduled injection nor
+// inflate the OOC fuzz sweep's fired-count for an unobservable injection.
+TEST(SpillStoreTest, RejectedAppendDoesNotConsumeInjectionCountdown) {
+  TempDirGuard dir("spill_store_reject_no_consume");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  ProcessMemoryBudget& mem = ProcessMemoryBudget::Global();
+  struct Cleanup {  // NOLINT(cppcoreguidelines-special-member-functions)
+    ProcessMemoryBudget* m;
+    ~Cleanup() { m->SetTestSpillIoFailCountdown(0); }
+  } cleanup{&mem};
+
+  SpillSegmentId dropped = 0;
+  {
+    auto seg_or = store.AllocateSegment();
+    ASSERT_EQ(seg_or.GetStatus().GetCode(), StatusCode::kSuccess);
+    dropped = seg_or.Value();
+  }
+  store.DropSegment(dropped);
+
+  mem.SetTestSpillIoFailCountdown(1);
+  std::vector<uint8_t> data(4096, 0x33);
+  const Status rejected = store.Append(dropped, data.data(), data.size());
+  EXPECT_EQ(rejected.GetCode(), StatusCode::kNotExists);
+
+  // The scheduled injection survived the rejected Append: the next real
+  // write attempt is the one that fails.
+  SpillSegmentWriter writer(&store, /*buffer_bytes=*/0);
+  ASSERT_EQ(writer.EnsureOpen(), Status::kSuccess);
+  EXPECT_EQ(writer.Write(data.data(), data.size()).GetCode(),
+            StatusCode::kIOError);
+  mem.SetTestSpillIoFailCountdown(0);
+}
+
+// T2978: the header promises "Total blocks handed to
+// platform::AdviseDontNeed since construction"; the write path now counts
+// its per-completed-block advisories instead of leaving them invisible.
+TEST(SpillStoreTest, WritePathAdvisoriesAreCounted) {
+  if (!platform::kSupportsAdviseDontNeed) {
+    GTEST_SKIP() << "AdviseDontNeed unsupported on this platform";
+  }
+  TempDirGuard dir("spill_store_advise_write");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  ASSERT_EQ(store.AdviseDontNeedCalls(), 0U);
+  constexpr size_t kBlocks = 3;
+  std::vector<uint8_t> data(kBlocks * SpillStore::kBlockSize, 0x5a);
+  auto seg_or = store.AllocateSegment();
+  ASSERT_EQ(seg_or.GetStatus().GetCode(), StatusCode::kSuccess);
+  ASSERT_EQ(store.Append(seg_or.Value(), data.data(), data.size()),
+            Status::kSuccess);
+  EXPECT_EQ(store.AdviseDontNeedCalls(), kBlocks);
+}
+
+// T2066: an explicitly supplied (empty) temp_dir means the current working
+// directory; only an option the caller never set falls through to
+// TINYLAMB_TEMP_DIR.  The env var is pointed at a missing directory so the
+// two paths are distinguishable: honoured cwd succeeds, fallback fails.
+TEST(SpillStoreTest, ExplicitlyEmptyTempDirBeatsEnvironmentFallback) {
+  const char* saved = std::getenv("TINYLAMB_TEMP_DIR");
+  const std::string saved_copy = saved != nullptr ? saved : "";
+  struct EnvRestore {  // NOLINT(cppcoreguidelines-special-member-functions)
+    bool had;
+    std::string value;
+    ~EnvRestore() {
+      if (had) {
+        (void)setenv("TINYLAMB_TEMP_DIR", value.c_str(), 1);
+      } else {
+        (void)unsetenv("TINYLAMB_TEMP_DIR");
+      }
+    }
+  } restore{saved != nullptr, saved_copy};  // NOLINT(modernize-use-designated-initializers)
+  ASSERT_EQ(setenv("TINYLAMB_TEMP_DIR", "/nonexistent_t2066_dir", 1), 0);
+
+  std::vector<uint8_t> data(4096, 0x77);
+  {
+    SpillStoreOptions opts;
+    opts.temp_dir_set = true;  // explicit "" from the caller
+    SpillStore store(std::move(opts));
+    SpillSegmentWriter writer(&store, /*buffer_bytes=*/0);
+    ASSERT_EQ(writer.EnsureOpen(), Status::kSuccess);
+    ASSERT_EQ(writer.Write(data.data(), data.size()), Status::kSuccess);
+    auto id_or = writer.Finish();
+    ASSERT_EQ(id_or.GetStatus().GetCode(), StatusCode::kSuccess);
+    SpillSegmentReader reader(&store, id_or.Value(), 8192);
+    std::vector<uint8_t> out(data.size(), 0);
+    ASSERT_EQ(reader.ReadExact(out.data(), out.size()), Status::kSuccess);
+    EXPECT_EQ(out, data);
+  }
+  {
+    SpillStore store(SpillStoreOptions{});  // unset -> env fallback
+    SpillSegmentWriter writer(&store, /*buffer_bytes=*/0);
+    ASSERT_EQ(writer.EnsureOpen(), Status::kSuccess);
+    EXPECT_NE(writer.Write(data.data(), data.size()), Status::kSuccess);
+  }
 }
 
 }  // namespace

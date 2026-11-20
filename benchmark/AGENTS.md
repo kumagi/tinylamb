@@ -27,4 +27,5 @@ not fetched for normal builds).
   `spsc_aggregation_benchmark.cpp`, `wasm_spike/` — TPC-DS, external-client
   TPC-C, SPSC aggregation, and WASM execution spike runners/benchmarks.
 
-Gate: `scripts/bench_gate.py` compares against `BenchmarkHistory.md`.
+Gate: `../scripts/bench_gate.py` compares against `../BenchmarkHistory.md`
+(paths relative to this directory; both files live at the repository root).

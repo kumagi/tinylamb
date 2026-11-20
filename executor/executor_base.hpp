@@ -42,6 +42,11 @@ class ExecutorBase {
   virtual size_t NextBatch(DataChunk* destination,
                            size_t max_rows = kDefaultVectorSize) = 0;
   bool Next(Row* dst, RowPosition* rp = nullptr);
+  // Batch consumption that first drains rows buffered by Next(); callers
+  // that may mix row-at-a-time and batch fetching on the same executor
+  // must go through this so buffered rows are never skipped.
+  size_t NextBatchDraining(DataChunk* destination,
+                           size_t max_rows = kDefaultVectorSize);
   virtual void Dump(std::ostream& o, int indent) const = 0;
   virtual void Explain(std::ostream& o, int indent) const { Dump(o, indent); }
   friend std::ostream& operator<<(std::ostream& o, const ExecutorBase& e) {
@@ -109,6 +114,9 @@ class ExecutorBase {
 
  private:
   mutable Status status_{Status::kSuccess};
+  // T4494: row-at-a-time fetch buffer backing Next().
+  DataChunk row_buffer_;
+  size_t row_buffer_pos_{0};
 };
 
 using Executor = std::shared_ptr<ExecutorBase>;

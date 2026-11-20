@@ -45,6 +45,7 @@ TEST(JsonStructHelpersTest, JsonTextToValueParsesScalars) {
   EXPECT_TRUE(JsonTextToValue("1.5", &parsed));
   EXPECT_EQ(parsed, Value(1.5));
   EXPECT_TRUE(JsonTextToValue("true", &parsed));
+  EXPECT_EQ(parsed, Value(true));
   // "null" parses successfully into a null Value.
   EXPECT_TRUE(JsonTextToValue("null", &parsed));
   EXPECT_TRUE(parsed.IsNull());

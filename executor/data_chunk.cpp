@@ -147,7 +147,15 @@ void ColumnVector::Append(const Value& value) {
     type_ = value.type;
     unsigned_ = value.IsUnsigned();
     MaterializeInferredStorage();
-  } else if (!is_null && type_ != value.type) {
+  } else if (!is_null &&
+             (type_ != value.type ||
+              (type_ == ValueType::kInt64 &&
+               value.IsUnsigned() != unsigned_ && size_ > 0 &&
+               allow_heterogeneous_))) {
+    // A different type -- or an INT64 cell whose signedness differs from the
+    // column's -- cannot share the typed integer storage: the column keeps a
+    // single unsigned flag, so -1 appended after a UINT64 would read back as
+    // 18446744073709551615.  Mixed columns keep per-value Values instead.
     if (allow_heterogeneous_) {
       PromoteToHeterogeneous();
       EnsureNullBit(size_, false);
@@ -200,7 +208,12 @@ void ColumnVector::Append(Value&& value) {
     type_ = value.type;
     unsigned_ = value.IsUnsigned();
     MaterializeInferredStorage();
-  } else if (!is_null && type_ != value.type) {
+  } else if (!is_null &&
+             (type_ != value.type ||
+              (type_ == ValueType::kInt64 &&
+               value.IsUnsigned() != unsigned_ && size_ > 0 &&
+               allow_heterogeneous_))) {
+    // See Append(const Value&): mixed INT64 signedness keeps per-value cells.
     if (allow_heterogeneous_) {
       PromoteToHeterogeneous();
       EnsureNullBit(size_, false);
@@ -243,6 +256,9 @@ void ColumnVector::Append(Value&& value) {
 }
 
 void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
+  if (index >= source.Size()) {
+    return;
+  }
   const bool is_null = source.IsNull(index);
   if (heterogeneous_ || source.heterogeneous_) {
     if (allow_heterogeneous_) {
@@ -367,7 +383,10 @@ void ColumnVector::AppendRange(const ColumnVector& source) {
 }
 
 void ColumnVector::AppendBoolBatch(const uint8_t* bits, size_t count) {
-  if (count == 0) {
+  // T1938: a null value buffer with count > 0 is a contract violation; treat
+  // it as a no-op instead of dereferencing (JIT filter output is never null,
+  // but the API must not hand the caller UB).
+  if (count == 0 || bits == nullptr) {
     return;
   }
   if (type_ == ValueType::kNull) {
@@ -431,7 +450,10 @@ void ColumnVector::AppendNullBatch(size_t count, ZoneMap* zone_map) {
 void ColumnVector::AppendIntBatch(ValueType type, bool is_unsigned,
                                   const int64_t* values, const uint8_t* nulls,
                                   size_t count, ZoneMap* zone_map) {
-  if (count == 0) {
+  // T1938: values == nullptr with count > 0 no-ops instead of memcpy/read UB
+  // (nulls == nullptr legitimately means "no nulls", values has no such
+  // reading).
+  if (count == 0 || values == nullptr) {
     return;
   }
   if (!heterogeneous_ && type_ == ValueType::kNull) {
@@ -462,8 +484,13 @@ void ColumnVector::AppendIntBatch(ValueType type, bool is_unsigned,
   const size_t old_size = size_;
   size_ = old_size + count;
   null_bitmap_.resize((size_ + 63) / 64, 0);
-  integers_.resize(size_);
-  std::memcpy(integers_.data() + old_size, values, count * sizeof(int64_t));
+  // T4752: the old `integers_.resize(size_)` value-initialized every new
+  // slot to 0 and the memcpy immediately rewrote all of them -- a pure
+  // second O(count*8B) pass per batch per column on the scan-materialize
+  // hot path. insert() from the caller's range writes each slot exactly
+  // once (null slots keep the same source bytes the memcpy gave them).
+  integers_.reserve(size_);
+  integers_.insert(integers_.end(), values, values + count);
   if (nulls == nullptr) {
     if (zone_map != nullptr) {
       if (is_unsigned) {
@@ -528,8 +555,8 @@ void ColumnVector::AppendIntBatch(ValueType type, bool is_unsigned,
 
 void ColumnVector::AppendDoubleBatch(const double* values, const uint8_t* nulls,
                                      size_t count, ZoneMap* zone_map) {
-  if (count == 0) {
-    return;
+  if (count == 0 || values == nullptr) {
+    return;  // T1938: see AppendIntBatch.
   }
   if (!heterogeneous_ && type_ == ValueType::kNull) {
     type_ = ValueType::kDouble;
@@ -550,8 +577,10 @@ void ColumnVector::AppendDoubleBatch(const double* values, const uint8_t* nulls,
   const size_t old_size = size_;
   size_ = old_size + count;
   null_bitmap_.resize((size_ + 63) / 64, 0);
-  doubles_.resize(size_);
-  std::memcpy(doubles_.data() + old_size, values, count * sizeof(double));
+  // T4752: same single-pass append as AppendIntBatch (resize+memcpy was
+  // memset-then-overwrite of every slot).
+  doubles_.reserve(size_);
+  doubles_.insert(doubles_.end(), values, values + count);
   size_t null_cnt = 0;
   size_t non_null = 0;
   bool has_bounds = false;
@@ -610,8 +639,8 @@ void ColumnVector::AppendDoubleBatch(const double* values, const uint8_t* nulls,
 void ColumnVector::AppendStringViewBatch(const std::string_view* values,
                                          const uint8_t* nulls, size_t count,
                                          ZoneMap* zone_map) {
-  if (count == 0) {
-    return;
+  if (count == 0 || values == nullptr) {
+    return;  // T1938: see AppendIntBatch.
   }
   if (!heterogeneous_ && type_ == ValueType::kNull) {
     type_ = ValueType::kVarChar;
@@ -1015,7 +1044,7 @@ void DataChunk::Append(Row&& row, RowPosition position) {
   ++size_;
 }
 
-void DataChunk::Append(const DataChunk& source, size_t row_index) {
+void DataChunk::AppendFrom(const DataChunk& source, size_t row_index) {
   if (row_index >= source.Size()) {
     CHECK_MSG(false, "data chunk append row out of range");
   }
@@ -1140,6 +1169,20 @@ void DataChunk::AppendGather(const DataChunk& source, const uint32_t* selection,
 }
 
 void DataChunk::CommitBatchAppend(size_t appended_rows) {
+  if (appended_rows == 0) {
+    return;
+  }
+  // T1940: this API trusts the caller to have grown every column's storage
+  // out-of-band and only advances size_/positions_. Over-reporting used to
+  // silently leave size_ ahead of ColumnVector::Size(), so RowAt/ValueAt read
+  // out-of-bounds cells and zone maps drifted. Clamp to the rows every column
+  // actually holds (a column-less chunk keeps the historical behaviour) so
+  // the size invariant Append/AppendGather maintain cannot be broken by a
+  // miscounted caller.
+  for (const ColumnVector& column : columns_) {
+    const size_t available = column.Size() > size_ ? column.Size() - size_ : 0;
+    appended_rows = std::min(appended_rows, available);
+  }
   if (appended_rows == 0) {
     return;
   }

@@ -19,6 +19,7 @@
 //
 
 #include "database/transaction_context.hpp"
+#include "common/string_util.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -33,26 +34,68 @@
 #include "database/catalog_reader.hpp"
 
 namespace tinylamb {
+namespace {
+thread_local const TransactionContext* tl_runtime_owner = nullptr;
+thread_local relational_detail::ExecutionRuntime* tl_runtime_ptr = nullptr;
+}  // namespace
+
+TransactionContext::ScopedRuntimeOverride::ScopedRuntimeOverride(
+    const TransactionContext& owner,
+    relational_detail::ExecutionRuntime* runtime)
+    : owner_(owner),
+      prev_owner_(tl_runtime_owner),
+      prev_runtime_(tl_runtime_ptr) {
+  owner_.runtime_override_depth_.fetch_add(1, std::memory_order_acq_rel);
+  tl_runtime_owner = &owner_;
+  tl_runtime_ptr = runtime;
+}
+
+TransactionContext::ScopedRuntimeOverride::~ScopedRuntimeOverride() {
+  tl_runtime_owner = prev_owner_;
+  tl_runtime_ptr = prev_runtime_;
+  owner_.runtime_override_depth_.fetch_sub(1, std::memory_order_release);
+}
+
+bool TransactionContext::LookupThreadRuntimeOverride(
+    const TransactionContext* owner,
+    relational_detail::ExecutionRuntime** out) {
+  if (tl_runtime_owner == owner) {
+    *out = tl_runtime_ptr;
+    return true;
+  }
+  return false;
+}
+
 StatusOr<std::shared_ptr<Table>> TransactionContext::GetTable(
     std::string_view table_name) {
-  auto it = tables_.find(std::string(table_name));
-  if (it != tables_.end()) {
-    return it->second;
+  {
+    std::scoped_lock lock(cache_mutex_);
+    auto it = tables_.find(AsciiToLower(table_name));
+    if (it != tables_.end()) {
+      return it->second;
+    }
   }
   if (catalog_ == nullptr) {
     return Status::kNotExists;
   }
   ASSIGN_OR_RETURN(Table, tbl, catalog_->GetTable(*this, table_name));
+  auto shared = std::make_shared<Table>(std::move(tbl));
+  std::scoped_lock lock(cache_mutex_);
   auto result =
-      tables_.emplace(table_name, std::make_shared<Table>(std::move(tbl)));
+      tables_.emplace(AsciiToLower(table_name), std::move(shared));
   return result.first->second;
 }
 
 StatusOr<std::shared_ptr<TableStatistics>> TransactionContext::GetStats(
     std::string_view table_name) {
-  auto it = stats_.find(std::string(table_name));
-  if (it != stats_.end()) {
-    return it->second;
+  // Use the same key as GetTable so callers can join the two caches.
+  const std::string name = AsciiToLower(table_name);
+  {
+    std::scoped_lock lock(cache_mutex_);
+    auto it = stats_.find(name);
+    if (it != stats_.end()) {
+      return it->second;
+    }
   }
   if (catalog_ == nullptr) {
     return Status::kNotExists;
@@ -69,21 +112,23 @@ StatusOr<std::shared_ptr<TableStatistics>> TransactionContext::GetStats(
     cache.epoch = epoch;
     cache.entries.clear();
   }
-  const std::string name(table_name);
   if (const auto cached = cache.entries.find(name);
       cached != cache.entries.end()) {
-    stats_.emplace(name, cached->second);
-    return cached->second;
+    std::scoped_lock lock(cache_mutex_);
+    auto result = stats_.emplace(name, cached->second);
+    return result.first->second;
   }
   ASSIGN_OR_RETURN(TableStatistics, tbl,
                    catalog_->GetStatistics(*this, table_name));
   auto shared = std::make_shared<TableStatistics>(std::move(tbl));
   cache.entries.emplace(name, shared);
-  auto result = stats_.emplace(table_name, std::move(shared));
+  std::scoped_lock lock(cache_mutex_);
+  auto result = stats_.emplace(name, std::move(shared));
   return result.first->second;
 }
 
 std::ostream& operator<<(std::ostream& o, const TransactionContext& ctx) {
+  std::scoped_lock lock(ctx.cache_mutex_);
   o << "TransactionContext(txn=" << ctx.txn_ << ", tables=[";
   for (const auto& [name, t] : ctx.tables_) {
     o << name << ": " << t << ", ";

@@ -31,7 +31,7 @@ class InExpression : public ExpressionBase {
  public:
   InExpression(Expression child, std::vector<Expression> list)
       : child_(std::move(child)), list_(std::move(list)) {}
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kInExp; }
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,

@@ -1519,7 +1519,7 @@ class PaxChunk final {
   };
 
   // Returns true when RG g may contain values in [lo,hi] for column c.
-  // Uses all-column zone maps when available; falls back to false-safe true.
+  // Uses all-column zone maps when available; falls back to fail-safe true.
   // Zone maps cover non-null values only: a cell holding NULLs overlaps any
   // range that contains 0 (NULL decodes as raw 0).
   [[nodiscard]] bool RGOverlapsCol(int32_t g, slot_t col, int64_t lo,
@@ -1566,7 +1566,12 @@ class PaxChunk final {
   // per-scheme extent checks are disabled (unlike Int64RegionAt); handing it
   // a hostile footer's raw offsets would read past the buffer.
   enum class CompareOp { kEq, kLe, kLt, kGe, kGt };
-  [[nodiscard]] static uint32_t ByteSliceNullAwareCount(
+  // A fold that cannot decode the region (currently only kPostings: the
+  // Rice stream has no self-described length) returns kCorrupt instead of
+  // falling into the per-row loop, which would read every row as 0 and
+  // turn corruption into a plausible count. Callers can fall back to the
+  // bounds-checked row path on failure.
+  [[nodiscard]] static StatusOr<uint32_t> ByteSliceNullAwareCount(
       const char* region, Scheme s, uint32_t param, uint32_t n,
       const uint8_t* null_bmp, CompareOp op, int64_t lit);
 
@@ -2000,6 +2005,14 @@ class PaxChunk final {
   int ResolveRowGroup(size_t global_row_index, uint32_t* g_out,
                       uint32_t* local_out) const;
   std::vector<uint64_t> rg_prefix_;
+  // Per-row-group byte offsets into footer_.null_bitmaps:
+  // null_rg_offsets_[g] is the start of row group g's bitmap region. Built
+  // once by BuildNullBitmapSummary (chunks are immutable afterwards) so
+  // CellNullBits resolves a (group, column) cell in O(1) instead of
+  // re-walking every preceding row group on each call. Empty when the
+  // footer's bitmap layout cannot be proven consistent; CellNullBits then
+  // falls back to the stateless RgColNullBits walk.
+  std::vector<uint64_t> null_rg_offsets_;
   // Flat select-sample storage: ef_sel_flat_[ef_sel_off_[i] ..
   // ef_sel_off_[i+1]) holds the samples of cell i (empty span = no
   // directory). Sample j of a cell is the position of its (8j)-th set bit.

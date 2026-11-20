@@ -178,6 +178,15 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
     } else {
       generic_indices_.push_back(index);
     }
+    // T3950: the generic path re-checks the kColumnValue child per row;
+    // resolve its schema slot once here instead (same input_schema_, so
+    // Offset() here returns exactly what the per-row call returned).
+    if (input.kind == AggregateInputKind::kGeneric && !IsCountStar(aggregate) &&
+        aggregate.Child() != nullptr &&
+        aggregate.Child()->Type() == TypeTag::kColumnValue) {
+      input.generic_column = input_schema_.Offset(
+          aggregate.Child()->AsColumnValue().GetColumnName());
+    }
     inputs_.push_back(input);
   }
 }
@@ -425,8 +434,9 @@ Status ParallelAggregationExecutor::AccumulateGeneric(
       if (IsCountStar(aggregate)) {
         value = Value(1);
       } else if (aggregate.Child()->Type() == TypeTag::kColumnValue) {
-        const int offset = input_schema_.Offset(
-            aggregate.Child()->AsColumnValue().GetColumnName());
+        // T3950: precomputed slot (constructor) instead of a per-row
+        // input_schema_.Offset() name scan for the same column.
+        const int offset = inputs_[index].generic_column;
         if (offset >= 0) {
           value =
               chunk.ColumnAt(static_cast<size_t>(offset)).ValueAt(row_index);

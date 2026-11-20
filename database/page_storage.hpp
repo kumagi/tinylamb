@@ -30,8 +30,8 @@
 
 namespace tinylamb {
 
-// Member order documents the teardown order (logger, pool, catalog
-// managers).
+// Member order documents the teardown order (logger, page manager, recovery /
+// transaction / checkpoint managers).
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 class PageStorage {
  public:
@@ -64,9 +64,9 @@ class PageStorage {
   //  * logger_ is constructed before rm_: RecoveryManager replays the WAL
   //    file, so Logger must have created/opened it first (page_storage.cpp
   //    relies on this at startup).
-  //  * tm_/cm_ hold raw pointers into pm_(pool)/logger_/rm_.
+  //  * tm_/cm_ hold raw pointers into pm_/logger_/rm_.
   //  * cm_ is declared LAST on purpose: ~CheckpointManager() joins its
-  //    background worker, which keeps dereferencing tm_/pp_/logger_ until
+  //    background worker, which keeps dereferencing tm_/pm_/logger_ until
   //    that join completes. Any other order risks use-after-free at
   //    shutdown or a failed startup.
   PageStorage(std::string_view dbname, std::unique_ptr<Logger> logger,

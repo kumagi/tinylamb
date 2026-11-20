@@ -1,6 +1,6 @@
 # batch_nested_loop_outer
 
-- 状態: draft   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft   /   執筆基準リビジョン: `72ad60a` (2026-11-19)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の登録 `"batch_nested_loop_outer"`（パターンは `cascades::dsl::OuterJoin()`、`join_type` が 1 (RIGHT) または 2 (FULL) に限定、共有ヘルパー `BatchNestedLoopFor(..., kind, /*wrap_selection=*/false)` に委譲）
 
 ## 概要
@@ -119,7 +119,7 @@ return {PlanAlternative{.plan = std::move(join),
 - `outer_nested_loop`: 非等値 LEFT 外部結合を担当する物理実装 Rule です。本 Rule とは `join_type` の値によって排他的に分担します。
 - `outer_hash_join`: 等値キー対を持つ外部結合を担当する物理実装 Rule です。ゲート条件によって適用領域が分離されます。
 - `right_to_left_outer_join`: RIGHT 外部結合を LEFT 外部結合に正規化する論理 Rule です。正規化が先行した場合は `outer_nested_loop` 側へ処理が誘導されます。
-- `batch_nested_loop` / `batch_nested_loop_semi` / `batch_nested_loop_anti`: 同一のビルダ関数を共有するブロック化結合ファミリの兄弟 Rule 群です。
+- `batch_nested_loop` / `batch_nested_loop_semi` / `batch_nested_loop_anti`: 同一のビルダ関数を共有するブロック化結合ファミリーの兄弟 Rule 群です。
 
 ## 検証テスト
 

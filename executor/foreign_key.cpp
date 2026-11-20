@@ -193,6 +193,7 @@ void ForeignKeyCounts::ReleaseSpillSegment() noexcept {
   if (store_ != nullptr && segment_id_ != kInvalidSpillSegmentId) {
     // DropSegment's Status cannot cross this noexcept boundary (destructor /
     // move assignment); a failure leaks the segment's temp space silently.
+    // NOLINTNEXTLINE(readability-redundant-casting) cast documents intent
     (void)store_->DropSegment(segment_id_);
   }
   segment_id_ = kInvalidSpillSegmentId;
@@ -426,10 +427,11 @@ Status ForeignKeyCounts::RebuildWithDeltas() {
             if (!old_two_level) {
               RETURN_IF_FAIL(decode_leaf_block(top.offset, top.length, emit));
             } else {
-              std::string dir_buf(top.length, '\0');
-              RETURN_IF_FAIL(store_->Read(old_seg, top.offset, dir_buf.data(),
-                                          top.length));
-              std::string_view sv(dir_buf);
+              // T4637: Read fills every byte; skip the memset.
+              std::unique_ptr<char[]> dir_raw(new char[top.length]);  // NOLINT(modernize-avoid-c-arrays)
+              RETURN_IF_FAIL(
+                  store_->Read(old_seg, top.offset, dir_raw.get(), top.length));
+              std::string_view sv(dir_raw.get(), top.length);
               uint32_t n = 0;
               if (!ReadUint32(&sv, &n)) {
                 return StatusError(StatusCode::kCorrupt,
@@ -491,10 +493,13 @@ StatusOr<int64_t> ForeignKeyCounts::LookupSpilledCount(
   uint64_t leaf_off = leaf->offset;
   uint32_t leaf_len = leaf->length;
   if (two_level_) {
-    std::string dir_buf(leaf->length, '\0');
+    // T4636: store_->Read overwrites every byte; the old
+    // std::string(leaf->length, '\0') memset the same block again for
+    // nothing. Default-new'ed char[] skips it, view keeps parsing identical.
+    std::unique_ptr<char[]> dir_raw(new char[leaf->length]);  // NOLINT(modernize-avoid-c-arrays)
     RETURN_IF_FAIL(
-        store_->Read(segment_id_, leaf->offset, dir_buf.data(), leaf->length));
-    std::string_view sv(dir_buf);
+        store_->Read(segment_id_, leaf->offset, dir_raw.get(), leaf->length));
+    std::string_view sv(dir_raw.get(), leaf->length);
     uint32_t n = 0;
     if (!ReadUint32(&sv, &n)) {
       return StatusError(StatusCode::kCorrupt, "corrupt FK dir header");
@@ -529,10 +534,10 @@ StatusOr<int64_t> ForeignKeyCounts::LookupSpilledCount(
     leaf_len = chosen_len;
   }
 
-  std::string leaf_buf(leaf_len, '\0');
-  RETURN_IF_FAIL(
-      store_->Read(segment_id_, leaf_off, leaf_buf.data(), leaf_len));
-  std::string_view sv(leaf_buf);
+  // T4635: same uninit-buffer rule as the dir read above.
+  std::unique_ptr<char[]> leaf_raw(new char[leaf_len]);  // NOLINT(modernize-avoid-c-arrays)
+  RETURN_IF_FAIL(store_->Read(segment_id_, leaf_off, leaf_raw.get(), leaf_len));
+  std::string_view sv(leaf_raw.get(), leaf_len);
   uint32_t n = 0;
   if (!ReadUint32(&sv, &n)) {
     return StatusError(StatusCode::kCorrupt, "corrupt FK leaf block");
@@ -1036,8 +1041,12 @@ StatusOr<std::optional<std::string>> FindReferencedParentKey(
     if (val.IsNull()) {
       return Status::kSuccess;
     }
-    return candidate_sorter.AddRow(
-        Row({Value(ForeignKeyString(val)), Value(val.AsString())}));
+    // T4638: only the encoded comparison key goes into the sorter now;
+    // the old second column materialized val.AsString() for EVERY candidate
+    // even though the message is consumed on the rare violation path.
+    // ForeignKeyString is tag + canonical AsString, so the display form is
+    // recovered by stripping the tag when (and only when) a key hits.
+    return candidate_sorter.AddRow(Row({Value(ForeignKeyString(val))}));
   }));
   RETURN_IF_FAIL(candidate_sorter.Finish());
   if (candidate_sorter.TotalRows() == 0) {
@@ -1172,8 +1181,9 @@ StatusOr<std::optional<std::string>> FindReferencedParentKey(
     const std::string_view ck = cand_row[0].AsStringView();
     const std::string_view dk = child_row[0].AsStringView();
     if (ck == dk) {
-      return std::optional<std::string>(
-          std::string(cand_row[1].AsStringView()));
+      // T4638: display value is the encoded key minus its leading type tag
+      // (canonicalized form of the compared value).
+      return std::optional<std::string>(std::string(ck.substr(1)));
     }
     if (ck < dk) {
       ASSIGN_OR_RETURN(bool, next_cand, candidate_sorter.NextRow(&cand_row));

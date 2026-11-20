@@ -33,7 +33,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", default="build-cov")
     parser.add_argument("--top", type=int, default=40)
-    parser.add_argument("--info", default="/tmp/cov_prod.info")
+    parser.add_argument(
+        "--info",
+        default=f"/tmp/cov_prod_{os.getpid()}.info")
     args = parser.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,8 +45,9 @@ def main() -> int:
         "--ignore-errors",
         IGNORE_B,
     ]
+    build_dir = os.path.abspath(args.build)
     capture = subprocess.run(
-        ["lcov", "--capture", f"--directory={root}",
+        ["lcov", "--capture", f"--directory={build_dir}",
          f"--output-file={args.info}", "--no-external"] + ignore_flags,
         capture_output=True,
         text=True,
@@ -83,6 +86,9 @@ def main() -> int:
     total_unc = sum(v[0] for v in files.values())
     total = sum(v[1] for v in files.values())
     print(f"production files: {len(files)}")
+    if total == 0:
+        print("line coverage: n/a (no DA rows in lcov data)")
+        return 0
     print(
         f"line coverage: {100 * (total - total_unc) / total:.1f}% "
         f"({total - total_unc}/{total})"

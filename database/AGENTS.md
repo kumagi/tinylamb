@@ -8,9 +8,9 @@ Facade over everything below: DDL/catalog, statistics persistence, and the
 - `database.{hpp,cpp}` (`Database : CatalogReader`) —
   `CreateTable/DropTable/CreateIndex/GetTable/ListTables`,
   `GetOrAddFunction`, `Get/Update/RefreshStatistics`, `BeginContext` /
-  `BeginReadOnlyContext`, `EmulateCrash`, `DeleteAll`. Owns 3 B+Trees
-  (catalog/statistics/functions) + `PageStorage` + `catalog_mu_` +
-  `schema_epoch_`. DDL and stats updates `BumpSchemaEpoch` (plan-cache
+  `BeginReadOnlyContext`, `EmulateCrash`, `DeleteAll`. Owns 3 LSM-Tree indexes
+  (`LsmIndex`, aliased as `BPlusTree`, for catalog/statistics/functions) +
+  `PageStorage` + `catalog_mu_` + `schema_epoch_`. DDL and stats updates `BumpSchemaEpoch` (plan-cache
   staleness; per-DB disjoint epoch ranges so a new DB never replays a
   destroyed predecessor's plans). `catalog_mu_` is held across the
   read→insert chain to prevent orphan page allocation on double registration.
@@ -29,7 +29,7 @@ Facade over everything below: DDL/catalog, statistics persistence, and the
 
 Test: `./build/catalog_test`, `database_extra_test`.
 
-`DurableWALLSN()` exposes only Logger's successfully synced frontier (acquire
+`DurableWalLSN()` exposes only Logger's successfully synced frontier (acquire
 load) to the server's own/dependency reply gate. BufferedLSN and CommittedLSN
 are not durability proofs. A cached requested target may lag that actual
 frontier because a successful sync can cover additional bytes.

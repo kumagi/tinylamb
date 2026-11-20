@@ -273,9 +273,10 @@ TEST_F(SqlScalarCoverageTest, JsonDeepNestingTerminatesCleanly) {
   RunSql(engine_.get(), context_.get(),
          "INSERT INTO jdeep VALUES ('" + deep_arr + "');");
   ExpectValue("SELECT json_extract(j, '$') IS NULL FROM jdeep", Value(true));
-  // Just under the bound still parses.
+  // Just under the bound (kMaxJsonDepth = 256, shared with the strict
+  // validator since T2407) still parses.
   const std::string ok_arr =
-      std::string(300, '[') + "7" + std::string(300, ']');
+      std::string(250, '[') + "7" + std::string(250, ']');
   ExpectValue("SELECT json_extract('" + ok_arr + "', '$') IS NOT NULL",
               Value(true));
 }
@@ -285,7 +286,33 @@ TEST_F(SqlScalarCoverageTest, JsonDeepNestingTerminatesCleanly) {
 TEST_F(SqlScalarCoverageTest, StructFieldAccessAndMutation) {
   ExpectValue("SELECT get_field(STRUCT(1 AS a, 'x' AS b), 'b')",
               Value(std::string("x")));
-  ExpectValue("SELECT get_field(STRUCT(1 AS a), 'zz') IS NULL", Value(true));
+  // T1647: a missing member raises "field not found" on the batch engine
+  // too (previously NULL there while the AST errored); NULL-tolerant
+  // callers keep __get_field_safe.  The engine surfaces the status error
+  // as an exception (Prepare/fold time) or as a zero-row result (runtime
+  // error swallowed into an empty ErrorTable) -- never as a NULL row.
+  {
+    bool threw = false;
+    size_t rows = 0;
+    try {
+      rows = RunSql(engine_.get(), context_.get(),
+                    "SELECT get_field(STRUCT(1 AS a), 'zz')")
+                 .size();
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    EXPECT_TRUE(threw || rows == 0);
+    threw = false;
+    rows = 0;  // NOLINT(clang-analyzer-deadcode.DeadStores)
+    try {
+      rows =
+          RunSql(engine_.get(), context_.get(), "SELECT get_field('27', 'a')")
+              .size();
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    EXPECT_TRUE(threw || rows == 0);
+  }
   ExpectValue("SELECT __get_field_safe(STRUCT(1 AS a), 'a')",
               Value(int64_t{1}));
   // get_field now shares the AST's typed member extraction (same as

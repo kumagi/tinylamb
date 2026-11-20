@@ -51,15 +51,19 @@ bool JoinValueEqual(const Value& left, const Value& right) {
          result.Value().Truthy();
 }
 
-bool JoinValueOrdered(const Value& left, const Value& right,
+// `lhs_operand`/`rhs_operand` name the sides of the comparison `operation`,
+// NOT the join sides: callers pass (probe, index) or (index, probe) order
+// depending on the range predicate, so read the call site before swapping.
+bool JoinValueOrdered(const Value& lhs_operand, const Value& rhs_operand,
                       BinaryOperation operation) {
   // Three-valued logic: a comparison against NULL is UNKNOWN, never TRUE, so
   // it cannot produce a match even though the index may still hand us the
   // NULL-keyed entry the seek range covered.
-  if (left.IsNull() || right.IsNull()) {
+  if (lhs_operand.IsNull() || rhs_operand.IsNull()) {
     return false;
   }
-  const auto result = TryEvaluateBinary(operation, left, right);
+  const auto result =
+      TryEvaluateBinary(operation, lhs_operand, rhs_operand);
   return result.HasValue() && !result.Value().IsNull() &&
          result.Value().Truthy();
 }
@@ -240,28 +244,32 @@ std::optional<Value> LookupJoin::SecondRangeBound() const {
   return hold_left_[*second_range_column_];
 }
 
-bool LookupJoin::Matches(const Row& left_key, const Row& right_key) const {
-  if (left_key.values_.size() != right_key.values_.size()) {
+bool LookupJoin::Matches(const Row& left_key, const Row& right_row) const {
+  if (left_key.values_.size() != right_cols_.size()) {
     return false;
   }
   for (size_t i = 0; i < left_key.values_.size(); ++i) {
+    const slot_t column = right_cols_[i];
+    if (column >= right_row.values_.size()) {
+      return false;
+    }
+    const Value& right_value = right_row[column];
     if (range_position_ && i == *range_position_) {
       // The seek range already excludes most of the key space, but boundary
       // inclusivity and the per-row bound fallback are only decidable here.
-      if (!JoinValueOrdered(right_key[i], left_key[i], range_operation_)) {
+      if (!JoinValueOrdered(right_value, left_key[i], range_operation_)) {
         return false;
       }
       if (second_range_operation_) {
         if (std::optional<Value> bound = SecondRangeBound()) {
-          if (!JoinValueOrdered(right_key[i], *bound,
-                                *second_range_operation_)) {
+          if (!JoinValueOrdered(right_value, *bound, *second_range_operation_)) {
             return false;
           }
         }
       }
       continue;
     }
-    if (!JoinValueEqual(left_key[i], right_key[i])) {
+    if (!JoinValueEqual(left_key[i], right_value)) {
       return false;
     }
   }
@@ -272,22 +280,28 @@ bool LookupJoin::Load() {
   if (GetStatus() != Status::kSuccess) {
     return false;
   }
-  DataChunk left_batch;
   for (;;) {
-    if (left_->NextBatch(&left_batch, 1) == 0) {
-      hold_left_.Clear();
-      if (left_->GetStatus() != Status::kSuccess) {
-        FailWith(left_->GetStatus());
+    if (left_batch_pos_ >= left_batch_.Size()) {
+      left_batch_.Reset();
+      left_batch_pos_ = 0;
+      if (left_->NextBatch(&left_batch_) == 0) {
+        hold_left_.Clear();
+        hold_left_key_.Clear();
+        if (left_->GetStatus() != Status::kSuccess) {
+          FailWith(left_->GetStatus());
+        }
+        return false;
       }
-      return false;
     }
-    hold_left_ = left_batch.RowAt(0);
-    const auto left_key_result = hold_left_.TryExtract(left_cols_);
+    hold_left_ = left_batch_.RowAt(left_batch_pos_);
+    ++left_batch_pos_;
+    auto left_key_result = hold_left_.TryExtract(left_cols_);
     if (!left_key_result.HasValue()) {
       FailWith(left_key_result.GetStatus());
       return false;
     }
-    const Row& left_key = left_key_result.Value();
+    hold_left_key_ = left_key_result.MoveValue();
+    const Row& left_key = hold_left_key_;
     // SQL's `NULL = NULL` is UNKNOWN, so a NULL equality key can never match;
     // a NaN key has no stable position in the memcomparable order. Both are
     // skipped before any seek, exactly as the residual predicate would.
@@ -324,13 +338,8 @@ bool LookupJoin::NextRow(Row* dst) {
     return false;
   }
   for (;;) {
-    const auto left_key_result = hold_left_.TryExtract(left_cols_);
-    if (!left_key_result.HasValue()) {
-      FailWith(left_key_result.GetStatus());
-      return false;
-    }
-    const Row& left_key = left_key_result.Value();
-    Row right_row = **right_it_;
+    // Extracted once in Load(); every candidate reuses this key row.
+    const Row& left_key = hold_left_key_;
     if (!right_it_->IsValid()) {
       if (right_it_->GetStatus() != Status::kSuccess) {
         return FailWith(right_it_->GetStatus());
@@ -341,6 +350,7 @@ bool LookupJoin::NextRow(Row* dst) {
       }
       continue;
     }
+    Row right_row = **right_it_;  // deref only after the validity check
     if (!right_row.IsValid()) {
       ++*right_it_;
       if (!right_it_->IsValid()) {
@@ -354,13 +364,9 @@ bool LookupJoin::NextRow(Row* dst) {
       }
       continue;
     }
-    const auto right_key_result = right_row.TryExtract(right_cols_);
-    if (!right_key_result.HasValue()) {
-      FailWith(right_key_result.GetStatus());
-      return false;
-    }
-    const Row& right_key = right_key_result.Value();
-    const bool matched = Matches(left_key, right_key);
+    // Matches reads the candidate's key columns in place; no per-candidate
+    // key Row allocation is needed.
+    const bool matched = Matches(left_key, right_row);
     if (at_most_one_ && matched) {
       // Point probe on a single-value unique key: this matching position is
       // the only row that key can name, so step the outer cursor instead of

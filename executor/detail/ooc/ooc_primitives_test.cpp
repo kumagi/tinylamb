@@ -287,7 +287,7 @@ TEST(SpillableStoreTest, SpillsOverBudgetAndCleansUpOnReset) {
   EXPECT_EQ(grant.UsedBytes(), 0U);
 }
 
-TEST(ExternalSorterTest, InMemoryFastPathAndTopNBoundedHeap) {
+TEST(OocPrimitivesSorterTest, InMemoryFastPathAndTopNBoundedHeap) {
   TempDirGuard dir("ooc_sorter_mem");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
 
@@ -352,7 +352,7 @@ TEST(ExternalSorterTest, InMemoryFastPathAndTopNBoundedHeap) {
   EXPECT_EQ(expected, 16);
 }
 
-TEST(ExternalSorterTest, MultiPassExternalMergeUnderTightBudget) {
+TEST(OocPrimitivesSorterTest, MultiPassExternalMergeUnderTightBudget) {
   TempDirGuard dir("ooc_sorter_ext");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
 
@@ -396,7 +396,44 @@ TEST(ExternalSorterTest, MultiPassExternalMergeUnderTightBudget) {
   EXPECT_EQ(store.Stats().current_active_bytes, 0U);
 }
 
-TEST(ExternalSorterTest, FaultInjectionAndTempLimitCleanUpAllSegments) {
+// P34/61: the K-way merge compares per-stream cached key cells in a loser
+// tree with an explicit stream-index tie-break.  Runs are written in
+// insertion order and stable-sorted, so a fully-tied input must merge out in
+// original insertion order (global sort stability across runs).  The old
+// binary heap over Rows broke ties by heap sifting, not by run order.
+TEST(OocPrimitivesSorterTest, CrossRunTieOrderIsStreamStable) {
+  TempDirGuard dir("ooc_sorter_ties");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  constexpr int kRows = 4000;
+  ExternalSorter sorter(ExternalSorter::Options{
+      .spill_store = &store,
+      .memory_budget_bytes = 32ULL << 10,
+      .keys = {OocSortKey{.column_index = 0, .ascending = true}},
+      .limit = std::nullopt,
+      .force_spill = true,
+  });
+  const std::string pad(160, 'P');
+  for (int i = 0; i < kRows; ++i) {
+    ASSERT_EQ(
+        sorter.AddRow(Row({Value(int64_t{7}), Value(std::to_string(i) + pad)})),
+        Status::kSuccess);
+  }
+  ASSERT_EQ(sorter.Finish(), Status::kSuccess);
+  EXPECT_TRUE(sorter.Spilled());
+  EXPECT_GE(sorter.RunCount(), 4U);
+  Row r;
+  int64_t next_payload = 0;
+  while (sorter.NextRow(&r).Value()) {
+    const std::string_view payload = r[1].AsStringView();
+    const int64_t idx = std::strtoll(std::string(payload).c_str(), nullptr, 10);
+    EXPECT_EQ(idx, next_payload++)
+        << "row " << next_payload - 1 << " lost run-order stability";
+  }
+  EXPECT_EQ(next_payload, kRows);
+  EXPECT_EQ(store.Stats().live_segments, 0U);
+}
+
+TEST(OocPrimitivesSorterTest, FaultInjectionAndTempLimitCleanUpAllSegments) {
   TempDirGuard dir("ooc_sorter_fault");
   ProcessMemoryBudget& mem = ProcessMemoryBudget::Global();
   struct Cleanup {
@@ -612,7 +649,7 @@ TEST(RecursivePartitionerTest, FaultInjectionDropsPartialBucketsCleanly) {
   EXPECT_EQ(store.Stats().current_active_bytes, 0U);
 }
 
-TEST(ExternalSorterTest, ShouldSkipTopKChunkRowRespectsCutoffs) {
+TEST(OocPrimitivesSorterTest, ShouldSkipTopKChunkRowRespectsCutoffs) {
   TempDirGuard dir("ooc_sorter_topk_skip");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
 
@@ -634,7 +671,7 @@ TEST(ExternalSorterTest, ShouldSkipTopKChunkRowRespectsCutoffs) {
   DataChunk probe;
   probe.Reserve(4);
   probe.Append(Row({Value(int64_t{15}), Value(seq++)}));  // 15 < 20 -> skip
-  probe.Append(Row({Value(int64_t{20}), Value(seq++)}));  // tie == 20 -> keep
+  probe.Append(Row({Value(int64_t{20}), Value(seq++)}));  // tie == 20 -> skip (later tie-breaker seq; all SQL keys compare equal)
   probe.Append(Row({Value(int64_t{25}), Value(seq++)}));  // 25 > 20 -> keep
   probe.Append(
       Row({Value(), Value(seq++)}));  // NULL (NULLS LAST in DESC) -> skip
@@ -659,6 +696,7 @@ TEST(SpillableStoreTest, AppendRowStagingRespectsTightGrantAndMoveAppendWorks) {
   TempDirGuard dir("ooc_spillable_tight_grant");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
   struct ResetGuard {
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
@@ -719,6 +757,7 @@ TEST(RecursivePartitionerTest,
   TempDirGuard dir("ooc_part_dynamic_bits");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
   struct ResetGuard {
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
@@ -768,10 +807,11 @@ TEST(RecursivePartitionerTest,
   EXPECT_EQ(total, 4200U);
 }
 
-TEST(ExternalSorterTest, GrantExhaustionDuringAddRowSpillsSingleRowRunSafely) {
+TEST(OocPrimitivesSorterTest, GrantExhaustionDuringAddRowSpillsSingleRowRunSafely) {
   TempDirGuard dir("ooc_sorter_grant_exhaustion");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
   struct ResetGuard {
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }

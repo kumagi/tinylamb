@@ -26,6 +26,13 @@ size_t QueryMemoryBudget::LimitFromEnv() {
   if (env == nullptr || env[0] == '\0') {
     return default_bytes;
   }
+  // strtoull silently wraps a leading '-' (e.g. "-1" becomes ULLONG_MAX);
+  // reject any sign or whitespace before the digits.
+  if (env[0] == '-' || env[0] == '+' ||
+      std::isspace(static_cast<unsigned char>(env[0])) != 0) {
+    LOG(WARN) << "Invalid TINYLAMB_QUERY_MEMORY_BYTES: " << env;
+    return default_bytes;
+  }
   errno = 0;
   char* end = nullptr;
   const unsigned long long bytes = std::strtoull(env, &end, 10);

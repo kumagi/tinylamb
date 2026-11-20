@@ -25,6 +25,7 @@
 #include <string_view>
 
 #include "common/crc32c.hpp"
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
 
 namespace tinylamb {
@@ -40,6 +41,15 @@ uint32_t ReadU32(const char* src) {
   return v;
 }
 void WriteString32(char* dst, size_t* offset, std::string_view sv) {
+  // T4253: callers must bound the record before serializing; truncating
+  // here would make Size() and the written length disagree. The guard has
+  // to survive NDEBUG (assert vanished in release fuzz/CI builds), and a
+  // >4GiB payload is a caller contract violation -- Logger caps whole
+  // records at kMaxRecordSize well below 4GiB -- so abort with a named
+  // diagnosis instead of silently corrupting the frame.
+  if (sv.size() > std::numeric_limits<uint32_t>::max()) {
+    LOG(FATAL) << "WAL string payload exceeds 4GiB: " << sv.size();
+  }
   const auto len = static_cast<uint32_t>(sv.size());
   WriteU32(dst + *offset, len);
   *offset += sizeof(uint32_t);
@@ -218,7 +228,9 @@ size_t LogRecord::Size() const {
 
 void LogRecord::SerializeTo(std::string* dst) const {
   const size_t total = Size();
-  dst->assign(total, '\0');
+  // Size() and the type switch below cover [0, total) completely; zero-filling
+  // first would overwrite every byte a second time on every WAL record.
+  dst->resize(total);
   char* buf = dst->data();
   size_t off = 0;
 
@@ -233,8 +245,9 @@ void LogRecord::SerializeTo(std::string* dst) const {
   off += SerializePID(buf + off, prev_lsn);
   off += SerializeU64(buf + off, owner);
   buf[off++] = static_cast<char>(type);
-  const uint8_t flags = (lsm_had_prev ? 1U : 0U) |
-                        (static_cast<uint8_t>(allocated_page_type) << 1U);
+  const auto flags = static_cast<uint8_t>(
+      (lsm_had_prev ? 1U : 0U) |
+      (static_cast<unsigned>(static_cast<uint8_t>(allocated_page_type)) << 1U));
   buf[off++] = static_cast<char>(flags);
 
   switch (type) {
@@ -286,9 +299,13 @@ void LogRecord::SerializeTo(std::string* dst) const {
       break;
   }
 
-  const uint32_t crc = Crc32C(buf, off);
-  WriteU32(buf + off, crc);
-  off += sizeof(uint32_t);
+  // The CRC lives in the fixed trailer slot derived from Size(), not at
+  // whatever offset the type switch happened to reach.  If Size() and the
+  // switch ever drift, writing at `off` would put the CRC outside the trailer
+  // (or leave uninitialized bytes) and make every record look corrupt.
+  const size_t crc_offset = total - sizeof(uint32_t);
+  const uint32_t crc = Crc32C(buf, crc_offset);
+  WriteU32(buf + crc_offset, crc);
 }
 
 std::string LogRecord::Serialize() const {
@@ -333,6 +350,9 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
 
   size_t off = 8;
   const size_t body_end = total - sizeof(uint32_t);
+  if (body_end < off + sizeof(uint32_t) + sizeof(uint64_t) + 2) {
+    return 0;  // too short to hold type/flags before the CRC trailer
+  }
   off += DeserializePID(src + off, &prev_lsn);
   off += DeserializeU64(src + off, &owner);
   const auto raw_type = static_cast<uint8_t>(src[off++]);
@@ -343,7 +363,13 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
   type = static_cast<LogType>(raw_type);
   const auto flags = static_cast<uint8_t>(src[off++]);
   lsm_had_prev = (flags & 1U) != 0;
-  allocated_page_type = static_cast<PageType>(flags >> 1U);
+  const uint8_t raw_page_type = flags >> 1U;
+  // Writers only ever store kUnknown(0)/kRowPage(1); a hostile or torn flags
+  // byte must not manufacture an undefined PageType enum value.
+  if (raw_page_type > static_cast<uint8_t>(PageType::kRowPage)) {
+    return 0;
+  }
+  allocated_page_type = static_cast<PageType>(raw_page_type);
 
   switch (type) {
     case LogType::kUnknown:
@@ -432,10 +458,60 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
   return total;
 }
 
+const char* LogTypeName(LogType type) {
+  switch (type) {
+    case LogType::kUnknown:
+      return "kUnknown";
+    case LogType::kBegin:
+      return "kBegin";
+    case LogType::kInsertRow:
+      return "kInsertRow";
+    case LogType::kUpdateRow:
+      return "kUpdateRow";
+    case LogType::kDeleteRow:
+      return "kDeleteRow";
+    case LogType::kCompensateUpdate:
+      return "kCompensateUpdate";
+    case LogType::kSetRowPageNext:
+      return "kSetRowPageNext";
+    case LogType::kSetRowPagePrev:
+      return "kSetRowPagePrev";
+    case LogType::kSystemAllocPage:
+      return "kSystemAllocPage";
+    case LogType::kSystemDestroyPage:
+      return "kSystemDestroyPage";
+    case LogType::kLsmPut:
+      return "kLsmPut";
+    case LogType::kLsmDelete:
+      return "kLsmDelete";
+    case LogType::kLsmDestroy:
+      return "kLsmDestroy";
+    case LogType::kCommit:
+      return "kCommit";
+    case LogType::kAbort:
+      return "kAbort";
+    case LogType::kBeginCheckpoint:
+      return "kBeginCheckpoint";
+    case LogType::kEndCheckpoint:
+      return "kEndCheckpoint";
+  }
+  return "kInvalid";
+}
+
 std::ostream& operator<<(std::ostream& o, const LogRecord& r) {
+  // T2115: the type renders symbolically (was a bare uint8), and pid/slot
+  // only appear when they carry meaning: BEGIN/COMMIT/ABORT/checkpoint
+  // records never touch them, so printing the numeric_limits::max()
+  // sentinel made traces claim every record targeted page 4294967295.
   o << "{prev:" << r.prev_lsn << " txn:" << r.owner
-    << " type:" << static_cast<int>(r.type) << " pid:" << r.pid
-    << " slot:" << r.slot << "}";
+    << " type:" << LogTypeName(r.type);
+  if (r.pid != std::numeric_limits<page_id_t>::max()) {
+    o << " pid:" << r.pid;
+  }
+  if (r.slot != std::numeric_limits<slot_t>::max()) {
+    o << " slot:" << r.slot;
+  }
+  o << "}";
   return o;
 }
 

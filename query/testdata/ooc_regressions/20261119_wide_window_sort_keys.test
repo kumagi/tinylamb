@@ -1,0 +1,8 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795036698030
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: query fails under memory pressure but runs without it [window+orderby] | stream: TooBigData :: op 3 `q ord=0 heavy=0 take=-1 nv=2 vs=98476554 ex=0 snap=0 :: SELECT k, ROW_NUMBER() OVER (ORDER BY pad DESC, pad, k) AS rn, RANK() OVER (ORDER BY g DESC) AS rk FROM ...(162B)`: query fails under memory pressure but runs without it [window+orderby]: SELECT k, ROW_NUMBER() OVER (ORDER BY pad DESC, pad, k) AS rn, RANK() OVER (ORDER BY g DESC) AS rk FROM t1 |   stream: TooBigData: row exceeds operator budget quarter |   knobs {opmem=65536 spill=0 temp=0 route=0}
+create t1 3 8015 2792
+ins_bulk t1 1 365 613
+knob opmem 65536
+q ord=0 heavy=0 take=-1 nv=2 vs=98476554 ex=0 snap=0 :: SELECT k, ROW_NUMBER() OVER (ORDER BY pad DESC, pad, k) AS rn, RANK() OVER (ORDER BY g DESC) AS rk FROM t1

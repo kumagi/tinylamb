@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/string_util.hpp"
 #include "common/status_or.hpp"
 #include "expression/expression.hpp"
 #include "expression/window_function_expression.hpp"
@@ -37,16 +38,14 @@ inline Status AstStatus(std::string message) {
 }
 
 inline std::string Lower(std::string value) {
-  std::ranges::transform(value, value.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
+  std::ranges::transform(value, value.begin(),
+                         [](char c) { return AsciiToLower(c); });
   return value;
 }
 
 inline std::string UpperCopy(std::string text) {
-  std::ranges::transform(text, text.begin(), [](unsigned char c) {
-    return static_cast<char>(std::toupper(c));
-  });
+  std::ranges::transform(text, text.begin(),
+                         [](char c) { return AsciiToUpper(c); });
   return text;
 }
 
@@ -79,6 +78,13 @@ uint64_t UdfSessionScope();
 void RegisterUdf(SqlUdf udf);
 // Definition visible to the current scope, or nullptr.
 SqlUdf* FindUdf(const std::string& name);
+// Issue 2553: lowered name of the first scalar-function or TVF reference in
+// `root` that resolves to a session-local UDF for the current scope, or
+// nullopt.  CREATE VIEW rejects a persistent definition that would capture a
+// thread_local UDF (cataloged view, un-cataloged dependency: every other
+// session / read worker fails to expand it with "unknown function").
+std::optional<std::string> FirstSessionLocalUdfReference(
+    const GoogleSqlAstNode& node);
 // Drops every definition owned by `session_id` (server disconnect).
 void PurgeUdfSessionDefinitions(uint64_t session_id);
 

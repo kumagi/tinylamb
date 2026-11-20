@@ -40,6 +40,7 @@ using relational_detail::MatchPrefixIn;
 using relational_detail::MatchSimpleCompare;
 using relational_detail::PrebuiltMembershipPredicate;
 using relational_detail::PrebuiltScalarComparePredicate;
+using relational_detail::SimpleComparePredicate;
 using relational_detail::TryCompilePrefixIn;
 using relational_detail::TryCompileSimpleCompare;
 using relational_detail::TryDecideConstantConjunct;
@@ -76,6 +77,28 @@ TEST(FlatIntSetAuditTest, RejectsOutOfRangeDenseWrites) {
   EXPECT_FALSE(set.DenseOverflowed());
 }
 
+// A dense set keeps no hash slots: a block range wider than eight bitmap
+// words must still be answered from the bitmap (it used to return false,
+// which made an IN-subquery probe scan skip whole blocks).
+TEST(FlatIntSetAuditTest, DenseContainsAnyInRangeSpansManyWords) {
+  FlatIntSet set;
+  ASSERT_TRUE(set.TryReserveDense(3, 5076));
+  for (int64_t k = 3; k <= 5076; k += 3) {
+    set.Insert(k);
+  }
+  EXPECT_TRUE(set.ContainsAnyInRange(1, 746));
+  EXPECT_TRUE(set.ContainsAnyInRange(747, 897));
+  EXPECT_TRUE(set.ContainsAnyInRange(-100, 10000));
+  EXPECT_FALSE(set.ContainsAnyInRange(4, 5));
+  EXPECT_FALSE(set.ContainsAnyInRange(5077, 9000));
+  FlatIntSet sparse;
+  ASSERT_TRUE(sparse.TryReserveDense(0, 4000));
+  sparse.Insert(0);
+  sparse.Insert(4000);
+  EXPECT_FALSE(sparse.ContainsAnyInRange(1, 3999));
+  EXPECT_TRUE(sparse.ContainsAnyInRange(1, 4000));
+}
+
 TEST(FlatIntSetAuditTest, BufferedDenseWritersKeepOverlapsAndPartialWords) {
   constexpr int64_t span = 300;
   for (int64_t base : {INT64_MIN, int64_t{-130}, INT64_MAX - span}) {
@@ -84,13 +107,14 @@ TEST(FlatIntSetAuditTest, BufferedDenseWritersKeepOverlapsAndPartialWords) {
     {
       std::vector<std::jthread> workers;
       workers.reserve(3);
-for (int64_t worker = 0; worker < 3; ++worker) {
+      for (int64_t worker = 0; worker < 3; ++worker) {
         workers.emplace_back([&, worker] {
           FlatIntSet::DenseWriter writer(set);
           for (int64_t n = 0; n <= span; ++n) {
             const int64_t i = worker == 1 ? span - n : n;
-            if (i % 5 >= 3) { continue;
-}
+            if (i % 5 >= 3) {
+              continue;
+            }
             if (worker == 2) {
               set.InsertDenseAtomic(base + i);
             } else {
@@ -117,6 +141,48 @@ for (int64_t worker = 0; worker < 3; ++worker) {
   }
 }
 
+TEST(FlatIntSetAuditTest, SortedBufferedInsertMatchesPerKeyAtomic) {
+  // T1231: the unordered runtime-filter build path now buffers the worker's
+  // keys and streams them sorted through DenseWriter; that must be
+  // bit-identical to per-key InsertDenseAtomic on the shuffled order.
+  constexpr int64_t base = -5000;
+  constexpr int64_t span = 10000;
+  std::vector<int64_t> keys;
+  keys.reserve(4096);
+  uint64_t rng = 0x243F6A8885A308D3ULL;
+  for (int i = 0; i < 4096; ++i) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    keys.push_back(base + static_cast<int64_t>(rng % (span + 1)));
+  }
+  FlatIntSet atomic_set;
+  ASSERT_TRUE(atomic_set.TryReserveDense(base, base + span));
+  for (const int64_t key : keys) {
+    atomic_set.InsertDenseAtomic(key);
+  }
+  atomic_set.FinalizeDenseBounds();
+
+  FlatIntSet sorted_set;
+  ASSERT_TRUE(sorted_set.TryReserveDense(base, base + span));
+  std::vector<int64_t> buf = keys;
+  std::ranges::sort(buf);
+  buf.erase(std::ranges::unique(buf).begin(), buf.end());
+  {
+    FlatIntSet::DenseWriter writer(sorted_set);
+    for (const int64_t key : buf) {
+      writer.Insert(key);
+    }
+  }
+  sorted_set.FinalizeDenseBounds();
+  EXPECT_FALSE(sorted_set.DenseOverflowed());
+  EXPECT_EQ(sorted_set.Size(), atomic_set.Size());
+  for (int64_t i = 0; i <= span; ++i) {
+    ASSERT_EQ(sorted_set.Contains(base + i), atomic_set.Contains(base + i))
+        << "i=" << i;
+  }
+}
+
 TEST(FlatIntSetAuditTest, WideDenseMembershipKeepsHolesAndSignedEndpoints) {
   constexpr int64_t span = 60000000;
   for (const int64_t base : {INT64_MIN, int64_t{-30000000}, INT64_MAX - span}) {
@@ -126,7 +192,7 @@ TEST(FlatIntSetAuditTest, WideDenseMembershipKeepsHolesAndSignedEndpoints) {
     {
       std::vector<std::jthread> workers;
       workers.reserve(3);
-for (int64_t w = 0; w < 3; ++w) {
+      for (int64_t w = 0; w < 3; ++w) {
         workers.emplace_back([&, w] {
           for (int64_t i = w; i <= span / 1000; i += 3) {
             set.InsertDenseAtomic(base + (i * 1000));
@@ -137,16 +203,19 @@ for (int64_t w = 0; w < 3; ++w) {
     }
     set.FinalizeDenseBounds();
     EXPECT_FALSE(set.DenseOverflowed());
-    EXPECT_EQ(set.Size(), span / 1000 + 1);
+    EXPECT_EQ(set.Size(), span / 1000 + 1);  // NOLINT(readability-math-missing-parentheses)
     for (int64_t i = 0; i <= span / 1000; ++i) {
-      EXPECT_TRUE(set.Contains(base + i * 1000));
-      if (i != span / 1000) { EXPECT_FALSE(set.Contains(base + i * 1000 + 1));
-}
+      EXPECT_TRUE(set.Contains(base + i * 1000));  // NOLINT(readability-math-missing-parentheses)
+      if (i != span / 1000) {
+        EXPECT_FALSE(set.Contains(base + i * 1000 + 1));  // NOLINT(readability-math-missing-parentheses)
+      }
     }
-    if (base > INT64_MIN) { EXPECT_FALSE(set.Contains(base - 1));
-}
-    if (base + span < INT64_MAX) { EXPECT_FALSE(set.Contains(base + span + 1));
-}
+    if (base > INT64_MIN) {
+      EXPECT_FALSE(set.Contains(base - 1));
+    }
+    if (base + span < INT64_MAX) {
+      EXPECT_FALSE(set.Contains(base + span + 1));
+    }
   }
   FlatIntSet too_wide;
   EXPECT_FALSE(too_wide.TryReserveDense(INT64_MIN, INT64_MAX));
@@ -468,6 +537,8 @@ TEST(ScanFilterTest, MatchPrebuiltMembershipThreeValuedAndExistence) {
       .contains_null = false,
       .existence = false,
       .string_values = nullptr,
+      .distinct_witness_minmax = nullptr,
+      .packed_pair_col2 = std::nullopt,
   };
   EXPECT_TRUE(MatchPrebuiltMembership(Row({Value(10)}), in_pred));
   EXPECT_FALSE(MatchPrebuiltMembership(Row({Value(30)}), in_pred));
@@ -659,6 +730,97 @@ TEST(ScanFilterTest, SingletonInUsesComparisonWithCanonicalNullSemantics) {
                           schema);
     EXPECT_TRUE(null_filter.simple.empty());
   }
+}
+
+TEST(ScanFilterTest,
+     InvalidDateRuntimeConstantPropagatesInsteadOfSilentReject) {
+  const Schema schema("", {Column("d", ValueType::kDate)});
+  const auto expression =
+      BinaryExpressionExp(ColumnValueExp("d"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value("2000-01-01")));
+  const auto compiled = TryCompileSimpleCompare(expression, schema);
+  ASSERT_TRUE(compiled.has_value());
+  ASSERT_TRUE(compiled->date_string_payload);  // NOLINT(bugprone-unchecked-optional-access)
+  // A parameter rebind can replace the parsed literal with an unparseable
+  // string after compilation; the failed coercion must surface as an error,
+  // not a clean per-row reject.
+  SimpleComparePredicate rebound = *compiled;  // NOLINT(bugprone-unchecked-optional-access)
+  rebound.date_string_payload = false;
+  rebound.constant = Value("invalid date");
+  const Row row({Value::DateFromDays(11138)});
+  Status error{Status::kSuccess};
+  EXPECT_FALSE(MatchSimpleCompare(row, rebound, &error));
+  EXPECT_FALSE(error.ok())
+      << "a failed DATE coercion was folded into an ordinary reject";
+}
+
+TEST(ScanFilterTest, UnsignedTaggingLimitedToReferencedColumns) {
+  Column unsigned_column(ColumnName("u"), ValueType::kInt64);
+  unsigned_column.SetUnsigned(true);
+  const Schema schema("test", {Column(ColumnName("id"), ValueType::kInt64),
+                               unsigned_column});
+  // A predicate over only the signed column must not disable the fast paths
+  // because of an untouched unsigned column.
+  const auto signed_filter = CompileScanFilter(
+      {BinaryExpressionExp(ColumnValueExp("id"), BinaryOperation::kEquals,
+                           ConstantValueExp(Value(5)))},
+      schema);
+  EXPECT_FALSE(signed_filter.needs_unsigned_tagging);
+  EXPECT_TRUE(signed_filter.unsigned_columns.empty());
+  // The unsigned column itself still requires tagging.
+  const auto unsigned_filter = CompileScanFilter(
+      {BinaryExpressionExp(ColumnValueExp("u"), BinaryOperation::kEquals,
+                           ConstantValueExp(Value(5)))},
+      schema);
+  EXPECT_TRUE(unsigned_filter.needs_unsigned_tagging);
+  ASSERT_EQ(unsigned_filter.unsigned_columns.size(), 1U);
+  EXPECT_EQ(unsigned_filter.unsigned_columns[0], 1);
+}
+
+TEST(ScanFilterTest, NullPeeksFoldTestsCommonToEveryBranch) {
+  const Schema schema("test", {Column(ColumnName("a"), ValueType::kInt64),
+                               Column(ColumnName("b"), ValueType::kInt64)});
+  CompiledScanFilter filter;
+  const Expression is_null_a =
+      UnaryExpressionExp(ColumnValueExp("a"), UnaryOperation::kIsNull);
+  const Expression is_not_null_a =
+      UnaryExpressionExp(ColumnValueExp("a"), UnaryOperation::kIsNotNull);
+  filter.disjunctive_branches.push_back({{}, {}, {}, {is_null_a}});
+  filter.disjunctive_branches.push_back({{}, {}, {}, {is_null_a}});
+  const auto common = BuildNullPeeks(filter, schema, nullptr, schema);
+  ASSERT_EQ(common.size(), 1U);
+  EXPECT_EQ(common[0].column, 0);
+  EXPECT_TRUE(common[0].expect_null);
+  // A test kept by only one branch must not reject rows surviving via the
+  // other branch.
+  filter.disjunctive_branches[1].residual = {is_not_null_a};
+  EXPECT_TRUE(BuildNullPeeks(filter, schema, nullptr, schema).empty());
+  // An uncovered top-level residual keeps the previous size-equality
+  // contract: nothing is folded from the branches.
+  CompiledScanFilter partial;
+  partial.residual = {
+      is_not_null_a,
+      BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(1)))};
+  const Expression like =
+      BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("%x%")));
+  partial.disjunctive_branches.push_back({{}, {}, {}, {is_null_a}});
+  partial.disjunctive_branches.push_back({{}, {}, {}, {is_null_a}});
+  const auto folded = BuildNullPeeks(partial, schema, nullptr, schema);
+  EXPECT_EQ(folded.size(), 1U);
+}
+
+TEST(ScanFilterTest, ManualNullBinaryChildrenStayOnResidualPath) {
+  const Schema schema("test", {Column(ColumnName("id"), ValueType::kInt64)});
+  // Hand-built AST nodes may carry null operands; compiling must not crash.
+  const Expression broken_equals = BinaryExpressionExp(
+      Expression(), BinaryOperation::kEquals, ConstantValueExp(Value(5)));
+  const Expression broken_child = BinaryExpressionExp(
+      ColumnValueExp("id"), BinaryOperation::kEquals, Expression());
+  const CompiledScanFilter filter =
+      CompileScanFilter({broken_equals, broken_child}, schema);
+  EXPECT_GE(filter.residual.size(), 1U);
 }
 
 }  // namespace

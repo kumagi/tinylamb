@@ -70,6 +70,31 @@ TEST(FunctionCallAuditTest, InvalidTimeZonesAreRejected) {
   }
 }
 
+TEST(FunctionCallAuditTest, NamedZoneOffsetUsesHistoricalYear) {
+  // America/Los_Angeles observed Pacific War Time (UTC-7) in March 1945.
+  // Re-dating the lookup to 1970 would wrongly answer PST (UTC-8) and shift
+  // the local time an hour earlier.
+  {
+    const auto value =
+        FunctionCallExp("string",
+                        {ConstantValueExp(Value("1945-03-15 12:00:00+00")),
+                         ConstantValueExp(Value("America/Los_Angeles"))})
+            ->TryEvaluate(Row(), Schema());
+    ASSERT_TRUE(value.HasValue()) << value.GetStatus();
+    EXPECT_EQ(value.Value(), Value("1945-03-15 05:00:00-07"));
+  }
+  {
+    const auto value =
+        FunctionCallExp("format_timestamp",
+                        {ConstantValueExp(Value("%Y-%m-%d %H:%M:%S")),
+                         ConstantValueExp(Value("1945-03-15 12:00:00+00")),
+                         ConstantValueExp(Value("America/Los_Angeles"))})
+            ->TryEvaluate(Row(), Schema());
+    ASSERT_TRUE(value.HasValue()) << value.GetStatus();
+    EXPECT_EQ(value.Value(), Value("1945-03-15 05:00:00"));
+  }
+}
+
 TEST(FunctionCallAuditTest, EmptyDateArithmeticHasInvalidResultType) {
   for (const char* name : {"date_add", "date_sub"}) {
     const auto expression = FunctionCallExp(name, {});
@@ -120,7 +145,7 @@ namespace {
 class NoSubqueryContext : public EvaluationContext {
  public:
   StatusOr<std::vector<Value>> RunSubquery(
-      const SelectStatement& /*statement*/ /*statement*/,
+      const SelectStatement& /*statement*/,
       /*outer_row*/ const Row* /*outer_row*/) override {
     return StatusError(StatusCode::kRuntimeError, "no subqueries in this test");
   }
@@ -202,10 +227,12 @@ TEST(FunctionCallAstSweepTest, EvaluateEveryDispatchedFunction) {
       {"is_inf", {Value(int64_t{4})}, 1},
       {"is_nan", {Value(2.5)}, 1},
       {"is_nan", {Value(int64_t{4})}, 1},
-      {"ascii", {Value(2.5)}, 1},
-      {"ascii", {Value(int64_t{4})}, 1},
-      {"unicode", {Value(2.5)}, 1},
-      {"unicode", {Value(int64_t{4})}, 1},
+      // ASCII/UNICODE take STRING (ASCII also BYTES); numbers are rejected
+      // like GoogleSQL's signature check.
+      {"ascii", {Value(2.5)}, 0},
+      {"ascii", {Value(int64_t{4})}, 0},
+      {"unicode", {Value(2.5)}, 0},
+      {"unicode", {Value(int64_t{4})}, 0},
       {"chr", {Value(2.5)}, 0},
       {"chr", {Value(int64_t{4})}, 1},
       {"to_hex", {Value(2.5)}, 0},
@@ -249,8 +276,8 @@ TEST(FunctionCallAstSweepTest, EvaluateEveryDispatchedFunction) {
       {"nullif", {Value(std::string("a")), Value(std::string("a"))}, 1},
       {"nullif", {Value(std::string("a")), Value(std::string("b"))}, 1},
       {"concat", {Value(std::string("a")), Value(std::string("b"))}, 1},
-      {"concat", {Value(std::string("a")), Value(int64_t{1})}, 0},
-      {"concat", {}, 1},
+      {"concat", {Value(std::string("a")), Value(int64_t{1})}, 1},
+      {"concat", {}, 0},  // CONCAT needs at least one argument
       {"length", {Value(std::string("hello"))}, -1},
       {"length", {Value(int64_t{1})}, -1},
       {"char_length", {Value(std::string("hello"))}, 1},
@@ -401,7 +428,7 @@ TEST(FunctionCallAstSweepTest, EvaluateEveryDispatchedFunction) {
       {"unix_millis", {Value(std::string("1970-01-01 00:00:01+00"))}, 1},
       {"unix_micros", {Value(std::string("1970-01-01 00:00:01+00"))}, 1},
       {"make_interval",
-       {Value(int64_t{1}), Value(std::string("DAY")), Value(int64_t{3})},
+       {Value(int64_t{1}), Value(std::string("DAY"))},
        1},
       {"date_sub", {Value::Date("2026-01-02"), Value(std::string("5 day"))}, 0},
       {"generate_array", {Value(int64_t{1}), Value(int64_t{5})}, -1},

@@ -43,7 +43,7 @@ using nodeid_t = uint32_t;   // common/constants.hpp に追加。登録時に固
                              // アドレス変更でも不変。0 は無効値。
 
 enum class Role : uint8_t { kFollower, kCandidate, kLeader, kLearner };
-// kLearner: 選挙権・過半数カウントに含まれない追従者(メンバシップ変更用)。
+// kLearner: 選挙権・過半数カウントに含まれない追従者(メンバーシップ変更用)。
 
 struct RaftEntry {
   uint64_t term;      // 追記したリーダーの term
@@ -303,7 +303,7 @@ receiver on InstallSnapshot:
 スナップショットには「適用時点の有効構成」を含めること(§10 の構成決定規則が
 スナップショット復元後も成立する必要がある)。
 
-## 10. 構成エントリ(メンバシップ変更の基礎)
+## 10. 構成エントリ(メンバーシップ変更の基礎)
 
 構成変更は FSM コマンドではなく **Raft ログへの特殊エントリ**として表現する
 (FSM を経由しない)。規則:

@@ -229,6 +229,11 @@ std::vector<Case> SweepCases() {
       {"__get_field_safe", {kJson, Value(std::string("a"))}, 1},
       {"__get_field_safe", {Value(), Value(std::string("a"))}, 1},
       {"get_field", {kJson, Value(std::string("a"))}, 1},
+      // T1647: the relational/batch evaluator must match the AST's strict
+      // contract -- a missing member or a non-struct payload fails instead
+      // of returning NULL.
+      {"get_field", {kJson, Value(std::string("nope"))}, 0},
+      {"get_field", {Value(std::string("27")), Value(std::string("a"))}, 0},
       {"__pipe_concat", {kArrStr, Value(std::string("-"))}, -1},
 
       // ---- arrays ---------------------------------------------------------
@@ -480,7 +485,9 @@ TEST_F(RelationalFunctionSweepTest, SafeConvertBytesToStringKeepsRawBytes) {
   const std::optional<Value> replaced =
       Evaluate("safe_convert_bytes_to_string", {Value(std::string(invalid))});
   ASSERT_TRUE(replaced.has_value());
-  EXPECT_EQ(replaced->AsString(), std::string("\xEF\xBF\xBD(\xEF\xBF\xBD", 7));
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+  EXPECT_EQ(replaced->AsStringView(),
+            std::string("\xEF\xBF\xBD(\xEF\xBF\xBD", 7));
 }
 
 // The byte-run validator above dropped the two UPPER bounds of the canonical
@@ -900,10 +907,7 @@ TEST_F(RelationalFunctionSweepTest, CivilTimeFractionsLeapSecondsAndErrors) {
                              .expected = "2024-01-02 03:04:05.010+00"},
                          Pin{.input = "2024-01-02 03:04:05.000010000+00",
                              .unit = "nanosecond",
-                             .expected = "2024-01-02 03:04:05.000010+00"},
-                         Pin{.input = " 2024-01-02T03:04:05+00 ",
-                             .unit = "hour",
-                             .expected = "2024-01-02 03:00:00+00"}}) {
+                             .expected = "2024-01-02 03:04:05.000010+00"}}) {
     SCOPED_TRACE(pin.input);
     const auto result = Evaluate(
         "timestamp_trunc", {Value(pin.input), Value(pin.unit), Value("UTC")});
@@ -914,7 +918,10 @@ TEST_F(RelationalFunctionSweepTest, CivilTimeFractionsLeapSecondsAndErrors) {
                            "2024-13-01 00:00:00+00", "2024-01-32 00:00:00+00",
                            "2024-01-01 24:00:00+00", "2024-01-01 00:60:00+00",
                            "2024-01-01 00:00:61+00", "9999-12-31 23:59:60+00",
-                           "2024-x1-01 00:00:00+00", ""}) {
+                           "2024-x1-01 00:00:00+00", "",
+                           // Surrounding whitespace is not a timestamp
+                           // literal (reference GoogleSQL rejects it).
+                           " 2024-01-02T03:04:05+00 "}) {
     SCOPED_TRACE(text);
     EXPECT_FALSE(Evaluate("timestamp_trunc", {Value(std::string(text)),
                                               Value("minute"), Value("UTC")})
@@ -1072,6 +1079,7 @@ TEST_F(RelationalFunctionSweepTest, NamedZoneOffsetUsesHistoricalYear) {
       Evaluate("string", {Value("1945-03-15 12:00:00+00"),
                           Value("America/Los_Angeles")});
   ASSERT_TRUE(as_string.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
   EXPECT_EQ(*as_string, Value("1945-03-15 05:00:00-07"));
   const std::optional<Value> formatted =
       Evaluate("format_timestamp",
@@ -1079,6 +1087,7 @@ TEST_F(RelationalFunctionSweepTest, NamedZoneOffsetUsesHistoricalYear) {
                 Value("1945-03-15 12:00:00+00"),
                 Value("America/Los_Angeles")});
   ASSERT_TRUE(formatted.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
   EXPECT_EQ(*formatted, Value("1945-03-15 05:00:00"));
 }
 
@@ -1104,6 +1113,7 @@ TEST_F(RelationalFunctionSweepTest, AuditJsonExtractionMatchesAst) {
       const auto actual = Evaluate(name, args);
       ASSERT_TRUE(expected.HasValue()) << name;
       ASSERT_TRUE(actual.has_value()) << name;
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
       EXPECT_EQ(*actual, expected.Value()) << name;
     }
   }
@@ -1118,7 +1128,30 @@ TEST_F(RelationalFunctionSweepTest, AuditJsonExtractionMatchesAst) {
   const auto arr_actual = Evaluate("json_value_array", arr_args);
   ASSERT_TRUE(arr_expected.HasValue());
   ASSERT_TRUE(arr_actual.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
   EXPECT_EQ(*arr_actual, arr_expected.Value());
+}
+
+// P454: __pipe_concat's element contract -- non-`{...}` elements parse
+// leniently as their whole body (proto-text shapes) and member keys match
+// case-insensitively -- must be identical in the AST ground truth and the
+// relational batch path, which used to reject the same inputs with
+// "requires STRUCT elements" and exact-case keys.
+TEST_F(RelationalFunctionSweepTest, PipeConcatProtoTextElementsMatchAst) {
+  const std::vector<Value> args = {
+      Arr({Value(std::string("a: 1 b: 2")), Value(std::string("B: 3, A: 4")),
+           Value(std::string("bare"))},
+          "STRING"),
+      Value(std::string("|"))};
+  const Expression call = FunctionCallExp(
+      "__pipe_concat", {ConstantValueExp(args[0]), ConstantValueExp(args[1])});
+  const auto ast = call->TryEvaluate(Row(), Schema("t", {}));
+  const auto batch = Evaluate("__pipe_concat", args);
+  ASSERT_TRUE(ast.HasValue()) << ast.GetStatus().GetMessage();
+  ASSERT_TRUE(batch.has_value())
+      << "batch must accept the AST's lenient element contract (P454)";
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+  EXPECT_EQ(*batch, ast.Value());
 }
 
 }  // namespace tinylamb

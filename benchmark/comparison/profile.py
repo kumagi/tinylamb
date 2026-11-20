@@ -29,8 +29,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     cpus = sorted(os.sched_getaffinity(0))[:8]
     environment = {k: v for k, v in os.environ.items() if not k.startswith("TINYLAMB_")}
-    environment.update(TINYLAMB_PAGE_POOL_BYTES="536870912",
-                       TINYLAMB_QUERY_MEMORY_BYTES=str(args.memory_mib * 1024 * 1024))
+    environment.update(                       TINYLAMB_QUERY_MEMORY_BYTES=str(args.memory_mib * 1024 * 1024))
     metadata = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "server": str(args.server.resolve()), "server_sha256": hashlib.sha256(args.server.read_bytes()).hexdigest(),
                 "cpus": cpus, "memory_mib": args.memory_mib, "load_start": os.getloadavg(),

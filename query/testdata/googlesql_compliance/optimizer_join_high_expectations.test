@@ -114,14 +114,14 @@ ARRAY<STRUCT<customer_id INT64, region_id INT64>>[
 [plan_not_contains=type=left]
 [plan_not_contains=LeftHashJoin]
 [name=null_rejecting_where_reduces_left_join_to_inner]
-SELECT c.customer_id, o.order_id
+SELECT c.customer_id, o.order_id, c.customer_name
 FROM opt_customers c LEFT JOIN opt_orders o
 ON c.customer_id = o.customer_id
 WHERE o.amount >= 60
 ORDER BY c.customer_id, o.order_id
 --
-ARRAY<STRUCT<customer_id INT64, order_id INT64>>[
-  {1, 102}, {3, 104}
+ARRAY<STRUCT<customer_id INT64, order_id INT64, customer_name STRING>>[
+  {1, 102, "Alice"}, {3, 104, "Carol"}
 ]
 ==
 

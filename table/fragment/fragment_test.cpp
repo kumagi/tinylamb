@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "table/fuzz/fuzz_chunk_common.hpp"
@@ -239,6 +240,50 @@ TEST_F(FragmentAuditTest, GroupSumSkipsNullSummandsOnEveryArtifactKind) {
         EXPECT_EQ(group.count, 1U);
         EXPECT_EQ(group.sum, 5);
       }
+    }
+  }
+}
+
+// T3108: the empty string is a real bound (SQL byte-order minimum), not
+// "unbounded".  `col < ''` must reject every non-null row on all three
+// artifacts, while a flagged lo='' stays permissive and a plain
+// [lo, hi) range keeps filtering exactly.
+TEST_F(FragmentAuditTest, EmptyStringVarcharRangeBoundIsHonored) {
+  auto range_conjunct = [](bool lo_set, const char* lo, bool hi_set,
+                           const char* hi) {
+    return Conjunct{.kind = ConjunctKind::kVarcharRange,
+                    .col = 2,
+                    .bytes_literal = lo,
+                    .in_literals = {},
+                    .bytes_literal_hi = hi,
+                    .bytes_lo_set = lo_set,
+                    .bytes_hi_set = hi_set};
+  };
+  struct Case {
+    Conjunct conjunct;
+    size_t expected_pass;
+  };
+  const std::vector<Case> cases{
+      // s values: NULL, "zero", "five", "last".  hi='' => nothing is
+      // strictly below it (old code read the empty hi as unbounded and
+      // passed all three non-null rows).
+      {range_conjunct(false, "", true, ""), 0},
+      // lo='' is permissive either way, but must now flow as a real bound.
+      {range_conjunct(true, "", false, ""), 3},
+      // Ordinary inclusive/exclusive bounds still prune.
+      {range_conjunct(true, "a", true, "g"), 1},
+      // Unset flags ignore the strings entirely.
+      {range_conjunct(false, "", false, ""), 3},
+  };
+  for (const Case& case_ : cases) {
+    for (const auto& artifact : Artifacts()) {
+      Fragment fragment;
+      fragment.conjuncts.push_back(case_.conjunct);
+      auto result = Execute(Runtime::kNative, {artifact}, fragment, schema_);
+      ASSERT_TRUE(result.HasValue());
+      EXPECT_EQ(result.Value().coverage, Coverage::kFull);
+      EXPECT_EQ(result.Value().rows_proved_pass, case_.expected_pass)
+          << "artifact kind " << static_cast<int>(artifact.kind);
     }
   }
 }

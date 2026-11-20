@@ -25,7 +25,7 @@ graph TD
 ## 適用条件
 
 - `cascades::dsl::Sort()` に対応する1子ノード。
-- 推定行数が容量选择の境界 (`MakeSortPlan` 内 `SortStrategy::kExternalMerge`)
+- 推定行数が容量選択の境界 (`MakeSortPlan` 内 `SortStrategy::kExternalMerge`)
   を超えること。境界以下は `sort` (バッファ) 側が担当します。
 
 ## 意味論的根拠

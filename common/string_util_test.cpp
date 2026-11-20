@@ -21,11 +21,12 @@ namespace {
 // the assertion (same idiom as common/decoder_test.cpp).
 std::atomic<uint64_t> g_alloc_count{0};
 std::atomic<bool> g_counting{false};
-std::thread::id g_measuring_thread;
+std::atomic<std::thread::id> g_measuring_thread;
 
 inline void CountAllocationIfActive() {
   if (g_counting.load(std::memory_order_relaxed) &&
-      std::this_thread::get_id() == g_measuring_thread) {
+      std::this_thread::get_id() ==
+      g_measuring_thread.load(std::memory_order_relaxed)) {
     g_alloc_count.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -34,7 +35,9 @@ inline void CountAllocationIfActive() {
 
 void* operator new(std::size_t n) {
   CountAllocationIfActive();
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
   void* p = std::malloc(n == 0 ? 1 : n);
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
   if (p == nullptr) {
     throw std::bad_alloc();
   }
@@ -46,6 +49,7 @@ void* operator new(std::size_t n, std::align_val_t a) {
   const auto align = static_cast<std::size_t>(a);
   std::size_t size = n == 0 ? 1 : n;
   size = (size + align - 1) & ~(align - 1);
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)  // raw-buffer codec test
   void* p = std::aligned_alloc(align, size);
   if (p == nullptr) {
     throw std::bad_alloc();
@@ -55,16 +59,28 @@ void* operator new(std::size_t n, std::align_val_t a) {
 void* operator new[](std::size_t n, std::align_val_t a) {
   return operator new(n, a);
 }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete(void* p) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete[](void* p) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete(void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete[](void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete(void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete[](void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 void operator delete(void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
   std::free(p);
 }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 void operator delete[](void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
   std::free(p);
 }
 
@@ -73,6 +89,7 @@ namespace {
 
 TEST(StringUtilTest,
      LiteralLikePatternHandlesEdgesAndDeclinesGeneralWildcards) {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
   for (const auto* const pattern :
        {"", "%", "%%", "abc", "abc%", "%abc", "%abc%"}) {
     const auto compiled = LiteralLikePattern::Compile(pattern);
@@ -80,6 +97,7 @@ TEST(StringUtilTest,
       ADD_FAILURE() << "Expected pattern to compile: " << pattern;
       continue;
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
     for (const auto* const value :
          {"", "abc", "xabc", "abcx", "xabcx", "ABC"}) {
       const std::string_view p(pattern), v(value);
@@ -92,8 +110,15 @@ TEST(StringUtilTest,
           << pattern << " / " << value;
     }
   }
-  for (const auto* const pattern : {"a_c", "a%b", "%a%b%", "%%%"}) {
+  for (const auto* const pattern : {"a_c", "a%b", "%a%b%"}) {
     EXPECT_FALSE(LiteralLikePattern::Compile(pattern));
+  }
+  // Runs of '%' at the ends collapse, so "%%%" is the match-everything
+  // pattern rather than an interior wildcard.
+  const auto all = LiteralLikePattern::Compile("%%%");
+  ASSERT_TRUE(all.has_value());
+  for (const auto* const value : {"", "abc", "%"}) {
+    EXPECT_TRUE(all->Matches(value)) << value;
   }
 }
 
@@ -185,7 +210,8 @@ TEST(StringUtilTest, TrimCodePointsDoesNotAllocateForTypicalCutsets) {
   std::atomic<uint64_t> sink{0};
   const auto measure = [&](std::string_view cutset) {
     g_alloc_count.store(0, std::memory_order_relaxed);
-    g_measuring_thread = std::this_thread::get_id();
+    g_measuring_thread.store(std::this_thread::get_id(),
+                                  std::memory_order_relaxed);
     g_counting.store(true, std::memory_order_seq_cst);
     for (int i = 0; i < 100; ++i) {
       sink.fetch_add(TrimCodePoints(text, cutset, true, true).size(),
@@ -198,6 +224,36 @@ TEST(StringUtilTest, TrimCodePointsDoesNotAllocateForTypicalCutsets) {
   EXPECT_EQ(measure(ascii_cutset), 0U);
   const std::string multi = "\xC3\x81\xC3\x82\xC3\x83";  // 3 inline points
   EXPECT_EQ(measure(multi), 0U);
+}
+
+// T1542: overlong leads (0xC0/0xC1) and above-U+10FFFF leads (0xF5..0xF7)
+// start sequences under the old masking, so TRIM/LIKE consumed malformed
+// bytes as one character while the canonical validator (IsValidUtf8Text)
+// accepts only C2..DF / E0..EF / F0..F4 leads.  Same window now.
+TEST(StringUtilTest, Utf8SequenceLengthMatchesValidatorWindow) {
+  EXPECT_EQ(Utf8SequenceLength(0x00), 1U);
+  EXPECT_EQ(Utf8SequenceLength(0x7F), 1U);
+  EXPECT_EQ(Utf8SequenceLength(0x80), 1U);  // stray continuation byte
+  EXPECT_EQ(Utf8SequenceLength(0xBF), 1U);
+  EXPECT_EQ(Utf8SequenceLength(0xC0), 1U);  // overlong 2-byte lead
+  EXPECT_EQ(Utf8SequenceLength(0xC1), 1U);  // overlong 2-byte lead
+  EXPECT_EQ(Utf8SequenceLength(0xC2), 2U);
+  EXPECT_EQ(Utf8SequenceLength(0xDF), 2U);
+  EXPECT_EQ(Utf8SequenceLength(0xE0), 3U);
+  EXPECT_EQ(Utf8SequenceLength(0xEF), 3U);
+  EXPECT_EQ(Utf8SequenceLength(0xF0), 4U);
+  EXPECT_EQ(Utf8SequenceLength(0xF4), 4U);
+  EXPECT_EQ(Utf8SequenceLength(0xF5), 1U);  // lead beyond U+10FFFF
+  EXPECT_EQ(Utf8SequenceLength(0xF7), 1U);
+  EXPECT_EQ(Utf8SequenceLength(0xF8), 1U);
+  EXPECT_EQ(Utf8SequenceLength(0xFF), 1U);
+
+  // Consequence pin: a malformed lead degrades to one byte, so trimming it
+  // removes only itself -- previously it swallowed the following 'x'.
+  EXPECT_EQ(
+      TrimCodePoints(std::string_view("\xC0x", 2), std::string_view("\xC0", 1),
+                     /*leading=*/true, /*trailing=*/false),
+      "x");
 }
 
 }  // namespace

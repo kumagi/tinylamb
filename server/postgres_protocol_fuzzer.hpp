@@ -97,9 +97,15 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     __builtin_trap();
   }
 
-  // (3) Statement splitting never emits more than one statement per ';' plus
-  // the tail after the last one.
-  const std::vector<std::string> statements = pgwire::SplitSqlStatements(raw);
+  // (3) Upper bound only: splitting emits at most one statement per ';'
+  // plus the unterminated tail. Semicolons inside literals/comments make
+  // this trivially true; the lower bound and per-statement text are not
+  // verified here.
+  const StatusOr<std::vector<std::string>> split =
+      pgwire::SplitSqlStatements(raw);
+  const std::vector<std::string> statements =
+      split.HasValue() ? std::vector<std::string>(split.Value())
+                       : std::vector<std::string>{};
   size_t semicolons = 0;
   for (const char c : raw) {
     if (c == ';') {

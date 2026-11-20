@@ -86,9 +86,11 @@ SELECT id FROM opt_skew WHERE correlated BETWEEN 30 AND 50 ORDER BY id
 ARRAY<STRUCT<id INT64>>[{3}, {4}, {5}]
 ==
 
-# Future: Filter rows~6 source=MCV_union
+# The exact IN predicate remains after min/max prefiltering.
 [mode=explain]
-[plan_contains=Selection: opt_skew.hot_key IN (1, 2)]
+[plan_contains=opt_skew.hot_key IN (1, 2)]
+[plan_contains=opt_skew.hot_key >= 1]
+[plan_contains=opt_skew.hot_key <= 2]
 [plan_contains=FullScan: opt_skew]
 [name=or_selectivity_accounts_for_disjoint_mcv_values]
 SELECT id FROM opt_skew WHERE hot_key = 1 OR hot_key = 2 ORDER BY id
@@ -101,7 +103,7 @@ ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}, {6}]
 # join; the old CrossJoin expectation documented a fixed alias-resolution bug.
 [mode=explain]
 [plan_contains=HashJoin]
-[name=foreign_key_join_estimate_excludes_null_keys]
+[name=primary_key_join_estimate_excludes_null_keys]
 SELECT s.id, d.label FROM opt_skew s JOIN opt_skew_dim d
 ON s.hot_key = d.hot_key ORDER BY s.id
 --
@@ -128,7 +130,7 @@ ARRAY<STRUCT<id INT64, label STRING>>[unknown order:
 # Future: IndexScan: opt_skew point selectivity=0.1
 [mode=explain]
 [plan_contains=FullScan: opt_skew]
-[name=rare_parameter_shape_chooses_index]
+[name=rare_parameter_shape_keeps_full_scan]
 SELECT id FROM opt_skew WHERE id = 10
 --
 ARRAY<STRUCT<id INT64>>[{10}]

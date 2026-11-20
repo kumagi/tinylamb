@@ -20,17 +20,22 @@
 
 #include "page_storage.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "recovery/log_record.hpp"
+#include "table/tlcs_file.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -42,7 +47,18 @@ size_t LogSegmentSizeFromEnv() {
   if (env == nullptr || env[0] == '\0') {
     return Logger::kDefaultLogSegmentSize;
   }
-  const unsigned long long bytes = std::strtoull(env, nullptr, 10);
+  // strtoull wraps a leading '-' to ULLONG_MAX; reject signs explicitly.
+  if (env[0] == '-' || env[0] == '+' ||
+      std::isspace(static_cast<unsigned char>(env[0])) != 0) {
+    return Logger::kDefaultLogSegmentSize;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long bytes = std::strtoull(env, &end, 10);
+  if (end == env || *end != '\0' || errno == ERANGE ||
+      bytes > std::numeric_limits<size_t>::max()) {
+    return Logger::kDefaultLogSegmentSize;
+  }
   if (bytes < kPageSize) {
     return Logger::kDefaultLogSegmentSize;
   }
@@ -72,9 +88,16 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
   size_t checkpoint_interval = 10;
   const char* ckpt_env = std::getenv("TINYLAMB_CHECKPOINT_SECONDS");
   if (ckpt_env != nullptr && ckpt_env[0] != '\0') {
-    const unsigned long long seconds = std::strtoull(ckpt_env, nullptr, 10);
-    checkpoint_interval = static_cast<size_t>(std::min<unsigned long long>(
-        seconds, 1ULL << (sizeof(size_t) * 8 - 5)));
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long seconds = std::strtoull(ckpt_env, &end, 10);
+    if (errno != 0 || end == ckpt_env || *end != '\0' || seconds == 0) {
+      LOG(WARN) << "invalid TINYLAMB_CHECKPOINT_SECONDS='" << ckpt_env
+                   << "'; using default 10s";
+    } else {
+      checkpoint_interval = static_cast<size_t>(std::min<unsigned long long>(
+          seconds, 1ULL << (sizeof(size_t) * 8 - 5)));
+    }
   }
   auto cm = std::make_unique<CheckpointManager>(dbname_str + ".last_checkpoint",
                                                 tm.get(), pm->GetPool(),
@@ -91,6 +114,9 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
         return rm_raw->ReadLog(lsn, &probe);
       });
   storage->rm_->SetLogger(storage->logger_.get());
+  storage->pm_->SetDurableWaiter([logger = storage->logger_.get()](lsn_t lsn) {
+    return logger->WaitForDurable(lsn);
+  });
   std::error_code db_size_error;
   const auto db_size =
       std::filesystem::file_size(dbname_str + ".db", db_size_error);
@@ -98,11 +124,78 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
     return StatusError(StatusCode::kIOError, "failed to stat database file: " +
                                                  db_size_error.message());
   }
-  if (db_size != 0 && storage->rm_->LogEnd() == 0) {
-    return StatusError(StatusCode::kCorrupt,
-                       "database file is nonempty but WAL is empty");
+  if (db_size != 0) {
+    // `LogEnd()` folds a real I/O failure into 0, which would misdiagnose an
+    // unreadable WAL as corruption; consult the status-preserving variant
+    // and only claim corruption for a genuinely empty log (P642).
+    ASSIGN_OR_RETURN(lsn_t, wal_end, storage->rm_->LogEndStatus());
+    if (wal_end == 0) {
+      return StatusError(StatusCode::kCorrupt,
+                         "database file is nonempty but WAL is empty");
+    }
   }
+  struct TlcsRecoveryEntry {
+    std::shared_ptr<TlcsFile> file;
+    Schema schema;
+  };
+  bool tlcs_scanned = false;
+  std::vector<TlcsRecoveryEntry> tlcs_entries;
+  storage->pm_->SetColumnarStubHydrator(
+      [db_path = dbname_str + ".db", &tlcs_scanned,
+       &tlcs_entries](page_id_t pid) -> StatusOr<std::vector<std::string>> {
+        if (!tlcs_scanned) {
+          tlcs_scanned = true;
+          const std::filesystem::path p(db_path);
+          const std::filesystem::path dir = p.parent_path().empty()
+                                                ? std::filesystem::path(".")
+                                                : p.parent_path();
+          const std::string prefix = p.filename().string() + ".tlcs.";
+          std::error_code ec;
+          std::filesystem::directory_iterator it(dir, ec);
+          if (ec) {
+            return StatusError(
+                StatusCode::kIOError,
+                "cannot enumerate TLCS recovery directory: " + ec.message());
+          }
+          for (const auto& entry : it) {
+            const std::string fname = entry.path().filename().string();
+            if (!fname.starts_with(prefix)) {
+              continue;
+            }
+            const std::string suffix = fname.substr(prefix.size());
+            if (suffix.empty() || !std::ranges::all_of(suffix, [](char c) {
+                  return c >= '0' && c <= '9';
+                })) {
+              continue;
+            }
+            Schema file_schema;
+            StatusOr<std::shared_ptr<TlcsFile>> opened =
+                TlcsFile::OpenWithStoredSchema(entry.path().string(),
+                                               &file_schema);
+            if (opened.HasValue()) {
+              tlcs_entries.push_back(TlcsRecoveryEntry{
+                  .file = opened.MoveValue(),
+                  .schema = std::move(file_schema),
+              });
+            }
+          }
+        }
+        for (const TlcsRecoveryEntry& item : tlcs_entries) {
+          if (item.file->FindBlockIndex(pid) !=
+              LSTableStore::kInvalidBlockIndex) {
+            std::vector<std::string> rows;
+            RETURN_IF_FAIL(item.file->DecodeBlockEncodedRowsByPid(
+                pid, item.schema, &rows));
+            return rows;
+          }
+        }
+        return StatusError(
+            StatusCode::kNotExists,
+            "no backing tlcs file covers stub page " + std::to_string(pid));
+      });
   const Status recovered = storage->rm_->RecoverFrom(0, storage->tm_.get());
+  storage->pm_->SetColumnarStubHydrator({});
+  tlcs_entries.clear();
   if (recovered != Status::kSuccess) {
     storage->pm_->GetPool()->DropAllPages();
     return recovered;
@@ -113,16 +206,37 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
   // again on every restart until the first periodic checkpoint lands -- a
   // crash 5 seconds after a long recovery re-pays the full pass, and the WAL
   // the recovery needed cannot be recycled until a checkpoint publishes a new
-  // master record. Failure is not fatal: the periodic checkpoint (when
+  // WAL. Failure is not fatal: the periodic checkpoint (when
   // enabled) retries, and the recovered pages stay protected by the retained
-  // WAL either way. TINYLAMB_DISABLE_EOR_CHECKPOINT=1 opts out (A/B tests).
-  if (storage->rm_->LogEnd() > 0 &&
+  // WAL either way. Presence of TINYLAMB_DISABLE_EOR_CHECKPOINT (any value)
+  // opts out (A/B tests).
+  // T4256: LogEnd() folded a transient I/O failure into 0, which silently
+  // skipped the end-of-recovery checkpoint below with no trace. Query the
+  // status-preserving variant: skipping stays non-fatal (the periodic
+  // checkpoint retries; the retained WAL still protects replayed pages),
+  // but the skip is now visible.
+  const StatusOr<lsn_t> wal_end_or = storage->rm_->LogEndStatus();
+  const lsn_t wal_end = wal_end_or.HasValue() ? wal_end_or.Value() : lsn_t{0};
+  if (!wal_end_or.HasValue()) {
+    LOG(LogLevel::kWarn) << "recovery: LogEnd failed ("
+                         << ToString(wal_end_or.GetStatus())
+                         << "); skipping end-of-recovery checkpoint";
+  }
+  // If recovery's WAL replay anchor already reaches the end of the log and no
+  // torn tail was repaired, the persisted snapshot covers every committed
+  // record: a full .db serialization here would be a pure no-op that only
+  // rewrites the file and its fsync on every clean open.
+  const bool snapshot_already_current =
+      storage->rm_->RecoveryAnchorLSN() >= wal_end &&
+      !storage->rm_->RecoveryTornTailTruncated();
+  if (wal_end > 0 && !snapshot_already_current &&
       std::getenv("TINYLAMB_DISABLE_EOR_CHECKPOINT") == nullptr) {
     const StatusOr<lsn_t> anchored = storage->cm_->WriteCheckpoint();
     if (!anchored.HasValue()) {
-      LOG(WARN) << "Post-recovery checkpoint failed (the periodic checkpoint "
-                   "will retry): "
-                << anchored.GetStatus();
+      LOG(WARN)
+          << "Post-recovery checkpoint failed (WAL retained; no automatic "
+             "retry when the periodic worker is disabled): "
+          << anchored.GetStatus();
     }
   }
   if (checkpoint_interval != 0) {

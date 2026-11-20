@@ -35,14 +35,18 @@ std::ostream& operator<<(std::ostream& o, const IndexMode& mode) {
   switch (mode) {
     case IndexMode::kUnique:
       o << "Unique";
-      break;
+      return o;
     case IndexMode::kNonUnique:
       o << "NonUnique";
-      break;
+      return o;
     case IndexMode::kVersionedUnique:
       o << "VersionedUnique";
-      break;
+      return o;
   }
+  // T2116 (same site as P938): a mode decoded from a corrupt record falls
+  // outside the enum; the old switch emitted NOTHING and the dump read
+  // "... ]" with the mode silently gone.  Label the numeric value instead.
+  o << "kInvalid(" << static_cast<int>(mode) << ")";
   return o;
 }
 

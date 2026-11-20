@@ -49,7 +49,13 @@ bool BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
   // swallowing them as FALSE corrupts Anti-join output (a failed match would
   // emit the outer row instead of erroring).  The error is recorded in the
   // sticky predicate_error_ and re-surfaced by Next().
-  Row combined = left + right;
+  predicate_scratch_.values_.clear();
+  predicate_scratch_.values_.reserve(left.values_.size() + right.values_.size());
+  predicate_scratch_.values_.insert(predicate_scratch_.values_.end(),
+                                    left.values_.begin(), left.values_.end());
+  predicate_scratch_.values_.insert(predicate_scratch_.values_.end(),
+                                    right.values_.begin(), right.values_.end());
+  const Row& combined = predicate_scratch_;
   if (kind_ == JoinKind::kInner) {
     // An inner-join predicate is a WHERE-level filter: conjuncts may have
     // been reordered by canonicalization, so a sibling that cleanly rejects

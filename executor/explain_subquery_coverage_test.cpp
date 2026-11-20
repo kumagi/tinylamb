@@ -196,7 +196,10 @@ TEST_F(ExplainSubqueryCoverageTest, CorrelatedSubqueriesRepeatAndCache) {
   const std::vector<std::string> shapes = {
       "SELECT o.id, (SELECT c.name FROM custs c WHERE c.id = o.cust) "
       "FROM orders o ORDER BY o.id",
-      "SELECT o.id, (SELECT c.name FROM custs c WHERE c.id = o.cust) "
+      // A second, distinct correlated shape: extra local predicate in the
+      // subquery exercises a different index/fingerprint cache key.
+      "SELECT o.id, (SELECT c.name FROM custs c "
+      "WHERE c.id = o.cust AND c.name IS NOT NULL) "
       "FROM orders o ORDER BY o.id",
       "SELECT o.id FROM orders o WHERE EXISTS "
       "(SELECT 1 FROM custs c WHERE c.id = o.cust) ORDER BY o.id",

@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -103,6 +104,10 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
       std::vector<Value> include_values;
       include_values.reserve(indexes_.back().sc_.include_.size());
       for (const slot_t& i : indexes_.back().sc_.include_) {
+        if (i >= row.values_.size()) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "index INCLUDE column out of range");
+        }
         include_values.push_back(row[i]);
       }
       grouped_multi[indexes_.back().GenerateKey(row)].push_back(
@@ -130,8 +135,14 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
       }
     }
   }
+  if (const Status scan_status = it.GetStatus();
+      scan_status != Status::kSuccess) {
+    undo();
+    return scan_status;
+  }
   if (LayoutGeneration() != generation) {
     undo();
+    // NOLINTNEXTLINE(modernize-return-braced-init-list) intentional pattern in this code
     return Status(StatusCode::kConflicts,
                   "table was modified while CREATE INDEX was scanning; retry");
   }
@@ -364,7 +375,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     const Status claim =
         page_manager->TryReserveTableTail(txn.ID(), first_pid_, ref->PageID());
     if (claim != Status::kSuccess && claim != Status::kConflicts) {
-      LOG(ERROR) << "TCHAIN6 status=" << claim;
+      LOG(ERROR) << "failed to reserve table tail: " << claim;
       txn.MarkFailed();
       return claim;
     }
@@ -372,7 +383,8 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       StatusOr<PageRef> successor_result =
           page_manager->AllocateNewPage(txn, PageType::kRowPage);
       if (!successor_result.HasValue()) {
-        LOG(ERROR) << "TCHAIN7 alloc status=" << successor_result.GetStatus();
+        LOG(ERROR) << "failed to allocate new tail page: "
+                   << successor_result.GetStatus();
         txn.MarkFailed();
         page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
         return successor_result.GetStatus();
@@ -465,6 +477,11 @@ bool IndexCoversUnchanged(const Index& idx,
 
 StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                     const Row& row) {
+  return Update(txn, pos, row, Row());
+}
+
+StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
+                                    const Row& row, Row original_row) {
   const auto contextualize = [&](Status status, std::string_view phase) {
     if (status == Status::kSuccess) {
       return status;
@@ -474,9 +491,10 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                            std::to_string(pos.page_id) + "/" +
                            std::to_string(pos.slot) + ": " + ToString(status));
   };
-  // An UPDATE rewrites the slot in place, so the pre-image stays reachable for
-  // older snapshots: the in-process rewrite latch keeps any clustering proof
-  // from outliving it (see Table::RowsRewrittenInPlace).
+  // An UPDATE normally rewrites the slot in place, but a kNoSpace result
+  // relocates the row to another page and deletes the old slot. The rewrite
+  // latch is latched conservatively in both cases so no clustering proof can
+  // outlive a changed physical row (see Table::RowsRewrittenInPlace).
   const RowMutationScope mutation(*this, /*rewrites_in_place=*/true);
   StatusOr<TableLease> acquired = AcquireLease(txn.ID());
   if (!acquired.HasValue()) {
@@ -489,6 +507,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       "tail visibility"));
   RETURN_IF_FAIL(EnsurePageHydratedIfStub(txn, pos.page_id));
   RETURN_IF_FAIL(CheckRowConstraints(row));
+  // Reject unserializable rows before the before-image read and per-index
+  // diff below: a failing batch otherwise pays that work for every row.
+  RETURN_IF_FAIL(row.CheckSerializable());
   // Phase2-3: the previous image feeds index maintenance only. Tables
   // without indexes skip the deserialize roundtrip entirely; RowPage::Update
   // still rejects absent/invisible slots with the same status Table::Read
@@ -500,8 +521,12 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // maintenance but also by restore_physical_row(); an index-less table used
   // to leave original_row empty and rewrite a 0-column image into the slot,
   // destroying the row on every failed UPDATE.
-  Row original_row;
-  {
+  // P652/689: the executor's UPDATE apply phase may already hold the
+  // before-image (FK/PK verification phases read it per row); pass it
+  // through instead of paying a second decode roundtrip.  An empty row
+  // (zero columns; a real slot read never yields zero columns) means "no
+  // hint" and takes the regular read below.
+  if (original_row.values_.empty()) {
     StatusOr<Row> visible = Read(txn, pos);
     RETURN_IF_FAIL(contextualize(visible.GetStatus(), "before-image read"));
     original_row = visible.MoveValue();
@@ -528,14 +553,17 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     changed_include_columns.erase(std::unique(changed_include_columns.begin(),
                                               changed_include_columns.end()),
                                   changed_include_columns.end());
-    const auto changed = [&](const std::vector<slot_t>& watched, bool key) {
+    const auto changed = [&](const std::vector<slot_t>& watched, bool key) {  // NOLINT(misc-unused-parameters)
+      (void)key;
       std::vector<slot_t> diff;
       for (slot_t slot : watched) {
         if (slot < original_row.values_.size() && slot < row.values_.size()) {
           const Value& before = original_row[slot];
           const Value& after = row[slot];
-          const bool differs =
-              key ? KeyColumnChanged(before, after) : before != after;
+          // INCLUDE values are read straight from the covering index, so
+          // bit-level changes (+0.0/-0.0, NaN payloads) must also trigger
+          // maintenance just like key columns do.
+          const bool differs = KeyColumnChanged(before, after);
           if (differs) {
             diff.push_back(slot);
           }
@@ -554,7 +582,6 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // phases below so the second descent on the same tree reuses the leaf the
   // first one landed on whenever the live routing agrees.
   std::vector<page_id_t> idx_cursors(indexes_.size(), 0);
-  RETURN_IF_FAIL(row.CheckSerializable());
   // Pre-acquire the write intent BEFORE latching the target page (the same
   // protocol Table::Delete already follows): RowPage::Update's internal
   // AddWriteSet then short-circuits on the write-set entry, so a genuine
@@ -809,8 +836,11 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     break;
   }
   // The copy at new_pos exists; now remove index entries and the original
-  // physical row.  Every failure below compensates by dropping the copy and
-  // keeping the original intact.
+  // physical row. Failures while removing old index entries or the source
+  // row compensate by dropping the copy and keeping the original intact. A
+  // failure in the final new-index insertion happens after the source was
+  // deleted: that path restores the old image at new_pos and repoints the
+  // old keys there (the row moves rather than the original surviving).
   const auto drop_reserved_copy = [&] {
     auto copy_result = txn.GetPageManager()->GetPage(new_pos.page_id);
     if (!copy_result.HasValue()) {
@@ -950,7 +980,14 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     // would corrupt row accounting after restart.
     std::string image(original_row.Size(), '\0');
     original_row.Serialize(image.data());
-    txn.RegisterVersionWrite(pos, image, std::nullopt);
+    // RegisterVersionWrite is not noexcept (it may allocate the version
+    // arena); keep exceptions inside this Status boundary like Update does.
+    try {
+      txn.RegisterVersionWrite(pos, image, std::nullopt);
+    } catch (...) {
+      txn.MarkFailed();
+      return Status::kRuntimeError;
+    }
     return Status::kSuccess;
   }
   if (delete_status != Status::kSuccess && !indexes_.empty()) {
@@ -966,7 +1003,7 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   RETURN_IF_FAIL(txn.GetPageManager()->CheckTableTailPage(txn.ID(), first_pid_,
                                                           pos.page_id));
   // Keep the PageRef alive while decoding: read_row points into the page
-  // buffer, which is only guaranteed stable while the page stays pinned.
+  // buffer, which is only guaranteed stable while the PageRef latch is held.
   // (The resulting Row owns its strings; Value::Deserialize copies varchar
   // data out of the buffer.)
   ASSIGN_OR_RETURN(PageRef, page,
@@ -974,9 +1011,23 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   if (page.IsNull()) {
     return Status::kNotExists;
   }
-  if (page->body.row_page.IsColumnarStub()) {
+  // P356/426: a columnar stub carries the CURRENT TLCS image with no version
+  // chains, so it may only answer transactions that are entitled to a
+  // physical read (same predicate as FullScanIterator's fast path).  A
+  // pinned snapshot must not see rows jump forward: hydrate the page back to
+  // row layout and run the normal MVCC resolver.
+  while (page->body.row_page.IsColumnarStub()) {
+    const page_id_t pid = pos.page_id;
     page.PageUnlock();
-    return ReadFromStub(pos);
+    if (txn.IsReadOnly() && !txn.HasPageVersionChains(pid)) {
+      return ReadFromStub(pos);
+    }
+    RETURN_IF_FAIL(EnsurePageHydratedIfStub(txn, pid));
+    ASSIGN_OR_RETURN(PageRef, again, txn.GetPageManager()->GetPage(pid, true));
+    page = std::move(again);
+    if (page.IsNull()) {
+      return Status::kNotExists;
+    }
   }
   ASSIGN_OR_RETURN(std::string_view, read_row, page->Read(txn, pos.slot));
   Row result;
@@ -997,9 +1048,21 @@ StatusOr<Row> Table::ReadLatest(Transaction& txn, RowPosition pos) const {
   if (page.IsNull()) {
     return Status::kNotExists;
   }
-  if (page->body.row_page.IsColumnarStub()) {
+  // P356/426: same stub entitlement as Table::Read -- with any version chain
+  // on the page the head version may live in the chain, not the TLCS image,
+  // so hydrate first.
+  while (page->body.row_page.IsColumnarStub()) {
+    const page_id_t pid = pos.page_id;
     page.PageUnlock();
-    return ReadFromStub(pos);
+    if (txn.IsReadOnly() && !txn.HasPageVersionChains(pid)) {
+      return ReadFromStub(pos);
+    }
+    RETURN_IF_FAIL(EnsurePageHydratedIfStub(txn, pid));
+    ASSIGN_OR_RETURN(PageRef, again, txn.GetPageManager()->GetPage(pid, true));
+    page = std::move(again);
+    if (page.IsNull()) {
+      return Status::kNotExists;
+    }
   }
   std::optional<std::string_view> physical;
   if (page->body.row_page.IsSlotOccupied(pos.slot)) {
@@ -1024,7 +1087,7 @@ StatusOr<Row> Table::ReadLatest(Transaction& txn, RowPosition pos) const {
 
 // A NULL anywhere in the key columns; SQL unique semantics say NULL !=
 // NULL, so such keys never collide (they still occupy the 1-byte NULL
-// encoding in the B+Tree so scans can reach them).
+// marker in the memcomparable key image so scans can reach them).
 namespace {
 bool KeyHasNull(const Index& idx, const Row& row) {
   return std::ranges::any_of(idx.sc_.key_, [&row](const slot_t key_column) {
@@ -1102,12 +1165,21 @@ Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
                                  RowPosition* wait_pos) const {
   BPlusTree bpt(idx.pid_);
   const std::string key = idx.GenerateKey(new_row);
-  std::vector<Value> include_values;
-  include_values.reserve(idx.sc_.include_.size());
-  for (const auto& in : idx.sc_.include_) {
-    include_values.push_back(new_row[in]);
+  // Most indexes have no INCLUDE columns; avoid the per-insert vector
+  // allocation in that common case.
+  Row include;
+  if (!idx.sc_.include_.empty()) {
+    std::vector<Value> include_values;
+    include_values.reserve(idx.sc_.include_.size());
+    for (const auto& in : idx.sc_.include_) {
+      if (in >= new_row.values_.size()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "index INCLUDE column out of range");
+      }
+      include_values.push_back(new_row[in]);
+    }
+    include = Row(std::move(include_values));
   }
-  Row include(include_values);
   // A page_id hint serves the read-modify-write pair below (LSM root when present).
   page_id_t cursor = 0;
   if (hint_leaf != nullptr) {
@@ -1118,7 +1190,7 @@ Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
   // insertable, while the single-value encoding would collide on the shared
   // NULL key image and reject the second row with kDuplicates.
   if (idx.StoresSingleValue() && !KeyHasNull(idx, new_row)) {
-    // BTree value is encoded pair<RowPosition, vector<Value>>.
+    // LSM index value is encoded pair<RowPosition, vector<Value>>.
     IndexValueType val;
     val.pos = pos;
     val.include = include;
@@ -1154,7 +1226,7 @@ Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
       RETURN_IF_FAIL(ins);
     }
   } else {
-    // BTree value is encoded vector<pair<RowPosition, vector<Value>>>.
+    // LSM index value is encoded vector<pair<RowPosition, vector<Value>>>.
     StatusOr<std::string> existing_value = bpt.Read(txn, key, &cursor);
     if (existing_value.HasValue()) {
       std::string_view existing_data = existing_value.Value();
@@ -1315,7 +1387,12 @@ std::shared_ptr<const LSTableStore> Table::GetLSTableStore() const {
       incarnation_state_->GetLSTableStoreRaw());
 }
 
-void Table::SetLSTableStore(std::shared_ptr<const LSTableStore> store) const {
+void Table::SetLSTableStore(std::shared_ptr<const LSTableStore> store) {  // NOLINT(readability-make-member-function-const): explicit mutation API
+  RefillLSTableStore(std::move(store));
+}
+
+void Table::RefillLSTableStore(
+    std::shared_ptr<const LSTableStore> store) const {
   if (incarnation_state_ != nullptr) {
     incarnation_state_->SetLSTableStoreRaw(std::move(store));
   }
@@ -1328,22 +1405,32 @@ std::shared_ptr<const LSTableStore> Table::GetProjectedLSTableStore() const {
                    incarnation_state_->GetProjectedLSTableStoreRaw());
 }
 
-void Table::SetProjectedLSTableStore(
+void Table::SetProjectedLSTableStore(  // NOLINT(readability-make-member-function-const): explicit mutation API
+    std::shared_ptr<const LSTableStore> store) {
+  RefillProjectedLSTableStore(std::move(store));
+}
+
+void Table::RefillProjectedLSTableStore(
     std::shared_ptr<const LSTableStore> store) const {
   if (incarnation_state_ != nullptr) {
     incarnation_state_->SetProjectedLSTableStoreRaw(std::move(store));
   }
 }
 
-std::shared_ptr<const TlcsFile> Table::GetBackingTLCSStore() const {
+std::shared_ptr<const TlcsFile> Table::GetBackingTlcsStore() const {
   if (incarnation_state_ == nullptr) {
     return nullptr;
   }
   return std::static_pointer_cast<const TlcsFile>(
-      incarnation_state_->GetBackingTLCSStoreRaw());
+      incarnation_state_->GetBackingTlcsStoreRaw());
 }
 
-void Table::SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const {
+void Table::SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store) {  // NOLINT(readability-make-member-function-const): explicit mutation API
+  RefillBackingTLCSStore(std::move(store));
+}
+
+void Table::RefillBackingTLCSStore(
+    std::shared_ptr<const TlcsFile> store) const {
   if (incarnation_state_ != nullptr) {
     std::shared_ptr<const LSTableStore> res =
         store != nullptr ? store->ResidentStore() : nullptr;
@@ -1358,7 +1445,7 @@ void Table::SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const {
 }
 
 uint64_t Table::BackingColumnarRowCount() const {
-  if (const auto tlcs = GetBackingTLCSStore(); tlcs != nullptr) {
+  if (const auto tlcs = GetBackingTlcsStore(); tlcs != nullptr) {
     return tlcs->TotalRows();
   }
   if (const auto lstable = GetLSTableStore(); lstable != nullptr) {
@@ -1377,7 +1464,7 @@ Status Table::EnsurePageHydratedIfStub(Transaction& txn, page_id_t pid) const {
     return Status::kSuccess;
   }
   page.PageUnlock();
-  std::shared_ptr<const TlcsFile> tlcs = GetBackingTLCSStore();
+  std::shared_ptr<const TlcsFile> tlcs = GetBackingTlcsStore();
   if (tlcs == nullptr) {
     return StatusError(StatusCode::kNotExists,
                        "columnar stub page missing backing tlcs store");
@@ -1390,7 +1477,7 @@ Status Table::EnsurePageHydratedIfStub(Transaction& txn, page_id_t pid) const {
 }
 
 StatusOr<Row> Table::ReadFromStub(RowPosition pos) const {
-  std::shared_ptr<const TlcsFile> tlcs = GetBackingTLCSStore();
+  std::shared_ptr<const TlcsFile> tlcs = GetBackingTlcsStore();
   if (tlcs == nullptr) {
     return Status::kNotExists;
   }
@@ -1400,7 +1487,7 @@ StatusOr<Row> Table::ReadFromStub(RowPosition pos) const {
 }
 
 Status Table::ReadEncodedFromStub(RowPosition pos, std::string* out) const {
-  std::shared_ptr<const TlcsFile> tlcs = GetBackingTLCSStore();
+  std::shared_ptr<const TlcsFile> tlcs = GetBackingTlcsStore();
   if (tlcs == nullptr) {
     return StatusError(StatusCode::kNotExists,
                        "columnar stub page missing backing tlcs store");
@@ -1463,7 +1550,7 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
         return slice_pids_to_morsels(store->page_ids);
       }
     }
-    if (std::shared_ptr<const TlcsFile> tlcs = GetBackingTLCSStore();
+    if (std::shared_ptr<const TlcsFile> tlcs = GetBackingTlcsStore();
         tlcs != nullptr && !txn.HasAnyPageVersionChains() &&
         tlcs->LayoutGeneration() == LayoutGeneration() &&
         tlcs->FirstPageId() == FirstPageId()) {
@@ -1754,8 +1841,20 @@ Encoder& operator<<(Encoder& e, const Table& t) {
 }
 
 std::ostream& operator<<(std::ostream& o, const Table& t) {
+  // T2113: the Encoder form persists incarnation_ alongside the other four
+  // fields, and the clustered-order proof (plan/full_scan_plan.hpp
+  // ClusteredOrderColumn) keys off its layout generation plus the in-place
+  // rewrite latch.  The old four-field dump showed two tables as equal
+  // strings when their proof state differed -- print the persisted seed and
+  // the live proof inputs.
   o << "Table(schema=" << t.schema_ << ", first_pid=" << t.first_pid_
-    << ", last_pid=" << t.last_pid_ << ", indexes=[";
+    << ", last_pid=" << t.last_pid_ << ", incarnation=" << t.incarnation_;
+  if (t.incarnation_state_ != nullptr) {
+    o << ", layout_generation=" << t.incarnation_state_->LayoutGeneration()
+      << ", rows_rewritten_in_place="
+      << (t.incarnation_state_->RowsRewrittenInPlace() ? "true" : "false");
+  }
+  o << ", indexes=[";
   for (size_t i = 0; i < t.indexes_.size(); i++) {
     if (i != 0) {
       o << ", ";

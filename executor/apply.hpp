@@ -25,7 +25,8 @@ class ApplyExecutor final : public ExecutorBase {
                 Executor outer_exec,
                 std::shared_ptr<const SelectStatement> inner_query,
                 std::string inner_alias, Executor inner_exec,
-                Expression predicate, JoinKind kind, Schema output_schema);
+                Expression predicate, JoinKind kind, Schema output_schema,
+                Schema inner_exec_schema = Schema());
 
   ApplyExecutor(const ApplyExecutor&) = delete;
   ApplyExecutor(ApplyExecutor&&) = delete;
@@ -51,6 +52,10 @@ class ApplyExecutor final : public ExecutorBase {
 
   Schema inner_schema_;
   Schema combined_schema_;
+  // T3668: output schema of inner_exec_ when the correlated side is a
+  // compiled child plan (inner_query_ == nullptr); used to build
+  // combined_schema_ before predicate evaluation.
+  Schema inner_exec_schema_;
 
   bool has_outer_row_{false};
   Row current_outer_row_;

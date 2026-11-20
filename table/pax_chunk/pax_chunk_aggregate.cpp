@@ -939,6 +939,27 @@ bool PaxChunk::CellHasNull(uint32_t g, slot_t c) const {
 }
 
 const uint8_t* PaxChunk::CellNullBits(uint32_t g, slot_t c) const {
+  // Same contract as RgColNullBits, but the per-group bitmap offsets were
+  // resolved once at construction, so the (group, column) cell is O(1)
+  // instead of re-walking every preceding row group per call.
+  if (!footer_.null_present || c >= footer_.column_count ||
+      g >= footer_.row_group_count || g >= footer_.row_counts.size()) {
+    return nullptr;
+  }
+  if (footer_.null_summary_valid && !footer_.null_any) {
+    return nullptr;
+  }
+  if (g < null_rg_offsets_.size()) {
+    const size_t cell_bytes =
+        (static_cast<size_t>(footer_.row_counts[g]) + 7) / 8;
+    const size_t off = static_cast<size_t>(null_rg_offsets_[g]) +
+                       // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+                       static_cast<size_t>(c) * cell_bytes;
+    if (off + cell_bytes > footer_.null_bitmaps.size()) {
+      return nullptr;
+    }
+    return footer_.null_bitmaps.data() + off;
+  }
   return RgColNullBits(footer_, g, c);
 }
 
@@ -2055,8 +2076,27 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
                         sc->GetColumn(col).Type() != ValueType::kDouble)) {
     return false;
   }
+  // Canonical DOUBLE ordering puts NaN before every number (Value::operator==
+  // treats two NaNs as equal). Raw IEEE comparisons would drop NaN rows for
+  // `d = NaN` and invert the mirror predicates.
   const auto matches = [](double value, PaxChunk::CompareOp compare,
                           double operand) {
+    const bool vn = std::isnan(value), on = std::isnan(operand);
+    if (vn || on) {
+      switch (compare) {
+        case PaxChunk::CompareOp::kEq:
+          return vn && on;
+        case PaxChunk::CompareOp::kLe:
+          return vn;
+        case PaxChunk::CompareOp::kLt:
+          return vn && !on;
+        case PaxChunk::CompareOp::kGe:
+          return on;
+        case PaxChunk::CompareOp::kGt:
+          return on && !vn;
+      }
+      return false;
+    }
     switch (compare) {
       case PaxChunk::CompareOp::kEq:
         return value == operand;
@@ -2210,8 +2250,27 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
                         sc->GetColumn(col).Type() != ValueType::kDouble)) {
     return false;
   }
+  // Canonical DOUBLE ordering puts NaN before every number (Value::operator==
+  // treats two NaNs as equal). Raw IEEE comparisons would drop NaN rows for
+  // `d = NaN` and invert the mirror predicates.
   const auto matches = [](double value, PaxChunk::CompareOp compare,
                           double operand) {
+    const bool vn = std::isnan(value), on = std::isnan(operand);
+    if (vn || on) {
+      switch (compare) {
+        case PaxChunk::CompareOp::kEq:
+          return vn && on;
+        case PaxChunk::CompareOp::kLe:
+          return vn;
+        case PaxChunk::CompareOp::kLt:
+          return vn && !on;
+        case PaxChunk::CompareOp::kGe:
+          return on;
+        case PaxChunk::CompareOp::kGt:
+          return on && !vn;
+      }
+      return false;
+    }
     switch (compare) {
       case PaxChunk::CompareOp::kEq:
         return value == operand;
@@ -2362,8 +2421,27 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
                         sc->GetColumn(col).Type() != ValueType::kDouble)) {
     return false;
   }
+  // Canonical DOUBLE ordering puts NaN before every number (Value::operator==
+  // treats two NaNs as equal). Raw IEEE comparisons would drop NaN rows for
+  // `d = NaN` and invert the mirror predicates.
   const auto matches = [](double value, PaxChunk::CompareOp compare,
                           double operand) {
+    const bool vn = std::isnan(value), on = std::isnan(operand);
+    if (vn || on) {
+      switch (compare) {
+        case PaxChunk::CompareOp::kEq:
+          return vn && on;
+        case PaxChunk::CompareOp::kLe:
+          return vn;
+        case PaxChunk::CompareOp::kLt:
+          return vn && !on;
+        case PaxChunk::CompareOp::kGe:
+          return on;
+        case PaxChunk::CompareOp::kGt:
+          return on && !vn;
+      }
+      return false;
+    }
     switch (compare) {
       case PaxChunk::CompareOp::kEq:
         return value == operand;
@@ -3617,7 +3695,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 continue;  // NULL cells participate in nothing (generic path)
               }
               ++sfreq[sym];
-              if (HuffDictDictAt(hp, sym) == 0) {
+              if (HuffDictAt(hp, sym) == 0) {
                 zero_nonnull = true;
               }
             }
@@ -3628,7 +3706,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 }
                 if (!TryAccumulateScaledSum(
                         plan.coeff,
-                        static_cast<platform::Int128>(HuffDictDictAt(hp, sym)) *
+                        static_cast<platform::Int128>(HuffDictAt(hp, sym)) *
                             static_cast<platform::Int128>(sfreq[sym]),
                         &res.sum)) {
                   return ReduceResult{};
@@ -3639,7 +3717,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 if (sfreq[sym] == 0) {
                   continue;
                 }
-                const int64_t v = HuffDictDictAt(hp, sym);
+                const int64_t v = HuffDictAt(hp, sym);
                 if (v != 0) {
                   consider(v);
                 }
@@ -7833,7 +7911,10 @@ bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p, uint32_t g,
                   ? 1
                   : 0;  // clamp bucket
     std::vector<int64_t> codes(rc, 0);
-    DecodeInnerI64All(creg, cs, cparam, rc, pool_hdr, codes.data());
+    if (!DecodeInnerI64All(creg, cs, cparam, rc, pool_hdr, codes.data())) {
+      // Failed decode leaves codes at zero; that is not real data.
+      return false;
+    }
     for (uint32_t i = 0; i < rc; ++i) {
       const auto code = static_cast<uint64_t>(codes[i]);
       if (pass[code < d ? code : d] != 0) {
@@ -8717,6 +8798,7 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
       if (!sum_ready || !sum_decoded) {
         ResizeDecodeBuffer(sbuf, rc);
         chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
+        // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
         sum_decoded = true;
       }
       platform::Int128 s = 0;
@@ -8779,6 +8861,7 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
           if (!sum_ready || !sum_decoded) {
             ResizeDecodeBuffer(sbuf, rc);
             chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
+            // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
             sum_decoded = true;
           }
           for (uint32_t i = 0; i < rc; ++i) {
@@ -8830,6 +8913,7 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
           } else {
             chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
           }
+          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
           sum_decoded = true;
         }
         const char* q = gr + 4;
@@ -8899,6 +8983,7 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
           } else {
             chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
           }
+          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
           sum_decoded = true;
         }
         const char* q = gruns_hdr + 4;

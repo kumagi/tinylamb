@@ -36,7 +36,6 @@ size_t LimitExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
       return 0;
     }
     ++skipped_;
-    ++consumed_rows_;
   }
   if (limit_ != 0 && emitted_ >= limit_) {
     early_stop_ = true;
@@ -65,8 +64,7 @@ size_t LimitExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   return destination->Size();
 }
 void LimitExecutor::Dump(std::ostream& output, int indent) const {
-  output << "Limit: " << limit_ << " offset " << offset_
-         << " (Limit count=" << limit_ << " offset=" << offset_ << ")\n"
+  output << "Limit: " << limit_ << " offset " << offset_ << '\n'
          << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
   if (early_stop_) {

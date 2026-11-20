@@ -122,7 +122,11 @@ class StatusOr {
   StatusOr(U&& v)  // NOLINT
       : status_(Status::kSuccess), value_(std::in_place, std::forward<U>(v)) {}
 
-  [[nodiscard]] bool HasValue() const { return status_ == Status::kSuccess; }
+  [[nodiscard]] bool HasValue() const {
+    // A success Status with no payload (e.g. `StatusOr<T> x = Status::kSuccess`)
+    // must not claim a value: Value()/MoveValue() would abort.
+    return status_ == Status::kSuccess && value_.has_value();
+  }
   // Callers must check HasValue() first: accessing the value of a failed
   // StatusOr is a contract violation and aborts (no exceptions).
   T& Value() {
@@ -147,9 +151,7 @@ class StatusOr {
     return *value_;
   }
   [[nodiscard]] Status GetStatus() const { return status_; }
-  [[nodiscard]] explicit operator bool() const {
-    return status_ == Status::kSuccess;
-  }
+  [[nodiscard]] explicit operator bool() const { return HasValue(); }
 
   friend std::ostream& operator<<(std::ostream& o, const StatusOr<T>& so) {
     if (so.HasValue()) {

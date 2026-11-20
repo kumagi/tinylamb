@@ -30,9 +30,9 @@
 
 namespace tinylamb {
 
-// Version-1 on-disk layout. All fixed-width scalars are big-endian and every
-// top-level page/WAL object carries this magic/version pair. Version 0 is
-// intentionally unsupported: the v1 migration is a destructive format bump.
+// Historical v1 on-disk scalar encoding helpers. All fixed-width scalars are
+// big-endian. kSerdesMagic/kSerdesVersion are legacy constants not embedded in
+// current page/WAL records (those carry their own per-format version fields).
 inline constexpr uint32_t kSerdesMagic = 0x54594231U;  // "TYB1"
 inline constexpr uint32_t kSerdesVersion = 1U;
 

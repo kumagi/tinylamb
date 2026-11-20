@@ -75,6 +75,10 @@ class SqlIntervalCoverageTest : public ::testing::Test {
     ASSERT_EQ(rows.size(), 1U);
     EXPECT_EQ(rows[0][0], expected);
   }
+  void ExpectThrow(const std::string& sql) {
+    SCOPED_TRACE(sql);
+    EXPECT_THROW(RunSql(engine_.get(), context_.get(), sql), std::exception);
+  }
   std::unique_ptr<Database> database_;
   std::unique_ptr<TransactionContext> context_;
   std::unique_ptr<SqlEngine> engine_;
@@ -115,11 +119,27 @@ TEST_F(SqlIntervalCoverageTest, IntervalArithmetic) {
   // make_interval is exactly (value, unit); extra arguments are rejected.
   ExpectScalar("SELECT make_interval(1, 'DAY')",
                Value("0-0 1 0:0:0").WithInterval());
+  // T2233: the GoogleSQL named-argument spelling desugars into the same
+  // (value, unit) calls joined by interval addition.
+  ExpectScalar("SELECT MAKE_INTERVAL(day => 4)",
+               Value("0-0 4 0:0:0").WithInterval());
+  ExpectScalar("SELECT MAKE_INTERVAL(second => -6)",
+               Value("0-0 0 -0:0:6").WithInterval());
+  ExpectScalar("SELECT MAKE_INTERVAL(hour => -4, day => 3)",
+               Value("0-0 3 -4:0:0").WithInterval());
+  ExpectScalar("SELECT MAKE_INTERVAL(year => 1, month => 2)",
+               Value("1-2 0 0:0:0").WithInterval());
+  // Positional arguments fill the year..second slots in order; mixing them
+  // ahead of named ones is allowed, after a named one is not.
+  ExpectScalar("SELECT MAKE_INTERVAL(1, month => 2)",
+               Value("1-2 0 0:0:0").WithInterval());
+  ExpectThrow("SELECT MAKE_INTERVAL(day => 4, 2)");
+  ExpectThrow("SELECT MAKE_INTERVAL(bogus => 1)");
 }
 
 TEST_F(SqlIntervalCoverageTest, LenientAndExtremeComponents) {
-  // Malformed components fall back to zero instead of erroring.
-  ExpectScalar("SELECT INTERVAL 'xx' DAY", Value("0-0 0 0:0:0").WithInterval());
+  // A malformed component is a GoogleSQL error, not a zero interval.
+  ExpectThrow("SELECT INTERVAL 'xx' DAY");
   // Huge year counts parse without overflowing the month accumulator.
   ExpectScalar("SELECT INTERVAL '9999999999999' YEAR",
                Value("9999999999999-0 0 0:0:0").WithInterval());

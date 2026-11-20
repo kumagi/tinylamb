@@ -11,8 +11,9 @@
 namespace tinylamb {
 
 // The collation an expression *statically* asks for: `COLLATE(x, 'und:ci')`
-// (or any other non-'binary' spec) is case-insensitive and
-// `COLLATE(x, 'binary')` is binary.
+// is case-insensitive and `COLLATE(x, 'binary')` is binary. Any other spec
+// (including the empty string and typos) resolves to kNone here — the static
+// resolver cannot reject, but the runtime COLLATE() evaluator does.
 //
 // Every other shape is kNone, including a COLLATE whose collator is not a
 // string literal (GoogleSQL rejects that at the frontend, but a hand-built

@@ -21,6 +21,7 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <optional>
 #if defined(__GNUC__) && !defined(__clang__)
 // GCC 15 reports -Wmaybe-uninitialized inside <regex>'s NFA construction when
@@ -520,15 +521,21 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
 
 // Compile `pattern` after the nested-repetition check above; callers get a
 // uniform StatusError for both rejected and malformed patterns.
-inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
+namespace regex_guard_detail {
+template <auto Transform>
+StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
   struct Entry {
     std::string pattern;
     std::regex compiled;
+    size_t bytes = 0;
   };
-  // Bounded per-thread storage avoids recompiling constant SQL patterns for
-  // every row without sharing mutable evaluator state between workers.
+  // P464: the old gate skipped caching patterns over 4096 bytes, so a stable
+  // huge pattern recompiled per row -- the most expensive part of the call.
+  // Cache any size while the per-thread total stays inside the budget,
+  // evicting round-robin-oldest entries first.
   static thread_local std::array<std::optional<Entry>, 8> cache;
   static thread_local size_t next = 0;
+  static thread_local size_t used = 0;
   for (const auto& entry : cache) {
     if (entry && entry->pattern == pattern) {
       return entry->compiled;
@@ -539,17 +546,56 @@ inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
                        "regular expression has nested repetition: " + pattern);
   }
   try {
-    std::regex compiled(pattern);
-    if (pattern.size() <= 4096) {
-      cache[next] = Entry{.pattern = pattern, .compiled = compiled};
+    std::regex compiled(Transform(pattern));
+    // std::regex exposes no introspection; charge 16x the pattern text as a
+    // conservative estimate of its NFA/submatch programs plus fixed overhead.
+    const size_t bytes = (pattern.size() * 16) + (size_t{1} << 10);
+    constexpr size_t kPatternCacheBudget = size_t{2} << 20;
+    if (bytes <= kPatternCacheBudget) {
+      // `next` is the FIFO head; free entries until this one fits.
+      for (;;) {
+        auto& slot = cache[next];
+        if (!slot && used + bytes <= kPatternCacheBudget) {
+          break;
+        }
+        if (slot) {
+          used -= slot->bytes;
+          slot.reset();
+        }
+        next = (next + 1) % cache.size();
+      }
+      auto& entry = cache[next].emplace(
+          Entry{.pattern = pattern, .compiled = compiled, .bytes = bytes});
+      used += bytes;
       next = (next + 1) % cache.size();
+      return entry.compiled;
     }
     return compiled;
+  } catch (const std::bad_alloc&) {
+    // T3722 (ADR 0012): compiling a huge pattern can exhaust memory; that
+    // is a resource failure, not the user's regex being invalid.
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "regular expression compilation ran out of memory");
   } catch (...) {
     return StatusError(StatusCode::kInvalidArgument,
                        "invalid regular expression: " + pattern);
   }
 }
+}  // namespace regex_guard_detail
+
+inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
+  return regex_guard_detail::CompileCheckedPattern<
+      [](const std::string& original) -> const std::string& {
+        return original;  // NOLINT(bugprone-return-const-ref-from-parameter): consumed immediately by std::regex
+      }>(pattern);
+}
+
+// Find a non-overlapping occurrence and report its one-based position. With
+// one capturing group, the position refers to that group's span.
+StatusOr<int64_t> CheckedRegexPosition(std::string_view input,
+                                       std::string_view pattern,
+                                       int64_t position, int64_t occurrence,
+                                       int64_t return_position, bool byte_mode);
 
 // GoogleSQL replacement strings use backslash-digit captures and escaped
 // backslashes; dollar and ampersand are ordinary text. Translate that small
@@ -559,6 +605,10 @@ inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
 StatusOr<std::string> ReplaceCheckedRegex(std::string_view input,
                                           std::string_view pattern,
                                           std::string_view replacement);
+
+// P464 test hook: number of full replacement-program compiles (cache misses)
+// executed on this thread since start.
+[[nodiscard]] size_t ReplacementProgramFullCompilesForTest();
 
 // Zero-copy variant of ReplaceCheckedRegex: when the result is a slice of
 // `input` (for example on non-match or when an anchored full-input match
@@ -570,6 +620,17 @@ StatusOr<std::string_view> ReplaceCheckedRegexView(std::string_view input,
                                                    std::string_view pattern,
                                                    std::string_view replacement,
                                                    std::string* scratch);
+
+struct DelimitedRegexCapture {
+  std::vector<std::string> prefixes;
+  uint8_t delimiter;
+};
+
+// Describes an anchored single-capture replacement whose result is the
+// nonempty run after a literal prefix and before its first delimiter.
+// Prefixes are tried in greedy regex order. Unmatched input is unchanged.
+StatusOr<std::optional<DelimitedRegexCapture>> DescribeDelimitedRegexCapture(
+    std::string_view pattern, std::string_view replacement);
 
 }  // namespace tinylamb
 

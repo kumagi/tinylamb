@@ -50,6 +50,9 @@ class Encoder {
 
   template <typename T>
   Encoder& operator<<(const std::vector<T>& vec) {
+    // Decoder::operator>> rejects more than kMaxDecodedElements (1<<20).
+    // Encoder has no failure channel, so callers must keep vectors below
+    // that bound; a record that exceeds it cannot be read back.
     uint64_t size = vec.size();
     *this << size;
     for (const auto& elm : vec) {

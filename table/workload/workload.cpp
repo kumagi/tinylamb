@@ -142,7 +142,7 @@ size_t WorkloadTracker::ApplyTo(Schema& sc) {
     if (inferred == AccessHint::kUnknown) {
       continue;
     }
-    const AccessHint current = sc.GetColumn(c).GetHint();
+    const AccessHint current = sc.GetColumn(c).Hint();
     auto ap = applied_.find(name);
     const bool eligible = current == AccessHint::kUnknown ||
                           (ap != applied_.end() && ap->second == current);

@@ -1236,6 +1236,12 @@ bool EvalDoubleExprChunkSlice(const TypedDoubleExprInput& expr,
       }
     }
     std::array<double, 16> stack{};
+    // Producers cap ops at 16 entries so pushes can never exceed the stack;
+    // keep that bound explicit here instead of relying on the upstream
+    // compiler invariant.
+    if (expr.ops.size() > stack.size()) {
+      return false;
+    }
     for (size_t i = 0; i < take; ++i) {
       const size_t lr = lr_start + i;
       size_t sp = 0;
@@ -1309,7 +1315,7 @@ StatusOr<bool> TryBuildPackedGroupingSets(
     const std::vector<std::vector<Value>>& worker_arguments,
     const std::vector<double>& flat_double_args,
     const std::vector<uint8_t>& flat_arg_kinds, bool exact_partial_merge,
-    bool finite_sum, bool all_double, bool no_nulls,
+    bool finite_sum, bool all_double, bool no_nulls, bool finest_keys_unique,
     std::vector<TypedWorkerGroups>& groups, std::vector<size_t>& row_groups,
     std::vector<std::vector<size_t>>& coarse_maps) {
   const bool is_columnar = input.HasColumnarOnly();
@@ -1541,22 +1547,22 @@ StatusOr<bool> TryBuildPackedGroupingSets(
   const auto add_finite_sum = [no_nulls](TypedWorkerGroups& local, size_t group,
                                          const Value& value) {
     if (!no_nulls && !value.IsNull()) {
-      local.slim_counts[group] = 1;
+      local.SlimCount(group, 0) = 1;
     }
     if (value.type == ValueType::kDouble) {
-      local.slim_double_totals[group] += value.value.double_value;
-      local.slim_flags[group] = 2;
+      local.SlimDoubleTotal(group, 0) += value.value.double_value;
+      local.SlimFlags(group, 0) |= 2;
     }
   };
   const auto add_finite_sum_flat = [no_nulls](TypedWorkerGroups& local,
                                               size_t group, double val,
                                               uint8_t kind) {
     if (!no_nulls && kind != 0) {
-      local.slim_counts[group] = 1;
+      local.SlimCount(group, 0) = 1;
     }
     if (kind == 1) {
-      local.slim_double_totals[group] += val;
-      local.slim_flags[group] = 2;
+      local.SlimDoubleTotal(group, 0) += val;
+      local.SlimFlags(group, 0) |= 2;
     }
   };
 
@@ -1669,8 +1675,8 @@ StatusOr<bool> TryBuildPackedGroupingSets(
           }
         }
       }
-      groups[0].slim_double_totals[0] = total;
-      groups[0].slim_flags[0] = 2;
+      groups[0].SlimDoubleTotal(0, 0) = total;
+      groups[0].SlimFlags(0, 0) |= 2;
       if (need_row_groups) {
         row_groups.assign(nrows, 0);
       }
@@ -1732,19 +1738,23 @@ StatusOr<bool> TryBuildPackedGroupingSets(
     return true;
   }
 
-  // Pass 3: Pack per-row uint64 keys and scatter into finest_workers
-  // partitions.
+  const bool use_row_ids = finest_keys_unique && finite_sum && all_direct_args;
+  // Pass 3: Pack the keys and distribute duplicate keys when they need a
+  // finest-level aggregation.
   std::vector<uint64_t> packed_all(nrows);
-  std::vector<uint8_t> row_buckets(need_row_groups ? nrows : 0);
+  std::vector<uint8_t> row_buckets(need_row_groups && !use_row_ids ? nrows : 0);
   std::vector<std::vector<std::vector<uint32_t>>> chunk_buckets(
-      finest_workers, std::vector<std::vector<uint32_t>>(finest_workers));
+      use_row_ids ? 0 : finest_workers,
+      std::vector<std::vector<uint32_t>>(finest_workers));
   RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t w) {
     const size_t w_chunk = nrows / finest_workers;
     const size_t begin = w * w_chunk;
     const size_t end = w + 1 == finest_workers ? nrows : begin + w_chunk;
     const size_t len = end - begin;
-    for (auto& bucket : chunk_buckets[w]) {
-      bucket.reserve((len / finest_workers) + 16);
+    if (!use_row_ids) {
+      for (auto& bucket : chunk_buckets[w]) {
+        bucket.reserve((len / finest_workers) + 16);
+      }
     }
     std::array<const uint32_t*, 32> col_ptr{};
     std::array<const uint32_t*, 32> remap_ptr{};
@@ -1759,7 +1769,7 @@ StatusOr<bool> TryBuildPackedGroupingSets(
       }
     }
     const uint64_t finest_mask = set_masks[0];
-    uint8_t* const rb_ptr = need_row_groups ? row_buckets.data() : nullptr;
+    uint8_t* const rb_ptr = row_buckets.empty() ? nullptr : row_buckets.data();
     for (size_t lr = 0; lr < len; ++lr) {
       uint64_t pk = 0;
       for (size_t i = 0; i < active_cols; ++i) {
@@ -1767,182 +1777,222 @@ StatusOr<bool> TryBuildPackedGroupingSets(
       }
       const size_t r = begin + lr;
       packed_all[r] = pk;
-      const auto b = static_cast<uint8_t>(MixCompactInt64(pk & finest_mask) %
-                                          finest_workers);
-      if (rb_ptr != nullptr) {
-        rb_ptr[r] = b;
+      if (!use_row_ids) {
+        const auto b = static_cast<uint8_t>(MixCompactInt64(pk & finest_mask) %
+                                            finest_workers);
+        if (rb_ptr != nullptr) {
+          rb_ptr[r] = b;
+        }
+        chunk_buckets[w][b].push_back(static_cast<uint32_t>(r));
       }
-      chunk_buckets[w][b].push_back(static_cast<uint32_t>(r));
     }
   }));
   std::vector<std::vector<std::vector<uint32_t>>>().swap(worker_codes);
   std::vector<std::vector<std::vector<uint32_t>>>().swap(local_to_global);
 
-  std::vector<TypedWorkerGroups> partials(finest_workers);
-  for (auto& partial : partials) {
-    partial.Configure(true, plans[0].key_offsets.size(), argument_count);
-    partial.ConfigureSlim(plans[0]);
-    partial.int_key = true;
-    partial.borrowed_key_offsets = &plans[0].key_offsets;
-    if (is_columnar) {
-      partial.borrowed_columnar = columnar;
-      partial.borrowed_chunk_prefix = &chunk_prefix;
+  auto& finest = groups[0];
+  std::vector<std::vector<uint64_t>> group_pks(count);
+  size_t total_groups = 0;
+  const auto aggregate_finest = [&]() -> Status {
+    std::vector<TypedWorkerGroups> partials(finest_workers);
+    for (auto& partial : partials) {
+      partial.Configure(true, plans[0].key_offsets.size(), argument_count);
+      partial.ConfigureSlim(plans[0]);
+      partial.int_key = true;
+      partial.borrowed_key_offsets = &plans[0].key_offsets;
+      if (is_columnar) {
+        partial.borrowed_columnar = columnar;
+        partial.borrowed_chunk_prefix = &chunk_prefix;
+      }
+      partial.mixed_numeric_sums = mixed_numeric_sums;
     }
-    partial.mixed_numeric_sums = mixed_numeric_sums;
-  }
-  std::vector<uint32_t> local_groups(need_row_groups ? nrows : 0);
-  std::vector<std::vector<size_t>> first_rows(finest_workers);
-  std::vector<Status> errors(finest_workers, Status::kSuccess);
-  std::vector<size_t> error_rows(finest_workers, SIZE_MAX);
-  RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t w) {
-    auto& partial = partials[w];
-    auto& first = first_rows[w];
-    size_t bucket_rows = 0;
-    for (size_t src = 0; src < finest_workers; ++src) {
-      bucket_rows += chunk_buckets[src][w].size();
-    }
-    partial.int_index.Reserve(bucket_rows >= 4096 && kcols >= 3
-                                  ? (bucket_rows * 3) / 4
-                                  : std::min<size_t>(bucket_rows, 8192));
-    first.reserve(std::min<size_t>(bucket_rows, 4096));
-    const uint64_t finest_mask = set_masks[0];
-    uint32_t* const lg_ptr = need_row_groups ? local_groups.data() : nullptr;
-    const double* const flat_v =
-        use_flat_args ? flat_double_args.data() : nullptr;
-    const uint8_t* const flat_k =
-        use_flat_args ? flat_arg_kinds.data() : nullptr;
-    int64_t prev_pk = 0;
-    size_t prev_group = 0;
-    bool has_prev = false;
-    for (size_t src = 0; src < finest_workers; ++src) {
-      size_t chunk_hint = 0;
-      for (const uint32_t r32 : chunk_buckets[src][w]) {
-        const size_t r = r32;
-        const auto pk = static_cast<int64_t>(packed_all[r] & finest_mask);
-        size_t group = 0;
-        if (has_prev && pk == prev_pk) {
-          group = prev_group;
-        } else {
-          bool inserted = false;
-          size_t* slot = partial.int_index.TryEmplace(pk, &inserted);
-          if (inserted) {
-            *slot = partial.GroupCount();
-            partial.AppendSlimOnlyGroup();
-            first.push_back(r);
-          }
-          group = *slot;
-          prev_pk = pk;
-          prev_group = group;
-          has_prev = true;
-        }
-        if (lg_ptr != nullptr) {
-          lg_ptr[r] = static_cast<uint32_t>(group);
-        }
-        if (finite_sum) {
-          if (use_flat_args) {
-            add_finite_sum_flat(partial, group, flat_v[r], flat_k[r]);
+    std::vector<uint32_t> local_groups(need_row_groups ? nrows : 0);
+    std::vector<std::vector<size_t>> first_rows(finest_workers);
+    std::vector<Status> errors(finest_workers, Status::kSuccess);
+    std::vector<size_t> error_rows(finest_workers, SIZE_MAX);
+    RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t w) {
+      auto& partial = partials[w];
+      auto& first = first_rows[w];
+      size_t bucket_rows = 0;
+      for (size_t src = 0; src < finest_workers; ++src) {
+        bucket_rows += chunk_buckets[src][w].size();
+      }
+      partial.int_index.Reserve(bucket_rows >= 4096 && kcols >= 3
+                                    ? (bucket_rows * 3) / 4
+                                    : std::min<size_t>(bucket_rows, 8192));
+      first.reserve(std::min<size_t>(bucket_rows, 4096));
+      const uint64_t finest_mask = set_masks[0];
+      uint32_t* const lg_ptr = need_row_groups ? local_groups.data() : nullptr;
+      const double* const flat_v =
+          use_flat_args ? flat_double_args.data() : nullptr;
+      const uint8_t* const flat_k =
+          use_flat_args ? flat_arg_kinds.data() : nullptr;
+      int64_t prev_pk = 0;
+      size_t prev_group = 0;
+      bool has_prev = false;
+      for (size_t src = 0; src < finest_workers; ++src) {
+        size_t chunk_hint = 0;
+        for (const uint32_t r32 : chunk_buckets[src][w]) {
+          const size_t r = r32;
+          const auto pk = static_cast<int64_t>(packed_all[r] & finest_mask);
+          size_t group = 0;
+          if (has_prev && pk == prev_pk) {
+            group = prev_group;
           } else {
-            const Value arg_val =
-                all_direct_args
-                    ? direct_arg_at(r, 0, &chunk_hint)
-                    : worker_arguments[r / arg_chunk]
-                                      [(r % arg_chunk) * argument_count];
-            add_finite_sum(partial, group, arg_val);
+            bool inserted = false;
+            size_t* slot = partial.int_index.TryEmplace(pk, &inserted);
+            if (inserted) {
+              *slot = partial.GroupCount();
+              partial.AppendSlimOnlyGroup();
+              first.push_back(r);
+            }
+            group = *slot;
+            prev_pk = pk;
+            prev_group = group;
+            has_prev = true;
           }
-        } else {
-          for (size_t a = 0; a < argument_count; ++a) {
+          if (lg_ptr != nullptr) {
+            lg_ptr[r] = static_cast<uint32_t>(group);
+          }
+          if (finite_sum) {
             if (use_flat_args) {
-              const size_t idx = (r * argument_count) + a;
-              if (!ApplyFlatArg(&partial, group, a, plans[0].slim_kinds[a],
-                                flat_v[idx], flat_k[idx], &errors[w])) {
-                error_rows[w] = r;
-                return;
-              }
+              add_finite_sum_flat(partial, group, flat_v[r], flat_k[r]);
             } else {
-              Value arg_val =
+              const Value arg_val =
                   all_direct_args
-                      ? direct_arg_at(r, a, &chunk_hint)
+                      ? direct_arg_at(r, 0, &chunk_hint)
                       : worker_arguments[r / arg_chunk]
-                                        [((r % arg_chunk) * argument_count) +
-                                         a];
-              if (!ApplySlimValue(&partial, group, a, plans[0].slim_kinds[a],
-                                  &arg_val, &errors[w])) {
-                error_rows[w] = r;
-                return;
+                                        [(r % arg_chunk) * argument_count];
+              add_finite_sum(partial, group, arg_val);
+            }
+          } else {
+            for (size_t a = 0; a < argument_count; ++a) {
+              if (use_flat_args) {
+                const size_t idx = (r * argument_count) + a;
+                if (!ApplyFlatArg(&partial, group, a, plans[0].slim_kinds[a],
+                                  flat_v[idx], flat_k[idx], &errors[w])) {
+                  error_rows[w] = r;
+                  return;
+                }
+              } else {
+                Value arg_val =
+                    all_direct_args
+                        ? direct_arg_at(r, a, &chunk_hint)
+                        : worker_arguments[r / arg_chunk]
+                                          [((r % arg_chunk) * argument_count) +
+                                           a];
+                if (!ApplySlimValue(&partial, group, a, plans[0].slim_kinds[a],
+                                    &arg_val, &errors[w])) {
+                  error_rows[w] = r;
+                  return;
+                }
               }
             }
           }
         }
       }
+    }));
+    std::vector<std::vector<std::vector<uint32_t>>>().swap(chunk_buckets);
+    const auto first_error = std::ranges::min_element(error_rows);
+    if (*first_error != SIZE_MAX) {
+      return errors[static_cast<size_t>(first_error - error_rows.begin())];
     }
-  }));
-  std::vector<std::vector<std::vector<uint32_t>>>().swap(chunk_buckets);
-  const auto first_error = std::ranges::min_element(error_rows);
-  if (*first_error != SIZE_MAX) {
-    return errors[static_cast<size_t>(first_error - error_rows.begin())];
-  }
 
-  std::vector<std::vector<size_t>> global_ids(need_row_groups ? finest_workers
-                                                              : 0);
-  size_t total_groups = 0;
-  std::vector<size_t> active_w;
-  active_w.reserve(finest_workers);
-  for (size_t w = 0; w < finest_workers; ++w) {
+    std::vector<std::vector<size_t>> global_ids(need_row_groups ? finest_workers
+                                                                : 0);
+    std::vector<size_t> active_w;
+    active_w.reserve(finest_workers);
+    for (size_t w = 0; w < finest_workers; ++w) {
+      if (need_row_groups) {
+        global_ids[w].resize(partials[w].GroupCount(), SIZE_MAX);
+      }
+      total_groups += partials[w].GroupCount();
+      if (!first_rows[w].empty()) {
+        active_w.push_back(w);
+      }
+    }
+    finest.ReserveGroups(total_groups);
+    finest.group_count = total_groups;
+    group_pks[0].resize(total_groups);
+    std::vector<GlobalSourceSlot> global_src;
+    if (total_groups > 0) {
+      PopulateLocalOrderedPks(
+          active_w, active_w.size(), first_rows, packed_all,
+          need_row_groups ? &global_ids : nullptr,
+          is_columnar ? nullptr : &finest.borrowed_key_rows,
+          is_columnar ? &finest.borrowed_key_row_ids : nullptr,
+          is_columnar ? nullptr : &input.rows, nullptr, nullptr, &global_src,
+          group_pks[0]);
+    }
+    std::vector<uint64_t>().swap(packed_all);
+    if (total_groups > 0) {
+      const size_t copy_workers =
+          total_groups >= 4096 ? finest_workers : size_t{1};
+      RETURN_IF_FAIL(RunParallelTasks(copy_workers, [&](size_t w) {
+        const size_t raw_begin = (total_groups * w) / copy_workers;
+        const size_t raw_end = (total_groups * (w + 1)) / copy_workers;
+        const size_t g_begin = w == 0 ? 0 : (raw_begin & ~size_t{63});
+        const size_t g_end =
+            w + 1 == copy_workers ? total_groups : (raw_end & ~size_t{63});
+        for (size_t global = g_begin; global < g_end; ++global) {
+          const GlobalSourceSlot src_slot = global_src[global];
+          const auto& partial = partials[src_slot.worker];
+          const size_t local = src_slot.local;
+          for (size_t a = 0; a < argument_count; ++a) {
+            finest.SlimCount(global, a) = partial.SlimCount(local, a);
+            finest.SlimIntTotal(global, a) = partial.SlimIntTotal(local, a);
+            finest.SlimDoubleTotal(global, a) =
+                partial.SlimDoubleTotal(local, a);
+            finest.SlimFlags(global, a) = partial.SlimFlags(local, a);
+          }
+        }
+      }));
+    }
+    std::vector<GlobalSourceSlot>().swap(global_src);
     if (need_row_groups) {
-      global_ids[w].resize(partials[w].GroupCount(), SIZE_MAX);
+      RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t w) {
+        const size_t begin = std::min(nrows, w * arg_chunk);
+        const size_t end = std::min(nrows, begin + arg_chunk);
+        for (size_t r = begin; r < end; ++r) {
+          row_groups[r] = global_ids[row_buckets[r]][local_groups[r]];
+        }
+      }));
     }
-    total_groups += partials[w].GroupCount();
-    if (!first_rows[w].empty()) {
-      active_w.push_back(w);
+    return Status::kSuccess;
+  };
+  if (use_row_ids) {
+    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    //   (unique_group_key_fiber_is_singleton)
+    // The fused partial aggregate already emitted one row per finest key.
+    // Use its row index as the group ID and keep the original row order.
+    total_groups = nrows;
+    finest.ReserveGroups(nrows);
+    finest.group_count = nrows;
+    if (is_columnar) {
+      finest.borrowed_key_row_ids.resize(nrows);
+    } else {
+      finest.borrowed_key_rows.resize(nrows);
     }
-  }
-  auto& finest = groups[0];
-  finest.ReserveGroups(total_groups);
-  finest.group_count = total_groups;
-  std::vector<std::vector<uint64_t>> group_pks(count);
-  group_pks[0].resize(total_groups);
-  std::vector<GlobalSourceSlot> global_src;
-  if (total_groups > 0) {
-    PopulateLocalOrderedPks(
-        active_w, active_w.size(), first_rows, packed_all,
-        need_row_groups ? &global_ids : nullptr,
-        is_columnar ? nullptr : &finest.borrowed_key_rows,
-        is_columnar ? &finest.borrowed_key_row_ids : nullptr,
-        is_columnar ? nullptr : &input.rows, nullptr, nullptr, &global_src,
-        group_pks[0]);
-  }
-  std::vector<uint64_t>().swap(packed_all);
-  if (total_groups > 0) {
-    const size_t copy_workers =
-        total_groups >= 4096 ? finest_workers : size_t{1};
-    RETURN_IF_FAIL(RunParallelTasks(copy_workers, [&](size_t w) {
-      const size_t raw_begin = (total_groups * w) / copy_workers;
-      const size_t raw_end = (total_groups * (w + 1)) / copy_workers;
-      const size_t g_begin = w == 0 ? 0 : (raw_begin & ~size_t{63});
-      const size_t g_end =
-          w + 1 == copy_workers ? total_groups : (raw_end & ~size_t{63});
-      for (size_t global = g_begin; global < g_end; ++global) {
-        const GlobalSourceSlot src_slot = global_src[global];
-        const auto& partial = partials[src_slot.worker];
-        const size_t local = src_slot.local;
-        for (size_t a = 0; a < argument_count; ++a) {
-          finest.SlimCount(global, a) = partial.SlimCount(local, a);
-          finest.SlimIntTotal(global, a) = partial.SlimIntTotal(local, a);
-          finest.SlimDoubleTotal(global, a) = partial.SlimDoubleTotal(local, a);
-          finest.SlimFlags(global, a) = partial.SlimFlags(local, a);
+    group_pks[0] = std::move(packed_all);
+    RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t worker) {
+      const size_t chunk = nrows / finest_workers;
+      const size_t begin = chunk * worker;
+      const size_t end = worker + 1 == finest_workers ? nrows : begin + chunk;
+      size_t chunk_hint = 0;
+      for (size_t r = begin; r < end; ++r) {
+        if (is_columnar) {
+          finest.borrowed_key_row_ids[r] = static_cast<uint32_t>(r);
+        } else {
+          finest.borrowed_key_rows[r] = &input.rows[r];
+        }
+        add_finite_sum(finest, r, direct_arg_at(r, 0, &chunk_hint));
+        if (need_row_groups) {
+          row_groups[r] = r;
         }
       }
     }));
-  }
-  std::vector<GlobalSourceSlot>().swap(global_src);
-  if (need_row_groups) {
-    RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t w) {
-      const size_t begin = std::min(nrows, w * arg_chunk);
-      const size_t end = std::min(nrows, begin + arg_chunk);
-      for (size_t r = begin; r < end; ++r) {
-        row_groups[r] = global_ids[row_buckets[r]][local_groups[r]];
-      }
-    }));
+  } else {
+    RETURN_IF_FAIL(aggregate_finest());
   }
 
   // Pass 5: Build coarser grouping sets from packed uint64 group keys.
@@ -2356,6 +2406,12 @@ bool TryEvaluateTypedDoubleChunkRow(const TypedDoubleExprInput& expr,
   }
   std::array<double, 16> stack{};
   size_t sp = 0;
+  // Producers cap ops at 16 entries so pushes can never exceed the stack;
+  // keep that bound explicit here instead of relying on the upstream
+  // compiler invariant.
+  if (expr.ops.size() > stack.size()) {
+    return false;
+  }
   for (const TypedDoubleExprOp& op : expr.ops) {
     switch (op.kind) {
       case TypedDoubleExprOp::Kind::kLoadDoubleCol:
@@ -2698,9 +2754,233 @@ bool AccumulateCompactColumnarRow(
   return true;
 }
 
+// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// (columnar_null_indicator_popcount_sound)
+struct NullIndicatorBoolOp {
+  enum class Kind : uint8_t {
+    kColIsNull = 0,
+    kColIsNotNull = 1,
+    kNot = 2,
+    kAnd = 3,
+    kOr = 4,
+  } kind{Kind::kColIsNull};
+  slot_t col{0};
+};
+
+struct NullIndicatorCaseSpec {
+  bool valid{false};
+  std::vector<NullIndicatorBoolOp> rpn;
+  bool then_is_null{true};
+  int64_t then_int{0};
+  bool else_is_null{true};
+  int64_t else_int{0};
+};
+
+bool CompileNullIndicatorBoolRpn(const Expression& expr, const Schema& schema,
+                                 std::vector<NullIndicatorBoolOp>* out,
+                                 size_t depth = 0) {
+  if (!expr || depth > 32 || out->size() >= 32) {
+    return false;
+  }
+  if (expr->Type() == TypeTag::kUnaryExp) {
+    const UnaryExpression& ue = expr->AsUnaryExpression();
+    if (ue.Op() == UnaryOperation::kIsNull ||
+        ue.Op() == UnaryOperation::kIsNotNull) {
+      if (!ue.Child() || ue.Child()->Type() != TypeTag::kColumnValue) {
+        return false;
+      }
+      const auto col = LocalColumnOffset(
+          schema, ue.Child()->AsColumnValue().GetColumnName());
+      if (!col || *col >= schema.ColumnCount()) {
+        return false;
+      }
+      out->push_back(NullIndicatorBoolOp{
+          .kind = ue.Op() == UnaryOperation::kIsNull
+                      ? NullIndicatorBoolOp::Kind::kColIsNull
+                      : NullIndicatorBoolOp::Kind::kColIsNotNull,
+          .col = static_cast<slot_t>(*col),
+      });
+      return true;
+    }
+    if (ue.Op() == UnaryOperation::kNot) {
+      if (!CompileNullIndicatorBoolRpn(ue.Child(), schema, out, depth + 1)) {
+        return false;
+      }
+      out->push_back(
+          NullIndicatorBoolOp{.kind = NullIndicatorBoolOp::Kind::kNot});
+      return true;
+    }
+    return false;
+  }
+  if (expr->Type() == TypeTag::kBinaryExp) {
+    const BinaryExpression& be = expr->AsBinaryExpression();
+    if (be.Op() != BinaryOperation::kAnd && be.Op() != BinaryOperation::kOr) {
+      return false;
+    }
+    if (!CompileNullIndicatorBoolRpn(be.Left(), schema, out, depth + 1) ||
+        !CompileNullIndicatorBoolRpn(be.Right(), schema, out, depth + 1)) {
+      return false;
+    }
+    out->push_back(NullIndicatorBoolOp{
+        .kind = be.Op() == BinaryOperation::kAnd
+                    ? NullIndicatorBoolOp::Kind::kAnd
+                    : NullIndicatorBoolOp::Kind::kOr,
+    });
+    return true;
+  }
+  return false;
+}
+
+NullIndicatorCaseSpec TryBuildNullIndicatorCaseSpec(
+    const AggregateExpression* agg, SlimAggKind kind, const Schema& schema) {
+  NullIndicatorCaseSpec spec;
+  if (agg == nullptr ||
+      (kind != SlimAggKind::kCount && kind != SlimAggKind::kSumInt64) ||
+      agg->Distinct() || agg->HasWhereFilter() ||
+      agg->Having() != AggregateHavingModifier::kNone ||
+      !agg->InnerOrderBy().empty() || agg->InnerLimit().has_value() ||
+      !agg->Child() || agg->Child()->Type() != TypeTag::kCaseExp) {
+    return spec;
+  }
+  const CaseExpression& ce = agg->Child()->AsCaseExpression();
+  if (ce.when_clauses_.size() != 1) {
+    return spec;
+  }
+  const auto parse_branch = [&](const Expression& branch, bool* is_null,
+                                int64_t* int_val) -> bool {
+    if (!branch) {
+      *is_null = true;
+      *int_val = 0;
+      return true;
+    }
+    if (branch->Type() != TypeTag::kConstantValue) {
+      return false;
+    }
+    const Value& v = branch->AsConstantValue().GetValue();
+    if (v.IsNull()) {
+      *is_null = true;
+      *int_val = 0;
+      return true;
+    }
+    if (kind == SlimAggKind::kCount) {
+      *is_null = false;
+      *int_val = 1;
+      return true;
+    }
+    if (v.type == ValueType::kInt64 && !v.IsUnsigned()) {
+      *is_null = false;
+      *int_val = v.value.int_value;
+      return true;
+    }
+    return false;
+  };
+  if (!parse_branch(ce.when_clauses_[0].second, &spec.then_is_null,
+                    &spec.then_int) ||
+      !parse_branch(ce.else_clause_, &spec.else_is_null, &spec.else_int)) {
+    return spec;
+  }
+  if (!CompileNullIndicatorBoolRpn(ce.when_clauses_[0].first, schema,
+                                   &spec.rpn) ||
+      spec.rpn.empty()) {
+    return spec;
+  }
+  spec.valid = true;
+  return spec;
+}
+
+int64_t CountNullIndicatorTrueInSlice(const NullIndicatorCaseSpec& spec,
+                                      const ColumnarChunk& ch, size_t lr_start,
+                                      size_t take) noexcept {
+  if (take == 0) {
+    return 0;
+  }
+  // Check whether every referenced column has chunk-invariant nullness.
+  bool all_const_nullness = true;
+  for (const NullIndicatorBoolOp& op : spec.rpn) {
+    if (op.kind != NullIndicatorBoolOp::Kind::kColIsNull &&
+        op.kind != NullIndicatorBoolOp::Kind::kColIsNotNull) {
+      continue;
+    }
+    const ColumnarColumn& c = ch.columns[op.col];
+    if (c.encoding == ColumnarColumn::Encoding::kGathered || !c.is_uniform) {
+      all_const_nullness = false;
+      break;
+    }
+    const bool always_null =
+        c.type == ValueType::kNull ||
+        (c.encoding == ColumnarColumn::Encoding::kConstant && c.const_is_null);
+    const bool never_null = !always_null && !c.has_null;
+    if (!always_null && !never_null) {
+      all_const_nullness = false;
+      break;
+    }
+  }
+  std::array<bool, 32> st{};
+  if (all_const_nullness) {
+    size_t sp = 0;
+    for (const NullIndicatorBoolOp& op : spec.rpn) {
+      switch (op.kind) {
+        case NullIndicatorBoolOp::Kind::kColIsNull:
+        case NullIndicatorBoolOp::Kind::kColIsNotNull: {
+          const ColumnarColumn& c = ch.columns[op.col];
+          const bool is_null =
+              c.type == ValueType::kNull ||
+              (c.encoding == ColumnarColumn::Encoding::kConstant &&
+               c.const_is_null);
+          st[sp++] = (op.kind == NullIndicatorBoolOp::Kind::kColIsNull)
+                         ? is_null
+                         : !is_null;
+          break;
+        }
+        case NullIndicatorBoolOp::Kind::kNot:
+          st[sp - 1] = !st[sp - 1];
+          break;
+        case NullIndicatorBoolOp::Kind::kAnd:
+          st[sp - 2] = st[sp - 2] && st[sp - 1];
+          --sp;
+          break;
+        case NullIndicatorBoolOp::Kind::kOr:
+          st[sp - 2] = st[sp - 2] || st[sp - 1];
+          --sp;
+          break;
+      }
+    }
+    return st[0] ? static_cast<int64_t>(take) : 0;
+  }
+  int64_t true_count = 0;
+  for (size_t i = 0; i < take; ++i) {
+    const size_t lr = lr_start + i;
+    size_t sp = 0;
+    for (const NullIndicatorBoolOp& op : spec.rpn) {
+      switch (op.kind) {
+        case NullIndicatorBoolOp::Kind::kColIsNull:
+          st[sp++] = ch.columns[op.col].IsNull(lr);
+          break;
+        case NullIndicatorBoolOp::Kind::kColIsNotNull:
+          st[sp++] = !ch.columns[op.col].IsNull(lr);
+          break;
+        case NullIndicatorBoolOp::Kind::kNot:
+          st[sp - 1] = !st[sp - 1];
+          break;
+        case NullIndicatorBoolOp::Kind::kAnd:
+          st[sp - 2] = st[sp - 2] && st[sp - 1];
+          --sp;
+          break;
+        case NullIndicatorBoolOp::Kind::kOr:
+          st[sp - 2] = st[sp - 2] || st[sp - 1];
+          --sp;
+          break;
+      }
+    }
+    true_count += st[0] ? 1 : 0;
+  }
+  return true_count;
+}
+
 Status AccumulateScalarChunkSlice(
     const TypedAggregationPlan& plan,
     const std::vector<const AggregateExpression*>& aggregates,
+    const std::vector<NullIndicatorCaseSpec>& null_indicator_specs,
     const ColumnarChunk& ch, size_t lr_start, size_t take,
     bool reject_non_finite_double, TypedWorkerGroups* target, bool* non_finite,
     Status* error) {
@@ -2718,6 +2998,9 @@ Status AccumulateScalarChunkSlice(
       if (!item.column && !item.conditional && !item.int_expr && !item.child &&
           !item.double_expr && !item.coalesce_double &&
           kind == SlimAggKind::kCount) {
+        continue;
+      }
+      if (a < null_indicator_specs.size() && null_indicator_specs[a].valid) {
         continue;
       }
       if (item.column) {
@@ -2751,6 +3034,49 @@ Status AccumulateScalarChunkSlice(
     for (size_t a = 0; a < agg_count; ++a) {
       const auto& item = plan.aggregates[a];
       const SlimAggKind kind = plan.slim_kinds[a];
+      if (a < null_indicator_specs.size() && null_indicator_specs[a].valid) {
+        const NullIndicatorCaseSpec& spec = null_indicator_specs[a];
+        const int64_t m =
+            CountNullIndicatorTrueInSlice(spec, ch, lr_start, take);
+        const int64_t rem_false = static_cast<int64_t>(take) - m;
+        if (kind == SlimAggKind::kCount) {
+          target->SlimCount(0, a) +=
+              (spec.then_is_null ? 0 : m) + (spec.else_is_null ? 0 : rem_false);
+        } else {
+          int64_t add_total = 0;
+          int64_t add_cnt = 0;
+          if (!spec.then_is_null && m > 0) {
+            int64_t prod = 0;
+            if (__builtin_mul_overflow(m, spec.then_int, &prod) ||
+                __builtin_add_overflow(add_total, prod, &add_total)) {
+              *error = StatusError(StatusCode::kIsInfinity,
+                                   "integer overflow in SUM");
+              return *error;
+            }
+            add_cnt += m;
+          }
+          if (!spec.else_is_null && rem_false > 0) {
+            int64_t prod = 0;
+            if (__builtin_mul_overflow(rem_false, spec.else_int, &prod) ||
+                __builtin_add_overflow(add_total, prod, &add_total)) {
+              *error = StatusError(StatusCode::kIsInfinity,
+                                   "integer overflow in SUM");
+              return *error;
+            }
+            add_cnt += rem_false;
+          }
+          int64_t next_total = 0;
+          if (__builtin_add_overflow(target->SlimIntTotal(0, a), add_total,
+                                     &next_total)) {
+            *error =
+                StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+            return *error;
+          }
+          target->SlimIntTotal(0, a) = next_total;
+          target->SlimCount(0, a) += add_cnt;
+        }
+        continue;
+      }
       if (!item.column && !item.double_expr && !item.coalesce_double) {
         target->SlimCount(0, a) += static_cast<int64_t>(take);
         continue;
@@ -3084,13 +3410,35 @@ StatusOr<std::optional<Relation>> TryCompactColumnarScalarAggregate(
     groups.AppendNonSlimGroup({}, agg_count, aggregates);
   }
 
+  std::vector<NullIndicatorCaseSpec> null_indicator_specs;
+  if (plan.slim && groups.mixed_numeric_sums.empty()) {
+    null_indicator_specs.resize(agg_count);
+    for (size_t a = 0; a < agg_count; ++a) {
+      null_indicator_specs[a] = TryBuildNullIndicatorCaseSpec(
+          aggregates[a], plan.slim_kinds[a], input.schema);
+    }
+  }
+
   const size_t max_workers =
       QueryParallelWorkerLimit(std::thread::hardware_concurrency());
-  const bool can_parallel_scalar =
-      plan.slim && total_rows >= 32768 && max_workers > 1 &&
-      std::ranges::none_of(plan.slim_kinds, [](SlimAggKind kind) {
-        return kind == SlimAggKind::kSumInt64 || IsSlimDistinctKind(kind);
-      });
+  bool parallel_sum_int_safe = true;
+  for (size_t a = 0; a < plan.slim_kinds.size(); ++a) {
+    const SlimAggKind kind = plan.slim_kinds[a];
+    if (IsSlimDistinctKind(kind)) {
+      parallel_sum_int_safe = false;
+      break;
+    }
+    if (kind == SlimAggKind::kSumInt64) {
+      if (a >= null_indicator_specs.size() || !null_indicator_specs[a].valid ||
+          null_indicator_specs[a].then_int < 0 ||
+          null_indicator_specs[a].else_int < 0) {
+        parallel_sum_int_safe = false;
+        break;
+      }
+    }
+  }
+  const bool can_parallel_scalar = plan.slim && total_rows >= 32768 &&
+                                   max_workers > 1 && parallel_sum_int_safe;
   bool parallel_done = false;
   if (can_parallel_scalar) {
     const size_t workers =
@@ -3118,9 +3466,9 @@ StatusOr<std::optional<Relation>> TryCompactColumnarScalarAggregate(
           const ColumnarChunk& ch = columnar.chunks[ci];
           const size_t take = std::min(rem, ch.rows - lr_start);
           bool nf = false;
-          Status st =
-              AccumulateScalarChunkSlice(plan, aggregates, ch, lr_start, take,
-                                         true, &partials[w], &nf, &errors[w]);
+          Status st = AccumulateScalarChunkSlice(
+              plan, aggregates, null_indicator_specs, ch, lr_start, take, true,
+              &partials[w], &nf, &errors[w]);
           if (!st.ok()) {
             if (errors[w].ok()) {
               errors[w] = st;
@@ -3175,8 +3523,9 @@ StatusOr<std::optional<Relation>> TryCompactColumnarScalarAggregate(
       }
       bool dummy_nf = false;
       Status err{Status::kSuccess};
-      Status st = AccumulateScalarChunkSlice(plan, aggregates, ch, 0, ch.rows,
-                                             false, &groups, &dummy_nf, &err);
+      Status st = AccumulateScalarChunkSlice(
+          plan, aggregates, null_indicator_specs, ch, 0, ch.rows, false,
+          &groups, &dummy_nf, &err);
       RETURN_IF_FAIL(st);
       RETURN_IF_FAIL(err);
     }
@@ -3244,8 +3593,8 @@ class ColumnarGroupLookup {
       const ColumnarColumn& col = ch.columns[(*loc_.key_offsets)[0]];
       if (col.type == ValueType::kNull || col.IsNull(lr)) {
         if (null_group_ == SIZE_MAX) {
-          null_group_ =
-              AllocateNewGroup(global_r, ci, lr, hash, new_group, new_group_ctx);
+          null_group_ = AllocateNewGroup(global_r, ci, lr, hash, new_group,
+                                         new_group_ctx);
           *inserted = true;
         } else {
           *inserted = false;
@@ -3256,8 +3605,8 @@ class ColumnarGroupLookup {
       bool map_inserted = false;
       size_t* slot = int_map_.TryEmplace(kv, &map_inserted);
       if (map_inserted) {
-        *slot = AllocateNewGroup(global_r, ci, lr, hash, new_group,
-                                 new_group_ctx);
+        *slot =
+            AllocateNewGroup(global_r, ci, lr, hash, new_group, new_group_ctx);
       }
       *inserted = map_inserted;
       return *slot;
@@ -3424,8 +3773,9 @@ struct CheckedSumProbeCtx {
 // the canonical running state over every row of this group that precedes
 // the merge point (carry sum + non-NULL count). `stats` is indexed by
 // measure slot; only checked-SUM slots are read.
-inline void SeedCheckedSumGroup(void* ctx, size_t group, uint32_t /*unused*/, size_t /*unused*/,
-                                size_t /*unused*/, size_t /*unused*/) {
+inline void SeedCheckedSumGroup(void* ctx, size_t group, uint32_t /*unused*/,
+                                size_t /*unused*/, size_t /*unused*/,
+                                size_t /*unused*/) {
   const CheckedSumProbeCtx& probe =
       *static_cast<const CheckedSumProbeCtx*>(ctx);
   if (group >= probe.stats->size()) {
@@ -3443,8 +3793,9 @@ inline void SeedCheckedSumGroup(void* ctx, size_t group, uint32_t /*unused*/, si
 }
 
 // on_new_group hook: records the row id that materialized each group.
-inline void PushCarryFirstRow(void* ctx, size_t /*unused*/, uint32_t global_r, size_t /*unused*/,
-                              size_t /*unused*/, size_t /*unused*/) {
+inline void PushCarryFirstRow(void* ctx, size_t /*unused*/, uint32_t global_r,
+                              size_t /*unused*/, size_t /*unused*/,
+                              size_t /*unused*/) {
   static_cast<std::vector<uint32_t>*>(ctx)->push_back(global_r);
 }
 
@@ -3522,7 +3873,7 @@ Status CollectCheckedSumRangeStats(
           continue;
         }
         if (!col.is_uniform || col.is_unsigned ||
-              col.type != ValueType::kInt64) {
+            col.type != ValueType::kInt64) {
           out->clear();  // not a plain int64 column; fall back to serial
           return Status::kSuccess;
         }
@@ -3892,22 +4243,20 @@ StatusOr<std::optional<Relation>> TryCompactColumnarKeyedAggregate(
             for (size_t g = 0; g < range_first[w].size(); ++g) {
               const uint32_t r = range_first[w][g];
               size_t hint = 0;
-              const auto [ci, lr] =
-                  TypedWorkerGroups::LocateColumnarChunkRow(chunk_prefix, r,
-                                                            &hint);
+              const auto [ci, lr] = TypedWorkerGroups::LocateColumnarChunkRow(
+                  chunk_prefix, r, &hint);
               bool inserted = false;
               carry_gid[w][g] =
                   carry_lookup.FindOrInsert(r, ci, lr, hashes[r], &inserted);
             }
           }
           for (size_t w = 0; w < workers; ++w) {
-            skew_carry[w].resize(
-                range_stats[w].size(),
-                std::vector<CheckedSumRangeStats>(agg_count));
+            skew_carry[w].resize(range_stats[w].size(),
+                                 std::vector<CheckedSumRangeStats>(agg_count));
           }
-          RETURN_IF_FAIL(MergeCheckedSumRanges(
-              workers, range_stats, carry_gid, carry_groups.GroupCount(),
-              checked_idx, &skew_carry));
+          RETURN_IF_FAIL(MergeCheckedSumRanges(workers, range_stats, carry_gid,
+                                               carry_groups.GroupCount(),
+                                               checked_idx, &skew_carry));
           skewed = true;
           skew_carry_ready = true;
         }
@@ -4865,13 +5214,18 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
 // Accumulators still receive the original rows in original order.
 StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     TransactionContext& context,
-    const std::vector<const SelectStatement*>& sets, Relation& input) {
+    const std::vector<const SelectStatement*>& sets, Relation& input,
+    bool finest_keys_unique) {
   if (sets.size() < 3 || sets.size() > 32 || input.HasSpill()) {
     return std::optional<std::vector<Relation>>{};
   }
   if (input.HasColumnarOnly() &&
       input.TotalRows() > std::numeric_limits<uint32_t>::max()) {
-    input.EnsureRowsMaterialized();
+    // T4539: bail out of the compaction (not a wrong answer: the generic
+    // path takes over) instead of compacting over an empty row set.
+    if (!input.EnsureRowsMaterialized().ok()) {
+      return std::optional<std::vector<Relation>>{};
+    }
   }
   const bool is_columnar_input = input.HasColumnarOnly();
   const size_t total_rows = input.TotalRows();
@@ -5937,11 +6291,11 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     const auto add_finite_sum = [no_nulls](TypedWorkerGroups& local,
                                            size_t group, const Value& value) {
       if (!no_nulls && !value.IsNull()) {
-        local.slim_counts[group] = 1;
+        local.SlimCount(group, 0) = 1;
       }
       if (value.type == ValueType::kDouble) {
-        local.slim_double_totals[group] += value.value.double_value;
-        local.slim_flags[group] = 2;
+        local.SlimDoubleTotal(group, 0) += value.value.double_value;
+        local.SlimFlags(group, 0) |= 2;
       }
     };
     std::vector<size_t> row_groups;
@@ -5963,14 +6317,15 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
           input, chunk_prefix, plans, groups[0].mixed_numeric_sums, agg_workers,
           arg_chunk, argument_count, all_direct_args, worker_arguments,
           flat_double_args, flat_arg_kinds, exact_partial_merge, finite_sum,
-          all_double, no_nulls, groups, row_groups, coarse_maps);
+          all_double, no_nulls, finest_keys_unique, groups, row_groups,
+          coarse_maps);
       RETURN_IF_FAIL(packed_or.GetStatus());
       packed_done = packed_or.MoveValue();
     }
     const size_t finest_workers = std::min<size_t>(8, agg_workers);
     if (!packed_done) {
       if (input.HasColumnarOnly()) {
-        input.EnsureRowsMaterialized();
+        RETURN_IF_FAIL(input.EnsureRowsMaterialized());
       }
       const bool use_flat = !flat_double_args.empty();
       const auto get_arg_val = [&](size_t r, size_t a) -> Value {
@@ -6669,11 +7024,11 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
               for (size_t r = 0; r < total_rows; ++r) {
                 const size_t group = coarse_groups[row_groups[r]];
                 if (!no_nulls && f_k[r] != 0) {
-                  local.slim_counts[group] = 1;
+                  local.SlimCount(group, 0) = 1;
                 }
                 if (f_k[r] == 1) {
-                  local.slim_double_totals[group] += f_v[r];
-                  local.slim_flags[group] = 2;
+                  local.SlimDoubleTotal(group, 0) += f_v[r];
+                  local.SlimFlags(group, 0) |= 2;
                 }
               }
             } else {
@@ -6785,7 +7140,7 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     std::vector<uint8_t>().swap(flat_arg_kinds);
     argument_charge.reset();
     if (input.HasColumnarOnly()) {
-      input.EnsureRowsMaterialized();
+      RETURN_IF_FAIL(input.EnsureRowsMaterialized());
     }
     std::vector<size_t> mapping;
     std::vector<Value> keys, coarse, values;
@@ -6861,6 +7216,7 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
       std::string_view name;
       bool is_null{false};
       bool is_int{false};
+      bool is_unsigned{false};  // signed -1 and UINT64_MAX are distinct keys
       int64_t int_key{0};
       std::vector<RankRef> rows;
     };
@@ -6883,17 +7239,18 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
         return id;
       }
 
-      size_t FindOrAddInt(int64_t key) {
+      size_t FindOrAddInt(int64_t key, bool is_unsigned = false) {
         if (cats.size() <= 8 && int_ids.empty()) {
           for (size_t i = 0; i < cats.size(); ++i) {
-            if (cats[i].is_int && cats[i].int_key == key) {
+            if (cats[i].is_int && cats[i].is_unsigned == is_unsigned &&
+                cats[i].int_key == key) {
               return i;
             }
           }
         } else {
           if (int_ids.empty()) {
             for (size_t i = 0; i < cats.size(); ++i) {
-              if (cats[i].is_int) {
+              if (cats[i].is_int && !cats[i].is_unsigned) {
                 int_ids.emplace(cats[i].int_key, i);
               }
             }
@@ -6904,6 +7261,7 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
         }
         Category cat;
         cat.is_int = true;
+        cat.is_unsigned = is_unsigned;
         cat.int_key = key;
         const size_t id = cats.size();
         if (!int_ids.empty() || cats.size() >= 8) {
@@ -6963,7 +7321,7 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
           return FindOrAddNull();
         }
         if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
-          return FindOrAddInt(value.value.int_value);
+          return FindOrAddInt(value.value.int_value, value.IsUnsigned());
         }
         if (value.type == ValueType::kVarChar) {
           return FindOrAddString(value.value.varchar_value);
@@ -7094,7 +7452,8 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
             if (src.is_null) {
               cat_map[w][lc] = merged_categories.FindOrAddNull();
             } else if (src.is_int) {
-              cat_map[w][lc] = merged_categories.FindOrAddInt(src.int_key);
+              cat_map[w][lc] =
+                  merged_categories.FindOrAddInt(src.int_key, src.is_unsigned);
             } else {
               cat_map[w][lc] = merged_categories.FindOrAddString(src.name);
             }
@@ -7170,9 +7529,8 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     for (size_t s = 0; s < count; ++s) {
       if (groups[s].GroupCount() == 0 && sets[s]->IsGroupAll()) {
         bool inserted = false;
-        static_cast<void>(groups[s].FindOrInsert(
-            {}, 0, aggregates[s].size(), aggregates[s], &inserted));
-
+        static_cast<void>(groups[s].FindOrInsert({}, 0, aggregates[s].size(),
+                                                 aggregates[s], &inserted));
       }
     }
     if (shaped) {

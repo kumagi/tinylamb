@@ -84,7 +84,13 @@ std::vector<MirrorRow> MirrorFromSetup(const std::vector<std::string>& setup,
       if (v.substr(i).starts_with("FALSE")) {
         return 0;
       }
-      return std::stoll(v.substr(i));
+      size_t used = 0;
+      try {
+        const int64_t parsed = std::stoll(v.substr(i), &used);
+        return used == v.size() - i ? parsed : kNull;
+      } catch (const std::exception&) {
+        return kNull;
+      }
     };
     MirrorRow m;
     m.u = to_int(fields[0]);
@@ -133,7 +139,16 @@ bool ParseProbeSpec(const std::string& spec, int* kind, int64_t* p1,
     if (bar == std::string::npos) {
       return false;
     }
-    val = std::stoll(spec.substr(pos, bar - pos));
+    const std::string field = spec.substr(pos, bar - pos);
+    size_t used = 0;
+    try {
+      val = std::stoll(field, &used);
+    } catch (const std::exception&) {
+      return false;
+    }
+    if (used != field.size()) {
+      return false;
+    }
     pos = bar + 1;
   }
   *kind = static_cast<int>(vals[0]);
@@ -1084,8 +1099,10 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
       break;
     }
   }
-  if (lst_ready) {
-    (void)ctx.txn_.PreCommit();
+  // T4569: a failed setup commit leaves the shadow table invisible to the
+  // fresh context below; treat it exactly like the RunUpdate failures above
+  // and skip the LST probe family instead of probing an uncommitted setup.
+  if (lst_ready && ctx.txn_.PreCommit() == Status::kSuccess) {
     ctx = db.BeginContext();
   }
 
@@ -1311,8 +1328,10 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
   {
     const std::string tab_suf = tab + "_1";
     if (RunUpdate(db, ctx, "CREATE TABLE " + tab_suf + " (x INT64);") &&
-        RunUpdate(db, ctx, "INSERT INTO " + tab_suf + " VALUES (0), (1);")) {
-      (void)ctx.txn_.PreCommit();
+        RunUpdate(db, ctx, "INSERT INTO " + tab_suf + " VALUES (0), (1);") &&
+        // T4569: same rule as the LST family above -- probes that depend on
+        // this setup run only when the commit actually landed.
+        ctx.txn_.PreCommit() == Status::kSuccess) {
       ctx = db.BeginContext();
       const std::array<std::string, 2> suf_probes = {
           "SELECT " + tab + ".u, " + tab + ".a FROM " + tab + " LEFT JOIN " +
@@ -1762,9 +1781,18 @@ bool CheckDqe(Database& db, TransactionContext& ctx, const OracleTrace& t,
     }
     return false;
   }
-  const int64_t cp = std::stoll(*count_p);
-  const int64_t ca = std::stoll(*count_all);
-  const int64_t cr = std::stoll(*count_after);
+  const auto parse_count = [](const std::string& text) -> int64_t {
+    size_t used = 0;
+    try {
+      const int64_t v = std::stoll(text, &used);
+      return used == text.size() ? v : 0;
+    } catch (const std::exception&) {
+      return 0;
+    }
+  };
+  const int64_t cp = parse_count(*count_p);
+  const int64_t ca = parse_count(*count_all);
+  const int64_t cr = parse_count(*count_after);
   if (cr == ca - cp) {
     return true;
   }

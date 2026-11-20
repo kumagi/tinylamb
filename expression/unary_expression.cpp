@@ -40,13 +40,35 @@ StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
     case UnaryOperation::kIsNotNull:
       return Value(!child.IsNull());
     case UnaryOperation::kIsTrue:
-      return Value(!child.IsNull() && child.Truthy());
     case UnaryOperation::kIsNotTrue:
-      return Value(child.IsNull() || !child.Truthy());
     case UnaryOperation::kIsFalse:
-      return Value(!child.IsNull() && !child.Truthy());
-    case UnaryOperation::kIsNotFalse:
-      return Value(child.IsNull() || child.Truthy());
+    case UnaryOperation::kIsNotFalse: {
+      // T3698: IS [NOT] TRUE/FALSE is a three-valued-logic predicate over
+      // BOOL. The engine carries BOOL as INT64 0/1 (no separate ValueType),
+      // so kInt64 stays accepted -- but VARCHAR/DOUBLE/DATE/ARRAY can never
+      // be BOOL and used to pass through Truthy() (`'abc' IS FALSE` quietly
+      // evaluated FALSE instead of failing like GoogleSQL's signature check).
+      if (child.type != ValueType::kInt64 && !child.IsNull()) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            std::string(operation == UnaryOperation::kIsTrue ||
+                                operation == UnaryOperation::kIsNotTrue
+                            ? "IS TRUE"
+                            : "IS FALSE") +
+                " requires a BOOL operand");
+      }
+      // Three-valued logic: the bare forms are FALSE on NULL, the negated
+      // forms TRUE on NULL; over a non-NULL operand IS TRUE / IS NOT FALSE
+      // follow Truthy(), IS FALSE / IS NOT TRUE its negation.
+      if (child.IsNull()) {
+        const bool negated = operation == UnaryOperation::kIsNotTrue ||
+                             operation == UnaryOperation::kIsNotFalse;
+        return Value(negated);
+      }
+      const bool truthy_following = operation == UnaryOperation::kIsTrue ||
+                                    operation == UnaryOperation::kIsNotFalse;
+      return Value(truthy_following ? child.Truthy() : !child.Truthy());
+    }
     case UnaryOperation::kNot:
       return child.IsNull() ? Value() : Value(!child.Truthy());
     case UnaryOperation::kMinus:
@@ -60,6 +82,8 @@ StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
         if (child.IsUnsigned()) {
           const auto u = static_cast<uint64_t>(child.value.int_value);
           if (u == 0) {
+            // -0 keeps the operand's UINT64 type (UnaryResultType returns the
+            // child type), so the value keeps its unsigned tag.
             return child;
           }
           return StatusError(StatusCode::kIsInfinity,
@@ -106,6 +130,15 @@ Type UnaryResultType(UnaryOperation operation, const Type& child) {
       operation == UnaryOperation::kNot) {
     return {TypeTag::kBigInt};
   }
+  if (operation == UnaryOperation::kMinus &&
+      child.GetType() != TypeTag::kBigInt &&
+      child.GetType() != TypeTag::kDouble) {
+    return {TypeTag::kInvalid};
+  }
+  if (operation == UnaryOperation::kBitwiseNot &&
+      child.GetType() != TypeTag::kBigInt) {
+    return {TypeTag::kInvalid};
+  }
   return child;
 }
 
@@ -138,6 +171,24 @@ Value UnaryExpression::Evaluate(const Row* left, const Schema& left_schema,
                                 const Row* right,
                                 const Schema& right_schema) const {
   return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "UnaryExpression::Evaluate");
+}
+
+// Context-aware form: same semantics as the plain evaluator with the
+// context threaded into the child (A1 stage 2).  Without this override the
+// base default drops the context into the 2-arg evaluator, so a subquery
+// under NOT / IS NULL reports "query expression requires an evaluation
+// context" even at a context root.
+StatusOr<Value> UnaryExpression::TryEvaluate(const Row& row,
+                                             const Schema& schema,
+                                             EvaluationContext& context) const {
+  ASSIGN_OR_RETURN(Value, child, child_->TryEvaluate(row, schema, context));
+  return TryEvaluateUnary(operation_, child);
+}
+
+Value UnaryExpression::Evaluate(const Row& row, const Schema& schema,
+                                EvaluationContext& context) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
                        "UnaryExpression::Evaluate");
 }
 

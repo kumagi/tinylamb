@@ -13,6 +13,7 @@
 #endif
 
 #include <algorithm>
+#include <ranges>
 #include <array>
 #include <bit>
 #include <cctype>
@@ -93,6 +94,127 @@
 namespace tinylamb::relational_detail {
 
 namespace {
+
+// T2234/T2238: code-point split + Levenshtein for the batch evaluator;
+// semantics (valid UTF-8 -> code points, invalid bytes pass through as the
+// engine's BYTES spelling) are mirrored exactly from the canonical
+// evaluator's CodePointsOf/LevenshteinCodePoints in
+// expression/function_call_expression.cpp so differential evaluation of
+// TO_CODE_POINTS / EDIT_DISTANCE cannot drift between lanes.
+[[nodiscard]] std::optional<std::pair<uint32_t, size_t>> DecodeUtf8Pair(
+    std::string_view value, size_t offset) {
+  if (offset >= value.size()) {
+    return std::nullopt;
+  }
+  const auto byte_at = [&](size_t index) {
+    return static_cast<unsigned char>(value[index]);
+  };
+  const auto first = byte_at(offset);
+  if (first <= 0x7F) {
+    return std::pair<uint32_t, size_t>{first, 1};
+  }
+  if (first >= 0xC2 && first <= 0xDF && offset + 1 < value.size() &&
+      (byte_at(offset + 1) & 0xC0) == 0x80) {
+    return std::pair<uint32_t, size_t>{
+        static_cast<uint32_t>(((first & 0x1F) << 6) |
+                              (byte_at(offset + 1) & 0x3F)),
+        2};
+  }
+  if (first >= 0xE0 && first <= 0xEF && offset + 2 < value.size() &&
+      (byte_at(offset + 1) & 0xC0) == 0x80 &&
+      (byte_at(offset + 2) & 0xC0) == 0x80) {
+    const auto cp = static_cast<uint32_t>(((first & 0x0F) << 12) |
+                                          ((byte_at(offset + 1) & 0x3F) << 6) |
+                                          (byte_at(offset + 2) & 0x3F));
+    if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) {
+      return std::nullopt;
+    }
+    return std::pair<uint32_t, size_t>{cp, 3};
+  }
+  if (first >= 0xF0 && first <= 0xF4 && offset + 3 < value.size() &&
+      (byte_at(offset + 1) & 0xC0) == 0x80 &&
+      (byte_at(offset + 2) & 0xC0) == 0x80 &&
+      (byte_at(offset + 3) & 0xC0) == 0x80) {
+    const auto cp = static_cast<uint32_t>(
+        ((first & 0x07) << 18) | ((byte_at(offset + 1) & 0x3F) << 12) |
+        ((byte_at(offset + 2) & 0x3F) << 6) | (byte_at(offset + 3) & 0x3F));
+    if (cp < 0x10000 || cp > 0x10FFFF) {
+      return std::nullopt;
+    }
+    return std::pair<uint32_t, size_t>{cp, 4};
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::vector<uint32_t> CodePointsOfBatch(std::string_view value) {
+  std::vector<uint32_t> out;
+  size_t offset = 0;
+  while (offset < value.size()) {
+    const auto decoded = DecodeUtf8Pair(value, offset);
+    if (decoded.has_value()) {
+      out.push_back(decoded->first);
+      offset += decoded->second;
+    } else {
+      out.push_back(static_cast<unsigned char>(value[offset]));
+      ++offset;
+    }
+  }
+  return out;
+}
+
+[[nodiscard]] int64_t LevenshteinCodePointsBatch(std::string_view left,
+                                                 std::string_view right) {
+  const std::vector<uint32_t> a = CodePointsOfBatch(left);
+  const std::vector<uint32_t> b = CodePointsOfBatch(right);
+  std::vector<int64_t> prev(b.size() + 1);
+  std::vector<int64_t> cur(b.size() + 1);
+  for (size_t j = 0; j <= b.size(); ++j) {
+    prev[j] = static_cast<int64_t>(j);
+  }
+  for (size_t i = 1; i <= a.size(); ++i) {
+    cur[0] = static_cast<int64_t>(i);
+    for (size_t j = 1; j <= b.size(); ++j) {
+      const int64_t substitution = prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1);
+      cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, substitution});
+    }
+    prev.swap(cur);
+  }
+  return prev[b.size()];
+}
+
+// T1653: the per-arm to_i64 conversion lambdas were copy-pasted verbatim
+// across the string-function arms; give each distinct contract one home so
+// a fix lands everywhere at once.
+//
+// Strict variant: only INT64 converts; every other input yields `def`
+// (the historical SUBSTR/byte_substr position & length contract).
+[[nodiscard]] int64_t ToInt64Exact(const Value& v, int64_t def) {
+  return v.type == ValueType::kInt64 ? v.value.int_value : def;
+}
+
+// Lenient variant: INT64 passes through, DOUBLE saturates, and canonical
+// INT64 text parses in place; anything else yields `def` ('2junk' does NOT
+// read as 2).
+[[nodiscard]] int64_t ToInt64WithText(const Value& v, int64_t def) {
+  if (v.type == ValueType::kInt64) {
+    return v.value.int_value;
+  }
+  if (v.type == ValueType::kDouble) {
+    return SaturatingDoubleToInt64(v.value.double_value);
+  }
+  if (v.type == ValueType::kVarChar) {
+    // from_chars parses the string_view in place (no per-row heap copy)
+    // and requiring end-of-token keeps '2junk' from reading as 2.
+    const std::string_view text = v.value.varchar_value;
+    int64_t parsed = 0;
+    const auto [end, ec] =
+        std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (ec == std::errc() && end == text.data() + text.size()) {
+      return parsed;
+    }
+  }
+  return def;
+}
 
 struct CivilTime {
   int year{1970};
@@ -404,10 +526,11 @@ bool FormatTimeYieldsEmpty(std::string_view fmt) {
 // so the offset must be removed here. Zone-less text is already civil time.
 StatusOr<CivilTime> ExplicitZoneTextToUtcCivil(std::string_view text,
                                                CivilTime ct) {
-  if (text.size() <= 10) {
+  // Time-only spellings place the zone marker at index 8, not 10.
+  if (text.size() <= 8) {
     return ct;
   }
-  for (size_t i = 10; i < text.size(); ++i) {
+  for (size_t i = 8; i < text.size(); ++i) {
     if ((text[i] != '+' && text[i] != '-') || i + 1 >= text.size() ||
         std::isdigit(static_cast<unsigned char>(text[i + 1])) == 0) {
       continue;
@@ -431,17 +554,19 @@ StatusOr<CivilTime> TryValueToCivilTime(const Value& val) {
     ct.day = static_cast<int>(static_cast<unsigned>(ymd.day()));
     return ct;
   }
-  if (val.type == ValueType::kVarChar) {
-    if (ParseCivilTime(val.value.varchar_value, &ct)) {
-      return ExplicitZoneTextToUtcCivil(val.value.varchar_value, ct);
-    }
+  if (val.type != ValueType::kVarChar) {
+    // The AST evaluator rejects other types outright; re-parsing AsString()
+    // here accepted INT64/DOUBLE/ARRAY display text and diverged in both
+    // accepted inputs and error messages.
+    return StatusError(StatusCode::kInvalidArgument,
+                       "requires DATE, DATETIME or TIMESTAMP");
   }
-  std::string s = val.AsString();
-  if (ParseCivilTime(s, &ct)) {
-    return ExplicitZoneTextToUtcCivil(s, ct);
+  if (ParseCivilTime(val.value.varchar_value, &ct)) {
+    return ExplicitZoneTextToUtcCivil(val.value.varchar_value, ct);
   }
   return StatusError(StatusCode::kInvalidArgument,
-                     "requires DATE, DATETIME or TIMESTAMP");
+                     "invalid DATE, DATETIME or TIMESTAMP value: " +
+                         std::string(val.value.varchar_value));
 }
 
 platform::Int128 CivilTimeToNanos(const CivilTime& ct) {
@@ -877,7 +1002,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       Schema dummy_schema;
       Expression checked =
           CastExpressionExp(ConstantValueExp(value), enum_type, false);
-      static_cast<void>(checked->TryEvaluate(dummy_row, dummy_schema));
+      // Match the AST canonical path: an invalid enum member/out-of-range
+      // ordinal must fail the guard instead of being silently discarded.
+      ASSIGN_OR_RETURN(Value, validated,
+                       (checked->TryEvaluate(dummy_row, dummy_schema)));
+      (void)validated;
     }
     if (expected == 3) {
       return TryEvaluate(args[2], scope, aggregates, context, ctes);
@@ -1184,10 +1313,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   }
   std::vector<Value> arguments;
   arguments.reserve(call.Args().size());
-  const bool truncates_civil_time = name_view == "date_trunc" ||
-                                    name_view == "datetime_trunc" ||
-                                    name_view == "timestamp_trunc" ||
-                                    name_view == "last_day";
+  const bool truncates_civil_time =
+      name_view == "date_trunc" || name_view == "datetime_trunc" ||
+      name_view == "timestamp_trunc" || name_view == "last_day";
   for (const Expression& argument : call.Args()) {
     // The second operand is a date-part token, not a row reference. Looking
     // up MINUTE in a wide row can otherwise synthesize a whole-row STRUCT
@@ -1221,23 +1349,22 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         continue;
       }
       const std::string text = raw_str(element);
-      if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "__pipe_concat requires STRUCT elements");
-      }
       Value a;
       Value b;
-      const std::string body = text.substr(1, text.size() - 2);
-      const std::vector<std::pair<std::string, std::string>> members =
-          SplitJsonObjectMembers(body);
-      for (const auto& [key, member] : members) {
+      // Same contract as the AST arm (invariant 3): a non-`{...}` element is
+      // parsed leniently as its whole body (proto-text shapes like
+      // `a: 1 b: 2`), and member keys match case-insensitively.
+      const std::string body = text.size() >= 2 && text.front() == '{'
+                                   ? text.substr(1, text.size() - 2)
+                                   : text;
+      for (const auto& [key, member] : SplitJsonObjectMembers(body)) {
         Value parsed;
         if (!JsonTextToValue(member, &parsed)) {
           continue;
         }
-        if (key == "a") {
+        if (IdentifierEquals(key, "a")) {
           a = std::move(parsed);
-        } else if (key == "b") {
+        } else if (IdentifierEquals(key, "b")) {
           b = std::move(parsed);
         }
       }
@@ -1252,7 +1379,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (!result.empty()) {
         result += separator;
       }
-      result += pair.a + "," + pair.b;
+      result.append(pair.a).append(1, ',').append(pair.b);
     }
     return Value(std::move(result));
   }
@@ -1301,7 +1428,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value();
       }
       std::string tz_str = raw_str(arguments[1]);
-      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
+      // T4097: mirror of the AST arm -- the two-argument form renders a
+      // TIMESTAMP instant, so resolve the zone's offset AT that instant
+      // (FORMAT_TIMESTAMP semantics), not as local wall-clock fields.
+      ASSIGN_OR_RETURN(int, tz_offset_sec,
+                       (ParseTimeZoneOffset(tz_str, &ct, /*at_utc=*/true)));
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
       int rem_mins = (tz_offset_sec % 3600) / 60;
       if (rem_mins != 0) {
@@ -1393,7 +1524,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::weekday{std::chrono::sys_days{year_start}}.c_encoding());
       int yday =
           static_cast<int>((sd - std::chrono::sys_days{year_start}).count());
-      int week_num = (yday + start_wd) / 7;
+      // GoogleSQL WEEK: days before the first Sunday are week 0.
+      const int first_sunday = (7 - start_wd) % 7;
+      int week_num =
+          yday < first_sunday
+              ? 0
+              : (yday - first_sunday) /  // NOLINT(readability-math-missing-parentheses)
+                        7 +  // NOLINT(readability-math-missing-parentheses)
+                    1;       // NOLINT(readability-math-missing-parentheses)
       return Value(static_cast<int64_t>(week_num));
     }
     if (name_view.starts_with("extract_week(")) {
@@ -1438,7 +1576,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(static_cast<int64_t>(wd + 1));
     }
     if (name_view == "extract_weekday") {
-      // BigQuery WEEKDAY: Monday = 1 ... Sunday = 7 (ISO encoding).
+      // WEEKDAY: Monday = 1 ... Sunday = 7 (ISO encoding). DAYOFWEEK above is
+      // the Sunday = 1 form; c_encoding() here returned Sunday = 0.
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
@@ -1492,7 +1631,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "__struct_set requires 3 arguments");
     }
-    return StructSetField(arguments[0], raw_str(arguments[1]), arguments[2]);
+    // T2398: call the StatusOr route directly; the throwing
+    // StructSetField shim leaked std::runtime_error across the
+    // StatusOr evaluation boundary (invariant #1).
+    return TryStructSetField(arguments[0], raw_str(arguments[1]), arguments[2]);
   }
   if (name_view == "error") {
     // Unreachable in valid plans unless evaluated: raise the requested
@@ -1528,9 +1670,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (val.type == ValueType::kVarChar) {
       std::string_view s = val.value.varchar_value;
-      if (s.size() >= 10 && s[4] == '-' && s[7] == '-') {
+      if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
         return TryParseDateDays(s.substr(0, 10));
       }
+      // Only a bare YYYY-MM-DD is a DATE; a timestamp spelling must fall
+      // through to the caller's TIMESTAMP handling instead of being silently
+      // truncated at the date part.
       return TryParseDateDays(s);
     }
     return StatusError(StatusCode::kInvalidArgument, "requires DATE");
@@ -1568,6 +1713,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     ASSIGN_OR_RETURN(int64_t, days, (parse_date_val(arguments[0])));
+    if (days < -11000000 || days > 11000000) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DATE_FROM_UNIX_DATE: day count out of range");
+    }
     return Value::DateFromDays(days);
   }
   if (name_view == "current_time") {
@@ -1578,15 +1727,28 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 1 && arguments[0].IsNull()) {
       return Value();
     }
+    // T3882: resolve the zone offset at the current instant, not at the
+    // one-argument ParseTimeZoneOffset default of 2000-01-01 (whose DST
+    // state is fixed and wrong inside DST by an hour); same fix
+    // CURRENT_DATETIME received under T1490.
+    const time_t utc_now = time(nullptr);
     int tz_offset_sec = 0;
     if (arguments.size() == 1 && !arguments[0].IsNull()) {
-      std::string tz_str = raw_str(arguments[0]);
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
-        tz_offset_sec = parsed_offset;
-      }
+      struct tm utc_tm = {};
+      platform::GmTime(static_cast<int64_t>(utc_now), &utc_tm);
+      const CivilTime utc_ct{.year = utc_tm.tm_year + 1900,
+                             .month = utc_tm.tm_mon + 1,
+                             .day = utc_tm.tm_mday,
+                             .hour = utc_tm.tm_hour,
+                             .minute = utc_tm.tm_min,
+                             .second = utc_tm.tm_sec,
+                             .subsecond_nanos = 0};
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(raw_str(arguments[0]), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
     }
-    time_t now = time(nullptr) + tz_offset_sec;
+    time_t now = utc_now + tz_offset_sec;
     struct tm t = {};
     platform::GmTime(static_cast<int64_t>(now), &t);
     std::array<char, 32> buf{};
@@ -1616,16 +1778,30 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 1 && arguments[0].IsNull()) {
       return Value();
     }
-    ASSIGN_OR_RETURN(int, tz_offset_sec,
-                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
+    // Resolve the zone offset at the current instant, not at 2000-01-01.
+    const time_t utc_now = time(nullptr);
+    struct tm utc_tm = {};
+    platform::GmTime(static_cast<int64_t>(utc_now), &utc_tm);
+    const CivilTime utc_ct{.year = utc_tm.tm_year + 1900,
+                           .month = utc_tm.tm_mon + 1,
+                           .day = utc_tm.tm_mday,
+                           .hour = utc_tm.tm_hour,
+                           .minute = utc_tm.tm_min,
+                           .second = utc_tm.tm_sec,
+                           .subsecond_nanos = 0};
+    int tz_offset_sec = 0;
     if (arguments.size() == 1 && !arguments[0].IsNull()) {
-      std::string tz_str = raw_str(arguments[0]);
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
-        tz_offset_sec = parsed_offset;
-      }
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(raw_str(arguments[0]), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
+    } else {
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
     }
-    time_t now = time(nullptr) + tz_offset_sec;
+    time_t now = utc_now + tz_offset_sec;
     struct tm t = {};
     platform::GmTime(static_cast<int64_t>(now), &t);
     CivilTime current{.year = t.tm_year + 1900,
@@ -1645,16 +1821,30 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 1 && arguments[0].IsNull()) {
       return Value();
     }
-    ASSIGN_OR_RETURN(int, tz_offset_sec,
-                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
+    // Resolve the zone offset at the current instant (see current_datetime).
+    const time_t utc_now = time(nullptr);
+    struct tm utc_tm = {};
+    platform::GmTime(static_cast<int64_t>(utc_now), &utc_tm);
+    const CivilTime utc_ct{.year = utc_tm.tm_year + 1900,
+                           .month = utc_tm.tm_mon + 1,
+                           .day = utc_tm.tm_mday,
+                           .hour = utc_tm.tm_hour,
+                           .minute = utc_tm.tm_min,
+                           .second = utc_tm.tm_sec,
+                           .subsecond_nanos = 0};
+    int tz_offset_sec = 0;
     if (arguments.size() == 1 && !arguments[0].IsNull()) {
-      std::string tz_str = raw_str(arguments[0]);
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
-        tz_offset_sec = parsed_offset;
-      }
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(raw_str(arguments[0]), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
+    } else {
+      ASSIGN_OR_RETURN(int, parsed_offset,
+                       (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct,
+                                            /*at_utc=*/true)));
+      tz_offset_sec = parsed_offset;
     }
-    time_t now = time(nullptr) + tz_offset_sec;
+    time_t now = utc_now + tz_offset_sec;
     struct tm t = {};
     platform::GmTime(static_cast<int64_t>(now), &t);
     std::chrono::year_month_day ymd{
@@ -1676,7 +1866,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 2) {
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
       std::string tz_str = raw_str(arguments[1]);
-      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
+      // T4097: mirror of the AST arm -- the two-argument form renders a
+      // TIMESTAMP instant, so resolve the zone's offset AT that instant
+      // (FORMAT_TIMESTAMP semantics), not as local wall-clock fields.
+      ASSIGN_OR_RETURN(int, tz_offset_sec,
+                       (ParseTimeZoneOffset(tz_str, &ct, /*at_utc=*/true)));
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
       int rem_mins = (tz_offset_sec % 3600) / 60;
       if (rem_mins != 0) {
@@ -1721,10 +1915,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         double sec = 0;
         const int fields =
             s.size() > 10
-                ? sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
-                    s.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &sec)
-                : sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
-                    s.c_str(), "%d-%d-%d", &Y, &M, &D);
+                ? sscanf(  // NOLINT(cert-err34-c) - conversion count is
+                           // checked.
+                      s.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &sec)
+                : sscanf(  // NOLINT(cert-err34-c) - conversion count is
+                           // checked.
+                      s.c_str(), "%d-%d-%d", &Y, &M, &D);
         if (fields >= (s.size() > 10 ? 5 : 3)) {
           int tz_offset_sec = 0;
           bool has_tz = false;
@@ -1794,9 +1990,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           }
         }
       }
-      return Value::Date(s.substr(0, 10));
+      return Value::TryDate(s.substr(0, 10));
     }
-    return Value::Date(s);
+    return Value::TryDate(s);
   }
   if (name_view == "datetime") {
     if (arguments.empty() || arguments.size() > 7) {
@@ -1828,8 +2024,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value(d + " " + arg1_str);
       }
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
+      // T5030: DATETIME(TIMESTAMP, zone) renders an instant, so resolve the
+      // zone's offset AT that UTC instant (T4097 / FORMAT_TIMESTAMP family),
+      // not against the UTC wall-clock fields as if they were local time.
       ASSIGN_OR_RETURN(int, tz_offset_sec,
-                       (ParseTimeZoneOffset(arg1_str, &ct)));
+                       (ParseTimeZoneOffset(arg1_str, &ct, /*at_utc=*/true)));
       if (tz_offset_sec != 0) {
         platform::Int128 ns =
             CivilTimeToNanos(ct) +
@@ -1908,9 +2107,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                   i + 1 < text.size() ? text[i + 1] : '0')) != 0) {
             has_explicit_zone = true;
             {
-              ASSIGN_OR_RETURN(
-                  int, parsed_offset,
-                  (ParseTimeZoneOffset(std::string(text.substr(i)), &ct)));
+              ASSIGN_OR_RETURN(int, parsed_offset,
+                               (ParseTimeZoneOffset(text.substr(i), &ct)));
               explicit_sec = parsed_offset;
             }
             break;
@@ -1936,6 +2134,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         CivilTimeToNanos(ct) -
         (static_cast<platform::Int128>(tz_offset_sec) * 1000000000);
     CivilTime utc_ct = NanosToCivilTime(ns);
+    if (utc_ct.year < 1 || utc_ct.year > 9999) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TIMESTAMP result is outside the valid year range");
+    }
     return Value(FormatCivilTime(utc_ct) + "+00");
   }
   if (name_view == "time") {
@@ -2010,7 +2212,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 2) {
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
       std::string tz_str = raw_str(arguments[1]);
-      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
+      // T5030: TIME(TIMESTAMP, zone) renders an instant -- resolve the zone
+      // offset at that UTC instant (T4097 / STRING(TIMESTAMP, zone) family).
+      ASSIGN_OR_RETURN(int, tz_offset_sec,
+                       (ParseTimeZoneOffset(tz_str, &ct, /*at_utc=*/true)));
       if (tz_offset_sec != 0) {
         platform::Int128 ns =
             CivilTimeToNanos(ct) +
@@ -2061,7 +2266,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                            ParseI64Strict(raw_str(arguments[3])));
           sub = static_cast<int>(sub_val);
         }
-        (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06d", h, m, s,
+        // The 4th TIME() argument is nanoseconds, not microseconds.
+        (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09d", h, m, s,
                        sub);
       } else {
         (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", h, m, s);
@@ -2249,7 +2455,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          "array index requires INT64");
     }
     const auto& elements = arr.ArrayElements();
-    int64_t index = arguments[1].value.int_value;
+    const int64_t requested_index = arguments[1].value.int_value;
+    int64_t index = requested_index;
     if (name.find("ordinal") != std::string::npos && index > 0) {
       --index;
     } else if (name.find("ordinal") != std::string::npos) {
@@ -2259,9 +2466,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       // Out-of-range plain accesses are errors in GoogleSQL; only the SAFE
       // variants yield NULL.
       if (!safe) {
-        return StatusError(
-            StatusCode::kInvalidArgument,
-            "Array index " + std::to_string(index) + " is out of bounds");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Array index " + std::to_string(requested_index) +
+                               " is out of bounds");
       }
       return Value();
     }
@@ -2420,9 +2627,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
               (type_name.empty() ? std::string("PROTO") : type_name) + "`");
     }
     const std::string payload = raw_str(arguments[0]);
-    ValidateEnumFieldValue(
-        type_name, path.empty() ? std::string() : path.back(), arguments[2]);
-    auto rewritten = ProtoTextSetField(payload, path, arguments[2], type_name);
+    // Use the Try* variant: the throwing EXC-SHIM wrappers would let a
+    // validation Status escape across this Status boundary (AST parity).
+    ASSIGN_OR_RETURN(
+        std::optional<std::string>, rewritten,
+        TryProtoTextSetField(payload, path, arguments[2], type_name));
     return Value(rewritten.value_or(payload));
   }
   if (name_view == "__get_extension") {
@@ -2435,12 +2644,21 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const std::string base = raw_str(arguments[0]);
-    const std::string key = "[" + raw_str(arguments[1]) + "]";
+    const StringArgView base_arg(arguments[0]);
+    const std::string_view base = base_arg.view;
+    const StringArgView ext_arg(arguments[1]);
+    const std::string_view extension_name = ext_arg.view;
+    // The bracketed key can be built as a small stack buffer for the common
+    // short extension names; TryProtoTextGetField takes string_view.
+    std::string key_storage;
+    key_storage.reserve(extension_name.size() + 2);
+    key_storage.push_back('[');
+    key_storage.append(extension_name);
+    key_storage.push_back(']');
     Value out;
-    if (!TryProtoTextGetField(base, key, &out)) {
+    if (!TryProtoTextGetField(base, key_storage, &out)) {
       return StatusError(StatusCode::kInvalidArgument,
-                         "extension " + raw_str(arguments[1]) + " not found");
+                         "extension " + std::string(name) + " not found");
     }
     return out;
   }
@@ -2506,13 +2724,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           constexpr std::string_view kDateMarker = "__tinylamb_date__:";
           if (parsed.type == ValueType::kVarChar &&
               parsed.value.varchar_value.starts_with(kDateMarker)) {
-            parsed = Value::Date(std::string(parsed.value.varchar_value)
-                                     .substr(kDateMarker.size()));
+            ASSIGN_OR_RETURN(
+                Value, date_decoded,
+                (Value::TryDate(std::string(parsed.value.varchar_value)
+                                    .substr(kDateMarker.size()))));
+            parsed = std::move(date_decoded);
           }
           if (parsed.type == ValueType::kVarChar &&
               (field_name == "amin" || field_name == "amax") &&
               object.find("ARRAY<DATE>") != std::string::npos) {
-            parsed = Value::Date(parsed.value.varchar_value);
+            ASSIGN_OR_RETURN(Value, date_decoded,
+                             (Value::TryDate(parsed.value.varchar_value)));
+            parsed = std::move(date_decoded);
           }
           return parsed;
         }
@@ -2520,7 +2743,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       // Anonymous struct members (`STRUCT(2)` stores {"f1":2}) are still
       // addressable by any field reference when unambiguous: a single-member
       // object exposes its only value positionally.
-      if (members.size() == 1) {
+      if (members.size() == 1 && members.front().first.empty()) {
         Value parsed;
         if (!JsonTextToValue(members.front().second, &parsed)) {
           return Value();
@@ -2528,8 +2751,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         constexpr std::string_view kDateMarker = "__tinylamb_date__:";
         if (parsed.type == ValueType::kVarChar &&
             parsed.value.varchar_value.starts_with(kDateMarker)) {
-          parsed = Value::Date(std::string(parsed.value.varchar_value)
-                                   .substr(kDateMarker.size()));
+          ASSIGN_OR_RETURN(
+              Value, date_decoded,
+              (Value::TryDate(std::string(parsed.value.varchar_value)
+                                  .substr(kDateMarker.size()))));
+          parsed = std::move(date_decoded);
         }
         return parsed;
       }
@@ -2572,7 +2798,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         Value parsed;
         if (!JsonTextToValue(text, &parsed)) {
-          return Value();
+          // T1647: match the AST evaluator's strict contract — a present
+          // member whose value fails to decode is an error, not NULL.
+          return StatusError(StatusCode::kInvalidArgument,
+                             "get_field: malformed member value");
         }
         return parsed;
       }
@@ -2631,9 +2860,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           return Value(std::move(fields[1]));
         }
       }
-      return Value();
+      // T1647: AST semantics are the ground truth — a missing member is a
+      // "field not found" error, not NULL.  NULL-tolerant consumers use
+      // __get_field_safe (the JSON-path/lambda route).
+      return StatusError(StatusCode::kInvalidArgument,
+                         "field not found: " + field_name);
     }
-    return Value();
+    return StatusError(StatusCode::kInvalidArgument,
+                       "get_field requires a STRUCT");
   }
   if (name_view == "date_diff" || name_view == "datetime_diff" ||
       name_view == "timestamp_diff") {
@@ -2683,6 +2917,22 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(static_cast<int64_t>(((ct1.year - ct2.year) * 12) +
                                         (ct1.month - ct2.month)));
     }
+    if (unit == "isoyear" || unit == "isoyears") {
+      // The ISO year is the calendar year of the Thursday of the date's ISO
+      // week (the extract_isoyear implementation uses the same rule).
+      const auto iso_year_of = [](const CivilTime& ct) {
+        std::chrono::year_month_day ymd{
+            std::chrono::year{ct.year},
+            std::chrono::month{static_cast<unsigned>(ct.month)},
+            std::chrono::day{static_cast<unsigned>(ct.day)}};
+        const std::chrono::sys_days sd{ymd};
+        const int wd =
+            static_cast<int>(std::chrono::weekday{sd}.iso_encoding());
+        const std::chrono::sys_days thu = sd + std::chrono::days{4 - wd};
+        return static_cast<int>(std::chrono::year_month_day{thu}.year());
+      };
+      return Value(static_cast<int64_t>(iso_year_of(ct1) - iso_year_of(ct2)));
+    }
 
     auto trunc_to_unit = [](CivilTime ct, std::string_view u) -> CivilTime {
       if (u == "week" || u == "weeks") {
@@ -2695,6 +2945,43 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         int days_back = (wd == 7) ? 0 : wd;
         std::chrono::sys_days week_start = sd - std::chrono::days{days_back};
         std::chrono::year_month_day res_ymd{week_start};
+        ct.year = int(res_ymd.year());
+        ct.month = static_cast<int>(static_cast<unsigned>(res_ymd.month()));
+        ct.day = static_cast<int>(static_cast<unsigned>(res_ymd.day()));
+        ct.hour = 0;
+        ct.minute = 0;
+        ct.second = 0;
+        ct.subsecond_nanos = 0;
+      } else if (u == "isoweek" || u == "isoweeks" ||
+                 (u.starts_with("week(") && u.ends_with(")"))) {
+        // ISO weeks start Monday; WEEK(<weekday>) starts on the named day and
+        // a bare WEEK starts Sunday. Truncate both operands to their week's
+        // first day, then the day-difference below yields whole weeks.
+        int start_iso = 7;  // Sunday
+        if (u == "isoweek" || u == "isoweeks" || u == "week(monday)") {
+          start_iso = 1;
+        } else if (u == "week(tuesday)") {
+          start_iso = 2;
+        } else if (u == "week(wednesday)") {
+          start_iso = 3;
+        } else if (u == "week(thursday)") {
+          start_iso = 4;
+        } else if (u == "week(friday)") {
+          start_iso = 5;
+        } else if (u == "week(saturday)") {
+          start_iso = 6;
+        }
+        std::chrono::year_month_day ymd{
+            std::chrono::year{ct.year},
+            std::chrono::month{static_cast<unsigned>(ct.month)},
+            std::chrono::day{static_cast<unsigned>(ct.day)}};
+        const std::chrono::sys_days sd{ymd};
+        const int cur_iso =
+            static_cast<int>(std::chrono::weekday{sd}.iso_encoding());
+        const int days_back = (cur_iso - start_iso + 7) % 7;
+        const std::chrono::sys_days week_start =
+            sd - std::chrono::days{days_back};
+        const std::chrono::year_month_day res_ymd{week_start};
         ct.year = int(res_ymd.year());
         ct.month = static_cast<int>(static_cast<unsigned>(res_ymd.month()));
         ct.day = static_cast<int>(static_cast<unsigned>(res_ymd.day()));
@@ -2729,7 +3016,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     platform::Int128 ns1 = CivilTimeToNanos(t1);
     platform::Int128 ns2 = CivilTimeToNanos(t2);
     platform::Int128 diff_ns = ns1 - ns2;
-    if (unit == "week" || unit == "weeks") {
+    if (unit == "week" || unit == "weeks" || unit == "isoweek" ||
+        unit == "isoweeks" ||
+        (unit.starts_with("week(") && unit.ends_with(")"))) {
       return Value(
           static_cast<int64_t>(diff_ns / (static_cast<platform::Int128>(7) *
                                           86400LL * 1000000000LL)));
@@ -3060,16 +3349,32 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     std::string fmt = raw_str(arguments[0]);
-    std::string input = raw_str(arguments[1]);
-    ASSIGN_OR_RETURN(int, tz_offset_sec,
-                     (ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr)));
-    if (arguments.size() == 3) {
-      std::string tz_str = raw_str(arguments[2]);
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
-        tz_offset_sec = parsed_offset;
+    // T3929: fold the glibc-only "%Ez" alias into "%z" before parsing so
+    // the input-offset precedence does not depend on the platform's
+    // strptime (the portable fallback parser does not know "%Ez").
+    {
+      std::string normalized;
+      normalized.reserve(fmt.size());
+      for (size_t i = 0; i < fmt.size(); ++i) {
+        if (fmt[i] != '%') {
+          normalized += fmt[i];
+          continue;
+        }
+        if (i + 1 < fmt.size() && fmt[i + 1] == '%') {
+          normalized += "%%";
+          ++i;
+          continue;
+        }
+        if (i + 2 < fmt.size() && fmt[i + 1] == 'E' && fmt[i + 2] == 'z') {
+          normalized += "%z";
+          i += 2;
+          continue;
+        }
+        normalized += fmt[i];
       }
+      fmt = std::move(normalized);
     }
+    std::string input = raw_str(arguments[1]);
     struct tm tm = {};
     tm.tm_year = 70;  // BigQuery: unspecified fields start at 1970-01-01.
     tm.tm_mon = 0;
@@ -3082,12 +3387,6 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "PARSE_TIMESTAMP failed for: " + input);
     }
-    // "%z"/"%Ez" records the input's offset in tm_gmtoff: prefer it over the
-    // default/third-argument zone (AST parity, GoogleSQL).
-    if (fmt.find("%z") != std::string::npos ||
-        fmt.find("%Ez") != std::string::npos) {
-      tz_offset_sec = static_cast<int>(platform::TmGmtoff(&tm));
-    }
     CivilTime ct;
     ct.year = tm.tm_year + 1900;
     ct.month = tm.tm_mon + 1;
@@ -3095,6 +3394,23 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ct.hour = tm.tm_hour;
     ct.minute = tm.tm_min;
     ct.second = tm.tm_sec;
+    // Resolve the zone offset AT the parsed civil time: the nullptr overload
+    // assumed 2000-01-01, applying standard time to a summer DST date.
+    int tz_offset_sec = 0;
+    // "%z" (and the "%Ez" alias, folded above by T3929) records the input's
+    // offset in tm_gmtoff: prefer it over the default/third-argument zone
+    // (AST parity, GoogleSQL).
+    if (fmt.find("%z") != std::string::npos) {
+      tz_offset_sec = static_cast<int>(platform::TmGmtoff(&tm));
+    } else if (arguments.size() == 3) {
+      ASSIGN_OR_RETURN(int, parsed_zone_offset,
+                       (ParseTimeZoneOffset(raw_str(arguments[2]), &ct)));
+      tz_offset_sec = parsed_zone_offset;
+    } else {
+      ASSIGN_OR_RETURN(int, parsed_zone_offset,
+                       (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
+      tz_offset_sec = parsed_zone_offset;
+    }
     ct = ShiftCivilTimeHours(ct, -tz_offset_sec / 3600);
     int rem_mins = (tz_offset_sec % 3600) / 60;
     if (rem_mins != 0) {
@@ -3340,15 +3656,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          "incomplete date format in PARSE_DATE");
     }
     if (fmt == "%W%y") {
-      if (val.size() < 3 || val.size() > 4) {
+      if (val.size() < 3 || val.size() > 4 ||
+          !std::ranges::all_of(val, [](char c) { return c >= '0' && c <= '9'; })) {
         return StatusError(StatusCode::kInvalidArgument,
-                           "invalid format for %W%y: " + val);
-      }
-      for (char c : val) {
-        if (c < '0' || c > '9') {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "invalid digit in PARSE_DATE: " + val);
-        }
+                           "Failed to parse input string " +
+                               Value(std::move(val)).AsString());
       }
       int w = 0, y = 0;
       if (val.size() == 3) {
@@ -3386,7 +3698,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     std::array<char, 32> buf{};
     (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d", tm.tm_year + 1900,
                    tm.tm_mon + 1, tm.tm_mday);
-    return Value::Date(std::string(buf.data()));
+    return Value::TryDate(std::string(buf.data()));
   }
   if (name_view == "last_day") {
     if (arguments.empty() || arguments.size() > 2) {
@@ -3468,6 +3780,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                        "unsupported LAST_DAY date_part " + part);
   }
   if (name_view == "week" && arguments.size() == 1) {
+    if (arguments[0].IsNull()) {
+      return Value();  // NULL propagates, like every other date function here
+    }
     return Value("week(" + to_lower(raw_str(arguments[0])) + ")");
   }
   if (name_view == "add_months") {
@@ -3547,20 +3862,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(int64_t, days, (parse_date_val(arguments[0])));
     std::string target_day_str = to_lower(raw_str(arguments[1]));
     int target_iso = 0;
-    if (target_day_str.starts_with("mon")) {
-      target_iso = 1;
-    } else if (target_day_str.starts_with("tue")) {
-      target_iso = 2;
-    } else if (target_day_str.starts_with("wed")) {
-      target_iso = 3;
-    } else if (target_day_str.starts_with("thu")) {
-      target_iso = 4;
-    } else if (target_day_str.starts_with("fri")) {
-      target_iso = 5;
-    } else if (target_day_str.starts_with("sat")) {
-      target_iso = 6;
-    } else if (target_day_str.starts_with("sun")) {
-      target_iso = 7;
+    static const std::unordered_map<std::string, int> kWeekdays = {
+        {"monday", 1}, {"tuesday", 2},  {"wednesday", 3}, {"thursday", 4},
+        {"friday", 5}, {"saturday", 6}, {"sunday", 7},    {"mon", 1},
+        {"tue", 2},    {"wed", 3},      {"thu", 4},       {"fri", 5},
+        {"sat", 6},    {"sun", 7}};
+    const auto wd = kWeekdays.find(target_day_str);
+    if (wd != kWeekdays.end()) {
+      target_iso = wd->second;
     } else {
       return StatusError(StatusCode::kInvalidArgument,
                          "invalid day name in NEXT_DAY: " + target_day_str);
@@ -3633,16 +3942,20 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(full_months + (day_diff / 31.0));
   }
 
-  auto utf8_offsets = [](std::string_view s)
-      -> std::vector<size_t> {  // NOLINT(bugprone-branch-clone)
+  auto utf8_offsets = [](std::string_view s) -> std::vector<size_t> {
     std::vector<size_t> offsets;
     offsets.reserve(s.size() + 1);
     for (size_t i = 0; i < s.size();) {
-      offsets.push_back(i);
       const auto c = static_cast<unsigned char>(s[i]);
-      if ((c & 0x80) == 0) {  // NOLINT(bugprone-branch-clone)
+      if ((c & 0xC0) == 0x80) {
+        // Orphan continuation byte: LENGTH/CHAR_LENGTH skip these, so they
+        // must not count as a character here either.  Keep utf8_len and the
+        // SUBSTR/LPAD/RIGHT offsets consistent with LENGTH.
         i += 1;
-      } else if ((c & 0xE0) == 0xC0) {
+        continue;
+      }
+      offsets.push_back(i);
+      if ((c & 0xE0) == 0xC0) {
         i += static_cast<size_t>((i + 1 < s.size()) ? 2 : 1);
       } else if ((c & 0xF0) == 0xE0) {
         i += static_cast<size_t>(
@@ -3653,6 +3966,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                 ? 4
                 : (i + 2 < s.size() ? 3 : (i + 1 < s.size() ? 2 : 1)));
       } else {
+        // ASCII byte or invalid lead byte: advance by one.
         i += 1;
       }
     }
@@ -3660,8 +3974,36 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return offsets;
   };
 
-  auto utf8_len = [&](std::string_view s) -> size_t {
-    return utf8_offsets(s).size() - 1;
+  auto utf8_len = [](std::string_view s) -> size_t {
+    // P497: allocation-free character count -- the same walk utf8_offsets
+    // performs (orphan continuation bytes skipped, lead lengths clamped at
+    // the end so a truncated lead consumes the tail) minus the per-row
+    // offset vector.  A plain "count non-continuation bytes" loop would
+    // disagree on malformed input like "\xC3\x41": the lead swallows 0x41.
+    size_t chars = 0;
+    for (size_t i = 0; i < s.size();) {
+      const auto c = static_cast<unsigned char>(s[i]);
+      if ((c & 0xC0) == 0x80) {
+        i += 1;
+        continue;
+      }
+      ++chars;
+      if ((c & 0xE0) == 0xC0) {
+        i += static_cast<size_t>((i + 1 < s.size()) ? 2 : 1);
+      } else if ((c & 0xF0) == 0xE0) {
+        i += static_cast<size_t>(
+            (i + 2 < s.size()) ? 3 : (i + 1 < s.size() ? 2 : 1));
+      } else if ((c & 0xF8) == 0xF0) {
+        i += static_cast<size_t>(
+            (i + 3 < s.size())
+                ? 4
+                : (i + 2 < s.size() ? 3 : (i + 1 < s.size() ? 2 : 1)));
+      } else {
+        // ASCII byte or invalid lead byte: advance by one.
+        i += 1;
+      }
+    }
+    return chars;
   };
 
   auto utf8_substr = [&](std::string_view s, size_t start_cp,
@@ -3734,6 +4076,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
+    if (arguments[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "UPPER requires a STRING argument");
+    }
     return Value(UnicodeUpper(raw_str(arguments[0])));
   }
   if (name_view == "lower") {
@@ -3743,6 +4089,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (arguments[0].IsNull()) {
       return Value();
+    }
+    if (arguments[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOWER requires a STRING argument");
     }
     return Value(UnicodeLower(raw_str(arguments[0])));
   }
@@ -3865,6 +4215,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return Value();
     }
+    for (const auto& arg : arguments) {
+      if (arg.type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "STARTS_WITH requires STRING arguments");
+      }
+    }
     const StringArgView text(arguments[0]);
     const StringArgView prefix(arguments[1]);
     return Value(text.view.starts_with(prefix.view));
@@ -3876,6 +4232,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return Value();
+    }
+    for (const auto& arg : arguments) {
+      if (arg.type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ENDS_WITH requires STRING arguments");
+      }
     }
     const StringArgView text(arguments[0]);
     const StringArgView suffix(arguments[1]);
@@ -3920,78 +4282,111 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string source = raw_str(arguments[0]);
     const std::string target = raw_str(arguments[1]);
-    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
+    auto to_i64 = [](const Value& v) -> StatusOr<int64_t> {
+      if (v.type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "REGEXP_EXTRACT position and occurrence require "
+                           "INT64 arguments");
       }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return v.value.int_value;
     };
-    const int64_t position =
-        arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
-    const int64_t occurrence =
-        arguments.size() == 4 ? to_i64(arguments[3], 1) : 1;
+    int64_t position = 1;
+    if (arguments.size() >= 3) {
+      ASSIGN_OR_RETURN(int64_t, parsed_position, to_i64(arguments[2]));
+      position = parsed_position;
+    }
+    int64_t occurrence = 1;
+    if (arguments.size() == 4) {
+      ASSIGN_OR_RETURN(int64_t, parsed_occurrence, to_i64(arguments[3]));
+      occurrence = parsed_occurrence;
+    }
 
     if (position == 0 || occurrence <= 0) {
       return StatusError(StatusCode::kInvalidArgument,
                          "position and occurrence must be positive");
     }
 
-    const auto s_offsets = utf8_offsets(source);
-    const size_t s_cps = s_offsets.size() > 1 ? s_offsets.size() - 1 : 0;
-    const auto t_offsets = utf8_offsets(target);
-    const size_t t_cps = t_offsets.size() > 1 ? t_offsets.size() - 1 : 0;
-
+    // P497: a single monotonic walk with a (target_cps + 1)-wide sliding
+    // window of code-point boundary offsets replaces the per-row
+    // utf8_offsets(source) vector; boundary derivation follows exactly the
+    // same rules (orphan continuation bytes skipped, lead lengths clamped
+    // at the end).
+    const size_t t_cps = utf8_len(target);
     if (t_cps == 0) {
+      const size_t s_cps = utf8_len(source);
       if (occurrence == 1 && static_cast<size_t>(position) <= s_cps + 1) {
         return Value(position);
       }
       return Value(int64_t{0});
     }
+    std::array<size_t, 33> small_bounds{};
+    std::vector<size_t> heap_bounds;
+    const size_t window = t_cps + 1;
+    size_t* bounds = nullptr;
+    if (window <= small_bounds.size()) {
+      bounds = small_bounds.data();
+    } else {
+      heap_bounds.resize(window);
+      bounds = heap_bounds.data();
+    }
+    std::vector<int64_t> matches;  // every match cp+1, ascending
+    size_t b_count = 0;
+    size_t i = 0;
+    for (;;) {
+      const bool at_end = i == source.size();
+      if (!at_end && (static_cast<unsigned char>(source[i]) & 0xC0) == 0x80) {
+        i += 1;
+        continue;
+      }
+      if (b_count >= t_cps) {
+        const size_t b_start = bounds[(b_count - t_cps) % window];
+        if (source.compare(b_start, i - b_start, target) == 0) {
+          matches.push_back(static_cast<int64_t>(b_count - t_cps) + 1);
+        }
+      }
+      bounds[b_count % window] = i;
+      if (at_end) {
+        break;
+      }
+      ++b_count;
+      const auto c = static_cast<unsigned char>(source[i]);
+      if ((c & 0xE0) == 0xC0) {
+        i += static_cast<size_t>((i + 1 < source.size()) ? 2 : 1);
+      } else if ((c & 0xF0) == 0xE0) {
+        i += static_cast<size_t>(
+            (i + 2 < source.size()) ? 3 : (i + 1 < source.size() ? 2 : 1));
+      } else if ((c & 0xF8) == 0xF0) {
+        i += static_cast<size_t>((i + 3 < source.size())
+                                     ? 4
+                                     : (i + 2 < source.size()
+                                            ? 3
+                                            : (i + 1 < source.size() ? 2 : 1)));
+      } else {
+        i += 1;
+      }
+    }
+    const size_t s_cps = b_count;
 
-    std::vector<size_t> matches;
+    std::vector<int64_t> ordered;
     if (position > 0) {
-      auto start_cp = static_cast<size_t>(position - 1);
-      for (size_t cp = start_cp; cp + t_cps <= s_cps; ++cp) {
-        size_t b_start = s_offsets[cp];
-        size_t b_end = s_offsets[cp + t_cps];
-        if (source.substr(b_start, b_end - b_start) == target) {
-          matches.push_back(cp + 1);
+      const int64_t start_cp = position - 1;
+      for (const int64_t cp1 : matches) {
+        if (cp1 > start_cp) {
+          ordered.push_back(cp1);
         }
       }
     } else {
-      int64_t target_cp = static_cast<int64_t>(s_cps) + position;
+      const int64_t target_cp = static_cast<int64_t>(s_cps) + position;
       if (target_cp >= 0) {
-        for (int64_t cp = target_cp; cp >= 0; --cp) {
-          if (static_cast<size_t>(cp) + t_cps <= s_cps) {
-            size_t b_start = s_offsets[static_cast<size_t>(cp)];
-            size_t b_end = s_offsets[static_cast<size_t>(cp) + t_cps];
-            if (source.substr(b_start, b_end - b_start) == target) {
-              matches.push_back(static_cast<size_t>(cp) + 1);
-            }
+        for (const auto match : std::views::reverse(matches)) {
+          if (match - 1 <= target_cp) {
+            ordered.push_back(match);
           }
         }
       }
     }
-
-    if (static_cast<size_t>(occurrence) <= matches.size()) {
-      return Value(
-          static_cast<int64_t>(matches[static_cast<size_t>(occurrence) - 1]));
+    if (static_cast<size_t>(occurrence) <= ordered.size()) {
+      return Value(ordered[static_cast<size_t>(occurrence) - 1]);
     }
     return Value(int64_t{0});
   }
@@ -4003,6 +4398,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull() || arguments[1].IsNull() ||
         arguments[2].IsNull()) {
       return Value();
+    }
+    for (const auto& arg : arguments) {
+      if (arg.type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "REPLACE requires STRING arguments");
+      }
     }
     std::string s = raw_str(arguments[0]);
     const std::string from = raw_str(arguments[1]);
@@ -4027,26 +4428,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string s = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return ToInt64WithText(v, def);
     };
     const int64_t n = to_i64(arguments[1], 0);
     if (n < 0) {
@@ -4116,7 +4498,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string input = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      return v.type == ValueType::kInt64 ? v.value.int_value : def;
+      return ToInt64Exact(v, def);
     };
     const int64_t start = to_i64(arguments[1], 1);
     if (arguments.size() == 3) {
@@ -4168,7 +4550,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string input = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      return v.type == ValueType::kInt64 ? v.value.int_value : def;
+      return ToInt64Exact(v, def);
     };
     const int64_t start = to_i64(arguments[1], 1);
     if (arguments.size() == 3) {
@@ -4226,26 +4608,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string s = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return ToInt64WithText(v, def);
     };
     const int64_t len = to_i64(arguments[1], 0);
     if (len < 0) {
@@ -4272,26 +4635,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string s = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return ToInt64WithText(v, def);
     };
     const int64_t len = to_i64(arguments[1], 0);
     if (len < 0) {
@@ -4327,26 +4671,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string s = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return ToInt64WithText(v, def);
     };
     const int64_t target_len = to_i64(arguments[1], 0);
     if (target_len < 0) {
@@ -4372,6 +4697,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(utf8_substr(s, 0, static_cast<size_t>(target_len)));
     }
     const size_t pad_cps = utf8_len(pad);
+    if (pad_cps == 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Pattern in LPAD/RPAD contains no characters");
+    }
     const size_t needed = static_cast<size_t>(target_len) - total_cps;
     std::string pad_str;
     for (size_t i = 0; i < needed / pad_cps; ++i) {
@@ -4379,6 +4708,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (needed % pad_cps != 0) {
       pad_str += utf8_substr(pad, 0, needed % pad_cps);
+    }
+    // The 1MB cap is in bytes (REPEAT parity): pad code points can expand
+    // to ~4x that in UTF-8, so check the real output size.
+    if (s.size() + pad_str.size() > 1000000) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Output of LPAD/RPAD exceeds max allowed output size of 1MB");
     }
     return Value(name_view == "lpad" ? pad_str + s : s + pad_str);
   }
@@ -4391,11 +4727,42 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
+    if (arguments[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ASCII requires a STRING argument");
+    }
     const std::string s = raw_str(arguments[0]);
     if (s.empty()) {
       return Value(int64_t{0});
     }
-    return Value(static_cast<int64_t>(static_cast<unsigned char>(s[0])));
+    // ASCII is the first Unicode code point (same as UNICODE), not the first
+    // UTF-8 byte. Mirror the UNICODE arm's decoding below.
+    const auto offsets = utf8_offsets(s);
+    if (offsets.size() < 2) {
+      return Value(int64_t{0});
+    }
+    const size_t char_start = offsets[0];
+    const size_t first_len = offsets[1] - char_start;
+    uint32_t code = 0;
+    if (first_len == 1) {
+      code = static_cast<unsigned char>(s[char_start]);
+    } else if (first_len == 2) {
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[char_start]) & 0x1F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 1]) & 0x3F));
+    } else if (first_len == 3) {
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[char_start]) & 0x0F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 2]) & 0x3F));
+    } else if (first_len == 4) {
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[char_start]) & 0x07) << 18) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 2]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 3]) & 0x3F));
+    }
+    return Value(static_cast<int64_t>(code));
   }
 
   if (name_view == "unicode") {
@@ -4406,30 +4773,40 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
+    if (arguments[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "UNICODE requires a STRING argument");
+    }
     const std::string s = raw_str(arguments[0]);
     if (s.empty()) {
       return Value(int64_t{0});
     }
     const auto offsets = utf8_offsets(s);
-    const size_t first_len = offsets[1];
+    // utf8_offsets skips orphan continuation bytes, so the first character
+    // can start past byte 0 and an all-orphan string has no characters.
+    if (offsets.size() < 2) {
+      return Value(int64_t{0});
+    }
+    const size_t char_start = offsets[0];
+    const size_t first_len = offsets[1] - char_start;
     uint32_t code = 0;
     if (first_len == 1) {
-      code = static_cast<unsigned char>(s[0]);
+      code = static_cast<unsigned char>(s[char_start]);
     } else if (first_len == 2) {
       code = static_cast<uint32_t>(
-          ((static_cast<unsigned char>(s[0]) & 0x1F) << 6) |
-          (static_cast<unsigned char>(s[1]) & 0x3F));
+          ((static_cast<unsigned char>(s[char_start]) & 0x1F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 1]) & 0x3F));
     } else if (first_len == 3) {
       code = static_cast<uint32_t>(
-          ((static_cast<unsigned char>(s[0]) & 0x0F) << 12) |
-          ((static_cast<unsigned char>(s[1]) & 0x3F) << 6) |
-          (static_cast<unsigned char>(s[2]) & 0x3F));
+          ((static_cast<unsigned char>(s[char_start]) & 0x0F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 2]) & 0x3F));
     } else if (first_len == 4) {
       code = static_cast<uint32_t>(
-          ((static_cast<unsigned char>(s[0]) & 0x07) << 18) |
-          ((static_cast<unsigned char>(s[1]) & 0x3F) << 12) |
-          ((static_cast<unsigned char>(s[2]) & 0x3F) << 6) |
-          (static_cast<unsigned char>(s[3]) & 0x3F));
+          ((static_cast<unsigned char>(s[char_start]) & 0x07) << 18) |
+          ((static_cast<unsigned char>(s[char_start + 1]) & 0x3F) << 12) |
+          ((static_cast<unsigned char>(s[char_start + 2]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[char_start + 3]) & 0x3F));
     }
     return Value(static_cast<int64_t>(code));
   }
@@ -4469,6 +4846,61 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(res));
   }
 
+  // T2234: inverse of CODE_POINTS_TO_STRING/BYTES (GoogleSQL standard).
+  if (name_view == "to_code_points") {
+    if (arguments.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TO_CODE_POINTS requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return Value();
+    }
+    if (arguments[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TO_CODE_POINTS requires a STRING or BYTES argument");
+    }
+    std::vector<Value> elements;
+    for (const uint32_t cp :
+         CodePointsOfBatch(arguments[0].value.varchar_value)) {
+      elements.push_back(Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
+    }
+    return Value::Array(std::move(elements), "INT64");
+  }
+  // T2238: EDIT_DISTANCE(value1, value2[, max_distance]); distance above
+  // max_distance reports max_distance + 1 per the GoogleSQL spec.
+  if (name_view == "edit_distance") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EDIT_DISTANCE requires 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
+      return Value();
+    }
+    if (arguments[0].type != ValueType::kVarChar ||
+        arguments[1].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EDIT_DISTANCE requires STRING arguments");
+    }
+    int64_t max_distance = -1;
+    if (arguments.size() == 3) {
+      if (arguments[2].type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "EDIT_DISTANCE max_distance must be an integer");
+      }
+      max_distance = arguments[2].value.int_value;
+      if (max_distance < 0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "EDIT_DISTANCE max_distance cannot be negative");
+      }
+    }
+    const int64_t distance = LevenshteinCodePointsBatch(
+        arguments[0].value.varchar_value, arguments[1].value.varchar_value);
+    if (max_distance >= 0 && distance > max_distance) {
+      return Value(max_distance + 1);
+    }
+    return Value(distance);
+  }
   if (name_view == "code_points_to_string") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -4611,98 +5043,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 5 && arguments[4].IsNull())) {
       return Value();
     }
-    const std::string s = raw_str(arguments[0]);
-    const std::string pat = raw_str(arguments[1]);
-    if (pat.empty()) {
-      return Value(int64_t{0});
-    }
-    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
-    };
-    const int64_t pos_arg = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
-    const int64_t occ_arg = arguments.size() >= 4 ? to_i64(arguments[3], 1) : 1;
-    const int64_t return_pos =
-        arguments.size() == 5 ? to_i64(arguments[4], 0) : 0;
-    if (pos_arg <= 0 || occ_arg <= 0) {
-      return StatusError(
-          StatusCode::kInvalidArgument,
-          "REGEXP_INSTR position and occurrence must be positive");
-    }
-    const bool byte_mode = name_view == "byte_regexp_instr";
-    const auto offsets = utf8_offsets(s);
-    const size_t total_cps = offsets.size() - 1;
-    if (static_cast<size_t>(pos_arg) > (byte_mode ? s.size() : total_cps) + 1) {
-      return Value(int64_t{0});
-    }
-    const size_t byte_start = byte_mode
-                                  ? static_cast<size_t>(pos_arg - 1)
-                                  : offsets[static_cast<size_t>(pos_arg - 1)];
-    try {
-      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      std::string search_str = s.substr(byte_start);
-      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
-      std::sregex_iterator end;
-      int64_t current_occ = 1;
-      while (it != end) {
-        if (current_occ == occ_arg) {
-          const auto& match = *it;
-          const bool has_capture = match.size() > 1 && match[1].matched;
-          const size_t target_start =
-              has_capture && return_pos == 0
-                  ? byte_start + static_cast<size_t>(match.position(1))
-                  : byte_start + static_cast<size_t>(match.position());
-          const size_t target_end = byte_start +
-                                    static_cast<size_t>(match.position()) +
-                                    static_cast<size_t>(match.length());
-          if (byte_mode) {
-            // `target_end` is already the one-based end position because it
-            // is an exclusive byte offset; starts need the usual +1.
-            return Value(static_cast<int64_t>(
-                return_pos == 1 ? target_end : target_start + 1));
-          }
-          size_t match_cp_start = 1;
-          size_t match_cp_end = 1;
-          for (size_t i = 0; i + 1 < offsets.size(); ++i) {
-            if (offsets[i] <= target_start && target_start < offsets[i + 1]) {
-              match_cp_start = i + 1;
-            }
-            if (offsets[i] < target_end && target_end <= offsets[i + 1]) {
-              match_cp_end = i + 1;
-            }
-          }
-          if (target_end >= s.size()) {
-            match_cp_end = total_cps;
-          }
-          return Value(static_cast<int64_t>(return_pos == 1 ? match_cp_end
-                                                            : match_cp_start));
-        }
-        ++current_occ;
-        ++it;
-      }
-      return Value(int64_t{0});
-    } catch (...) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "invalid regular expression: " + pat);
-    }
+    const int64_t position =
+        arguments.size() >= 3 ? ToInt64WithText(arguments[2], 1) : 1;
+    const int64_t occurrence =
+        arguments.size() >= 4 ? ToInt64WithText(arguments[3], 1) : 1;
+    const int64_t occurrence_position =
+        arguments.size() == 5 ? ToInt64WithText(arguments[4], 0) : 0;
+    ASSIGN_OR_RETURN(
+        int64_t, match,
+        CheckedRegexPosition(raw_str(arguments[0]), raw_str(arguments[1]),
+                             position, occurrence, occurrence_position,
+                             name_view == "byte_regexp_instr"));
+    return Value(match);
   }
 
   if (name_view == "regexp_extract_all" ||
@@ -4746,7 +5098,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
   }
 
-  if (name_view == "regexp_extract") {
+  if (name_view == "regexp_extract" || name_view == "regexp_substr") {
+    // T2235: REGEXP_SUBSTR is the GoogleSQL synonym of REGEXP_EXTRACT.
     if (arguments.size() < 2 || arguments.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_EXTRACT requires 2 to 4 arguments");
@@ -4759,26 +5112,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string s = raw_str(arguments[0]);
     const std::string pat = raw_str(arguments[1]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return ToInt64WithText(v, def);
     };
     const int64_t pos_arg = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
     const int64_t occ_arg = arguments.size() == 4 ? to_i64(arguments[3], 1) : 1;
@@ -4795,12 +5129,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const size_t byte_start = offsets[static_cast<size_t>(pos_arg - 1)];
     try {
       ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      const std::string search_str = s.substr(byte_start);
-      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
-      std::sregex_iterator end;
+      const char* const search_begin = s.data() + byte_start;
+      const char* const search_end = s.data() + s.size();
+      std::cregex_iterator it(search_begin, search_end, re);
+      std::cregex_iterator end;
       for (int64_t current_occ = 1; it != end; ++it, ++current_occ) {
         if (current_occ == occ_arg) {
           if (it->size() > 1) {
+            // GoogleSQL: a capture group that did not participate in the
+            // match is NULL, not an empty string.
+            if (!(*it)[1].matched) {
+              return Value();
+            }
             return Value(it->str(1));
           }
           return Value(it->str(0));
@@ -4855,28 +5195,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string str = raw_str(arguments[0]);
     const std::string delim = raw_str(arguments[1]);
+    // T1653: was a stoll-based copy of the lenient converter; unified onto
+    // ToInt64WithText (same whole-token requirement, no exception cost).
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return SaturatingDoubleToInt64(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          // stoll accepts a numeric prefix and ignores trailing junk; require
-          // the whole token so '2junk' is not silently read as 2.
-          std::size_t idx = 0;
-          const std::string text(v.value.varchar_value);
-          const int64_t parsed = std::stoll(text, &idx);
-          if (idx == text.size()) {
-            return parsed;
-          }
-          // NOLINTNEXTLINE(bugprone-empty-catch)
-        } catch (...) {
-        }
-      }
-      return def;
+      return ToInt64WithText(v, def);
     };
     const int64_t occ = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
 
@@ -5058,51 +5380,95 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         arguments[2].IsNull()) {
       return Value();
     }
-    const std::string s = raw_str(arguments[0]);
-    const std::string src = raw_str(arguments[1]);
-    const std::string dst = raw_str(arguments[2]);
-    const auto s_offsets = utf8_offsets(s);
-    const auto src_offsets = utf8_offsets(src);
-    const auto dst_offsets = utf8_offsets(dst);
-    const size_t s_len = s_offsets.size() - 1;
-    const size_t src_len = src_offsets.size() - 1;
-    const size_t dst_len = dst_offsets.size() - 1;
-
-    std::vector<std::string> src_chars;
-    src_chars.reserve(src_len);
-    std::unordered_set<std::string> source_seen;
-    source_seen.reserve(src_len);
-    for (size_t i = 0; i < src_len; ++i) {
-      std::string source_char =
-          src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]);
-      if (!source_seen.insert(source_char).second) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "TRANSLATE source contains duplicate characters");
+    const StringArgView text(arguments[0]);
+    const StringArgView src(arguments[1]);
+    const StringArgView dst(arguments[2]);
+    // P630: src/dst are constant across the rows of a batch, so decompose
+    // them once and let the row loop probe a string_view table (ReplaceStr's
+    // hoisted-pattern design) instead of rebuilding code-point vectors and
+    // per-character std::string keys per row.
+    struct TranslatePlan {
+      std::string src;  // backing storage for the lookup keys
+      std::string dst;  // backing storage for the replacement views
+      std::vector<std::string_view> dst_chars;
+      std::unordered_map<std::string_view, size_t> lookup;
+      bool valid{false};  // false before the first build and after a
+                          // duplicate-source error (which must re-raise)
+    };
+    static thread_local TranslatePlan plan;
+    if (!plan.valid || plan.src != src.view || plan.dst != dst.view) {
+      plan = TranslatePlan{};
+      plan.src = std::string(src.view);
+      plan.dst = std::string(dst.view);
+      const auto src_offsets = utf8_offsets(plan.src);
+      const auto dst_offsets = utf8_offsets(plan.dst);
+      const size_t src_len = src_offsets.size() - 1;
+      const size_t dst_len = dst_offsets.size() - 1;
+      plan.dst_chars.reserve(dst_len);
+      for (size_t i = 0; i < dst_len; ++i) {
+        plan.dst_chars.emplace_back(plan.dst.data() + dst_offsets[i],
+                                    dst_offsets[i + 1] - dst_offsets[i]);
       }
-      src_chars.push_back(std::move(source_char));
-    }
-    std::vector<std::string> dst_chars;
-    dst_chars.reserve(dst_len);
-    for (size_t i = 0; i < dst_len; ++i) {
-      dst_chars.push_back(
-          dst.substr(dst_offsets[i], dst_offsets[i + 1] - dst_offsets[i]));
-    }
-
-    std::string res;
-    for (size_t i = 0; i < s_len; ++i) {
-      std::string ch = s.substr(s_offsets[i], s_offsets[i + 1] - s_offsets[i]);
-      bool replaced = false;
-      for (size_t j = 0; j < src_chars.size(); ++j) {
-        if (ch == src_chars[j]) {
-          if (j < dst_chars.size()) {
-            res += dst_chars[j];
-          }
-          replaced = true;
-          break;
+      plan.lookup.reserve(src_len);
+      for (size_t i = 0; i < src_len; ++i) {
+        const std::string_view source_char{plan.src.data() + src_offsets[i],
+                                           src_offsets[i + 1] - src_offsets[i]};
+        if (!plan.lookup.emplace(source_char, i).second) {
+          // Leave `valid` false so the next row re-checks (and re-raises)
+          // exactly like the per-row implementation did.
+          return StatusError(StatusCode::kInvalidArgument,
+                             "TRANSLATE source contains duplicate characters");
         }
       }
-      if (!replaced) {
-        res += ch;
+      plan.valid = true;
+    }
+
+    // Single monotonic walk of the row text with the same boundary rules as
+    // utf8_offsets (orphan continuation bytes are dropped at the head and
+    // fold into the preceding character elsewhere -- no separate vector).
+    std::string res;
+    res.reserve(text.view.size());
+    size_t char_begin = 0;
+    bool have_char = false;
+    auto append_char = [&](size_t end) {
+      if (!have_char) {
+        return;
+      }
+      const std::string_view ch{text.view.data() + char_begin,
+                                end - char_begin};
+      const auto found = plan.lookup.find(ch);
+      if (found == plan.lookup.end()) {
+        res.append(ch);
+      } else if (found->second < plan.dst_chars.size()) {
+        res.append(plan.dst_chars[found->second]);
+      }
+    };
+    for (size_t p = 0; p <= text.view.size();) {
+      const bool at_end = p == text.view.size();
+      const auto c = at_end ? 0U : static_cast<unsigned char>(text.view[p]);
+      if (!at_end && (c & 0xC0U) == 0x80U) {
+        p += 1;
+        continue;  // orphan continuation byte: extends the pending character
+      }
+      append_char(p);
+      if (at_end) {
+        break;
+      }
+      char_begin = p;
+      have_char = true;
+      if ((c & 0xE0U) == 0xC0U) {
+        p += (p + 1 < text.view.size()) ? 2 : 1;
+      } else if ((c & 0xF0U) == 0xE0U) {
+        p +=
+            (p + 2 < text.view.size()) ? 3 : (p + 1 < text.view.size() ? 2 : 1);
+      } else if ((c & 0xF8U) == 0xF0U) {
+        p += (p + 3 < text.view.size())
+                 ? 4
+                 : (p + 2 < text.view.size()
+                        ? 3
+                        : (p + 1 < text.view.size() ? 2 : 1));
+      } else {
+        p += 1;
       }
     }
     return Value(std::move(res));
@@ -5162,7 +5528,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return val.value.double_value;
     }
     return StatusError(StatusCode::kInvalidArgument,
-                       fname + " requires a numeric argument");
+                       fname + " requires numeric argument");
   };
   if (name_view == "abs") {
     if (arguments.size() != 1) {
@@ -5187,7 +5553,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::fabs(arguments[0].value.double_value));
     }
     return StatusError(StatusCode::kInvalidArgument,
-                       "ABS requires a numeric argument");
+                       "ABS requires numeric argument");
   }
   if (name_view == "sign") {
     if (arguments.size() != 1) {
@@ -5213,7 +5579,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(v > 0.0 ? 1.0 : (v < 0.0 ? -1.0 : 0.0));
     }
     return StatusError(StatusCode::kInvalidArgument,
-                       "SIGN requires a numeric argument");
+                       "SIGN requires numeric argument");
   }
   if (name_view == "trunc" || name_view == "truncate") {
     if (arguments.empty() || arguments.size() > 2) {
@@ -5274,7 +5640,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(ScaleRoundDouble(val, digits, /*truncate=*/true));
     }
     return StatusError(StatusCode::kInvalidArgument,
-                       name + " requires a numeric argument");
+                       name + " requires numeric argument");
   }
   if (name_view == "ceil" || name_view == "ceiling") {
     if (arguments.size() != 1) {
@@ -5291,7 +5657,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::ceil(arguments[0].value.double_value));
     }
     return StatusError(StatusCode::kInvalidArgument,
-                       name + " requires a numeric argument");
+                       name + " requires numeric argument");
   }
   if (name_view == "floor") {
     if (arguments.size() != 1) {
@@ -5308,7 +5674,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::floor(arguments[0].value.double_value));
     }
     return StatusError(StatusCode::kInvalidArgument,
-                       "FLOOR requires a numeric argument");
+                       "FLOOR requires numeric argument");
   }
   if (name_view == "mod") {
     if (arguments.size() != 2) {
@@ -5321,6 +5687,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].type == ValueType::kInt64 &&
         arguments[1].type == ValueType::kInt64) {
       if (arguments[0].IsUnsigned() || arguments[1].IsUnsigned()) {
+        // Same rule as the AST reference (FunctionCallExpression): a signed
+        // negative divisor against UINT64 has no valid result type.
+        if (!arguments[1].IsUnsigned() && arguments[1].value.int_value < 0) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "MOD with a negative divisor and UINT64 is invalid");
+        }
         const auto r = static_cast<uint64_t>(arguments[1].value.int_value);
         if (r == 0) {
           return StatusError(StatusCode::kIsInfinity,
@@ -5416,7 +5789,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "Floating point error in function: POW");
     }
-    if (l == 0.0 && r < 0.0 && !std::isinf(r)) {
+    if (l == 0.0 && r < 0.0) {
       return StatusError(StatusCode::kIsInfinity, "division by zero in POW");
     }
     const double res = std::pow(l, r);
@@ -5498,11 +5871,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           best = arguments[i];
         }
       } else if (name_view == "greatest") {
-        if (arguments[i] > best) {
+        ASSIGN_OR_RETURN(bool, takes, arguments[i].TryGreater(best));
+        if (takes) {
           best = arguments[i];
         }
-      } else if (arguments[i] < best) {
-        best = arguments[i];
+      } else {
+        ASSIGN_OR_RETURN(bool, takes, arguments[i].TryLess(best));
+        if (takes) {
+          best = arguments[i];
+        }
       }
     }
     bool has_double = false;
@@ -5526,6 +5903,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "LN"));
+    if (v <= 0.0) {
+      // T3885: GoogleSQL LN fails for x <= 0 (SAFE_LN returns NULL);
+      // std::log would silently hand back -inf / NaN instead. Error
+      // discipline mirrors the SQRT negative arm above.
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LN of non-positive number");
+    }
     return Value(std::log(v));
   }
   if (name_view == "log" || name_view == "log10") {
@@ -5546,6 +5930,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::log(v));
     }
     ASSIGN_OR_RETURN(double, base, to_numeric_double(arguments[1], "LOG base"));
+    if (base == 1.0) {
+      // log(x)/log(1) divides by zero.  For a non-finite x the reference
+      // engine yields NaN (compliance goldens: LOG(-inf, 1)); a finite x is
+      // a domain error.
+      if (!std::isfinite(v)) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOG base must not be 1");
+    }
     if (v == 1.0 && std::isinf(base)) {
       return Value(std::numeric_limits<double>::quiet_NaN());
     }
@@ -5714,6 +6108,58 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(res);
   }
+  // T2245: reciprocal trig family, mirrored from the canonical evaluator.
+  if (name_view == "csc" || name_view == "sec" || name_view == "cot") {
+    if (arguments.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         std::string(name_view) + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v,
+                     to_numeric_double(arguments[0], std::string(name_view)));
+    if (name_view == "csc") {
+      const double s = std::sin(v);
+      if (s == 0.0) {
+        return StatusError(StatusCode::kIsInfinity, "division by zero");
+      }
+      return Value(1.0 / s);
+    }
+    if (name_view == "sec") {
+      const double c = std::cos(v);
+      if (c == 0.0) {
+        return StatusError(StatusCode::kIsInfinity, "division by zero");
+      }
+      return Value(1.0 / c);
+    }
+    const double s = std::sin(v);
+    if (s == 0.0) {
+      return StatusError(StatusCode::kIsInfinity, "division by zero");
+    }
+    return Value(std::cos(v) / s);
+  }
+  if (name_view == "sech" || name_view == "csch" || name_view == "coth") {
+    if (arguments.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         std::string(name_view) + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v,
+                     to_numeric_double(arguments[0], std::string(name_view)));
+    const double h = name_view == "sech" ? std::cosh(v) : std::sinh(v);
+    if (std::isinf(h) && !std::isinf(v)) {
+      return StatusError(
+          StatusCode::kIsInfinity,
+          "Floating point overflow in function: " + std::string(name_view));
+    }
+    if (h == 0.0) {
+      return StatusError(StatusCode::kIsInfinity, "division by zero");
+    }
+    return Value(name_view == "coth" ? std::cosh(v) / h : 1.0 / h);
+  }
   if (name_view == "tanh") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -5736,6 +6182,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].type == ValueType::kInt64 &&
         arguments[1].type == ValueType::kInt64) {
       if (arguments[0].IsUnsigned() || arguments[1].IsUnsigned()) {
+        // Same rule as the AST reference (FunctionCallExpression): a signed
+        // negative divisor against UINT64 has no valid result type.
+        if (!arguments[1].IsUnsigned() && arguments[1].value.int_value < 0) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "DIV with a negative divisor and UINT64 is invalid");
+        }
         const auto r = static_cast<uint64_t>(arguments[1].value.int_value);
         if (r == 0) {
           return StatusError(StatusCode::kIsInfinity,
@@ -5782,7 +6235,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return name_view == "safe_divide" ? Value() : Value(l / r);
     }
     const double res = l / r;
-    if (name_view == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
+    // Only overflow of finite operands is suppressed; non-finite inputs keep
+    // their IEEE result (SAFE_DIVIDE(0, NaN) is NaN), matching GoogleSQL and
+    // the AST evaluator.
+    if (name_view == "safe_divide" && !std::isfinite(res) &&
+        std::isfinite(l) && std::isfinite(r)) {
       return Value();
     }
     return Value(res);
@@ -5908,6 +6365,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   }
 
   if (name_view == "current_timestamp") {
+    if (!arguments.empty()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CURRENT_TIMESTAMP takes no arguments");
+    }
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
     platform::GmTime(static_cast<int64_t>(now), &tm);
@@ -6146,7 +6607,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const Value& sketch = arguments[0];
     if (sketch.IsNull()) {
-      return Value(int64_t{0});
+      return Value(
+          int64_t{0});  // GoogleSQL defines a NULL sketch's estimate as zero.
     }
     int typecode = 0;
     int64_t precision = 0;
@@ -6268,7 +6730,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (size <= 0 || n == 0) {
       return Value::Array({}, arr.ArrayElementSqlType());
     }
-    int64_t begin = offset >= 0 ? offset - 1 : n + offset;
+    if (offset == 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ARRAY_SLICE offset must be non-zero (1-based)");
+    }
+    int64_t begin = offset > 0 ? offset - 1 : n + offset;
     const platform::Int128 wide_end =
         static_cast<platform::Int128>(begin) + size;
     int64_t end = static_cast<int64_t>(std::min<platform::Int128>(wide_end, n));
@@ -6340,6 +6806,32 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // here keeps the two engines element-wise identical (integer stepping
   // stays exact near INT64 boundaries).
   if (name_view == "generate_series") {
+    return ExecuteFunction(name, arguments);
+  }
+
+  // T2242: GENERATE_TIMESTAMP_ARRAY keeps its single implementation in the
+  // expression layer; delegating (like generate_series above) keeps the
+  // batch engine element-wise identical to the AST ground truth.
+  if (name_view == "generate_timestamp_array") {
+    return ExecuteFunction(name, arguments);
+  }
+
+  // T2241: PARSE_DATETIME is implemented AST-first (expression layer); the
+  // batch delegates so the format parsing, the 1970 field defaults and the
+  // canonical zone-less rendering cannot diverge between the engines.
+  if (name_view == "parse_datetime") {
+    return ExecuteFunction(name, arguments);
+  }
+
+  // T2236: same delegation rationale for REGEXP_EXTRACT_GROUPS (the pattern
+  // rewriting and match walking must not diverge between the engines).
+  if (name_view == "regexp_extract_groups") {
+    return ExecuteFunction(name, arguments);
+  }
+
+  // T2237: CONTAINS_SUBSTR likewise stays single-sourced in the expression
+  // layer so case folding and array walking are provably identical.
+  if (name_view == "contains_substr") {
     return ExecuteFunction(name, arguments);
   }
 
@@ -6489,24 +6981,24 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     };
     const auto& haystack = input.ArrayElements();
-    bool result = false;
+    bool matched = false;
     if (name_view == "array_includes") {
-      result = false;
+      matched = false;
       for (const Value& element : haystack) {
         if (!element.IsNull() && equals(element, target)) {
-          result = true;
+          matched = true;
           break;
         }
       }
     } else {
       const auto& targets = target.ArrayElements();
-      result = name_view != "array_includes_any";
+      matched = name_view != "array_includes_any";
       for (const Value& wanted : targets) {
         if (wanted.IsNull()) {
           // NULL target elements match nothing: ANY cannot use them and ALL
           // fails outright.
           if (name_view == "array_includes_all") {
-            result = false;
+            matched = false;
           }
           continue;
         }
@@ -6519,16 +7011,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         if (name_view == "array_includes_any") {
           if (found) {
-            result = true;
+            matched = true;
             break;
           }
         } else if (!found) {
-          result = false;
+          matched = false;
           break;
         }
       }
     }
-    return Value(result);
+    return Value(matched);
   }
 
   if (name_view == "rand") {
@@ -6737,6 +7229,87 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(out));
   }
 
+  // T2239 / T2240: RFC 4648 base32 pair, mirroring the base64 arms'
+  // leniency (whitespace skipped, padding ends the payload, lowercase
+  // accepted) so FROM_/TO_ round-trip for any encoding we accept.
+  if (name_view == "to_base32") {
+    if (arguments.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TO_BASE32 requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return Value();
+    }
+    static constexpr std::string_view kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    static constexpr size_t kPadChars[] = {0, 6, 4, 3, 1};  // NOLINT(modernize-avoid-c-arrays)
+    const std::string input = raw_str(arguments[0]);
+    std::string out;
+    out.reserve((input.size() + 4) / 5 * 8);
+    uint64_t buffer = 0;
+    int bits = 0;
+    for (const char c : input) {
+      buffer = (buffer << 8) | static_cast<unsigned char>(c);
+      bits += 8;
+      while (bits >= 5) {
+        bits -= 5;
+        out.push_back(kAlphabet[(buffer >> bits) & 0x1F]);
+      }
+    }
+    if (bits > 0) {
+      out.push_back(kAlphabet[(buffer << (5 - bits)) & 0x1F]);
+    }
+    out.append(kPadChars[input.size() % 5], '=');
+    return Value(std::move(out));
+  }
+
+  if (name_view == "from_base32") {
+    if (arguments.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "FROM_BASE32 requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return Value();
+    }
+    const std::string input = raw_str(arguments[0]);
+    auto value_of = [](char c) -> int {
+      if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+      }
+      if (c >= 'a' && c <= 'z') {
+        return c - 'a';
+      }
+      if (c >= '2' && c <= '7') {
+        return c - '2' + 26;
+      }
+      return -1;
+    };
+    std::string out;
+    out.reserve(input.size() / 8 * 5);
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (const char c : input) {
+      if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+        continue;
+      }
+      if (c == '=') {
+        break;
+      }
+      const int decoded = value_of(c);
+      if (decoded < 0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "FROM_BASE32: invalid character in input");
+      }
+      buffer = (buffer << 5) | static_cast<uint32_t>(decoded);
+      bits += 5;
+      if (bits >= 8) {
+        bits -= 8;
+        out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+      }
+    }
+    return Value(std::move(out));
+  }
+
   if (name_view == "from_hex") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -6879,12 +7452,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (name_view == "bit_cast_to_int64") {
       return Value(static_cast<int64_t>(bits));
     }
-    // UINT64 results above INT64_MAX have no exact in-engine representation:
-    // widen to double so they compare distinct from any signed value.
-    if (bits >= 0x8000000000000000ULL) {
-      return Value(static_cast<double>(bits));
-    }
-    return Value(static_cast<int64_t>(bits));
+    // UINT64 is exactly representable through the Value unsigned tag
+    // (collation_ == 3): keep the full 64-bit pattern so values >= 2^63
+    // stay precise and order above every signed INT64 instead of widening
+    // to double.
+    return Value(static_cast<int64_t>(bits)).WithUnsigned();
   }
 
   if (name_view == "error") {
@@ -6926,7 +7498,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (!array.IsArray()) {
       return StatusError(StatusCode::kInvalidArgument,
-                         "ARRAY_IS_DISTINCT requires an ARRAY argument");
+                         "ARRAY_IS_DISTINCT requires an array");
     }
     const auto& elements = array.ArrayElements();
     bool saw_null = false;
@@ -6990,7 +7562,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   if (name_view == "array_slice") {
     if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
-                         "ARRAY_SLICE requires two or three arguments");
+                         "ARRAY_SLICE requires 2 or 3 arguments");
     }
     const Value& array = arguments[0];
     if (array.IsNull()) {
@@ -6998,7 +7570,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (!array.IsArray()) {
       return StatusError(StatusCode::kInvalidArgument,
-                         "ARRAY_SLICE requires an ARRAY argument");
+                         "ARRAY_SLICE requires an array");
     }
     auto as_index = [&](const Value& v) -> StatusOr<int64_t> {
       if (v.IsNull() ||
@@ -7065,7 +7637,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.double_value;
       }
       if (v.type == ValueType::kInt64) {
-        return static_cast<double>(v.value.int_value);
+        return v.IsUnsigned() ? static_cast<double>(
+                                    static_cast<uint64_t>(v.value.int_value))
+                              : static_cast<double>(v.value.int_value);
       }
       // ARRAY<STRUCT<key, value>> elements stay JSON-encoded: the distance
       // runs over the numeric payload (last member); the leading member is
@@ -7114,8 +7688,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "ELEMENT requires an ARRAY argument");
     }
+    if (array.ArrayElements().empty()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ELEMENT requires a non-empty array");
+    }
     if (array.ArrayElements().size() != 1) {
-      return StatusError(StatusCode::kInvalidArgument, "More than one element");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ELEMENT requires exactly one array element");
     }
     return array.ArrayElements().front();
   }

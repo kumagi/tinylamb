@@ -99,7 +99,7 @@ TEST(DigestExtraTest, DistinctInputsNeverShareADigest) {
   }
 }
 
-TEST(DigestExtraTest, ToHexEncodesNibblesAndSurvivesRoundTripSize) {
+TEST(DigestExtraTest, ToHexEncodesNibblesAndFixedOutputSize) {
   EXPECT_EQ(digest::ToHex(""), "");
   EXPECT_EQ(digest::ToHex(std::string({'\x00', '\x0f', '\xf0', '\xff'})),
             "000ff0ff");

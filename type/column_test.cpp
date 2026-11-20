@@ -54,7 +54,8 @@ TEST(ColumnTest, AuditIntervalMetadataSurvivesSerialization) {
 }
 
 TEST(ColumnTest, AuditIntegerWidthsSurviveSerializationAndEnforceBounds) {
-  for (uint8_t bits : {8, 16, 32, 64}) {
+  for (const uint8_t bits :
+       {uint8_t{8}, uint8_t{16}, uint8_t{32}, uint8_t{64}}) {
     for (bool is_unsigned : {false, true}) {
       Column column("plain_name", ValueType::kInt64,
                     Constraint(Constraint::kNotNull));

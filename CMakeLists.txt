@@ -19,6 +19,8 @@ option(TINYLAMB_ENABLE_GOOGLESQL
 option(TINYLAMB_ENABLE_LLVM_JIT "Build LLVM ORC expression kernels" ON)
 option(TINYLAMB_ENABLE_FUZZ "Build libFuzzer targets" OFF)
 option(TINYLAMB_ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+option(TINYLAMB_TSAN_DETECT_DEADLOCKS
+       "Run TSan tests with detect_deadlocks=1 (lock-order inversion detection)" OFF)
 option(TINYLAMB_ENABLE_LTO "Enable IPO/LTO for Release builds" OFF)
 
 # Centralized third-party versions (M6.6).
@@ -30,22 +32,37 @@ set(TINYLAMB_GOOGLETEST_SHA256
     "40d4ec942217dcc84a9ebe2a68584ada7d4a33a8ee958755763278ea1c5e18ff"
     CACHE STRING "GoogleTest archive SHA-256")
 
-find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+if(NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    endif()
 endif()
 
+find_program(MOLD_PROGRAM mold)
+if(MOLD_PROGRAM AND NOT APPLE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR
+       (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+        CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12.1"))
+        add_link_options(-fuse-ld=mold)
+        message(STATUS "Linker: mold (${MOLD_PROGRAM})")
+    endif()
+endif()
+
+if(TINYLAMB_ENABLE_LTO AND NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+    message(WARNING "TINYLAMB_ENABLE_LTO=ON only takes effect in Release builds")
+endif()
 if(TINYLAMB_ENABLE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-# Architecture tuning: "native" compiles for the building machine (AVX-512
-# etc.); any other non-empty value is passed through as the -march argument
-# (e.g. x86-64-v3). Empty keeps the portable baseline default for the general
-# build -- but the PAX chunk sources below additionally get -mavx2 -mbmi2 on
-# x86_64 regardless of this flag, so those translation units always require
-# an AVX2/BMI2-capable x86_64 target.
+#Architecture tuning : "native" compiles for the building machine(AVX - 512
+#etc.); any other non - empty value is passed through as the - march argument
+#(e.g.x86 - 64 - v3).Empty keeps the portable baseline default for the general
+#build-- but the PAX chunk sources below additionally get - mavx2 - mbmi2 on
+#x86_64 regardless of this flag, so those translation units always require
+#an AVX2 / BMI2 - capable x86_64 target.
 set(TINYLAMB_ARCH "" CACHE STRING
     "Architecture flag: empty (portable baseline) | native | <raw -march value>")
 if(NOT TINYLAMB_ARCH STREQUAL "")
@@ -65,24 +82,24 @@ if(TINYLAMB_ENABLE_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
-# libFuzzer targets need MORE than their own TU instrumented: the SQL/plan/
-# executor fuzzers call straight into tinylamb::sql, so without layer-wide
-# coverage the whole engine is one black box (cov stays at 1, the corpus
-# cannot guide mutations). fuzzer-no-link adds the PC table everywhere; the
-# actual libFuzzer runtime is linked only by add_fuzzer_test.  GCC has no
-# fuzzer-no-link, so this applies to clang fuzz builds only.
+#libFuzzer targets need MORE than their own TU instrumented : the SQL / plan /
+#executor fuzzers call straight into tinylamb::sql, so without layer - wide
+#coverage the whole engine is one black box(cov stays at 1, the corpus
+#cannot guide mutations).fuzzer - no - link adds the PC table everywhere; the
+#actual libFuzzer runtime is linked only by add_fuzzer_test.GCC has no
+#fuzzer - no - link, so this applies to clang fuzz builds only.
 if(TINYLAMB_ENABLE_FUZZ AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options(-fsanitize=fuzzer-no-link,undefined,bounds)
     add_link_options(-fsanitize=fuzzer-no-link,undefined,bounds)
 endif()
 
-# Global allocator swap. "system" keeps the libc allocator; "mimalloc"
-# vendors the pinned upstream release (FetchContent, like dbgen below) and
-# "jemalloc" links the system libjemalloc. Executor workloads allocate
-# heavily per row (Row images, group tables, accumulator state), and the
-# allocator's per-thread caches change TPC-H end-to-end time by double-digit
-# percents, so the choice is a first-class build knob. Sanitizers must keep
-# the system allocator: ASan / TSan intercept malloc themselves.
+#Global allocator swap."system" keeps the libc allocator; "mimalloc"
+#vendors the pinned upstream release(FetchContent, like dbgen below) and
+#"jemalloc" links the system libjemalloc.Executor workloads allocate
+#heavily per row(Row images, group tables, accumulator state), and the
+#allocator's per-thread caches change TPC-H end-to-end time by double-digit
+#percents, so the choice is a first - class build knob.Sanitizers must keep
+#the system allocator : ASan / TSan intercept malloc themselves.
 set(TINYLAMB_ALLOCATOR "system" CACHE STRING
     "Global allocator: system | mimalloc | jemalloc")
 set_property(CACHE TINYLAMB_ALLOCATOR PROPERTY
@@ -100,8 +117,8 @@ if(NOT TINYLAMB_ALLOCATOR STREQUAL "system")
             GIT_TAG "v2.1.7"
             GIT_SHALLOW TRUE)
         FetchContent_MakeAvailable(mimalloc)
-# The `mimalloc` target overrides malloc / free / operator new for every
-# executable linked into this directory scope.
+#The `mimalloc` target overrides malloc / free / operator new for every
+#executable linked into this directory scope.
         link_libraries(mimalloc)
         message(STATUS "Allocator: mimalloc (vendored v2.1.7)")
     elseif(TINYLAMB_ALLOCATOR STREQUAL "jemalloc")
@@ -121,6 +138,18 @@ endif()
 
 set(TINYLAMB_GOOGLESQL_VERSION "2026.7.2" CACHE STRING
     "Pinned GoogleSQL release used by the SQL frontend")
+
+# The EXPECTED_HASH values below are pinned to 2026.7.2. Letting a caller
+# override only the version produces a cryptic checksum mismatch at download
+# time; fail early with an actionable message instead. When upgrading, bump
+# both the version and the per-platform SHA256 values together.
+if(TINYLAMB_ENABLE_GOOGLESQL AND
+   NOT TINYLAMB_GOOGLESQL_VERSION STREQUAL "2026.7.2")
+    message(FATAL_ERROR
+        "TINYLAMB_GOOGLESQL_VERSION=${TINYLAMB_GOOGLESQL_VERSION} has no pinned "
+        "SHA256 (the download hashes in this file are for 2026.7.2). Update "
+        "the _googlesql_sha256 values together with the version.")
+endif()
 
 if(TINYLAMB_ENABLE_GOOGLESQL)
     set(_googlesql_download_dir "${CMAKE_BINARY_DIR}/_deps/googlesql")
@@ -288,12 +317,15 @@ set(TINYLAMB_LAYER_LIBS
         tinylamb_expression
         tinylamb_executor)
 
-# Layer 1: common utilities (no upstream tinylamb dependencies).
+#Layer 1 : common utilities(no upstream tinylamb dependencies).
 tinylamb_add_layer(tinylamb_common
         ALIAS tinylamb::common
         SOURCES
         common/serdes.cpp
         common/log_message.cpp
+        common/memory_budget.cpp
+        common/query_grant.cpp
+        common/spill/spill_store.cpp
         common/encoder.cpp
         common/decoder.cpp
         common/runtime_filter.cpp
@@ -301,6 +333,7 @@ tinylamb_add_layer(tinylamb_common
         common/sorted_distinct_runs.cpp
         common/regex_guard.cpp
         common/platform/cpu_affinity.cpp
+        common/platform/range_selection.cpp
         common/platform/event_poller.cpp
         common/platform/file_io.cpp
         common/platform/int128_rt.cpp
@@ -308,8 +341,8 @@ tinylamb_add_layer(tinylamb_common
         common/platform/socket.cpp
         common/platform/time_format.cpp
         common/platform/time_zone.cpp)
-# Optional linear-time regex replacement. Builds without RE2 retain the
-# guarded standard-library evaluator and identical replacement syntax.
+#Optional linear - time regex replacement.Builds without RE2 retain the
+#guarded standard - library evaluator and identical replacement syntax.
 option(TINYLAMB_ENABLE_RE2 "Use installed RE2 for regular expression replacement" ON)
 if(TINYLAMB_ENABLE_RE2)
     find_path(TINYLAMB_RE2_INCLUDE_DIR re2/re2.h)
@@ -325,18 +358,19 @@ if(TINYLAMB_ENABLE_RE2)
 endif()
 
 if(APPLE)
-    # common/platform/time_zone.cpp: Apple's libc++ ships no C++20 tzdb, so
-    # zone lookups go through CFTimeZone.
+#common / platform / time_zone.cpp : Apple's libc++ ships no C++20 tzdb, so
+#zone lookups go through CFTimeZone.
     target_link_libraries(tinylamb_common PUBLIC "-framework CoreFoundation")
 elseif(WIN32)
     target_link_libraries(tinylamb_common PUBLIC ws2_32)
 endif()
 
-# Layer 2: type system.
+#Layer 2 : type system.
 tinylamb_add_layer(tinylamb_type
         ALIAS tinylamb::type
         SOURCES
         type/row.cpp
+        type/row_block_codec.cpp
         type/schema.cpp
         type/date.cpp
         type/interval.cpp
@@ -349,11 +383,12 @@ tinylamb_add_layer(tinylamb_type
         type/type.cpp
         DEPENDS tinylamb::common)
 
-# Layer 3: page + recovery + transaction (tightly coupled storage foundation).
+#Layer 3 : page + recovery + transaction(tightly coupled storage foundation).
 tinylamb_add_layer(tinylamb_page
         ALIAS tinylamb::page
         SOURCES
         page/page.cpp
+        page/page_lsm_store.cpp
         page/row_page.cpp
         page/page_manager.cpp
         page/page_type.cpp
@@ -366,7 +401,7 @@ tinylamb_add_layer(tinylamb_page
         transaction/transaction_manager.cpp
         DEPENDS tinylamb::type)
 
-# Layer 4: index structures (LSM-Tree index).
+#Layer 4 : index structures(LSM - Tree index).
 tinylamb_add_layer(tinylamb_index
         ALIAS tinylamb::index
         SOURCES
@@ -375,7 +410,7 @@ tinylamb_add_layer(tinylamb_index
         index/index_schema.cpp
         DEPENDS tinylamb::page)
 
-# Layer 5: table access (includes index_scan_iterator to avoid table<->index cycle).
+# Layer 5: table access (includes index_scan_iterator to avoid table <-> index cycle).
 set(TINYLAMB_PAX_SOURCES
         table/memtable/memtable.cpp
         table/memtable/skiplist.cpp
@@ -402,12 +437,13 @@ tinylamb_add_layer(tinylamb_table
         table/table.cpp
         table/full_scan_iterator.cpp
         table/lstable_bridge.cpp
+        table/tlcs_file.cpp
         table/table_statistics.cpp
         index/index_scan_iterator.cpp
         ${TINYLAMB_PAX_SOURCES}
         DEPENDS tinylamb::index)
 
-# Layer 6: catalog and database orchestration.
+#Layer 6 : catalog and database orchestration.
 tinylamb_add_layer(tinylamb_database
         ALIAS tinylamb::database
         SOURCES
@@ -416,7 +452,7 @@ tinylamb_add_layer(tinylamb_database
         database/transaction_context.cpp
         DEPENDS tinylamb::table)
 
-# Layer 7: expression evaluation.
+#Layer 7 : expression evaluation.
 tinylamb_add_layer(tinylamb_expression
         ALIAS tinylamb::expression
         SOURCES
@@ -451,11 +487,11 @@ if(LLVM_FOUND AND TINYLAMB_ENABLE_LLVM_JIT)
     target_include_directories(tinylamb_expression SYSTEM PRIVATE
             ${LLVM_INCLUDE_DIRS})
     llvm_map_components_to_libnames(TINYLAMB_LLVM_LIBS
-            Core OrcJIT ExecutionEngine RuntimeDyld Support native)
+            Core OrcJIT ExecutionEngine RuntimeDyld Support Passes native)
     target_link_libraries(tinylamb_expression PUBLIC ${TINYLAMB_LLVM_LIBS})
 endif()
 
-# Layer 8: plan + executor (+ query_data used by the optimizer).
+#Layer 8 : plan + executor(+query_data used by the optimizer).
 tinylamb_add_layer(tinylamb_executor
         ALIAS tinylamb::executor
         SOURCES
@@ -495,22 +531,45 @@ tinylamb_add_layer(tinylamb_executor
         executor/window.cpp
         executor/relational.cpp
         executor/relational_factory.cpp
+        executor/pipeline_lowering.cpp
+        executor/detail/columnar_table.cpp
         executor/detail/relation.cpp
+        executor/detail/relational_sort_limit.cpp
         executor/detail/subquery_runtime.cpp
         executor/detail/window_eval.cpp
+        executor/detail/window_eval_columnar.cpp
         executor/detail/expression_eval.cpp
         executor/detail/function_eval.cpp
         executor/detail/aggregate_accumulator.cpp
         executor/detail/scan_filter.cpp
         executor/detail/parallel_table_scan.cpp
         executor/detail/planning_heuristics.cpp
+        executor/detail/planning_columnar_keys.cpp
         executor/detail/build_input.cpp
+        executor/detail/build_input_joins.cpp
         executor/detail/fused_grouped_join.cpp
-        executor/detail/stream_grouped_join.cpp
+        executor/detail/fused_grouped_join_stream.cpp
         executor/detail/typed_column_eval.cpp
         executor/detail/typed_stream_aggregate.cpp
+        executor/detail/typed_stream_aggregate_compact.cpp
+        executor/detail/typed_stream_aggregate_dict.cpp
+        executor/detail/columnar_tlcs_fast_path.cpp
+        executor/detail/typed_stream_aggregate_partitioned.cpp
+        executor/columnar_tlcs_scan_executor.cpp
         executor/detail/explain_format.cpp
         executor/detail/work_table_index.cpp
+        executor/detail/ooc/chunk_codec.cpp
+        executor/detail/ooc/spillable_store.cpp
+        executor/detail/ooc/external_sorter.cpp
+        executor/detail/ooc/recursive_partitioner.cpp
+        executor/detail/pipeline/pipeline_ir.cpp
+        executor/detail/pipeline/pipeline_ops.cpp
+        executor/detail/pipeline/ooc_sort_distinct_sink.cpp
+        executor/detail/pipeline/ooc_group_agg_sink.cpp
+        executor/detail/pipeline/ooc_hash_join_sink.cpp
+        executor/detail/pipeline/ooc_window_sink.cpp
+        executor/detail/pipeline/ooc_setop_incsort_sink.cpp
+        executor/detail/pipeline/ooc_join_cte_sources.cpp
         executor/index_scan.cpp
         executor/index_only_scan.cpp
         executor/parallel_index_scan.cpp
@@ -567,7 +626,7 @@ tinylamb_add_layer(tinylamb_executor
         query/query_data.cpp
         DEPENDS tinylamb::expression)
 
-# Aggregate target preserving tinylamb::core backward compatibility.
+#Aggregate target preserving tinylamb::core backward compatibility.
 add_library(tinylamb_core INTERFACE)
 add_library(tinylamb::core ALIAS tinylamb_core)
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24" AND
@@ -577,7 +636,7 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24" AND
             "$<LINK_GROUP:RESCAN,${TINYLAMB_LAYER_LIBS}>"
             Threads::Threads)
 elseif(APPLE)
-    # ld64 rescans static archives on its own and rejects --start-group.
+#ld64 rescans static archives on its own and rejects-- start - group.
     target_link_libraries(tinylamb_core INTERFACE
             ${TINYLAMB_LAYER_LIBS}
             Threads::Threads)
@@ -595,15 +654,22 @@ add_library(tinylamb_sql
         query/googlesql_ast.cpp
         query/googlesql_ast_visitor.cpp
         query/googlesql_ast_visitor_dml.cpp
+        query/googlesql_ast_visitor_expr.cpp
         query/sql_template.cpp
         query/sql_engine.cpp
+        query/sql_engine_statements.cpp
+        query/grouped_pipeline_lowering.cpp
         query/select_rewrites.cpp
+        query/tpch_select_rewrites.cpp
         query/join_reduction.cpp
         query/sql_oracle_fuzzer.cpp
+        query/sql_oracle_checks.cpp
         query/sql_join_fuzzer.cpp
         query/sql_aggregate_fuzzer.cpp
-        query/sql_plancache_fuzzer.cpp
+        query/sql_plan_cache_fuzzer.cpp
         query/sql_session_fuzzer.cpp
+        query/sql_ooc_fuzzer.cpp
+        query/sql_ooc_query_gen.cpp
         query/expr_oracle_fuzzer.cpp
         query/griffin_fuzzer.cpp
         query/sql_diff_oracle_fuzzer.cpp
@@ -613,9 +679,9 @@ target_compile_features(tinylamb_sql PUBLIC cxx_std_20)
 tinylamb_apply_options(tinylamb_sql)
 target_link_libraries(tinylamb_sql PUBLIC tinylamb::core)
 if(TINYLAMB_ENABLE_GOOGLESQL)
-    # Runtime path embedded into the frontend. Defaults to the build-tree
-    # copy; override it when cross-compiling and the target machine keeps the
-    # helper somewhere else (e.g. /tmp/tinylamb-execute-query on a Pi).
+#Runtime path embedded into the frontend.Defaults to the build - tree
+#copy; override it when cross - compiling and the target machine keeps the
+#helper somewhere else(e.g./ tmp / tinylamb - execute - query on a Pi).
     set(TINYLAMB_GOOGLESQL_EXECUTABLE_PATH "${_googlesql_executable}"
         CACHE STRING
         "Runtime path of the execute_query helper embedded into tinylamb_sql")
@@ -675,10 +741,10 @@ tinylamb_apply_options(tinylamb)
 target_link_libraries(
         tinylamb
         PRIVATE
-        # Shares pgwire::SplitSqlStatements with the server so the CLI does
-        # not keep a diverged (comment/backslash-unaware) copy of the
-        # statement splitter; tinylamb::postgres_server transitively links
-        # tinylamb::sql PUBLIC.
+#Shares pgwire::SplitSqlStatements with the server so the CLI does
+#not keep a diverged(comment / backslash - unaware) copy of the
+#statement splitter; tinylamb::postgres_server transitively links
+#tinylamb::sql PUBLIC.
         tinylamb::postgres_server
 )
 target_include_directories(
@@ -714,13 +780,18 @@ if(TINYLAMB_TPCC_MYSQL)
     target_link_libraries(tinylamb_tpcc_three_benchmark PRIVATE ${TINYLAMB_MYSQL_LIBRARY})
 endif()
 
-# TPC-H DBGEN is an executable build dependency of the benchmark only.  It is
-# deliberately not linked into tinylamb and is not downloaded when building
-# the database, server, or unit-test targets.
+#TPC - H DBGEN is an executable build dependency of the benchmark only.It is
+#deliberately not linked into tinylamb and is not downloaded when building
+#the database, server, or unit - test targets.
 include(ExternalProject)
 set(TINYLAMB_TPCH_DBGEN_COMMIT
     "32f1c1b92d1664dba542e927d23d86ffa57aa253"
     CACHE STRING "Pinned TPC-H DBGEN commit")
+option(TINYLAMB_TPCH_DBGEN_WARNINGS "Show warnings from the external TPC-H DBGEN build" OFF)
+set(_tpch_dbgen_cc "cc -std=gnu17 -D_DEFAULT_SOURCE")
+if(NOT TINYLAMB_TPCH_DBGEN_WARNINGS)
+    string(APPEND _tpch_dbgen_cc " -w")
+endif()
 set(_tpch_dbgen_source_dir "${CMAKE_BINARY_DIR}/_deps/tpch-dbgen-src")
 ExternalProject_Add(tinylamb_tpch_dbgen
     PREFIX "${CMAKE_BINARY_DIR}/_deps/tpch-dbgen"
@@ -731,7 +802,7 @@ ExternalProject_Add(tinylamb_tpch_dbgen
     SOURCE_DIR "${_tpch_dbgen_source_dir}"
     CONFIGURE_COMMAND ""
     BUILD_IN_SOURCE TRUE
-    BUILD_COMMAND make "CC=cc -std=gnu17 -D_DEFAULT_SOURCE" dbgen
+    BUILD_COMMAND make "CC=${_tpch_dbgen_cc}" dbgen
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE)
 
@@ -757,7 +828,7 @@ add_executable(tinylamb_tpcds_compare EXCLUDE_FROM_ALL
 tinylamb_apply_options(tinylamb_tpcds_compare)
 target_link_libraries(tinylamb_tpcds_compare PRIVATE tinylamb::sql)
 
-# Isolated bounded-SPSC aggregate pipeline experiment; not an executor path.
+#Isolated bounded - SPSC aggregate pipeline experiment; not an executor path.
 add_executable(tinylamb_spsc_aggregation_benchmark EXCLUDE_FROM_ALL
         benchmark/spsc_aggregation_benchmark.cpp)
 tinylamb_apply_options(tinylamb_spsc_aggregation_benchmark)
@@ -775,28 +846,21 @@ add_executable(tinylamb_expression_jit_benchmark EXCLUDE_FROM_ALL
 tinylamb_apply_options(tinylamb_expression_jit_benchmark)
 target_link_libraries(tinylamb_expression_jit_benchmark PRIVATE tinylamb::core)
 
+add_executable(tinylamb_ooc_baseline_measure EXCLUDE_FROM_ALL
+        benchmark/ooc_baseline_measure.cpp)
+tinylamb_apply_options(tinylamb_ooc_baseline_measure)
+target_link_libraries(tinylamb_ooc_baseline_measure PRIVATE tinylamb::sql)
+
+#One - session - per - process driver of the OOC session fuzzer(crash / hang
+#capture, trace minimization); scripts / ooc_fuzz.py runs campaigns of it.
+add_executable(sql_ooc_fuzz EXCLUDE_FROM_ALL query/sql_ooc_fuzz_main.cpp)
+tinylamb_apply_options(sql_ooc_fuzz)
+target_link_libraries(sql_ooc_fuzz PRIVATE tinylamb::sql)
+
 ########################################
 ## Bench
 ########################################
 
-function(add_benchmark file_path)
-    get_filename_component(filename ${file_path} NAME)
-    get_filename_component(target_name ${filename} NAME_WE)
-    add_executable(${target_name} ${file_path})
-    tinylamb_apply_options(${target_name})
-    # Keep IPO opt-in, just like the rest of the project.  An unconditional
-    # LTO compile makes this otherwise small benchmark consume several times
-    # the memory of a normal target and can make a complete build fail before
-    # any benchmark code is used.
-    if(TINYLAMB_ENABLE_LTO)
-        set_property(TARGET ${target_name} PROPERTY
-                     INTERPROCEDURAL_OPTIMIZATION TRUE)
-    endif()
-    target_link_libraries(${target_name}
-            PRIVATE
-            tinylamb::core
-    )
-endfunction()
 
 ########################################
 ## Testing
@@ -804,7 +868,10 @@ endfunction()
 include(CTest)
 if(BUILD_TESTING)
     enable_testing()
-    find_package(GTest QUIET)
+    # Request the pinned version as a minimum: an older system GTest (e.g.
+    # 1.14, whose gtest-printers.h breaks clang 21) must fail the version
+    # check here so the FetchContent pin below is used instead.
+    find_package(GTest ${TINYLAMB_GOOGLETEST_VERSION} QUIET)
     if(NOT GTest_FOUND)
         include(FetchContent)
         FetchContent_Declare(
@@ -813,7 +880,7 @@ if(BUILD_TESTING)
                 URL_HASH SHA256=${TINYLAMB_GOOGLETEST_SHA256}
         )
 
-        # Keep the dependency focused on the test library used here.
+#Keep the dependency focused on the test library used here.
         set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
         set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
         set(INSTALL_GMOCK OFF CACHE BOOL "" FORCE)
@@ -827,18 +894,21 @@ if(BUILD_TESTING)
     include(GoogleTest)
 
     function(add_simple_test file_path)
-        # TIMEOUT (seconds) overrides ctest's default 1500s for heavy
-        # stateful-session / crash-recovery sweeps whose wall time explodes
-        # when several suites run concurrently on one machine.
-        cmake_parse_arguments(SIMPLE_TEST "" "TIMEOUT" "LIBS" ${ARGN})
-        get_filename_component(filename ${file_path} NAME)
-        get_filename_component(target_name ${filename} NAME_WE)
-        # The workspace-cleanup environment (database/test_workspace_cleanup_env
-        # .cpp) removes .db/.log files the tests left in the working directory;
-        # it is compiled directly into every test binary (gtest environments
-        # only fire if the TU is linked). TINYLAMB_KEEP_TEST_DATABASES=1 keeps
-        # them for post-mortem inspection.
-        add_executable(${target_name} ${file_path}
+#All unit tests must run within 60 seconds; reject longer waits via
+#CTest's per-test TIMEOUT property.
+        cmake_parse_arguments(SIMPLE_TEST "" "TARGET" "LIBS;SOURCES" ${ARGN})
+        if(SIMPLE_TEST_TARGET)
+            set(target_name ${SIMPLE_TEST_TARGET})
+        else()
+            get_filename_component(filename ${file_path} NAME)
+            get_filename_component(target_name ${filename} NAME_WE)
+        endif()
+#The workspace - cleanup environment(database / test_workspace_cleanup_env
+#.cpp) removes.db /.log files the tests left in the working directory;
+#it is compiled directly into every test binary(gtest environments
+#only fire if the TU is linked).TINYLAMB_KEEP_TEST_DATABASES = 1 keeps
+#them for post - mortem inspection.
+        add_executable(${target_name} ${file_path} ${SIMPLE_TEST_SOURCES}
                 "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
         tinylamb_apply_options(${target_name})
         if(SIMPLE_TEST_LIBS)
@@ -853,18 +923,25 @@ if(BUILD_TESTING)
                 tinylamb::test_util
         )
         if(TINYLAMB_ENABLE_TSAN)
-            # Preserve the existing race-only TSan configuration. The original
-            # exemption referred to the retired PagePool; it is not evidence
-            # that current lock-order reports are false positives. A separate
-            # detector-enabled audit is required before claiming lock-order
-            # coverage. die_after_fork=0 permits gtest death-test children.
-            set(_test_env "TSAN_OPTIONS=detect_deadlocks=0 die_after_fork=0")
+#Preserve the existing race - only TSan configuration.The original
+#exemption referred to the retired PagePool; it is not evidence
+#that current lock - order reports are false positives.A separate
+#detector - enabled audit is required before claiming lock - order
+# die_after_fork=0 permits gtest death-test children; detect_deadlocks is
+# toggled independently below based on TINYLAMB_TSAN_DETECT_DEADLOCKS.
+            if(TINYLAMB_TSAN_DETECT_DEADLOCKS)
+                # Lock-order (ABBA) inversions are only visible to TSan's
+                # deadlock detector; see docs/lock_order.md.
+                set(_test_env "TSAN_OPTIONS=detect_deadlocks=1 die_after_fork=0")
+            else()
+                set(_test_env "TSAN_OPTIONS=detect_deadlocks=0 die_after_fork=0")
+            endif()
         else()
             set(_test_env "")
         endif()
-        # Always replay the committed oracle regression files; without the
-        # directory the guard test silently skips (no-exception-rule-migration
-        # .md / AGENTS.md fuzzing workflow).
+#Always replay the committed oracle regression files; without the
+#directory the guard test silently skips(no - exception - rule - migration
+#.md / AGENTS.md fuzzing workflow).
         list(APPEND _test_env
              "TINYLAMB_ORACLE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/oracle_regressions")
         list(APPEND _test_env
@@ -874,33 +951,97 @@ if(BUILD_TESTING)
         list(APPEND _test_env
              "TINYLAMB_JOIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/join_regressions")
         list(APPEND _test_env
-             "TINYLAMB_GRIFFIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/griffin_regressions")
-        # Test listing runs right after each link. The 5 s default is too
-        # tight under a fully parallel build, and on macOS the first launch of
-        # a freshly linked (LLVM-sized) binary also waits for the system's
-        # executable scan.
+             "TINYLAMB_GRIFFIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/griffin_regressions"
+             "TINYLAMB_PLANCACHE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/plancache_regressions")
+        list(APPEND _test_env
+             "TINYLAMB_OOC_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/ooc_regressions")
+        list(APPEND _test_env
+             "TINYLAMB_EXPR_FUZZ_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/expression/testdata/expression_fuzzer_regressions")
+#Test listing runs right after each link.The 5 s default is too
+#tight under a fully parallel build, and on macOS the first launch of
+#a freshly linked(LLVM - sized) binary also waits for the system's
+#executable scan.
         set(_discovery_mode "")
         if(CMAKE_CROSSCOMPILING)
             set(_discovery_mode DISCOVERY_MODE PRE_TEST)
         endif()
-        if(SIMPLE_TEST_TIMEOUT)
-            gtest_discover_tests(${target_name}
-                                 ${_discovery_mode}
-                                 DISCOVERY_TIMEOUT 120
-                                 PROPERTIES
-                                 ENVIRONMENT "${_test_env}"
-                                 TIMEOUT ${SIMPLE_TEST_TIMEOUT})
+        gtest_discover_tests(${target_name}
+                             ${_discovery_mode}
+                             DISCOVERY_TIMEOUT 120
+                             PROPERTIES
+                             ENVIRONMENT "${_test_env}"
+                             TIMEOUT 60)
+    endfunction()
+
+    function(add_scale_test file_path)
+        cmake_parse_arguments(SCALE_TEST "" "TARGET" "LIBS;SOURCES" ${ARGN})
+        if(SCALE_TEST_TARGET)
+            set(target_name ${SCALE_TEST_TARGET})
         else()
-            gtest_discover_tests(${target_name}
-                                 ${_discovery_mode}
-                                 DISCOVERY_TIMEOUT 120
-                                 PROPERTIES ENVIRONMENT "${_test_env}")
+            get_filename_component(filename ${file_path} NAME)
+            get_filename_component(target_name ${filename} NAME_WE)
         endif()
+        add_executable(${target_name} ${file_path} ${SCALE_TEST_SOURCES}
+                "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
+        tinylamb_apply_options(${target_name})
+        if(SCALE_TEST_LIBS)
+            set(_test_libs ${SCALE_TEST_LIBS})
+        else()
+            set(_test_libs tinylamb::sql)
+        endif()
+        target_link_libraries(${target_name}
+                PRIVATE
+                GTest::gtest_main
+                ${_test_libs}
+                tinylamb::test_util
+        )
+        # Same test environment as add_simple_test (race-only TSan config +
+        # oracle regression dirs); only the timeout/label differ. Scale tests
+        # run opt-in via `ctest -L scale` and are excluded from default runs.
+        if(TINYLAMB_ENABLE_TSAN)
+            if(TINYLAMB_TSAN_DETECT_DEADLOCKS)
+                set(_scale_test_env "TSAN_OPTIONS=detect_deadlocks=1 die_after_fork=0")
+            else()
+                set(_scale_test_env "TSAN_OPTIONS=detect_deadlocks=0 die_after_fork=0")
+            endif()
+        else()
+            set(_scale_test_env "")
+        endif()
+        list(APPEND _scale_test_env
+             "TINYLAMB_ORACLE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/oracle_regressions")
+        list(APPEND _scale_test_env
+             "TINYLAMB_SESSION_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/session_regressions")
+        list(APPEND _scale_test_env
+             "TINYLAMB_AGGREGATE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/aggregate_regressions")
+        list(APPEND _scale_test_env
+             "TINYLAMB_JOIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/join_regressions")
+        list(APPEND _scale_test_env
+             "TINYLAMB_GRIFFIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/griffin_regressions"
+             "TINYLAMB_PLANCACHE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/plancache_regressions")
+        list(APPEND _scale_test_env
+             "TINYLAMB_OOC_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/ooc_regressions")
+        list(APPEND _scale_test_env
+             "TINYLAMB_EXPR_FUZZ_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/expression/testdata/expression_fuzzer_regressions")
+        set(_discovery_mode "")
+        if(CMAKE_CROSSCOMPILING)
+            set(_discovery_mode DISCOVERY_MODE PRE_TEST)
+        endif()
+        gtest_discover_tests(${target_name}
+                             ${_discovery_mode}
+                             DISCOVERY_TIMEOUT 120
+                             PROPERTIES
+                             ENVIRONMENT "${_scale_test_env}"
+                             LABELS "scale"
+                             TIMEOUT 600)
     endfunction()
 
 add_simple_test(common/log_message_test.cpp)
+add_simple_test(common/memory_budget_test.cpp)
+add_simple_test(common/query_grant_test.cpp)
 add_simple_test(common/crc32c_test.cpp)
 add_simple_test(common/platform/platform_test.cpp)
+add_simple_test(common/platform/range_selection_test.cpp)
+add_simple_test(common/decoder_test.cpp)
 add_simple_test(common/serdes_test.cpp)
 add_simple_test(common/status_or_test.cpp)
 add_simple_test(common/string_util_test.cpp)
@@ -913,6 +1054,7 @@ add_simple_test(type/constraint_test.cpp)
 add_simple_test(type/column_test.cpp)
 add_simple_test(type/schema_test.cpp)
 add_simple_test(page/page_manager_test.cpp)
+add_simple_test(page/page_lsm_store_test.cpp)
 add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/logger_segment_test.cpp)
 add_simple_test(recovery/recovery_manager_test.cpp)
@@ -930,17 +1072,33 @@ add_simple_test(expression/rewrite_test.cpp)
 add_simple_test(expression/bytecode_test.cpp)
 add_simple_test(expression/jit_test.cpp)
 add_simple_test(expression/parameter_slot_test.cpp)
-add_simple_test(executor/executor_test.cpp)
+# Issue #33: expression_fuzzer differential replay corpus (see
+# expression/expression_fuzzer.hpp; corpus dir wired via
+# TINYLAMB_EXPR_FUZZ_REGRESSION_DIR below).
+add_simple_test(expression/expression_fuzzer_test.cpp
+        SOURCES expression/expression_fuzzer.cpp)
+add_simple_test(executor/executor_test_part1.cpp
+        TARGET executor_test
+        SOURCES
+        executor/executor_test_part2.cpp
+        executor/executor_test_part3.cpp)
 add_simple_test(executor/parallel_index_scan_test.cpp)
-add_simple_test(executor/relational_regression_test.cpp)
+add_simple_test(executor/relational_regression_test_part1.cpp
+        TARGET relational_regression_test
+        SOURCES
+        executor/relational_regression_test_part2.cpp
+        executor/relational_regression_test_part3.cpp
+        executor/relational_regression_test_part4.cpp)
 add_simple_test(common/sorted_distinct_runs_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
+add_simple_test(executor/columnar_tlcs_fast_path_test.cpp)
 add_simple_test(executor/distinct_test.cpp)
 add_simple_test(executor/sort_collation_test.cpp)
 add_simple_test(executor/sort_shape_executor_test.cpp)
 add_simple_test(executor/grouped_aggregate_test.cpp)
 add_simple_test(executor/window_spill_test.cpp)
 add_simple_test(executor/detail/flat_int_key_map_test.cpp)
+add_simple_test(executor/detail/columnar_table_test.cpp)
 add_simple_test(executor/detail/work_table_index_test.cpp)
 add_simple_test(executor/detail/scan_filter_test.cpp)
 add_simple_test(executor/detail/planning_heuristics_test.cpp)
@@ -953,6 +1111,7 @@ add_simple_test(query/join_reduction_test.cpp)
 add_simple_test(query/select_rewrites_test.cpp)
 add_simple_test(table/pax_chunk/pax_chunk_codecs_test.cpp)
 add_simple_test(table/fragment/fragment_test.cpp)
+add_simple_test(table/memtable/memtable_sync_test.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(pax_chunk_codecs_test PRIVATE ${_pax_compile_opts})
 endif()
@@ -976,8 +1135,15 @@ add_simple_test(executor/query_memory_test.cpp)
 add_simple_test(database/catalog_test.cpp)
 add_simple_test(plan/plan_test.cpp)
 add_simple_test(type/column_name_test.cpp)
-add_simple_test(plan/optimizer_test.cpp)
-add_simple_test(plan/cascades_test.cpp)
+add_simple_test(plan/optimizer_test_part1.cpp
+        TARGET optimizer_test
+        SOURCES
+        plan/optimizer_test_part2.cpp)
+add_simple_test(plan/cascades_test_part1.cpp
+        TARGET cascades_test
+        SOURCES
+        plan/cascades_test_part2.cpp
+        plan/cascades_test_part3.cpp)
 add_simple_test(plan/collation_property_test.cpp)
 add_simple_test(plan/sort_shape_test.cpp)
 add_simple_test(plan/aggregate_shape_test.cpp)
@@ -987,7 +1153,12 @@ add_simple_test(plan/full_scan_plan_test.cpp)
 add_simple_test(plan/late_materialization_join_plan_test.cpp)
 add_simple_test(plan/plan_memo_oracle_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
-add_simple_test(query/query_test.cpp)
+add_simple_test(table/tlcs_file_test.cpp)
+add_simple_test(query/query_test_part1.cpp
+        TARGET query_test
+        SOURCES
+        query/query_test_part2.cpp
+        query/query_test_part3.cpp)
 add_simple_test(query/date_array_and_compare_test.cpp)
 add_simple_test(query/late_materialization_sql_test.cpp)
 add_simple_test(query/sql_clustered_order_test.cpp)
@@ -997,16 +1168,17 @@ add_simple_test(query/googlesql_frontend_test.cpp)
 add_simple_test(query/googlesql_ast_test.cpp)
 add_simple_test(query/sql_template_test.cpp)
 add_simple_test(query/sql_engine_tpcc_test.cpp)
-add_simple_test(query/sql_engine_tpch_test.cpp TIMEOUT 5400)
+add_simple_test(query/sql_engine_tpch_test.cpp)
 add_simple_test(query/googlesql_compliance_test.cpp)
-add_simple_test(query/sql_oracle_fuzzer_test.cpp TIMEOUT 5400)
+add_simple_test(query/sql_oracle_fuzzer_test.cpp)
 add_simple_test(query/sql_join_fuzzer_test.cpp)
 add_simple_test(query/sql_aggregate_fuzzer_test.cpp)
-add_simple_test(query/sql_plancache_fuzzer_test.cpp)
-add_simple_test(query/sql_session_fuzzer_test.cpp TIMEOUT 5400)
-add_simple_test(query/expr_oracle_fuzzer_test.cpp TIMEOUT 5400)
+add_simple_test(query/sql_plan_cache_fuzzer_test.cpp)
+add_simple_test(query/sql_session_fuzzer_test.cpp)
+add_simple_test(query/sql_ooc_fuzzer_test.cpp)
+add_simple_test(query/expr_oracle_fuzzer_test.cpp)
 add_simple_test(query/sql_diff_oracle_fuzzer_test.cpp)
-add_simple_test(query/griffin_fuzzer_test.cpp TIMEOUT 5400)
+add_simple_test(query/griffin_fuzzer_test.cpp)
 add_simple_test(expression/expr_simplify_oracle_test.cpp)
 target_sources(googlesql_compliance_test PRIVATE
         query/googlesql_compliance_file.cpp)
@@ -1020,13 +1192,14 @@ add_simple_test(server/postgres_protocol_test.cpp LIBS tinylamb::postgres_server
 add_simple_test(server/postgres_server_test.cpp LIBS tinylamb::postgres_server)
 add_simple_test(benchmark/tpcc_workload_test.cpp LIBS tinylamb::tpcc)
 
-# Coverage-focused tests.
+#Coverage - focused tests.
 add_simple_test(executor/relational_extra_test.cpp)
 add_simple_test(benchmark/tpcc_workload_extra_test.cpp LIBS tinylamb::tpcc)
 add_simple_test(server/postgres_server_extra_test.cpp LIBS tinylamb::postgres_server)
 add_simple_test(table/table_statistics_extra_test.cpp)
 add_simple_test(query/sql_extra_test.cpp)
 add_simple_test(query/sql_audit_regression_test.cpp)
+add_simple_test(query/pipeline_p3a_sql_test.cpp)
 add_simple_test(query/sql_bugfix_regression_test.cpp)
 add_simple_test(query/analytical_features_test.cpp)
 add_simple_test(query/foreign_key_test.cpp)
@@ -1039,9 +1212,7 @@ add_simple_test(type/row_schema_extra_test.cpp)
 add_simple_test(common/util_extra_test.cpp)
 add_simple_test(plan/plan_extra_test.cpp)
 add_simple_test(executor/executor_extra_test.cpp)
-# The checkpoint-storm scenario needs ~33 min even on a quiet machine
-# (2003s measured 2026-09-28); the 1500s default truncates it.
-add_simple_test(database/database_extra_test.cpp TIMEOUT 2700)
+add_simple_test(database/database_extra_test.cpp)
 add_simple_test(transaction/transaction_extra_test.cpp)
 add_simple_test(transaction/index_key_history_test.cpp)
 add_simple_test(query/sql_function_coverage_test.cpp)
@@ -1054,7 +1225,10 @@ add_simple_test(expression/proto_json_helpers_test.cpp)
 add_simple_test(query/sql_window_agg_coverage_test.cpp)
 add_simple_test(query/sql_engine_coverage_test.cpp)
 add_simple_test(query/sql_grouping_sets_test.cpp)
-add_simple_test(executor/executor_feature_test.cpp)
+add_simple_test(executor/executor_feature_test_part1.cpp
+        TARGET executor_feature_test
+        SOURCES
+        executor/executor_feature_test_part2.cpp)
 add_simple_test(executor/band_join_test.cpp)
 add_simple_test(executor/dynamic_filter_join_test.cpp)
 add_simple_test(executor/hash_semi_reduction_test.cpp)
@@ -1081,7 +1255,10 @@ add_simple_test(plan/cascades_coverage_test.cpp)
 add_simple_test(plan/cascades_predicate_coverage_test.cpp)
 add_simple_test(executor/executor_coverage_test.cpp)
 add_simple_test(query/sql_feature_coverage_test.cpp)
-add_simple_test(query/tpcds_query_test.cpp TIMEOUT 5400)
+add_simple_test(query/tpcds_query_test_part1.cpp
+        TARGET tpcds_query_test
+        SOURCES
+        query/tpcds_query_test_part2.cpp)
 add_simple_test(query/sql_scalar_coverage_test.cpp)
 add_simple_test(query/sql_interval_coverage_test.cpp)
 add_simple_test(query/sql_parser_feature_coverage_test.cpp)
@@ -1095,6 +1272,12 @@ add_simple_test(query/sql_dml_paths_coverage_test.cpp)
 add_simple_test(query/sql_ast_function_sweep_test.cpp)
 add_simple_test(cli_main_test.cpp)
 add_dependencies(cli_main_test tinylamb)
+add_simple_test(common/spill/spill_store_test.cpp)
+add_simple_test(type/row_block_codec_test.cpp)
+add_simple_test(executor/detail/ooc/ooc_primitives_test.cpp)
+add_simple_test(executor/detail/pipeline/pipeline_p3a_test.cpp)
+add_simple_test(executor/detail/pipeline/pipeline_p3b_test.cpp)
+add_scale_test(common/ooc_scale_baseline_test.cpp)
 
 add_executable(rule_fuzzer plan/rule_fuzzer.cpp)
 tinylamb_apply_options(rule_fuzzer)
@@ -1111,11 +1294,11 @@ endif()
 ## Fuzzing
 ########################################
 if(TINYLAMB_ENABLE_FUZZ)
-    # -fsanitize=fuzzer is the clang libFuzzer driver; GCC has no fuzzer
-    # sanitizer nor the runtime, and no PC-guard coverage instrumentation to
-    # feed it. Fuzz targets are clang-only by design (see fuzzer-nightly.yml
-    # which pins CC=clang); fail at configure time with this explanation
-    # instead of 25 cryptic compile errors.
+#- fsanitize = fuzzer is the clang libFuzzer driver; GCC has no fuzzer
+#sanitizer nor the runtime, and no PC - guard coverage instrumentation to
+#feed it.Fuzz targets are clang - only by design(see fuzzer - nightly.yml
+#which pins CC = clang); fail at configure time with this explanation
+#instead of 25 cryptic compile errors.
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         message(FATAL_ERROR
                 "TINYLAMB_ENABLE_FUZZ requires clang (libFuzzer is clang-only); "
@@ -1125,23 +1308,23 @@ if(TINYLAMB_ENABLE_FUZZ)
     endif()
 function(add_fuzzer_test file_path)
     set(fuzzer_option "-fsanitize=fuzzer,undefined,bounds")
-    # When the global sanitizer interface lib is active the linked static
-    # libraries are ASAN-instrumented, so the link line must load the ASAN
-    # runtime too.
+#When the global sanitizer interface lib is active the linked static
+#libraries are ASAN - instrumented, so the link line must load the ASAN
+#runtime too.
     if(TINYLAMB_ENABLE_SANITIZERS)
         set(fuzzer_option "${fuzzer_option},address")
     endif()
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})
-    # -UNDEBUG keeps the harness assertions alive: several fuzzers encode
-    # commits and oracle checks inside assert(), and RelWithDebInfo's global
-    # -DNDEBUG would silently strip them out.
+#- UNDEBUG keeps the harness assertions alive : several fuzzers encode
+#commits and oracle checks inside assert(), and RelWithDebInfo's global
+#- DNDEBUG would silently strip them out.
     target_compile_options(${target_name} PRIVATE -g ${fuzzer_option}
             -UNDEBUG)
     target_link_options(${target_name} PRIVATE ${fuzzer_option})
-    # Optional extra libraries come first so a layer that links tinylamb::core
-    # itself (e.g. tinylamb::sql) does not shadow the default.
+#Optional extra libraries come first so a layer that links tinylamb::core
+#itself(e.g.tinylamb::sql) does not shadow the default.
     target_link_libraries(${target_name} PRIVATE ${ARGN} tinylamb::core)
 endfunction()
 
@@ -1170,8 +1353,9 @@ add_fuzzer_test(query/googlesql_ast_fuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_join_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_aggregate_fuzzer_libfuzzer.cpp tinylamb::sql)
-add_fuzzer_test(query/sql_plancache_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_plan_cache_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_session_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_ooc_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/expr_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/griffin_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_diff_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
@@ -1182,11 +1366,11 @@ endif()
 ########################################
 if(TINYLAMB_ENABLE_FUZZ)
 function(add_replay_test file_path input_mode)
-    # Link the UBSan runtime: tinylamb::core objects are compiled with
-    # -fsanitize=undefined (see the TINYLAMB_ENABLE_FUZZ block above), which
-    # requires the runtime at link time.  -fsanitize-trap=undefined only
-    # affects how the replay TU's own checks are lowered and would leave
-    # __ubsan_* references in the libraries undefined.
+#Link the UBSan runtime : tinylamb::core objects are compiled with
+#- fsanitize = undefined(see the TINYLAMB_ENABLE_FUZZ block above), which
+#requires the runtime at link time.- fsanitize - trap = undefined only
+#affects how the replay TU's own checks are lowered and would leave
+#__ubsan_* references in the libraries undefined.
     set(fuzzer_option "-fsanitize=undefined,bounds")
     if(TINYLAMB_ENABLE_SANITIZERS)
         set(fuzzer_option "${fuzzer_option},address")
@@ -1194,7 +1378,7 @@ function(add_replay_test file_path input_mode)
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})
-    # -UNDEBUG keeps the harness assertions alive; see add_fuzzer_test.
+#- UNDEBUG keeps the harness assertions alive; see add_fuzzer_test.
     target_compile_options(${target_name} PRIVATE -g ${fuzzer_option}
             -UNDEBUG)
     target_link_options(${target_name} PRIVATE ${fuzzer_option})

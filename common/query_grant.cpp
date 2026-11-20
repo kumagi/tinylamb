@@ -15,9 +15,14 @@ size_t ReadGrantEnvU64(const char* name, size_t fallback) noexcept {
   if (raw == nullptr || raw[0] == '\0') {
     return fallback;
   }
+  if (raw[0] == '-' || raw[0] == '+') {
+    return fallback;
+  }
   char* end = nullptr;
+  errno = 0;
   const unsigned long long parsed = std::strtoull(raw, &end, 10);
-  if (end == raw || *end != '\0') {
+  if (errno != 0 || end == raw || *end != '\0' ||
+      parsed > std::numeric_limits<size_t>::max()) {
     return fallback;
   }
   return static_cast<size_t>(parsed);
@@ -95,7 +100,13 @@ void QueryMemoryGrant::LocalBatchCache::Release(size_t bytes) {
   }
   held_bytes_ -= n;
   cached_bytes_ += n;
-  if (cached_bytes_ > refill_bytes_ * 2 && grant_ != nullptr) {
+  // Saturating doubling: a huge refill_bytes_ would wrap in size_t and make
+  // the threshold spuriously small, corrupting the released-byte accounting.
+  const size_t threshold =
+      refill_bytes_ > std::numeric_limits<size_t>::max() / 2
+          ? std::numeric_limits<size_t>::max()
+          : refill_bytes_ * 2;
+  if (cached_bytes_ > threshold && grant_ != nullptr) {
     const size_t excess = cached_bytes_ - refill_bytes_;
     cached_bytes_ -= excess;
     if (const auto live = alive_.lock()) {
@@ -198,6 +209,21 @@ size_t QueryMemoryGrant::ComputeEffectiveDop(size_t requested_dop,
   return std::min(dop, max_workers);
 }
 
+void QueryMemoryGrant::RecordPeak(size_t used) noexcept {
+  // RecordOperatorPeakBytes is itself a global atomic max over one cache line
+  // (plus a thread-local scope-chain walk). Only publish when this grant saw
+  // a genuinely new peak; repeated small consumes below the old peak need no
+  // cross-thread traffic at all.
+  size_t peak = reported_peak_bytes_.load(std::memory_order_relaxed);
+  while (used > peak &&
+         !reported_peak_bytes_.compare_exchange_weak(
+             peak, used, std::memory_order_relaxed, std::memory_order_relaxed)) {
+  }
+  if (used > peak) {
+    ProcessMemoryBudget::Global().RecordOperatorPeakBytes(used);
+  }
+}
+
 bool QueryMemoryGrant::TryConsume(size_t bytes) noexcept {
   if (bytes == 0) {
     return true;
@@ -207,9 +233,8 @@ bool QueryMemoryGrant::TryConsume(size_t bytes) noexcept {
   }
   const size_t limit = granted_bytes_.load(std::memory_order_acquire);
   if (!limited_ || limit == 0) {
-    used_bytes_.fetch_add(bytes, std::memory_order_acq_rel);
-    ProcessMemoryBudget::Global().RecordOperatorPeakBytes(
-        used_bytes_.load(std::memory_order_relaxed));
+    const size_t used_after = used_bytes_.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
+    RecordPeak(used_after);
     return true;
   }
   size_t cur = used_bytes_.load(std::memory_order_acquire);
@@ -220,7 +245,7 @@ bool QueryMemoryGrant::TryConsume(size_t bytes) noexcept {
     if (used_bytes_.compare_exchange_weak(cur, cur + bytes,
                                           std::memory_order_acq_rel,
                                           std::memory_order_acquire)) {
-      ProcessMemoryBudget::Global().RecordOperatorPeakBytes(cur + bytes);
+      RecordPeak(cur + bytes);
       return true;
     }
   }
@@ -258,8 +283,12 @@ QueryMemoryCoordinator& QueryMemoryCoordinator::Global() {
 QueryMemoryCoordinator::QueryMemoryCoordinator(ProcessMemoryBudget* budget)
     : budget_(budget) {
   if (budget_ != nullptr) {
-    release_listener_id_ =
-        budget_->RegisterReleaseListener([this] { NotifyReleased(); });
+    std::weak_ptr<ReleaseSignal> weak_signal = signal_;
+    release_listener_id_ = budget_->RegisterReleaseListener([weak_signal] {
+      if (const auto sig = weak_signal.lock()) {
+        sig->cv.notify_all();
+      }
+    });
   }
 }
 
@@ -286,8 +315,13 @@ size_t QueryMemoryCoordinator::MaxGrantFromEnv() const noexcept {
 }
 
 uint64_t QueryMemoryCoordinator::WaitTimeoutMsFromEnv() noexcept {
-  return static_cast<uint64_t>(
-      ReadGrantEnvU64("TINYLAMB_GRANT_WAIT_TIMEOUT_MS", kDefaultWaitTimeoutMs));
+  const uint64_t raw =
+      ReadGrantEnvU64("TINYLAMB_GRANT_WAIT_TIMEOUT_MS", kDefaultWaitTimeoutMs);
+  // The deadline arithmetic converts this to std::chrono::milliseconds'
+  // signed rep; values above INT64_MAX would wrap negative and make the
+  // wait expire immediately.
+  return std::min<uint64_t>(raw,
+                            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
 }
 
 void QueryMemoryCoordinator::NotifyReleased() {
@@ -295,7 +329,7 @@ void QueryMemoryCoordinator::NotifyReleased() {
   // resume, and there is no state mutated under mu_ for them to observe.
   // Notifying while holding mu_ only made every woken waiter block again on
   // this same mutex.
-  cv_.notify_all();
+  signal_->cv.notify_all();
 }
 
 StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
@@ -317,6 +351,10 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
             " bytes exceeds query pool max " + std::to_string(pool_ceiling) +
             " bytes (pool='query')");
   }
+  if (budget_ != nullptr && !budget_->Unlimited() && pool_ceiling == 0) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "query memory pool max is zero bytes");
+  }
 
   const auto start = std::chrono::steady_clock::now();
   const uint64_t timeout = wait_timeout_ms.value_or(WaitTimeoutMsFromEnv());
@@ -336,7 +374,9 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
       return true;
     }
     // If bounded below `capped_max`, try elastic shrink down to `floor_min`.
-    size_t probe = capped_max / 2;
+    // Start no lower than floor_min: if floor_min > capped_max/2 a plain
+    // halving would skip the entire [floor_min, capped_max) window.
+    size_t probe = std::max(capped_max / 2, floor_min);
     while (probe >= std::max<size_t>(1, floor_min)) {
       if (budget_->TryReserveWithReclaim(MemoryPoolKind::kQuery, probe,
                                          err_out)) {
@@ -363,6 +403,7 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
   }
 
   std::unique_lock<std::mutex> lk(mu_);
+  const auto sig = signal_;  // keep the wake-up target alive across the wait
   while (true) {
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
@@ -372,7 +413,7 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
             std::chrono::milliseconds(1),
         std::chrono::milliseconds(10));
-    cv_.wait_for(lk, slice);
+    sig->cv.wait_for(lk, slice);
     lk.unlock();
     if (try_once(&granted, &last_err)) {
       const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(

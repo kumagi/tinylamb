@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -54,8 +55,15 @@
 namespace tinylamb {
 
 std::unordered_set<ColumnName> BinaryExpression::TouchedColumns() const {
-  std::unordered_set<ColumnName> result = left_->TouchedColumns();
-  result.merge(right_->TouchedColumns());
+  // Hand-built or rewrite-damaged nodes can carry null children; treat them
+  // as touching nothing instead of dereferencing a null Expression.
+  std::unordered_set<ColumnName> result;
+  if (left_) {
+    result = left_->TouchedColumns();
+  }
+  if (right_) {
+    result.merge(right_->TouchedColumns());
+  }
   return result;
 }
 namespace {
@@ -174,7 +182,8 @@ bool IsComparisonOp(BinaryOperation op) {
 }
 
 // DATE arithmetic (GoogleSQL surface): DATE ± INTERVAL, DATE ± INT64 (days),
-// INT64 + DATE, and DATE - DATE → INT64 day difference.  The INTERVAL operand
+// INT64 + DATE, and DATE - DATE → INT64 day difference (a DATE_DIFF-like
+// design choice; GoogleSQL `-` on dates yields INTERVAL). The INTERVAL operand
 // arrives as one of two string shapes: the relational interpreter renders
 // interval literals as "<amount> <unit>" ("3 day"), while the AST/bytecode
 // layer carries the canonical IntervalValue text ("0-0 3 0:0:0").  Calendar
@@ -241,6 +250,19 @@ StatusOr<Value> TryDateArithmetic(BinaryOperation op, const Value& left,
   if (!add && !sub) {
     return StatusError(StatusCode::kInvalidArgument, "type mismatch");
   }
+  // T444 (P381): `-INT64_MIN` is UB in C++ even though two's-complement
+  // hardware wraps "correctly"; Debug/UBSan/-ftrapv builds trap.  Negate
+  // through checked 0 - x and surface the same range error the unsigned arm
+  // below already uses (type/date.cpp's TryAddDateIntervalDays likewise
+  // rejects via __builtin_*_overflow).
+  const auto try_negate = [](int64_t x) -> StatusOr<int64_t> {
+    int64_t neg = 0;
+    if (__builtin_sub_overflow(int64_t{0}, x, &neg)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DATE arithmetic offset out of range");
+    }
+    return neg;
+  };
   const auto apply = [](int64_t date_days, int64_t months,
                         int64_t day_count) -> StatusOr<Value> {
     int64_t shifted = date_days;
@@ -257,8 +279,22 @@ StatusOr<Value> TryDateArithmetic(BinaryOperation op, const Value& left,
     return Value::DateFromDays(shifted);
   };
   if (left.type == ValueType::kDate && right.type == ValueType::kInt64) {
-    return apply(left.DateDays(), 0,
-                 sub ? -right.value.int_value : right.value.int_value);
+    int64_t delta = right.value.int_value;
+    if (right.IsUnsigned()) {
+      // An unsigned INT64 holds 2^63..2^64-1 in its signed bit pattern;
+      // treating those bits as a signed day count reverses the direction.
+      const auto unsigned_delta = static_cast<uint64_t>(delta);
+      if (unsigned_delta > static_cast<uint64_t>(INT64_MAX)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "DATE arithmetic offset out of range");
+      }
+      delta = static_cast<int64_t>(unsigned_delta);
+    }
+    if (!sub) {
+      return apply(left.DateDays(), 0, delta);
+    }
+    ASSIGN_OR_RETURN(int64_t, neg_delta, try_negate(delta));
+    return apply(left.DateDays(), 0, neg_delta);
   }
   if (left.type == ValueType::kInt64 && right.type == ValueType::kDate) {
     return add ? apply(right.DateDays(), 0, left.value.int_value)
@@ -280,8 +316,15 @@ StatusOr<Value> TryDateArithmetic(BinaryOperation op, const Value& left,
       // (INTERVAL 24 HOUR against a DATE has no matching signature).
       return StatusError(StatusCode::kInvalidArgument, "type mismatch");
     }
-    return apply(left.DateDays(), sub ? -iv.months : iv.months,
-                 sub ? -iv.days : iv.days);
+    int64_t months = iv.months;
+    int64_t day_count = iv.days;
+    if (sub) {
+      ASSIGN_OR_RETURN(int64_t, neg_months, try_negate(months));
+      months = neg_months;
+      ASSIGN_OR_RETURN(int64_t, neg_days, try_negate(day_count));
+      day_count = neg_days;
+    }
+    return apply(left.DateDays(), months, day_count);
   }
   if (left.type == ValueType::kVarChar && right.type == ValueType::kDate) {
     if (add) {
@@ -389,7 +432,13 @@ bool Like(std::string_view value, std::string_view pattern) {
       ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
       pattern_pos = wildcard + 1;
-      value_pos = ++retry;
+      // '%' retries the match at the next character boundary, mirroring
+      // '_': a byte-wise retry could restart a literal comparison inside a
+      // multi-byte UTF-8 sequence.
+      retry +=
+          std::min(Utf8SequenceLength(static_cast<unsigned char>(value[retry])),
+                   value.size() - retry);
+      value_pos = retry;
     } else {
       return false;
     }
@@ -481,6 +530,15 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
   }
   if (left.IsNull() || right.IsNull()) {
     return Value();
+  }
+  // Explicit but incompatible string collations (binary vs
+  // case-insensitive) make the comparison ambiguous: GoogleSQL rejects the
+  // pair instead of silently folding one side, matching the IN-list guard
+  // in in_expression.cpp.  Placed before every comparison fast path so the
+  // byte-compare, timestamp-instant and fold routes all observe it.
+  if (IsComparisonOp(op) && HaveConflictingCollations(left, right)) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Collation conflict between comparison operands");
   }
   // Homogeneous scalar comparisons dominate scan/join/aggregation predicate
   // work, so resolve them before the canonical dispatch below (which copies
@@ -587,9 +645,9 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         break;
     }
   }
-  // IN lists are typed by the left-hand expression in GoogleSQL.  The AST
-  // represents a bare DATE literal as STRING, so coerce it when it is
-  // compared with a DATE column value.
+  // Comparisons are symmetric: when either operand is a DATE, a
+  // date-shaped STRING on the other side is coerced before comparing (the
+  // AST represents a bare DATE literal as STRING).
   if (IsComparisonOp(op)) {
     auto as_date = [](const Value& value) -> std::optional<int64_t> {
       if (value.type == ValueType::kDate) {
@@ -648,10 +706,11 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         return std::nullopt;
       }
       int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
-      // All six fields are required and rejected on mismatch; field values
-      // flow into std::tm which normalizes out-of-range values.  The 'T'
+      // All six fields are required and rejected on mismatch.  The 'T'
       // separator accepted by the shape check is normalized to ' ' because
-      // the format string below matches a literal space only.
+      // the format string below matches a literal space only; field ranges
+      // are validated explicitly below because std::tm/TimeGm would
+      // otherwise normalize impossible values into a real instant.
       std::string head(text.substr(0, 19));
       if (head[10] == 'T') {
         head[10] = ' ';
@@ -659,6 +718,19 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       // NOLINTNEXTLINE(cert-err34-c)
       if (sscanf(head.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour,
                  &minute, &second) != 6) {
+        return std::nullopt;
+      }
+      // Mirror the CAST-side ParseCivilTime bounds: an out-of-range or
+      // nonexistent calendar value is not a timestamp spelling (second == 60
+      // is a leap second and TimeGm carries it like CAST does).
+      if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 ||
+          day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+          second < 0 || second > 60 ||
+          !std::chrono::year_month_day{
+              std::chrono::year{year},
+              std::chrono::month{static_cast<unsigned>(month)},
+              std::chrono::day{static_cast<unsigned>(day)}}
+               .ok()) {
         return std::nullopt;
       }
       std::tm tm{};
@@ -685,6 +757,13 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
           ++pos;
         }
       }
+      // Only a fractional part and a zone marker may follow the 19-char
+      // civil prefix. Trailing junk ("...00garbage") must not be silently
+      // ignored as if it were a valid timestamp spelling.
+      if (pos < text.size() && text[pos] != '+' && text[pos] != '-' &&
+          text[pos] != 'Z' && text[pos] != 'z') {
+        return std::nullopt;
+      }
       const size_t zone = text.find_first_of("+-Zz", 19);
       if (zone == std::string_view::npos) {
         StatusOr<int> default_offset = TryTimeZoneOffsetAtLocalTime(
@@ -698,18 +777,18 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         // An explicit numeric offset names the string's own zone: convert to
         // UTC instead of silently treating every offset as UTC.  "+05:30"
         // means local time is 5h30 AHEAD of UTC, so UTC = civil - offset.
+        // The shared zone parser applies the same +HH:MM / +HHMM / +HH
+        // grammar and bounds CAST enforces — a bare "+0530" is 5h30m, not
+        // 530 hours — and a malformed suffix means this is not a timestamp
+        // spelling at all.
         const std::string suffix(text.substr(zone));
-        const char sign = suffix[0];
-        std::string digits = suffix;
-        digits[0] = ' ';
-        int zone_hours = 0, zone_minutes = 0;
-        // Return value checked; an overlong digit run would simply produce a
-        // huge offset and the comparison itself stays well-defined.
-        // NOLINTNEXTLINE(cert-err34-c)
-        if (sscanf(digits.c_str(), " %d:%d", &zone_hours, &zone_minutes) >= 1) {
-          const int64_t offset = (zone_hours * 3600LL) + (zone_minutes * 60LL);
-          instant.seconds += (sign == '-') ? offset : -offset;
+        StatusOr<int> zone_offset = TryTimeZoneOffsetAtLocalTime(
+            suffix, year, static_cast<unsigned>(month),
+            static_cast<unsigned>(day), hour, minute, second);
+        if (!zone_offset.HasValue()) {
+          return std::nullopt;
         }
+        instant.seconds -= zone_offset.Value();
       }
       return instant;
     };
@@ -756,13 +835,15 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
   }
   // Bit shifts operate on the two's-complement representation with logical
   // (unsigned) semantics, matching GoogleSQL: shift amounts >= 64 yield 0 and
-  // negative amounts raise OUT_OF_RANGE.
+  // negative amounts raise INVALID_ARGUMENT.
   if (op == BinaryOperation::kShiftLeft || op == BinaryOperation::kShiftRight) {
     if (left.type != ValueType::kInt64 || right.type != ValueType::kInt64) {
       return StatusError(StatusCode::kInvalidArgument,
                          "bitwise shift requires integer operands");
     }
-    const bool is_u = left.IsUnsigned() || right.IsUnsigned();
+    // GoogleSQL shifts return the LEFT operand's type; the right operand is
+    // only a shift count and its signedness must not affect the result tag.
+    const bool is_u = left.IsUnsigned();
     auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
     const int64_t amount = right.value.int_value;
     // An UNSIGNED shift count >= 2^63 is a huge positive amount (the result
@@ -783,25 +864,33 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
   // Collation-aware normalization: when either operand carries a
   // case-insensitive collator, both sides fold to lowercase.  GoogleSQL
   // resolves an explicit COLLATE on one side for the whole comparison.
-  Value folded_left = left;
-  Value folded_right = right;
+  // Only the case-insensitive path needs folded copies; building two deep
+  // Value copies for every comparison would pay two heap round-trips per row
+  // for the common (no collation) case.
+  std::optional<Value> folded_left_storage;
+  std::optional<Value> folded_right_storage;
+  const Value* folded_left = &left;
+  const Value* folded_right = &right;
   if (IsComparisonOp(op) && left.type == ValueType::kVarChar &&
       right.type == ValueType::kVarChar &&
       (left.IsCaseInsensitive() || right.IsCaseInsensitive())) {
     // Tags ride along so downstream LIKE validation still sees the collator.
-    folded_left = Value(FoldCase(left.value.varchar_value))
-                      .WithCollation(left.Collation());
-    folded_right = Value(FoldCase(right.value.varchar_value))
-                       .WithCollation(right.Collation());
+    folded_left_storage.emplace(Value(FoldCase(left.value.varchar_value))
+                                    .WithCollation(left.Collation()));
+    folded_right_storage.emplace(Value(FoldCase(right.value.varchar_value))
+                                     .WithCollation(right.Collation()));
+    folded_left = &*folded_left_storage;
+    folded_right = &*folded_right_storage;
   }
   if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
-    if (folded_left.type != ValueType::kVarChar ||
-        folded_right.type != ValueType::kVarChar) {
+    if (folded_left->type != ValueType::kVarChar ||
+        folded_right->type != ValueType::kVarChar) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LIKE requires string operands");
     }
-    const std::string_view pattern = folded_right.value.varchar_value;
-    if ((folded_left.IsCaseInsensitive() || folded_right.IsCaseInsensitive()) &&
+    const std::string_view pattern = folded_right->value.varchar_value;
+    if ((folded_left->IsCaseInsensitive() ||
+         folded_right->IsCaseInsensitive()) &&
         pattern.find('_') != std::string_view::npos) {
       return StatusError(
           StatusCode::kInvalidArgument,
@@ -809,7 +898,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
           "collation: " +
               std::string(pattern));
     }
-    const bool matched = Like(folded_left.value.varchar_value, pattern);
+    const bool matched = Like(folded_left->value.varchar_value, pattern);
     return Value(op == BinaryOperation::kLike ? matched : !matched);
   }
   const bool numeric =
@@ -992,11 +1081,14 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
                                         right.value.int_value))
                                   : static_cast<double>(right.value.int_value));
     // IEEE unordered comparisons: any ordered comparison against NaN is
-    // FALSE (never NULL), even NaN vs NaN (GoogleSQL BETWEEN semantics).
+    // FALSE (never NULL); equality falls through to the IEEE operators
+    // below, so NaN != NaN as well.  This engine's unordered semantics
+    // differ from GoogleSQL, where NaN = NaN is TRUE — only the ordered
+    // FALSE results match its BETWEEN behavior.
     const auto is_nan = [](const Value& v) {
       return v.type == ValueType::kDouble && std::isnan(v.value.double_value);
     };
-    if (is_nan(folded_left) || is_nan(folded_right)) {
+    if (is_nan(*folded_left) || is_nan(*folded_right)) {
       switch (op) {
         case BinaryOperation::kLessThan:
         case BinaryOperation::kLessThanEquals:
@@ -1098,6 +1190,13 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       if (date_arith.HasValue()) {
         return date_arith.MoveValue();
       }
+      // T381 (bug 444): a failed DATE arithmetic attempt used to be laundered
+      // into the generic "type mismatch" below, hiding the genuine range
+      // errors ("DATE computation out of range", the checked-negation error)
+      // from callers.  Propagate the actual status; combinations that are
+      // truly unsupported already carry the identical "type mismatch" text
+      // out of TryDateArithmetic, so nothing else re-times its wording.
+      return date_arith;
     }
     return StatusError(StatusCode::kInvalidArgument, "type mismatch");
   }
@@ -1105,6 +1204,22 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       left.IsInterval() != right.IsInterval() && IsComparisonOp(op)) {
     return StatusError(StatusCode::kInvalidArgument,
                        "INTERVAL/STRING type mismatch");
+  }
+  if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
+      !left.IsInterval() && !right.IsInterval() &&
+      (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract)) {
+    // Two timestamp spellings: neither interval arithmetic nor text
+    // concatenation is meaningful, so report the operation as unsupported.
+    const auto timestamp_shaped = [](std::string_view text) {
+      return text.size() >= 19 && text[4] == '-' && text[7] == '-' &&
+             (text[10] == ' ' || text[10] == 'T') && text[13] == ':' &&
+             text[16] == ':';
+    };
+    if (timestamp_shaped(left.value.varchar_value) &&
+        timestamp_shaped(right.value.varchar_value)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported binary operation");
+    }
   }
   if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
       left.IsInterval() != right.IsInterval() &&
@@ -1125,7 +1240,13 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       ((left.IsInterval() && right.IsInterval()) ||
        op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract)) {
     auto is_iv = [](std::string_view s) {
-      return s.find('-') != std::string_view::npos &&
+      // Same timestamp-shape exclusion as the mixed-type multiply branch:
+      // "YYYY-MM-DD HH:MM:SS" also has '-' before ' ', but it is a timestamp
+      // spelling and must not be parsed as an interval's Y-M fields.
+      const bool timestamp_shaped =
+          s.size() >= 10 && s[4] == '-' && s[7] == '-' &&
+          (s.size() == 10 || s[10] == ' ' || s[10] == 'T');
+      return !timestamp_shaped && s.find('-') != std::string_view::npos &&
              s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };
     // The shape test admits strings that are not intervals ("P-100 model");
@@ -1171,13 +1292,16 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       }
     }
   }
-  // IEEE unordered comparisons: any ordered comparison against a NaN is
-  // FALSE (never NULL), even NaN vs NaN (GoogleSQL BETWEEN semantics).
+  // IEEE unordered comparisons: every comparison against a NaN is decided
+  // two-valued — ordered operators are FALSE and NaN != NaN.  This is the
+  // engine's unordered semantics; GoogleSQL's NaN = NaN rule would make
+  // kEquals TRUE here, and only the ordered FALSE results match its
+  // BETWEEN behavior.
   {
     const auto operand_is_nan = [](const Value& v) {
       return v.type == ValueType::kDouble && std::isnan(v.value.double_value);
     };
-    if (operand_is_nan(folded_left) || operand_is_nan(folded_right)) {
+    if (operand_is_nan(*folded_left) || operand_is_nan(*folded_right)) {
       switch (op) {
         case BinaryOperation::kEquals:
           return Value(false);
@@ -1193,7 +1317,8 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       }
     }
   }
-  // DATE - DATE is an INT64 day difference (GoogleSQL); DATE + DATE has no
+  // DATE - DATE is an INT64 day difference (DATE_DIFF-like design choice,
+  // not GoogleSQL `-`); DATE + DATE has no
   // signature and keeps falling through to the "unsupported" error below.
   if (left.type == ValueType::kDate && right.type == ValueType::kDate &&
       op == BinaryOperation::kSubtract) {
@@ -1235,42 +1360,61 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     case BinaryOperation::kDivide:
     case BinaryOperation::kModulo:
     case BinaryOperation::kEquals:
-      if (folded_left.type == ValueType::kVarChar &&
-          folded_right.type == ValueType::kVarChar &&
-          IsStructJson(folded_left.value.varchar_value) &&
-          IsStructJson(folded_right.value.varchar_value)) {
-        return StructJsonCompare(folded_left.value.varchar_value,
-                                 folded_right.value.varchar_value);
+      if (folded_left->type == ValueType::kVarChar &&
+          folded_right->type == ValueType::kVarChar &&
+          IsStructJson(folded_left->value.varchar_value) &&
+          IsStructJson(folded_right->value.varchar_value)) {
+        return StructJsonCompare(folded_left->value.varchar_value,
+                                 folded_right->value.varchar_value);
       }
-      return Value(folded_left == folded_right);
+      return Value(*folded_left == *folded_right);
     case BinaryOperation::kNotEquals:
-      if (folded_left.type == ValueType::kVarChar &&
-          folded_right.type == ValueType::kVarChar &&
-          IsStructJson(folded_left.value.varchar_value) &&
-          IsStructJson(folded_right.value.varchar_value)) {
-        const Value equal = StructJsonCompare(folded_left.value.varchar_value,
-                                              folded_right.value.varchar_value);
+      if (folded_left->type == ValueType::kVarChar &&
+          folded_right->type == ValueType::kVarChar &&
+          IsStructJson(folded_left->value.varchar_value) &&
+          IsStructJson(folded_right->value.varchar_value)) {
+        const Value equal =
+            StructJsonCompare(folded_left->value.varchar_value,
+                              folded_right->value.varchar_value);
         if (equal.IsNull()) {
           return Value();
         }
         return Value(!equal.Truthy());
       }
-      return Value(folded_left != folded_right);
+      return Value(*folded_left != *folded_right);
     case BinaryOperation::kLessThan: {
-      ASSIGN_OR_RETURN(bool, result, folded_left.TryLess(folded_right));
+      ASSIGN_OR_RETURN(bool, result, folded_left->TryLess(*folded_right));
       return Value(result);
     }
-    case BinaryOperation::kLessThanEquals: {
-      ASSIGN_OR_RETURN(bool, result, folded_left.TryLess(folded_right));
-      return Value(result || folded_left == folded_right);
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThanEquals: {
+      // Struct-JSON equality uses field-wise comparison via StructJsonCompare,
+      // while TryLess/TryGreater compare raw text. If the two are equal under
+      // the equality domain, both <= and >= must be TRUE regardless of the
+      // raw-text ordering (otherwise `x = y TRUE` but `x <= y FALSE`).
+      if (folded_left->type == ValueType::kVarChar &&
+          folded_right->type == ValueType::kVarChar &&
+          IsStructJson(folded_left->value.varchar_value) &&
+          IsStructJson(folded_right->value.varchar_value)) {
+        const Value equal = StructJsonCompare(folded_left->value.varchar_value,
+                                              folded_right->value.varchar_value);
+        if (equal.IsNull() || equal.Truthy()) {
+          return equal.IsNull() ? Value() : Value(true);
+        }
+      }
+      bool lt = false;
+      if (op == BinaryOperation::kLessThanEquals) {
+        auto cmp = folded_left->TryLess(*folded_right);
+        lt = cmp.HasValue() && cmp.Value();
+      } else {
+        auto cmp = folded_left->TryGreater(*folded_right);
+        lt = cmp.HasValue() && cmp.Value();
+      }
+      return Value(lt || *folded_left == *folded_right);
     }
     case BinaryOperation::kGreaterThan: {
-      ASSIGN_OR_RETURN(bool, result, folded_left.TryGreater(folded_right));
+      ASSIGN_OR_RETURN(bool, result, folded_left->TryGreater(*folded_right));
       return Value(result);
-    }
-    case BinaryOperation::kGreaterThanEquals: {
-      ASSIGN_OR_RETURN(bool, result, folded_left.TryGreater(folded_right));
-      return Value(result || folded_left == folded_right);
     }
     case BinaryOperation::kAnd:
     case BinaryOperation::kOr:
@@ -1320,12 +1464,20 @@ StatusOr<Value> BinaryExpression::TryEvaluate(const Row& row,
                                               const Schema& schema) const {
   // AND/OR are short-circuited: the right child must not be evaluated when
   // the left operand already decides the result (three-valued logic).
+  if (!left_ || !right_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "binary expression with missing operand");
+  }
   return EvaluateMaybeShortCircuited(op_, *left_, *right_, row, schema);
 }
 
 StatusOr<Value> BinaryExpression::TryEvaluate(
     const Row* left, const Schema& left_schema, const Row* right,
     const Schema& right_schema) const {
+  if (!left_ || !right_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "binary expression with missing operand");
+  }
   return EvaluateMaybeShortCircuited(op_, *left_, *right_, left, left_schema,
                                      right, right_schema);
 }
@@ -1408,8 +1560,12 @@ Type BinaryExpression::ResultType(const Schema& left,
 }
 
 std::string BinaryExpression::ToString() const {
-  return "(" + left_->ToString() + " " + std::string(tinylamb::ToString(op_)) +
-         " " + right_->ToString() + ")";
+  // Null operands only exist on hand-built or damaged trees; print a
+  // placeholder instead of dereferencing null.
+  const std::string left_text = left_ ? left_->ToString() : "<null>";
+  const std::string right_text = right_ ? right_->ToString() : "<null>";
+  return "(" + left_text + " " + std::string(tinylamb::ToString(op_)) + " " +
+         right_text + ")";
 }
 
 void BinaryExpression::Dump(std::ostream& o) const { o << ToString(); }

@@ -245,7 +245,7 @@ size_t ParallelIndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
     if (pending_) {
       while (pending_offset_ < pending_->Size() &&
              destination->Size() < max_rows) {
-        destination->Append(*pending_, pending_offset_++);
+        destination->AppendFrom(*pending_, pending_offset_++);
       }
       if (pending_offset_ == pending_->Size()) {
         pending_.reset();
@@ -307,12 +307,12 @@ size_t ParallelIndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
       pending_ = std::move(chunk);
       pending_offset_ = 0;
       while (destination->Size() < max_rows) {
-        destination->Append(*pending_, pending_offset_++);
+        destination->AppendFrom(*pending_, pending_offset_++);
       }
       return destination->Size();
     }
     for (size_t index = 0; index < chunk.Size(); ++index) {
-      destination->Append(chunk, index);
+      destination->AppendFrom(chunk, index);
     }
   }
   return destination->Size();

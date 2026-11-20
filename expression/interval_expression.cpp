@@ -19,7 +19,9 @@ StatusOr<Value> IntervalExpression::TryEvaluate(
 
 Value IntervalExpression::Evaluate(const Row& /*row*/,
                                    const Schema& /*schema*/) const {
-  return TryEvaluate(Row(), Schema()).MoveValue();
+  // EXC-SHIM: unwrap through the shared status boundary like other nodes.
+  return ExcShimUnwrap(TryEvaluate(Row(), Schema()),
+                       "IntervalExpression::Evaluate");
 }
 
 StatusOr<Value> IntervalExpression::TryEvaluate(
@@ -32,9 +34,9 @@ Value IntervalExpression::Evaluate(const Row* /*unused*/,
                                    const Schema& /*unused*/,
                                    const Row* /*unused*/,
                                    const Schema& /*unused*/) const {
-  return TryEvaluate(static_cast<const Row*>(nullptr), Schema(), nullptr,
-                     Schema())
-      .MoveValue();
+  return ExcShimUnwrap(
+      TryEvaluate(static_cast<const Row*>(nullptr), Schema(), nullptr, Schema()),
+      "IntervalExpression::Evaluate");
 }
 
 tinylamb::Type IntervalExpression::ResultType(const Schema& /*unused*/) const {
@@ -46,7 +48,16 @@ tinylamb::Type IntervalExpression::ResultType(const Schema& /*unused*/,
   return {TypeTag::kVarChar};
 }
 
-std::string IntervalExpression::ToString() const { return "INTERVAL " + text_; }
+std::string IntervalExpression::ToString() const {
+  // T2105: print the ORIGINAL SQL spelling, not IntervalValue::ToString()'s
+  // internal canonical form ("0-0 3 0:0:0" is neither the spelling nor a
+  // unit name, so debug dumps hid what the query actually said). Both forms
+  // below are valid GoogleSQL interval literals again, unlike the canonical.
+  if (!raw_amount_.empty()) {
+    return "INTERVAL " + raw_amount_ + " " + unit_;
+  }
+  return "INTERVAL " + std::to_string(amount_) + " " + unit_;
+}
 
 void IntervalExpression::Dump(std::ostream& output) const {
   output << ToString();

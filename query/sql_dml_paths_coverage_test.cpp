@@ -207,12 +207,15 @@ TEST_F(SqlDmlPathsCoverageTest, StructTextInsertDecodesJsonEscapes) {
   ExpectRows("SELECT a, b FROM j2",
              {Row({Value(std::string("caf\xC3\xA9")), Value(2)})});
   // The short escapes, including the \b / \f forms that were missing.
-  Query("CREATE TABLE j3 (s STRING(MAX))");
-  Query(R"(INSERT INTO j3 VALUES ('{"a\\tb\\fc"}'))");
-  ExpectRows("SELECT s FROM j3", {Row({Value(std::string("a\tb\fc"))})});
+  // (Two columns, like j2: a one-column table takes the quoted text as an
+  // ordinary STRING literal, never as a struct row.)
+  Query("CREATE TABLE j3 (s STRING(MAX), n INT64)");
+  Query(R"(INSERT INTO j3 VALUES ('{"a\\tb\\fc", 1}'))");
+  ExpectRows("SELECT s FROM j3 WHERE n = 1",
+             {Row({Value(std::string("a\tb\fc"))})});
   // A surrogate pair decodes to its astral code point (U+1F600).
-  Query(R"(INSERT INTO j3 VALUES ('{"\\ud83d\\ude00"}'))");
-  ExpectRows("SELECT s FROM j3",
+  Query(R"(INSERT INTO j3 VALUES ('{"\\ud83d\\ude00", 2}'))");
+  ExpectRows("SELECT s FROM j3 WHERE n = 2",
              {Row({Value(std::string("\xF0\x9F\x98\x80"))})});
 }
 

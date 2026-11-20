@@ -17,9 +17,9 @@ cmake -S . -B build -DTINYLAMB_TPCC_MYSQL=ON
 ninja -C build tinylamb_tpcc_three_benchmark
 python benchmark/comparison/tpcc_three.py \
   --output benchmark/comparison/results/my-tpcc-three-run \
-  --server build/benchmarks/pg15-bin/server-c8 \
+  --server <path-to-your-server-binary> \
   --client build/tinylamb_tpcc_three_benchmark \
-  --fixture build/benchmarks/pg15-bin/tpcc-v2-gold \
+  --fixture <path-to-your-W1-fixture> \
   --seconds 30 --warmup 5 --trials 3 --clients 10
 ```
 
@@ -61,17 +61,17 @@ python benchmark/comparison/run.py \
 ```
 
 公式[Quackプロトコル](https://duckdb.org/docs/2.0/quack/overview)の
-`ATTACH`＋`CONNECT`で、SQLセッション全体をlocalhostの専用DuckDBサーバーへ送る。
-永続DBを開くのはサーバーだけで、負荷生成プロセスはファイルを直接開かない。
+`ATTACH`＋`CONNECT`で、SQLセッション全体をlocalhostの専用DuckDBサーバへ送る。
+永続DBを開くのはサーバだけで、負荷生成プロセスはファイルを直接開かない。
 SQL送信・HTTP・結果の全件取得・型変換を計時に含める。組み込みAPIの直接呼び出しの
-数値とは区別する。各クライアント側DuckDBは1スレッド、サーバーの既定スレッド数は
+数値とは区別する。各クライアント側DuckDBは1スレッド、サーバの既定スレッド数は
 `--server-cpus`で選んだCPU数。認証tokenはランダムで、引数・測定メタデータへ出さない。
 
 Quack拡張は準備時だけ公式配布から取得し、既定では
 `build/benchmarks/duckdb-extensions-2.0.0`へキャッシュする。取得にはネット接続が必要。
 `--duckdb-extensions`で保存先を変更でき、使用したバイナリのSHA-256を記録する。
 実行中のクライアントは取得済み拡張をLOADする。
-専用ポートの既定は59494。終了時にサーバーと一時DBを削除し、拡張キャッシュは残す。
+専用ポートの既定は59494。終了時にサーバと一時DBを削除し、拡張キャッシュは残す。
 
 DuckDBは永続ファイルと標準WAL設定を使い、in-memory DBや耐久性を省いた設定を使わない。
 [snapshot isolationと楽観的並行制御](https://duckdb.org/docs/2.0/connect/concurrency)のため、
@@ -168,12 +168,12 @@ UNION ALLではPGの可視性情報とBitmap Heap Scan／Index Only Scanの違�
 
 2026-10-30のTPC-C W=1／TPC-H SF=1の単体測定は
 [BenchmarkHistory](../../BenchmarkHistory.md)に追記した。
-[測定記録](results/2026-10-30-tpc-native/)には3試行の中央値・全22問・競合中断を保存。
+3試行の中央値・全22問・競合中断の詳細は [BenchmarkHistory](../../BenchmarkHistory.md) に記録した (生データの `results/` は gitignore 済みのローカル成果物)。
 これはTinylambの直接API測定であり、このディレクトリのTCP経由3製品比較とは別条件。
 
 ## 実行
 
-必要環境はLinux、Docker、`taskset`、Python 3.11以上、GoogleSQL有効のtinylambビルド。Dockerへのアクセスが必要。通常のテストやビルドにはPythonドライバも比較DBも追加しない。
+必要環境はLinux、Docker、`taskset`、Python 3.12以上（`:13` のとおり tpcc_three.py のCSV空文字/NULL弁別が csv.QUOTE_NOTNULL を要求するため、比較スイート全体に 3.12 が必要）、GoogleSQL有効のtinylambビルド。Dockerへのアクセスが必要。通常のテストやビルドにはPythonドライバも比較DBも追加しない。
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -252,7 +252,7 @@ OLTPは各試行後に行数と残高総和を検査する。更新では全成�
 
 待機やネットワーク停止にはDB／ドライバ側タイムアウトと子プロセスの監督期限を設ける。tinylambにはSQLキャンセル機構がないため、子プロセスを停止してもサーバ内部のクエリ終了は保証しない。タイムアウト発生時の後続値はログと負荷を確認して扱う。
 
-最新の全条件再測定は `results/2026-10-29-full5/`（詳細な過去レポートは整理済み; 各実験の一次記録・CSV・プランは `results/` と [`BenchmarkHistory.md`](../../BenchmarkHistory.md) に保存）。EXISTSとOLTP読み取りの改善後、追加索引なし／共通二次索引ありの両方で、3スケールの共通OLAP、TPC-H全22クエリ、全OLTP／HTAPを測定した。未測定の領域は、キャッシュを超えるデータ、長時間定常負荷、分離異常、障害・再起動、レプリケーション、prepared protocol、TPC-C／TPC-DSの3製品共通実装など。ベンチマークの範囲を広く取っているが、これらまで測定済みとは扱わない。
+最新の全条件再測定は `results/2026-10-29-full5/`（詳細な過去レポートは整理済み； 各実験の一次記録・CSV・プランは `results/` と [`BenchmarkHistory.md`](../../BenchmarkHistory.md) に保存）。EXISTSとOLTP読み取りの改善後、追加索引なし／共通二次索引ありの両方で、3スケールの共通OLAP、TPC-H全22クエリ、全OLTP／HTAPを測定した。未測定の領域は、キャッシュを超えるデータ、長時間定常負荷、分離異常、障害・再起動、レプリケーション、prepared protocol、TPC-C／TPC-DSの3製品共通実装など。ベンチマークの範囲を広く取っているが、これらまで測定済みとは扱わない。
 
 ## 第5巡の全種目比較
 
@@ -409,7 +409,7 @@ python3 benchmark/comparison/gap_results.py \
 直接キー集合を構築する改善を比較している。
 各組は前後／後前／前後の順とし、MySQLは固定した旧値と同時期の両基準で判定する。
 全4,099テストと301秒のSQL oracleを通過した後に交互測定を実行した。
-再集計と新しい出力名での再実行は、同ディレクトリのREADMEと`run_pairs.py`を参照。
+再集計と新しい出力名での再実行は、同ディレクトリの `run.py` と `analyze.py` を参照。
 この追測には全OLTP／HTAPの再測定は含めていない。
 
 ```bash
@@ -433,9 +433,10 @@ smokeの性能値は最終比較に混ぜていない。
 同時期PGだけでなく、第2巡フル測定の速いPG値を固定した比率も判定する。
 全体のフル測定の更新ではなく、この2種類の読み取りと周辺7 OLAPの追測である。
 
-`run-final.py`のserverパスとoutput名を新しいものへ変えると再実行できる。
-`summarize.py`は3試行のp50／p95／p99／query毎秒を集計する。
-計時ハーネスはrange_readのSUMを毎回は照合しないため、`range_audit.py`で
-全始点とNULL・値更新後の結果を計時外に完全列挙して検証する。
+`run.py`のserverパスとoutput名を新しいものへ変えると再実行できる。
+`analyze.py`は3試行のp50／p95／p99／query毎秒を集計する (`run_pairs.py` / `summarize.py` という単体スクリプトは存在しない)。
+計時ハーネスはrange_readのSUMを毎回は照合しないため、SQLオラクル
+(`sql_oracle_fuzzer`) のPQS/DQE検査で全始点とNULL・値更新後の結果を
+計時外に検証する。 (`range_audit.py`という単体スクリプトは存在しない。)
 `results/2026-10-29-read4-version/`にはC++差分と最終バイナリの指紋、
 `results/2026-10-29-read4-validation/`には全テストとoracleの記録を置いた。

@@ -116,7 +116,7 @@ Crc32CRawHardwareChained(uint32_t crc, const uint8_t* p, size_t n) {
 // Byte-indexed expansion of a composed advance matrix: one 256-entry table
 // per register byte turns ApplyAdvanceMatrix's popcount(reg) XOR chain into
 // four loads and three XORs.  Built lazily per (composed) advance distance
-// and kept in a 4-slot fully-associative cache — page checksums reuse a
+// and kept in a 16-slot round-robin cache — page checksums reuse a
 // fixed set of distances (32 KiB spans), so the cache hit rate is ~100%
 // there; diverse record-sized spans rebuild an entry (a few thousand XORs)
 // and fall back to the same behavior as the matrix walk.
@@ -178,10 +178,6 @@ struct AdvanceByteTable {
   }
   slot.bytes = bytes;
   return slot;
-}
-
-[[nodiscard]] inline uint32_t AdvanceRegisterBy(uint32_t r, size_t bytes) {
-  return ApplyByteAdvance(AdvanceByteTableFor(bytes), r);
 }
 
 // Combining independent register states of consecutive slices (linearity):
@@ -258,10 +254,11 @@ struct AdvanceByteTable {
 // result is exactly equivalent to the software loop above. The target
 // attribute lets this compile in translation units built without -msse4.2;
 // the compiler will not inline a target mismatch, but a static call is still
-// far cheaper than the 32k+ cycle bit loop for a 4 KiB page.
+// far cheaper than the 32k+ cycle bit loop for a 32 KiB page.
 [[gnu::target("sse4.2")]] [[nodiscard]] inline uint32_t Crc32CRawHardware(
     uint32_t crc, std::span<const uint8_t> data) {
-  // A/B hatch: TINYLAMB_DISABLE_CRC_LANES=1 restores the plain chained loop.
+  // A/B hatch: presence of TINYLAMB_DISABLE_CRC_LANES (any value, even =0)
+  // restores the plain chained loop.
   static const bool lanes_disabled =
       std::getenv("TINYLAMB_DISABLE_CRC_LANES") != nullptr;
   // Below 2 KiB, direct chained _mm_crc32_u64 avoids table-build thrashing on

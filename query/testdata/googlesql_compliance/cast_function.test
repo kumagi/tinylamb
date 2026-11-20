@@ -1107,7 +1107,7 @@ ARRAY<STRUCT<STRUCT<ARRAY<>, BYTES>>>[
 ]
 ==
 
-# Casting to STRING(L) fails if the casted string is longer than L.
+# Casting to STRING(L) fails if the cast string is longer than L.
 [required_features=PARAMETERIZED_TYPES]
 [name=cast_string_type_parameters_invalid_input]
 select cast(123456 as STRING(5));
@@ -1115,7 +1115,7 @@ select cast(123456 as STRING(5));
 ERROR: generic::out_of_range: STRING(5) has maximum length 5 but got a value with length 6
 ==
 
-# Casting to NUMERIC(P) fails if the casted numeric has more than P digits.
+# Casting to NUMERIC(P) fails if the cast numeric has more than P digits.
 [required_features=PARAMETERIZED_TYPES,NUMERIC_TYPE]
 [name=cast_numeric_type_parameters_invalid_input]
 select cast(123456 as NUMERIC(5));

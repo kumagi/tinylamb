@@ -87,8 +87,13 @@ class QueryMemoryBudget {
 // RAII charge against the global budget.
 class QueryMemoryCharge {
  public:
+  // Tag for adopting bytes that were already atomically reserved via
+  // QueryMemoryBudget::TryReserve (T3724): the reservation must not be
+  // forced through ReserveForced a second time.
+  struct kAlreadyReserved {};
   QueryMemoryCharge() = default;
   explicit QueryMemoryCharge(size_t bytes);
+  QueryMemoryCharge(kAlreadyReserved, size_t bytes) noexcept : bytes_(bytes) {}  // NOLINT(readability-named-parameter)
   QueryMemoryCharge(const QueryMemoryCharge&) = delete;
   QueryMemoryCharge& operator=(const QueryMemoryCharge&) = delete;
   QueryMemoryCharge(QueryMemoryCharge&& other) noexcept;

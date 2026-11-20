@@ -12,11 +12,19 @@
 #include <string_view>
 #include <system_error>
 
+#include "common/log_message.hpp"
 #include "common/platform/process.hpp"
 
 namespace tinylamb {
 
 namespace {
+
+// floor(x * pct / 100) without premature truncation or size_t overflow.
+constexpr size_t PercentOf(size_t x, size_t pct) {
+  return (x / 100) * pct +  // NOLINT(readability-math-missing-parentheses)
+         ((x % 100) * pct) /  // NOLINT(readability-math-missing-parentheses)
+             100;  // NOLINT(readability-math-missing-parentheses)
+}
 
 thread_local bool tl_in_reclaim_hook = false;
 
@@ -26,6 +34,9 @@ size_t ReadEnvBytes(const char* name, size_t fallback) noexcept {
     return fallback;
   }
   char* end = nullptr;
+  if (raw[0] == '-') {
+    return fallback;  // negative values wrap to SIZE_MAX via strtoull
+  }
   const unsigned long long parsed = std::strtoull(raw, &end, 10);
   if (end == raw || *end != '\0') {
     return fallback;
@@ -44,14 +55,30 @@ thread_local OocQueryScope* tl_ooc_query_scope = nullptr;
 
 template <typename Fn>
 void ForEachActiveQueryMetrics(Fn&& fn) noexcept {
-  OocQueryMetrics* last = nullptr;
+  // The scope chain can revisit the same metrics non-contiguously (M1->M2->M1).
+  // Dedup against all seen pointers; a fixed array keeps this noexcept.
+  OocQueryMetrics* seen[128]{};  // NOLINT(modernize-avoid-c-arrays)
+  size_t seen_count = 0;
   for (OocQueryScope* s = tl_ooc_query_scope; s != nullptr;
        s = s->PrevScope()) {
     OocQueryMetrics* m = s->Metrics();
-    if (m != nullptr && m != last) {
-      fn(*m);
-      last = m;
+    if (m == nullptr) {
+      continue;
     }
+    bool duplicate = false;
+    for (size_t i = 0; i < seen_count; ++i) {
+      if (seen[i] == m) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) {
+      continue;
+    }
+    if (seen_count < std::size(seen)) {
+      seen[seen_count++] = m;
+    }
+    fn(*m);
   }
 }
 
@@ -118,8 +145,6 @@ OocQueryScope::OocQueryScope(OocQueryMetrics* metrics) noexcept
 
 OocQueryScope::~OocQueryScope() { tl_ooc_query_scope = prev_scope_; }
 
-OocQueryScope* OocQueryScope::Top() noexcept { return tl_ooc_query_scope; }
-
 OocQueryMetrics* OocQueryScope::Current() noexcept {
   return tl_ooc_query_scope != nullptr ? tl_ooc_query_scope->Metrics()
                                        : nullptr;
@@ -141,7 +166,12 @@ ProcessMemoryBudget::ProcessMemoryBudget() {
       auto_scaled = default_limit > kDefaultLimitBytes;
     }
   }
-  const size_t lim = ReadEnvBytes("TINYLAMB_MEMORY_LIMIT_BYTES", default_limit);
+  size_t lim = ReadEnvBytes("TINYLAMB_MEMORY_LIMIT_BYTES", default_limit);
+  if (lim != 0 && lim < (size_t{1} << 30)) {
+    LOG(LogLevel::kWarn) << "TINYLAMB_MEMORY_LIMIT_BYTES=" << lim
+                         << " below documented 1 GiB minimum; clamping";
+    lim = size_t{1} << 30;
+  }
   limit_.store(lim, std::memory_order_relaxed);
   const size_t default_storage =
       lim == 0 ? (size_t{4} << 30)
@@ -149,7 +179,7 @@ ProcessMemoryBudget::ProcessMemoryBudget() {
                               : std::min<size_t>(size_t{4} << 30, lim / 4));
   // Let reusable column projections use the shared headroom. Reservation
   // still enforces the process soft limit and every other pool's floor; a
-  // fixed 2 GiB cap otherwise rebuilds projections on every large scan.
+  // fixed 8 GiB cap otherwise rebuilds projections on every large scan.
   const size_t default_columnar =
       lim == 0 ? (size_t{8} << 30)
                : (auto_scaled ? lim / 2
@@ -160,7 +190,9 @@ ProcessMemoryBudget::ProcessMemoryBudget() {
   columnar_limit_.store(
       ReadEnvBytes("TINYLAMB_COLUMNAR_CACHE_BYTES", default_columnar),
       std::memory_order_relaxed);
-  const size_t soft = lim == 0 ? 0 : (lim / 5) * 4;
+  const size_t soft =
+      lim -
+      lim / 5;  // 80% of lim  // NOLINT(readability-math-missing-parentheses)
   size_t s_pct = ReadEnvBytes("TINYLAMB_STORAGE_FLOOR_PCT", 25);
   size_t q_pct = ReadEnvBytes("TINYLAMB_QUERY_FLOOR_PCT", 25);
   size_t t_pct = ReadEnvBytes("TINYLAMB_TX_FLOOR_PCT", 5);
@@ -171,10 +203,10 @@ ProcessMemoryBudget::ProcessMemoryBudget() {
     t_pct = 5;
     c_pct = 0;
   }
-  storage_floor_.store((soft / 100) * s_pct, std::memory_order_relaxed);
-  query_floor_.store((soft / 100) * q_pct, std::memory_order_relaxed);
-  tx_floor_.store((soft / 100) * t_pct, std::memory_order_relaxed);
-  columnar_floor_.store((soft / 100) * c_pct, std::memory_order_relaxed);
+  storage_floor_.store(PercentOf(soft, s_pct), std::memory_order_relaxed);
+  query_floor_.store(PercentOf(soft, q_pct), std::memory_order_relaxed);
+  tx_floor_.store(PercentOf(soft, t_pct), std::memory_order_relaxed);
+  columnar_floor_.store(PercentOf(soft, c_pct), std::memory_order_relaxed);
   emergency_limit_.store(lim == 0
                              ? (size_t{64} << 20)
                              : std::min<size_t>(size_t{64} << 20, lim / 20),
@@ -273,12 +305,27 @@ size_t ProcessMemoryBudget::PoolFloorBytes(MemoryPoolKind pool) const noexcept {
       if (lim == 0) {
         return base + srv;
       }
-      const size_t soft = (lim / 5) * 4;
+      const size_t soft =
+          lim - lim / 5;  // NOLINT(readability-math-missing-parentheses)
       const size_t other = storage_floor_.load(std::memory_order_acquire) +
                            columnar_floor_.load(std::memory_order_acquire) +
                            query_floor_.load(std::memory_order_acquire);
       const size_t max_tx = soft > other ? soft - other : base;
-      return std::min(base + srv, std::max(base, max_tx));
+      const size_t wanted = base + srv;
+      const size_t granted = std::min(wanted, std::max(base, max_tx));
+      // T1845: with a limit set, other pools' floors can clamp the server
+      // tx floor (max_connections x per-connection send floor) away --
+      // ooca-v2.md SS5.6 says that product must ride in D1's tx floor, so
+      // say out loud when it gets squeezed instead of dropping it in
+      // silence. Once per process: PoolFloorBytes is on query hot paths.
+      if (srv > 0 && granted < wanted &&
+          !tx_floor_clamp_warned_.exchange(true, std::memory_order_relaxed)) {
+        LOG(LogLevel::kWarn)
+            << "tx pool floor clamped to " << granted << " of " << wanted
+            << " bytes (" << srv
+            << " server send floor bytes squeezed by other pool floors)";
+      }
+      return granted;
     }
     case MemoryPoolKind::kQuery:
     default:
@@ -313,7 +360,10 @@ size_t ProcessMemoryBudget::EffectivePoolMaxBytes(
   if (l == 0) {
     return pool_cap == 0 ? std::numeric_limits<size_t>::max() : pool_cap;
   }
-  const size_t soft = (l / 5) * 4;
+  // Same soft limit the public SoftLimit() reports; the old `l - l / 5`
+  // spelling exceeded (l / 5) * 4 by up to 4 bytes, so a pool could be
+  // granted past the limit callers observe.
+  const size_t soft = SoftLimit();
   size_t other_floors = 0;
   for (MemoryPoolKind k : {MemoryPoolKind::kStorage, MemoryPoolKind::kColumnar,
                            MemoryPoolKind::kQuery, MemoryPoolKind::kTx}) {
@@ -455,10 +505,13 @@ size_t ProcessMemoryBudget::Available() const noexcept {
   const size_t u = total_used_.load(std::memory_order_acquire);
   size_t avail = u < l ? l - u : 0;
   if (check_rss_pressure_.load(std::memory_order_acquire)) {
-    const uint64_t rss = SampledRssBytes(false);
+    // T1965: consult the cached sample instead of driving the sampler —
+    // asking "how much is available" must not itself advance the tick,
+    // hit /proc, or move peak RSS telemetry.
+    const uint64_t rss = CachedRssBytes();
     // Reserve ~12.5% headroom for allocator metadata, thread stacks, and
     // unbudgeted containers so RSS stays safely below Limit().
-    const size_t rss_cap = (l / 8) * 7;
+    const size_t rss_cap = RssWarnLimit();
     if (rss >= rss_cap) {
       return 0;
     }
@@ -478,8 +531,15 @@ bool ProcessMemoryBudget::UnderMemoryPressure() const noexcept {
     return true;
   }
   if (check_rss_pressure_.load(std::memory_order_acquire)) {
+    // UnderMemoryPressure() is the designated sampler-driven probe (T1965):
+    // it intentionally refreshes the sample that the pure getters
+    // (Available()/CanReserve()) read via CachedRssBytes().
     const uint64_t rss = SampledRssBytes(false);
-    return rss >= SoftLimit();
+    // T1836: RSS pressure is defined by ADR 0003 as the 87.5% warn line
+    // (RssWarnLimit), the same cap Available()/CanReserve()/TryReserve()
+    // enforce — not the 80% reservation SoftLimit, which would call
+    // "pressure" at 82% while still approving new reservations.
+    return rss >= RssWarnLimit();
   }
   return false;
 }
@@ -500,16 +560,18 @@ bool ProcessMemoryBudget::CanReserve(MemoryPoolKind pool,
   if (l == 0) {
     return true;
   }
-  const size_t soft = (l / 5) * 4;
+  // Same soft limit the public SoftLimit() reports; the old `l - l / 5`
+  // spelling exceeded (l / 5) * 4 by up to 4 bytes, so a pool could be
+  // granted past the limit callers observe.
+  const size_t soft = SoftLimit();
   const size_t u = total_used_.load(std::memory_order_acquire);
   const size_t protected_other = ProtectedFloorForOthers(pool);
-  if (u > soft || bytes > soft - u ||
-      protected_other > soft - u - bytes) {
+  if (u > soft || bytes > soft - u || protected_other > soft - u - bytes) {
     return false;
   }
   if (check_rss_pressure_.load(std::memory_order_acquire)) {
-    const uint64_t rss = SampledRssBytes(false);
-    const size_t rss_soft = (l / 8) * 7;
+    const uint64_t rss = CachedRssBytes();  // T1965: see Available().
+    const size_t rss_soft = RssWarnLimit();
     if (rss >= rss_soft) {
       return false;
     }
@@ -529,14 +591,20 @@ bool ProcessMemoryBudget::TryReserveNoFault(MemoryPoolKind pool, size_t bytes,
   const size_t pool_cap = PoolLimitFor(pool);
   const size_t l = limit_.load(std::memory_order_acquire);
   if (l > 0 && check_rss_pressure_.load(std::memory_order_acquire)) {
-    const size_t rss_cap = respect_soft_limit ? (l / 8) * 7 : (l / 16) * 15;
+    const size_t rss_cap =
+        respect_soft_limit
+            ? RssWarnLimit()
+            : (l - l / 16);  // NOLINT(readability-math-missing-parentheses)
     const uint64_t rss = SampledRssBytes(bytes >= (size_t{16} << 20));
     if (rss >= rss_cap || bytes > (rss_cap - static_cast<size_t>(rss))) {
       return false;
     }
   }
   const size_t effective_total_cap =
-      l == 0 ? 0 : (respect_soft_limit ? ((l / 5) * 4) : l);
+      l == 0 ? 0
+             : (respect_soft_limit
+                    ? SoftLimit()
+                    : l);  // NOLINT(readability-math-missing-parentheses)
   size_t cur_total = total_used_.load(std::memory_order_acquire);
   while (true) {
     const size_t protected_other =
@@ -639,11 +707,13 @@ void ProcessMemoryBudget::PublishReleaseListenerView() {
       snapshot->push_back(e);
     }
   }
+  // Count exactly the listeners published in the view (empty callables were
+  // skipped above) before the snapshot is moved into the shared_ptr slot.
+  const size_t published_count = snapshot->size();
   // Publish the view first, then open the fast-path gate, so a reader that
   // sees count > 0 always loads a view at least as new as that count.
   release_view_.store(std::move(snapshot), std::memory_order_release);
-  release_listener_count_.store(release_listeners_.size(),
-                                std::memory_order_release);
+  release_listener_count_.store(published_count, std::memory_order_release);
 }
 
 size_t ProcessMemoryBudget::InvokeReclaimHooks(size_t target_bytes) noexcept {
@@ -656,21 +726,33 @@ size_t ProcessMemoryBudget::InvokeReclaimHooks(size_t target_bytes) noexcept {
        {ReclaimStage::kColumnar, ReclaimStage::kCleanStorage,
         ReclaimStage::kSpillableQuery}) {
     std::vector<std::pair<uint64_t, ReclaimCallback>> cbs;
-    {
-      std::unique_lock<std::mutex> lk(hooks_mu_, std::try_to_lock);
-      if (!lk.owns_lock()) {
-        continue;
-      }
-      for (const ReclaimHookEntry& e : reclaim_hooks_) {
-        if (e.stage == stage && e.cb) {
-          cbs.emplace_back(
-              e.recency ? e.recency->load(std::memory_order_relaxed) : 0, e.cb);
+    try {
+      {
+        std::unique_lock<std::mutex> lk(hooks_mu_, std::try_to_lock);
+        if (!lk.owns_lock()) {
+          continue;
+        }
+        for (const ReclaimHookEntry& e : reclaim_hooks_) {
+          if (e.stage == stage && e.cb) {
+            cbs.emplace_back(
+                e.recency ? e.recency->load(std::memory_order_relaxed) : 0,
+                e.cb);
+          }
         }
       }
+      std::stable_sort(
+          cbs.begin(), cbs.end(),
+          [](const auto& a, const auto& b) { return a.first < b.first; });
+    } catch (...) {
+      // T1844: this function is noexcept and runs precisely under memory
+      // pressure; staging/sorting the hook list can itself throw (bad_alloc,
+      // or std::function copy allocation). Same contract as the hook bodies
+      // below: count the suppressed throw and move on instead of turning
+      // OOM relief into std::terminate.
+      static std::atomic<uint64_t> suppressed_reclaim_staging{0};
+      suppressed_reclaim_staging.fetch_add(1, std::memory_order_relaxed);
+      continue;
     }
-    std::stable_sort(cbs.begin(), cbs.end(), [](const auto& a, const auto& b) {
-      return a.first < b.first;
-    });
     for (const auto& [recency, cb] : cbs) {
       const size_t need =
           reclaimed_total < target_bytes ? target_bytes - reclaimed_total : 0;
@@ -751,18 +833,34 @@ bool ProcessMemoryBudget::TryReserveWithReclaim(MemoryPoolKind pool,
   return false;
 }
 
-void ProcessMemoryBudget::ReserveEmergency(MemoryPoolKind pool,
+bool ProcessMemoryBudget::ReserveEmergency(MemoryPoolKind pool,
                                            size_t bytes) noexcept {
   if (bytes == 0) {
-    return;
+    return true;
   }
-  emergency_used_.fetch_add(bytes, std::memory_order_acq_rel);
+  // T1835: aggregate cap check before any counter moves. The ledger
+  // invariant `emergency_used_ <= emergency_limit_` holds whenever the CAS
+  // below accepts, so `limit - cur` cannot underflow; a limit lowered
+  // mid-flight (tests) is handled by the cur >= limit short-circuit.
+  const size_t limit = emergency_limit_.load(std::memory_order_acquire);
+  size_t cur = emergency_used_.load(std::memory_order_acquire);
+  while (true) {
+    if (limit != 0 && (cur >= limit || bytes > limit - cur)) {
+      return false;
+    }
+    if (emergency_used_.compare_exchange_weak(cur, cur + bytes,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire)) {
+      break;
+    }
+  }
   const size_t next_pool =
       PoolCounter(pool).fetch_add(bytes, std::memory_order_acq_rel) + bytes;
   UpdatePeak(PoolPeakCounter(pool), next_pool);
   const size_t next_total =
       total_used_.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
   UpdatePeak(total_peak_, next_total);
+  return true;
 }
 
 void ProcessMemoryBudget::ReleaseEmergency(MemoryPoolKind pool,
@@ -970,6 +1068,10 @@ bool ProcessMemoryCharge::TryAdd(size_t bytes,
   }
   if (!ProcessMemoryBudget::Global().TryReserve(pool_, bytes,
                                                 respect_soft_limit)) {
+    // T1838: keep Ok() honest — any failed reservation on this handle flips
+    // it, so callers checking the RAII charge after the fact (not just after
+    // the ctor) see the failure instead of a silently-ignored short reserve.
+    valid_ = false;
     return false;
   }
   bytes_ += bytes;
@@ -981,6 +1083,7 @@ bool ProcessMemoryCharge::TryAddWithReclaim(size_t bytes) {
     return true;
   }
   if (!ProcessMemoryBudget::Global().TryReserveWithReclaim(pool_, bytes)) {
+    valid_ = false;  // T1838: see TryAdd.
     return false;
   }
   bytes_ += bytes;

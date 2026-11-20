@@ -1,7 +1,7 @@
 # push_selection_through_aggregation
 
 - 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
-- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(登録式。ヘルパは
+- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(登録式。ヘルパーは
   `GroupingOutputs` / `RewriteThroughOutputs` / `ContainsAggregate`)
 
 ## 概要

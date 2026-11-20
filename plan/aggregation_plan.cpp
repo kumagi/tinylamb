@@ -183,7 +183,8 @@ std::string AggregationPlan::GroupKeysToString() const {
     if (i > 0) {
       s += ", ";
     }
-    s += group_keys_[i].expression->ToString();
+    s += group_keys_[i].expression ? group_keys_[i].expression->ToString()
+                                   : std::string("?");
   }
   return s;
 }
@@ -204,7 +205,8 @@ std::string AggregationPlan::ToString() const {
       s += ", ";
     }
     first = false;
-    s += agg.name + ": " + agg.expression->ToString();
+    s += agg.name + ": " +
+         (agg.expression ? agg.expression->ToString() : std::string("?"));
   }
   s += "}";
   s += MemorySuffix();
@@ -213,7 +215,7 @@ std::string AggregationPlan::ToString() const {
 
 void AggregationPlan::Dump(std::ostream& o, int indent) const {
   o << Indent(static_cast<size_t>(indent)) << ToString() << "\n";
-  child_->Dump(o, indent + 2);
+  DumpChild(o, *child_, indent + 2);
 }
 
 Schema AggregationPlan::GenerateSchema() const {
@@ -255,10 +257,12 @@ Schema AggregationPlan::GenerateSchema() const {
     }
     const auto& expression = agg.expression->AsAggregateExpression();
     ValueType type = ValueType::kInt64;
-    if (expression.GetType() == AggregationType::kAvg) {
-      type = ValueType::kDouble;
-    } else if (expression.GetType() != AggregationType::kCount &&
-               expression.Child()) {
+    // P461/501: canonical result-kind table shared with
+    // AggregateExpression::ResultType and the pipeline lowering.
+    if (const auto kind = CanonicalAggregateResultKind(expression.GetType());
+        kind.has_value()) {
+      type = *kind;
+    } else if (expression.Child()) {
       // SUM/MIN/MAX inherit their argument's evaluated type so that
       // arithmetic arguments (e.g. TPC-H Q1
       // sum(l_extendedprice*(1-l_discount))) do not silently claim Int64.
@@ -310,16 +314,16 @@ bool AggregationPlan::InstallParameterSlots(
     return false;
   }
   for (NamedExpression& key : group_keys_) {
-    if (!SlotizeInPlace(&key.expression, parameters, cursor, slots)) {
+    if (!CollectParameterSlots(&key.expression, slots)) {
       return false;
     }
   }
   for (NamedExpression& aggregate : aggregates_) {
-    if (!SlotizeInPlace(&aggregate.expression, parameters, cursor, slots)) {
+    if (!CollectParameterSlots(&aggregate.expression, slots)) {
       return false;
     }
   }
-  return !having_ || SlotizeInPlace(&having_, parameters, cursor, slots);
+  return !having_ || CollectParameterSlots(&having_, slots);
 }
 
 Collation AggregationPlan::OrderCollation() const {

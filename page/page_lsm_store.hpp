@@ -163,7 +163,7 @@ class LsmBlockCache {
   LsmBlockCache& operator=(LsmBlockCache&&) = delete;
 
   [[nodiscard]] StatusOr<std::shared_ptr<const DecodedLsmBlock>> GetOrLoad(
-      const int& fd, std::mutex& file_mu, uint64_t run_id, uint32_t block_idx,
+      int fd, std::mutex& file_mu, uint64_t run_id, uint32_t block_idx,
       const LsmRunBlockMeta& meta, size_t limit_bytes, bool populate_cache);
 
   size_t EvictToTarget(size_t target_bytes,
@@ -208,10 +208,11 @@ class LsmBlockCache {
   size_t emergency_bytes_{0};
 };
 
-// Streaming cursor over one disk-backed SSTable run (~32 KiB RAM per cursor).
+// Streaming cursor over one disk-backed SSTable run (~32 KiB of encoded block
+// bytes per cursor (plus decoded rows)).
 class LsmRunCursor {
  public:
-  LsmRunCursor(const int& fd, std::mutex& file_mu, LsmBlockCache& cache,
+  LsmRunCursor(int fd, std::mutex& file_mu, LsmBlockCache& cache,
                uint64_t run_id, std::span<const LsmRunBlockMeta> blocks,
                size_t cache_limit_bytes, bool populate_cache);
 
@@ -223,13 +224,20 @@ class LsmRunCursor {
     return block_ != nullptr && entry_idx_ < block_->entries.size();
   }
   [[nodiscard]] const LsmRunEntry& Current() const noexcept {
+    // T4094: defensive for consumers that skip Valid(): an exhausted cursor
+    // hands back a stable empty entry instead of dereferencing a reset
+    // block_ or indexing past the last decoded entry.
+    static const LsmRunEntry kInvalidEntry{};
+    if (block_ == nullptr || entry_idx_ >= block_->entries.size()) {
+      return kInvalidEntry;
+    }
     return block_->entries[entry_idx_];
   }
 
  private:
   Status LoadBlock(size_t bidx);
 
-  const int& fd_;
+  int fd_;
   std::mutex& file_mu_;
   LsmBlockCache& cache_;
   uint64_t run_id_{0};
@@ -243,7 +251,7 @@ class LsmRunCursor {
 
 // Writes sorted entries from an arbitrary producer callback as CRC-protected
 // ~32 KiB SSTable blocks sequentially into `fd` starting at `*append_offset`.
-Status WriteLsmRunStream(const int& fd, std::mutex& file_mu,
+Status WriteLsmRunStream(int fd, std::mutex& file_mu,
                          uint64_t* append_offset,
                          const std::function<bool(LsmRunEntry*)>& next_entry,
                          std::vector<LsmRunBlockMeta>* blocks_out,
@@ -253,7 +261,7 @@ Status WriteLsmRunStream(const int& fd, std::mutex& file_mu,
 // optional newest sorted memory overlay producer (`next_mem_entry`), writing
 // the merged output run to `out_fd` (~O(K * 32 KiB) memory total).
 Status MergeLsmSourcesToFd(
-    const int& in_fd, std::mutex& in_file_mu, const int& out_fd,
+    int in_fd, std::mutex& in_file_mu, int out_fd,
     std::mutex& out_file_mu, uint64_t* out_append_offset, LsmBlockCache& cache,
     std::span<const LsmRunSpec> runs,
     const std::function<bool(LsmRunEntry*)>& next_mem_entry,

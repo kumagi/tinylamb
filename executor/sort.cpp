@@ -314,15 +314,16 @@ class SortKeyEncoder {
 };
 
 void RadixSortIndices(size_t* begin, const size_t* end,
-                      const std::vector<uint64_t>& keys,
-                      std::vector<size_t>* tmp) {
+                      const std::vector<uint64_t>& keys) {
   const auto n = static_cast<size_t>(end - begin);
   if (n < 2) {
     return;
   }
-  tmp->resize(n);
+  // Every pass below scatters all n slots of the scratch buffer before any of
+  // them is read, so the buffer needs no zero-initialization.
+  std::unique_ptr<size_t[]> scratch(new size_t[n]);  // NOLINT(modernize-avoid-c-arrays)
   size_t* src = begin;
-  size_t* dst = tmp->data();
+  size_t* dst = scratch.get();
   for (int pass = 0; pass < 8; ++pass) {
     const int shift = pass * 8;
     std::array<size_t, 257> count{};
@@ -438,8 +439,7 @@ class KeyOrdering {
     const bool parallel = workers > 1 && sortable_rows >= kParallelSortMinRows;
     if (!parallel) {
       if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64 && !mixed_bands_) {
-        std::vector<size_t> tmp;
-        RadixSortIndices(base, base + sortable_rows, raw_keys_, &tmp);
+        RadixSortIndices(base, base + sortable_rows, raw_keys_);
       } else {
         std::stable_sort(base, base + sortable_rows, index_less);
       }
@@ -462,8 +462,7 @@ class KeyOrdering {
           try {
             if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64 &&
                 !mixed_bands_) {
-              std::vector<size_t> tmp;
-              RadixSortIndices(base + begin, base + end, raw_keys_, &tmp);
+              RadixSortIndices(base + begin, base + end, raw_keys_);
             } else {
               std::stable_sort(base + begin, base + end, index_less);
             }
@@ -598,7 +597,9 @@ Status SortExecutor::Materialize() {
     runs.push_back(std::move(run));
     ordering.ResetForNewChunk();
     rows_.clear();
-    rows_.shrink_to_fit();
+    // Keep the vector capacity for the next run: the ingest loop immediately
+    // refills rows_, so shrinking here only adds a malloc/free per run. The
+    // memory budget is released separately by charge.ReleaseAll().
     return Status::kSuccess;
   };
 
@@ -823,8 +824,9 @@ size_t SortExecutor::NextBatch(DataChunk* destination, size_t max_rows) try {
 }
 
 void SortExecutor::Dump(std::ostream& output, int indent) const {
-  output << "ParallelSort (" << worker_count_
-         << " workers, spill=" << SpillModeLabel(options_.spill_mode);
+  output << (worker_count_ > 1 ? "ParallelSort (" : "Sort (")
+         << worker_count_ << " workers, spill="
+         << SpillModeLabel(options_.spill_mode);
   if (options_.memory_budget_bytes != 0) {
     output << ", budget=" << options_.memory_budget_bytes << "B";
   }

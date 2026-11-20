@@ -413,6 +413,9 @@ TEST_F(FullScanClusteredOrderTest, ContextScopeReportsTheClaim) {
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
                           ctx.GetStats("Clustered"));
     EXPECT_TRUE(AnyResolvedTableHasClusteredOrder(ctx));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, lowercase_stats,
+                          ctx.GetStats("clustered"));
+    EXPECT_EQ(stats, lowercase_stats);
     ASSERT_SUCCESS(ctx.PreCommit());
   }
   {

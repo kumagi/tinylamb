@@ -177,7 +177,7 @@ ARRAY<STRUCT<n INT64>>[{11}]
 ==
 
 [mode=explain_analyze]
-[plan_contains=Filter short_circuit_rhs_evaluations=0]
+[plan_contains=EmptyResult]
 [name=boolean_short_circuit_profile_skips_dead_errors]
 SELECT id FROM opt_probe WHERE false AND payload / 0 = 1
 --

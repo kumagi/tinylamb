@@ -25,6 +25,14 @@
 
 namespace tinylamb {
 
+// Issue 1314: TypeTag carries TWO domains in one enum.  The first entries
+// (kInvalid .. kArray) are SQL TYPE tags -- what tinylamb::Type::GetType()
+// reports.  The k*Exp entries (kBinaryExp .. kLambdaExp) are EXPRESSION NODE
+// KINDS -- what ExpressionBase::NodeKind() (legacy alias Type()) reports.
+// The value domain of an expression is a ValueType (type/value.hpp), and
+// ExpressionBase::ResultType() returns a tinylamb::Type.  When dispatching,
+// pick the accessor by intent: NodeKind() for tree shape, ResultType() /
+// ValueType for data types.
 enum class TypeTag : uint8_t {
   kInvalid,
   kInteger,

@@ -27,7 +27,15 @@
 namespace tinylamb {
 
 size_t ConstantExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
-  destination->Reset();
+  if (schema_.ColumnCount() == 0 && !rows_.empty()) {
+    std::vector<Column> cols;
+    cols.reserve(rows_.front().values_.size());
+    for (const Value& v : rows_.front().values_) {
+      cols.emplace_back("", v.type);
+    }
+    schema_ = Schema("", std::move(cols));
+  }
+  destination->Reset(schema_);
   while (offset_ < rows_.size() && destination->Size() < max_rows) {
     destination->Append(std::move(rows_[offset_++]));
   }
@@ -39,7 +47,12 @@ void ConstantExecutor::Dump(std::ostream& o, int /*indent*/) const {
 }
 
 void EmptyResultExecutor::Dump(std::ostream& o, int /*indent*/) const {
-  o << "EmptyResult\nFilter short_circuit_rhs_evaluations=0";
+  // T2114: the old form hardcoded `Filter short_circuit_rhs_evaluations=0`
+  // -- a measured-looking counter this node never increments (identical
+  // before EXPLAIN and after EXPLAIN ANALYZE) -- and its bare '\n' dropped
+  // the second line to column 0 under an indented parent.  The node has no
+  // runtime state to report: name only.
+  o << "EmptyResult";
 }
 
 }  // namespace tinylamb

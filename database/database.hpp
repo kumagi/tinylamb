@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -68,9 +69,10 @@ class Database final : public CatalogReader {
   Database& operator=(const Database&) = delete;
   Database(Database&&) = delete;
   Database& operator=(Database&&) = delete;
-  ~Database() override = default;
+  // Drops the columnar caches of every table incarnation: compiled plans may
+  // outlive the database while still holding Table copies.
+  ~Database() override;
 
-  // Transaction Begin() { return storage_.Begin(); }
   TransactionContext BeginContext() { return {storage_->Begin(), this}; }
   TransactionContext BeginReadOnlyContext() {
     return {storage_->BeginReadOnly(), this};
@@ -85,11 +87,11 @@ class Database final : public CatalogReader {
     return storage_->logger_->FixedSizeSegments();
   }
   Status WaitForCommitDurable(lsn_t target) {
-    return storage_->tm_->WaitForWALDurable(target);
+    return storage_->tm_->WaitForWalDurable(target);
   }
   // Successful fdatasync frontier, including bytes beyond a waiter's target.
   // BufferedLSN / CommittedLSN are not durability proofs.
-  [[nodiscard]] lsn_t DurableWALLSN() const {
+  [[nodiscard]] lsn_t DurableWalLSN() const {
     return storage_->logger_->DurableLSN();
   }
   void SetTransactionMetricsEnabled(bool enabled) {
@@ -137,7 +139,8 @@ class Database final : public CatalogReader {
   static constexpr std::string_view kViewKeyPrefix = "__view\x1e";
   static constexpr std::string_view kViewIndexKey = "__view\x1e\x01__index";
   Status PutViewDefinition(TransactionContext& ctx, std::string_view name,
-                           std::string_view query_text);
+                           std::string_view query_text,
+                           bool replace_existing = false);
   StatusOr<std::string> GetViewDefinition(TransactionContext& ctx,
                                           std::string_view name);
   Status DeleteViewDefinition(TransactionContext& ctx, std::string_view name);
@@ -181,15 +184,32 @@ class Database final : public CatalogReader {
   StatusOr<Table> GetTable(TransactionContext& ctx,
                            std::string_view schema_name) override;
 
+  // #1100: lightweight identity probe for compiled-plan reuse.  True while
+  // `state` is still the incarnation object bound to `canonical_name` in the
+  // per-database map and no drop has begun.  Replaces a
+  // catalog GetTable (LSM read + full Table deserialization) per retained
+  // table per plan-cache hit; DDL swaps or retires the map binding, and
+  // epoch-keyed cache lookups cover the catalog-only rewrites.
+  [[nodiscard]] bool IsCurrentIncarnation(
+      std::string_view canonical_name,
+      const std::shared_ptr<TableIncarnation>& state) const;
+
   // Catalog table names in ascending key order.
   std::vector<std::string> ListTables(TransactionContext& ctx);
 
   void EmulateCrash();
 
-  // Forces a fuzzy checkpoint now (the automatic compaction/checkpoint worker is far too
-  // slow to matter in a test/fuzz iteration).  No page latch may be held on
-  // this thread.  Returns the begin-checkpoint LSN recovery will resume from.
+  // Forces a fuzzy checkpoint now (the automatic compaction/checkpoint worker
+  // is far too slow to matter in a test/fuzz iteration).  No page latch may be
+  // held on this thread.  Returns the begin-checkpoint LSN recovery will resume
+  // from.
   StatusOr<lsn_t> WriteCheckpoint();
+
+  // Compacts `schema_name`'s committed RowPage chain into an immutable `.tlcs`
+  // columnar file alongside `<db>.db` and replaces the in-memory pages with
+  // columnar stub pages bound to the backing `TlcsFile`.
+  Status CompactTableToTlcs(TransactionContext& ctx,
+                            std::string_view schema_name);
 
   void DeleteAll();
 
@@ -205,6 +225,7 @@ class Database final : public CatalogReader {
   uint64_t BumpSchemaEpoch() noexcept {
     return schema_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
   }
+  void BumpCatalogEpoch() noexcept override { BumpSchemaEpoch(); }
 
  private:
   friend class TransactionContext;
@@ -221,7 +242,7 @@ class Database final : public CatalogReader {
 
   // Persistent statistics: table name → row-count meta, and
   // table name + NUL + column index → ColumnStats.  Splitting by column
-  // keeps each B+tree value under the leaf entry size limit.
+  // keeps each catalog value small (LsmIndex has no value-size limit).
   BPlusTree statistics_;
 
   // Persistent { Name => Function } storage.
@@ -232,9 +253,24 @@ class Database final : public CatalogReader {
   // registration can no longer allocate pages it would never reclaim.
   std::mutex catalog_mu_;
 
-  std::mutex table_incarnations_mu_;
-  std::unordered_map<std::string, std::shared_ptr<TableIncarnation>>
+  mutable std::mutex table_incarnations_mu_;
+  // T4634: transparent key lookup lets lookups probe with a string_view,
+  // so hot paths (GetTable, IsCurrentIncarnation) do not materialize a
+  // std::string while holding table_incarnations_mu_; only inserts
+  // allocate. (Same root cause as T4327, which covered the other site.)
+  struct StringViewNameHash {
+    using is_transparent = void;
+    [[nodiscard]] size_t operator()(std::string_view sv) const noexcept {
+      return std::hash<std::string_view>{}(sv);
+    }
+  };
+  mutable std::unordered_map<std::string, std::shared_ptr<TableIncarnation>,
+                             StringViewNameHash, std::equal_to<>>
       table_incarnations_;
+  mutable std::mutex tlcs_attach_mu_;
+  std::unordered_set<page_id_t> tlcs_probed_pids_;
+
+  void MaybeAttachBackingTlcs(Table& table);
 
   // Compiled-plan invalidation epoch; see SchemaEpoch()/BumpSchemaEpoch().
   // Starts from a process-global counter so two Database instances never

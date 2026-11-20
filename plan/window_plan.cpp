@@ -127,7 +127,7 @@ bool WindowPlan::IsOrderedBy(
   // the child's order. Decided here, before the runtime row count is known: a
   // plan that might spill must never leave a claim that it might violate.
   if (SpillCapable()) {
-    return expressions.empty() && ascending.empty();
+    return expressions.empty() && ascending.empty() && nulls_first.empty();
   }
   if (child_ == nullptr) {
     return expressions.empty() && ascending.empty();
@@ -152,7 +152,7 @@ void WindowPlan::Dump(std::ostream& output, int indent) const {
   }
   output << "\n" << Indent(static_cast<size_t>(indent) + 2);
   if (child_ != nullptr) {
-    child_->Dump(output, indent + 2);
+    DumpChild(output, *child_, indent + 2);
   }
 }
 

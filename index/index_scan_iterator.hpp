@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#ifndef TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
-#define TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
+#ifndef TINYLAMB_INDEX_SCAN_ITERATOR_HPP
+#define TINYLAMB_INDEX_SCAN_ITERATOR_HPP
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "common/incarnation.hpp"
@@ -80,7 +81,7 @@ class IndexScanIterator : public IteratorBase {
   // Index-only visibility fast path (the MVCC visibility-map equivalent of
   // full_scan_iterator.cpp's PhysicalReadEligible): when the index does not
   // retain deleted entries and the entry's row page carries no version
-  // chains, the B+Tree entry itself -- key columns plus INCLUDE payload --
+  // chains, the index entry itself -- key columns plus INCLUDE payload --
   // is the committed image every snapshot sees, so a covering consumer can
   // be served without the heap fetch.  Returns true and fills |dst| when
   // the entry qualifies; false means the caller must dereference the
@@ -91,7 +92,7 @@ class IndexScanIterator : public IteratorBase {
   // RangePartitionedScan support: the key-count-based virtual-leaf partition
   // boundaries of [begin_key, end_key], decoded to key images (strictly
   // ascending, each strictly greater than |begin_key|).  See
-  // BPlusTree::ScanPartitionBoundaries; an empty result means one partition
+  // LsmIndex::ScanPartitionBoundaries; an empty result means one partition
   // covers the whole range.
   static StatusOr<std::vector<Row>> PartitionBoundaries(
       const Index& index, Transaction& txn, const std::vector<Value>& begin_key,
@@ -140,13 +141,15 @@ class IndexScanIterator : public IteratorBase {
   bool resolve_head_;
   bool is_unique_;
   // Set by Clear(): once cleared the iterator must never report valid again
-  // even though the underlying BPlusTreeIterator may still iterate.
+  // even though the underlying LsmIndexIterator may still iterate.
   bool invalidated_{false};
-  Status status_{Status::kSuccess};
+  // Const resolve paths record failures here; keep it mutable instead of
+  // casting away constness at each call site.
+  mutable Status status_{Status::kSuccess};
   // -1 means "not positioned"; otherwise an index into the non-unique
   // value list of the current key. Signed so the sentinel cannot wrap.
   int64_t value_offset_{-1};
-  // Owned images, valid until the B+Tree cursor changes keys. Snapshot scans
+  // Owned images, valid until the index cursor changes keys. Snapshot scans
   // hold an index read gate; DML resolve-head scans reload before each step.
   std::vector<IndexValueType> value_list_;
   bool entry_loaded_{false};
@@ -162,9 +165,10 @@ class IndexScanIterator : public IteratorBase {
   Row include_;
   mutable Row current_row_;
   mutable bool current_row_resolved_{false};
-  // Snapshot range scans own one chain-free heap page's row images. No page
-  // latch or buffer-pool pointer survives a call. A later writer cannot change
-  // the image this fixed read-only snapshot must see.
+  // Snapshot range scans own one chain-free heap page's row images: the cache
+  // below keeps owned std::string copies plus the source page ids, so no page
+  // latch survives a call. A later writer cannot change the image this fixed
+  // read-only snapshot must see.
   bool cache_heap_images_{false};
   mutable page_id_t last_heap_page_{~page_id_t{0}};
   mutable page_id_t heap_image_page_{~page_id_t{0}};
@@ -177,10 +181,13 @@ class IndexScanIterator : public IteratorBase {
   // One-slot memo for the chain probe in TryReadIndexOnly: consecutive
   // entries usually land on the same row page.  A cached verdict stays sound
   // for the scan's lifetime -- see the implementation.
-  mutable page_id_t chain_checked_page_{0};
+  // Sentinel must not be a valid page id: page 0 needs its first chain check.
+  mutable page_id_t chain_checked_page_{std::numeric_limits<page_id_t>::max()};
   mutable bool chain_checked_free_{false};
+  uint64_t advance_steps_{0};
+  [[nodiscard]] bool CheckTimeoutOnStep();
 };
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
+#endif  // TINYLAMB_INDEX_SCAN_ITERATOR_HPP

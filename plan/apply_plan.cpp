@@ -34,14 +34,19 @@ TableStatistics MakeStats(const Schema& schema, size_t rows) {
 Schema BuildApplySchema(const Plan& child, const Plan& inner_child,
                         const std::string& alias, JoinKind kind,
                         Schema declared_schema) {
-  (void)alias;
-  if (declared_schema.ColumnCount() > 0) {
+  // The relation alias is part of the output schema's qualified name; do
+  // not silently discard it.
+  Schema output = declared_schema;
+  if (!alias.empty()) {
+    output.SetName(alias);
+  }
+  if (output.ColumnCount() > 0) {
     if (child && child->GetSchema().ColumnCount() > 0 &&
         declared_schema.Offset(child->GetSchema().GetColumn(0).Name()) == -1) {
       if (kind == JoinKind::kSemi || kind == JoinKind::kAnti) {
         return child->GetSchema();
       }
-      return child->GetSchema() + declared_schema;
+      return child->GetSchema() + output;
     }
     return declared_schema;
   }
@@ -105,10 +110,10 @@ void ApplyPlan::Dump(std::ostream& output, int indent) const {
   }
   output << " (schema: " << schema_ << ")\n";
   if (child_) {
-    child_->Dump(output, indent + 2);
+    DumpChild(output, *child_, indent + 2);
   }
   if (inner_child_) {
-    inner_child_->Dump(output, indent + 2);
+    DumpChild(output, *inner_child_, indent + 2);
   }
 }
 

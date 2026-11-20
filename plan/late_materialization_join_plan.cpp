@@ -191,7 +191,7 @@ bool LateMaterializationJoinPlan::IsOrderedBy(
 
 void LateMaterializationJoinPlan::Dump(std::ostream& output, int indent) const {
   output << ToString() << "\n" << Indent(static_cast<size_t>(indent) + 2);
-  left_->Dump(output, indent + 2);
+  DumpChild(output, *left_, indent + 2);
   if (right_table_ != nullptr) {
     output << "\n"
            << Indent(static_cast<size_t>(indent) + 2)
@@ -221,7 +221,7 @@ bool LateMaterializationJoinPlan::InstallParameterSlots(
     const std::vector<Value>& parameters, size_t* cursor,
     std::vector<Expression>* slots) {
   return left_->InstallParameterSlots(parameters, cursor, slots) &&
-         SlotizeInPlace(&predicate_, parameters, cursor, slots);
+         CollectParameterSlots(&predicate_, slots);
 }
 
 }  // namespace tinylamb

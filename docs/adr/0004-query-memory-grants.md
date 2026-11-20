@@ -38,8 +38,10 @@ Status: accepted（2026-11-16 決定、2026-11-17 P1/P3 実装済み: `common/qu
 
 ### プランナ
 
-10. プランナがコスト計算に使うメモリ予算（`plan/implementation_rules.cpp` の
-    `memory_budget_bytes`）は、同じ付与から求める。実行時と別の定数を持たない。
+10. （未達）プランナがコスト計算に使うメモリ予算は、実行時付与と同じ場所から
+    求める。実行時と別の定数を持たない。現状は `plan/aggregation_plan.hpp` /
+    `sort_plan.hpp` / `window_plan.hpp` がそれぞれ 64 MiB の自前既定定数を保持
+    しており、上記 Status 行の例外注記のとおり未実装である。
 
 ### 旧演算子
 

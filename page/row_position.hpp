@@ -40,7 +40,9 @@ struct RowPosition {
   // narrowing conversion back to slot_t under -Wsign-conversion.
   slot_t slot = static_cast<slot_t>(~0);
 
-  [[nodiscard]] bool IsValid() const { return page_id != ~0LLU; }
+  [[nodiscard]] bool IsValid() const {
+    return page_id != ~0LLU && slot != static_cast<slot_t>(~0);
+  }
 
   friend std::ostream& operator<<(std::ostream& o, const RowPosition& p) {
     o << "{" << p.page_id << ": " << p.slot << "}";
@@ -81,8 +83,15 @@ template <>
 class hash<tinylamb::RowPosition> {
  public:
   uint64_t operator()(const tinylamb::RowPosition& target) const {
-    return std::hash<tinylamb::page_id_t>()(target.page_id) +
-           std::hash<tinylamb::slot_t>()(target.slot);
+    uint64_t h = target.page_id * 0x9e3779b97f4a7c15ULL;
+    h ^= static_cast<uint64_t>(target.slot) + 0x517cc1b727220a95ULL + (h << 6) +
+         (h >> 2);
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
   }
 };
 

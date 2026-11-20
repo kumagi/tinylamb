@@ -13,6 +13,7 @@
 
 #include "common/memory_budget.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/expression_eval.hpp"
 #include "executor/detail/pipeline/pipeline_ops.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/full_scan.hpp"
@@ -28,6 +29,7 @@
 #include "expression/aggregate_expression.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/column_value.hpp"
+#include "expression/jit.hpp"
 #include "expression/parameter_slot.hpp"
 #include "expression/rewrite.hpp"
 #include "plan/aggregation_plan.hpp"
@@ -251,9 +253,12 @@ class PipelineStreamExecutor final : public ExecutorBase {
         // so each operator's output reuses allocated columns instead of
         // re-allocating them every batch (`DataChunk::Reset` reuse path).
         std::swap(cur_, next_);
+        // An operator may produce its final rows AND set exhausted (e.g.
+        // LimitOp reaching its cap). Keep feeding later operators so their
+        // projection/filter still applies; only stop after the last one,
+        // matching PipelineExecutor::ApplyOperators.
         if (exhausted) {
           eof_ = true;
-          break;
         }
       }
       if (!cur_.Empty()) {
@@ -307,7 +312,9 @@ class LazyAdaptedPipelineSource final : public PipelineSource {
   StatusOr<bool> NextBatch(PipelineContext* /*ctx*/, DataChunk* out,
                            size_t max_rows) override {
     if (!exec_) {
-      return false;
+      // Open() must run first; an uninitialised source is not an empty one.
+      return StatusError(StatusCode::kRuntimeError,
+                         "LazyAdaptedPipelineSource read before Open");
     }
     const size_t n = exec_->NextBatch(out, max_rows);
     if (exec_->GetStatus() != Status::kSuccess) {
@@ -333,6 +340,257 @@ class LazyAdaptedPipelineSource final : public PipelineSource {
   std::string label_;
   Executor exec_;
 };
+
+// This sink replaces only a tail of the chunk-driven pipeline. The original
+// Filter and Project operators remain available for unproven batches.
+class FusedFilterProjectSumSink final : public PipelineSink {
+ public:
+  FusedFilterProjectSumSink(
+      std::shared_ptr<PipelineOperator> filter,
+      std::shared_ptr<PipelineOperator> project, Schema input_schema,
+      Schema aggregate_input_schema, Schema output_schema, Expression aggregate,
+      const relational_detail::SimpleComparePredicate& predicate,
+      Projection::Int64Affine affine)
+      : filter_(std::move(filter)),
+        project_(std::move(project)),
+        input_schema_(std::move(input_schema)),
+        aggregate_input_schema_(std::move(aggregate_input_schema)),
+        output_schema_(std::move(output_schema)),
+        aggregate_(std::move(aggregate)),
+        accumulator_(&aggregate_->AsAggregateExpression(),
+                     &aggregate_input_schema_),
+        predicate_column_(predicate.column),
+        operation_(predicate.op),
+        constant_(predicate.int_constant),
+        affine_(affine) {}
+
+  Status Init(PipelineContext* ctx, size_t workers) override {
+    if (workers != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "fused scalar SUM requires a serial sink");
+    }
+    RETURN_IF_FAIL(filter_->Open(ctx));
+    return project_ ? project_->Open(ctx) : Status::kSuccess;
+  }
+
+  Status Consume(PipelineContext* ctx, size_t /*worker*/,
+                 const DataChunk& input) override {
+    if (input.Empty()) {
+      return Status::kSuccess;
+    }
+    constexpr size_t kCompileAfterRows = 65536;
+    if (!attempted_) {
+      seen_ += input.Size();
+      if (seen_ >= kCompileAfterRows) {
+        attempted_ = true;
+        kernel_ = JitInt64Kernels::CompileFilterProjectSum(operation_);
+      }
+    }
+    if (kernel_ && TryConsumeFused(input)) {
+      return Status::kSuccess;
+    }
+    bool exhausted = false;
+    RETURN_IF_FAIL(filter_->Process(ctx, input, &selected_, &exhausted));
+    const DataChunk* batch = &selected_;
+    if (project_) {
+      RETURN_IF_FAIL(
+          project_->Process(ctx, selected_, &projected_, &exhausted));
+      batch = &projected_;
+    }
+    const auto& arg = aggregate_->AsAggregateExpression().Child();
+    for (size_t row = 0; row < batch->Size(); ++row) {
+      ASSIGN_OR_RETURN(
+          Value, value,
+          arg->TryEvaluate(batch->RowAt(row), aggregate_input_schema_));
+      RETURN_IF_FAIL(accumulator_.Add(value));
+    }
+    return Status::kSuccess;
+  }
+
+  StatusOr<std::shared_ptr<PipelineSource>> Finalize(
+      PipelineContext* /*ctx*/) override {
+    ASSIGN_OR_RETURN(Value, sum, accumulator_.TryFinish());
+    DataChunk result;
+    result.Reset(output_schema_, 1);
+    result.Append(Row({std::move(sum)}));
+    std::vector<DataChunk> chunks;
+    chunks.push_back(std::move(result));
+    return std::shared_ptr<PipelineSource>(
+        std::make_shared<ChunkVectorSource>(std::move(chunks), Describe()));
+  }
+
+  [[nodiscard]] std::string Describe() const override {
+    return "FusedFilterProjectSum";
+  }
+
+  void DumpExplain(std::ostream& out, int indent) const override {
+    out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
+        << Describe() << " (jit_batches=" << jit_batches_ << ")\n";
+  }
+
+ private:
+  bool TryConsumeFused(const DataChunk& input) {
+    if (!kernel_ || !input.HasLayout(input_schema_) ||
+        accumulator_.sum_is_uint64 || accumulator_.total_is_double ||
+        std::cmp_greater(input.Size(), INT64_MAX - accumulator_.count)) {
+      return false;
+    }
+    const auto valid = [&](size_t slot) {
+      const auto& c = input.ColumnAt(slot);
+      const auto& z = input.ZoneMapAt(slot);
+      return c.Type() == ValueType::kInt64 && !c.IsUnsigned() &&
+             !c.IsHeterogeneous() && z.Initialized() && z.NullCount() == 0;
+    };
+    if (!valid(predicate_column_)) {
+      return false;
+    }
+    if (!input.ZoneMapAt(predicate_column_)
+             .MayMatch(operation_, Value(constant_))) {
+      return true;
+    }
+    if (!valid(affine_.column)) {
+      return false;
+    }
+    const auto& zone = input.ZoneMapAt(affine_.column);
+    const auto& low = zone.Minimum();
+    const auto& high = zone.Maximum();
+    if (!low || !high || low->type != ValueType::kInt64 ||
+        high->type != ValueType::kInt64 || low->IsUnsigned() ||
+        high->IsUnsigned() ||
+        !JitInt64Kernels::CanUseFilterProjectSum(
+            low->AsInt64(), high->AsInt64(), affine_.multiplier, affine_.addend,
+            accumulator_.int_total, input.Size())) {
+      return false;
+    }
+    uint64_t selected = 0;
+    accumulator_.int_total = kernel_->FilterProjectSum(
+        input.ColumnAt(predicate_column_).IntegerData().data(),
+        input.ColumnAt(affine_.column).IntegerData().data(), input.Size(),
+        constant_, affine_.multiplier, affine_.addend, accumulator_.int_total,
+        &selected);
+    accumulator_.count += static_cast<int64_t>(selected);
+    ++jit_batches_;
+    return true;
+  }
+
+  std::shared_ptr<PipelineOperator> filter_;
+  std::shared_ptr<PipelineOperator> project_;
+  Schema input_schema_;
+  Schema aggregate_input_schema_;
+  Schema output_schema_;
+  Expression aggregate_;
+  relational_detail::AggregateAccumulator accumulator_;
+  slot_t predicate_column_;
+  BinaryOperation operation_;
+  int64_t constant_;
+  Projection::Int64Affine affine_;
+  DataChunk selected_;
+  DataChunk projected_;
+  std::optional<JitInt64Kernels> kernel_;
+  size_t seen_{0};
+  size_t jit_batches_{0};
+  bool attempted_{false};
+};
+
+std::shared_ptr<PipelineSink> TryFuseFilterProjectSum(
+    const AggregationPlan& plan, LoweredStream* stream) {
+  if (std::getenv("TINYLAMB_DISABLE_FUSED_SUM_JIT") != nullptr ||
+      !BytecodeEnabled() || !plan.GroupKeys().empty() || plan.Having() ||
+      plan.Aggregates().size() != 1 || stream->operators.empty()) {
+    return nullptr;
+  }
+  const auto& owner = plan.Aggregates()[0].expression;
+  const auto& aggregate = owner->AsAggregateExpression();
+  if (aggregate.GetType() != AggregationType::kSum || aggregate.Distinct() ||
+      aggregate.HasWhereFilter() || aggregate.NeedsGroupContext() ||
+      aggregate.HasInnerGroupBy() || !aggregate.Child() ||
+      aggregate.Having() != AggregateHavingModifier::kNone ||
+      aggregate.InnerLimit() || !aggregate.InnerOrderBy().empty() ||
+      aggregate.SecondaryArg() || !aggregate.ExtraArgs().empty() ||
+      !aggregate.TrailingArgs().empty()) {
+    return nullptr;
+  }
+
+  const Plan& input = plan.Child();
+  const auto* projection = dynamic_cast<const ProjectionPlan*>(input.get());
+  const auto* selection = dynamic_cast<const SelectionPlan*>(
+      (projection != nullptr ? projection->GetSource() : input).get());
+  const size_t tail = projection != nullptr ? 2 : 1;
+  if (selection == nullptr || stream->operators.size() < tail) {
+    return nullptr;
+  }
+  const size_t first = stream->operators.size() - tail;
+  const auto* filter_op =
+      dynamic_cast<const FilterOp*>(stream->operators[first].get());
+  if (filter_op == nullptr ||
+      filter_op->Predicate() != selection->Predicate()) {
+    return nullptr;
+  }
+
+  if (projection != nullptr) {
+    const auto* project_op =
+        dynamic_cast<const ProjectOp*>(stream->operators.back().get());
+    const auto same_expression = [](const auto& left, const auto& right) {
+      return left.expression == right.expression;
+    };
+    if (project_op == nullptr ||
+        !std::ranges::equal(project_op->Expressions(), projection->Columns(),
+                            same_expression)) {
+      return nullptr;
+    }
+  }
+  const auto& raw_schema = selection->Src()->GetSchema();
+  const auto predicate = relational_detail::TryCompileSimpleCompare(
+      selection->Predicate(), raw_schema);
+  if (!predicate || !predicate->int_payload || predicate->column_payload ||
+      predicate->constant.type != ValueType::kInt64 ||
+      predicate->constant.IsUnsigned() || !IsComparison(predicate->op)) {
+    return nullptr;
+  }
+  const auto& key = raw_schema.GetColumn(predicate->column);
+  if (key.Type() != ValueType::kInt64 || key.IsUnsigned()) {
+    return nullptr;
+  }
+  const auto& arg = aggregate.Child();
+  auto affine = Projection::ResolveInt64Affine(
+      arg, projection != nullptr ? input->GetSchema() : raw_schema);
+  if (!affine) {
+    return nullptr;
+  }
+  if (projection != nullptr) {
+    const auto& columns = projection->Columns();
+    const bool pass_through =
+        std::ranges::all_of(columns, [&](const NamedExpression& item) {
+          return item.expression &&
+                 item.expression->Type() == TypeTag::kColumnValue &&
+                 raw_schema.Offset(
+                     item.expression->AsColumnValue().GetColumnName()) >= 0;
+        });
+    if (pass_through) {
+      const auto source = Projection::ResolveInt64Affine(
+          columns[affine->column].expression, raw_schema);
+      if (!source) {
+        return nullptr;
+      }
+      affine->column = source->column;
+    } else if (columns.size() == 1 && arg->Type() == TypeTag::kColumnValue) {
+      affine =
+          Projection::ResolveInt64Affine(columns[0].expression, raw_schema);
+      if (!affine) {
+        return nullptr;
+      }
+    } else {
+      return nullptr;
+    }
+  }
+
+  auto sink = std::make_shared<FusedFilterProjectSumSink>(
+      stream->operators[first],
+      projection != nullptr ? stream->operators.back() : nullptr, raw_schema,
+      input->GetSchema(), plan.GetSchema(), owner, *predicate, *affine);
+  stream->operators.resize(first);
+  return sink;
+}
 
 }  // namespace
 
@@ -524,6 +782,7 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
           .ascending = k.ascending,
           .nulls_first = k.nulls_first,
           .collation = k.collation,
+          .column_slot = std::nullopt,
       });
     }
     auto sink = std::make_shared<OocSortSink>(
@@ -578,6 +837,45 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
   //     NeedsGroupContext (`ARRAY_AGG`, `STRING_AGG`, inner `ORDER BY`,
   //     `FILTER`, `HAVING MAX/MIN`, `PERCENTILE_*`).
   if (const auto* agg = dynamic_cast<const AggregationPlan*>(base)) {
+    // Keyless scalar aggregates (`SELECT COUNT(*) FROM t`, `MIN`/`MAX`/`SUM`)
+    // hold O(1) 1-row state (zero group hash table) and benefit from
+    // `EmitScalarAggregation`'s column narrowing + `AggregationExecutor`
+    // metadata/block folding (`TryFoldScan` / `TryFoldAffineSums` / JIT SIMD).
+    if (agg->GroupKeys().empty() && !agg->Having() &&
+        !ProcessMemoryBudget::Global().AlwaysSpillEnabled() &&
+        ProcessMemoryBudget::Global().OpMemoryOverrideBytes() == 0 &&
+        std::ranges::all_of(agg->Aggregates(), [](const NamedExpression& ne) {
+          if (!ne.expression || ne.expression->Type() != TypeTag::kAggregateExp) {
+            return false;
+          }
+          const auto& ae = ne.expression->AsAggregateExpression();
+          return !ae.Distinct() && !ae.NeedsGroupContext() &&
+                 !ae.HasInnerGroupBy();
+        })) {
+      const PlanBase* cur = agg->Child().get();
+      while (cur != nullptr) {
+        if (const auto* p = dynamic_cast<const ProjectionPlan*>(cur)) {
+          cur = p->GetSource().get();
+        } else if (const auto* s = dynamic_cast<const SelectionPlan*>(cur)) {
+          cur = s->Src().get();
+        } else if (const auto* r =
+                       dynamic_cast<const RelationRenamePlan*>(cur)) {
+          cur = r->GetSource().get();
+        } else {
+          break;
+        }
+      }
+      if (dynamic_cast<const FullScanPlan*>(cur) != nullptr ||
+          dynamic_cast<const IndexOnlyScanPlan*>(cur) != nullptr) {
+        Executor scalar_exec = agg->EmitExecutor(ctx);
+        out->source = std::make_shared<StreamingExecutorSource>(
+            std::move(scalar_exec), agg->StrategyName());
+        out->operators.clear();
+        out->schema = agg->GetSchema();
+        out->scan_origin.reset();
+        return Status::kSuccess;
+      }
+    }
     bool supported = true;
     std::vector<Expression> agg_owners;
     agg_owners.reserve(agg->Aggregates().size());
@@ -596,6 +894,10 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
 
     if (supported) {
       RETURN_IF_FAIL(LowerNode(agg->Child(), ctx, custom_hook, graph, out));
+      if (auto fused = TryFuseFilterProjectSum(*agg, out)) {
+        return BreakWithSink(graph, out, std::move(fused),
+                             "FusedFilterProjectSum", agg->GetSchema());
+      }
       if (agg->GroupKeys().empty() && agg->Aggregates().size() == 1 &&
           agg->Child()->GetSchema().ColumnCount() == 1 &&
           out->operators.empty()) {
@@ -641,6 +943,10 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
               .expression = ColumnValueExp(agg_schema.GetColumn(i).Name()),
               .ascending = true,
               .nulls_first = true,
+              .collation = Collation::kNone,  // group keys use the default binary order
+              // Slot-based resolution: aggregate output names can collide
+              // with group-key names, so never re-resolve by name here.
+              .column_slot = i,
           });
         }
         auto sort_sink =
@@ -660,8 +966,8 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
   }
 
   // 11. Equi Hash Join (`ProductPlan` with non-empty join keys and non-lookup
-  //     right plan). Cross/BNL/Lookup falls back cleanly to `LegacySource` in
-  //     P3a until P3b.
+  //     right plan). Cross/BNL are lowered to OOC sinks; lookup stays on its
+  //     dedicated executor.
   if (const auto* prod = dynamic_cast<const ProductPlan*>(base)) {
     std::vector<slot_t> left_slots;
     std::vector<slot_t> right_slots;
@@ -1409,6 +1715,10 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
              rsrc = std::move(rstream.source),
              rops = std::move(rstream.operators), lcol = lcols.front(),
              rcol = rcols.front(), op = zz->Operation(), pred = zz->Predicate(),
+             // T3510: residual predicates are compiled against the
+             // concatenated input schemas, not the output schema.
+             residual_schema =
+                 zz->Left()->GetSchema() + zz->Right()->GetSchema(),
              out_schema =
                  zz->GetSchema()](PipelineContext* pctx) -> StatusOr<Executor> {
               Executor lex = std::make_shared<PipelineStreamExecutor>(
@@ -1417,7 +1727,7 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
                   pctx, rsrc, rops, "PipelineRight");
               return Executor(std::make_shared<ZigZagJoin>(
                   std::move(lex), lcol, std::move(rex), rcol, op, pred,
-                  out_schema));
+                  residual_schema, out_schema));
             },
             "ZigZagJoin");
       } else {

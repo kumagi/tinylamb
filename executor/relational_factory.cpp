@@ -123,7 +123,9 @@ namespace {
 class FailedScanExecutor final : public ExecutorBase {
  public:
   explicit FailedScanExecutor(Status status) : status_(std::move(status)) {}
-  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override { return 0; }
+  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override {
+    return 0;
+  }
   void Dump(std::ostream& o, int indent) const override {
     o << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
       << "BitmapScan(failed)";
@@ -162,7 +164,8 @@ Executor ApplyPlan::EmitExecutor(TransactionContext& ctx) const {
       inner_child_ ? inner_child_->EmitExecutor(ctx) : nullptr;
   return std::make_shared<ApplyExecutor>(
       ctx, std::move(child_schema), std::move(child_exec), inner_query_, alias_,
-      std::move(inner_exec), predicate_, kind_, schema_);
+      std::move(inner_exec), predicate_, kind_, schema_,
+      inner_child_ ? inner_child_->GetSchema() : Schema());
 }
 
 Executor RecursiveCtePlan::EmitExecutor(TransactionContext& ctx) const {
@@ -1165,12 +1168,14 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
                                        std::move(index_read_guard), prefetch);
   }
   // ParallelIndexScan / ParallelIndexScan: a large ascending single-range
-  // scan partitions at B+Tree leaf boundaries and scans the partitions in
-  // parallel.  The morsel-ordered handoff keeps the key order, so the plan's
-  // ordering claims stay valid; the residual predicate rides a Selection
-  // above the scan because AST evaluation is single-threaded.  DML source
-  // scans (lock_rows_) stay serial.
-  static const bool parallel_index_scan_disabled =
+  // scan partitions at LSM key-range partition boundaries and scans the
+  // partitions in parallel.  The morsel-ordered handoff keeps the key order, so
+  // the plan's ordering claims stay valid; the residual predicate rides a
+  // Selection above the scan because AST evaluation is single-threaded.  DML
+  // source scans (lock_rows_) stay serial.
+  // Read per call like TINYLAMB_DISABLE_PARALLEL_SCAN so interactive A/B and
+  // regression tests can toggle the hatch after warm-up.
+  const bool parallel_index_scan_disabled =
       std::getenv("TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN") != nullptr;
   if (!parallel_index_scan_disabled && ascending_ && !lock_rows_ &&
       LimitHint() == std::numeric_limits<size_t>::max() &&
@@ -1195,9 +1200,9 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
       txn.txn_, table_, index_, begin_key, end_key, ascending_, where_,
       GetSchema(), lock_rows_, wait_for_write_intent_,
       std::move(index_read_guard),
-      // A look-ahead cursor copies its own leaf snapshot. A short range fits
-      // in one execution vector; constructing and walking a second cursor
-      // costs more than the warming can save on that path.
+      // A look-ahead cursor opens a second index scan (kIndexOnly mode). A
+      // short range fits in one execution vector; constructing and walking a
+      // second cursor costs more than the warming can save on that path.
       LimitHint() == std::numeric_limits<size_t>::max() &&
           EmitRowCount() > kDefaultVectorSize);
 }
@@ -1430,8 +1435,7 @@ void BuildKeyOffsets(const Schema& schema,
       }
     }
     if (!found) {
-      CHECK_MSG(false,
-                "ProductPlan: join key column not found: " + col.ToString());
+      CHECK_MSG(false, "join key column not found: " + col.ToString());
     }
   }
 }
@@ -1469,12 +1473,11 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
       Left()->EmitRowCount() + Right()->EmitRowCount() >=
           kParallelMergeJoinMinRows) {
     const size_t workers = std::max<size_t>(
-        1, std::min<size_t>(
-               16, QueryParallelWorkerLimit(static_cast<size_t>(
-                        std::thread::hardware_concurrency()))));
+        1, std::min<size_t>(16, QueryParallelWorkerLimit(static_cast<size_t>(
+                                    std::thread::hardware_concurrency()))));
     return std::make_shared<ParallelMergeJoin>(
         Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
-        std::move(right), workers, Kind(), Expression(), Schema(),
+        std::move(right), workers, Kind(), Residual(), residual_schema,
         Right()->GetSchema().ColumnCount(), Left()->GetSchema().ColumnCount());
   }
   return std::make_shared<MergeJoin>(
@@ -1592,9 +1595,10 @@ Executor ZigZagJoinPlan::EmitExecutor(TransactionContext& ctx) const {
         std::move(left_executor), Left()->GetSchema(),
         std::move(right_executor), Right()->GetSchema(), Predicate());
   }
-  return std::make_shared<ZigZagJoin>(std::move(left_executor), left.front(),
-                                      std::move(right_executor), right.front(),
-                                      Operation(), Predicate(), GetSchema());
+  const Schema residual = Left()->GetSchema() + Right()->GetSchema();
+  return std::make_shared<ZigZagJoin>(
+      std::move(left_executor), left.front(), std::move(right_executor),
+      right.front(), Operation(), Predicate(), residual, GetSchema());
 }
 
 Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -1650,6 +1654,13 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   const Schema& right_schema =
       right_tbl_ != nullptr ? right_tbl_->GetSchema() : right_src_->GetSchema();
   BuildKeyOffsets(right_schema, right_cols_, &right);
+  // 1824: MaterializeHybrid must spill with the same partition count the
+  // planner's HybridHashJoin cost model evaluated from the build estimate.
+  // An index-side build (right_tbl_ without a right plan) has no estimate,
+  // and HybridPartitionCount(0) keeps the historical 32.
+  const size_t hybrid_partitions = HybridPartitionCount(
+      (right_src_ != nullptr ? right_src_->EmitRowCount() : 0) *
+      kHashJoinRowBytesEstimate);
   if (right_tbl_ != nullptr) {
     Executor left_executor = left_src_->EmitExecutor(ctx);
     auto index_read_guard = ctx.txn_.AcquireIndexReadGuard(right_idx_->Root());
@@ -1671,7 +1682,8 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
           kind_,
           std::min<size_t>(
               16, std::max<size_t>(1, std::thread::hardware_concurrency())),
-          right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
+          right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount(),
+          hybrid_partitions);
       join->SetJoinAnnotations(key_null_safe_, residual_note_);
       if (residual_note_ &&
           (kind_ == JoinKind::kLeftOuter || kind_ == JoinKind::kRightOuter ||
@@ -1724,7 +1736,8 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
         right, hash_mode_, kind_,
         std::min<size_t>(
             16, std::max<size_t>(1, std::thread::hardware_concurrency())),
-        right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
+        right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount(),
+        hybrid_partitions);
     join->SetJoinAnnotations(key_null_safe_, residual_note_);
     if (semi_reduction_) {
       // Phase 2 "Hash Semi Reduction": a semi/anti join emits only the probe
@@ -1780,17 +1793,16 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
       left_src_->EmitRowCount() + right_src_->EmitRowCount() >=
           kParallelHashJoinMinRows) {
     const size_t workers = std::max<size_t>(
-        1, std::min<size_t>(
-               16, QueryParallelWorkerLimit(static_cast<size_t>(
-                        std::thread::hardware_concurrency()))));
+        1, std::min<size_t>(16, QueryParallelWorkerLimit(static_cast<size_t>(
+                                    std::thread::hardware_concurrency()))));
     return std::make_shared<SharedBuildParallelHashJoin>(
         left_src_->EmitExecutor(ctx), left, right_src_->EmitExecutor(ctx),
         right, workers, JoinKind::kInner,
         right_src_->GetSchema().ColumnCount());
   }
-  auto join = std::make_shared<HashJoin>(left_src_->EmitExecutor(ctx), left,
-                                         right_src_->EmitExecutor(ctx), right,
-                                         hash_mode_);
+  auto join = std::make_shared<HashJoin>(
+      left_src_->EmitExecutor(ctx), left, right_src_->EmitExecutor(ctx), right,
+      hash_mode_, std::thread::hardware_concurrency(), hybrid_partitions);
   join->SetJoinAnnotations(key_null_safe_, residual_note_);
   if (dynamic_filter) {
     join->EnableDynamicFilter(DynamicFilterBuildsLeft());

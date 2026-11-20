@@ -17,13 +17,17 @@
 #ifndef TINYLAMB_COMMON_PLATFORM_EVENT_POLLER_HPP
 #define TINYLAMB_COMMON_PLATFORM_EVENT_POLLER_HPP
 
+#include <atomic>
 #include <cstdint>
 #ifdef _WIN32
 #include <condition_variable>
+#include <winsock2.h>
 #endif
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace tinylamb::platform {
 
@@ -84,6 +88,12 @@ class EventPoller {
   // the previous interest to know which filters to add or delete.
   std::mutex mu_;
   std::unordered_map<int, uint32_t> interest_;
+#ifdef _WIN32
+  // Cached WSAPOLLFD inputs: rebuilt only when the interest set changes.
+  std::vector<std::pair<int, uint32_t>> poll_cache_snapshot_;
+  std::vector<WSAPOLLFD> poll_cache_fds_;
+  std::vector<uint32_t> poll_cache_interests_;
+#endif
 #endif
 };
 
@@ -110,7 +120,10 @@ class Waker {
 
  private:
   int read_fd_{-1};
-  int write_fd_{-1};  // == read_fd_ for eventfd
+  // == read_fd_ for eventfd. Atomic because the header contract lets any
+  // thread call Wake() while the polling thread may run Close(); a plain
+  // int made the Wake()/Close() pair a data race (TSAN) on the fd number.
+  std::atomic<int> write_fd_{-1};
 };
 
 }  // namespace tinylamb::platform

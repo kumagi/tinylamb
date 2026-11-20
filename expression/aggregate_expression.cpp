@@ -43,7 +43,9 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
     columns.merge(where_filter_->TouchedColumns());
   }
   for (const auto& term : inner_order_by_) {
-    columns.merge(term.expression->TouchedColumns());
+    if (term.expression) {
+      columns.merge(term.expression->TouchedColumns());
+    }
   }
   if (secondary_arg_) {
     columns.merge(secondary_arg_->TouchedColumns());
@@ -76,22 +78,26 @@ Value AggregateExpression::Evaluate(const Row& row,
 }
 
 Type AggregateExpression::ResultType(const Schema& schema) const {
-  if (type_ == AggregationType::kCount) {
-    return {TypeTag::kBigInt};
-  }
-  if (type_ == AggregationType::kRegrCount) {
-    return {TypeTag::kBigInt};
-  }
-  if (type_ == AggregationType::kAvg || IsStatisticalAggregate(type_) ||
-      type_ == AggregationType::kHllMerge) {
-    return {TypeTag::kDouble};
-  }
-  if (IsSketchAggregate(type_)) {
-    return {TypeTag::kVarChar};
+  // P461/501: canonical declaration table (type/value.cpp); std::nullopt
+  // means the result carries the child's type.
+  if (const auto kind = CanonicalAggregateResultKind(type_); kind.has_value()) {
+    switch (*kind) {
+      case ValueType::kInt64:
+        return {TypeTag::kBigInt};
+      case ValueType::kDouble:
+        return {TypeTag::kDouble};
+      case ValueType::kVarChar:
+        return {TypeTag::kVarChar};
+      case ValueType::kArray:
+        return {TypeTag::kArray};
+      default:
+        break;
+    }
   }
   if (!child_) {
-    // Matches the two-schema overload: a childless aggregate (COUNT(*)
-    // built without a column child) must not dereference null.
+    // Only the INT64-declared aggregates above are valid without a column
+    // child; others derive their type from the child and must not silently
+    // claim INT64 (handled by the canonical table).
     return {TypeTag::kBigInt};
   }
   return child_->ResultType(schema);
@@ -99,18 +105,19 @@ Type AggregateExpression::ResultType(const Schema& schema) const {
 
 Type AggregateExpression::ResultType(const Schema& left,
                                      const Schema& right) const {
-  if (type_ == AggregationType::kCount) {
-    return {TypeTag::kBigInt};
-  }
-  if (type_ == AggregationType::kRegrCount) {
-    return {TypeTag::kBigInt};
-  }
-  if (type_ == AggregationType::kAvg || IsStatisticalAggregate(type_) ||
-      type_ == AggregationType::kHllMerge) {
-    return {TypeTag::kDouble};
-  }
-  if (IsSketchAggregate(type_)) {
-    return {TypeTag::kVarChar};
+  if (const auto kind = CanonicalAggregateResultKind(type_); kind.has_value()) {
+    switch (*kind) {
+      case ValueType::kInt64:
+        return {TypeTag::kBigInt};
+      case ValueType::kDouble:
+        return {TypeTag::kDouble};
+      case ValueType::kVarChar:
+        return {TypeTag::kVarChar};
+      case ValueType::kArray:
+        return {TypeTag::kArray};
+      default:
+        break;
+    }
   }
   if (!child_) {
     return {TypeTag::kBigInt};
@@ -128,7 +135,18 @@ std::string AggregateExpression::ToString() const {
     }
   }
   if (secondary_arg_) {
-    out += ", " + secondary_arg_->ToString();
+    // Quote a string delimiter so the rendered SQL is re-parseable.
+    std::string delim = secondary_arg_->ToString();
+    if (secondary_arg_->Type() == TypeTag::kConstantValue) {
+      std::string quoted = "\"";
+      for (char c : delim) {
+        if (c == '"' || c == '\\') quoted += '\\';  // NOLINT(readability-braces-around-statements)
+        quoted += c;
+      }
+      quoted += '"';
+      delim = std::move(quoted);
+    }
+    out += ", " + delim;
   }
   if (ignore_nulls_) {
     out += " IGNORE NULLS";
@@ -141,6 +159,22 @@ std::string AggregateExpression::ToString() const {
                                                     : " HAVING MIN ";
     out += having_cond_->ToString();
   }
+  if (inner_limit_.has_value()) {
+    out += " LIMIT " + std::to_string(*inner_limit_);
+  }
+  // T4808: inner GROUP BY was invisible in the text form, so two aggregates
+  // differing only by GROUP BY rendered identically -- the ToString-based
+  // dedup/rewrite keys the reader contract (round 155 CLEAN) promises to
+  // include it. Rendered before ORDER BY, matching GoogleSQL syntax.
+  if (!inner_group_by_.empty()) {
+    out += " GROUP BY ";
+    for (size_t i = 0; i < inner_group_by_.size(); ++i) {
+      if (i != 0U) {
+        out += ", ";
+      }
+      out += inner_group_by_[i]->ToString();
+    }
+  }
   if (!inner_order_by_.empty()) {
     out += " ORDER BY ";
     for (size_t i = 0; i < inner_order_by_.size(); ++i) {
@@ -151,10 +185,11 @@ std::string AggregateExpression::ToString() const {
       if (!inner_order_by_[i].ascending) {
         out += " DESC";
       }
+      if (inner_order_by_[i].nulls_first.has_value()) {
+        out += inner_order_by_[i].nulls_first.value() ? " NULLS FIRST"  // NOLINT(bugprone-unchecked-optional-access)
+                                                    : " NULLS LAST";
+      }
     }
-  }
-  if (inner_limit_.has_value()) {
-    out += " LIMIT " + std::to_string(*inner_limit_);
   }
   return out + ")";
 }

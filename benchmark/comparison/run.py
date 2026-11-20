@@ -246,7 +246,7 @@ class Stack:
                     client_threads=1, isolation='snapshot isolation; optimistic write conflicts; no retries',
                     timeout='supervising worker wall-clock deadline', index_type='ART')
             else:
-                data["settings"][engine] = {"page_pool_bytes": getattr(self.args, 'data_cache_mib', 512) * 1024 * 1024, "query_memory_bytes": self.args.tiny_query_memory_mib * 1024 * 1024,
+                data["settings"][engine] = {"query_memory_bytes": self.args.tiny_query_memory_mib * 1024 * 1024,
                                             "synchronous_commit": "default true; docs/commit_durability.md", "read_workers": self.args.read_workers,
                                             "commit_driven_wal_sync": None, "io_cpu": None, "fixed_size_wal": None,
                                             "wal_sync_policy": "when commit-driven sync is enabled: requested barriers remain immediate; unrequested dirty WAL has a 200 ms backstop"}
@@ -684,7 +684,7 @@ def main():
     parser.add_argument("--tiny-port", type=int, default=55433)
     parser.add_argument("--pg-port", type=int, default=55432)
     parser.add_argument("--mysql-port", type=int, default=53306)
-    parser.add_argument("--postgres-image", default="postgres:18")
+    parser.add_argument("--postgres-image", default="postgres@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4")
     parser.add_argument("--mysql-image", default="mysql:8.4")
     parser.add_argument('--include-duckdb', action='store_true', help='also run DuckDB with official Quack over localhost')
     parser.add_argument('--duckdb-port', type=int, default=59494)

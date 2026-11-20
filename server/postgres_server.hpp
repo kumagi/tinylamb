@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "common/constants.hpp"
@@ -25,8 +26,9 @@ struct PostgresServerOptions {
   // Shared pool for snapshot reads and ordinary DML/transaction messages.
   // One message per session is in flight. TEMP/UDF sessions and DDL retain
   // the frontend's thread-local affinity on the event loop.
-  // Zero selects std::thread::hardware_concurrency() (capped at 16).
-  size_t read_worker_threads{0};
+  // Unset selects std::thread::hardware_concurrency() (capped at 16); an
+  // explicit 0 starts a degraded pool where every task runs inline.
+  std::optional<size_t> read_worker_threads{};
   // Connections beyond this limit are shed immediately (client sees EOF).
   size_t max_connections{1024};
   // Truncate a torn/unparsable WAL tail to its intact prefix at boot instead

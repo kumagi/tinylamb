@@ -889,12 +889,13 @@ TEST_F(RelationalRegressionTest,
         (SELECT MAX(k) AS m FROM SmallKeys) c
     GROUP BY a.k HAVING SUM(a.v)>MAX(c.m) ORDER BY a.k
   )sql";
-  const auto rows = RelationalRun(*rs_, sql);
+  const auto rows = RelationalRun(*rs_, sql, /*force_relational=*/true);
   ASSERT_EQ(rows.size(), 10U);
   for (size_t i = 0; i < rows.size(); ++i) {
     EXPECT_EQ(rows[i], Row({Value(i), Value(20), Value(4)}));
   }
-  EXPECT_NE(ExplainAnalyze(*rs_, sql).find("grouped_join_fusions=1"),
+  EXPECT_NE(ExplainAnalyze(*rs_, sql, /*force_relational=*/true)
+                .find("grouped_join_fusions=1"),
             std::string::npos);
   EXPECT_EQ(
       RelationalRun(*rs_, R"sql(
@@ -1228,7 +1229,7 @@ TEST_F(RelationalRegressionTest,
           std::vector<Value> encoded, reference;
           ASSERT_SUCCESS(relational_detail::ComputeOneWindow(
               context, window, rows, schema, nullptr, {}, &encoded));
-          // The contextful expression route retains the general comparator.
+          // The contextual expression route retains the general comparator.
           window.order_by[0].expression = FunctionCallExp(
               "coalesce", {ColumnValueExp("k"), ColumnValueExp("k")});
           ASSERT_SUCCESS(relational_detail::ComputeOneWindow(

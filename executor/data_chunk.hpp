@@ -73,7 +73,11 @@ class ColumnVector {
   [[nodiscard]] bool IsHeterogeneous() const { return heterogeneous_; }
   void SetAllowHeterogeneous(bool allow) { allow_heterogeneous_ = allow; }
   void RebindEmptyType(ValueType type, bool is_unsigned) {
-    assert(size_ == 0);
+    // assert() disappears under NDEBUG; leaving stale integers_/doubles_
+    // data behind a changed type_ would make ValueAt() silently wrong.
+    if (size_ != 0) {
+      return;
+    }
     type_ = type;
     unsigned_ = is_unsigned;
     heterogeneous_ = false;
@@ -143,7 +147,10 @@ class DataChunk {
 
   void Append(const Row& row, RowPosition position = RowPosition());
   void Append(Row&& row, RowPosition position = RowPosition());
-  void Append(const DataChunk& source, size_t row_index);
+  // T1312: same "copy one element from a same-shape container" operation as
+  // ColumnVector::AppendFrom — the old 2-arg Append overload hid that among
+  // Append(Row) variants.
+  void AppendFrom(const DataChunk& source, size_t row_index);
   // Appends one row assembled column-wise from `sources` without
   // materializing an intermediate Row.  On an empty chunk the layout is
   // inferred from the source column types.

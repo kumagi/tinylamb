@@ -18,12 +18,20 @@ size_t MinMaxIndexExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   }
   emitted_ = true;
 
+  // T3767: pull the source in vector-sized batches and probe the wanted
+  // column through ColumnVector::IsNull.  The old loop asked for one row per
+  // NextBatch call (paying Reset/Reserve/scan-set-up per row over a NULL
+  // prefix or low-selectivity column) and materialized a full Row via
+  // RowAt() just to test one slot.
   DataChunk batch;
-  while (source_->NextBatch(&batch, 1) != 0) {
+  while (source_->NextBatch(&batch, kDefaultVectorSize) != 0) {
+    if (value_slot_ >= batch.ColumnCount()) {
+      continue;
+    }
+    const ColumnVector& column = batch.ColumnAt(value_slot_);
     for (size_t i = 0; i < batch.Size(); ++i) {
-      const Row input = batch.RowAt(i);
-      if (value_slot_ < input.values_.size() && !input[value_slot_].IsNull()) {
-        destination->Append(Row({input[value_slot_]}));
+      if (!column.IsNull(i)) {
+        destination->Append(Row({column.ValueAt(i)}));
         return 1;
       }
     }

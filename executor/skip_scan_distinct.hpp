@@ -26,7 +26,7 @@ class Index;
 class Transaction;
 
 // Index skip-scan distinct executor that jumps directly to the next distinct
-// key using BPlusTreeIterator seek instead of scanning duplicates.
+// key using LsmIndexIterator seek instead of scanning duplicates.
 class SkipScanDistinct : public ExecutorBase {
  public:
   SkipScanDistinct(Transaction& txn, const Table& table, const Index& index,
@@ -69,8 +69,8 @@ class SkipScanDistinct : public ExecutorBase {
   bool is_unique_{false};
 
   TransactionManager::IndexReadGuard index_read_guard_;
-  BPlusTree bpt_;
-  BPlusTreeIterator iter_;
+  LsmIndex bpt_;
+  LsmIndexIterator iter_;
   RowPosition current_pos_;
   Row current_index_key_;
   mutable Row current_row_;

@@ -94,7 +94,6 @@ class OocQueryScope {
   ~OocQueryScope();
 
   [[nodiscard]] static OocQueryMetrics* Current() noexcept;
-  [[nodiscard]] static OocQueryScope* Top() noexcept;
   [[nodiscard]] OocQueryMetrics* Metrics() const noexcept { return metrics_; }
   [[nodiscard]] OocQueryScope* PrevScope() const noexcept {
     return prev_scope_;
@@ -124,8 +123,11 @@ class ProcessMemoryBudget {
     return l == 0 ? static_cast<size_t>(-1) : (l / 5) * 4;
   }
   [[nodiscard]] size_t RssWarnLimit() const noexcept {
+    // T1383: single source of truth for the ADR 0003 "RSS 警戒" threshold
+    // (0.875 * limit). Available()/CanReserve()/TryReserveNoFault() and
+    // UnderMemoryPressure() all read it instead of re-deriving the formula.
     const size_t l = limit_.load(std::memory_order_acquire);
-    return l == 0 ? static_cast<size_t>(-1) : (l / 8) * 7;
+    return l == 0 ? static_cast<size_t>(-1) : l - l / 8;  // NOLINT(readability-math-missing-parentheses)
   }
 
   [[nodiscard]] size_t StorageUsed() const noexcept {
@@ -162,10 +164,10 @@ class ProcessMemoryBudget {
   [[nodiscard]] uint64_t PeakRssBytes() const noexcept {
     return peak_rss_bytes_.load(std::memory_order_acquire);
   }
-  [[nodiscard]] uint64_t CurrentUnaccountedRssBytes() const noexcept;
   [[nodiscard]] uint64_t PeakUnaccountedRssBytes() const noexcept {
     return peak_unaccounted_rss_bytes_.load(std::memory_order_acquire);
   }
+  [[nodiscard]] uint64_t CurrentUnaccountedRssBytes() const noexcept;
   void ResetPeaks() noexcept;
 
   // Global OOC telemetry helpers (also forwards to OocQueryScope::Current()).
@@ -217,8 +219,9 @@ class ProcessMemoryBudget {
   }
 
   // Atomically reserves `bytes` against both total process headroom (up to
-  // hard Limit() for query spills / soft limit depending on `respect_soft_limit`) and
-  // the pool counter. Returns false without modifying counters when full.
+  // hard Limit() for query spills / soft limit depending on
+  // `respect_soft_limit`) and the pool counter. Returns false without modifying
+  // counters when full.
   [[nodiscard]] bool TryReserve(MemoryPoolKind pool, size_t bytes,
                                 bool respect_soft_limit = true) noexcept;
   // Accounting-only reservation: does NOT consume a fault-injection countdown.
@@ -239,7 +242,14 @@ class ProcessMemoryBudget {
                                            Status* status_out = nullptr);
 
   // Small must-succeed emergency reserve (metadata, error paths, recovery).
-  void ReserveEmergency(MemoryPoolKind pool, size_t bytes) noexcept;
+  // T1835: enforces EmergencyLimit() CENTRALLY on the aggregate ledger —
+  // returns false (without touching any counter) once the running
+  // emergency_used_ total plus `bytes` would exceed the limit. Callers must
+  // only pair a later ReleaseEmergency with a reserve that returned true;
+  // a rejected reserve means the bytes are real but untracked, which beats
+  // pretending the design cap applies only to whichever two callers
+  // pre-checked their single request against EmergencyLimit().
+  bool ReserveEmergency(MemoryPoolKind pool, size_t bytes) noexcept;
   void ReleaseEmergency(MemoryPoolKind pool, size_t bytes) noexcept;
 
   // Non-blocking reclaim hook registration (ADR 0003). Hooks must not wait on
@@ -267,6 +277,20 @@ class ProcessMemoryBudget {
   // call frequency unless `force_refresh` is true).
   [[nodiscard]] uint64_t SampledRssBytes(
       bool force_refresh = false) const noexcept;
+
+  // T1965: pure-read view of the last SampledRssBytes() value. Unlike the
+  // sampler this neither advances the sample tick, reads /proc, nor moves
+  // peak telemetry, so const getters (Available()/CanReserve()) can consult
+  // RSS pressure without the observation itself changing what a later
+  // observation sees. Returns 0 (no pressure signal) while RSS checking is
+  // disabled or nothing has been sampled yet; the enforcement paths
+  // (TryReserve*/UnderMemoryPressure) keep refreshing the sample.
+  [[nodiscard]] uint64_t CachedRssBytes() const noexcept {
+    if (!check_rss_pressure_.load(std::memory_order_acquire)) {
+      return 0;
+    }
+    return last_rss_bytes_.load(std::memory_order_acquire);
+  }
 
   // Overrides limits and zeroes pool usage counters for unit tests. If
   // `limit_bytes` == 0, process-level limits are disabled.
@@ -307,7 +331,7 @@ class ProcessMemoryBudget {
   // counters (unlike ResetForTest), so a fuzzer can shrink or grow the
   // buffer pool while databases are open and keep the cap across a
   // crash-reopen (recovery then runs under the same cap).  `0` restores the
-  // documented default (`min(4 GiB, limit / 4)` / `min(2 GiB, limit / 8)`).
+  // documented default (`min(4 GiB, limit / 4)` / `min(8 GiB, limit / 2)`).
   void SetStoragePoolLimitForTest(size_t bytes) noexcept;
   void SetColumnarPoolLimitForTest(size_t bytes) noexcept;
   // If `countdown` > 0, the `countdown`-th reservation / spill I/O call
@@ -355,6 +379,9 @@ class ProcessMemoryBudget {
   std::atomic<size_t> query_floor_{0};
   std::atomic<size_t> tx_floor_{0};
   std::atomic<size_t> server_tx_floor_{0};
+  // T1845: one-shot advisory so PoolFloorBytes' kTx clamp is never silent,
+  // yet never spams the query hot path.
+  mutable std::atomic<bool> tx_floor_clamp_warned_{false};
   std::atomic<size_t> emergency_limit_{size_t{64} << 20};
   std::atomic<size_t> emergency_used_{0};
   std::atomic<size_t> storage_used_{0};
@@ -442,6 +469,9 @@ class ProcessMemoryCharge {
   void Release(size_t bytes) noexcept;
   void ReleaseAll() noexcept;
   [[nodiscard]] size_t Bytes() const noexcept { return bytes_; }
+  // True while every reservation made through this handle succeeded (ctor,
+  // TryAdd, TryAddWithReclaim). A failed reservation leaves the charge not
+  // holding those bytes and flips this flag (T1838).
   [[nodiscard]] bool Ok() const noexcept { return valid_; }
 
  private:

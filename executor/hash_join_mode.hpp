@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <string_view>
 
 #include "executor/query_memory.hpp"
 
@@ -21,15 +20,10 @@ enum class HashJoinMode : uint8_t {
   kHybrid = 1,
 };
 
-inline std::string_view HashJoinModeName(HashJoinMode mode) {
-  switch (mode) {
-    case HashJoinMode::kInMemory:
-      return "HashJoin";
-    case HashJoinMode::kHybrid:
-      return "HybridHashJoin";
-  }
-  return "HashJoin";
-}
+// EXPLAIN operator names come from HashJoin::Dump (executor/hash_join.cpp),
+// which renders "PartitionedHashJoin" / "PartitionedHashJoin (pipelined, ...)"
+// for these modes. There is deliberately no shared name helper here: keeping
+// one would risk drifting from the golden EXPLAIN output.
 
 // Rough per-row footprint used by the planner when TableStatistics lack width.
 inline constexpr size_t kHashJoinRowBytesEstimate = 128;

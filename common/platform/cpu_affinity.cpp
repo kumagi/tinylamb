@@ -16,6 +16,8 @@
 
 #include "common/platform/cpu_affinity.hpp"
 
+#include <cstring>
+
 namespace tinylamb::platform {
 
 #ifdef __linux__
@@ -53,7 +55,11 @@ int CpuSet::First() const {
 }
 
 bool CpuSet::operator==(const CpuSet& other) const {
-  return CPU_EQUAL(&set_, &other.set_);
+  // Cost contract (P45): ParallelPool::Work() compares this once per task
+  // batch, so equality must stay a single fixed-size memcmp of the POD
+  // bitmask. glibc's CPU_EQUAL expands to exactly this, but on other libcs
+  // it can fall back to a word-looping helper, so compare the raw words.
+  return std::memcmp(&set_, &other.set_, sizeof(set_)) == 0;
 }
 
 #else

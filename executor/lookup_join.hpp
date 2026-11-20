@@ -36,7 +36,7 @@ class Transaction;
 // Index nested-loop join (lookup join).
 //
 // For every left row the executor builds a seek key from `left_cols` and
-// probes the right table's B+Tree through `index`, emitting
+// probes the right table's LSM index through `index`, emitting
 // `left + right` for each candidate that satisfies the join keys.  The two
 // column vectors are aligned with the index's leading key columns -- NOT with
 // the order the equi-join happens to list its keys in -- because the seek key
@@ -97,8 +97,10 @@ class LookupJoin : public ExecutorBase {
   bool Load();
   // Builds the half-open [begin, end) seek range for `left_key`.
   void BuildSeekRange(const Row& left_key);
-  // Re-checks one candidate row against the join keys.
-  [[nodiscard]] bool Matches(const Row& left_key, const Row& right_key) const;
+  // Re-checks one candidate row against the join keys. `right_row` is the
+  // full candidate; its key values are read in place via right_cols_ so no
+  // per-candidate key Row needs to be allocated.
+  [[nodiscard]] bool Matches(const Row& left_key, const Row& right_row) const;
   // The interval probe's second bound, read from the current left row.
   [[nodiscard]] std::optional<Value> SecondRangeBound() const;
 
@@ -108,6 +110,10 @@ class LookupJoin : public ExecutorBase {
   const Table& right_;
   const Index& right_idx_;
   Row hold_left_;
+  // Extracted once per outer row in Load(), reused for every probe candidate.
+  Row hold_left_key_;
+  DataChunk left_batch_;
+  size_t left_batch_pos_{0};
   TransactionManager::IndexReadGuard index_read_guard_;
   std::unique_ptr<IndexScanIterator> right_it_;
   std::vector<slot_t> right_cols_;

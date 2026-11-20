@@ -89,15 +89,17 @@ bool DumpMatches(const std::string& actual, const std::string& expected) {
       ++expected_it;
       continue;
     }
-    const double av = strtod(a.c_str(), nullptr);
-    const double ev = strtod(e.c_str(), nullptr);
     const auto numeric = [](const std::string& token) {
-      return !token.empty() &&
-             std::all_of(token.begin(), token.end(), [](char ch) {
-               return isdigit(static_cast<unsigned char>(ch)) != 0 ||
-                      ch == '.' || ch == '-' || ch == '+' || ch == 'e';
-             });
+      if (token.empty()) {
+        return false;
+      }
+      char* end = nullptr;
+      // NOLINTNEXTLINE(cert-err33-c) error intentionally ignored
+      std::strtod(token.c_str(), &end);
+      return end != token.c_str() && *end == '\0';
     };
+    const double av = std::strtod(a.c_str(), nullptr);
+    const double ev = std::strtod(e.c_str(), nullptr);
     // Both sides must be numeric: strtod("NULL") is 0, so a one-sided check
     // accepted an actual "0" where "NULL" was pinned.
     if (!numeric(a) || !numeric(e) ||
@@ -3132,11 +3134,11 @@ TEST_F(SqlStatementSweepTest, PinnedDumpTable) {
       {"SELECT a FROM (SELECT a FROM t UNION ALL SELECT k FROM g) WHERE a < 3 "
        "ORDER BY a",
        "5 rows | [1] | [1] | [2] | [2] | [2]"},
+      // `*` over a one-column CTE yields that column only (the old golden
+      // pinned the identity-flatten bug that expanded every base column).
       {"WITH x AS (SELECT a FROM t) SELECT * FROM x ORDER BY a",
-       "10 rows | [1, 1.5, \"apple\", 1] | [2, 2.5, \"banana\", 0] | [2, 2.5, "
-       "\"fig\", 0] | [3, NULL, \"cherry\", 1] | [4, 4, NULL, 0] | [5, 5.5, "
-       "\"elder\", NULL] | [7, -1.25, \"grape\", 1] | [8, 0, \"\", 0] | [9, "
-       "100.25, \"date\", 1] | [10, NULL, NULL, NULL]"},
+       "10 rows | [1] | [2] | [2] | [3] | [4] | [5] | [7] | [8] | [9] | "
+       "[10]"},
       {"WITH x AS (SELECT a FROM t), y AS (SELECT a*2 AS b FROM x) SELECT * "
        "FROM y ORDER BY b",
        "10 rows | [2] | [4] | [4] | [6] | [8] | [10] | [14] | [16] | [18] | "

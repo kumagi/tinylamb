@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -91,13 +92,21 @@ std::filesystem::path CurrentExecutablePath() {
   std::filesystem::path resolved = std::filesystem::canonical(buffer, ec);
   return ec ? std::filesystem::path(buffer) : resolved;
 #else
-  std::array<char, 4096> self{};
-  const ssize_t len =
-      ::readlink("/proc/self/exe", self.data(), self.size() - 1);
-  if (len <= 0) {
-    return {};
+  // T625: readlink(2) does not NUL-terminate and reports the length used;
+  // a fixed buffer truncated longer install paths SILENTLY (len == size-1
+  // on the old code, and the truncated path then broke relative resource
+  // resolution). Grow until the result no longer fills the buffer.
+  std::vector<char> self(512);
+  for (;;) {
+    const ssize_t len = ::readlink("/proc/self/exe", self.data(), self.size());
+    if (len <= 0) {
+      return {};
+    }
+    if (static_cast<size_t>(len) < self.size()) {
+      return {std::string(self.data(), static_cast<size_t>(len))};
+    }
+    self.resize(self.size() * 2);
   }
-  return {std::string(self.data(), static_cast<size_t>(len))};
 #endif
 }
 
@@ -147,7 +156,9 @@ int UnsetEnv(const char* name) {
     errno = EINVAL;
     return -1;
   }
-  const errno_t err = ::_putenv_s(name, "");
+  // _putenv_s(name, nullptr) removes the variable from the CRT environment;
+  // passing "" leaves an empty value that std::getenv still sees.
+  const errno_t err = ::_putenv_s(name, nullptr);
   if (err != 0) {
     errno = err;
     return -1;
@@ -201,6 +212,15 @@ int RunProcess(
 
   std::vector<std::pair<std::string, std::string>> saved_env;
   for (const auto& [k, v] : env_overrides) {
+    // T2621: SetEnv/CommandLine both stop at an embedded NUL; reject up
+    // front like the POSIX branch does instead of applying a truncated
+    // override.
+    if (k.find('\0') != std::string::npos || v.find('\0') != std::string::npos) {
+      if (error_out != nullptr) {
+        *error_out = "invalid environment override";
+      }
+      return -1;
+    }
     const char* prev = std::getenv(k.c_str());
     saved_env.emplace_back(k,
                            prev != nullptr ? std::string(prev) : std::string());
@@ -212,16 +232,25 @@ int RunProcess(
 
   STARTUPINFOW si{};
   si.cb = sizeof(si);
+  // Match the POSIX path: the child inherits the parent's redirected
+  // stdin/stdout/stderr instead of getting fresh console handles.
+  si.dwFlags |= STARTF_USESTDHANDLES;
+  si.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+  si.hStdOutput = ::GetStdHandle(STD_OUTPUT_HANDLE);
+  si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
   PROCESS_INFORMATION pi{};
   const BOOL ok =
-      ::CreateProcessW(executable.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+      ::CreateProcessW(executable.c_str(), cmd.data(), nullptr, nullptr, TRUE,
                        0, nullptr, nullptr, &si, &pi);
 
   for (const auto& [k, v] : saved_env) {
-    if (!k.empty() && k[0] == '\0') {
-      UnsetEnv(k.c_str() + 1);
-    } else {
-      SetEnv(k.c_str(), v.c_str(), 1);
+    const int rc = (!k.empty() && k[0] == '\0')
+                       ? UnsetEnv(k.c_str() + 1)
+                       : SetEnv(k.c_str(), v.c_str(), 1);
+    if (rc != 0) {
+      // Environment overrides must not silently leak into later tests in the
+      // same process; surface the failure via errno (logged by the caller).
+      errno = rc;
     }
   }
 
@@ -236,12 +265,32 @@ int RunProcess(
   ::GetExitCodeProcess(pi.hProcess, &exit_code);
   ::CloseHandle(pi.hThread);
   ::CloseHandle(pi.hProcess);
-  return static_cast<int>(exit_code);
+  // -1 is reserved for "spawn failed"; clamp to the POSIX 0..255 range so
+  // ExitProcess(0xFFFFFFFF) does not masquerade as a spawn failure.
+  return static_cast<int>(exit_code & 0xffU);
 #else
   // Construct all storage in the parent. Calling setenv or allocating after
   // fork can deadlock on locks inherited from other application threads.
   std::string exe_str = executable.string();
   std::vector<std::string> owned = args;
+  // T2621: the exec family terminates every string at its first NUL, so a
+  // silent truncation would hand the child different arguments than the
+  // caller intended (with exit code 0 on success).  The env_overrides loop
+  // below has always rejected NULs; hold argv to the same contract.
+  if (exe_str.find('\0') != std::string::npos) {
+    if (error_out != nullptr) {
+      *error_out = "executable path contains embedded NUL";
+    }
+    return -1;
+  }
+  for (const std::string& arg : owned) {
+    if (arg.find('\0') != std::string::npos) {
+      if (error_out != nullptr) {
+        *error_out = "argument contains embedded NUL";
+      }
+      return -1;
+    }
+  }
   std::vector<char*> argv;
   argv.reserve(owned.size() + 2);
   argv.push_back(exe_str.data());
@@ -296,7 +345,23 @@ int RunProcess(
   }
   if (!WIFEXITED(status)) {
     if (error_out != nullptr) {
-      *error_out = "process terminated abnormally";
+      // T2627: distinguish signal death (OOM killer, crashes, timeout
+      // kills) from a normal nonzero exit; the raw status code alone left
+      // operators guessing whether the child crashed or was killed.
+      if (WIFSIGNALED(status)) {
+        *error_out = "process terminated by signal " +
+                     std::to_string(WTERMSIG(status));
+#ifdef WCOREDUMP
+        if (WCOREDUMP(status)) {
+          *error_out += " (core dumped)";
+        }
+#endif
+      } else if (WIFSTOPPED(status)) {
+        *error_out = "process unexpectedly stopped (signal " +
+                     std::to_string(WSTOPSIG(status)) + ")";
+      } else {
+        *error_out = "process terminated abnormally";
+      }
     }
     return -1;
   }
@@ -351,9 +416,11 @@ int OpenWriteFailingDescriptor() {
   if (scratch < 0) return -1;
   ::close(scratch);
   const int fd = ::open(pattern.c_str(), O_RDONLY | O_CLOEXEC);
-  const int saved = errno;
+  const int open_errno = fd < 0 ? errno : 0;
   ::unlink(pattern.c_str());
-  errno = saved;
+  if (fd < 0) {
+    errno = open_errno;
+  }
   return fd;
 #endif
 }
@@ -379,7 +446,9 @@ uint64_t CurrentProcessRssBytes() noexcept {
   if (fd < 0) {
     return 0;
   }
-  std::array<char, 128> buf{};
+  // Seven unsigned 64-bit fields can be ~140 digits plus separators; use a
+  // generously sized buffer so a large-memory host cannot truncate the line.
+  std::array<char, 512> buf{};
   const ssize_t n = ::read(fd, buf.data(), buf.size() - 1);
   ::close(fd);
   if (n <= 0) {
@@ -431,15 +500,24 @@ bool ReleaseFreeHeapToOs() noexcept {
 #if defined(TINYLAMB_HAVE_MIMALLOC_COLLECT) || \
     (defined(__linux__) && defined(__GLIBC__))
   static std::atomic<int64_t> last_purge_ns{0};
+  static std::atomic<bool> purge_in_flight{false};
   const int64_t now_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch())
           .count();
   int64_t prev = last_purge_ns.load(std::memory_order_relaxed);
-  // Only one caller per ~20 ms pays for the purge; concurrent waiters retry.
-  if (now_ns - prev < 20'000'000LL ||
-      !last_purge_ns.compare_exchange_strong(prev, now_ns,
-                                             std::memory_order_acq_rel)) {
+  // Only one caller per ~20 ms pays for the purge; concurrent callers return false.
+  if (now_ns - prev < 20'000'000LL) {
+    return false;
+  }
+  // T2622: claim the window with an in-flight flag instead of stamping the
+  // timestamp up front.  A purge that outlives the window (huge heaps) used
+  // to let the next caller's CAS succeed while the first purge was still
+  // running, starting concurrent trims; the window is now measured from
+  // COMPLETION of the previous purge.
+  bool expected = false;
+  if (!purge_in_flight.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
     return false;
   }
 #ifdef TINYLAMB_HAVE_MIMALLOC_COLLECT
@@ -448,21 +526,74 @@ bool ReleaseFreeHeapToOs() noexcept {
 #if defined(__linux__) && defined(__GLIBC__)
   ::malloc_trim(0);
 #endif
+  // Stamp after the purge finished (T2622) so the next window starts at
+  // completion, not at start.
+  last_purge_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+  purge_in_flight.store(false, std::memory_order_release);
   return true;
 #else
   return false;
 #endif
 }
 
+namespace {
+// T2630: cgroup memory limit ("max"/absent/unparseable => 0 = unlimited).
+// v1 encodes "no limit" as a huge PAGE_COUNTER_MAX sentinel, filtered by
+// the >= 2^60 cutoff.
+uint64_t ReadCgroupMemoryLimit(const char* path) noexcept {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return 0;
+  }
+  std::string text;
+  std::getline(in, text);
+  while (!text.empty() &&
+         (text.back() == '\r' || text.back() == '\n' || text.back() == ' ')) {
+    text.pop_back();
+  }
+  if (text.empty() || text == "max") {
+    return 0;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+  if (errno != 0 || end == text.c_str() || value >= (1ULL << 60)) {
+    return 0;
+  }
+  return static_cast<uint64_t>(value);
+}
+}  // namespace
+
 uint64_t PhysicalMemoryBytes() noexcept {
 #if defined(__linux__) || defined(__APPLE__)
   const long pages = ::sysconf(_SC_PHYS_PAGES);
   const long page_size = ::sysconf(_SC_PAGESIZE);
+  uint64_t total = 0;
   if (pages > 0 && page_size > 0) {
-    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+    total = static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+  }
+#ifdef __linux__
+  // T2630: inside a container sysconf reports the HOST's RAM; auto-sized
+  // budgets (memory_budget.cpp TINYLAMB_MEMORY_LIMIT_BYTES=auto) derived
+  // from it overshot the cgroup and got the process OOM-killed.  Clamp by
+  // the cgroup v2 / v1 memory limit when one is set.
+  const uint64_t v2 = ReadCgroupMemoryLimit("/sys/fs/cgroup/memory.max");
+  const uint64_t v1 =
+      ReadCgroupMemoryLimit("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+  for (const uint64_t limit : {v2, v1}) {
+    if (limit > 0 && (total == 0 || limit < total)) {
+      total = limit;
+    }
   }
 #endif
+  return total;
+#else
   return 0;
+#endif
 }
 
 }  // namespace tinylamb::platform

@@ -38,8 +38,12 @@ inline Schema MakeSchemaFromByte(uint8_t b) {
   std::vector<Column> cols;
   cols.reserve(ncols);
   for (size_t i = 0; i < ncols; ++i) {
-    const uint8_t raw = (b >> (4 + (i % 2) * 2)) & 0x3;
-    const auto vt = static_cast<ValueType>((raw % 3) + 1);
+    // Derive each column independently from (seed byte, column index):
+    // using only two bit pairs made c0==c2 and c1==c3, and limiting to
+    // 1..3 never generated DATE/ARRAY columns.
+    const auto raw = static_cast<uint8_t>(
+        ((static_cast<size_t>(b) * 131U) + (17U * (i + 1))) >> 4);
+    const auto vt = static_cast<ValueType>(1 + (raw % 5));
     if (i == key) {
       cols.emplace_back(ColumnName{"", "c" + std::to_string(i)}, vt,
                         Constraint{Constraint::kPrimaryKey});

@@ -1,5 +1,68 @@
 # Benchmark history
 
+## 2026-11-18 — TPC-H SF=1 full 22-query suite baseline (value-corrected)
+
+- This section is the current `query_sum_q1_q22` regression-gate baseline.
+  It supersedes the pre-C3 figure in the 2026-10-31 snapshot below: that
+  figure returned 54 wrong Q16 group counts and was explicitly disallowed
+  by the history as a valid full-suite score, so `scripts/bench_gate.py`
+  must not harvest it as the CI baseline.
+- Source: gate04/gate05 in `benchmark/comparison/README-tpch.md` (twin runs
+  over all 22 queries, identical answer bags, every median within the 2x
+  limit; C3/C4 produce correct Q16 values). Sum of the 22 per-query medians:
+  gate04 220.03 ms, gate05 220.05 ms.
+
+  - **Query sum (Q1-Q22):** **0.22004 s** median of the two gate runs.
+    Includes planning and result draining; it is a median-of-medians suite
+    total, not a cold-I/O measurement. This is the gate baseline; raw
+    observations retained in older sections are not.
+
+## 2026-11-16 — Out-of-Core P2 SpillStore & OOC Components (`ooca-v2.md` §6 P2, ADRs 0005/0006)
+
+- **Changes verified:**
+  - Nameless/unlinked temp files (`OpenUnlinkedTempFile`, `O_TMPFILE` / `mkstemp` + `unlink`) in `common/platform/file_io.{hpp,cpp}`.
+  - Block-multiplexed `SpillStore` (`common/spill/spill_store.{hpp,cpp}`): constant open FDs (1 FD for 10,000+ segments), 64 KiB blocks, free-block reuse + empty truncate, `AdviseDontNeed`, `TINYLAMB_TEMP_LIMIT_BYTES` -> `kNoSpace`, G6 rollback on injected I/O errors.
+  - Arbitrary-length row codec (`type/row_block_codec.{hpp,cpp}`) and `DataChunk` codec (`executor/detail/ooc/chunk_codec.{hpp,cpp}`).
+  - P2 OOC primitives (`executor/detail/ooc/`): `SpillableStore`, `ExternalSorter` (in-memory fast path, bounded Top-N max-heap, multi-pass K-way merge), and `RecursivePartitioner` (MSB radix partitioning, dynamic budget-bounded fanout `4 <= F <= 64`, `< 20%` shrink / `max_depth` skew detection -> `skew_fallback`).
+- **Verification (`RelWithDebInfo`):**
+  - `python3 scripts/check_layering.py`: exit 0 (`allowlisted=99`).
+  - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`).
+  - P2 unit tests (`PlatformUnlinkedTempFileTest`, `SpillStoreTest`, `RowBlockCodecTest`, `ChunkCodecTest`, `SpillableStoreTest`, `ExternalSorterTest`, `RecursivePartitionerTest`): `20/20` passed (`0.12 sec`).
+  - `OocScaleBaselineTest.G2ExternalSortOneGiBUnderOneMiBBudget`: `1,048,576` rows (> 1 GiB spilled) sorted under strict `1 MiB` working budget with multi-pass merge (`>= 2` passes) and `<= 64 MiB` RSS delta: passed (`5.11 sec`).
+
+## 2026-11-16 — Out-of-Core P1 Unified Budget, Reclaim & Coordinator (`ooca-v2.md` §6 P1, ADRs 0003/0004/0012)
+
+- **Changes verified:**
+  - `StatusCode::kMemoryLimitExceeded` (`16`) -> PostgreSQL `53200`, `StatusCode::kNoSpace` -> `53100` (`common/constants.hpp`, `server/postgres_server.cpp`).
+  - `ProcessMemoryBudget` pool floors (`25% storage / 0% columnar / 25% query / 5% tx` of `M_t = 0.80 M`), RSS warn threshold `0.875 M`, emergency non-failing reservation (`PageManager` & `TlcsFile` fallback), and `ReclaimStage` ordered callbacks (`kColumnar` -> `kCleanStorage` -> `kSpillableQuery`) (`common/memory_budget.*`, `common/incarnation.hpp`, `page/page_manager.*`, `table/tlcs_file.*`, `table/lstable_bridge.*`).
+  - WAL ring buffer (`recovery/logger.*`) and `LSTableStore` (`table/lstable_bridge.*`) wired into `MemoryPoolKind::kTx` / `MemoryPoolKind::kColumnar`.
+  - `QueryMemoryCoordinator` + `QueryMemoryGrant` + `ActiveConsumerGuard` + `LocalBatchCache` + `ComputeEffectiveDop` (`common/query_grant.*`).
+- **Verification (`RelWithDebInfo`):**
+  - `python3 scripts/check_layering.py`: exit 0 (`95 upward edge(s)... allowlisted=95`).
+  - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`).
+  - Full `ctest --test-dir build --output-on-failure -j$(nproc)`: `100% tests passed out of 4045` (3 skipped pre-existing tests; `40.56 sec` wall time), including `QueryGrantTest.*` (4/4).
+  - `OocScaleBaselineTest` (`ctest -L scale` & `TINYLAMB_MEMORY_LIMIT_BYTES=1073741824 ./build/ooc_scale_baseline_test`): 3/3 passed (`0.28s`), verifying `(RSS - tracked) <= 0.075 M` under both `M = 16 GiB` and `M = 1 GiB`.
+  - `./build/tinylamb_ooc_baseline_measure` (50k-row self-join): `After 50k load: RSS=78.33 MiB, tracked_total=14.80 MiB (storage=6.80 MiB, tx=8.00 MiB), unaccounted=63.53 MiB`; `Peak after query: RSS=92.89 MiB, total_peak=24.26 MiB, unaccounted=75.24 MiB <= 76.8 MiB (0.075 * 1 GiB)`; `Memory: tracked=19670096B peak_tracked=25437264B rss=97406976B unaccounted_rss=77736880B pools(storage=7133000B, columnar=2989000B, query=1159488B, tx=8388608B)`.
+
+## 2026-11-16 — Out-of-Core P0 Baseline (`ooca-v2.md` §6 P0)
+
+- **Baseline revision:** `HEAD=118d8f1` + staged & unstaged working tree with P0 instrumentation (`benchmark/ooc_baseline_measure.cpp`, `common/memory_budget.*`, `scripts/check_ooc_invariants.py`, `add_scale_test`).
+- **Static structure footprint (`sizeof` and 1 TB extrapolation at `kPageSize = 32 KiB` -> `33,554,432` pages, `500,000` TLCS blocks):**
+  - `Page` (incl. `RowPage` shell): **416 B/page** → **13.00 GiB** at 1 TB (permanent in `PageManager::blocks_` even after `EvictBatch`) → **exceeds 1% of M** (P5 target).
+  - `RowPage`: **296 B/page** → **9.25 GiB** at 1 TB.
+  - `TlcsFile::BlockDirEntry` (**40 B**) + 16 × `TlcsFile::ColumnMeta` (**152 B × 16 = 2,432 B**): **2,472 B/block** → **1.15 GiB** for 500k blocks → **exceeds 1% of M** (P4 target).
+  - `LsmTreeState`: **224 B/tree**; `LsmTreeState::MemEntry`: **80 B**; `LsmSortedRun::Entry`: **80 B** → **0.75 GiB** per 10M entries (+ heap key/value payloads) → **exceeds 1% of M** (P5 target).
+  - `LogRecord`: **168 B/record** → **0.16 GiB** per 1M rows in `staged_records_` (+ heap row payloads) → (P6a target).
+  - `CompiledPlan`: **200 B/plan** (does not scale with `N`, holds `retained_tables`/`retained_stats` metadata references).
+- **Live 50k-row self-join & `EvictColdPagesForTest` observation (`tinylamb_ooc_baseline_measure`):**
+  - Startup RSS: **27.11 MiB**.
+  - After 50k INSERT load: `RSS = 77.69 MiB`, `tracked_total = 6.80 MiB (storage = 6.80 MiB)`, `unaccounted_rss = 70.89 MiB`.
+  - After `SELECT a.g, SUM(a.v1), COUNT(*) FROM t a JOIN t b ON a.k = b.k GROUP BY a.g ORDER BY a.g`: `peak_tracked = 13.41 MiB`, `RSS = 92.07 MiB`, `unaccounted_rss = 85.27 MiB` (exceeds `0.075 * 1 GiB = 76.8 MiB`, identifying untracked runtime/child allocations to close in P1).
+  - Uncommitted eviction check (`PreCommit`前の `EvictColdPagesForTest(0)`): `ResidentBytes 6.80 -> 6.80 MiB`, `EvictedPageCount = 0` (**cannot evict uncommitted dirty pages**, confirming P6b ADR 0007 target).
+  - Post-commit eviction check: `ResidentBytes 6.80 -> 0.04 MiB`, `EvictedPageCount = 101`, `RSS = 92.08 MiB`.
+- **OOC lint baseline (`scripts/check_ooc_invariants.py`):** 44 allowlisted legacy/infra calls across 18 entries (`ReserveForced`/`AddForced`: 17 across 10 files; `Collect()`: 3; `ReadAllRows`/`ReadAllPositioned`: 24 across 5 files).
+- **Scale test suite (`ctest -L scale`):** `OocScaleBaselineTest` (2/2 pass). P3–P6 scale-invariance tests (multi-pass sort, skewed join/agg, large window, 10x DB scan, 10x bulk Tx) remain gated behind P1–P6 implementation per `ooca-v2.md` §6.
+
 ## 2026-11-06 — TPC-C-derived W=1: Tinylamb / PostgreSQL / MySQL
 
 - **Completed:** nine selected measurements, 10 clients, 5-second warmup plus
@@ -49,7 +112,7 @@
   errors prevent claiming a full current-source engine build/regression;
   this measures the validated C8 server. Balance/order-count checks are not
   a complete TPC-C serial oracle. Both figures visually checked.
-- **Artifacts:** [report](docs/tpcc_three_comparison_2026-11-06.md),
+- **Artifacts:** Historical 2026-11-06 report archived/removed,
   [primary matrix, selection audit, CSV and plots](benchmark/comparison/results/2026-11-06-tpcc-three-quiet/),
   [two final replacements](benchmark/comparison/results/2026-11-06-tpcc-three-quiet-repeat1/).
   Earlier final/repeat1 directories are preserved as provisional records.
@@ -97,7 +160,7 @@
   four five-engine figures visually checked. No engine source changes.
   DuckDB TPC-C, SF=1, embedded/direct and no-secondary profiles are unmeasured.
   Owned servers/containers/data cleaned; official images/extensions cached.
-- **Artifacts:** [report](docs/duckdb_comparison_2026-11-05.md),
+- **Artifacts:** Historical 2026-11-05 report removed,
   [raw records, plans, runtime scripts, audit and recovery](benchmark/comparison/results/2026-11-05-duckdb-5engine-indexed/).
 
 ## 2026-10-31 — Oracle AI Database Free added: four-engine, two-core comparison
@@ -131,7 +194,7 @@
   528 warmup** write-intent conflicts, across 30 error-bearing trials;
   all remain valid by post-trial invariants. Successful TPS excludes failures.
   Zero result mismatches/validation failures across all products.
-- **Artifacts:** [report](docs/oracle_free_comparison_2026-10-31.md),
+- **Artifacts:** Historical 2026-10-31 report removed,
   [all raw records, plans, frozen runtime scripts and audit](benchmark/comparison/results/2026-10-31-oracle-2core-indexed-final/).
   Four-engine tables/plots generated and visually checked; harness **40 tests pass**.
   Comparison-owned containers/data removed; the official image remains cached.
@@ -215,8 +278,8 @@
   **42.92–43.12%**, PG **.48–.54%** of attempts; successful latency/TPS
   must not conceal the different no-wait/locking behavior or failed work.
 - [All trials, errors and invariants](benchmark/comparison/results/2026-10-31-pg15-tpcc-c7/),
-  [all 20 median ratios](benchmark/comparison/results/2026-10-30-pg15/tpcc-c7-targets.json),
-  [ongoing plan](docs/postgresql_1_5_plan_2026-10-30.md).
+  [all 20 median ratios](benchmark/comparison/results/2026-10-30-pg15/tpcc-c7-targets.json)
+  (historical 2026-10-30 `postgresql_1_5_plan` removed).
   Frozen C7 SHA256: `09e138998180774c7dd552d96b3df007eb2843a1090af09b33a5508c85d3ed9e`.
   Targeted page/history tests 27 + 8 passed; full post-C7 QA: 4,192 CTest entries, failure 0, existing skips 3; SQL oracle 601 s / 788 runs / 676 new units, mismatch/crash 0; harness 40 pass, layering 66 allowlisted.
 
@@ -338,8 +401,8 @@ matching all 18,331 group keys/row counts. The historical Q16 timing and
 8.24156 s suite total below are retained as raw observations, **not accepted
 as a correct 22-query performance score**. C3 fixes the parallel scan's
 omission of precompiled NOT IN filters; C4's paired Q16 check matches every
-value. The full post-fix SF=1 rerun remains pending in the
-[1.5× plan](docs/postgresql_1_5_plan_2026-10-30.md).
+value. (Historical follow-up plan `docs/postgresql_1_5_plan_2026-10-30.md` was
+removed during doc cleanup.)
 
 - Fresh load from the pinned DBGEN commit
   `32f1c1b92d1664dba542e927d23d86ffa57aa253`, 6,001,215 lineitem rows;
@@ -434,7 +497,7 @@ value. The full post-fix SF=1 rerun remains pending in the
   **The first version hardcoded a 4-byte memset after `type`, but
   `sizeof(enum PageType) == 1`, so bytes [37,40) kept the BE type's high
   half and every clean page read failed its checksum —
-  `PagePoolTest.PersistencyWithReset` caught it on the first run.** The
+  `the checkpoint persistency tests` caught it on the first run.** The
   memset length is now derived from the `type`/`checksum` member
   addresses. On the changed tree: page_pool 43/43, recovery_extra 20/20,
   recovery_manager 85/85, differential 15/15.
@@ -772,7 +835,7 @@ was built, measured net-negative for Q2 as shipped, and left opt-in)
   (`FilterCompileEnv`) reaches the LoadSource, FilterRelation and
   FinishQuery filter sites. Q22 wall 341 → 252 ms (quiet single pass);
   min-of-4 pooled −4.8%. Honest decomposition: the previous "serial
-  contextful filter" cost was mostly the orders membership BUILD (same
+  contextual filter" cost was mostly the orders membership BUILD (same
   execution either way), not per-row dispatch — the runtime already only
   probed the ~19K rows that survived the leading simple compares, so the
   parallel-filter win is modest, not the −100–150 ms the 2026-10-06 entry
@@ -906,12 +969,12 @@ auditor, no 2-hour TPC-C window, no TPC-H power/throughput mix).
   175/175.
 - **Where the remaining time is (updated):**
   - **Q22 (233 ms)**: filter_ms ~200 of it — the residual NOT-IN
-    membership probes (19K rows) still pay contextful `TryEvaluate`
+    membership probes (19K rows) still pay contextual `TryEvaluate`
     dispatch per row, and the whole filter stays serial because the
     residual bytecode cannot compile kQueryExp. The sketched-but-unbuilt
     lever is a prebuilt-cache worker mode: fold/prebuild all row-side
     caches at compile time, make the hit-path counters atomic, and let
-    `TryParallelFilterRows` run the contextful `MatchScanFilter` in
+    `TryParallelFilterRows` run the contextual `MatchScanFilter` in
     workers with per-row defer on raise (est. −100–150 ms here, and it
     would generalize to Q2/Q17-class filters).
   - **Q2 (~340 ms)**: 561 correlated-apply executions of the 4-table min
@@ -956,8 +1019,7 @@ BASE_DISABLE="TINYLAMB_DISABLE_SUBQUERY_FOLD=1 TINYLAMB_DISABLE_PREFIX_IN=1" \
   the grouped-route default (Cascades-first) is TPC-H-unfavorable (−38%
   suite) while TPC-DS is at parity. Flipping the default needs a full ctest
   pass under `TINYLAMB_GROUPED_ROUTE=relational` plus a per-query audit of
-  where the Cascades route still wins (2026-10-06 ctest-under-hatch run is
-  recorded in docs/next-actions.md 第18報).
+  where the Cascades route still wins (2026-10-06 ctest-under-hatch note).
 
 ## 2026-10-05 — TPC-H SF=1: parallel relation-filter lowered to 32K rows (+ deterministic chunk rotation), page-read zero-scan pre-check (suite −3.0% min-of-4; the ~20% target was NOT reached — sixth consecutive TPC-H session; entry records two landed executor/page fixes plus a recalibrated map of where the remaining wall time sits)
 
@@ -1002,7 +1064,7 @@ BASE_DISABLE="TINYLAMB_DISABLE_SUBQUERY_FOLD=1 TINYLAMB_DISABLE_PREFIX_IN=1" \
     plan-cache wins are invisible to it by construction.
   - **Q22's customer filter is still serial**: its WHERE carries scalar/
     membership subqueries, `CompileWorkerFilter` returns incomplete
-    programs, and the whole 150K-row pipeline falls back to the contextful
+    programs, and the whole 150K-row pipeline falls back to the contextual
     per-row evaluator (61K uncorrelated memo hits are cheap; the AST walk
     around them is not). The next targeted lever is eager constant-folding
     of *uncorrelated* subqueries at scan-filter compile time (sound: same
@@ -1381,3 +1443,103 @@ cmake --build build -j8 --target tinylamb_tpch_benchmark
 - Remaining structural levers unchanged: Q9's 4-hop materializing join chain
   (star-join fusion), Q18's 6M-row GROUP BY, scan-projection default flip
   behind the Q19 plan-feedback interaction.
+
+## 2026-11-16 — Phase P3a verified (`TINYLAMB_EXEC_ENGINE=pipeline` default)
+
+- **Pipeline engine & core OOC sinks shipped and enabled by default:**
+  `PipelineLowering` (`executor/pipeline_lowering.{hpp,cpp}`),
+  `TryLowerGroupedStatementToPipeline` (`query/grouped_pipeline_lowering.{hpp,cpp}`),
+  `OocSortSink`, `OocDistinctSink`, `OocGroupAggSink` (`ARRAY_AGG`/`COUNT(DISTINCT)`
+  skew sort fallback), `OocSemiProbeIntakeSink`, `OocHashBuildSink`, and
+  `OocAdaptiveHashProbeSource` (Grace partitioning + recursive split + skew
+  sort-merge fallback + dynamic filter & semi-reduction).
+- **Verification (post-final-edit):**
+  - `python3 scripts/check_layering.py`: exit 0 (`allowlisted=107`, 0 new entries)
+  - `python3 scripts/check_ooc_invariants.py`: exit 0
+  - Full `ctest --test-dir build --output-on-failure -j$(nproc)`: **4076/4076
+    passed** (`100%`, 3 expected pre-existing skips, 40.49s real) including
+    `PipelineP3aTest.*`, `PipelineP3aSqlTest.*` (G3/G4/G5/G7 + `EXPLAIN
+    ANALYZE PIPELINE` with `legacy_source_ms=0` under 32 KiB spill),
+    `OocScaleBaselineTest.G2ExternalSortOneGiBUnderOneMiBBudget`,
+    `DynamicFilterJoinTest.*`, `HashSemiReductionSqlTest.*`, and
+    `GoogleSqlComplianceFileTest.*`.
+
+## 2026-11-16 — Phase P3b verified (remaining pipeline sinks/sources + PostgresServer streaming)
+
+- **All remaining SQL/relational operators lowered to OOC sinks & streaming sources:**
+  - `OocWindowSink` (`executor/detail/pipeline/ooc_window_sink.cpp`): buffered fast-path `<= B_op/2`, multi-spec `ExternalSorter` chaining `(partition_by, order_by, orig_seq)`, G4 `SkewCallStream` (`SpillSegmentWriter`/`SpillSegmentReader`) streaming ranking/navigation/prefix/sliding aggregates (`<= B_op`) and rejecting non-streaming unbounded skew collections with `kMemoryLimitExceeded`.
+  - `OocGroupAggSink`: extended to `NeedsGroupContext` aggregates (`ARRAY_AGG`, `STRING_AGG`, inner `ORDER BY`, `HAVING`, `FILTER`, `PERCENTILE_CONT`) with `kTooBigData` guard ONLY on collection/order-dependent skew groups and generalized single-`COUNT(DISTINCT expr)` external sort deduplication.
+  - `OocSetOpCoordinator`/`OocConcatSource`/`OocMergeAppendSource`, extended `OocDistinctSink` (`DISTINCT ON`), `IncrementalSortSource`, `IndexSkipScanSource`, `MinMaxIndexSource`, `OocBitmapScanSource`, `OocMultiIndexCoveringSource` (`executor/detail/pipeline/ooc_setop_incsort_sink.cpp`).
+  - `OocMergeJoinSource`, `OocBandJoinSource`, `OocCrossJoinBuildSink`/`OocCrossJoinProbeSource`, `OocRecursiveCteSource` (backed by `WorkTableIndex` + `ExternalSorter` anti-join spill), `OocApplySource` (`SpillableStore` + byte-bounded LRU cache), `LateMaterializationJoin` & `ZigZagJoin` pipeline lowering (`executor/detail/pipeline/ooc_join_cte_sources.cpp`).
+  - `PostgresServer` (`server/postgres_server.cpp`): removed `kMaxServerResultRows` and `64 MiB` whole-result string accumulation; added chunked outbound `EventPoller` (`kPollWritable`) streaming (`kClientStreamChunkBytes = 256 KiB`, `1 MiB` yield cap per turn) + `ServerBufferFloorBytes` D1 `kTx` floor accounting in `ProcessMemoryBudget` (`common/memory_budget.{hpp,cpp}`) and SQLSTATE `53200`/`53100` propagation.
+- **Verification (post-final-edit):**
+  - `python3 scripts/check_layering.py`: exit 0 (`allowlisted=111`, within existing wildcard debt)
+  - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`)
+  - Full `ctest --test-dir build --output-on-failure -j$(nproc)`: **4080/4080 executed tests passed** (`4083` total including `3` pre-existing skips, `41.80s` real), including `PipelineP3bTest.*` (`5/5`), `PostgresServerTest.*` (`48/48` including `StreamsLargeResultBeyondOldRowAndBufferCapsOverSlowClient` over `1,050,000` rows / `>64 MiB` slow TCP client and `PropagatesResourceLimitSqlStates53200And53100`).
+
+## 2026-11-16 — Phase P4 verified (Columnar layer: TLCS v2 paged directory, reclaimable resident stores, LSTableStore kColumnar caps)
+
+- **`LSTableStore` `kColumnar` caps & accounting (`table/lstable_bridge.cpp`):**
+  - Bounded `EffectiveBuildByteLimit`, `dictionary_summary_budget`, and `code_index_budget` by `min(ColumnarPoolLimit(), EffectivePoolMaxBytes(kColumnar))` so D1 floors prevent columnar builds from squeezing query/storage pools.
+  - Charged `flat_page_to_block` (falling back to sparse `page_to_block` on pressure), dictionaries, summaries, FOR-16 codes, and integer Bloom filters against `store->memory_charge` (`MemoryPoolKind::kColumnar`), gracefully stripping optional metadata or rejecting capacity on limit pressure.
+- **TLCS v2 Paged Directory & Reclaimable Resident Stores (`table/tlcs_file.{hpp,cpp}`, `table/full_scan_iterator.cpp`, `docs/page_format.md`, `docs/lock_order.md`):**
+  - Bumped `TlcsFile::kFormatVersion` from `1` to `2` (`ADR 0011`, explicitly rejecting v1 headers with `Status::kCorrupt`), interleaved CRC-checked `128`-block `DirGroup` batches serialized incrementally during `WriteTlcsTempFile` (eliminating `PendingTlcsCommit::blocks` bulk staging) and patched stub PIDs in `FinalizeTlcsFile`.
+  - Replaced unbounded `TlcsFile::blocks_` eager loading with compact `O(N / 128)` `DirGroupMeta` summaries + bounded-LRU `dir_cache_` (with eager directory preload capped by `min(4 MiB, EffectivePoolMaxBytes(kColumnar) / 32)` and disabled under `AlwaysSpillEnabled()`).
+  - Protected `resident_mmap_`/`resident_store_` via `resident_mu_`, attached `store->memory_charge` on resident & projected stores, and extended `TlcsFile::EvictDecodedCacheForReclaim` to evict `cache_map_`, `dir_cache_`, `eager_dir_groups_`, AND `resident_store_` under `ReclaimStage::kColumnar` without breaking active scans.
+- **Verification (post-final-edit):**
+  - `python3 scripts/check_layering.py`: exit `0` (`allowlisted=111`, 0 new entries)
+  - `python3 scripts/check_ooc_invariants.py`: exit `0` (`42 allowlisted occurrences across 16 entries`)
+  - Filtered `ctest --test-dir build --output-on-failure -j$(nproc) -R 'TlcsFile|FullScanIterator|OocScaleBaseline|RelationalRegressionTest'`: **261/261 passed** (`100%`, `20.34s` real), including new tests `TlcsFileTest.RejectsVersionOneHeaderPerAdr0011`, `TlcsFileTest.PagedDirectoryModeAndReclaimDropResidentAndEagerCaches`, and `TlcsFileTest.BuildLSTableStoreRespectsEffectiveColumnarPoolCap`.
+
+## 2026-11-16 — Phase P5 verified (Compact page directory, bounded PageManager memory, disk-backed LSM SSTables, v4 checkpoint, compact recovery bitmap)
+
+- **Compact non-resident page directory & bounded resident pool (`page/page_lsm_store.{hpp,cpp}`, `page/page_ref.{hpp,cpp}`, `page/page_manager.{hpp,cpp}`):**
+  - Replaced retained non-resident `Page` shells (`416 B/page`) in `PageManager::blocks_` with two-level 256-slot sparse `EvictedPageTable` (`EvictedPageDesc` = `16 B` holding `{disk_offset, disk_length, file_gen}`) and coalesced `BoundedFreeIdSet` (`kMaxRanges = 65536`), removing evicted `Page` objects cleanly while preserving concurrent-fault safety via `PageRef` `std::shared_ptr<Page>` ownership (`PageUnlock` releases after unlock).
+  - Bounded `EffectiveBufferPoolLimit()` with `min(StoragePoolLimit(), EffectivePoolMaxBytes(kStorage))`, accounted `EvictedPageTable` directory bytes in `MemoryPoolKind::kStorage`, and supported parallel cold faults across `.blocks.<gen>` rotations via `ManagedBlockFile`.
+- **Bounded LSM write buffer, disk SSTables, v4 checkpoint & compact recovery (`page/page_lsm_store.{hpp,cpp}`, `page/page_manager.{hpp,cpp}`, `recovery/recovery_manager.cpp`, `database/database.cpp`, `scripts/clean_root_artifacts.py`, `docs/page_format.md`, `docs/lock_order.md`):**
+  - Replaced fixed `1024`-entry flush thresholds and RAM `LsmSortedRun::entries` with global `total_lsm_mem_bytes_` spilling heaviest trees to CRC-32C-protected ~32 KiB SSTable blocks in `<db>.lsm.<gen>` + streaming `LsmRunCursor` K-way heap merge compaction and `MemoryPoolKind::kStorage`-bounded `LsmBlockCache` LRU (evicted first in `ReclaimStage::kCleanStorage`).
+  - Bumped `kFuzzyCheckpointVersion` to `4` (`ADR 0011`, rejecting older versions with `Status::kCorrupt`), streaming `<= 256`-page cursor batches without materializing snapshot vectors.
+  - Replaced Pass-1 `std::unordered_set<txn_id_t>` in `RecoveryManager::RecoverFrom` with a chunked `CompactTxnBitmap` (`8 KiB` per `65,536` TXNs) tracked in `MemoryPoolKind::kStorage`.
+- **Verification (post-final-edit):**
+  - `python3 scripts/check_layering.py`: exit `0` (`allowlisted=111`, 0 new entries).
+  - `python3 scripts/check_ooc_invariants.py`: exit `0` (`42 allowlisted occurrences across 16 entries`).
+  - Filtered `ctest --test-dir build --output-on-failure -j$(nproc) -R 'PageManager|RecoveryManager|CheckpointManager|DatabaseExtra|CatalogTest|LsmIndex|TlcsFile|Tpcc'`: **107/107 passed** (`100%`, `0.94s` real), including `PageManagerTest.CompactNonResidentDirectoryAndRejectsV3Checkpoint`, `PageManagerTest.OutOfCoreDatasetBeyond5xPoolWithLsmCompactionAndRestart`, `RecoveryManagerTest.RecoveryTxnBitmapHandlesSpacedAndAbortedTransactions`, and `35/35` TPC-C tests.
+
+## 2026-11-16 — Phase P6a verified (WAL re-read mode for staged_records_, spillable write_set_, bounded read_set_)
+
+- **WAL re-read mode (`transaction/transaction.{hpp,cpp}`, `transaction/transaction_manager.{hpp,cpp}`, `recovery/recovery_manager.{hpp,cpp}`, `page/page_manager.{hpp,cpp}`, `docs/recovery_invariants.md`, `ADR 0008`):**
+  - Replaced unbounded `Transaction::staged_records_` accumulation with `MemoryPoolKind::kTx` tracking up to `min(4 MiB, EffectivePoolMaxBytes(kTx)/4)`; transactions exceeding the threshold drop `staged_records_` into WAL re-read mode (`wal_reread_mode_`).
+  - Added streaming `PageManager::{Begin,Apply...Record,Finish}Transaction{Commit,Abort}` shared by both staged and WAL re-read paths, `RecoveryManager::ReadWalRecordForward` (with segment pre-roll padding skips), backward `prev_lsn` chain unwinding via `Logger::TryCopyBuffered` / `RecoveryManager::ReadLog` on runtime abort, forward WAL scan across `[FirstLSN(), commit_start)` on commit, and WAL-backed `FindPendingLsmWriteViaWal` / `ForEachPendingLsmWriteViaWal`.
+  - Exposed `wal_reread_activations` and `wal_reread_bytes` in `TransactionRuntimeStats` and updated `docs/recovery_invariants.md`.
+- **Spillable `TransactionWriteSet` & bounded `read_set_` (`transaction/transaction.{hpp,cpp}`, `transaction/transaction_manager.{hpp,cpp}`):**
+  - Kept the 64-entry inline sorted vector fast path, added `MemoryPoolKind::kTx`-tracked hash storage up to `4096` entries (or tight pool budget), and spilled overflowing write sets into a shared `TransactionManager` `SpillStore` (`1` unlinked FD across concurrent transactions), routing `HasWriteSet` to exact `TransactionManager::HoldsWriteIntent` checks and streaming `CommitVersions` / `AbortVersions` in 512-entry `SpillSegmentReader` batches (`16 KiB` buffer).
+  - Bounded `Transaction::read_set_` to `1024` diagnostic sample entries while preserving total count reporting.
+- **Verification (post-final-edit):**
+  - `python3 scripts/check_layering.py`: exit `0` (`allowlisted=111`, 0 new entries).
+  - `python3 scripts/check_ooc_invariants.py`: exit `0` (`42 allowlisted occurrences across 16 entries`).
+  - Filtered `ctest --test-dir build --output-on-failure -j$(nproc) -R 'TransactionP6a|TransactionTest|TransactionCoverage|RecoveryManager|PageManager|Tpcc'`: **156/156 passed** (`100%`, `5.14s` real), including new tests `TransactionP6aTest.WalRereadModeCommitsAndAbortsBeyond4MiBAndSurvivesCrash`, `TransactionP6aTest.WalRereadPreservesPendingLsmScanUnderForeignOverwrite`, `TransactionP6aTest.SpillableWriteSetHandlesManyIntentsOnCommitAndAbort`, and `TransactionP6aTest.DiagnosticReadSetRemainsBounded`.
+
+---
+
+## Phase P6b & Final Gate Verification (2026-11-16)
+
+- **P6b-1 — Uncommitted Dirty Page Overlay Spill (`page/page_lsm_store.hpp`, `page/page_manager.{hpp,cpp}`, `page/row_page.{hpp,cpp}`, `page/page_manager_test.cpp`):**
+  - Added `EvictedPageDesc::kUncommittedOnlyDiskOffset` and `HasCommittedDiskBlock()`, enabling cold dirty uncommitted pages (both updated committed pages and uncommitted newly allocated pages) to spill overlays under tight `kStorage` memory budgets and reload or discard cleanly on commit, abort, and crash recovery.
+- **P6b-2 — Cold MVCC Version Payload Spill (`transaction/transaction_manager.{hpp,cpp}`, `transaction/transaction_test.cpp`):**
+  - Replaced inline `std::optional<std::string>` payloads in `CommittedVersion` and `PendingVersion` with `VersionPayload`, enforced `MemoryPoolKind::kTx` tracking up to `EffectiveVersionSpillThresholdBytes()` (`min(4 MiB, EffectivePoolMaxBytes(kTx)/4)`), added two-tier cold payload eviction (`SpillColdVersionPayloadsLockedSweep`) into `256 KiB` `SpillStore` segments with `Crc32cOf` integrity verification in lock-free `ReadSpilledVersionPayload`, and exposed `TransactionRuntimeStats::{version_spills,version_spill_bytes,version_payload_resident_bytes}`.
+- **P6b-3 — Bounded Foreign Key Verification & DML Pending Buffers (`executor/foreign_key.{hpp,cpp}`, `executor/{delete,update,insert}.cpp`, `query/sql_engine_statements.cpp`, `query/foreign_key_test.cpp`):**
+  - Converted `ForeignKeyCounts` into a `ProcessMemoryCharge(kQuery)`-budgeted structure spilling via `ExternalSorter` + 1-/2-level `16 KiB` block `SpillStore` indexes (`Contains`, `IncrementKey`, `DecrementKey`, `RebuildWithDeltas`).
+  - Replaced unbounded `DeleteExecutor::pending` and `Update::pending` vectors with `SpillableRowPositionList` / `SpillablePendingUpdateList`, and replaced `O(|pending| * |child|)` nested child scans with `FindReferencedParentKey` (`ExternalSorter` sort-merge + anti-join for spilled ignore sets).
+- **P6b-4 — Statement Timeout & WAL/GC Retention Warnings (`transaction/transaction.{hpp,cpp}`, `transaction/transaction_manager.{hpp,cpp}`, `recovery/checkpoint_manager.{hpp,cpp}`, `table/full_scan_iterator.{hpp,cpp}`, `index/index_scan_iterator.{hpp,cpp}`, `executor/{pipeline_lowering,aggregation,cross_join,insert,update,delete,foreign_key}.cpp`, `query/sql_engine.cpp`, `docs/recovery_invariants.md`):**
+  - Enforced `TINYLAMB_STATEMENT_TIMEOUT_MS` across execution pipelines, scan iterators, join/agg operators, DML loops, and FK count builds via `Transaction::CheckStatementTimeout` / `ScopedThreadStatementDeadline`.
+  - Added rate-limited `LOG(WARN)` alerts in `CheckpointManager::WriteCheckpoint` (`TINYLAMB_WAL_RETENTION_WARN_BYTES`, default `64 MiB`) and `TransactionManager::MaybeWarnGcPin` (with cold-VM `last == 0` guard fix).
+- **Full-Suite Fixes Discovered Under Verification:**
+  - `recovery/logger.cpp`: `Logger::AddLog` now zeroes pre-roll ring-buffer gaps `[lsn, next_lsn)` across segment rolls so `WalkWalRecordsForward` / `PreRollPaddingEnd` do not read stale ring bytes from previous laps.
+  - `page/page_manager.{hpp,cpp}`: Replaced `O(N)` full-map traversals in `LsmTreeState::EstimateCommittedMemBytesLocked()` and `EstimateTotalMemoryBytesLocked()` (called from `AccountTreeMemoryLocked` per LSM mutation) with `O(1)` incremental byte counters (`committed_mem_bytes`, `memtable_bytes`, `immutable_mem_bytes`, `runs_bytes`), resolving the `QueueTableTest.PointRangeOnKeyPrefixResolvesHeapRows` 60s timeout (`>60s` -> `2.15s` isolated, `3.48s` full parallel CTest).
+- **Final Verification (post-final-edit):**
+  - Build: `cmake --build build -j` + `cmake --build build -j --target tinylamb_ooc_baseline_measure` -> exit `0`.
+  - `python3 scripts/check_layering.py`: exit `0` (`allowlisted=111`, 0 new violations).
+  - `python3 scripts/check_ooc_invariants.py`: exit `0` (`42 allowlisted occurrences across 16 entries`).
+  - `ctest --test-dir build --output-on-failure -j$(nproc)`: **4099/4099 executed tests passed** (`4102` registered, `3` pre-existing skipped: `#2818 SqlSessionFuzzer.RepeatSeedForNondeterministicBugs`, `#3447 SqlEngineCoverageTest.NullableUniqueDoesNotProveGroupDependency`, `#3664 CascadesRulesCoverageTest.GroupedSqlSelectsHashAndStreamAlternatives`, `0` failures, `41.90s` real).
+  - `ctest --test-dir build -L scale --output-on-failure -j$(nproc)`: **4/4 passed** (`5.21s` real), including `OocScaleBaselineTest.G2ExternalSortOneGiBUnderOneMiBBudget` (`5.12s`) and `OocScaleBaselineTest.P1MemoryAccountingGateUnder16GiBAnd1GiB` (`0.17s`).
+  - `./build/tinylamb_ooc_baseline_measure`: Startup `RSS=28.15 MiB`; after 50k load `RSS=77.85 MiB`, `tracked_total=17.65 MiB` (`storage=6.80 MiB`, `columnar=0.00 MiB`, `query=0.00 MiB`, `tx=10.85 MiB`), `unaccounted=60.20 MiB`; query peak `RSS=92.36 MiB`, `total_peak=24.88 MiB`, `unaccounted=74.15 MiB`; `EvictColdPagesForTest(0)` evicted `101` pages (`ResidentBytes 6.80 -> 0.00 MiB`). Note on scope: multi-GiB external-dataset runs (TPC-H SF=100 via external `dbgen`, ClickBench 100M) remain outside offline CTest execution.

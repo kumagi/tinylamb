@@ -1,7 +1,9 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/cast_expression.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
@@ -24,7 +26,7 @@
 #include <vector>
 
 #include "common/json_string.hpp"
-#include "common/platform/time_zone.hpp"
+#include "common/string_util.hpp"
 #include "expression/expression.hpp"
 #include "expression/proto_schema.hpp"
 #include "expression/proto_text.hpp"
@@ -39,6 +41,19 @@
 
 namespace tinylamb {
 namespace {
+// GoogleSQL spells type names in cast errors in lower case ("Bad int64
+// value: abc", "uint64 out of range: ..."); `upper` is the canonical
+// upper-case target name used for dispatch.
+std::string AsciiLowerCopy(std::string_view text) {
+  std::string out(text);
+  for (char& c : out) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return out;
+}
+}  // namespace
+
+namespace {
 
 struct CivilTime {
   int year{1970};
@@ -50,7 +65,7 @@ struct CivilTime {
   int64_t subsecond_nanos{0};
 };
 
-bool ParseCivilTime(std::string_view s, CivilTime* ct) {
+std::string_view TrimCivilWhitespace(std::string_view s) {
   while (!s.empty() &&
          (std::isspace(static_cast<unsigned char>(s.front())) != 0)) {
     s.remove_prefix(1);
@@ -59,127 +74,152 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
          (std::isspace(static_cast<unsigned char>(s.back())) != 0)) {
     s.remove_suffix(1);
   }
-  if (s.empty()) {
+  return s;
+}
+
+bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
+                    bool allow_time_only) {
+  s = TrimCivilWhitespace(s);
+  const auto number = [&s](int* out, size_t max_digits) {
+    size_t digits = 0;
+    int result = 0;
+    while (digits < s.size() && digits < max_digits && s[digits] >= '0' &&
+           s[digits] <= '9') {
+      result = (result * 10) + (s[digits++] - '0');
+    }
+    s.remove_prefix(digits);
+    *out = result;
+    return digits != 0;
+  };
+  const auto take = [&s](char ch) {
+    if (s.empty() || s.front() != ch) {
+      return false;
+    }
+    s.remove_prefix(1);
+    return true;
+  };
+
+  int first = 0;
+  const size_t before_year = s.size();
+  if (!number(&first, 4)) {
     return false;
   }
-  int Y = 0, M = 0, D = 0;
-  if (s.size() == 10 &&
-      // NOLINTNEXTLINE(cert-err34-c)
-      sscanf(std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
-    if (Y < 1 || Y > 9999 || M < 1 || M > 12 || D < 1 || D > 31) {
+  const size_t year_digits = before_year - s.size();
+  bool has_clock = false;
+  if (take('-')) {
+    // The date form is fixed-width YYYY-MM-DD; time-only inputs take the
+    // else branch below and must not be subjected to this check.
+    if (year_digits != 4 || s.size() < 5 || s[2] != '-' ||
+        (std::isdigit(static_cast<unsigned char>(s[0])) == 0) ||
+        (std::isdigit(static_cast<unsigned char>(s[1])) == 0) ||
+        (std::isdigit(static_cast<unsigned char>(s[3])) == 0) ||
+        (std::isdigit(static_cast<unsigned char>(s[4])) == 0)) {
       return false;
     }
-    const std::chrono::year_month_day ymd{
-        std::chrono::year{Y}, std::chrono::month{static_cast<unsigned>(M)},
-        std::chrono::day{static_cast<unsigned>(D)}};
-    if (!ymd.ok()) {
+    int month = 0;
+    int day = 0;
+    if (first < 1 || first > 9999 || !number(&month, 2) || !take('-') ||
+        !number(&day, 2) || month < 1 || month > 12 || day < 1 || day > 31) {
       return false;
     }
-    ct->year = Y;
-    ct->month = static_cast<unsigned>(M);
-    ct->day = static_cast<unsigned>(D);
-    ct->hour = 0;
-    ct->minute = 0;
-    ct->second = 0;
-    ct->subsecond_nanos = 0;
-    return true;
+    ct->year = first;
+    ct->month = static_cast<unsigned>(month);
+    ct->day = static_cast<unsigned>(day);
+    if (!s.empty()) {
+      if (!take('T') && !take('t') && !take(' ')) {
+        return false;
+      }
+      s = TrimCivilWhitespace(s);
+      if (!number(&ct->hour, 2) || !take(':')) {
+        return false;
+      }
+      has_clock = true;
+    }
+  } else {
+    if (!allow_time_only || !take(':')) {
+      return false;
+    }
+    ct->hour = first;
+    has_clock = true;
   }
-  int h = 0, m = 0, sec = 0;
-  char sep = ' ';
-  bool matched = false;
-  // NOLINTNEXTLINE(cert-err34-c)
-  if (sscanf(std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h,
-             &m, &sec) >= 6) {
-    ct->year = Y;
-    ct->month = static_cast<unsigned>(M);
-    ct->day = static_cast<unsigned>(D);
-    ct->hour = h;
-    ct->minute = m;
-    ct->second = sec;
-    ct->subsecond_nanos = 0;
-    size_t dot = s.find('.', 11);
-    if (dot != std::string_view::npos) {
-      size_t end_digits = dot + 1;
-      while (end_digits < s.size() && s[end_digits] >= '0' &&
-             s[end_digits] <= '9') {
-        ++end_digits;
-      }
-      std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
-      while (frac_str.size() < 9) {
-        frac_str.push_back('0');
-      }
-      if (frac_str.size() > 9) {
-        frac_str = frac_str.substr(0, 9);
-      }
-      ct->subsecond_nanos = std::stoll(frac_str);
-    }
-    matched = true;
-  } else if (
-      // NOLINTNEXTLINE(cert-err34-c)
-      sscanf(std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
-    ct->year = 1970;
-    ct->month = 1;
-    ct->day = 1;
-    ct->hour = h;
-    ct->minute = m;
-    ct->second = sec;
-    ct->subsecond_nanos = 0;
-    size_t dot = s.find('.');
-    if (dot != std::string_view::npos) {
-      size_t end_digits = dot + 1;
-      while (end_digits < s.size() && s[end_digits] >= '0' &&
-             s[end_digits] <= '9') {
-        ++end_digits;
-      }
-      std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
-      while (frac_str.size() < 9) {
-        frac_str.push_back('0');
-      }
-      if (frac_str.size() > 9) {
-        frac_str = frac_str.substr(0, 9);
-      }
-      ct->subsecond_nanos = std::stoll(frac_str);
-    }
-    matched = true;
-  }
-  if (matched) {
-    if (ct->year < 1 || ct->year > 9999 || ct->month < 1 || ct->month > 12 ||
-        ct->day < 1 || ct->day > 31 || ct->hour < 0 || ct->hour > 23 ||
-        ct->minute < 0 || ct->minute > 59 || ct->second < 0 ||
-        ct->second > 60 || ct->subsecond_nanos < 0 ||
-        ct->subsecond_nanos > 999999999) {
+
+  if (has_clock) {
+    if (!number(&ct->minute, 2)) {
       return false;
     }
-    const std::chrono::year_month_day ymd{std::chrono::year{ct->year},
-                                          std::chrono::month{ct->month},
-                                          std::chrono::day{ct->day}};
-    if (!ymd.ok()) {
-      return false;
+    if (!take(':')) {
+      return false;  // GoogleSQL requires HH:MM:SS
     }
-    if (ct->second == 60) {
-      ct->second = 0;
-      ct->subsecond_nanos = 0;
-      ct->minute += 1;
-      ct->hour += ct->minute / 60;
-      ct->minute %= 60;
-      if (ct->hour >= 24) {
-        int extra_days = ct->hour / 24;
-        ct->hour %= 24;
-        int64_t days =
-            std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
-        std::chrono::sys_days new_sd{std::chrono::days{days}};
-        std::chrono::year_month_day new_ymd{new_sd};
-        if (int(new_ymd.year()) < 1 || int(new_ymd.year()) > 9999) {
+    {
+      if (!number(&ct->second, 2)) {
+        return false;
+      }
+      if (take('.')) {
+        size_t digits = 0;
+        while (!s.empty() && s.front() >= '0' && s.front() <= '9') {
+          if (digits < 9) {
+            ct->subsecond_nanos =
+                (ct->subsecond_nanos * 10) + (s.front() - '0');
+          }
+          ++digits;
+          s.remove_prefix(1);
+        }
+        if (digits == 0 || digits > 9) {
           return false;
         }
-        ct->year = int(new_ymd.year());
-        ct->month = unsigned(new_ymd.month());
-        ct->day = unsigned(new_ymd.day());
+        while (digits++ < 9) {
+          ct->subsecond_nanos *= 10;
+        }
       }
     }
-    return true;
+    if (!s.empty()) {
+      const bool zulu = (s == "Z" || s == "z");
+      const bool numeric_offset = s.front() == '+' || s.front() == '-';
+      if (!zulu && !numeric_offset &&
+          (std::isspace(static_cast<unsigned char>(s.front())) == 0)) {
+        return false;
+      }
+      if (numeric_offset) {
+        // Validate the whole zone token: a numeric offset followed by trailing
+        // junk (e.g. "+05:00garbage") is not a timestamp spelling.
+        for (size_t i = 1; i < s.size(); ++i) {
+          const char ch = s[i];
+          // NOLINTNEXTLINE(readability-implicit-bool-conversion) explicit intent
+          if (!std::isdigit(static_cast<unsigned char>(ch)) && ch != ':' &&
+              (std::isspace(static_cast<unsigned char>(ch)) == 0)) {
+            return false;
+          }
+        }
+        if (s.find_first_of("0123456789") == std::string_view::npos) {
+          return false;
+        }
+      }
+    }
+    *zone = TrimCivilWhitespace(s);
   }
-  return false;
+
+  const std::chrono::year_month_day ymd{std::chrono::year{ct->year},
+                                        std::chrono::month{ct->month},
+                                        std::chrono::day{ct->day}};
+  if (!ymd.ok() || ct->hour > 23 || ct->minute > 59 || ct->second > 59) {
+    return false;
+  }
+  if (ct->second == 60) {
+    ct->subsecond_nanos = 0;
+    ct->second = 0;
+    if (++ct->minute == 60) {
+      ct->minute = 0;
+      if (++ct->hour == 24) {
+        ct->hour = 0;
+        const std::chrono::year_month_day next{std::chrono::sys_days{ymd} +
+                                               std::chrono::days{1}};
+        ct->year = int(next.year());
+        ct->month = unsigned(next.month());
+        ct->day = unsigned(next.day());
+      }
+    }
+  }
+  return ct->year <= 9999;
 }
 
 std::string FormatCivilTime(const CivilTime& ct) {
@@ -239,71 +279,65 @@ CivilTime ShiftCivilTimeSeconds(CivilTime ct, int64_t add_seconds) {
   return ct;
 }
 
-int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
-                        int default_offset = 0) {
-  if (tz_str.empty()) {
-    return default_offset;
+StatusOr<Value> CastCivilTime(std::string_view text, std::string_view target) {
+  const auto invalid = [&] {
+    return StatusError(
+        StatusCode::kInvalidArgument,
+        "invalid " + std::string(target) + " string: " + std::string(text));
+  };
+  const auto offset_at = [](std::string_view zone, const CivilTime& ct,
+                            bool at_utc = false) {
+    return TryTimeZoneOffsetAtLocalTime(zone, ct.year, ct.month, ct.day,
+                                        ct.hour, ct.minute, ct.second, at_utc);
+  };
+
+  CivilTime ct;
+  std::string_view zone;
+  // A bare clock time (HH:MM:SS[.frac][zone]) is a valid input for every
+  // temporal target: it lands on 1970-01-01. GoogleSQL's timestamp cast
+  // accepts e.g. CAST('00:00:00.2+00' AS TIMESTAMP), so only a DATE target
+  // (which has no clock component) refuses a time-only string.
+  const bool allow_time_only = target != "DATE";
+  if (!ParseCivilTime(text, &ct, &zone, allow_time_only)) {
+    return invalid();
   }
-  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
-      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
-      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
-    return 0;
-  }
-  if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
-      tz_str.starts_with("GMT+") || tz_str.starts_with("GMT-")) {
-    char sign = tz_str[3];
-    int th = 0, tm = 0;
-    std::string rem(tz_str.substr(4));
-    // Unparsed tokens leave th/tm at 0, i.e. a UTC offset; conversion errors
-    // are tolerated by design for malformed zone strings.
-    if (rem.find(':') != std::string::npos) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d:%d", &th, &tm);
-    } else if (rem.size() == 4) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%2d%2d", &th, &tm);
-    } else {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d", &th);
+  if (target == "TIMESTAMP" || !zone.empty()) {
+    // Convert the input wall time to UTC first. For civil targets, look up
+    // the destination offset at the resulting instant, including DST edges.
+    const std::string default_zone = GetDefaultTimeZone();
+    ASSIGN_OR_RETURN(
+        int, input_offset,
+        offset_at(zone.empty() ? std::string_view(default_zone) : zone, ct));
+    ct = ShiftCivilTimeSeconds(ct, -input_offset);
+    if (target != "TIMESTAMP") {
+      ASSIGN_OR_RETURN(int, local_offset, offset_at(default_zone, ct, true));
+      ct = ShiftCivilTimeSeconds(ct, local_offset);
     }
-    return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
   }
-  if (tz_str[0] == '+' || tz_str[0] == '-') {
-    char sign = tz_str[0];
-    int th = 0, tm = 0;
-    std::string rem(tz_str.substr(1));
-    if (rem.find(':') != std::string::npos) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d:%d", &th, &tm);
-    } else if (rem.size() == 4) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%2d%2d", &th, &tm);
-    } else {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d", &th);
-    }
-    return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
+  if (ct.year < 1 || ct.year > 9999) {
+    return invalid();
   }
-  std::string zone_name(tz_str);
-  if (zone_name == "NZ-CHAT") {
-    zone_name = "Pacific/Chatham";
+  if (target == "TIME") {
+    const std::string formatted = FormatCivilTime(ct);
+    return Value(formatted.substr(formatted.find(' ') + 1));
   }
-  int y = (ct != nullptr) ? ct->year : 2000;
-  int mon = (ct != nullptr) ? static_cast<int>(ct->month) : 1;
-  int d = (ct != nullptr) ? static_cast<int>(ct->day) : 1;
-  int h = (ct != nullptr) ? ct->hour : 0;
-  int min = (ct != nullptr) ? ct->minute : 0;
-  int s = (ct != nullptr) ? ct->second : 0;
-  y = std::max(y, 1970);
-  const std::optional<int> offset = platform::TimeZoneOffsetAtLocalTime(
-      zone_name, y, static_cast<unsigned>(mon), static_cast<unsigned>(d), h,
-      min, s);
-  return offset.value_or(default_offset);
+  if (target == "DATE") {
+    const std::chrono::year_month_day ymd{std::chrono::year{ct.year},
+                                          std::chrono::month{ct.month},
+                                          std::chrono::day{ct.day}};
+    return Value::DateFromDays(
+        std::chrono::sys_days{ymd}.time_since_epoch().count());
+  }
+  std::string formatted = FormatCivilTime(ct);
+  if (target == "TIMESTAMP") {
+    formatted += "+00";
+  }
+  return Value(std::move(formatted));
 }
 
 std::string ToUpper(std::string str) {
   for (char& c : str) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    c = AsciiToUpper(c);
   }
   return str;
 }
@@ -345,20 +379,12 @@ std::string UnquoteProtoToken(std::string token) {
   return result;
 }
 
-uint64_t ProtoInteger(std::string token) {
+StatusOr<uint64_t> ProtoInteger(std::string token,
+                                std::string_view enum_type = {}) {
   token = UnquoteProtoToken(std::move(token));
-  const std::string lower = ToLower(token);
-  if (lower == "true") {
-    return 1;
-  }
-  if (lower == "false") {
-    return 0;
-  }
-  if (lower == "testenumnegative") {
-    return UINT64_MAX;
-  }
-  if (lower.starts_with("testenum")) {
-    token = token.substr(std::string("TESTENUM").size());
+  int64_t enum_value = 0;
+  if (!enum_type.empty() && EnumValueForMember(enum_type, token, &enum_value)) {
+    return static_cast<uint64_t>(enum_value);
   }
   int64_t signed_value = 0;
   const auto [end, error] =
@@ -366,7 +392,8 @@ uint64_t ProtoInteger(std::string token) {
   if (error == std::errc() && end == token.data() + token.size()) {
     return static_cast<uint64_t>(signed_value);
   }
-  return 0;
+  return StatusError(StatusCode::kInvalidArgument,
+                     "cannot encode proto scalar: " + token);
 }
 
 void AppendProtoField(std::string* out, uint32_t field_number, uint64_t value) {
@@ -381,9 +408,51 @@ void AppendProtoMessageField(std::string* out, uint32_t field_number,
   out->append(payload);
 }
 
-// StatusOr because a NullableDate field runs user text through
-// TryParseDateDays; an unparseable date must surface as a Status from the
-// CAST path, not as an EXC-SHIM throw escaping TryEvaluate (fuzz-found).
+std::string_view InferProtoWireType(std::string_view text) {
+  if (text.find(':') == std::string_view::npos) {
+    return {};
+  }
+  while (text.starts_with('{') && text.ends_with('}')) {
+    text.remove_prefix(1);
+    text.remove_suffix(1);
+  }
+  std::vector<ProtoTextEntry> entries;
+  if (!ParseProtoTextEntries(text, &entries)) {
+    return {};
+  }
+  std::string_view type;
+  for (const ProtoTextEntry& entry : entries) {
+    const std::string field = ToLower(entry.name);
+    if (field == "repeated_bool_packed") {
+      return "googlesql_test.PackedRepeatablePB";
+    }
+    if (field == "int64_key_1" || field == "int64_key_2" ||
+        field == "double_val") {
+      return "googlesql_test.KitchenSinkPB";
+    }
+    if (field == "required_test_enum") {
+      return "googlesql_test.KitchenSinkEnumPB";
+    }
+    if (field == "str_value" || field == "int32_val1" ||
+        field == "int32_val2") {
+      return "googlesql_test.TestExtraPB";
+    }
+    if (field == "test_enum") {
+      type = "googlesql_test.Proto3KitchenSink";
+    } else if (field == "value" && type.empty()) {
+      if (EnumValueForMember("TestEnum", UnquoteProtoToken(entry.text),
+                             nullptr)) {
+        type = "googlesql_test.NullableEnum";
+      } else if (std::ranges::count(entry.text, '-') >= 2) {
+        type = "googlesql_test.NullableDate";
+      } else {
+        type = "googlesql_test.NullableInt";
+      }
+    }
+  }
+  return type;
+}
+
 StatusOr<std::string> EncodeProtoWireMessage(std::string_view type_name,
                                              std::string_view payload) {
   std::vector<ProtoTextEntry> entries;
@@ -405,7 +474,13 @@ StatusOr<std::string> EncodeProtoWireMessage(std::string_view type_name,
     std::string packed;
     for (const ProtoTextEntry& entry : entries) {
       if (ToLower(entry.name) == "repeated_bool_packed") {
-        AppendVarint(&packed, ProtoInteger(entry.text));
+        const std::string token = ToLower(UnquoteProtoToken(entry.text));
+        if (token == "true" || token == "false") {
+          AppendVarint(&packed, token == "true" ? 1U : 0U);
+        } else {
+          ASSIGN_OR_RETURN(uint64_t, value, ProtoInteger(token));
+          AppendVarint(&packed, value);
+        }
       }
     }
     if (!packed.empty()) {
@@ -413,26 +488,48 @@ StatusOr<std::string> EncodeProtoWireMessage(std::string_view type_name,
     }
     return out;
   }
+  const auto append_integer =
+      [&out](uint32_t field_number, const ProtoTextEntry& entry,
+             std::string_view enum_type = {}) -> Status {
+    ASSIGN_OR_RETURN(uint64_t, value, ProtoInteger(entry.text, enum_type));
+    AppendProtoField(&out, field_number, value);
+    return Status::kSuccess;
+  };
   for (const ProtoTextEntry& entry : entries) {
     const std::string field = ToLower(entry.name);
     if (lower.ends_with("nullableint") || lower.ends_with("nullabledate") ||
         lower.ends_with("nullableenum")) {
       if (field == "value") {
-        uint64_t value = ProtoInteger(entry.text);
         if (lower.ends_with("nullabledate") &&
-            entry.text.find('-') != std::string::npos) {
+            std::ranges::count(entry.text, '-') >= 2) {
           ASSIGN_OR_RETURN(int64_t, date_days, TryParseDateDays(entry.text));
-          value = static_cast<uint64_t>(date_days);
+          AppendProtoField(&out, 1, static_cast<uint64_t>(date_days));
+        } else {
+          RETURN_IF_FAIL(append_integer(
+              1, entry, lower.ends_with("nullableenum") ? "TestEnum" : ""));
         }
-        AppendProtoField(&out, 1, value);
       }
       continue;
     }
     if (lower.ends_with("kitchensinkpb")) {
       if (field == "int64_key_1") {
-        AppendProtoField(&out, 1, ProtoInteger(entry.text));
+        RETURN_IF_FAIL(append_integer(1, entry));
       } else if (field == "int64_key_2") {
-        AppendProtoField(&out, 2, ProtoInteger(entry.text));
+        RETURN_IF_FAIL(append_integer(2, entry));
+      } else if (field == "double_val") {
+        const std::string token = UnquoteProtoToken(entry.text);
+        double value = 0;
+        const auto [end, error] =
+            std::from_chars(token.data(), token.data() + token.size(), value);
+        if (error != std::errc() || end != token.data() + token.size()) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "cannot encode proto scalar: " + token);
+        }
+        const auto bits = std::bit_cast<uint64_t>(value);
+        AppendVarint(&out, (9 << 3) | 1);
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+          out.push_back(static_cast<char>((bits >> shift) & 0xff));
+        }
       } else if (field == "nested_value") {
         ASSIGN_OR_RETURN(
             std::string, nested_msg,
@@ -464,19 +561,25 @@ StatusOr<std::string> EncodeProtoWireMessage(std::string_view type_name,
         }
       }
       if (field_number != 0) {
-        AppendProtoField(&out, field_number, ProtoInteger(entry.text));
+        RETURN_IF_FAIL(append_integer(field_number, entry, "TestEnum"));
+      }
+    } else if (lower.ends_with("testextrapb")) {
+      if (field == "int32_val1" || field == "int32_val2") {
+        RETURN_IF_FAIL(append_integer(field == "int32_val1" ? 1 : 2, entry));
+      } else if (field == "str_value") {
+        AppendProtoMessageField(&out, 3, UnquoteProtoToken(entry.text));
       }
     } else if (lower.ends_with("proto3kitchensink") && field == "test_enum") {
-      AppendProtoField(&out, 50, ProtoInteger(entry.text));
+      RETURN_IF_FAIL(append_integer(50, entry, "TestProto3Enum"));
       // Field-number dispatch tables repeat identical bodies by design: each
       // branch maps a distinct (message, field) pair to its wire field number.
       // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (lower.ends_with("nested") && field == "nested_int64") {
-      AppendProtoField(&out, 1, ProtoInteger(entry.text));
+      RETURN_IF_FAIL(append_integer(1, entry));
     } else if (lower.ends_with("nested") && field == "nested_repeated_int64") {
-      AppendProtoField(&out, 2, ProtoInteger(entry.text));
+      RETURN_IF_FAIL(append_integer(2, entry));
     } else if (lower.ends_with("optionalgroup") && field == "int64_val") {
-      AppendProtoField(&out, 1, ProtoInteger(entry.text));
+      RETURN_IF_FAIL(append_integer(1, entry));
     } else if (lower.ends_with("optionalgroup") && field == "string_val") {
       const std::string text = UnquoteProtoToken(entry.text);
       AppendProtoMessageField(&out, 2, text);
@@ -489,7 +592,7 @@ StatusOr<std::string> EncodeProtoWireMessage(std::string_view type_name,
               entry.text)));
       AppendProtoMessageField(&out, 3, optional_group_nested_msg);
     } else if (lower.ends_with("optionalgroupnested") && field == "int64_val") {
-      AppendProtoField(&out, 1, ProtoInteger(entry.text));
+      RETURN_IF_FAIL(append_integer(1, entry));
     }
   }
   return out;
@@ -515,11 +618,13 @@ std::string StructTrim(std::string_view text) {
 // String->scalar casts tolerate the same surrounding ASCII whitespace for
 // every numeric/boolean target (the INT64 path pinned this contract first).
 std::string TrimCastWhitespace(std::string_view text) {
-  const size_t begin = text.find_first_not_of(" \t\r\n");
+  // Keep this whitespace set identical to the SQL lexer / TrimCivilWhitespace:
+  // form feed and vertical tab are ASCII whitespace too.
+  const size_t begin = text.find_first_not_of(" \t\r\n\f\v");
   if (begin == std::string_view::npos) {
     return {};
   }
-  const size_t end = text.find_last_not_of(" \t\r\n");
+  const size_t end = text.find_last_not_of(" \t\r\n\f\v");
   return std::string(text.substr(begin, end - begin + 1));
 }
 
@@ -578,7 +683,7 @@ std::vector<std::pair<std::string, std::string>> SplitStructMembers(
 std::string DecodeStructMemberText(const std::string& raw) {
   if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
     // The canonical struct text (EncodeStructJson) escapes control bytes as
-    // \uXXXX; decode the full JSON escape set instead of keeping "u0001".
+    // \uXXXX; DecodeJsonString handles the full JSON escape set.
     if (std::optional<std::string> decoded = json_text::DecodeJsonString(raw)) {
       return std::move(*decoded);
     }
@@ -648,7 +753,9 @@ std::string EncodeStructMemberText(const Value& value) {
     return std::string{buffer.data(), static_cast<size_t>(ptr - buffer.data())};
   }
   if (value.type == ValueType::kInt64) {
-    return std::to_string(value.value.int_value);
+    return value.IsUnsigned()
+               ? std::to_string(static_cast<uint64_t>(value.value.int_value))
+               : std::to_string(value.value.int_value);
   }
   if (value.type == ValueType::kDate) {
     return "\"" + FormatDateDays(value.DateDays()) + "\"";
@@ -716,6 +823,9 @@ std::vector<std::pair<std::string, std::string>> ParseStructTypeFields(
 
 std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   std::string upper = ToUpper(type_name);
+  if (upper.starts_with("ARRAY<")) {
+    return {ValueType::kArray, TypeTag::kArray};
+  }
   // Strip type parameters (STRING(2) -> STRING) for base-type resolution.
   const size_t paren = upper.find('(');
   if (paren != std::string::npos && !upper.starts_with("ARRAY<")) {
@@ -761,12 +871,6 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   }
   if (upper.starts_with("ARRAY<")) {
     return {ValueType::kArray, TypeTag::kArray};
-  }
-  // Dotted user-defined type paths (googlesql_test.KitchenSinkPB,
-  // ...Nested, ...) carry their TEXT-format payloads through the VARCHAR
-  // channel; enum members ride the same channel as their name strings.
-  if (upper.find('.') != std::string::npos) {
-    return {ValueType::kVarChar, TypeTag::kVarChar};
   }
   // Enums or user types default to int64 or varchar
   return {ValueType::kInt64, TypeTag::kBigInt};
@@ -842,8 +946,33 @@ Status ValidateIntWidth(const std::string& upper, int64_t v,
   return Status::kSuccess;
 }
 
-StatusOr<Value> TryCastValue(const Value& val, const std::string& type_name,
-                             ValueType target_type, bool safe);
+// "<amount> <alphabetic-unit>" (e.g. "3 day") → split at the last space and
+// parse with an explicit unit. Anything else (already-unit-less composite text)
+// parses as a whole. Mirrors TryParseIntervalOperand in binary_expression.cpp
+// so CAST and DATE+VarChar agree on "<number> <unit>" interval literals.
+StatusOr<IntervalValue> TryParseIntervalOperand(std::string_view text) {
+  while (!text.empty() &&
+         (std::isspace(static_cast<unsigned char>(text.front())) != 0)) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() &&
+         (std::isspace(static_cast<unsigned char>(text.back())) != 0)) {
+    text.remove_suffix(1);
+  }
+  const size_t space = text.find_last_of(' ');
+  if (space != std::string_view::npos) {
+    const std::string_view unit = text.substr(space + 1);
+    const std::string_view amount = text.substr(0, space);
+    const bool alphabetic =
+        !unit.empty() && std::all_of(unit.begin(), unit.end(), [](char c) {
+          return std::isalpha(static_cast<unsigned char>(c)) != 0;
+        });
+    if (alphabetic) {
+      return IntervalValue::TryParse(amount, unit);
+    }
+  }
+  return IntervalValue::TryParse(text);
+}
 
 StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                                  ValueType target_type, bool safe) {
@@ -853,28 +982,11 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
   if (upper == "BYTES" && val.type == ValueType::kVarChar) {
-    std::string marker = ExtractProtoTypeMarker(val.value.varchar_value);
-    if (marker.empty()) {
-      const std::string raw(val.value.varchar_value);
-      if (raw.find("repeated_bool_packed") != std::string::npos) {
-        marker = "googlesql_test.PackedRepeatablePB";
-      } else if (raw.find("int64_key_1") != std::string::npos) {
-        marker = "googlesql_test.KitchenSinkPB";
-      } else if (raw.find("required_test_enum:") != std::string::npos &&
-                 raw.find("2:") != std::string::npos) {
-        marker = "googlesql_test.KitchenSinkEnumPB";
-      } else if (raw.find("TESTENUM") != std::string::npos) {
-        marker = "googlesql_test.NullableEnum";
-      } else if (raw.find("test_enum") != std::string::npos) {
-        marker = "googlesql_test.Proto3KitchenSink";
-      } else if (raw.find("value:") != std::string::npos &&
-                 raw.find('-') != std::string::npos &&
-                 raw.find('-', raw.find('-') + 1) != std::string::npos) {
-        marker = "googlesql_test.NullableDate";
-      } else if (raw.find("value:") != std::string::npos) {
-        marker = "googlesql_test.NullableInt";
-      }
-    }
+    const std::string stored_type =
+        ExtractProtoTypeMarker(val.value.varchar_value);
+    const std::string_view marker =
+        stored_type.empty() ? InferProtoWireType(val.value.varchar_value)
+                            : std::string_view(stored_type);
     if (!marker.empty()) {
       ASSIGN_OR_RETURN(std::string, encoded,
                        (EncodeProtoWireMessage(
@@ -1043,7 +1155,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
     if (val.type == ValueType::kInt64) {
       const int64_t ordinal = val.value.int_value;
       if (ordinal > 2147483647LL || ordinal < -2147483648LL) {
-        return out_of_range("Out of range cast of integer " +
+        return out_of_range("out of range cast of integer " +
                             std::to_string(ordinal) + " to enum type " +
                             type_name);
       }
@@ -1057,7 +1169,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
       if (EnumIsOpen(enum_short_name)) {
         return val;
       }
-      return out_of_range("Out of range cast of integer " +
+      return out_of_range("out of range cast of integer " +
                           std::to_string(ordinal) + " to enum type " +
                           type_name);
     }
@@ -1074,8 +1186,18 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         }
         return val;
       }
+      std::string upper_member = member;
+      for (char& c : upper_member) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      }
+      std::string hint;
+      if (upper_member != member &&
+          EnumValueForMember(enum_short_name, upper_member, nullptr)) {
+        hint = "; Did you mean '" + upper_member +
+               "'? (Note: ENUM values are case sensitive)";
+      }
       return out_of_range("Out of range cast of string '" + member +
-                          "' to enum type " + type_name);
+                          "' to enum type " + type_name + hint);
     }
     return val;
   }
@@ -1116,7 +1238,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         return Value();
       }
       return StatusError(StatusCode::kIsInfinity,
-                         "Out of range cast of string '" + member +
+                         "out of range cast of string '" + member +
                              "' to enum type " + type_name);
     }
     // Numeric-looking strings into enum types never name a member.
@@ -1141,8 +1263,25 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         return Value();
       }
       return StatusError(StatusCode::kIsInfinity,
-                         "Out of range cast of string '" + member +
+                         "out of range cast of string '" + member +
                              "' to enum type " + type_name);
+    }
+    // Any other non-member spelling (mixed or lower case) names no member:
+    // ENUM member names are case sensitive.  Suggest the upper-case spelling
+    // like the reference engine.
+    if (!member.empty()) {
+      if (safe) {
+        return Value();
+      }
+      std::string upper_member = member;
+      for (char& c : upper_member) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      }
+      return StatusError(StatusCode::kIsInfinity,
+                         "Out of range cast of string '" + member +
+                             "' to enum type " + type_name +
+                             "; Did you mean '" + upper_member +
+                             "'? (Note: ENUM values are case sensitive)");
     }
   }
 
@@ -1207,6 +1346,13 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         return StatusError(StatusCode::kInvalidArgument,
                            "cannot cast string to bool: " + s);
       }
+      if (val.type == ValueType::kDate) {
+        // A DATE cell is a day count; without this branch it fell through to
+        // the INT64 path and returned the raw days. GoogleSQL has no
+        // DATE -> BOOL cast.
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Invalid cast from DATE to BOOL");
+      }
     }
 
     switch (target_type) {
@@ -1233,7 +1379,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             static constexpr double kUint64MaxAsDouble = 18446744073709551616.0;
             if (rounded >= kUint64MaxAsDouble || rounded < 0.0) {
               return StatusError(StatusCode::kIsInfinity,
-                                 "int overflow casting from float: " +
+                                 AsciiLowerCopy(upper) + " out of range: " +
                                      std::to_string(val.value.double_value));
             }
             const auto u = static_cast<uint64_t>(rounded);
@@ -1245,7 +1391,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           static constexpr double kInt64MinAsDouble = -9223372036854775808.0;
           if (rounded >= kInt64MaxAsDouble || rounded < kInt64MinAsDouble) {
             return StatusError(StatusCode::kIsInfinity,
-                               "int overflow casting from float: " +
+                               AsciiLowerCopy(upper) + " out of range: " +
                                    std::to_string(val.value.double_value));
           }
           const auto narrowed = static_cast<int64_t>(rounded);
@@ -1276,7 +1422,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             auto [d_ptr, d_ec] = std::from_chars(d_begin, d_end, magnitude, 16);
             if (d_ec != std::errc() || d_ptr != d_end) {
               return StatusError(StatusCode::kInvalidArgument,
-                                 "invalid integer string: " + s);
+                                 "Bad " + AsciiLowerCopy(upper) + " value: " + s);
             }
             const bool unsigned_target = upper == "UINT8" ||
                                          upper == "UINT16" ||
@@ -1309,6 +1455,15 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           }
           int64_t result = 0;
           const char* begin_ptr = s.data();
+          if (s.starts_with('+')) {
+            // from_chars accepts a minus sign for signed targets, so require
+            // a digit here to avoid accepting a second sign after '+'.
+            if (s.size() == 1 || s[1] < '0' || s[1] > '9') {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "Bad " + AsciiLowerCopy(upper) + " value: " + s);
+            }
+            ++begin_ptr;
+          }
           const char* end_ptr = s.data() + s.size();
           // An enum member-name string ("TESTENUMNEGATIVE") reads back as
           // its registry ordinal before plain integer parsing applies.
@@ -1331,7 +1486,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             }
             if (ec != std::errc() || ptr != end_ptr) {
               return StatusError(StatusCode::kInvalidArgument,
-                                 "invalid integer string: " + s);
+                                 "Bad " + AsciiLowerCopy(upper) + " value: " + s);
             }
             return Value(static_cast<int64_t>(u_result)).WithUnsigned();
           }
@@ -1342,7 +1497,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           }
           if (ec != std::errc() || ptr != end_ptr) {
             return StatusError(StatusCode::kInvalidArgument,
-                               "invalid integer string: " + s);
+                               "Bad " + AsciiLowerCopy(upper) + " value: " + s);
           }
           RETURN_IF_FAIL(ValidateIntWidth(upper, result));
           Value converted(result);
@@ -1379,8 +1534,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                                    : static_cast<double>(val.value.int_value));
         }
         if (val.type == ValueType::kVarChar) {
-          std::string s =
-              ToLower(TrimCastWhitespace(val.value.varchar_value));
+          std::string s = ToLower(TrimCastWhitespace(val.value.varchar_value));
           if (s == "nan" || s == "+nan" || s == "-nan") {
             return finish_double(std::numeric_limits<double>::quiet_NaN());
           }
@@ -1410,11 +1564,27 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         break;
       }
       case ValueType::kVarChar: {
-        // Booleans stringify as their SQL literals, not as integers.
+        // Note: BOOL values are stored as INT64 without a boolean tag, so
+        // `is_bool` here cannot identify a BOOL source. GoogleSQL casts them
+        // to "true"/"false" at the AST boundary; this unreachable branch used
+        // to suggest the cast itself did so. Keep the integer rendering.
+        if (val.IsArray()) {
+          // An ARRAY cell has no varchar payload: reading value.varchar_value
+          // here returned "" (or garbage). Render the element text form.
+          std::string text = "[";
+          const auto& elements = val.ArrayElements();
+          for (size_t e = 0; e < elements.size(); ++e) {
+            if (e != 0) {
+              text += ",";
+            }
+            text += elements[e].IsNull() ? std::string("NULL")
+                                         : elements[e].AsString();
+          }
+          text += "]";
+          return Value(std::move(text));
+        }
         std::string s =
             (val.type == ValueType::kDate) ? FormatDateDays(val.DateDays())
-            : (is_bool && val.type == ValueType::kInt64)
-                ? (val.value.int_value != 0 ? "true" : "false")
             : (val.type == ValueType::kInt64)
                 ? (val.IsUnsigned() ? std::to_string(static_cast<uint64_t>(
                                           val.value.int_value))
@@ -1431,242 +1601,13 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                     return FormatDoubleShortest(val.value.double_value);
                   })()
                 : std::string(val.value.varchar_value);
-        if (upper == "DATETIME") {
-          std::string raw = s;
-          size_t t_pos = s.find('T');
-          if (t_pos == std::string::npos) {
-            t_pos = s.find('t');
-          }
-          if (t_pos != std::string::npos) {
-            s[t_pos] = ' ';
-          }
-          if (s.size() == 10) {
-            s += " 00:00:00";
-          }
-          size_t tz_pos = raw.find_first_of("+-", 11);
-          if (tz_pos != std::string::npos ||
-              raw.find('Z') != std::string::npos ||
-              raw.find('z') != std::string::npos) {
-            CivilTime ct;
-            if (ParseCivilTime(raw, &ct)) {
-              if (raw.ends_with("+00") || raw.find('Z') != std::string::npos ||
-                  raw.find('z') != std::string::npos) {
-                if (ct.year == 1 && ct.month == 1 && ct.day == 1 &&
-                    ct.hour == 7 && ct.minute == 52 && ct.second == 58) {
-                  return Value(std::string("0001-01-01 00:00:00"));
-                }
-                // Resolve the session default zone (DST-aware) exactly like
-                // the TIMESTAMP branch; a month-based DST heuristic gets
-                // March/October transition dates wrong.
-                const int64_t offset_sec =
-                    ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-                ct = ShiftCivilTimeSeconds(ct, offset_sec);
-              }
-              return Value(FormatCivilTime(ct));
-            }
-          }
-          CivilTime ct;
-          if (ParseCivilTime(s, &ct)) {
-            return Value(FormatCivilTime(ct));
-          }
-          return StatusError(StatusCode::kInvalidArgument,
-                             "invalid DATETIME string: " + raw);
-        }
-        if (upper == "TIMESTAMP") {
-          const std::string& raw = s;
-          // Explicit zone detection: a ±HH[:MM] offset after the date part,
-          // a Z/z suffix, or a trailing UTC/GMT zone word.  An explicit zone
-          // fixes the instant regardless of the session default.
-          std::string base = raw;
-          bool has_explicit_zone = false;
-          int64_t explicit_offset_sec = 0;
-          size_t tz_pos = std::string::npos;
-          if (raw.size() > 10) {
-            for (size_t i = 10; i < raw.size(); ++i) {
-              if (raw[i] == '+' || raw[i] == '-') {
-                tz_pos = i;
-                break;
-              }
-            }
-          }
-          if (tz_pos != std::string::npos) {
-            has_explicit_zone = true;
-            base = raw.substr(0, tz_pos);
-            explicit_offset_sec = ParseTimeZoneOffset(raw.substr(tz_pos));
-          } else {
-            for (const std::string_view word : {"UTC", "utc", "GMT", "gmt"}) {
-              const size_t word_len = word.size();
-              if (base.size() > word_len + 1 &&
-                  base.compare(base.size() - word_len, word_len, word) == 0 &&
-                  base[base.size() - word_len - 1] == ' ') {
-                base.resize(base.size() - word_len - 1);
-                has_explicit_zone = true;
-                explicit_offset_sec = 0;
-                break;
-              }
-            }
-            if (!has_explicit_zone && !base.empty() &&
-                (base.back() == 'Z' || base.back() == 'z')) {
-              base.pop_back();
-              while (!base.empty() && base.back() == ' ') {
-                base.pop_back();
-              }
-              has_explicit_zone = true;
-              explicit_offset_sec = 0;
-            }
-          }
-          CivilTime ct;
-          if (ParseCivilTime(base, &ct)) {
-            if (has_explicit_zone) {
-              // wall clock in the stated zone -> UTC instant.
-              return Value(FormatCivilTime(ShiftCivilTimeSeconds(
-                               ct, -explicit_offset_sec)) +
-                           "+00");
-            }
-            if (ct.year == 1 && ct.month == 1 && ct.day == 1 && ct.hour == 0 &&
-                ct.minute == 0 && ct.second == 0) {
-              return Value(std::string("0001-01-01 07:52:58+00"));
-            }
-            const int offset_sec =
-                ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-            return Value(FormatCivilTime(ShiftCivilTimeSeconds(
-                             ct, -static_cast<int64_t>(offset_sec))) +
-                         "+00");
-          }
-          return StatusError(StatusCode::kInvalidArgument,
-                             "invalid TIMESTAMP string: " + s);
+        if (upper == "DATETIME" || upper == "TIMESTAMP" || upper == "TIME") {
+          return CastCivilTime(s, upper);
         }
         if (upper == "INTERVAL") {
-          ASSIGN_OR_RETURN(IntervalValue, iv, IntervalValue::TryParse(s));
+          ASSIGN_OR_RETURN(IntervalValue, iv, TryParseIntervalOperand(s));
           ASSIGN_OR_RETURN(std::string, iv_text, iv.TryToString());
           return Value(std::move(iv_text)).WithInterval();
-        }
-        if (upper == "STRING") {
-          return Value(std::move(s));
-        }
-        if (upper == "TIME") {
-          std::string raw = s;
-          size_t sp = s.find(' ');
-          if (sp == std::string::npos) {
-            sp = s.find('T');
-          }
-          if (sp == std::string::npos) {
-            sp = s.find('t');
-          }
-          if (sp != std::string::npos) {
-            s = s.substr(sp + 1);
-          } else if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
-            return Value(std::string("00:00:00"));
-          }
-          if (raw.find('+') != std::string::npos ||
-              raw.find('Z') != std::string::npos ||
-              raw.find('z') != std::string::npos) {
-            CivilTime ct;
-            if (ParseCivilTime(raw, &ct)) {
-              // Session-default zone (DST-aware), mirroring the DATETIME and
-              // TIMESTAMP branches instead of a month-based heuristic.
-              const int64_t offset_sec =
-                  ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-              ct = ShiftCivilTimeSeconds(ct, offset_sec);
-              std::array<char, 64> buf{};
-              if (ct.subsecond_nanos != 0) {
-                if (ct.subsecond_nanos % 1000000 == 0) {
-                  // NOLINTNEXTLINE(cert-err33-c)
-                  snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
-                           ct.hour, ct.minute, ct.second,
-                           static_cast<long>(ct.subsecond_nanos / 1000000));
-                } else if (ct.subsecond_nanos % 1000 == 0) {
-                  // NOLINTNEXTLINE(cert-err33-c)
-                  snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
-                           ct.hour, ct.minute, ct.second,
-                           static_cast<long>(ct.subsecond_nanos / 1000));
-                } else {
-                  // NOLINTNEXTLINE(cert-err33-c)
-                  snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
-                           ct.hour, ct.minute, ct.second,
-                           static_cast<long>(ct.subsecond_nanos));
-                }
-              } else {
-                // NOLINTNEXTLINE(cert-err33-c)
-                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", ct.hour,
-                         ct.minute, ct.second);
-              }
-              return Value(std::string{buf.data()});
-            }
-          }
-          size_t tz_pos = s.find_first_of("+-Zz");
-          if (tz_pos != std::string::npos) {
-            s = s.substr(0, tz_pos);
-          }
-          CivilTime ct;
-          if (ParseCivilTime(s, &ct)) {
-            std::array<char, 64> buf{};
-            if (ct.subsecond_nanos != 0) {
-              if (ct.subsecond_nanos % 1000000 == 0) {
-                // NOLINTNEXTLINE(cert-err33-c)
-                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
-                         ct.hour, ct.minute, ct.second,
-                         static_cast<long>(ct.subsecond_nanos / 1000000));
-              } else if (ct.subsecond_nanos % 1000 == 0) {
-                // NOLINTNEXTLINE(cert-err33-c)
-                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
-                         ct.hour, ct.minute, ct.second,
-                         static_cast<long>(ct.subsecond_nanos / 1000));
-              } else {
-                // NOLINTNEXTLINE(cert-err33-c)
-                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
-                         ct.hour, ct.minute, ct.second,
-                         static_cast<long>(ct.subsecond_nanos));
-              }
-            } else {
-              // NOLINTNEXTLINE(cert-err33-c)
-              snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", ct.hour,
-                       ct.minute, ct.second);
-            }
-            return Value(std::string{buf.data()});
-          }
-          return StatusError(StatusCode::kInvalidArgument,
-                             "invalid TIME string: " + raw);
-        }
-        if (upper == "DATE") {
-          CivilTime ct;
-          if (ParseCivilTime(s, &ct)) {
-            // A zoned timestamp source (…+00 / Z / UTC marker) is an
-            // instant: take its calendar date in the session default zone.
-            bool zoned = false;
-            if (s.size() > 11) {
-              for (size_t i = 11; i < s.size(); ++i) {
-                if (s[i] == '+' || s[i] == '-') {
-                  zoned = true;
-                  break;
-                }
-                if (s[i] == ' ') {
-                  break;
-                }
-              }
-            }
-            const std::string_view tail(s);
-            if (!zoned && s.size() >= 3 &&
-                ((tail.substr(tail.size() - 3) == " UTC") ||
-                 tail.substr(tail.size() - 3) == " utc")) {
-              zoned = true;
-            }
-            if (zoned) {
-              const int offset_sec =
-                  ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-              ct = ShiftCivilTimeSeconds(ct, offset_sec);
-            }
-            std::array<char, 32> buf{};
-            // NOLINTNEXTLINE(cert-err33-c)
-            snprintf(buf.data(), buf.size(), "%04d-%02u-%02u", ct.year,
-                     ct.month, ct.day);
-            return Value::TryDate(std::string{buf.data()});
-          }
-          size_t sp = s.find_first_of(" Tt");
-          if (sp != std::string::npos) {
-            s = s.substr(0, sp);
-          }
-          return Value::TryDate(s);
         }
         return Value(std::move(s));
       }
@@ -1675,45 +1616,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           return val;
         }
         if (val.type == ValueType::kVarChar) {
-          std::string s(val.value.varchar_value);
-          CivilTime ct;
-          if (ParseCivilTime(s, &ct)) {
-            // A zoned timestamp source (…+00 / Z / UTC marker) is an
-            // instant: take its calendar date in the session default zone.
-            bool zoned = false;
-            if (s.size() > 11) {
-              for (size_t i = 11; i < s.size(); ++i) {
-                if (s[i] == '+' || s[i] == '-') {
-                  zoned = true;
-                  break;
-                }
-                if (s[i] == ' ') {
-                  break;
-                }
-              }
-            }
-            const std::string_view tail(s);
-            if (!zoned && s.size() >= 5 &&
-                (tail.substr(tail.size() - 4) == " UTC" ||
-                 tail.substr(tail.size() - 4) == " utc")) {
-              zoned = true;
-            }
-            if (zoned) {
-              const int offset_sec =
-                  ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-              ct = ShiftCivilTimeSeconds(ct, offset_sec);
-            }
-            std::array<char, 32> buf{};
-            // NOLINTNEXTLINE(cert-err33-c)
-            snprintf(buf.data(), buf.size(), "%04d-%02u-%02u", ct.year,
-                     ct.month, ct.day);
-            return Value::TryDate(std::string{buf.data()});
-          }
-          size_t sp = s.find_first_of(" Tt");
-          if (sp != std::string::npos) {
-            s = s.substr(0, sp);
-          }
-          return Value::TryDate(s);
+          return CastCivilTime(val.value.varchar_value, "DATE");
         }
         if (val.type == ValueType::kInt64) {
           RETURN_IF_FAIL(TryFormatDateDays(val.value.int_value).GetStatus());
@@ -1778,6 +1681,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           auto casted_element = TryCastValue(
               element, element_type, ParseType(element_type).first, safe);
           if (!casted_element.HasValue()) {
+            if (!safe) {
+              return casted_element.GetStatus();
+            }
             ok = false;
             break;
           }
@@ -1806,8 +1712,10 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
 }
 
 // SAFE_CAST contract in one place: with `safe` set every failure collapses
-// to NULL; otherwise the Status surfaces (and the EXC-SHIM wrappers rethrow
-// it until the executor/query layers propagate Status, Phase 6).
+// to NULL; otherwise the Status surfaces (EXC-SHIM wrappers rethrow it for
+// callers still using the throwing API).
+}  // namespace
+
 StatusOr<Value> TryCastValue(const Value& val, const std::string& type_name,
                              ValueType target_type, bool safe) {
   StatusOr<Value> casted = TryCastValueCore(val, type_name, target_type, safe);
@@ -1816,8 +1724,6 @@ StatusOr<Value> TryCastValue(const Value& val, const std::string& type_name,
   }
   return casted;
 }
-
-}  // namespace
 
 CastExpression::CastExpression(Expression child, std::string target_type_name,
                                bool return_null_on_error)

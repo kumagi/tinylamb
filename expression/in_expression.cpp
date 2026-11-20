@@ -20,6 +20,7 @@
 #include <ostream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
@@ -33,25 +34,28 @@
 namespace tinylamb {
 
 namespace {
-StatusOr<Value> TryMatches(const Value& child, const Value& candidate) {
-  if (HaveConflictingCollations(child, candidate)) {
-    return StatusError(StatusCode::kInvalidArgument,
-                       "Collation conflict between the IN operands");
-  }
-  return TryEvaluateBinary(BinaryOperation::kEquals, child, candidate);
-}
-
 template <typename... Args>
 StatusOr<Value> TryMembership(const ExpressionBase& child,
                               const std::vector<Expression>& list,
                               Args&&... args) {
   ASSIGN_OR_RETURN(Value, child_value, child.TryEvaluate(args...));
   bool saw_null = child_value.IsNull();
+  // Candidates are tried in order and the first match wins: neither an
+  // evaluation error nor a collation conflict in a later candidate is raised
+  // (`-1 IN (-1, 1/0)` is TRUE), matching the bytecode/rewrite paths that the
+  // differential audits pin.
   for (const auto& item : list) {
     ASSIGN_OR_RETURN(Value, candidate, item->TryEvaluate(args...));
+    if (!child_value.IsNull() && !candidate.IsNull() &&
+        HaveConflictingCollations(child_value, candidate)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Collation conflict between the IN operands");
+    }
     saw_null |= candidate.IsNull();
     if (!child_value.IsNull() && !candidate.IsNull()) {
-      ASSIGN_OR_RETURN(Value, match, TryMatches(child_value, candidate));
+      ASSIGN_OR_RETURN(
+          Value, match,
+          TryEvaluateBinary(BinaryOperation::kEquals, child_value, candidate));
       if (match.IsNull()) {
         saw_null = true;
       } else if (match.Truthy()) {

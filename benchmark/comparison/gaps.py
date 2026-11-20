@@ -69,10 +69,19 @@ def collect(records, profile, threshold=10, reference_engine="postgresql"):
         trial_ids=[{r['trial'] for r in trials} for trials in (t,p)]
         if trial_ids[0]!=trial_ids[1] or any(len(ids)!=len(trials) for ids,trials in zip(trial_ids,(t,p))):
             raise ValueError('OLTP trial IDs must match and must not repeat')
+        by_trial=({r['trial']:r for r in t},{r['trial']:r for r in p})
         for metric in ('tps','p50_ms','p95_ms','p99_ms'):
+            # Pair by trial id so both medians are over the SAME trials; filtering
+            # None independently on each side could compare different sets.
+            trial_values=([],[])
+            for trial_id in sorted(by_trial[0]):
+                left,right=by_trial[0][trial_id][metric],by_trial[1][trial_id][metric]
+                if left is None or right is None:
+                    raise ValueError(f'metric {metric} missing for trial {trial_id}')
+                trial_values[0].append(left)
+                trial_values[1].append(right)
             emit('tail' if metric in ('p95_ms','p99_ms') else 'oltp',name,metric,
-                 [r[metric] for r in t if r[metric] is not None],
-                 [r[metric] for r in p if r[metric] is not None],clients=clients,
+                 trial_values[0],trial_values[1],clients=clients,
                  measured_errors_tinylamb=sum(r['errors'] for r in t),
                  **{"measured_errors_"+reference_engine:sum(r['errors'] for r in p)})
         if name=='htap':
@@ -121,7 +130,11 @@ def main():
     comparisons=[]
     for profile in ('unindexed','indexed'):
         path=args.directory/profile/'results.jsonl'
+        if not path.is_file():
+            parser.error(f'missing {path}')
         comparisons.extend(collect([json.loads(line) for line in path.read_text().splitlines()],profile,args.threshold,args.reference_engine))
+    if args.output.exists() and not args.overwrite:
+        parser.error(f'{args.output} exists; pass --overwrite')
     selected=[r for r in comparisons if r['qualified']]
     result={'source':str(args.directory),'reference_engine':args.reference_engine,'threshold':args.threshold,
             'comparison_count':len(comparisons),'qualified_count':len(selected),

@@ -55,10 +55,6 @@ std::vector<EnumSchema> BuildEnums() {
   return enums;
 }
 
-const std::vector<EnumSchema>& Enums() {
-  static const std::vector<EnumSchema> enums = BuildEnums();
-  return enums;
-}
 
 bool NameMatches(std::string_view left, std::string_view right) {
   if (left.size() != right.size()) {
@@ -242,6 +238,14 @@ const MessageMap& Messages() {
 
 }  // namespace
 
+// T4465: the registry is exposed in the header now (it used to be
+// anonymous-namespace-private, which forced proto_text.cpp's
+// IsKnownEnumTypeName to hand-copy a name list that silently drifted).
+[[nodiscard]] const std::vector<EnumSchema>& Enums() {
+  static const std::vector<EnumSchema> enums = BuildEnums();
+  return enums;
+}
+
 const std::vector<ProtoFieldSchema>* FindProtoMessageFields(
     const std::string& full_name) {
   const MessageMap& messages = Messages();
@@ -275,6 +279,8 @@ bool EnumValueForMember(std::string_view enum_short_name, std::string_view name,
       continue;
     }
     for (const auto& [member, ordinal_value] : schema.members) {
+      // Enum member names are case sensitive (GoogleSQL: 'TestEnum1' is not
+      // TESTENUM1); only the enum *type* name matches case-insensitively.
       if (member == name) {
         if (ordinal != nullptr) {
           *ordinal = ordinal_value;
@@ -290,7 +296,7 @@ bool EnumValueForMember(std::string_view enum_short_name, std::string_view name,
 std::optional<int64_t> OrdinalForEnumMemberName(std::string_view name) {
   for (const EnumSchema& schema : Enums()) {
     for (const auto& [member, ordinal] : schema.members) {
-      if (member == name) {
+      if (NameMatches(member, name)) {
         return ordinal;
       }
     }

@@ -78,6 +78,11 @@ class AggregationExecutor : public ExecutorBase {
     size_t column{0};
     ValueType type{ValueType::kNull};
     Value constant;
+    // T3950: schema slot of a kColumnValue child for generic-path aggregates;
+    // -1 when the child is not a plain column reference.  The generic per-row
+    // loop used to run input_schema_.Offset() (a name scan over every column)
+    // for each row instead of reusing this loop invariant.
+    int generic_column{-1};
   };
   // Accumulates one whole batch through the typed accumulators.  Returns
   // false when the batch layout does not match the declared types; the caller
@@ -99,6 +104,9 @@ class AggregationExecutor : public ExecutorBase {
   bool all_typed_{false};
   bool affine_folded_{false};
   bool executed_ = false;
+  // T1793: rows actually consumed from the child across ALL drain paths
+  // (the JIT loop's rows_seen_ only ticks on the compiled-SUM arm).
+  size_t input_rows_{0};
   DataChunk input_batch_;
   bool jit_sum_eligible_{false};
   uint16_t jit_sum_column_{0};

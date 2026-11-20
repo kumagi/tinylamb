@@ -2,6 +2,7 @@
 #define TINYLAMB_INCARNATION_HPP
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -104,12 +105,13 @@ class TableIncarnation {
       quiescent_.notify_all();
       return;
     }
-    --active_leases_;
     auto found = owner_leases_.find(owner);
-    if (found != owner_leases_.end()) {
-      if (--found->second == 0) {
-        owner_leases_.erase(found);
-      }
+    if (found == owner_leases_.end()) {
+      return;  // unknown owner: do not break the active/owner accounting
+    }
+    --active_leases_;
+    if (--found->second == 0) {
+      owner_leases_.erase(found);
     }
     if (active_leases_ == 0) {
       quiescent_.notify_all();
@@ -138,7 +140,12 @@ class TableIncarnation {
     if (owner_leases_.contains(owner)) {
       return false;
     }
-    quiescent_.wait(lock, [&] { return active_leases_ == 0; });
+    // Do not block a DDL worker forever on a leaked/long-lived lease: the
+    // callers already treat false as a retryable conflict.
+    if (!quiescent_.wait_for(lock, std::chrono::seconds(60),
+                             [&] { return active_leases_ == 0; })) {
+      return false;
+    }
     return true;
   }
 
@@ -248,25 +255,32 @@ class TableIncarnation {
     lstable_capacity_rejected_generation_.store(generation,
                                                 std::memory_order_release);
   }
-  [[nodiscard]] std::shared_ptr<const void> GetBackingTLCSStoreRaw() const {
+  [[nodiscard]] std::shared_ptr<const void> GetBackingTlcsStoreRaw() const {
     std::scoped_lock lock(columnar_cache_->mu);
     return backing_tlcs_store_;
   }
   void SetBackingTLCSStoreRaw(std::shared_ptr<const void> store) {
-    std::scoped_lock lock(columnar_cache_->mu);
-    backing_tlcs_store_ = std::move(store);
+    std::shared_ptr<const void> old;
+    {
+      std::scoped_lock lock(columnar_cache_->mu);
+      old = std::move(backing_tlcs_store_);
+      backing_tlcs_store_ = std::move(store);
+    }
+    // Destroy the old TlcsFile outside the mutex so its budget return and
+    // mmap unmap do not block a concurrent reclaim hook.
   }
 
  private:
   void TouchColumnarCache() const noexcept {
-    static std::atomic<uint64_t> clock{1};
-    columnar_cache_->recency->store(
-        clock.fetch_add(1, std::memory_order_relaxed),
-        std::memory_order_relaxed);
+    // Callers hold columnar_cache_->mu, so a per-cache plain counter suffices;
+    // a process-global atomic would serialise unrelated tables on one line.
+    columnar_cache_->recency->store(++columnar_cache_->touch_clock,
+                                    std::memory_order_relaxed);
   }
 
   struct ColumnarCacheState {
     ReclaimRecency recency{std::make_shared<std::atomic<uint64_t>>(0)};
+    uint64_t touch_clock{1};  // guarded by mu
     mutable std::mutex mu;
     std::shared_ptr<const void> lstable_store;
     std::shared_ptr<const void> projected_lstable_store;

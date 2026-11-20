@@ -695,7 +695,7 @@ def main():
     bench.add_argument('--reference', choices=('clickhouse', 'duckdb'), default='clickhouse')
     bench.add_argument('--duckdb', type=Path)
     bench.add_argument('--url', default='http://127.0.0.1:18123')
-    bench.add_argument('--database', default='cb1m')
+    bench.add_argument('--database', default='clickbench')
     bench.add_argument('--server-pid', type=int)
     bench.add_argument('--threads', type=int, default=2)
     bench.add_argument('--cpus', default='0,1')

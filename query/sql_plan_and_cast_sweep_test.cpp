@@ -67,7 +67,7 @@ int64_t ScalarInt(SqlEngine* engine, TransactionContext* ctx,
 
 }  // namespace
 
-class SqlPlanCacheSweepTest : public ::testing::Test {
+class SqlPlanAndCastSweepTest : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
@@ -102,7 +102,7 @@ class SqlPlanCacheSweepTest : public ::testing::Test {
 // Repeated same-shape INSERTs with varying literals: the first fill stores a
 // parametric plan, every further execution replays it with new parameter
 // values (ParameterSlot::Evaluate paths in plan_cache.hpp).
-TEST_F(SqlPlanCacheSweepTest, RepeatedInsertShapesReplayParameterized) {
+TEST_F(SqlPlanAndCastSweepTest, RepeatedInsertShapesReplayParameterized) {
   for (int64_t i = 0; i < 12; ++i) {
     RunSql(engine_.get(), context_.get(),
            "INSERT INTO pc VALUES (" + std::to_string(i) + ", 'name" +
@@ -116,7 +116,7 @@ TEST_F(SqlPlanCacheSweepTest, RepeatedInsertShapesReplayParameterized) {
 }
 
 // Repeated same-shape SELECT / UPDATE / DELETE replay compiled plans.
-TEST_F(SqlPlanCacheSweepTest, RepeatedSelectUpdateDeleteShapes) {
+TEST_F(SqlPlanAndCastSweepTest, RepeatedSelectUpdateDeleteShapes) {
   for (int64_t i = 0; i < 10; ++i) {
     RunSql(engine_.get(), context_.get(),
            "INSERT INTO pc VALUES (" + std::to_string(i) + ", 'v')");
@@ -155,7 +155,7 @@ TEST_F(SqlPlanCacheSweepTest, RepeatedSelectUpdateDeleteShapes) {
             1);
 }
 
-TEST_F(SqlPlanCacheSweepTest, ReorderedArithmeticUpdateReplaysAllSlots) {
+TEST_F(SqlPlanAndCastSweepTest, ReorderedArithmeticUpdateReplaysAllSlots) {
   RunSql(engine_.get(), context_.get(),
          "CREATE TABLE pslot (w INT64, d INT64, s INT64)");
   RunSql(engine_.get(), context_.get(),
@@ -195,7 +195,7 @@ TEST_F(SqlPlanCacheSweepTest, ReorderedArithmeticUpdateReplaysAllSlots) {
 // Redundant-cast elimination and cast-aware predicate handling in the
 // optimizer (cascades.cpp cast rewriter): these shapes must produce correct
 // results whether or not the cast is folded away.
-TEST_F(SqlPlanCacheSweepTest, CastEliminationShapes) {
+TEST_F(SqlPlanAndCastSweepTest, CastEliminationShapes) {
   RunSql(engine_.get(), context_.get(),
          "INSERT INTO pc VALUES (1, 'one'), (2, 'two'), (3, 'three')");
   EXPECT_EQ(ScalarInt(engine_.get(), context_.get(),
@@ -230,7 +230,7 @@ TEST_F(SqlPlanCacheSweepTest, CastEliminationShapes) {
 
 // RANGE window frames with constant bounds (cascades.cpp depth-bound
 // simplification) on both operand sides.
-TEST_F(SqlPlanCacheSweepTest, RangeFrameBoundShapes) {
+TEST_F(SqlPlanAndCastSweepTest, RangeFrameBoundShapes) {
   RunSql(engine_.get(), context_.get(),
          "INSERT INTO pcr VALUES (1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0), "
          "(5, 5.0)");
@@ -257,7 +257,7 @@ TEST_F(SqlPlanCacheSweepTest, RangeFrameBoundShapes) {
 }
 
 // Struct-field UPDATE and EXPLAIN coverage over mixed plan shapes.
-TEST_F(SqlPlanCacheSweepTest, StructUpdateAndExplainShapes) {
+TEST_F(SqlPlanAndCastSweepTest, StructUpdateAndExplainShapes) {
   // The empty CTAS table now infers the SELECT literal's INT64 type, so
   // typed INSERTs succeed and the struct-field UPDATEs below mutate a real
   // stored row (previously pinned as zero-row no-ops).

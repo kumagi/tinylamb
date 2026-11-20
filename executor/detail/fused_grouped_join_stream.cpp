@@ -812,8 +812,8 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       (frequency_fold ||
        (probe_like_filters.empty() && probe_int_filters.empty())) &&
       !key_counts && has_dense_rows) {
-    std::shared_ptr<const LSTableStore> store =
-        GetOrBuildLSTableStore(context.txn_, *tables[probe], true);
+    std::shared_ptr<const LSTableStore> store = GetOrBuildLSTableStore(
+        context.txn_, *tables[probe], true, &projections[probe]);
     if (store != nullptr && store->uncommitted_owner_txn == 0 &&
         store->layout_generation == tables[probe]->LayoutGeneration() &&
         store->first_pid == tables[probe]->FirstPageId()) {
@@ -981,8 +981,8 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   if (probe_lstable_store == nullptr &&
       (context.txn_.IsReadOnly() || context.txn_.WriteSetEmpty()) &&
       frequency_fold && !key_counts && has_dense_rows) {
-    std::shared_ptr<const LSTableStore> store =
-        GetOrBuildLSTableStore(context.txn_, *tables[probe], true);
+    std::shared_ptr<const LSTableStore> store = GetOrBuildLSTableStore(
+        context.txn_, *tables[probe], true, &projections[probe]);
     if (store != nullptr && store->uncommitted_owner_txn == 0 &&
         store->layout_generation == tables[probe]->LayoutGeneration() &&
         store->first_pid == tables[probe]->FirstPageId()) {

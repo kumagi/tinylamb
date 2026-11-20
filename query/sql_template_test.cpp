@@ -161,6 +161,101 @@ TEST(SqlTemplateTest, BindSelectPreservesForUpdate) {
   EXPECT_NE(select.WhereClause()->ToString().find('9'), std::string::npos);
 }
 
+TEST(SqlTemplateTest, BindSelectPreservesGroupAll) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  // `GROUP BY ()` is a placeholder constant key plus the IsGroupAll marker;
+  // a re-bind that dropped the marker would replay group-all aggregates as
+  // zero rows on empty input through the template-cache path.
+  auto original = ParseSql("SELECT COUNT(*) FROM t GROUP BY ();");
+  ASSERT_TRUE(original);
+  EXPECT_TRUE(dynamic_cast<const SelectStatement&>(*original).IsGroupAll());
+  const SqlTemplate templated =
+      ExtractSqlTemplate("SELECT COUNT(*) FROM t GROUP BY ();");
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue()) << bound_or;
+  const auto& select =
+      dynamic_cast<const SelectStatement&>(*bound_or.MoveValue());
+  EXPECT_TRUE(select.IsGroupAll())
+      << "BindSelect must transcribe the GROUP BY () marker (like FOR UPDATE)";
+}
+
+// P363/432: the extractor parameterizes window frame offsets and LAG/LEAD
+// arguments, but BindExpression had no kWindowFunctionExp arm: the default
+// shared the subtree consuming zero parameters, so ANY windowed statement
+// with a literal failed the global count check and permanently missed the
+// template cache (every replay paid the external process parse).
+TEST(SqlTemplateTest, BindsWindowLiteralsInTextOrder) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  auto original = ParseSql(
+      "SELECT SUM(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT "
+      "ROW) FROM t WHERE a = 3;");
+  ASSERT_TRUE(original);
+  const SqlTemplate templated = ExtractSqlTemplate(
+      "SELECT SUM(x) OVER (ORDER BY y ROWS BETWEEN 7 PRECEDING AND CURRENT "
+      "ROW) FROM t WHERE a = 9;");
+  ASSERT_EQ(templated.parameters.size(), 2U);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue()) << bound_or;
+  const auto& select =
+      dynamic_cast<const SelectStatement&>(*bound_or.MoveValue());
+  ASSERT_FALSE(select.SelectList().empty());
+  const std::string rendered = select.SelectList()[0].expression->ToString();
+  EXPECT_NE(rendered.find("7 PRECEDING"), std::string::npos) << rendered;
+  ASSERT_TRUE(select.WhereClause() != nullptr);
+  EXPECT_NE(select.WhereClause()->ToString().find('9'), std::string::npos);
+}
+
+// P363/432: the binder's kIntervalExp arm rebuilds the interval from folded
+// AST metadata and cannot distinguish INTERVAL '5' DAY (text extractor
+// parameterized the quoted amount) from INTERVAL 5 DAY (verbatim).  The
+// extractor now keeps any quoted amount verbatim -- same treatment as the
+// bare number -- so extraction and binding agree on consuming nothing.
+TEST(SqlTemplateTest, QuotedIntervalAmountStaysInTemplate) {
+  const SqlTemplate single_string =
+      ExtractSqlTemplate("SELECT d + INTERVAL '5 hours' FROM t WHERE x = 1;");
+  EXPECT_TRUE(single_string.templatable);
+  ASSERT_EQ(single_string.parameters.size(), 1U)
+      << "the interval amount must not be parameterized";
+  EXPECT_NE(single_string.fingerprint.find("INTERVAL '5 hours'"),
+            std::string::npos);
+  const SqlTemplate typed =
+      ExtractSqlTemplate("SELECT d + INTERVAL '5' HOUR FROM t WHERE x = 1;");
+  ASSERT_EQ(typed.parameters.size(), 1U);
+  EXPECT_NE(typed.fingerprint.find("INTERVAL '5' HOUR"), std::string::npos);
+  // Doubled quotes inside the amount keep the string scan aligned (it stays
+  // verbatim, so the fingerprint must close at the real end).
+  const SqlTemplate escaped =
+      ExtractSqlTemplate("SELECT d + INTERVAL '5''x' hours FROM t;");
+  EXPECT_NE(escaped.fingerprint.find("INTERVAL '5''x' hours"),
+            std::string::npos);
+}
+
+// P363/432: INSERT..SELECT literals were parameterized by the extractor but
+// SetQuery passed the SELECT through unbound, so every INSERT..SELECT with a
+// literal missed the template cache forever.
+TEST(SqlTemplateTest, BindsInsertSelectQueryLiterals) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  auto original = ParseSql("INSERT INTO u SELECT a FROM t WHERE a = 5;");
+  ASSERT_TRUE(original);
+  const SqlTemplate templated =
+      ExtractSqlTemplate("INSERT INTO u SELECT a FROM t WHERE a = 9;");
+  ASSERT_EQ(templated.parameters.size(), 1U);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue()) << bound_or;
+  const auto& insert =
+      dynamic_cast<const InsertStatement&>(*bound_or.MoveValue());
+  ASSERT_TRUE(insert.Query() != nullptr);
+  ASSERT_TRUE(insert.Query()->WhereClause() != nullptr);
+  EXPECT_NE(insert.Query()->WhereClause()->ToString().find('9'),
+            std::string::npos);
+}
+
 TEST(SqlTemplateTest, BindsCompositeStockLookup) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";
@@ -655,11 +750,11 @@ std::shared_ptr<SelectStatement> LiteralCteBody(const char* column,
                           ConstantValueExp(Value(literal))));
 }
 
-TEST(SqlTemplateTest, MultiWithWithLiteralsRefusesTemplateBinding) {
-  // WithQueries() is an unordered_map: the declaration order of two or more
-  // CTE bodies is unrecoverable, so binding them positionally could swap
-  // literals between bodies. Such statements must refuse template binding
-  // (the engine falls back to parsing verbatim) instead of risking a swap.
+TEST(SqlTemplateTest, MultiWithWithLiteralsBindsInDeclarationOrder) {
+  // T2540: WithQueries() is an unordered_map, but the parser-recorded
+  // WithQueryOrder() recovers declaration order, so bodies must bind
+  // positionally in DECLARATION order (ExtractSqlTemplate emits parameters
+  // strictly left-to-right in the text) instead of being refused.
   auto cached = std::make_shared<SelectStatement>(
       std::vector<NamedExpression>{NamedExpression("k", ColumnValueExp("k"))},
       std::vector<std::string>{"t"},
@@ -667,9 +762,24 @@ TEST(SqlTemplateTest, MultiWithWithLiteralsRefusesTemplateBinding) {
                           ConstantValueExp(Value(3))));
   cached->AddWithQuery("zeta", LiteralCteBody("x", 1));
   cached->AddWithQuery("alpha", LiteralCteBody("y", 2));
-  // Exact parameter count so only the ordering guard can throw.
-  EXPECT_FALSE(BindStatementLiterals(*cached, {Value(7), Value(8), Value(9)})
-                   .HasValue());
+  auto bound_or =
+      BindStatementLiterals(*cached, {Value(7), Value(8), Value(9)});
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  // Declaration order survives the rebind -- NOT the old alphabetical one.
+  ASSERT_EQ(select.WithQueryOrder().size(), 2U);
+  EXPECT_EQ(select.WithQueryOrder()[0], "zeta");
+  EXPECT_EQ(select.WithQueryOrder()[1], "alpha");
+  // Positional parameters follow the text: zeta <- 7, alpha <- 8, main <- 9.
+  const auto& zeta = *select.WithQueries().at("zeta");
+  ASSERT_TRUE(zeta.WhereClause());
+  EXPECT_EQ(zeta.WhereClause()->ToString(), "(x = 7)");
+  const auto& alpha = *select.WithQueries().at("alpha");
+  ASSERT_TRUE(alpha.WhereClause());
+  EXPECT_EQ(alpha.WhereClause()->ToString(), "(y = 8)");
+  ASSERT_TRUE(select.WhereClause());
+  EXPECT_EQ(select.WhereClause()->ToString(), "(k = 9)");
 }
 
 TEST(SqlTemplateTest, BindsMultipleLiteralFreeWithQueries) {
@@ -936,6 +1046,60 @@ TEST(SqlTemplateTest, BindsCachedMergeTree) {
             std::string::npos);
   EXPECT_NE(merge.Clauses()[1].action.insert_values[1]->ToString().find("xins"),
             std::string::npos);
+}
+
+// T2547: inside a raw (r'...'/br'...') literal a backslash is a plain
+// character; the scanner used to consume `\'` pairs, so a trailing
+// backslash ate the closing quote and the statement was forever excluded
+// from template caching.
+TEST(SqlTemplateRawLiteralTest, TrailingBackslashClosesRawLiteral) {
+  const SqlTemplate plain = ExtractSqlTemplate(R"(SELECT 'ab\' AS x)");
+  // Non-raw keeps the escape behaviour: \' does not close the literal.
+  EXPECT_FALSE(plain.templatable);
+  const SqlTemplate raw = ExtractSqlTemplate(R"(SELECT r'ab\' AS x)");
+  EXPECT_FALSE(raw.parameters.empty());
+  ASSERT_EQ(raw.parameters.size(), 1u);  // NOLINT(readability-uppercase-literal-suffix)
+  EXPECT_EQ(raw.parameters[0].value.varchar_value, "ab\\");
+  const SqlTemplate raw_b = ExtractSqlTemplate(R"(SELECT br'ab\' AS x)");
+  ASSERT_EQ(raw_b.parameters.size(), 1u);  // NOLINT(readability-uppercase-literal-suffix)
+  EXPECT_EQ(raw_b.parameters[0].value.varchar_value, "ab\\");
+}
+
+// T2541: an undecodable escape must decline templating WITHOUT truncating
+// the fingerprint — the compiled-plan lookup may still key on it when no
+// parameters were seen before the failure.
+TEST(SqlTemplateDecodeFailureTest, FingerprintCoversFullSql) {
+  const SqlTemplate t =
+      ExtractSqlTemplate("SELECT 'a\\uzzzz' AS x FROM tbl WHERE y = 1");
+  EXPECT_FALSE(t.templatable);
+  EXPECT_NE(t.fingerprint.find("FROM"), std::string::npos) << t.fingerprint;
+  EXPECT_NE(t.fingerprint.find("tbl"), std::string::npos) << t.fingerprint;
+}
+
+TEST(SqlTemplateTest, RebindPreservesCompositeIntervalRawAmount) {
+  // T2539 regression guard (hand-built statement: parsed SQL would
+  // parameterize the interval amount, which sql_template's binder does not
+  // consume, so that pairing refuses to bind as before).  BindExpression's
+  // kIntervalExp arm must carry RawAmount() into the rebuilt node: the
+  // 2-arg factory re-parses from the folded Amount() and turns
+  // INTERVAL '1-2' YEAR TO MONTH into a bare 1-year interval — the exact
+  // bug parameter_slot.hpp documents for its sister rebuild path.
+  auto where =
+      BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(4)));
+  auto stmt = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(
+          "x", BinaryExpressionExp(
+                   ColumnValueExp("d"), BinaryOperation::kAdd,
+                   IntervalExpressionExp(1, "year to month", "1-2")))},
+      std::vector<std::string>{"t"}, where);
+  auto bound_or = BindStatementLiterals(*stmt, {Value(7)});
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  ASSERT_EQ(select.SelectList().size(), 1U);
+  const std::string text = select.SelectList()[0].expression->ToString();
+  EXPECT_NE(text.find("1-2"), std::string::npos) << text;
 }
 
 }  // namespace

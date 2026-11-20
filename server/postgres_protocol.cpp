@@ -37,6 +37,9 @@ std::string Message(char type, const std::string& payload) {
 }
 
 std::string SanitizeField(std::string_view value) {
+  if (value.find('\0') == std::string_view::npos) {
+    return std::string(value);  // common case: no copy-and-scan round trip
+  }
   std::string result(value);
   std::ranges::replace(result, '\0', ' ');
   return result;
@@ -47,7 +50,7 @@ std::string ValueText(const Value& value) {
     case ValueType::kNull:
       return {};
     case ValueType::kInt64:
-      return std::to_string(value.value.int_value);
+      return value.AsString();
     case ValueType::kVarChar:
       return std::string(value.value.varchar_value);
     case ValueType::kDate:
@@ -108,7 +111,7 @@ std::string Trim(std::string_view value) {
 }  // namespace
 
 StatusOr<uint16_t> ReadUint16(std::string_view bytes, size_t offset) {
-  if (offset + sizeof(uint16_t) > bytes.size()) {
+  if (offset > bytes.size() || bytes.size() - offset < sizeof(uint16_t)) {
     return Status(Status::kCorrupt, "short PostgreSQL protocol field");
   }
   const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
@@ -117,7 +120,7 @@ StatusOr<uint16_t> ReadUint16(std::string_view bytes, size_t offset) {
 }
 
 StatusOr<uint32_t> ReadUint32(std::string_view bytes, size_t offset) {
-  if (offset + sizeof(uint32_t) > bytes.size()) {
+  if (offset > bytes.size() || bytes.size() - offset < sizeof(uint32_t)) {
     return Status(Status::kCorrupt, "short PostgreSQL protocol field");
   }
   const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
@@ -183,6 +186,19 @@ std::optional<StartupPacket> ParseStartupPacket(std::string_view packet,
   return std::nullopt;
 }
 
+void DiscardQueuedReply(std::string& output, size_t sent_prefix,
+                        size_t earlier_pending_bytes) {
+  // Guard the precondition (sent_prefix <= output.size()): a miscomputed
+  // prefix must not wrap `output.size() - sent_prefix` through size_t and
+  // request a ~2^64 resize, which aborts the whole process. Clamping keeps
+  // the caller's earlier-bytes intact instead.
+  if (sent_prefix > output.size()) {  // NOLINT(readability-use-std-min-max)
+    sent_prefix = output.size();
+  }
+  const size_t pending = output.size() - sent_prefix;
+  output.resize(sent_prefix + std::min(pending, earlier_pending_bytes));
+}
+
 std::string AuthenticationOk() {
   std::string payload;
   AppendUint32(&payload, 0);
@@ -196,6 +212,23 @@ std::string ParameterStatus(std::string_view name, std::string_view value) {
   return Message('S', payload);
 }
 
+void AppendParameterStatus(std::string* output, std::string_view name,
+                           std::string_view value) {
+  // Same wire bytes as ParameterStatus() but appended in place: batching
+  // the startup parameter set avoids one temporary string per message.
+  const size_t start = output->size();
+  output->push_back('S');
+  AppendUint32(output, 0);  // length placeholder, patched below
+  AppendCString(output, name);
+  AppendCString(output, value);
+  const uint32_t length =  // NOLINT(modernize-use-auto)
+      static_cast<uint32_t>(output->size() - start - 1);  // = payload + 4
+  (*output)[start + 1] = static_cast<char>((length >> 24U) & 0xffU);
+  (*output)[start + 2] = static_cast<char>((length >> 16U) & 0xffU);
+  (*output)[start + 3] = static_cast<char>((length >> 8U) & 0xffU);
+  (*output)[start + 4] = static_cast<char>(length & 0xffU);
+}
+
 std::string BackendKeyData(uint32_t process_id, uint32_t secret_key) {
   std::string payload;
   AppendUint32(&payload, process_id);
@@ -207,18 +240,54 @@ std::string ReadyForQuery(char transaction_status) {
   return Message('Z', std::string(1, transaction_status));
 }
 
-std::string ErrorResponse(std::string_view message, std::string_view sqlstate) {
+std::string ErrorResponse(std::string_view message, std::string_view sqlstate,
+                          std::string_view severity) {
   std::string payload;
   payload.push_back('S');
-  AppendCString(&payload, "ERROR");
+  AppendCString(&payload, severity);
   payload.push_back('V');
-  AppendCString(&payload, "ERROR");
+  AppendCString(&payload, severity);
+  payload.push_back('C');
+  AppendCString(&payload, SanitizeField(sqlstate));
+  payload.push_back('M');
+  AppendCString(&payload, SanitizeField(message));
+  // GoogleSQL frontend diagnostics end with "[at line:column]"; surface the
+  // column as PostgreSQL's P field so psql/JDBC can show an error caret.
+  if (const size_t at = message.find("[at "); at != std::string_view::npos) {
+    const size_t colon = message.find(':', at + 4);
+    const size_t close = message.find(']', colon == std::string_view::npos
+                                                ? at + 4
+                                                : colon + 1);
+    if (colon != std::string_view::npos && close != std::string_view::npos &&
+        close > colon + 1) {
+      std::string_view pos = message.substr(colon + 1, close - colon - 1);
+      bool digits = !pos.empty();
+      for (char c : pos) {
+        digits = digits && c >= '0' && c <= '9';
+      }
+      if (digits) {
+        payload.push_back('P');
+        AppendCString(&payload, pos);
+      }
+    }
+  }
+  payload.push_back('\0');
+  return Message('E', payload);
+}
+
+std::string NoticeResponse(std::string_view message,
+                           std::string_view sqlstate) {
+  std::string payload;
+  payload.push_back('S');
+  AppendCString(&payload, "NOTICE");
+  payload.push_back('V');
+  AppendCString(&payload, "NOTICE");
   payload.push_back('C');
   AppendCString(&payload, SanitizeField(sqlstate));
   payload.push_back('M');
   AppendCString(&payload, SanitizeField(message));
   payload.push_back('\0');
-  return Message('E', payload);
+  return Message('N', payload);
 }
 
 std::string EmptyQueryResponse() { return Message('I', {}); }
@@ -232,7 +301,11 @@ std::string RowDescription(const std::vector<ColumnDescription>& columns) {
   std::string payload;
   AppendUint16(&payload, static_cast<uint16_t>(columns.size()));
   for (const ColumnDescription& column : columns) {
-    AppendCString(&payload, column.name.empty() ? "?column?" : column.name);
+    const std::string safe_name =
+        column.name.find('\0') == std::string::npos && !column.name.empty()
+            ? column.name
+            : "?column?";
+    AppendCString(&payload, safe_name);
     AppendUint32(&payload, 0);  // Not tied to a pg_catalog table OID.
     AppendUint16(&payload, 0);
     const PgType type = ToPgType(column.type);
@@ -254,7 +327,12 @@ std::string DataRow(const Row& row) {
       AppendUint32(&payload, std::numeric_limits<uint32_t>::max());
       continue;
     }
-    const std::string text = ValueText(value);
+    // PostgreSQL text values cannot contain NUL: clients read PQgetvalue as a
+    // NUL-terminated C string, so an embedded NUL would silently truncate the
+    // cell. Match ErrorResponse's SanitizeField policy (NUL -> space).
+    const std::string text = SanitizeField(ValueText(value));
+    CHECK_MSG(text.size() <= std::numeric_limits<uint32_t>::max(),
+              "PostgreSQL DataRow cell exceeds uint32 length");
     AppendUint32(&payload, static_cast<uint32_t>(text.size()));
     payload.append(text);
   }
@@ -279,8 +357,9 @@ std::string NegotiateProtocolVersion(
   return Message('v', payload);
 }
 
-std::vector<std::string> SplitSqlStatements(std::string_view sql) {
+StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql) {
   std::vector<std::string> statements;
+  bool overflowed = false;
   std::string current;
   // Length of `current` up to the last character that is neither whitespace
   // nor comment bytes. A trailing comment (or trailing whitespace/comment
@@ -305,7 +384,11 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
     current.resize(meaningful);
     current = Trim(current);
     if (!current.empty()) {
-      statements.push_back(current);
+      if (statements.size() >= kMaxSqlStatements) {
+        overflowed = true;
+      } else {
+        statements.push_back(current);
+      }
     }
     current.clear();
     meaningful = 0;
@@ -318,7 +401,7 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
       // a trailing comment with no real content after it is dropped at
       // flush time (see `meaningful`).
       current.push_back(current_char);
-      if (current_char == '\n') {
+      if (current_char == '\n' || current_char == '\r') {
         line_comment = false;
       }
       continue;
@@ -352,6 +435,13 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
         current.push_back('-');
         continue;
       }
+      // GoogleSQL also accepts '#' as a line comment; the frontend skips it,
+      // so the statement splitter must not treat a ';' inside it as a boundary.
+      if (current_char == '#') {
+        line_comment = true;
+        current.push_back(current_char);
+        continue;
+      }
       if (current_char == '/' && next == '*') {
         block_comment = true;
         block_comment_depth = 1;
@@ -366,6 +456,12 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
         // and require the closing '$' of the opener; otherwise the '$' is a
         // placeholder and stays ordinary text.
         size_t j = i + 1;
+        // PostgreSQL dollar-quote tags follow unquoted-identifier rules:
+        // the first character cannot be a digit ($1$ is a placeholder).
+        if (j < sql.size() && std::isdigit(static_cast<unsigned char>(sql[j])) != 0) {
+          Append(current_char);
+          continue;
+        }
         while (j < sql.size() &&
                (std::isalnum(static_cast<unsigned char>(sql[j])) != 0 ||
                 sql[j] == '_')) {
@@ -443,6 +539,11 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
     Append(current_char);
   }
   FlushCurrent();
+  if (overflowed) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "too many SQL statements in one message (limit " +
+                           std::to_string(kMaxSqlStatements) + ")");
+  }
   return statements;
 }
 

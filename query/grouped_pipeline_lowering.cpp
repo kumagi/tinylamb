@@ -18,6 +18,7 @@
 #include "executor/detail/window_eval.hpp"
 #include "executor/pipeline_lowering.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -64,10 +65,17 @@ ValueType InferExprValueType(const Expression& expr, const Schema& schema) {
 
 ValueType InferAggValueType(const AggregateExpression& agg,
                             const Schema& schema) {
-  if (agg.GetType() == AggregationType::kAvg) {
-    return ValueType::kDouble;
+  // P461/501: canonical result-kind table shared with
+  // AggregateExpression::ResultType and the plan/executor schema sources.
+  // (Differences vs. the old local table: PERCENTILE_DISC now follows the
+  // input value type, statistical REGR_* helpers declare DOUBLE, sketch
+  // inits/merges declare the serialized VARCHAR bytes, HLL_MERGE declares
+  // its INT64 cardinality, and the approx array aggregates declare ARRAY.)
+  if (const auto kind = CanonicalAggregateResultKind(agg.GetType());
+      kind.has_value()) {
+    return *kind;
   }
-  if (agg.GetType() == AggregationType::kCount || !agg.Child()) {
+  if (!agg.Child()) {
     return ValueType::kInt64;
   }
   return InferExprValueType(agg.Child(), schema);
@@ -88,7 +96,10 @@ bool ValidateCoreExpr(const Expression& expr, const Schema& core_schema,
     case TypeTag::kColumnValue: {
       const ColumnName& col = expr->AsColumnValue().GetColumnName();
       if (col.name == "*") {
-        return true;
+        // A wildcard is not a resolvable group key column (SELECT-list '*'
+        // is rejected elsewhere); keep the same guard for GROUP BY.
+        *all_ok = false;
+        return false;
       }
       if (core_schema.Offset(col) < 0) {
         *all_ok = false;
@@ -341,7 +352,12 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   std::unordered_map<std::string, Expression> select_aliases;
   for (const NamedExpression& item : select.SelectList()) {
     if (!item.name.empty() && item.expression) {
-      select_aliases.try_emplace(item.name, item.expression);
+      // Duplicate aliases are invalid SQL; the general path reports the
+      // error. try_emplace's first-wins behaviour here would silently pick
+      // one of the two expressions for HAVING/ORDER BY.
+      if (!select_aliases.emplace(item.name, item.expression).second) {
+        return std::optional<PipelineGraph>(std::nullopt);
+      }
     }
   }
   auto expand_alias_root = [&](const Expression& e) -> Expression {
@@ -409,7 +425,8 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
     order_keys.push_back(OocSortSink::KeySpec{
         .expression = MakeSynthCol(col_name),
         .ascending = term.ascending,
-        .nulls_first = term.nulls_first,
+        .nulls_first = term.nulls_first,  // NOLINT(clang-diagnostic-error)
+        .collation = CollationOfExpression(term.expression),
     });
   }
 
@@ -450,10 +467,9 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
     strip_items.reserve(select.SelectList().size());
     for (size_t i = 0; i < select.SelectList().size(); ++i) {
       final_cols.push_back(proj_schema.GetColumn(i));
-      // Use unique __sel_i / explicit alias from proj_schema; when duplicate
-      // user names occur, reference by explicit position if unambiguous or keep
-      // unique internal names when building final projection. Wait: if two
-      // user aliases collide, make internal names before final strip unique!
+      // proj_schema already carries unique __tinylamb_sel_i names (or explicit
+      // aliases). The has_dup_sel_names branch above keeps those internal names
+      // through the final projection so colliding user aliases remain distinct.
       strip_items.emplace_back(proj_items[i].name,
                                MakeSynthCol(proj_items[i].name));
     }
@@ -464,7 +480,7 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   }
 
   // If any two user select names collide (e.g. `SELECT a, a`), give the
-  // pre-sort/distinct ProjectOp unambiguous `__sel_i` names (unless we keep
+  // pre-sort/distinct ProjectOp unambiguous `__tinylamb_sel_i` names (unless we keep
   // them unique all the way through!). Notice Column names on output rows are
   // positional for clients; result_column_names_ already came from AST.
   bool has_dup_sel_names = false;
@@ -514,12 +530,10 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   }
 
   if (select.Distinct() && !order_keys.empty()) {
-    // Project visible columns first, deduplicate, WAIT -- ORDER BY after
-    // DISTINCT in SQL sorts on projected/group expressions! Here proj_items
-    // already holds [select..., __ord_0...]; if DISTINCT + ORDER BY are both
-    // present, SQL DISTINCT deduplicates ONLY visible select columns!
-    // Delegate DISTINCT + ORDER BY combinations safely or project+distinct on
-    // visible prefix keys! Wait: OocDistinctSink accepts key_cols!
+    // DISTINCT applies to the visible SELECT columns only; ORDER BY keys are
+    // carried as hidden __ord_i columns after them. The distinct key list
+    // below is therefore limited to the visible prefix, while the hidden keys
+    // remain available to the following ORDER BY stage.
     stream.operators.push_back(
         std::make_shared<ProjectOp>(std::move(proj_items), agg_schema));
     std::vector<slot_t> distinct_cols;
@@ -527,20 +541,20 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
     for (size_t i = 0; i < select.SelectList().size(); ++i) {
       distinct_cols.push_back(static_cast<slot_t>(i));
     }
-    auto dist_sink = std::make_shared<OocDistinctSink>(
+    auto visible_distinct_sink = std::make_shared<OocDistinctSink>(
         effective_proj_schema, std::move(distinct_cols), "Distinct");
-    RETURN_IF_FAIL(
-        PipelineLowering::BreakWithSink(&graph, &stream, std::move(dist_sink),
-                                        "Distinct", effective_proj_schema));
+    RETURN_IF_FAIL(PipelineLowering::BreakWithSink(
+        &graph, &stream, std::move(visible_distinct_sink), "Distinct",
+        effective_proj_schema));
   } else {
     stream.operators.push_back(
         std::make_shared<ProjectOp>(std::move(proj_items), agg_schema));
     if (select.Distinct()) {
-      auto dist_sink = std::make_shared<OocDistinctSink>(
+      auto all_columns_distinct_sink = std::make_shared<OocDistinctSink>(
           effective_proj_schema, std::vector<slot_t>{}, "Distinct");
-      RETURN_IF_FAIL(
-          PipelineLowering::BreakWithSink(&graph, &stream, std::move(dist_sink),
-                                          "Distinct", effective_proj_schema));
+      RETURN_IF_FAIL(PipelineLowering::BreakWithSink(
+          &graph, &stream, std::move(all_columns_distinct_sink), "Distinct",
+          effective_proj_schema));
     }
   }
   stream.schema = effective_proj_schema;

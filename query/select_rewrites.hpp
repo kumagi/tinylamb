@@ -135,6 +135,165 @@ bool BypassDisjointUnionGroupBy(SelectStatement* select);
 // group_by_functional_expr_reduction_sound).
 bool PruneRedundantGroupByKeys(SelectStatement* select);
 
+// Folds `NOT (x IS [NOT] NULL/TRUE/FALSE)` into its exact 3VL dual unary
+// predicate (Lean: TpcdsExecCodegen.lean
+// two_valued_predicate_not_involution_sound, sqlIsNull_never_tNull).
+bool CanonicalizeTwoValuedNegations(SelectStatement* select);
+
+// Canonicalizes unqualified GROUP BY items that either resolve to a single
+// base relation while shadowed by a SELECT alias, or reference an unshadowed
+// deterministic SELECT alias (Lean: TpcdsExecCodegen.lean
+// select_alias_group_by_canonicalization_sound).
+bool CanonicalizeSelectAliasGroupBy(SelectStatement* select,
+                                    TransactionContext& ctx);
+
+// Pushes the disjunction of consumer WHERE constant restrictions on a GROUP BY
+// key into a multi-referenced grouped CTE body and any inner UNION branches
+// (Lean: TpcdsExecCodegen.lean
+// shared_grouped_union_distinct_cte_disjunctive_pushdown_sound).
+// Literal-specialized: caller must disarm compiled-plan caching when true.
+bool PushSharedGroupedCteKeyRestrictions(SelectStatement* outer,
+                                         TransactionContext& ctx);
+
+// Pre-aggregates surrogate join keys `(fk, ...)` via GROUP BY before joining a
+// large VARCHAR dimension inside SELECT DISTINCT set-operation branches
+// (Lean: TpcdsExecCodegen.lean eager_distinct_surrogate_keys_setop_sound,
+// except_below_non_injective_dim_unsound).
+bool PushDistinctSurrogateKeysBeforeDimJoins(SelectStatement* outer,
+                                             TransactionContext& ctx);
+
+// Factors common conjuncts out of N-ary ORs, synthesizes per-table disjunctive
+// envelopes when every branch constrains that table, and appends SARGable
+// numeric/date interval hulls (Lean: TpchSf10Discovery.lean
+// kleene_common_conjunct_factor_or_sound,
+// disjunctive_join_envelope_pushdown_sound, interval_hull_of_disjuncts_sound,
+// envelope_missing_branch_pred_drops_rows_bug).
+bool FactorAndEnvelopeDisjunctiveWhere(SelectStatement* select,
+                                       TransactionContext& ctx);
+
+// Pre-aggregates the null-supplying right table of a LEFT OUTER JOIN for
+// null-strict COUNT(colR) aggregates, eliding the outer GROUP BY only when the
+// left key is certified UNIQUE + NOT NULL (Lean: TpchSf10Discovery.lean
+// left_join_right_preagg_and_unique_elide_groupby_sound,
+// nullable_unique_left_elides_groupby_bug, left_join_count_nonstrict_expr_bug).
+bool PreaggregateLeftJoinRightCounts(SelectStatement* select,
+                                     TransactionContext& ctx);
+
+// Absorbs `key IN (SELECT key FROM T WHERE w GROUP BY key HAVING h)` together
+// with an outer join to the same base table T (under matching WHERE w) into a
+// single grouped derived table over T (Lean: TpchSf10Discovery.lean
+// self_semijoin_having_agg_absorption_sound,
+// self_semijoin_mismatched_where_bug).
+bool AbsorbSelfSemijoinHavingAggregate(SelectStatement* select,
+                                       TransactionContext& ctx);
+
+// Rewrites a doubly-referenced CTE filtered by `val = (SELECT MAX/MIN(val)
+// FROM cte)` into a singly-referenced `WHERE val IS NOT NULL ORDER BY val
+// DESC/ASC FETCH FIRST 1 ROWS WITH TIES` CTE (Lean: TpchSf10Discovery.lean
+// cte_argmax_subquery_to_nonnull_max_ties_sound,
+// argmax_with_ties_without_is_not_null_bug).
+bool RewriteCteArgmaxSubqueryToTopTies(SelectStatement* outer,
+                                       TransactionContext& ctx);
+
+// Synthesizes missing pairwise equijoins across 3+-relation equality classes
+// so dimensions can join before large fact tables (Lean: TpchSf10Discovery.lean
+// equijoin_transitive_closure_sound).
+bool SynthesizeTransitiveEquijoins(SelectStatement* select,
+                                   TransactionContext& ctx);
+
+// Defers unreferenced wide/dependent attributes of certified unique dimensions
+// past `GROUP BY ... ORDER BY agg LIMIT K` while retaining foreign-key
+// semi-join filtering inside the Top-K core (Lean: TpchSf10Discovery.lean
+// topn_agg_late_unique_dim_attribute_join_sound,
+// late_dim_join_without_key_semijoin_steals_limit_bug).
+bool DeferUniqueDimensionAttributesAfterTopN(SelectStatement* select,
+                                             TransactionContext& ctx);
+
+// Decorrelates strict comparisons against correlated `SUM`/`AVG`/`MIN`/`MAX`
+// scalar subqueries into INNER JOINs over grouped derived tables, strictly
+// rejecting `COUNT` and `COALESCE` (Lean: TpchSf10Discovery.lean
+// correlated_gt_sum_decorrelate_to_inner_join_sound,
+// correlated_gt_count_demotes_to_inner_join_bug).
+bool DecorrelateCorrelatedSumComparisons(SelectStatement* select,
+                                         TransactionContext& ctx);
+
+// Factors common conjuncts inside correlated scalar `COUNT(*)` subqueries and
+// rewrites top-level WHERE `(SELECT COUNT(*) FROM S WHERE inner_k = outer_k
+// AND P) > 0` (and `>= 1`) into `outer_k IN (SELECT inner_k FROM S WHERE P AND
+// inner_k IS NOT NULL)` (Lean: TpcdsExecCodegen.lean
+// kleene_and_or_distrib_left_sound, correlated_count_gt_zero_to_in_subquery_sound,
+// trap_correlated_count_eq_zero_not_in_null_outer_unsound).
+bool RewriteCorrelatedPositiveCountToInSubquery(SelectStatement* select,
+                                                TransactionContext& ctx);
+
+// Decomposes `SUM(col ± c)` into `SUM(col) + (±c * COUNT(col))` when signed
+// INT64 column bounds certify zero per-row or cumulative overflow, preserving
+// 3VL NULL on empty/all-NULL groups (Lean: ClickBenchRound2.lean
+// affine_sum_homomorphism_sound, affine_sum_coalesce_empty_bug,
+// affine_sum_overflow_masked_bug).
+bool RewriteAffineLinearSums(SelectStatement* select, TransactionContext& ctx);
+
+// Defers joins to runtime-verified duplicate-free non-null dimensions past
+// GROUP BY when a unique key of the dimension determines its attributes and no
+// aggregate argument reads the dimension (Lean: TpcdsExecCodegen.lean
+// bijective_dim_key_cte_deferral_sound). Literal/snapshot-specialized.
+bool DeferUniqueDimJoinPastGroupBy(SelectStatement* outer,
+                                   TransactionContext& ctx);
+
+// Replaces unreferenced INNER JOINs to runtime-verified contiguous non-null
+// unique integer PK tables `fk = D.pk` with `fk >= min_pk AND fk <= max_pk`
+// (Lean: TpcdsExecCodegen.lean
+// unreferenced_unique_pk_inner_join_to_semi_sound). Snapshot-specialized:
+// caller must disarm compiled-plan caching when true.
+bool EliminateUnreferencedUniquePkInnerJoins(SelectStatement* outer,
+                                             TransactionContext& ctx);
+
+// Eliminates CROSS/INNER joins to guaranteed-singleton scalar aggregate CTEs
+// or derived tables inside plain GROUP BY queries when referenced only via
+// idempotent MIN/MAX aggregates, restoring a scalar subquery (Lean:
+// TpcdsExecCodegen.lean singleton_scalar_cross_join_elim_sound,
+// trap_singleton_cross_join_sum_not_idempotent).
+bool EliminateSingletonScalarCrossJoins(SelectStatement* outer,
+                                        TransactionContext& ctx);
+
+// Pushes SELECT DISTINCT + selective inner-joined dimension filters into
+// branches of a UNION ALL derived table before joining remaining outer tables
+// (Lean: TpcdsExecCodegen.lean distinct_union_all_dim_distribution_sound).
+bool DistributeDistinctUnionDimJoins(SelectStatement* outer,
+                                     TransactionContext& ctx);
+
+// Rewrites 3-way `(v1, v1_lag, v1_lead)` `rn = rn_lag + 1 AND rn = rn_lead - 1`
+// self-joins over grouped `RANK()` CTEs into single-pass `LAG`/`LEAD` window
+// functions (Lean: TpcdsExecCodegen.lean
+// adjacent_rank_self_join_to_lag_lead_sound).
+bool RewriteAdjacentRankSelfJoinToLagLead(SelectStatement* outer);
+
+// Folds `RANK()`/`DENSE_RANK()`/`ROW_NUMBER()` to constant `1` when its
+// PARTITION BY covers the query's GROUP BY keys, and absorbs tautological
+// self-domain `IN (SELECT key FROM same_join GROUP BY key)` filters into
+// `key IS NOT NULL` (Lean: TpcdsExecCodegen.lean
+// singleton_partition_rank_const_one_sound).
+bool FoldSingletonPartitionRankToOne(SelectStatement* outer);
+
+// Collapses N >= 2 deferred unique-dimension joins (`__tpcds_dim_pre ⋈ D` on
+// `fk = D.pk`) across inner-joined derived subqueries into a single post-join
+// dimension lookup when the outer query equates all N subqueries on a unique
+// non-null attribute `D.uk` (Lean: TpcdsExecCodegen.lean
+// multi_join_shared_unique_dim_deferral_sound,
+// trap_non_unique_uk_dim_collapse_unsound). Snapshot-specialized.
+bool CollapseSharedUniqueDimAcrossJoinedSubqueries(SelectStatement* outer,
+                                                   TransactionContext& ctx);
+
+// Pushes a disjunctive null-rejecting outer WHERE filter `(p_1(r_1) OR ... OR
+// p_k(r_k))` over LEFT JOINed grouped CTEs `r_1..r_k` as an `EXISTS (...) OR
+// ...` semi-filter into the preserved grouped CTE `s_0`'s fact scan (plus
+// constant group-key restrictions into `s_0, r_1..r_k`) before CTE
+// materialization (Lean: TpcdsExecCodegen.lean
+// left_join_disjunctive_null_rejecting_semi_filter_sound,
+// trap_left_join_non_strict_predicate_semi_unsound). Literal-specialized.
+bool PushDisjunctiveNullRejectingLeftJoinSemiFilter(SelectStatement* outer,
+                                                    TransactionContext& ctx);
+
 // Returns true when a recursive CTE can be lifted to an opaque memo leaf.
 bool RecursiveCteLiftable(const SelectStatement& outer,
                           const std::string& name);

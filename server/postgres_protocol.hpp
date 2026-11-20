@@ -18,9 +18,14 @@
 namespace tinylamb::pgwire {
 
 constexpr uint32_t kProtocolVersion30 = 196608;
-constexpr uint32_t kSslRequestCode = 80877103;
+// T3102: protocol request codes carry the official wire-message spelling
+// (SSLRequest / GSSENCRequest / CancelRequest) so a grep for `SSL` finds
+// the constant, the parser branch, and the tests in one sweep. Internal
+// feature identifiers elsewhere in the tree keep camelCase (kWal...,
+// kJit...); these three name protocol messages, not features.
+constexpr uint32_t kSSLRequestCode = 80877103;
 constexpr uint32_t kCancelRequestCode = 80877102;
-constexpr uint32_t kGssEncRequestCode = 80877104;
+constexpr uint32_t kGSSEncRequestCode = 80877104;
 
 struct StartupPacket {
   uint32_t protocol_version{0};
@@ -39,12 +44,29 @@ void AppendUint32(std::string* output, uint32_t value);
 
 std::optional<StartupPacket> ParseStartupPacket(std::string_view packet,
                                                 std::string* error);
+// Roll back a withheld response, preserving the earlier bytes still queued.
+void DiscardQueuedReply(std::string& output, size_t sent_prefix,
+                        size_t earlier_pending_bytes);
 std::string AuthenticationOk();
 std::string ParameterStatus(std::string_view name, std::string_view value);
+// Appends one ParameterStatus frame directly into `output` (no temporary
+// string), so a batch of frames can be built in a single buffer.
+void AppendParameterStatus(std::string* output, std::string_view name,
+                           std::string_view value);
 std::string BackendKeyData(uint32_t process_id, uint32_t secret_key);
 std::string ReadyForQuery(char transaction_status);
+// `severity` fills the S/V fields. PostgreSQL's convention: "ERROR" for
+// statements that keep the session, "FATAL" when the server closes the
+// connection right after the frame (P655). Default matches Simple Query
+// statement errors.
 std::string ErrorResponse(std::string_view message,
-                          std::string_view sqlstate = "XX000");
+                          std::string_view sqlstate = "XX000",
+                          std::string_view severity = "ERROR");
+// NoticeResponse ('N'): same field layout as ErrorResponse but severity
+// NOTICE -- non-erroneous warnings such as nested BEGIN (25001) or a
+// no-op COMMIT (25P01) that psql/JDBC notice listeners expect (P1693).
+std::string NoticeResponse(std::string_view message,
+                           std::string_view sqlstate = "00000");
 std::string EmptyQueryResponse();
 std::string RowDescription(const std::vector<ColumnDescription>& columns);
 std::string DataRow(const Row& row);
@@ -53,7 +75,13 @@ std::string NegotiateProtocolVersion(
     uint32_t newest_minor,
     const std::vector<std::string>& unsupported_parameters);
 
-std::vector<std::string> SplitSqlStatements(std::string_view sql);
+// Cap on the statements one split emits, bounding what a single 16 MiB Q
+// message can make the splitter allocate (`a;a;a;...` is ~8M non-empty
+// one-character statements). Overflow returns kInvalidArgument instead of
+// hundreds of MB of transient strings.
+inline constexpr size_t kMaxSqlStatements = 100000;
+
+StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql);
 
 }  // namespace tinylamb::pgwire
 

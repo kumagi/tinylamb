@@ -1,7 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under the Apache-2.0. */
 
 // Byte-driven DataChunk/ColumnVector fuzzing: every bulk path
-// (AppendGather, Append(source,row), AppendFrom, AppendRowFromColumns) must
+// (AppendGather, AppendFrom(source,row), AppendFrom, AppendRowFromColumns) must
 // produce exactly the same observable state as the scalar reference: row
 // values (null bits included), row positions, per-column zone maps
 // (initialized / null count / value count / min / max) and the column
@@ -10,6 +10,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <string>
@@ -34,7 +36,7 @@ struct Cursor {
 };
 
 Value MakeInt(Cursor& c) {
-  switch (c.Next() % 6) {
+  switch (c.Next() % 8) {
     case 0:
       return {};  // NULL
     case 1:
@@ -44,6 +46,10 @@ Value MakeInt(Cursor& c) {
     case 3:
       return Value(std::numeric_limits<int64_t>::min());
     case 4:
+      return Value(std::numeric_limits<int64_t>::max());
+    case 5:
+      return Value(int64_t{-2});
+    case 6:
       return Value(static_cast<int64_t>(c.Next()) - 128);
     default:
       return Value(static_cast<int64_t>(c.Next()) << 40);
@@ -51,8 +57,21 @@ Value MakeInt(Cursor& c) {
 }
 
 Value MakeDouble(Cursor& c) {
-  if (c.Next() % 8 == 0) {
+  const uint8_t kind = c.Next() % 12;
+  if (kind == 0) {
     return {};  // NULL
+  }
+  if (kind == 1) {
+    return Value(std::numeric_limits<double>::quiet_NaN());
+  }
+  if (kind == 2) {
+    return Value(std::numeric_limits<double>::infinity());
+  }
+  if (kind == 3) {
+    return Value(-std::numeric_limits<double>::infinity());
+  }
+  if (kind == 4) {
+    return Value(-0.0);
   }
   return Value(static_cast<double>(static_cast<int64_t>(c.Next()) - 128) / 4.0);
 }
@@ -76,24 +95,50 @@ bool SameOptionalValue(const std::optional<Value>& a,
 
 void CheckChunkMatches(const DataChunk& a, const DataChunk& b,
                        const std::string& tag) {
-  assert(a.Size() == b.Size());
-  assert(a.ColumnCount() == b.ColumnCount());
+  // Name the failing bulk path: a bare assert only points back at this
+  // function's line, forcing every finding to be re-bisected across the
+  // three caller paths by hand.
+  const auto fail = [&](const std::string& detail) {
+    std::cerr << "CheckChunkMatches[" << tag << "]: " << detail << "\n"
+              << std::flush;
+    std::abort();
+  };
+  if (a.Size() != b.Size()) {
+    fail("row count " + std::to_string(a.Size()) + " != " +
+         std::to_string(b.Size()));
+  }
+  if (a.ColumnCount() != b.ColumnCount()) {
+    fail("column count " + std::to_string(a.ColumnCount()) + " != " +
+         std::to_string(b.ColumnCount()));
+  }
   for (size_t row = 0; row < a.Size(); ++row) {
-    const Row left = a.RowAt(row);
-    const Row right = b.RowAt(row);
-    assert(left == right);
-    assert(a.PositionAt(row) == b.PositionAt(row));
+    if (Row left = a.RowAt(row); !(left == b.RowAt(row))) {
+      fail("row " + std::to_string(row) + " values differ");
+    }
+    if (a.PositionAt(row) != b.PositionAt(row)) {
+      fail("row " + std::to_string(row) + " position differs");
+    }
   }
   for (size_t col = 0; col < a.ColumnCount(); ++col) {
     const ZoneMap& za = a.ZoneMapAt(col);
     const ZoneMap& zb = b.ZoneMapAt(col);
-    assert(za.Initialized() == zb.Initialized());
-    assert(za.NullCount() == zb.NullCount());
-    assert(za.ValueCount() == zb.ValueCount());
-    assert(SameOptionalValue(za.Minimum(), zb.Minimum()));
-    assert(SameOptionalValue(za.Maximum(), zb.Maximum()));
+    const std::string where = "zone map col " + std::to_string(col);
+    if (za.Initialized() != zb.Initialized()) {
+      fail(where + " initialized flag differs");
+    }
+    if (za.NullCount() != zb.NullCount()) {
+      fail(where + " null count differs");
+    }
+    if (za.ValueCount() != zb.ValueCount()) {
+      fail(where + " value count differs");
+    }
+    if (!SameOptionalValue(za.Minimum(), zb.Minimum())) {
+      fail(where + " minimum differs");
+    }
+    if (!SameOptionalValue(za.Maximum(), zb.Maximum())) {
+      fail(where + " maximum differs");
+    }
   }
-  (void)tag;
 }
 
 }  // namespace
@@ -129,9 +174,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   // (2) Append(source, i) path.
   DataChunk row_by_row(schema, 0);
   for (size_t i = 0; i < source.Size(); ++i) {
-    row_by_row.Append(source, i);
+    row_by_row.AppendFrom(source, i);
   }
-  CheckChunkMatches(scalar, row_by_row, "Append(source,row)");
+  CheckChunkMatches(scalar, row_by_row, "AppendFrom(source,row)");
 
   // (3) AppendGather with a random selection vector.
   std::vector<uint32_t> selection;

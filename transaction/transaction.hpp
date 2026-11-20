@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <iterator>
@@ -34,6 +35,7 @@
 #include <variant>
 #include <vector>
 
+#include "common/memory_budget.hpp"
 #include "page/page.hpp"
 #include "page/row_position.hpp"
 #include "recovery/log_record.hpp"
@@ -45,12 +47,21 @@ class TransactionManager;
 class CheckpointManager;
 class PageManager;
 class Logger;
+class SpillStore;
+class SpillSegmentWriter;
 struct Row;
 
 class TransactionWriteSet final {
  public:
   using value_type = RowPosition;
   using size_type = std::size_t;
+
+  TransactionWriteSet();
+  ~TransactionWriteSet();
+  TransactionWriteSet(const TransactionWriteSet&) = delete;
+  TransactionWriteSet& operator=(const TransactionWriteSet&) = delete;
+  TransactionWriteSet(TransactionWriteSet&& o) noexcept;
+  TransactionWriteSet& operator=(TransactionWriteSet&& o) noexcept;
 
  private:
   template <typename VectorIterator, typename SetIterator>
@@ -134,6 +145,10 @@ class TransactionWriteSet final {
   const_iterator cend() const { return end(); }
 
   [[nodiscard]] bool contains(const value_type& value) const {
+    if (disk_spilled_) {
+      return std::ranges::any_of(
+          spill_tail_, [&value](const RowPosition& rp) { return rp == value; });
+    }
     if (spilled_) {
       return spill_.contains(value);
     }
@@ -142,9 +157,24 @@ class TransactionWriteSet final {
     return position != small_.end() && *position == value;
   }
 
+  [[nodiscard]] bool IsDiskSpilled() const noexcept { return disk_spilled_; }
+
+  bool TryInsert(const value_type& value,
+                 const std::shared_ptr<SpillStore>& spill_store,
+                 size_t max_in_memory_entries, uint64_t* spilled_bytes_out,
+                 bool* initial_spill_out, Status* error_out = nullptr);
+
   std::pair<iterator, bool> insert(const value_type& value) {
+    if (disk_spilled_) {
+      spill_tail_.push_back(value);
+      ++total_count_;
+      return {iterator(spill_.end()), true};
+    }
     if (spilled_) {
       auto [position, inserted] = spill_.insert(value);
+      if (inserted) {
+        ++total_count_;
+      }
       return {iterator(position), inserted};
     }
 
@@ -157,6 +187,7 @@ class TransactionWriteSet final {
     if (small_.size() < kSmallCapacity) {
       const auto offset = position - small_.begin();
       small_.insert(position, value);
+      ++total_count_;
       return {iterator(small_.begin() + offset), true};
     }
 
@@ -169,26 +200,19 @@ class TransactionWriteSet final {
     spill_.swap(replacement);
     std::vector<RowPosition>().swap(small_);
     spilled_ = true;
+    ++total_count_;
     return {iterator(spill_.find(value)), true};
   }
 
-  size_type erase(const value_type& value) {
-    if (spilled_) {
-      return spill_.erase(value);
-    }
-    const auto position =
-        std::lower_bound(small_.begin(), small_.end(), value, Less{});
-    if (position == small_.end() || *position != value) {
-      return 0;
-    }
-    small_.erase(position);
-    return 1;
-  }
+  size_type erase(const value_type& value);
 
   iterator erase(iterator position) {
     if (spilled_) {
       if (std::holds_alternative<std::unordered_set<RowPosition>::iterator>(
               position.value_)) {
+        if (total_count_ > 0) {
+          --total_count_;
+        }
         return {
             spill_.erase(std::get<std::unordered_set<RowPosition>::iterator>(
                 position.value_))};
@@ -201,6 +225,9 @@ class TransactionWriteSet final {
           std::get<std::vector<RowPosition>::iterator>(position.value_);
       const auto offset = vector_position - small_.begin();
       small_.erase(vector_position);
+      if (total_count_ > 0) {
+        --total_count_;
+      }
       return {small_.begin() + offset};
     }
     return end();
@@ -208,6 +235,11 @@ class TransactionWriteSet final {
 
   template <typename Predicate>
   size_type erase_if(Predicate predicate) {
+    if (disk_spilled_) {
+      const size_type removed = std::erase_if(spill_tail_, predicate);
+      total_count_ = total_count_ >= removed ? total_count_ - removed : 0;
+      return removed;
+    }
     size_type removed = 0;
     for (auto position = begin(); position != end();) {
       if (predicate(*position)) {
@@ -220,17 +252,20 @@ class TransactionWriteSet final {
     return removed;
   }
 
-  void clear() {
-    std::vector<RowPosition>().swap(small_);
-    std::unordered_set<RowPosition>().swap(spill_);
-    spilled_ = false;
-  }
+  Status ForEach(const std::function<Status(const RowPosition&)>& fn);
 
-  [[nodiscard]] bool empty() const { return small_.empty() && spill_.empty(); }
-  [[nodiscard]] size_type size() const { return small_.size() + spill_.size(); }
+  void clear();
+
+  [[nodiscard]] bool empty() const noexcept { return total_count_ == 0; }
+  [[nodiscard]] size_type size() const noexcept { return total_count_; }
 
  private:
   static constexpr size_type kSmallCapacity = 64;
+  static constexpr size_t kEntryChargeBytes = 40;
+  static constexpr size_t kSpillBufferBytes = 16384;
+  static constexpr size_t kSpillTailCapacity = 1024;
+
+  Status FlushTailToWriter(uint64_t* spilled_bytes_out);
 
   struct Less {
     bool operator()(const RowPosition& lhs, const RowPosition& rhs) const {
@@ -243,7 +278,14 @@ class TransactionWriteSet final {
 
   std::vector<RowPosition> small_{};
   std::unordered_set<RowPosition> spill_{};
+  std::vector<RowPosition> spill_tail_{};
+  std::shared_ptr<SpillStore> spill_store_{};
+  std::unique_ptr<SpillSegmentWriter> segment_writer_{};
+  uint64_t spill_segment_id_{0};  // kInvalidSpillSegmentId
+  ProcessMemoryCharge mem_charge_{MemoryPoolKind::kTx, 0, /*forced=*/false};
+  size_t total_count_{0};
   bool spilled_{false};
+  bool disk_spilled_{false};
 };
 
 enum class TransactionStatus : uint_fast8_t {
@@ -283,10 +325,18 @@ class Transaction final {
     snapshot_ts_ = o.snapshot_ts_;
     read_set_ = std::move(o.read_set_);
     write_set_ = std::move(o.write_set_);
+    write_set_spill_store_ = std::move(o.write_set_spill_store_);
     recycled_page_allocations_ = std::move(o.recycled_page_allocations_);
     mutated_index_roots_ = std::move(o.mutated_index_roots_);
     index_undo_reservations_ = std::move(o.index_undo_reservations_);
     staged_records_ = std::move(o.staged_records_);
+    wal_reread_mode_ = o.wal_reread_mode_;
+    staged_bytes_ = o.staged_bytes_;
+    staged_charge_ = std::move(o.staged_charge_);
+    read_set_count_ = o.read_set_count_;
+    o.wal_reread_mode_ = false;
+    o.staged_bytes_ = 0;
+    o.read_set_count_ = 0;
     shard_epoch_ = o.shard_epoch_;
     write_epoch_.store(o.write_epoch_.load(std::memory_order_acquire),
                        std::memory_order_release);
@@ -327,6 +377,21 @@ class Transaction final {
     abort_started_.store(o.abort_started_.load(std::memory_order_acquire),
                          std::memory_order_release);
     intent_wait_failure_ = o.intent_wait_failure_;
+    write_set_failure_status_ = std::move(o.write_set_failure_status_);
+    // T389 (P422): the move constructor transfers the statement timer and
+    // debug fields; move-assign must mirror it exactly or a moved-assign'd
+    // Transaction keeps the moved-from statement's deadline (leaking a stale
+    // timeout into the new statement) or loses an explicit one.
+    statement_timeout_ms_.store(
+        o.statement_timeout_ms_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    statement_deadline_ns_.store(
+        o.statement_deadline_ns_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    debug_phase_.store(o.debug_phase_.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+    debug_tid_.store(o.debug_tid_.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
     if (o.transaction_manager_ != nullptr) {
       o.transaction_manager_->MoveActiveTransaction(&o, this);
     }
@@ -335,6 +400,12 @@ class Transaction final {
     o.transaction_manager_ = nullptr;
     o.finish_hooks_.clear();
     o.finish_hooks_finalized_ = true;
+    // A Wound() arriving at the old handle must not be lost: the registry
+    // now points at the new object, so keep the flags observable there.
+    o.wounded_.store(false, std::memory_order_release);
+    o.abort_started_.store(false, std::memory_order_release);
+    catalog_dirty_ = o.catalog_dirty_;
+    o.catalog_dirty_ = false;
     return *this;
   }
 
@@ -399,13 +470,28 @@ class Transaction final {
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
   [[nodiscard]] bool HasWriteSet(const RowPosition& rp) const {
+    if (write_set_.IsDiskSpilled() && transaction_manager_ != nullptr) {
+      return transaction_manager_->HoldsWriteIntent(*this, rp);
+    }
     return write_set_.contains(rp);
+  }
+  [[nodiscard]] bool IsWalRereadMode() const noexcept {
+    return wal_reread_mode_;
+  }
+  [[nodiscard]] bool IsWriteSetDiskSpilled() const noexcept {
+    return write_set_.IsDiskSpilled();
   }
   // Like AddWriteSet, but installs `before` as the chain's base committed
   // version so concurrent readers keep seeing the old row until the write is
   // staged (prevents a phantom kNotExists during the intent window).
   bool AddWriteSet(const RowPosition& rp, std::string_view before);
   bool TryAddWriteSet(const RowPosition& rp);
+  // Non-mutating counterpart for RowPage::Insert's locked-hole accounting:
+  // mirrors TryAddWriteSet's "cannot acquire" verdict (no manager, failed /
+  // finished / read-only / wounded txn, fail-stopped manager all count as
+  // unavailable) and otherwise asks the manager whether another transaction
+  // holds the intent.  Never acquires or releases anything.
+  [[nodiscard]] bool WriteIntentUnavailable(const RowPosition& rp) const;
   // True when the position's committed chain still serves a live row under
   // this transaction's snapshot.  RowPage::Insert consults this before
   // reusing a deleted slot: an insert staged at a position whose old row is
@@ -456,6 +542,42 @@ class Transaction final {
     write_epoch_.fetch_add(1, std::memory_order_release);
   }
 
+  // Per-statement timeout enforcement (`TINYLAMB_STATEMENT_TIMEOUT_MS` default
+  // or per-transaction override).  Checked at statement prepare/execution
+  // boundaries and periodically inside long scan/DML loops.
+  static void SetDefaultStatementTimeoutForTest(
+      std::chrono::milliseconds timeout) noexcept;
+  [[nodiscard]] static std::chrono::milliseconds
+  DefaultStatementTimeout() noexcept;
+  void SetStatementTimeout(std::chrono::milliseconds timeout) noexcept;
+  [[nodiscard]] std::chrono::milliseconds StatementTimeout() const noexcept;
+  void BeginStatementTimer() noexcept;
+  [[nodiscard]] bool HasStatementTimeout() const noexcept {
+    return statement_deadline_ns_.load(std::memory_order_acquire) != 0;
+  }
+  [[nodiscard]] int64_t StatementDeadlineNs() const noexcept {
+    return statement_deadline_ns_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] Status CheckStatementTimeout() const noexcept;
+  // Thread-local deadline propagation for blocking executor operators
+  // (Aggregation / CrossJoin) inside StatementTimeoutExecutor pulls.
+  class ScopedThreadStatementDeadline {
+   public:
+    explicit ScopedThreadStatementDeadline(int64_t deadline_ns) noexcept;
+    ~ScopedThreadStatementDeadline();
+    ScopedThreadStatementDeadline(const ScopedThreadStatementDeadline&) =
+        delete;
+    ScopedThreadStatementDeadline& operator=(
+        const ScopedThreadStatementDeadline&) = delete;
+    ScopedThreadStatementDeadline(ScopedThreadStatementDeadline&&) = delete;
+    ScopedThreadStatementDeadline& operator=(ScopedThreadStatementDeadline&&) =
+        delete;
+
+   private:
+    int64_t prev_deadline_ns_{0};
+  };
+  [[nodiscard]] static Status CheckThreadStatementTimeout() noexcept;
+
   [[nodiscard]] txn_id_t ID() const { return txn_id_; }
   [[nodiscard]] uint64_t SnapshotTimestamp() const { return snapshot_ts_; }
   [[nodiscard]] bool RequiresHistoricalRead() const;
@@ -464,7 +586,7 @@ class Transaction final {
   [[nodiscard]] TransactionManager::IndexReadGuard AcquireIndexReadGuard(
       page_id_t index_root) const {
     if (transaction_manager_ == nullptr) {
-      return TransactionManager::IndexReadGuard();
+      return {};
     }
     return transaction_manager_->AcquireIndexReadGuard(index_root);
   }
@@ -512,11 +634,6 @@ class Transaction final {
       transaction_manager_->RecordIndexScanPrefetch();
     }
   }
-  // Bytes on |pid| that OTHER transactions' unresolved undo may still claim
-  // (see TransactionManager::ReserveIndexUndoBytes). Admission checks
-  // subtract it from free_size_; callers without a manager (recovery redo)
-  // read zero. Own reservations never block own operations: the reverse-chain
-  // undo frees a later op's bytes before an earlier op's undo re-claims them.
   // Diagnostic: render the outstanding reservation owners on |pid| (test
   // support for the reservation regressions; not on any hot path).
   [[nodiscard]] std::string DebugDumpIndexReservations(page_id_t pid) const {
@@ -524,6 +641,11 @@ class Transaction final {
                ? ""
                : transaction_manager_->DebugDumpIndexReservations(pid);
   }
+  // Bytes on |pid| that OTHER transactions' unresolved undo may still claim
+  // (see TransactionManager::ReserveIndexUndoBytes). Admission checks
+  // subtract it from free_size_; callers without a manager (recovery redo)
+  // read zero. Own reservations never block own operations: the reverse-chain
+  // undo frees a later op's bytes before an earlier op's undo re-claims them.
   [[nodiscard]] size_t IndexUndoReservedBytes(page_id_t pid) const {
     return transaction_manager_ == nullptr
                ? 0
@@ -554,9 +676,7 @@ class Transaction final {
             : transaction_manager_->GetWriteIntentWaitLimit());
   }
   // Explicit-budget variant for callers that hold a lock the drain must not
-  // ride (see BPlusTree: an index-gate holder waiting out a multi-second
-  // reservation manufactures a gate x reservation cycle the detector cannot
-  // see). A zero limit with a null manager still reports success.
+  // ride. A zero limit with a null manager still reports success.
   Status WaitAllIndexReservationsDrain(std::chrono::milliseconds limit) const {
     if (transaction_manager_ == nullptr) {
       return Status::kSuccess;
@@ -564,7 +684,7 @@ class Transaction final {
     return transaction_manager_->WaitForAllIndexReservationsDrain(txn_id_,
                                                                   limit, this);
   }
-  // B+Tree's in-gate drain points (FindLeaf / LeafInsert) set this when their
+  // the index-undo reservation drain set this when their
   // short budget expires: the kNoSpace they return then means "a foreign
   // index-undo reservation outlived the budget", not "the page is genuinely
   // full". Table::IndexInsert/IndexDelete consume it to re-run the guarded
@@ -632,6 +752,14 @@ class Transaction final {
   [[nodiscard]] bool IsAbortStarted() const noexcept {
     return abort_started_.load(std::memory_order_acquire);
   }
+  // Set when the transaction buffers a catalog (view definition) write.
+  // T485: an Abort rolls those writes back without moving the schema-epoch
+  // counter, so the abort path must bump the epoch for caches that were
+  // stamped from the transaction-local catalog view to go stale.
+  void MarkCatalogDirty() noexcept { catalog_dirty_ = true; }
+  [[nodiscard]] bool IsCatalogDirty() const noexcept {
+    return catalog_dirty_;
+  }
   // Diagnostic (round 9): where this transaction is currently parked, set
   // just before each potentially-blocking engine wait (write-intent wait,
   // tail reservation wait, durability barrier, undo walk, WAL append) and
@@ -665,10 +793,19 @@ class Transaction final {
   [[nodiscard]] IntentWaitFailure LastIntentWaitFailure() const {
     return intent_wait_failure_;
   }
+  void RecordWriteSetFailure(Status status) {
+    write_set_failure_status_ = std::move(status);
+  }
+  [[nodiscard]] Status LastWriteSetFailureStatus(
+      const Status& fallback = Status::kConflicts) const {
+    return write_set_failure_status_ != Status::kSuccess
+               ? write_set_failure_status_
+               : fallback;
+  }
 
   Status PreCommit();
   // Commit publication without blocking this execution thread. The caller
-  // must pass the returned own/dependency target to WaitForWALDurable and
+  // must pass the returned own/dependency target to WaitForWalDurable and
   // surface any failure BEFORE delivering results or a commit acknowledgement.
   StatusOr<lsn_t> PrepareCommitForDurableReply();
   Status Abort();
@@ -730,8 +867,8 @@ class Transaction final {
   }
 
   // Drops MVCC version chains left by a previous incarnation of |pid|.
-  // Invoked by PageManager::AllocateNewPage when it recycles a page id off
-  // the free list; see TransactionManager::InvalidatePageVersions.
+  // Invoked by PageManager::AllocateNewPage when it takes a page id from
+  // the bounded free-id set; see TransactionManager::InvalidatePageVersions.
   void InvalidatePageVersions(page_id_t pid) {
     if (transaction_manager_ != nullptr) {
       transaction_manager_->InvalidatePageVersions(pid, this);
@@ -753,13 +890,20 @@ class Transaction final {
   // Whether |id| still names a live transaction.  Used by the page
   // allocator to keep a page id whose destroy is still undoable out of the
   // allocation path.
+  // See TransactionManager::IsRunningUncommitted: |id|'s writes are
+  // invisible to every live snapshot (snapshot readers may skip its
+  // unpublished table-tail pages instead of waiting for it).
+  [[nodiscard]] bool IsTransactionRunningUncommitted(txn_id_t id) const {
+    return transaction_manager_ != nullptr &&
+           transaction_manager_->IsRunningUncommitted(id);
+  }
   [[nodiscard]] bool IsTransactionActive(txn_id_t id) const {
     return transaction_manager_ != nullptr &&
            transaction_manager_->IsActive(id);
   }
   friend std::ostream& operator<<(std::ostream& o, const Transaction& t) {
     o << "Transaction(id=" << t.txn_id_ << ", status=" << t.status_
-      << ", prev_lsn=" << t.prev_lsn_ << ", read_set=" << t.read_set_.size()
+      << ", prev_lsn=" << t.prev_lsn_ << ", read_set=" << t.read_set_count_
       << ", write_set=" << t.write_set_.size() << ")";
     return o;
   }
@@ -771,8 +915,11 @@ class Transaction final {
   friend class TransactionManager;
   friend class CheckpointManager;
 
+  static constexpr size_t kMaxDiagnosticReadSetEntries = 1024;
+
   Status PreCommitImpl(lsn_t* external_durability_target);
   void FinishRunningNoexcept() noexcept;
+  bool TryInsertWriteSet(const RowPosition& rp, Status* error_out = nullptr);
 
   // Version cache sharded per reading thread, each with its own lock.  Scan
   // workers read concurrently through one transaction: steady-state reads
@@ -823,13 +970,43 @@ class Transaction final {
  private:
   txn_id_t txn_id_{static_cast<txn_id_t>(-1)};
   uint64_t snapshot_ts_{0};
-
-  std::unordered_set<RowPosition> read_set_{};
-  // Owner-thread confined: writes are issued from the transaction's owning
-  // thread only (reads may register concurrently from join workers, hence
-  // read_state_mutex_; writes also drive AcquireWriteIntent whose shard
-  // locks must never nest under a transaction-local mutex).
-  TransactionWriteSet write_set_{};
+  size_t read_set_count_{0};
+  size_t staged_bytes_{0};
+  // Process-wide generation, unique across every Transaction ever created.
+  // Thread-local shard caches key on it so a destroyed transaction whose
+  // address (or even id, across Database instances) is reused can never be
+  // mistaken for the cached owner.
+  uint64_t shard_epoch_{0};
+  // Write generation for version cache invalidation (see VersionCacheEntry).
+  std::atomic<uint64_t> write_epoch_{0};
+  // A read-only query may hand page morsels to multiple scan workers.  The
+  // version cache and read set are transaction-local, so guard them while
+  // preserving a single MVCC snapshot across those workers.
+  std::unique_ptr<std::mutex> read_state_mutex_{std::make_unique<std::mutex>()};
+  // Relaxed atomics: writers (the owning thread, via AddLog/SetStatus) do
+  // not hold transaction_table_lock, but the checkpoint thread reads both
+  // fields for its ActiveTransactionTable snapshot while holding it.  The
+  // atomics remove the data race; no cross-field ordering is required.
+  std::atomic<lsn_t> prev_lsn_{0};
+  // End LSN of the record that starts at prev_lsn_ (see PrevRecordEndLSN).
+  std::atomic<lsn_t> prev_end_lsn_{0};
+  // Start LSN of the first record this transaction ever appended (see
+  // FirstLSN). Compare-exchanged so a concurrent reader always sees the
+  // earliest value.
+  std::atomic<lsn_t> first_lsn_{0};
+  // D4: highest dependency commit LSN observed by this transaction (see
+  // RecordDurabilityDependence).  Updated from const read paths.
+  mutable std::atomic<lsn_t> durability_dependence_{0};
+  // Not owned by this class.
+  TransactionManager* transaction_manager_{nullptr};
+  // See DebugSetPhase (round 9 stall postmortem aid). Mutable: diagnostic
+  // observers (and const-context park sites) tag the current phase.
+  mutable std::atomic<const char*> debug_phase_{nullptr};
+  std::atomic<int64_t> debug_tid_{0};
+  // Statement timeout policy (-1 = use process default, 0 = disabled, >0 = ms)
+  // and active deadline (steady_clock nanoseconds; 0 = no active deadline).
+  std::atomic<int64_t> statement_timeout_ms_{-1};
+  std::atomic<int64_t> statement_deadline_ns_{0};
   std::vector<page_id_t> recycled_page_allocations_{};
   // Index roots whose delete/update keys this transaction removed. A vector
   // with linear dedup in MarkIndexKeysChanged: the per-transaction count is
@@ -842,19 +1019,9 @@ class Transaction final {
   // released (ForgetTransaction), so a repeated finish cannot double-release.
   std::vector<std::pair<page_id_t, uint64_t>> index_undo_reservations_{};
   std::vector<LogRecord> staged_records_{};
-  // Process-wide generation, unique across every Transaction ever created.
-  // Thread-local shard caches key on it so a destroyed transaction whose
-  // address (or even id, across Database instances) is reused can never be
-  // mistaken for the cached owner.
-  uint64_t shard_epoch_{0};
-  // Write generation for version cache invalidation (see VersionCacheEntry).
-  std::atomic<uint64_t> write_epoch_{0};
-  std::unordered_map<std::thread::id, std::unique_ptr<VersionCacheShard>>
-      version_read_caches_{};
-  // A read-only query may hand page morsels to multiple scan workers.  The
-  // version cache and read set are transaction-local, so guard them while
-  // preserving a single MVCC snapshot across those workers.
-  std::unique_ptr<std::mutex> read_state_mutex_{std::make_unique<std::mutex>()};
+  ProcessMemoryCharge staged_charge_{MemoryPoolKind::kTx, 0, /*forced=*/false};
+  std::vector<std::shared_ptr<TransactionFinishHook>> finish_hooks_;
+  std::string serialization_scratch_{};
   // Serializes WAL chain maintenance ({AppendLog, PreCommit's commit record,
   // Abort's terminator} + the prev_lsn_/status stores) against the
   // checkpoint's active-transaction snapshot, which takes this mutex per
@@ -865,31 +1032,29 @@ class Transaction final {
   // Begin()'s registry unlock and the move's re-registration), so this
   // mutex must stay valid and lockable on the moved-from object too.
   mutable std::mutex chain_mu_{};
-  std::string serialization_scratch_{};
-  // Relaxed atomics: writers (the owning thread, via AddLog/SetStatus) do
-  // not hold transaction_table_lock, but the checkpoint thread reads both
-  // fields for its ActiveTransactionTable snapshot while holding it.  The
-  // atomics remove the data race; no cross-field ordering is required.
-  std::atomic<lsn_t> prev_lsn_{0};
-  // End LSN of the record that starts at prev_lsn_ (see PrevRecordEndLSN).
-  std::atomic<lsn_t> prev_end_lsn_{0};
-  // Start LSN of the first record this transaction ever appended (see
-  // FirstLSN). Compare-exchanged so a concurrent reader always sees the
-  // earliest value.
-  std::atomic<lsn_t> first_lsn_{0};
+  std::unordered_set<RowPosition> read_set_{};
+  std::unordered_map<std::thread::id, std::unique_ptr<VersionCacheShard>>
+      version_read_caches_{};
+  // Owner-thread confined: writes are issued from the transaction's owning
+  // thread only (reads may register concurrently from join workers, hence
+  // read_state_mutex_; writes also drive AcquireWriteIntent whose shard
+  // locks must never nest under a transaction-local mutex).
+  TransactionWriteSet write_set_{};
+  // Lazily-cached handle to the manager's write-set spill store (P472):
+  // immutable once created, so TryInsertWriteSet takes the global
+  // creation mutex at most once per transaction.
+  std::shared_ptr<SpillStore> write_set_spill_store_{};
+  // In-gate drain-budget exhaustion signal; see
+  // NoteIndexReservationDrainExhausted. Mutable: the index-undo drains run
+  // in const-adjacent contexts and Table consumes it from a const method.
+  mutable std::atomic<uint32_t> index_drain_exhausted_{0};
+  bool wal_reread_mode_{false};
   std::atomic<bool> has_log_{false};
   std::atomic<bool> has_table_drop_{false};
-  std::vector<std::shared_ptr<TransactionFinishHook>> finish_hooks_;
   bool finish_hooks_finalized_{false};
-  // D4: highest dependency commit LSN observed by this transaction (see
-  // RecordDurabilityDependence).  Updated from const read paths.
-  mutable std::atomic<lsn_t> durability_dependence_{0};
   std::atomic<TransactionStatus> status_{TransactionStatus::kUnknown};
   std::atomic<bool> failed_{false};
   bool read_only_{false};
-
-  // Not owned by this class.
-  TransactionManager* transaction_manager_{nullptr};
   // Set by an older transaction's Wound-Wait preemption or by a deadlock
   // detector that chose this transaction as a victim. AcquireWriteIntent
   // checks this on every entry; the next call returns false and the caller
@@ -898,16 +1063,12 @@ class Transaction final {
   // Set by TransactionManager::Abort when the undo walk begins; see
   // MarkAbortStarted for why waiters consult it.
   std::atomic<bool> abort_started_{false};
-  // See DebugSetPhase (round 9 stall postmortem aid). Mutable: diagnostic
-  // observers (and const-context park sites) tag the current phase.
-  mutable std::atomic<const char*> debug_phase_{nullptr};
-  std::atomic<int64_t> debug_tid_{0};
-  // In-gate drain-budget exhaustion signal; see
-  // NoteIndexReservationDrainExhausted. Mutable: the B+Tree drain points run
-  // in const-adjacent contexts and Table consumes it from a const method.
-  mutable std::atomic<uint32_t> index_drain_exhausted_{0};
+  // Thread-confined (catalog writes hold Database::catalog_mu_); see
+  // MarkCatalogDirty.
+  bool catalog_dirty_{false};
   // Last write-intent acquisition failure reason (owner-thread confined).
   IntentWaitFailure intent_wait_failure_{IntentWaitFailure::kNone};
+  Status write_set_failure_status_{Status::kSuccess};
   friend class TransactionManager;
 };
 

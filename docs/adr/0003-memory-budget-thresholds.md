@@ -11,7 +11,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P1 実装済み: `common/memor
 - 上限 `M`: `TINYLAMB_MEMORY_LIMIT_BYTES`、既定 16 GiB
 - 追跡量のソフト上限: `M` の 80%
 - RSS による打ち切り: `M` の 87.5%
-- `kStorage` の上限 `min(4 GiB, M/4)`、`kColumnar` の上限 `min(2 GiB, M/8)`、`kQuery` は上限なし
+- `kStorage` の上限 `min(4 GiB, M/4)`、`kColumnar` の上限 `min(8 GiB, M/2)`、`kQuery` は上限なし
 
 これとは別に `QueryMemoryBudget`（`executor/query_memory.hpp`）がプロセス全体の
 シングルトンとして実行用の上限を持つ。上限が 2 か所にあり、プール間で回収する仕組みが無い。

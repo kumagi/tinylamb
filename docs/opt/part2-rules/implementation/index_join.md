@@ -7,7 +7,7 @@
 
 ## 概要
 
-論理等値内部結合 `kJoin` を、内側（右側）リレーションの B+Tree 索引を外側（左側）行ごとに直接シーク・プローブする `ProductPlan`（索引結合形態）へ実装する規則です。右側の全表走査およびハッシュテーブル構築を回避し、左側入力から取得した結合キー値を用いて右側テーブルの索引を直接ポイントルックアップします。
+論理等値内部結合 `kJoin` を、内側（右側）リレーションの LsmIndex 索引を外側（左側）行ごとに直接シーク・プローブする `ProductPlan`（索引結合形態）へ実装する規則です。右側の全表走査およびハッシュテーブル構築を回避し、左側入力から取得した結合キー値を用いて右側テーブルの索引を直接ポイントルックアップします。
 
 この probe は複合キーの等値 prefix と、prefix の次の索引キー列に対する範囲 bound を最大 2 個まで（下限と上限に 1 個ずつ）表せます。片側しか述語がなければ従来どおりの片側境界、両側が揃えば `lower < key < upper` の区間シークになります。probe 自身では決定できない述語（同じ側の 2 個目の境界、3 個目以降の範囲、索引キー列ではない列の等値、範囲 whitelist 外の型の範囲）は、結合 node の上に残差 `Selection` として残り、probe の過剰フェッチを述語が絞り込みます。
 
@@ -20,11 +20,11 @@ graph TD
     J --> R2["Group R (kScan t2)"]
   end
   subgraph after["変換後: 物理プラン"]
-    IJ["ProductPlan (IndexJoin)<br/>probe = (a 等値 prefix) + (範囲 bound 最大 2 個 = 下限/上限)<br/>left_keys = (a)<br/>right = テーブル t2 + 索引 (x)<br/>local_cost = (l_rows * 2.0) + equi_estimate<br/>estimated_rows = equi_estimate"] --> L1["L の最良プラン"]
+    IJ["ProductPlan (IndexJoin)<br/>probe = (a 等値 prefix) + (範囲 bound 最大 2 個 = 下限/上限)<br/>left_keys = (a)<br/>right = テーブル t2 + 索引 (x)<br/>local_cost = (l_rows * probe_factor) + l_rows + candidate_rows<br/>estimated_rows = equi_estimate"] --> L1["L の最良プラン"]
   end
 ```
 
-右子プランは実行時には起動されず、物理実行器がテーブルストレージおよび B+Tree 索引ハンドルを直接参照してタプルを生成します（出力スキーマはリネーム解決済みの `declared_output` を使用します）。
+右子プランは実行時には起動されず、物理実行器がテーブルストレージおよび LsmIndex 索引ハンドルを直接参照してタプルを生成します（出力スキーマはリネーム解決済みの `declared_output` を使用します）。
 
 ## 適用条件
 
@@ -70,7 +70,7 @@ if (children.size() != 2 || required.require_row_position) {
 
 本規則において最も重大な意味論的制約は、第 2 のガード条件である「右側スキャングループのフィルタ不在性」です。
 
-`ProductPlan` のインデックス結合実行器は、右子プラン（イテレータ）を実行せず、生のテーブルストレージに対して B+Tree 索引シークを行います。もし論理規則 `push_selection_into_scan` によって右側のスキャングループにフィルタ述語（Selection）がマージされていた場合、そのフィルタは右子プランの走査時に評価される前提となっています。右子プランをバイパスするインデックス結合を適用してしまうと、本来評価されるべきフィルタが完全に脱落し、不正な行が出力される「述語消失（Predicate Erasure）」が発生します。したがって、右側にフィルタが存在する局面では本規則は厳格に発火を抑止されます。
+`ProductPlan` のインデックス結合実行器は、右子プラン（イテレータ）を実行せず、生のテーブルストレージに対して LsmIndex 索引シークを行います。もし論理規則 `push_selection_into_scan` によって右側のスキャングループにフィルタ述語（Selection）がマージされていた場合、そのフィルタは右子プランの走査時に評価される前提となっています。右子プランをバイパスするインデックス結合を適用してしまうと、本来評価されるべきフィルタが完全に脱落し、不正な行が出力される「述語消失（Predicate Erasure）」が発生します。したがって、右側にフィルタが存在する局面では本規則は厳格に発火を抑止されます。
 
 probe が等値 prefix として固定できるのは、索引キー順で連続して並んだ先頭キー列だけです。gap の後ろのキー列は probe が値を固定していないので順序付けに寄与せず、範囲 bound を置いても seek は狭まらない。索引キー順の連続性で prefix を決めることで、結合キーの並び順が索引の並び順と違っても探索キーが格納キー画像の prefix になり、範囲外のバイト列を走査することがない。
 
@@ -109,14 +109,14 @@ for (const LookupRangeCandidate& range : ranges) {
 ```
 
 - **probe 導出**: `DeriveLookupSeek`（`plan/product_plan.cpp`）が索引キー順で等値 prefix を作る。この情報は `ProductPlan` の ctor の中でも導出され、`relational_factory.cpp` がそれを `slot_t` に解決して `LookupJoin` を組み立てる。規則側が `SetLookupRange` を呼ぶのはこの導出結果に範囲位置を足すためで、`range_key_offset` が prefix 長と一致しない場合は `false` を返す。2 回目の呼び出しは同じ位置・反対側の bound だけを受け入れ、片側ずつだった境界を区間へ閉じる。区間の 2 個目の bound は `left_columns` に載らず `LookupSeek::second_range_left_column` として別に持ち、`relational_factory.cpp` が左行の該当スロットへ解決して `LookupJoin` に渡す。
-- **`local_cost = (l_rows * 2.0) + equi_estimate`**: 左入力の行ごとに「B+Tree プローブ走査 + レコード組み立て」のコストとして 2 行分を計上し、さらに索引から実際にヒットして返る推定行数（`equi_estimate`、残余述語の選択度も込み）を加算します。範囲 bound を採用した場合は、点プローブが範囲走査に変わるので、範囲スライス索引スキャンと同じクラスタリング罰（`RangeClusteringPenalty`）を掛ける。
-- **`estimated_rows`**: `equi_estimate` を基盤とし、`equi_conjuncts` の上限を `unique` 索引かつ点プローブのときだけ `l_rows` で打ち切る（1 左行に複数右行が一致しうるので、範囲 bound がある／prefix がキー全体でない場合はこの cap を掛けない）。
+- **`local_cost = (l_rows * probe_factor) + l_rows + candidate_rows`**: `candidate_rows = max(equi_estimate, max(1.0, l_rows) * candidates_per_probe)`。`probe_factor` は出力順序をプローブが配達できる場合に割り引かれる。範囲 bound を採用した場合は `RangeClusteringPenalty` を掛ける。
+- **`estimated_rows`**: `lookup_plan->EmitRowCount()` をそのまま使う（`equi_estimate` を独自に再計算して cap する式ではない）。
 - **残差**: 全 conjunct から probe が強制する等値と採用済み bound を除いた集合を `SelectionPlan` として結合の上に置く。
 - **スキーマの整合性**: `declared_output` により、右側テーブルの物理スキーマを論理エイリアスを含む形式へリネームし、上流演算子の参照列位置を正しく整合させます。
 
 ## 最適化効果
 
-右リレーションの全表走査とハッシュテーブル構築を、外側入力の行数に比例する B+Tree の探索へ置き換えます。右側テーブルが大きく、索引の選択度が高い（1 キーあたりのヒット件数が少ない）場合は、全走査を要する `hash_join` より低コストです。一方、左側入力が大きいとシーク回数も増えるため、ハッシュ結合が有利になる場合があります。Cascades 探索エンジンは、両者の推定コストを比較して物理実装を選びます。
+右リレーションの全表走査とハッシュテーブル構築を、外側入力の行数に比例する LsmIndex の探索へ置き換えます。右側テーブルが大きく、索引の選択度が高い（1 キーあたりのヒット件数が少ない）場合は、全走査を要する `hash_join` より低コストです。一方、左側入力が大きいとシーク回数も増えるため、ハッシュ結合が有利になる場合があります。Cascades 探索エンジンは、両者の推定コストを比較して物理実装を選びます。
 
 ## 関連 Rule との相互作用
 

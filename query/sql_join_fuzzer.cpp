@@ -987,7 +987,8 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   }
 
   // On multi-super-block (`large`, 9,000-row) rounds, probe the 3 selectivity
-  // patterns of the streaming grouped-join paths across 4,096-row LSTable super-blocks:
+  // patterns of the streaming grouped-join paths across 4,096-row LSTable
+  // super-blocks:
   //   0: Pattern A (<5% sparse gather across block 0 & block 1 boundary)
   //   1: Pattern C (100% block 0) + Pattern B (~22% block 1) + 0% block 2
   //   2: Pattern B (>92% high-selectivity block 0) + Pattern C (100% block 1/2)
@@ -1348,11 +1349,16 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   // indexes on fact and dim, run ANALYZE, and re-verify every recorded query
   // under the default optimizer, relational fallback, Cascades grouped route,
   // and 512B disk-spill budget.
-  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);");
-  if (!large) {
-    ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  // A silent index-creation failure would make the "indexed" modes run as
+  // plain scans and mislabel the finding.  Fail loudly instead.
+  if (!ApplyIndexSpec(db, ctx,
+                      "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);") ||
+      (!large &&
+       !ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);")) ||
+      !ApplyIndexSpec(db, ctx,
+                      "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);")) {
+    return std::string("[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n");  // NOLINT(modernize-return-braced-init-list)
   }
-  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);");
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
     if (auto res = engine.Execute(ctx, analyze_sql); res.HasValue()) {
       res.Value().Drain();
@@ -1382,6 +1388,11 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       auto got =
           RunQuery(db, ctx, qe.sql, &error, /*force_relational=*/mode == 1);
       if (!got.has_value()) {
+        // An error that appears only in the indexed / relational / cascades /
+        // spill mode is exactly what the index-independence oracle must catch;
+        // silently skipping it hides the regression (and differs from replay).
+        report += std::string("[JOIN-MODE ERROR] mode=") +
+                  std::to_string(mode) + " " + qe.sql + "\n  " + error + "\n";
         continue;
       }
       std::vector<std::string> actual;
@@ -1445,7 +1456,13 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
     }
     result.Value().Drain();
   }
-  (void)ctx.txn_.PreCommit();
+  // T4619: surface a setup-commit failure as a replay error (the caller
+  // buckets reports by signature) instead of silently probing an
+  // uncommitted setup.
+  const Status committed = ctx.txn_.PreCommit();
+  if (committed != Status::kSuccess) {
+    return "setup commit failed: " + ToString(committed);
+  }
   ctx = db.BeginContext();
   auto check_queries = [&](bool force_relational,
                            const char* tag) -> std::string {
@@ -1578,7 +1595,15 @@ bool ParseJoinTest(std::string_view text, uint64_t* seed, JoinTrace* trace,
     };
     std::string value;
     if (consume("-- seed: ", &value)) {
-      *seed = std::stoull(value);
+      try {
+        size_t used = 0;
+        *seed = std::stoull(value, &used);
+        if (used != value.size()) {
+          return false;
+        }
+      } catch (const std::exception&) {
+        return false;
+      }
     } else if (consume("-- setup: ", &value)) {
       trace->setup.push_back(value);
     } else if (consume("-- query: ", &value)) {

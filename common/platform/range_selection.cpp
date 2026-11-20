@@ -154,6 +154,7 @@ uint32_t CompactDoubleRange(const int64_t* values, uint32_t* positions,
   using Kernel = decltype(&CompactDoubleScalar<true, true>);
   static const auto kernels = [] {
     struct Kernels {
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized buffer
       Kernel functions[4];
     };
 #ifdef TINYLAMB_RANGE_X86

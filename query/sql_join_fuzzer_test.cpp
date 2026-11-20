@@ -44,9 +44,16 @@ TEST(SqlJoinFuzzer, SeededJoinsMatchMirror) {
   int queries = 0;
   int left_joins = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations =
-      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
-                         : 48;
+  int kIterations = 48;
+  if (scale != nullptr) {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(scale, &end, 10);
+    if (errno == 0 && end != scale && *end == '\0' && parsed > 0 &&
+        parsed <= std::numeric_limits<int>::max()) {
+      kIterations = static_cast<int>(parsed);
+    }
+  }
   for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     std::mt19937 rng(seed);
     JoinStats stats;

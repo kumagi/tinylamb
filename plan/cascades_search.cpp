@@ -687,12 +687,36 @@ Pattern Pattern::Op(LogicalOperator operation, std::vector<Pattern> children,
   return pattern;
 }
 
+namespace {
+// Equivalence rewrites can form cycles between memo groups; cap the
+// Pattern/Match recursion instead of trusting a "finite query" comment.
+constexpr size_t kMaxPatternMatchDepth = 512;
+thread_local size_t tls_pattern_match_depth = 0;
+struct PatternMatchDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+  bool entered{false};
+  PatternMatchDepthGuard() {
+    if (tls_pattern_match_depth < kMaxPatternMatchDepth) {
+      ++tls_pattern_match_depth;
+      entered = true;
+    }
+  }
+  ~PatternMatchDepthGuard() {
+    if (entered) {
+      --tls_pattern_match_depth;
+    }
+  }
+};
+}  // namespace
+
 bool Pattern::MatchGroup(
     const Memo& memo,
     GroupId group,  // NOLINT(misc-no-recursion) // Cascades pattern matching
-                    // recurses over the expression tree by design; depth is
-                    // bounded by the memo built from a finite query.
+                    // recurses over the expression tree by design.
     Bindings* bindings) const {
+  PatternMatchDepthGuard depth_guard;
+  if (!depth_guard.entered) {
+    return false;
+  }
   if (!capture_.empty()) {
     auto [iter, inserted] = bindings->emplace(capture_, group);
     if (!inserted && iter->second != group) {
@@ -1312,7 +1336,9 @@ std::optional<BestPlan> SearchEngine::Optimize(
               rule.Apply(memo_, group, expression, children, required, ctx);
           for (PlanAlternative& alternative : generated) {
             alternative.rule_name = rule.Name();
-            AttachPlanExplainInfo(alternative, required, ctx);
+            // Explain info is attached once by OptimizeGroup() below, which
+            // sees every alternative produced by implement(); attaching here
+            // as well rebuilt the same strings twice per alternative.
           }
           alternatives.insert(alternatives.end(),
                               std::make_move_iterator(generated.begin()),

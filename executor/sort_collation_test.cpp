@@ -45,6 +45,13 @@ const Schema& TextSchema() {
   return schema;
 }
 
+const Schema& TwoTextSchema() {
+  static const Schema schema("synthetic",
+                             {Column("a", ValueType::kVarChar),
+                              Column("b", ValueType::kVarChar)});
+  return schema;
+}
+
 const Schema& NameSchema() {
   static const Schema schema("synthetic",
                              {Column("name", ValueType::kVarChar)});
@@ -224,7 +231,7 @@ class PositionedRows final : public ExecutorBase {
 // key-evaluation failure).
 class ExplodingKey final : public ExpressionBase {
  public:
-  [[nodiscard]] TypeTag Type() const override {
+  [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kFunctionCallExp;
   }
   [[nodiscard]] StatusOr<Value> TryEvaluate(
@@ -424,6 +431,33 @@ TEST(SortCollationTest, CollatedSortFoldsEveryKeyOfACompositeOrder) {
     texts.emplace_back(row[1].value.varchar_value);
   }
   EXPECT_EQ(texts, (std::vector<std::string>{"a", "C", "A", "b"}));
+}
+
+// A composite order can mix collations per key. With a binary first key,
+// CI folding of the second key must only break ties inside each first-key
+// group; it must not reorder groups (the plan-level "any CI => fold all"
+// aggregate is deliberately conservative here).
+TEST(SortCollationTest, MixedBinaryAndCiCompositeKeysKeepGroupOrder) {
+  const std::vector<Row> rows{Row({Value("b"), Value("A")}),
+                              Row({Value("a"), Value("z")}),
+                              Row({Value("a"), Value("B")})};
+  std::vector<SortExecutor::Key> keys{
+      SortExecutor::Key{.expression = ColumnValueExp("a"),
+                        .ascending = true,
+                        .nulls_first = std::nullopt,
+                        .collation = Collation::kBinary},
+      CiSortKey(Collate(ColumnValueExp("b"), "und:ci"))};
+  auto sort = std::make_shared<SortExecutor>(
+      std::make_shared<ConstantExecutor>(rows), TwoTextSchema(),
+      std::move(keys));
+  std::vector<std::string> texts;
+  Row row;
+  RowPosition position;
+  while (sort->Next(&row, &position)) {
+    texts.emplace_back(std::string(row[0].value.varchar_value) +
+                       std::string(row[1].value.varchar_value));
+  }
+  EXPECT_EQ(texts, (std::vector<std::string>{"aB", "az", "bA"}));
 }
 
 TEST(SortCollationTest, CollatedSortPropagatesKeyEvaluationErrors) {

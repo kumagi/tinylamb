@@ -32,11 +32,12 @@ namespace {
 // noise from background threads cannot flip the pin.
 std::atomic<uint64_t> g_alloc_count{0};
 std::atomic<bool> g_counting{false};
-std::thread::id g_measuring_thread;
+std::atomic<std::thread::id> g_measuring_thread;
 
 inline void CountAllocationIfActive() {
   if (g_counting.load(std::memory_order_relaxed) &&
-      std::this_thread::get_id() == g_measuring_thread) {
+      std::this_thread::get_id() ==
+      g_measuring_thread.load(std::memory_order_relaxed)) {
     g_alloc_count.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -49,7 +50,9 @@ inline void CountAllocationIfActive() {
 // because all operator new/delete paths are replaced together.
 void* operator new(std::size_t n) {
   CountAllocationIfActive();
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) raw-buffer codec test
   void* p = std::malloc(n == 0 ? 1 : n);
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
   if (p == nullptr) {
     throw std::bad_alloc();
   }
@@ -57,8 +60,10 @@ void* operator new(std::size_t n) {
 }
 void* operator new[](std::size_t n) {
   CountAllocationIfActive();
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) raw-buffer codec test
   void* p = std::malloc(n == 0 ? 1 : n);
   if (p == nullptr) {
+    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
     throw std::bad_alloc();
   }
   return p;
@@ -68,6 +73,7 @@ void* operator new(std::size_t n, std::align_val_t a) {
   const auto align = static_cast<std::size_t>(a);
   std::size_t size = n == 0 ? 1 : n;
   size = (size + align - 1) & ~(align - 1);
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)  // raw-buffer codec test
   void* p = std::aligned_alloc(align, size);
   if (p == nullptr) {
     throw std::bad_alloc();
@@ -77,30 +83,47 @@ void* operator new(std::size_t n, std::align_val_t a) {
 void* operator new[](std::size_t n, std::align_val_t a) {
   return operator new(n, a);
 }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete(void* p) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete[](void* p) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete(void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete[](void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete(void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
 void operator delete[](void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
   std::free(p);
 }
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 void operator delete[](void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
   std::free(p);
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 }
 
 namespace tinylamb {
 
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 namespace {
 
 struct ScopedAllocationCount {
   uint64_t count;
 };
 
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+
 ScopedAllocationCount MeasureAllocations(const std::function<void()>& fn) {
   g_alloc_count.store(0, std::memory_order_relaxed);
-  g_measuring_thread = std::this_thread::get_id();
+  g_measuring_thread.store(std::this_thread::get_id(),
+                                  std::memory_order_relaxed);
   g_counting.store(true, std::memory_order_seq_cst);
   fn();
   g_counting.store(false, std::memory_order_seq_cst);

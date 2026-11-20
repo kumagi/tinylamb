@@ -10,8 +10,9 @@
 // shapes trade memory for rejection power (the dynamic filter join design):
 //
 //   kExactSet  information passing: the distinct build keys themselves.
-//              No false positives, 8 bytes/key, chosen while the domain is
-//              small.
+//              No false positives, ~16 bytes/key (8 for the int64 key plus a
+//              4-byte hash-table slot at >=2x load), chosen while the domain
+//              is small.
 //   kMinMax    shared information passing, range half: the [lo, hi]
 //              enclosure of the build keys.  Two int64 of state regardless
 //              of domain size; very effective when the build side is itself
@@ -109,8 +110,10 @@ class ExactSetRuntimeFilter final : public RuntimeFilter {
            (table_slots * sizeof(uint32_t));
   }
   [[nodiscard]] const std::vector<int64_t>& Keys() const { return keys_; }
-  [[nodiscard]] int64_t Min() const { return keys_.front(); }
-  [[nodiscard]] int64_t Max() const { return keys_.back(); }
+  // An empty set rejects every key (see Reject()), so it has no min/max.
+  // Guard the accessors instead of calling front()/back() on an empty vector.
+  [[nodiscard]] int64_t Min() const { return keys_.empty() ? 0 : keys_.front(); }
+  [[nodiscard]] int64_t Max() const { return keys_.empty() ? 0 : keys_.back(); }
 
  private:
   std::vector<int64_t> keys_;
@@ -145,8 +148,10 @@ class MinMaxRuntimeFilter final : public RuntimeFilter {
 // set per key; a key is rejected when any required probe bit is clear.
 class BloomRuntimeFilter final : public RuntimeFilter {
  public:
-  // `distinct_keys` sizes the bitset at ~10 bits/key (false-positive rate
-  // well under 2%); the bit count is rounded up to a power of two.
+  // `distinct_keys` sizes the bitset at ~10 bits/key. With kHashProbes=2 the
+  // Bloom false-positive rate is (1-e^{-2/10})^2 ~= 3.3% (reaching <=2% would
+  // need ~20 bits/key), which is the accepted tradeoff for a small filter;
+  // the bit count is rounded up to a power of two.
   BloomRuntimeFilter(std::vector<uint64_t> bits, size_t bit_count,
                      size_t distinct_keys, size_t nominal_bit_count = 0);
   // Zero-copy constructor over an immutable memory-mapped word span whose
@@ -360,8 +365,8 @@ class RuntimeFilterGroup final {
 class RuntimeFilterBuilder {
  public:
   // Above this many distinct keys an exact set is replaced by the
-  // range+membership pair; 4096 keys is 32 KiB, already more than the probe
-  // scan saves in a typical plan.
+  // range+membership pair; 4096 keys is ~64 KiB (16 B/key including the hash
+  // table), already more than the probe scan saves in a typical plan.
   static constexpr size_t kMaxExactKeys = 4096;
   // Hard cap on retained keys (2M keys ~ 15.3 MiB). Beyond it only the running
   // [lo, hi] enclosure survives.

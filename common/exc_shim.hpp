@@ -22,9 +22,11 @@ namespace detail {
 
 [[noreturn]] inline void ExcShimThrow(std::string_view /*what*/,
                                       const Status& status) {
-  // The message must round-trip verbatim: differential tests and server
-  // error strings compare these texts, and the old throw sites carried
-  // exactly this payload without any wrapper prefix.
+  // The Status message must round-trip verbatim: differential tests and
+  // server error strings compare these texts, and the old throw sites
+  // carried exactly this payload without any wrapper prefix.  The `what`
+  // label is deliberately NOT prepended (a prefix would break those
+  // comparisons); it only documents the throwing wrapper at the call site.
   throw std::runtime_error(status.GetMessage().empty()
                                ? std::string(ToString(status.GetCode()))
                                : status.GetMessage());

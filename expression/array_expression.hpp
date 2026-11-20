@@ -48,7 +48,7 @@ class ArrayExpression : public ExpressionBase {
   }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kArrayExp; }
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kArrayExp; }
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
  private:

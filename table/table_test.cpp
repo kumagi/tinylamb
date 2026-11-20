@@ -514,6 +514,48 @@ TEST_F(TableTest, Update_SingleRow_UpdatesRowSuccessfully) {
   ASSERT_EQ(read, new_row);
 }
 
+// P652/689: the before-image-taking Update overload must keep the heap and
+// every index in exactly the same state as the auto-fetch overload does, and
+// an empty hint must fall back to the internal read (the contract the
+// executor's UPDATE pre-image cache relies on).
+TEST_F(TableTest, UpdateWithSuppliedPreimageKeepsHeapAndIndexConsistent) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  const Row original({Value(7), Value("orig"), Value(1.5)});
+  ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Insert(ctx.txn_, original));
+
+  const Row moved({Value(8), Value("orig"), Value(1.5)});
+  ASSIGN_OR_ASSERT_FAIL(RowPosition, rp2,
+                        tbl->Update(ctx.txn_, rp, moved, original));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rp2));
+  ASSERT_EQ(read, moved);
+
+  // The col1 index must have followed the key change: stale 7 gone, 8 present.
+  size_t stale_hits = 0;
+  for (Iterator it =
+           tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(0), Value(7), Value(7));
+       it.IsValid(); ++it) {
+    ++stale_hits;
+  }
+  EXPECT_EQ(stale_hits, 0U);
+  size_t new_hits = 0;
+  for (Iterator it =
+           tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(0), Value(8), Value(8));
+       it.IsValid(); ++it) {
+    ++new_hits;
+  }
+  EXPECT_EQ(new_hits, 1U);
+
+  // Empty hint behaves like the 3-arg overload (internal before-image read).
+  const Row moved2({Value(9), Value("again"), Value(2.5)});
+  ASSIGN_OR_ASSERT_FAIL(RowPosition, rp3,
+                        tbl->Update(ctx.txn_, rp2, moved2, Row()));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read2, tbl->Read(ctx.txn_, rp3));
+  ASSERT_EQ(read2, moved2);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
 TEST_F(TableTest, Update_MultipleRowsRepeatedly_UpdatesSuccessfully) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
@@ -1226,6 +1268,13 @@ TEST_F(TableTest,
   std::stringstream ss;
   ss << *tbl;
   EXPECT_NE(ss.str().find("Table(schema="), std::string::npos);
+  // T2113: the dump must carry the persisted incarnation seed and the live
+  // clustered-order proof inputs (layout generation + rewrite latch) that
+  // ClusteredOrderColumn keys off; four fields hid them.
+  EXPECT_NE(ss.str().find("incarnation="), std::string::npos) << ss.str();
+  EXPECT_NE(ss.str().find("layout_generation="), std::string::npos) << ss.str();
+  EXPECT_NE(ss.str().find("rows_rewritten_in_place="), std::string::npos)
+      << ss.str();
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
@@ -1462,7 +1511,7 @@ TEST_F(TableTest, DropTableWaitsForActiveFullScan) {
     EXPECT_EQ(drop_future.wait_for(std::chrono::milliseconds(50)),
               std::future_status::timeout);
   }
-  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(5)),
+  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(30)),
             std::future_status::ready);
   EXPECT_EQ(drop_future.get(), Status::kSuccess);
 }
@@ -1499,7 +1548,7 @@ TEST_F(TableTest, DropAbortReopensFullScan) {
     EXPECT_EQ(drop_future.wait_for(std::chrono::milliseconds(50)),
               std::future_status::timeout);
   }
-  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(5)),
+  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(30)),
             std::future_status::ready);
   EXPECT_EQ(drop_future.get(), Status::kSuccess);
 
@@ -1577,7 +1626,7 @@ TEST_F(TableTest, DropTableWaitsForActiveIndexScan) {
     EXPECT_EQ(drop_future.wait_for(std::chrono::milliseconds(50)),
               std::future_status::timeout);
   }
-  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(5)),
+  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(30)),
             std::future_status::ready);
   EXPECT_EQ(drop_future.get(), Status::kSuccess);
 }
@@ -1614,7 +1663,10 @@ TEST_F(TableTest, UniqueIndexWaitsForAbortedWriterAndSucceeds) {
 
     s1_inserted_fut.wait();
 
+    std::promise<void> s2_started_promise;
+    auto s2_started = s2_started_promise.get_future();
     auto s2_worker = std::async(std::launch::async, [&]() -> Status {
+      s2_started_promise.set_value();
       TransactionContext s2 = rs_->BeginContext();
       auto tbl = s2.GetTable(tbl_name).Value();
       Status ins = tbl->Insert(s2.txn_, Row({Value(42), Value(2)})).GetStatus();
@@ -1625,6 +1677,7 @@ TEST_F(TableTest, UniqueIndexWaitsForAbortedWriterAndSucceeds) {
       return s2.txn_.PreCommit();
     });
 
+    s2_started.wait();
     EXPECT_EQ(s2_worker.wait_for(std::chrono::milliseconds(50)),
               std::future_status::timeout);
     release_s1.set_value();

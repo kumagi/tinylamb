@@ -45,4 +45,4 @@ Status: accepted（2026-11-16 決定、2026-11-17 P1 実装済み: `StatusCode::
 
 - `StatusCode` を文字列にする箇所と、網羅的な `switch` に 1 件ずつ足す。
 - 旧経路が返しているエラーコードは変えない（[ADR 0006](0006-ooc-parts-on-new-sinks-only.md)）。
-- サーバに SQLSTATE への対応付けを足す（現状、`53xxx` を返す箇所は無い）。
+- サーバに SQLSTATE への対応付けを足す（~~現状、`53xxx` を返す箇所は無い~~ 2026-11-17 実装済み: `SqlStateForStatus` が `kMemoryLimitExceeded` → `53200`、`kNoSpace` → `53100` を返し、`server/postgres_server.cpp` の ErrorResponse 経路が呼ぶ。ピンは `server/postgres_server_test.cpp` の `PropagatesResourceLimitSqlStates53200And53100` と `common/status_or_test.cpp`）。

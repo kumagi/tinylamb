@@ -973,8 +973,18 @@ def values_match(actual_rendered, expected):
     # (FormatSimplifyValue). Floats compare numerically so integral doubles
     # agree regardless of fixed/scientific rendering; TRUE/FALSE accept 1/0
     # because the engine stores booleans as INT64.
-    if expected.startswith("THROW:"):
-        return actual_rendered.startswith("ERROR")
+    # The C++ reference renders a thrown evaluation as "THROW(<msg>)"; accept
+    # both that and the legacy "THROW:<msg>" spelling.
+    if expected.startswith("THROW:") or expected.startswith("THROW("):
+        if not actual_rendered.startswith("ERROR"):
+            return False
+        # Check that the expected error message actually appears; a parse
+        # error or unrelated exception must not satisfy a THROW expectation.
+        if expected.startswith("THROW:"):
+            want_msg = expected.split(":", 1)[1]
+        else:
+            want_msg = expected[len("THROW("):].rstrip(")")
+        return want_msg in actual_rendered
     if not actual_rendered.startswith("OK "):
         return False
     actual = actual_rendered[3:]
@@ -983,6 +993,13 @@ def values_match(actual_rendered, expected):
     bool_map = {"TRUE": "1", "FALSE": "0"}
     if bool_map.get(actual, actual) == expected:
         return True
+    # Python float has only a 53-bit mantissa: two adjacent INT64s above
+    # 2**53 would compare equal after conversion. Try exact integer first.
+    try:
+        ia, ib = int(actual, 10), int(expected, 10)
+        return ia == ib
+    except ValueError:
+        pass
     try:
         fa, fb = float(actual), float(expected)
         import math

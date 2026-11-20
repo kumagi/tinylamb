@@ -204,6 +204,8 @@ int FuzzChunkFooterOneInput(const uint8_t* data, size_t size) {
 
   const Status v1 = PaxChunk::ValidateChunkBytes(bytes);
   const Status v2 = PaxChunk::ValidateChunkBytes(bytes);
+  // Note: this catches state that changes across back-to-back calls only;
+  // deep state-dependent nondeterminism needs a varied input sequence.
   if (v1 != v2) {
     std::cerr << "nondeterministic ValidateChunkBytes verdict\n";
     std::abort();

@@ -33,6 +33,10 @@ struct EnumSchema {
   bool closed{true};  // proto2 closed vs proto3 open enum
 };
 
+// The full enum registry (single source of truth; T4465: callers must not
+// hand-copy name lists against it).
+[[nodiscard]] const std::vector<EnumSchema>& Enums();
+
 // Returns nullptr when the message is unknown.
 [[nodiscard]] const std::vector<ProtoFieldSchema>* FindProtoMessageFields(
     const std::string& full_name);

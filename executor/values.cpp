@@ -12,7 +12,15 @@
 namespace tinylamb {
 
 size_t ValuesExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
-  destination->Reset();
+  if (schema_.ColumnCount() == 0 && !rows_.empty()) {
+    std::vector<Column> cols;
+    cols.reserve(rows_.front().values_.size());
+    for (const Value& v : rows_.front().values_) {
+      cols.emplace_back("", v.type);
+    }
+    schema_ = Schema("", std::move(cols));
+  }
+  destination->Reset(schema_);
   while (offset_ < rows_.size() && destination->Size() < max_rows) {
     destination->Append(std::move(rows_[offset_++]));
   }

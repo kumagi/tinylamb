@@ -1,6 +1,6 @@
 # batch_nested_loop
 
-- 状態: draft   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft   /   執筆基準リビジョン: `72ad60a` (2026-11-19)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の
   登録 `"batch_nested_loop"`（パターン: `Join()`、共有ヘルパー `BatchNestedLoopFor` に委譲）
 
@@ -8,7 +8,7 @@
 
 論理式 `kJoin`（内部結合）のうち等値結合キー対を持たない非等値結合を対象とし、結合述語全体を保持する直積形式の `ProductPlan` にブロック化実行標識 `PreferBatchNestedLoop()` を付与して変換する Rule です。
 
-タプル単位の入れ子ループ結合（`nested_loop_join`）と同一のプラン形状・同一コスト・同一の推定行数を返却するためコスト比較では同点となりますが、ルール登録順序により通常はタプル版が選ばれる検証済みフォールバックとして位置付けられています。
+タプル単位の入れ子ループ結合（`nested_loop_join`）と同一のプラン形状を返却しますが、局所コストは直積ペア部分に 0.8 の係数を乗せて見積もるため（ブロック化カーネルのペアあたりコストがタプル版より低い）、通常のコスト比較ではブロック化版が選択され得ます。
 
 ## 変換前後の関係
 
@@ -38,7 +38,7 @@ return BatchNestedLoopFor(logical.predicate, children[0], children[1],
                           /*wrap_selection=*/true);
 ```
 
-`BatchNestedLoopFor` の内部では、以下の 2 つのゲート条件を課します。
+`BatchNestedLoopFor` の内部では、以下のゲート条件を課します。
 
 1. **結合述語の存在**:
    ```cpp
@@ -46,7 +46,19 @@ return BatchNestedLoopFor(logical.predicate, children[0], children[1],
      return {};
    }
    ```
-2. **等値結合キー対の不在**:
+2. **非ラップ形状での定値述語の除外**（セミ/アンチ/アウター兄弟用。内部結合は `wrap_selection=true` のため該当しません）:
+   ```cpp
+   if (!wrap_selection && predicate->Type() == TypeTag::kConstantValue) {
+     // ON FALSE/NULL over an outer/semi/anti shape is short-circuited by the
+     // logical layer; like outer_nested_loop, leave those shapes out. (ON
+     // TRUE stays: the blocked executor pads correctly around it.)
+     const Value constant = predicate->AsConstantValue().GetValue();
+     if (constant.IsNull() || !constant.Truthy()) {
+       return {};
+     }
+   }
+   ```
+3. **等値結合キー対の不在**:
    ```cpp
    if (HasEquiColumnPair(predicate, left.plan, right.plan)) {
      return {};
@@ -57,7 +69,7 @@ return BatchNestedLoopFor(logical.predicate, children[0], children[1],
 
 ## 意味論的根拠とブロック化実行の境界
 
-本ファミリ全体のゲート条件（等値キー対の不在）は、以下の理由に基づいています。
+本ファミリー全体のゲート条件（等値キー対の不在）は、以下の理由に基づいています。
 
 ```cpp
 // Shared builder for the batch_nested_loop family: a cross-shaped
@@ -65,9 +77,13 @@ return BatchNestedLoopFor(logical.predicate, children[0], children[1],
 // The gate (usable predicate, no equi pair) keeps hash/merge shapes — and
 // single-key equi NOT IN, the only source of null-aware anti joins — out of
 // reach, so the rule only fires where hash/merge offer nothing:
-// - inner: ties the tuple nested_loop_join exactly (same shape, cost and
-//   estimate); the tuple rule is registered first and wins ties, so
-//   existing plans are unchanged and the blocked form is a tested fallback.
+// - inner: the blocked kernel has a lower per-pair cost than the tuple
+//   nested loop, so ordinary SQL can select it.
+// - semi/anti/full/right-outer: no tuple implementation exists, so the
+//   blocked form is new capability (previously relational fallback).
+// Semi/anti/outer carry no Selection wrapper: the executor null-pads
+// unmatched rows (outer) and reduces to the probe side (semi/anti) while
+// pairing, and a Selection above would filter those rows back out.
 ```
 
 等値キーが存在する結合は、ハッシュ結合やマージ結合が担当すべき領域であり、それらの方が計算量および I/O の観点で圧倒的に優れています。
@@ -79,17 +95,28 @@ return BatchNestedLoopFor(logical.predicate, children[0], children[1],
 プランの構築は `ProductPlan` に対する設定として行われます。
 
 ```cpp
-Plan join = std::make_shared<ProductPlan>(left.plan, right.plan);
-std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes({}, predicate);
-std::static_pointer_cast<ProductPlan>(join)->PreferBatchNestedLoop();
-
-if (wrap_selection) {
-  join = std::make_shared<SelectionPlan>(join, predicate, join->GetStats());
-  estimated_rows = l_rows * r_rows;
-}
-return {PlanAlternative{.plan = std::move(join),
-                        .local_cost = (l_rows * r_rows) + l_rows + r_rows,
-                        .estimated_rows = estimated_rows}};
+  Plan join;
+  if (!kind.has_value()) {
+    join = std::make_shared<ProductPlan>(left.plan, right.plan);
+  } else if (IsSemiJoinKind(*kind) || IsAntiJoinKind(*kind)) {
+    join = std::make_shared<ProductPlan>(left.plan, std::vector<ColumnName>{},
+                                         right.plan, std::vector<ColumnName>{},
+                                         HashJoinMode::kInMemory, *kind);
+  } else {
+    join = std::make_shared<ProductPlan>(left.plan, right.plan, *kind,
+                                         RowEstimate(l_rows * r_rows));
+  }
+  std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes({}, predicate);
+  std::static_pointer_cast<ProductPlan>(join)->PreferBatchNestedLoop();
+  // See JoinAlternatives: never evaluate a volatile predicate twice.
+  if (wrap_selection && !ContainsVolatileCall(predicate)) {
+    join = std::make_shared<SelectionPlan>(join, predicate, join->GetStats());
+  }
+  const auto estimated_rows = static_cast<double>(join->EmitRowCount());
+  return {
+      PlanAlternative{.plan = std::move(join),
+                      .local_cost = (l_rows * r_rows * 0.8) + l_rows + r_rows,
+                      .estimated_rows = estimated_rows}};
 ```
 
 物理エグゼキュータの生成時（`ProductPlan::EmitExecutor`）において、`batch_nested_loop_` フラグが有効であれば、タプル単位のループではなく `BatchNestedLoopJoin` エグゼキュータがインスタンス化されます。
@@ -100,7 +127,7 @@ return {PlanAlternative{.plan = std::move(join),
 
 非等値結合に対するブロック化アルゴリズムの適用パスを確保します。
 
-標準のルールセットではタプル版 `nested_loop_join` とコストが拮抗して登録順序によりタプル版が採用されますが、タプル版を明示的に無効化した際や、ブロック化実行が有利な状況において安定して利用可能な代替手段を提供します。
+標準のルールセットでは局所コストの直積部分に 0.8 の係数を乗せるため、ブロック化カーネルのペアあたりコストがタプル版を下回る状況では本 Rule が選択されます。タプル版 `nested_loop_join` は同等の代替手段として残ります。
 
 ## 関連 Rule との相互作用
 

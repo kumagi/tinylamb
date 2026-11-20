@@ -139,7 +139,8 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
     for (size_t c = 0; c < fk_checks_.size(); ++c) {
       const ForeignKeyCheck& check = fk_checks_[c];
       if (check.child_offset >= row.values_.size()) {
-        continue;
+        return StatusError(StatusCode::kInvalidArgument,
+                           "foreign key child column outside input row");
       }
       StatusOr<bool> viol =
           IsForeignKeyViolation(fk_counts[c], row[check.child_offset]);
@@ -226,10 +227,13 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
               for (const size_t offset : upsert_offsets_) {
                 // Guard both sides: a narrow source row must not read past
                 // its end, and a narrow stored row must not be grown.
-                if (offset < updated.values_.size() &&
-                    offset < new_row.values_.size()) {
-                  updated[offset] = new_row[offset];
+                if (offset >= updated.values_.size() ||
+                    offset >= new_row.values_.size()) {
+                  return FailWith(StatusError(
+                      StatusCode::kInvalidArgument,
+                      "upsert column outside input row"));
                 }
+                updated[offset] = new_row[offset];
               }
             } else {
               updated = new_row;
@@ -295,7 +299,7 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
             return FailWith(
                 StatusError(StatusCode::kDuplicates,
 
-                            "Failed to insert row with primary key (" + key +
+                            "insert failed on table: duplicate primary key (" + key +
                                 ") due to previously existing row"));
         }
       }

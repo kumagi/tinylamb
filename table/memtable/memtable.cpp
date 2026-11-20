@@ -95,6 +95,41 @@ inline bool MemKeyEq(std::string_view a, std::string_view b) {
   }
   return a == b;
 }
+
+// Issue 2525: when a key is rewritten inside one pending generation, move
+// the previous version (and its retained history) into the fresh entry's
+// `older_versions` chain, newest-first, so Snapshot(V) can still answer a
+// pinned read version even though the intermediate write was never separated
+// from its successor by a Sync().  Only global-version mode builds chains
+// (version 0 = unversioned: no pinned reader can distinguish the two writes,
+// so the old in-place replace stays).  Chains are capped at
+// kMaxKeptVersionsPerKey -- a hot key churned without Sync must not grow
+// unboundedly; history older than the cap is unreachable for pinned reads.
+// Caller holds the shard lock.
+constexpr size_t kMaxKeptVersionsPerKey = 16;
+
+void PushPriorVersions(SkipList& list, std::string_view key, RowEntry& fresh) {
+  if (fresh.version == 0) {
+    return;
+  }
+  RowEntry* prev = list.Find(key);
+  if (prev == nullptr) {
+    return;
+  }
+  std::vector<RowEntry> history = std::move(prev->older_versions);
+  RowEntry stolen = std::move(*prev);
+  stolen.older_versions.clear();  // moved-from; keep the node entry tidy
+  std::vector<RowEntry> chain;
+  chain.reserve(1 + history.size());
+  chain.push_back(std::move(stolen));
+  for (auto& old : history) {
+    if (chain.size() >= kMaxKeptVersionsPerKey) {
+      break;  // drop the oldest retained versions
+    }
+    chain.push_back(std::move(old));
+  }
+  fresh.older_versions = std::move(chain);
+}
 }  // namespace
 
 Status MemTable::Lookup(std::string_view key, Row* row_out) const {
@@ -118,26 +153,34 @@ Status MemTable::Lookup(std::string_view key, Row* row_out) const {
 // equal keys the active version wins and both cursors advance. Tombstones
 // are preserved. Entries with version > max_visible_version are invisible
 // (version 0 = unversioned = always visible): skipping them HERE lets an
-// older visible entry win the per-key collapse, which a post-hoc filter on
-// the collapsed output could never recover. Caller holds the shard lock.
+// older visible version win the per-key collapse, which a post-hoc filter on
+// the collapsed output could never recover. Issue 2525: a node's
+// `older_versions` chain participates in the same visibility collapse --
+// the newest VISIBLE row among the entry and its retained history is
+// emitted. Caller holds the shard lock.
 std::vector<std::pair<std::string, RowEntry>> MemTable::SnapshotShard(
     const Shard& s, uint64_t max_visible_version) {
   std::vector<std::pair<std::string, RowEntry>> out;
   out.reserve(s.active.Size() + s.sealed.Size());
   auto ai = s.active.Begin();
   auto si = s.sealed.Begin();
-  const auto invisible =
-      [max_visible_version](const SkipList::ConstIterator& i) {
-        const uint64_t v = i.Entry().version;
-        return v != 0 && v > max_visible_version;
-      };
+  const auto invisible_entry = [max_visible_version](const RowEntry& e) {
+    return e.version != 0 && e.version > max_visible_version;
+  };
+  // True only when NEITHER the entry nor any retained older version is
+  // visible: such a node drops out before the ordering decision so the
+  // newest-VISIBLE version wins the tie group.
+  const auto node_invisible = [&](const SkipList::ConstIterator& i) {
+    if (!invisible_entry(i.Entry())) {
+      return false;
+    }
+    return std::ranges::all_of(i.Entry().older_versions, invisible_entry);
+  };
   while (ai.Valid() || si.Valid()) {
-    // Invisible entries drop out before the ordering decision so the
-    // newest-VISIBLE version wins the tie group.
-    while (ai.Valid() && invisible(ai)) {
+    while (ai.Valid() && node_invisible(ai)) {
       ai.Next();
     }
-    while (si.Valid() && invisible(si)) {
+    while (si.Valid() && node_invisible(si)) {
       si.Next();
     }
     if (!ai.Valid() && !si.Valid()) {
@@ -155,7 +198,20 @@ std::vector<std::pair<std::string, RowEntry>> MemTable::SnapshotShard(
     SkipList::ConstIterator& other = take_active ? si : ai;
     // When keys tie, emit once from the newer list and drop the stale one.
     const bool dupes_other = other.Valid() && MemKeyEq(other.Key(), it.Key());
-    out.emplace_back(std::string(it.Key()), it.Entry());
+    const RowEntry& head = it.Entry();
+    const RowEntry* visible = &head;
+    if (invisible_entry(head)) {
+      visible = nullptr;
+      for (const RowEntry& old : head.older_versions) {
+        if (!invisible_entry(old)) {
+          visible = &old;  // chain is newest-first: first hit wins
+          break;
+        }
+      }
+    }
+    if (visible != nullptr) {
+      out.emplace_back(std::string(it.Key()), *visible);
+    }
     it.Next();
     if (dupes_other) {
       other.Next();
@@ -281,6 +337,11 @@ Status MemTable::Put(const Row& r, bool sync) {
   if (r.values_.size() >= 0x8000) {
     return Status::kTooBigData;
   }
+  // A short row would Serialize fine but fail DeserializeBounded on readback
+  // (count != schema.ColumnCount()), turning the flushed run corrupt.
+  if (r.values_.size() != schema_.ColumnCount()) {
+    return Status::kCorruption;
+  }
   // A row shorter than the key column index has no key cell at all: the
   // general path would throw from EncodeKeyMemcomparableFormat and the
   // fixed-key fast path below would index r.values_[key_idx_] out of
@@ -292,7 +353,9 @@ Status MemTable::Put(const Row& r, bool sync) {
     Shard& s = ShardFor(key);
     std::scoped_lock lk(s.lock);
     const uint64_t v = global_version_mode_ ? NextGlobalVersion() : 0;
-    s.active.Upsert(key, RowEntry(r, false, v));
+    RowEntry entry(r, false, v);
+    PushPriorVersions(s.active, key, entry);
+    s.active.Upsert(key, std::move(entry));
   };
   if (fixed_key_) {
     // A fixed-width key always encodes to 9 memcomparable bytes, and the
@@ -301,30 +364,41 @@ Status MemTable::Put(const Row& r, bool sync) {
     // both the heap and the encode call chain.
     std::array<char, 9> kbuf{};
     const Value& kv = r.values_[key_idx_];
-    size_t klen = 0;
-    if (kv.type == key_type_) {
-      klen = key_type_ == ValueType::kInt64
-                 ? (kv.IsUnsigned() ? EncodeMemcomparableFormatUint64To(
-                                          kbuf.data(), kv.value.int_value)
-                                    : EncodeMemcomparableFormatIntegerTo(
-                                          kbuf.data(), kv.value.int_value))
-                 : EncodeMemcomparableFormatDoubleTo(kbuf.data(),
-                                                     kv.value.double_value);
-    } else if (kv.type == ValueType::kVarChar) {
-      // A varchar encodes to 9 bytes PER 8-char group: calling
-      // EncodeMemcomparableFormatTo on the 9-byte stack buffer would smash
-      // it. Same malformed-row gate as the length/null checks above.
-      return Status::kUnknownType;
+    if (kv.type == ValueType::kVarChar) {
+      // A varchar encodes to 9 bytes PER 8-char group, so it cannot use the
+      // 9-byte stack buffer -- and the general path (which encodes by value
+      // type, not schema type) accepts this same schema/value mismatch.
+      // Delegate so both routes apply the same gate instead of rejecting
+      // only when the schema key happens to be INT64/DOUBLE.
+      put_entry(r.EncodeKeyMemcomparableFormat(schema_));
     } else {
-      // The remaining mismatch (kInt64 vs kDouble) still encodes to exactly
-      // 9 bytes and matches the general path, which encodes by value type.
-      klen = kv.EncodeMemcomparableFormatTo(kbuf.data());
+      size_t klen = 0;
+      if (kv.type == key_type_) {
+        klen = key_type_ == ValueType::kInt64
+                   ? (kv.IsUnsigned() ? EncodeMemcomparableFormatUint64To(
+                                            kbuf.data(), kv.value.int_value)
+                                      : EncodeMemcomparableFormatIntegerTo(
+                                            kbuf.data(), kv.value.int_value))
+                   : EncodeMemcomparableFormatDoubleTo(kbuf.data(),
+                                                       kv.value.double_value);
+      } else {
+        // The remaining mismatch (kInt64 vs kDouble) still encodes to
+        // exactly 9 bytes and matches the general path, which encodes by
+        // value type.
+        klen = kv.EncodeMemcomparableFormatTo(kbuf.data());
+      }
+      put_entry(std::string_view(kbuf.data(), klen));
     }
-    put_entry(std::string_view(kbuf.data(), klen));
   } else {
     put_entry(r.EncodeKeyMemcomparableFormat(schema_));
   }
   if (sync) {
+    // T4191 contract: sync=true means "the durability hook has run by the
+    // time we return". The run outputs are DISCARDED here on purpose --
+    // no in-process caller consumes them on this path (only the model
+    // fuzzer drives it). A future sync-to-SortedRun design must extend
+    // Put/Delete to hand the blob/runs back; it cannot assume they are
+    // kept by this branch. See memtable.hpp Sync docs.
     std::vector<char> blob;
     std::vector<uint32_t> kr;
     std::vector<uint32_t> rr;
@@ -342,9 +416,13 @@ Status MemTable::Delete(std::string_view key, bool sync) {
   {
     std::scoped_lock lk(s.lock);
     const uint64_t v = global_version_mode_ ? NextGlobalVersion() : 0;
-    s.active.Upsert(key, RowEntry(Row{}, true, v));
+    RowEntry entry(Row{}, true, v);
+    PushPriorVersions(s.active, key, entry);
+    s.active.Upsert(key, std::move(entry));
   }
   if (sync) {
+    // T4191: same contract as Put -- durability fired, run outputs
+    // intentionally discarded (memtable.hpp Sync docs).
     std::vector<char> blob;
     std::vector<uint32_t> kr;
     std::vector<uint32_t> rr;
@@ -542,8 +620,9 @@ Status MemTable::Sync(std::vector<char>* blob_out,
       durability_fn_(reinterpret_cast<const char*>(blob_out->data()),
                      blob_out->size(), durability_ctx_);
     } catch (const std::exception& e) {
-      return StatusError(StatusCode::kIOError,
-                         std::string("WAL durability hook failed: ") + e.what());
+      return StatusError(
+          StatusCode::kIOError,
+          std::string("WAL durability hook failed: ") + e.what());
     } catch (...) {
       return StatusError(StatusCode::kIOError, "WAL durability hook failed");
     }

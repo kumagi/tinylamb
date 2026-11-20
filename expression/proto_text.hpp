@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/int128_conversion.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -72,7 +73,7 @@ std::optional<std::string> ProtoTextSetField(
 // Builds a whole proto TEXT payload from ordered (field, value) pairs.
 // NULL scalars are omitted, arrays fan out into repeated entries, message-
 // looking strings nest as "field { ... }".  Enforces required fields for the
-// known compliance protos; throws std::runtime_error on violation.
+// known compliance protos; returns a Status error on violation.
 [[nodiscard]] StatusOr<std::string> TryConstructProtoText(
     const std::string& type_name,
     const std::vector<std::pair<std::string, Value>>& fields);
@@ -105,6 +106,13 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
 bool TryProtoTextGetField(std::string_view text, std::string_view key,
                           Value* out);
 
+// Nested-path read matching TryProtoTextSetField's descent: walks every
+// intermediate segment through matching message entries and extracts the
+// final segment from each parent, merging repeated fields (a write to the
+// same path lands in every parent, so reads must see them all).
+[[nodiscard]] StatusOr<bool> TryProtoTextGetFieldPath(
+    std::string_view text, const std::vector<std::string>& path, Value* out);
+
 // Appends the engine's proto-type marker comment ("# tinylamb-proto-type=...")
 // so per-type unset-field defaults resolve at extraction time.
 std::string AppendProtoTypeMarker(const std::string& payload,
@@ -127,7 +135,7 @@ bool IsKnownEnumTypeName(const std::string& type_name);
 
 // Parses GoogleSQL-style timestamp text ("YYYY-MM-DD[ T]HH:MM:SS[.fff][±tz]")
 // into epoch nanoseconds (UTC); nullopt when unparsable.
-std::optional<__int128> ParseTimestampTextNanos(std::string_view text);
+std::optional<platform::Int128> ParseTimestampTextNanos(std::string_view text);
 
 // True when the field belongs to a proto compiled with required fields that
 // this engine models (used to reject null/missing constructions).

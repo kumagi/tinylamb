@@ -27,6 +27,7 @@
 #include "executor/join_kind.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/jit.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "page/row_position.hpp"
@@ -56,6 +57,9 @@ class OocSortSink final : public PipelineSink {
     bool ascending{true};
     std::optional<bool> nulls_first{std::nullopt};
     Collation collation{Collation::kNone};
+    // When the key is a direct input column, use this slot instead of
+    // resolving expression->name against the schema (names can collide).
+    std::optional<size_t> column_slot{std::nullopt};
   };
 
   OocSortSink(std::vector<KeySpec> keys, Schema input_schema,
@@ -203,7 +207,8 @@ class OocGroupAggSink final : public PipelineSink {
   std::unique_ptr<RecursivePartitioner> partitioner_;
 };
 
-// --- 4. OOC Adaptive Grace Hash Join (`OocHashBuildSink` + the OOC hash-join probe source)
+// --- 4. OOC Adaptive Grace Hash Join (`OocHashBuildSink` + the OOC hash-join
+// probe source)
 // ---
 
 struct OocHashJoinSpec {
@@ -381,6 +386,39 @@ class OocHashBuildSink final : public PipelineSink {
   bool semi_seen_capped_{false};
 };
 
+class FilteredHashProbe {
+ public:
+  enum class Mode { kDirect, kCompact };
+
+  [[nodiscard]] static Mode ChooseMode(const JoinHashIndex& index,
+                                       const int64_t* filter, size_t count,
+                                       BinaryOperation op, int64_t constant);
+  // Both columns are contiguous, non-NULL signed INT64 vectors. Their
+  // storage and the resident hash index must outlive the cursor.
+  void Start(Mode mode, const JitInt64Kernels& kernel,
+             const JoinHashIndex& index, const int64_t* filter,
+             const int64_t* keys, size_t count, int64_t constant);
+  [[nodiscard]] size_t Next(size_t* row, size_t* accepted);
+
+ private:
+  struct Candidate {
+    size_t row;
+    uint64_t hash;
+  };
+  const JitInt64Kernels* kernel_{nullptr};
+  const JoinHashIndex* index_{nullptr};
+  JoinHashIndex::Int64Slots slots_{};
+  const int64_t* filter_{nullptr};
+  const int64_t* keys_{nullptr};
+  size_t count_{0};
+  int64_t constant_{0};
+  size_t next_{0};
+  uint64_t direct_cursor_{0};
+  Mode mode_{Mode::kDirect};
+  std::vector<uint8_t> mask_;
+  std::vector<Candidate> candidates_;
+};
+
 // Stage 1 adaptive probe source:
 // - When `!join_ctx->spilled`, pulls probe subpipeline chunks streamingly and
 //   probes `join_ctx->hash_index` in O(1) probe RAM (plus Right/Full outer
@@ -446,6 +484,8 @@ class OocAdaptiveHashProbeSource final : public PipelineSource {
   struct GracePartitionCursor;
 
   [[nodiscard]] Status PullNextProbeChunk(PipelineContext* ctx, DataChunk* out);
+  void EnableFilteredProbe();
+  [[nodiscard]] bool StartFilteredProbe(const DataChunk& batch);
   [[nodiscard]] Status PrepareGracePartitions(PipelineContext* ctx);
   [[nodiscard]] Status AdvanceGraceCursor(PipelineContext* ctx);
   [[nodiscard]] Status OpenNextPartitionPair(PipelineContext* ctx,
@@ -467,6 +507,25 @@ class OocAdaptiveHashProbeSource final : public PipelineSource {
   size_t active_probe_row_{0};
   ActiveProbeRowState active_probe_state_;
   std::string key_scratch_;
+  struct FilteredProbePredicate {
+    slot_t column;
+    slot_t key;
+    BinaryOperation operation;
+    int64_t constant;
+  };
+  std::optional<FilteredProbePredicate> filtered_probe_predicate_;
+  const Schema* filtered_probe_input_{nullptr};
+  size_t filtered_probe_filter_idx_{0};
+  std::vector<slot_t> filtered_probe_output_slots_;
+  std::optional<FilteredHashProbe::Mode> forced_probe_mode_;
+  std::optional<JitInt64Kernels> direct_probe_kernel_;
+  std::optional<JitInt64Kernels> compact_probe_kernel_;
+  FilteredHashProbe filtered_probe_;
+  size_t filtered_probe_rows_seen_{0};
+  size_t direct_probe_batches_{0};
+  size_t compact_probe_batches_{0};
+  bool filtered_probe_active_{false};
+  bool filtered_probe_exact_runtime_filter_{false};
 
   // Spilled Grace Hash state:
   std::vector<PendingJoinPair> pending_pairs_;
@@ -477,10 +536,11 @@ class OocAdaptiveHashProbeSource final : public PipelineSource {
 
 // Out-of-core Window function evaluation sink (`ooca-v2.md` §5.3 P3b).
 //
-// Buffers input rows up to `budget_bytes_ / 2` on small inputs (zero spill
+// Buffers input rows up to max(kMinWindowMemBudget, budget_bytes_ / 2)
+// on small inputs (zero spill
 // overhead and native input-order preservation), then transitions to sorted
 // `ExternalSorter` passes grouped by unique `(PARTITION BY, ORDER BY)` specs:
-// - Normal partitions (`<= B_op / 2`) evaluate via canonical
+// - Normal partitions (`<= max(16 KiB, B_op / 2)`) evaluate via canonical
 // `ComputeOneWindow`.
 // - Overflowing single partitions (G4 skew: e.g. `no PARTITION BY` over 1M+
 //   rows under tiny `B_op`) spill to a single `SpillStore` segment in exact
@@ -518,6 +578,9 @@ class OocWindowSink final : public PipelineSink {
   struct SpecGroup {
     std::vector<Expression> partition_by;
     std::vector<WindowOrderTerm> order_by;
+    std::vector<slot_t> partition_slots;
+    std::vector<slot_t> order_slots;
+    std::vector<Expression> computed_keys;
     std::vector<CallSpec> calls;
   };
 
@@ -1076,6 +1139,7 @@ class OocCrossJoinProbeSource final : public PipelineSource {
     Row row;
     RowPosition pos;
     bool matched{false};
+    uint64_t matches{0};
   };
 
   [[nodiscard]] StatusOr<bool> PairPasses(const Row& left_row,
@@ -1134,7 +1198,8 @@ class OocRecursiveCteSource final : public PipelineSource {
 };
 
 // OOC Correlated Apply / Lateral Join (`ApplyPlan`): streams outer batches,
-// caches correlated inner results up to `B_op / 2` LRU bytes, or spills
+// caches correlated inner results up to max(kMinJoinMemBudget, B_op / 2)
+// LRU bytes, or spills
 // uncorrelated/large inner subplans cleanly via `SpillableStore`.
 class OocApplySource final : public PipelineSource {
  public:
@@ -1181,11 +1246,10 @@ class OocApplySource final : public PipelineSource {
   bool static_inner_ready_{false};
   std::unique_ptr<SpillableStore> static_inner_store_;
 
-  // Bounded LRU cache for correlated inner queries (O(B_op / 2)):
+  // Bounded LRU cache for correlated inner queries
+  // (max(kMinJoinMemBudget, B_op / 2)):
   std::vector<LruEntry> lru_cache_;
   size_t lru_bytes_{0};
-  uint64_t cache_probes_{0};
-  uint64_t cache_hits_{0};
 
   // Active outer row streaming state:
   DataChunk outer_chunk_;

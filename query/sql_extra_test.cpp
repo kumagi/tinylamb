@@ -7,6 +7,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/random_string.hpp"
@@ -147,7 +148,7 @@ TEST_F(SqlUdfTest, CorrelatedSubqueryBodySeesParameter) {
   ASSERT_EQ(rows.size(), 2U);
   std::vector<Value> seen;
   seen.reserve(rows.size());
-for (const Row& row : rows) {
+  for (const Row& row : rows) {
     seen.push_back(row[0]);
   }
   std::sort(seen.begin(), seen.end());
@@ -192,7 +193,7 @@ TEST_F(SqlUdfTest, AggregateFunctionRespectsGrouping) {
   // The aggregate must respect the GROUP BY key: k=1 has two rows, k=2 one.
   std::vector<std::pair<int64_t, int64_t>> observed;
   observed.reserve(rows.size());
-for (const Row& row : rows) {
+  for (const Row& row : rows) {
     observed.emplace_back(row[0].value.int_value, row[1].value.int_value);
   }
   std::sort(observed.begin(), observed.end());
@@ -218,6 +219,11 @@ TEST_F(SqlUdfTest, CreateTableFunctionStatementPrepares) {
       RunSql(engine_.get(), context_.get(),
              "CREATE TABLE FUNCTION UdfTvf(x INT64) RETURNS TABLE<a "
              "INT64> AS ( SELECT x AS a )"));
+  // The TVF must actually be registered and callable.
+  const auto rows =
+      RunSql(engine_.get(), context_.get(), "SELECT * FROM UdfTvf(7)");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{7}));
 }
 
 TEST_F(SqlUdfTest, TempViewResolvesThroughFromClause) {
@@ -292,7 +298,8 @@ TEST_F(SqlUdfTest, StructConstructorInsideFunctionBindsParameter) {
       RunSql(engine_.get(), context_.get(), "SELECT UdfPair(\"A\")");
   ASSERT_EQ(rows.size(), 1U);
   // Struct values are encoded as JSON objects with positional field names.
-  const std::string text = rows[0][0].AsString();
+  // AsString() renders a JSON-escaped literal; read the raw payload.
+  const std::string text(rows[0][0].AsStringView());
   EXPECT_NE(text.find("\"f1\":\"A\""), std::string::npos);
   EXPECT_NE(text.find("\"f2\":\"A\""), std::string::npos);
 }
@@ -870,16 +877,21 @@ TEST_F(WindowEvalDirectTest, ExclusionModesOnFullFrame) {
   EXPECT_TRUE(rows[1][1].IsNull());
 }
 
-TEST_F(WindowEvalDirectTest, FrameErrorsSurfaceAsExceptions) {
+// T4836: each site pins the actual diagnosis that must reach stderr before
+// the abort (Apply's MoveValue() LOG(FATAL)s "StatusOr has no value:
+// kInvalidArgument: <message>").  The old empty regexes accepted ANY death
+// (SIGSEGV included), and the old name promised exceptions while the
+// mechanism is abort.
+TEST_F(WindowEvalDirectTest, FrameErrorsAbortWithPinnedDiagnosis) {
   // ROWS offset must be a constant integer.
   auto nonconst = MakeSumFrame(WindowFrameUnit::kRows, 1);
   nonconst->frame_start.offset = ColumnValueExp("v");
-  EXPECT_DEATH(Apply(nonconst), "");
+  EXPECT_DEATH(Apply(nonconst), "ROWS offset must be a constant integer");
 
   // GROUPS frames require an ORDER BY key.
   auto nogroups = MakeSumFrame(WindowFrameUnit::kGroups, 1);
   nogroups->order_by.clear();
-  EXPECT_DEATH(Apply(nogroups), "");
+  EXPECT_DEATH(Apply(nogroups), "GROUPS frame requires an ORDER BY key");
 
   // RANGE offsets require exactly one ORDER BY key.
   auto tworanges = MakeSumFrame(WindowFrameUnit::kRange, 1);
@@ -887,13 +899,13 @@ TEST_F(WindowEvalDirectTest, FrameErrorsSurfaceAsExceptions) {
       WindowOrderTerm{.expression = ColumnValueExp("v"),
                       .ascending = true,
                       .nulls_first = std::nullopt});
-  EXPECT_DEATH(Apply(tworanges), "");
+  EXPECT_DEATH(Apply(tworanges), "RANGE offset requires one constant key");
 
   // NTILE needs a positive constant bucket count and NTH_VALUE needs 2 args.
   auto ntile = std::make_shared<WindowFunctionCallExpression>();
   ntile->function = "NTILE";
   ntile->args = {ConstantValueExp(Value(0))};
-  EXPECT_DEATH(Apply(ntile), "");
+  EXPECT_DEATH(Apply(ntile), "for the NTILE function must be positive");
 
   auto nth = std::make_shared<WindowFunctionCallExpression>();
   nth->function = "NTH_VALUE";
@@ -901,7 +913,7 @@ TEST_F(WindowEvalDirectTest, FrameErrorsSurfaceAsExceptions) {
   nth->order_by = {WindowOrderTerm{.expression = ColumnValueExp("v"),
                                    .ascending = true,
                                    .nulls_first = std::nullopt}};
-  EXPECT_DEATH(Apply(nth), "");
+  EXPECT_DEATH(Apply(nth), "NTH_VALUE requires two arguments");
 }
 
 TEST_F(WindowEvalDirectTest, NonWindowStatementPassesThroughUntouched) {
@@ -996,7 +1008,8 @@ TEST(SelectStatementFingerprintTest, IncludesModifiersAndTracksMutation) {
       BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(int64_t{1}))));
   EXPECT_NE(first.Fingerprint(), original);
-  EXPECT_EQ(first.Fingerprint(), first.Fingerprint());
+  const auto stable_fingerprint = first.Fingerprint();
+  EXPECT_EQ(first.Fingerprint(), stable_fingerprint);
 }
 
 TEST(SelectStatementFingerprintTest, AuditSharedChildMutationRecomputesParent) {
@@ -1024,6 +1037,22 @@ TEST(SelectStatementFingerprintTest, IncludesAggregateFilter) {
   EXPECT_NE(first.Fingerprint(), second.Fingerprint());
 }
 
+// T226: the set-operation route descends into PrepareStatement per branch;
+// pgwire pairs RowDescription name×type from engine members, so the last
+// branch must not leak its column types into the outer statement (rows and
+// names come from the FIRST branch).
+TEST_F(AggregateHavingTest, SetOperationKeepsFirstBranchColumnTypes) {
+  StatusOr<QueryResult> result = engine_->Execute(
+      *context_,
+      "SELECT CAST(g AS FLOAT64) AS g FROM t UNION ALL SELECT g FROM t");
+  ASSERT_TRUE(result.HasValue()) << engine_->LastError();
+  const auto& types = result.Value().ColumnTypes();
+  ASSERT_EQ(types.size(), 1U);
+  EXPECT_EQ(types[0], ValueType::kDouble);
+  result.Value().ForEach([](const Row&) {});
+  EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
+}
+
 TEST_F(AggregateHavingTest, StatementTimeoutAbortsLongQueryAndAllowsFollowup) {
   context_->txn_.SetStatementTimeout(std::chrono::milliseconds(20));
   StatusOr<Executor> exec =
@@ -1034,11 +1063,18 @@ TEST_F(AggregateHavingTest, StatementTimeoutAbortsLongQueryAndAllowsFollowup) {
     Row row;
     while (exec.Value()->Next(&row, nullptr)) {
     }
-    EXPECT_EQ(exec.Value()->GetStatus().GetCode(), StatusCode::kRuntimeError);
+    EXPECT_EQ(exec.Value()->GetStatus().GetCode(),
+              StatusCode::kQueryCanceled);
     EXPECT_NE(exec.Value()->GetStatus().GetMessage().find("timeout"),
               std::string::npos);
   } else {
-    EXPECT_EQ(exec.GetStatus().GetCode(), StatusCode::kRuntimeError);
+    // Under scheduling load the deadline can expire inside Prepare itself,
+    // so the prepare-level outcome is either the budget error or the
+    // cancellation -- both prove the timeout fired before results.
+    const StatusCode code = exec.GetStatus().GetCode();
+    EXPECT_TRUE(code == StatusCode::kRuntimeError ||
+                code == StatusCode::kQueryCanceled)
+        << ToString(exec.GetStatus());
   }
 
   // Subsequent statement with a generous timeout succeeds cleanly.
@@ -1047,6 +1083,30 @@ TEST_F(AggregateHavingTest, StatementTimeoutAbortsLongQueryAndAllowsFollowup) {
       RunSql(engine_.get(), context_.get(), "SELECT COUNT(*) FROM t");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{5}));
+}
+
+// P440: EXPLAIN [ANALYZE] returns from Prepare without the
+// FinishPrepareWithTimeout wrapper, and the ANALYZE drain loop ran the whole
+// statement with no deadline checks.  With an expired statement timeout the
+// drain must abort (kQueryCanceled) instead of running to completion.
+TEST_F(AggregateHavingTest, ExplainAnalyzeHonorsStatementTimeout) {
+  context_->txn_.SetStatementTimeout(std::chrono::milliseconds(1));
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  StatusOr<Executor> exec =
+      engine_->Prepare(*context_,
+                       "EXPLAIN ANALYZE SELECT COUNT(*) FROM "
+                       "GENERATE_SERIES(1, 200000)");
+  if (exec.HasValue()) {
+    Row row;
+    while (exec.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_EQ(exec.Value()->GetStatus().GetCode(), StatusCode::kQueryCanceled);
+    EXPECT_NE(exec.Value()->GetStatus().GetMessage().find("timeout"),
+              std::string::npos);
+  } else {
+    EXPECT_EQ(exec.GetStatus().GetCode(), StatusCode::kQueryCanceled);
+  }
+  context_->txn_.SetStatementTimeout(std::chrono::milliseconds(0));
 }
 
 TEST_F(SqlUdfTest, QualifiedStarOverDerivedSource) {

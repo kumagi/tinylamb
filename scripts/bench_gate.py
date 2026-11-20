@@ -14,6 +14,10 @@ Baseline extraction (BenchmarkHistory.md):
       table rows:   | `tps` | 821.1 |
       bold bullets: - **Query sum (Q1-Q22):** **81.30 s**
                     - **Load:** 126.39 s total
+  - A section that explicitly disclaims its numbers (e.g. "2026-10-31
+    correction: ... retained as raw observations, not accepted as a correct
+    ... score") is untrusted from that annotation onward: those values are
+    raw observations, not gate baselines, and are skipped.
   - Keys are normalized: lowercased, every non-alphanumeric run -> "_",
     trimmed. e.g. "Query sum (Q1\u2013Q22)" -> "query_sum_q1_q22".
 
@@ -25,7 +29,7 @@ Direction: keys containing tps/qps/tpm/rps/ops are higher-is-better;
 everything else is treated as time (lower-is-better).
 
 Exit codes: 0 pass, 1 regression / no comparable metric (unless
---allow-empty), 2 usage error.
+--allow-empty), 2 usage error or malformed/missing baseline data.
 """
 
 import argparse
@@ -35,6 +39,14 @@ import sys
 from pathlib import Path
 
 HIGHER_IS_BETTER_TOKENS = ("tps", "qps", "tpm", "rps", "ops")
+
+# A section may retract its own numbers as "raw observations, not accepted as
+# a correct ... score" (e.g. the pre-C3 Q16 result).  From such an annotation
+# onward the rest of that section must not contribute gate baselines.
+SECTION_DISCLAIMER_RE = re.compile(
+    r"correction:\*\*|not accepted as a correct|retained as raw observations",
+    re.IGNORECASE,
+)
 
 
 def normalize_key(name: str) -> str:
@@ -62,7 +74,17 @@ def extract_baseline(history_path: Path) -> dict:
     # newest-first document: iterate oldest -> newest and let newer sections
     # overwrite, so each key resolves to its newest recorded baseline.
     for section in reversed(sections):
-        body = "\n".join(section)
+        # Drop everything from an explicit retraction onward.  Newest-first
+        # documents may keep an old, already-corrected measurement in an
+        # earlier section; harvesting it would resurrect a value the history
+        # itself declared unfit as a performance baseline (and would also
+        # give the gate a misleading ~97% safety margin).
+        trusted_lines = []
+        for line in section:
+            if SECTION_DISCLAIMER_RE.search(line):
+                break
+            trusted_lines.append(line)
+        body = "\n".join(trusted_lines)
         # "| `tps` | 821.1 |" style rows (first cell label, second cell number)
         for match in re.finditer(
                 r"^\s*\|\s*`?([^|`]+)`?\s*\|\s*([0-9][0-9,.]*)\s*(?:\||$)",
@@ -129,6 +151,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.threshold_pct < 0:
         parser.error("--threshold-pct must be >= 0")
+    if args.threshold_pct >= 100:
+        parser.error("--threshold-pct must be < 100 (100+ disables the higher-is-better gate)")
 
     if not args.history.is_file():
         print(f"error: history not found: {args.history}", file=sys.stderr)
