@@ -247,6 +247,7 @@ TEST_F(SqlEngineCoverageTest, PrimaryKeyDefinitionCreatesUniqueIndex) {
       "GROUP BY id, payload");
   ASSERT_FALSE(plan_rows.empty());
   std::string plan;
+  plan.reserve(plan_rows.size());
   for (const Row& row : plan_rows) {
     plan += row[0].AsString();
   }
@@ -277,6 +278,7 @@ TEST_F(SqlEngineCoverageTest, NullableUniqueDoesNotProveGroupDependency) {
       "payload");
   ASSERT_FALSE(plan_rows.empty());
   std::string plan;
+  plan.reserve(plan_rows.size());
   for (const Row& row : plan_rows) {
     plan += row[0].AsString();
   }
@@ -303,6 +305,7 @@ TEST_F(SqlEngineCoverageTest,
       "GROUP BY id, payload");
   ASSERT_FALSE(plan_rows.empty());
   std::string plan;
+  plan.reserve(plan_rows.size());
   for (const Row& row : plan_rows) {
     plan += row[0].AsString();
   }
@@ -325,6 +328,7 @@ TEST_F(SqlEngineCoverageTest, ExplainProducesPlanText) {
     const auto rows = RunSql(engine_.get(), context_.get(), sql);
     ASSERT_FALSE(rows.empty());
     std::string plan;
+    plan.reserve(rows.size());
     for (const Row& row : rows) {
       plan += row[0].AsString();
       plan += "\n";

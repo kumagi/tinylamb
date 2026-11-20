@@ -1677,6 +1677,22 @@ TEST(ValueTypeTest, ValueTypeToString_AllEnumValues_ReturnsExpectedString) {
   EXPECT_EQ(ValueTypeToString(invalid_type), "unknown value type");
 }
 
+TEST(FunctionTest, DecodedArityMustFitAndAgreeWithDeclaredArguments) {
+  const auto valid = [](std::vector<Type> args, int64_t count) {
+    std::stringstream stream;
+    Encoder encoder(stream);
+    encoder << std::string("f") << args << Type(TypeTag::kBigInt) << count;
+    Decoder decoder(stream);
+    Function function;
+    decoder >> function;
+    return !decoder.Failed();
+  };
+  EXPECT_TRUE(valid({}, 3));
+  EXPECT_FALSE(valid({}, -1));
+  EXPECT_FALSE(valid({}, int64_t{1} << 32));
+  EXPECT_FALSE(valid({Type(TypeTag::kBigInt)}, 2));
+}
+
 TEST(FunctionTest, Serialize_CustomFunction_RoundTripsThroughDecoder) {
   Function f_def;
   Function f_named("my_func", 3);

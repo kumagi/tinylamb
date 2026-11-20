@@ -72,7 +72,9 @@ TEST_F(TpccWorkloadExtraTest, TransactionMixReplaysPerSeedAndCoversAllTypes) {
   TpccWorkload first(*database_, scale, /*seed=*/99);
   TpccWorkload second(*database_, scale, /*seed=*/99);
   std::vector<TpccTransactionType> first_mix;
+  first_mix.reserve(500);
   std::vector<TpccTransactionType> second_mix;
+  second_mix.reserve(500);
   std::set<TpccTransactionType> seen;
   for (int i = 0; i < 500; ++i) {
     const TpccTransactionType type = first.NextTransactionType();

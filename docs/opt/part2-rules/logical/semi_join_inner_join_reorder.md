@@ -26,6 +26,15 @@ graph TD
 
 ## 適用条件
 
+半結合述語がある場合は、結合順序を変えても評価回数の違いが結果に影響しないことを確認します。
+
+```cpp
+if (semi_expr.operation != LogicalOperator::kSemiJoin ||
+                semi_expr.children.size() != 2 ||
+                (semi_expr.predicate && *semi_expr.predicate &&
+                 !SafeToReduceEvaluationCount(*semi_expr.predicate))) {
+```
+
 パターンは `Join(Any("semi_child"), Any("t"))` であり、対象演算子は `LogicalOperator::kJoin` です。以下のガード条件をすべて満たす場合にのみ発火します。
 
 1. 外側の式が `LogicalOperator::kJoin` であり、子ノード数が 2 であること。

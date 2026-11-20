@@ -76,6 +76,7 @@ namespace {
 template <class Fn>
 double Measure(Fn fn, size_t repetitions, uint64_t& checksum) {
   std::vector<double> samples;
+  samples.reserve(8);
   for (size_t sample = 0; sample < 8; ++sample) {
     const auto begin = std::chrono::steady_clock::now();
     uint64_t observed = 0;
@@ -588,6 +589,7 @@ int main(int argc, char** argv) {
 
     auto make_inputs = [&](const JitBranchlessProgram& prog, bool with_bounds) {
       std::vector<JitColumnInput> out;
+      out.reserve(prog.ReferencedColumns().size());
       for (uint16_t col : prog.ReferencedColumns()) {
         if (col == 0) {
           out.push_back({.values = c_qty.data(),

@@ -223,6 +223,7 @@ TEST_F(PageManagerTest, CompactionDropsOverlayBeforeReusingTailPage) {
 TEST_F(PageManagerTest, CheckpointMergesResidentAndEvictedPageStreams) {
   pm_->SetBufferPoolLimitBytesForTest(size_t{64} << 10);
   std::vector<page_id_t> ids;
+  ids.reserve(600);
   auto setup = tm_->Begin();
   for (int i = 0; i < 600; ++i) {
     ASSIGN_OR_ASSERT_FAIL(PageRef, page,
@@ -340,7 +341,9 @@ TEST_F(PageManagerTest, CheckpointLsmRotationSerializesWithConcurrentFlushes) {
   // write-buffer limit and flush/compaction streams actually run.
   pm_->SetBufferPoolLimitBytesForTest(1U << 20);
   std::vector<std::string> keys;
+  keys.reserve(kChunks * kPerChunk);
   std::vector<std::string> values;
+  values.reserve(kChunks * kPerChunk);
   for (int i = 0; i < kChunks * kPerChunk; ++i) {
     // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized buffer
     char buf[16];
@@ -841,6 +844,7 @@ TEST_F(PageManagerTest, EvictsColdCommittedPagesToDiskAndReloadsOnAccess) {
   // trigger eviction to <db>.db.blocks and transparent reload on GetPage.
   pm_->SetBufferPoolLimitBytesForTest(256ULL * 1024ULL);
   std::vector<std::pair<page_id_t, slot_t>> refs;
+  refs.reserve(40);
   const std::string payload(8000, 'X');
   for (int i = 0; i < 40; ++i) {
     Transaction txn = tm_->Begin();
@@ -1189,6 +1193,7 @@ TEST_F(PageManagerTest, UncommittedSpilledPagesAbortAndCrashDiscardOverlays) {
   constexpr int kBasePages = 24;
   constexpr int kExtraPages = 60;
   std::vector<std::pair<page_id_t, slot_t>> base_rows;
+  base_rows.reserve(kBasePages);
   {
     Transaction setup = tm_->Begin();
     for (int i = 0; i < kBasePages; ++i) {
@@ -1326,6 +1331,7 @@ TEST_F(PageManagerTest,
   // exercises both exact-equality fast path (when sequential) and general
   // delta.
   std::vector<RowPosition> after_t1 = baseline;
+  after_t1.reserve(50);
   for (size_t i = 0; i < 50; ++i) {
     after_t1.emplace_back(static_cast<page_id_t>(100 + i), 0);
   }
@@ -1362,6 +1368,7 @@ TEST_F(PageManagerTest, InsertOnHoleyPageKeepsIntentVerdicts) {
                         pm_->AllocateNewPage(setup, PageType::kRowPage));
   const page_id_t pid = page->PageID();
   std::vector<slot_t> slots;
+  slots.reserve(20);
   for (int i = 0; i < 20; ++i) {
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot,
                           page->Insert(setup, "row-" + std::to_string(i)));

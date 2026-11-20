@@ -231,6 +231,7 @@ bool CanBorrowJoinKeys(const Relation& a, const Relation& b,
                           const std::vector<slot_t>& columns,
                           const std::vector<int64_t>& biases) {
     std::vector<size_t> check_indices;
+    check_indices.reserve(columns.size());
     if (input.uniform_cell_types) {
       for (size_t k = 0; k < columns.size(); ++k) {
         const ValueType t = input.schema.GetColumn(columns[k]).Type();

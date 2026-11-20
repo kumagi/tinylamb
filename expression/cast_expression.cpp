@@ -28,6 +28,7 @@
 #include "common/json_string.hpp"
 #include "common/string_util.hpp"
 #include "expression/expression.hpp"
+#include "expression/json_text.hpp"
 #include "expression/proto_schema.hpp"
 #include "expression/proto_text.hpp"
 #include "type/column_name.hpp"
@@ -631,6 +632,7 @@ std::string TrimCastWhitespace(std::string_view text) {
 std::vector<std::pair<std::string, std::string>> SplitStructMembers(
     const std::string& body) {
   std::vector<std::pair<std::string, std::string>> members;
+  members.reserve(body.size() + 1);
   int depth = 0;
   bool in_string = false;
   size_t segment_begin = 0;
@@ -754,11 +756,18 @@ std::string EncodeStructMemberText(const Value& value) {
   }
   if (value.type == ValueType::kInt64) {
     return value.IsUnsigned()
-               ? std::to_string(static_cast<uint64_t>(value.value.int_value))
-               : std::to_string(value.value.int_value);
+               ? IntegerToString(static_cast<uint64_t>(value.value.int_value))
+               : IntegerToString(value.value.int_value);
   }
   if (value.type == ValueType::kDate) {
     return "\"" + FormatDateDays(value.DateDays()) + "\"";
+  }
+  if (value.type == ValueType::kArray) {
+    // Array members store as JSON arrays, matching TryEncodeStructMemberJson
+    // (__struct_set): the bespoke reader decodes `[...]` back to an ARRAY,
+    // while the quoted "ARRAY<T>[...]" display text used to read back as a
+    // plain STRING and lose the element type.
+    return json_text::ToJsonText(value);
   }
   return "\"" + value.AsString() + "\"";
 }
@@ -1313,9 +1322,15 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           return Value(std::move(payload));
         }
         if (!LooksLikeProtoText(raw)) {
-          // Not proto-shaped text (plain strings, binary junk): store as-is.
-          std::string verbatim = raw;
-          return Value(std::move(verbatim));
+          if (IsValidUtf8Text(raw)) {
+            // Not proto-shaped text (plain strings): store as-is.  Binary
+            // wire junk that failed DecodeProtoWireBytes is NOT valid
+            // proto TEXT either — persisting it would leave a permanently
+            // damaged cell that breaks every later proto-text reader
+            // (P899), so it takes the same reject path as malformed TEXT.
+            std::string verbatim = raw;
+            return Value(std::move(verbatim));
+          }
         }
         if (!safe) {
           return StatusError(StatusCode::kInvalidArgument,
@@ -1586,9 +1601,10 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         std::string s =
             (val.type == ValueType::kDate) ? FormatDateDays(val.DateDays())
             : (val.type == ValueType::kInt64)
-                ? (val.IsUnsigned() ? std::to_string(static_cast<uint64_t>(
-                                          val.value.int_value))
-                                    : std::to_string(val.value.int_value))
+                ? (val.IsUnsigned()
+                       ? IntegerToString(static_cast<uint64_t>(
+                             val.value.int_value))
+                       : IntegerToString(val.value.int_value))
             : (val.type == ValueType::kDouble)
                 ? ([&]() {
                     if (std::isnan(val.value.double_value)) {
@@ -1659,6 +1675,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           }
         }
         std::vector<Value> elements;
+        elements.reserve(val.ArrayElements().size());
         bool ok = true;
         for (const Value& element : val.ArrayElements()) {
           if (element.IsNull()) {

@@ -427,6 +427,7 @@ TEST_F(ExecutorFeatureSqlTest, SetOperationSpillsUnderTinyBudget) {
   Run("CREATE TABLE big2(x INT64)");
   for (int64_t base = 0; base < 4; ++base) {
     std::string values;
+    values.reserve(40 * 6);
     for (int64_t i = 0; i < 40; ++i) {
       if (i != 0) {
         values += ", ";
@@ -535,7 +536,9 @@ TEST(HashJoinKindTest, SingleJoinRejectsDuplicateMatch) {
 
 TEST(HashJoinKindTest, SingleJoinReloadsSpilledSides) {
   std::vector<Row> left_rows;
+  left_rows.reserve(120);
   std::vector<Row> right_rows;
+  right_rows.reserve(60);
   for (int64_t i = 0; i < 120; ++i) {
     left_rows.push_back(IRow(i));
     if (i % 2 == 0) {
@@ -897,7 +900,9 @@ TEST(HashJoinOuterTest, NullSafeOuterKindsPreserveNullAndUnmatchedRows) {
   }
 
   std::vector<Row> spill_left;
+  spill_left.reserve(80);
   std::vector<Row> spill_right;
+  spill_right.reserve(80);
   for (int64_t i = 0; i < 80; ++i) {
     const std::string payload(96, 'x');
     spill_left.push_back(Row({Value(i % 7), Value(std::string(payload))}));
@@ -920,7 +925,9 @@ TEST(HashJoinOuterTest, NullSafeOuterKindsPreserveNullAndUnmatchedRows) {
 
 TEST(HashJoinOuterTest, OuterJoinsSurviveSpillAndReload) {
   std::vector<Row> left_rows;
+  left_rows.reserve(150);
   std::vector<Row> right_rows;
+  right_rows.reserve(150);
   for (int64_t i = 0; i < 150; ++i) {
     left_rows.push_back(IRow(i));
     right_rows.push_back(IRow(i % 50));
@@ -1000,6 +1007,7 @@ TEST(HashJoinSemiAntiTest, AntiJoinWithEmptySpilledBuildEmitsAll) {
 
 TEST(HashJoinSemiAntiTest, SemiJoinTinyBudgetMatchesSpilledBuild) {
   std::vector<Row> probe_rows;
+  probe_rows.reserve(7);
   probe_rows.push_back(Row({Value()}));
   for (int64_t i = 1; i <= 6; ++i) {
     probe_rows.push_back(IRow(i));
@@ -1025,7 +1033,9 @@ TEST(HashJoinHybridTest, HybridModeMatchesInnerJoinSemantics) {
   // Variant A: unique keys on both sides -> 1:1 join.
   {
     std::vector<Row> left_rows;
+    left_rows.reserve(300);
     std::vector<Row> right_rows;
+    right_rows.reserve(300);
     for (int64_t i = 0; i < 300; ++i) {
       left_rows.push_back(Row({Value(i), Value(i * 2)}));
       right_rows.push_back(Row({Value(i), Value("r")}));
@@ -1044,7 +1054,9 @@ TEST(HashJoinHybridTest, HybridModeMatchesInnerJoinSemantics) {
   // Variant B: duplicate keys on the right side.
   {
     std::vector<Row> left_rows;
+    left_rows.reserve(40);
     std::vector<Row> right_rows;
+    right_rows.reserve(40);
     for (int64_t i = 0; i < 40; ++i) {
       left_rows.push_back(Row({Value(i), Value(i * 2)}));
       right_rows.push_back(Row({Value(i % 10), Value("r")}));
@@ -1147,7 +1159,9 @@ TEST(HashJoinParallelProbeTest, StripedProbeOverLargeProbeSide) {
 
 TEST(HashJoinSpillTest, BothSidesSpilledInnerJoinPartitionPairwise) {
   std::vector<Row> left_rows;
+  left_rows.reserve(400);
   std::vector<Row> right_rows;
+  right_rows.reserve(400);
   for (int64_t i = 0; i < 400; ++i) {
     left_rows.push_back(Row({Value(i % 13)}));
     right_rows.push_back(Row({Value(i % 7)}));
@@ -1193,7 +1207,9 @@ TEST(HashJoinSpillTest, OneSideSpilledKeepsResultExact) {
 
 TEST(HashJoinSpillTest, MultiKeySpilledJoinWithStringComponent) {
   std::vector<Row> left_rows;
+  left_rows.reserve(200);
   std::vector<Row> right_rows;
+  right_rows.reserve(200);
   for (int64_t i = 0; i < 200; ++i) {
     left_rows.push_back(Row({Value(i % 10), Value("k")}));
     right_rows.push_back(Row({Value(i % 6), Value("k")}));

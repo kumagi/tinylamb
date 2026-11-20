@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/memory_budget.hpp"
@@ -247,6 +248,19 @@ class TableIncarnation {
       TouchColumnarCache();
     }
   }
+  bool ProjectionRejected(uint64_t generation, uint64_t limit,
+                          const std::vector<uint8_t>& mask) const {
+    std::scoped_lock lock(columnar_cache_->mu);
+    return rejected_projection_generation_ == generation &&
+           rejected_projection_limit_ == limit && rejected_projection_ == mask;
+  }
+  void RejectProjection(uint64_t generation, uint64_t limit,
+                        const std::vector<uint8_t>& mask) {
+    std::scoped_lock lock(columnar_cache_->mu);
+    rejected_projection_generation_ = generation;
+    rejected_projection_limit_ = limit;
+    rejected_projection_ = mask;
+  }
   [[nodiscard]] uint64_t LSTableCapacityRejectedGeneration() const {
     return lstable_capacity_rejected_generation_.load(
         std::memory_order_acquire);
@@ -265,6 +279,7 @@ class TableIncarnation {
       std::scoped_lock lock(columnar_cache_->mu);
       old = std::move(backing_tlcs_store_);
       backing_tlcs_store_ = std::move(store);
+      rejected_projection_generation_ = 0;
     }
     // Destroy the old TlcsFile outside the mutex so its budget return and
     // mmap unmap do not block a concurrent reclaim hook.
@@ -301,6 +316,9 @@ class TableIncarnation {
   std::shared_ptr<ColumnarCacheState> columnar_cache_{
       std::make_shared<ColumnarCacheState>()};
   ScopedReclaimHook reclaim_hook_;
+  uint64_t rejected_projection_generation_{0};
+  uint64_t rejected_projection_limit_{0};
+  std::vector<uint8_t> rejected_projection_;
   std::atomic<uint64_t> lstable_capacity_rejected_generation_{0};
   std::shared_ptr<const void> backing_tlcs_store_;
 };

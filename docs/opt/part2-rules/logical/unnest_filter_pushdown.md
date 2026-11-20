@@ -23,6 +23,15 @@ graph TD
 
 ## 適用条件
 
+展開の前に述語を移すと評価回数が変わります。揮発性やデータ依存のエラーを含む述語は、この検査で除外します。
+
+```cpp
+if (!expression.predicate || !*expression.predicate ||
+              !free_of_data_dependent_errors(free_of_data_dependent_errors,
+                                             *expression.predicate) ||
+              !SafeToReduceEvaluationCount(*expression.predicate)) {
+```
+
 パターンは `Selection(Unnest(Any(), "unnest"))` であり、対象演算子は `LogicalOperator::kSelection` です。変換ラムダ内で以下のガード条件を検証します。
 
 ```cpp

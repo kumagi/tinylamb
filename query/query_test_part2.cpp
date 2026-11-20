@@ -1362,6 +1362,7 @@ TEST_F(QueryTest, SqlEngineWeakenedCteFilterFitsCellBudget) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE big (k INT64, v INT64);");
   std::string insert = "INSERT INTO big VALUES ";
+  insert.reserve(2000 * 8);
   for (int i = 0; i < 2000; ++i) {
     insert += (i == 0 ? "(" : ",(") + std::to_string(i) + "," +
               std::to_string(i) + ")";
@@ -1540,7 +1541,9 @@ TEST_F(QueryTest, SqlEngineOverBudgetCteKeepsRescanPath) {
   RunSql(ctx, *db_, "CREATE TABLE t1 (k INT64);");
   RunSql(ctx, *db_, "CREATE TABLE t2 (k INT64);");
   std::string insert1 = "INSERT INTO t1 VALUES ";
+  insert1.reserve(40 * 6);
   std::string insert2 = "INSERT INTO t2 VALUES ";
+  insert2.reserve(30 * 6);
   for (int i = 0; i < 40; ++i) {
     insert1 += (i == 0 ? "(" : ",(") + std::to_string(i) + ")";
     if (i < 30) {

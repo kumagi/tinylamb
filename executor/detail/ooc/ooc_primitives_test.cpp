@@ -401,6 +401,27 @@ TEST(OocPrimitivesSorterTest, MultiPassExternalMergeUnderTightBudget) {
 // insertion order and stable-sorted, so a fully-tied input must merge out in
 // original insertion order (global sort stability across runs).  The old
 // binary heap over Rows broke ties by heap sifting, not by run order.
+TEST(OocPrimitivesSorterTest, WideRowsRoundTripUnderSmallBudget) {
+  TempDirGuard dir("ooc_sorter_wide");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  ExternalSorter sorter(ExternalSorter::Options{
+      .spill_store = &store, .memory_budget_bytes = 8192,
+      .keys = {OocSortKey{.column_index = 0, .ascending = true}},
+      .limit = std::nullopt});
+  const Row large({Value(int64_t{2}), Value(std::string(16000, 'b'))});
+  const Row small({Value(int64_t{1}), Value(std::string(3000, 'a'))});
+  ASSERT_EQ(sorter.AddRow(large), Status::kSuccess);
+  ASSERT_EQ(sorter.AddRow(small), Status::kSuccess);
+  ASSERT_EQ(sorter.Finish(), Status::kSuccess);
+  EXPECT_TRUE(sorter.Spilled());
+  Row row;
+  ASSERT_TRUE(sorter.NextRow(&row).Value());
+  EXPECT_EQ(row, small);
+  ASSERT_TRUE(sorter.NextRow(&row).Value());
+  EXPECT_EQ(row, large);
+  EXPECT_FALSE(sorter.NextRow(&row).Value());
+}
+
 TEST(OocPrimitivesSorterTest, CrossRunTieOrderIsStreamStable) {
   TempDirGuard dir("ooc_sorter_ties");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});

@@ -29,7 +29,9 @@ graph TD
 
 ## 適用条件
 
-パターンは `Projection(Any("input"))` であり、入力グループ内に論理結合演算子（`kJoin`）が存在することを検査します。適用判定（guard）は以下の 4 条件から成ります（`plan/cascades.cpp`）。
+既に生成した射影の再適用を防ぐため、入力が `join-project-join:` で始まるグループなら終了し、左右の子に対応する `join-project-left:` または `join-project-right:` タグがあれば、その結合候補を除外します。
+
+パターンは `Projection(Any("input"))` であり、入力グループ内に論理結合演算子（`kJoin`）が存在することを検査します。適用判定（guard）は以下の条件で行います（`plan/cascades.cpp`）。
 
 ```cpp
     // Projection(Join(L, R)): retain only columns needed by the projection

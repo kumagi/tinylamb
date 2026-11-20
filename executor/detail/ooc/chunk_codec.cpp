@@ -1,6 +1,9 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/detail/ooc/chunk_codec.hpp"
 
+
+#include <new>
+#include <stdexcept>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -519,7 +522,16 @@ StatusOr<bool> ReadDataChunk(SpillSegmentReader* reader, DataChunk* chunk_out,
   RETURN_IF_FAIL(reader->ReadPod(&frame_bytes));
   std::string local;
   std::string* buf = (scratch_buffer != nullptr) ? scratch_buffer : &local;
-  buf->resize(frame_bytes);
+  if (frame_bytes > reader->Remaining()) {
+    return StatusError(StatusCode::kCorrupt, "truncated DataChunk spill frame");
+  }
+  try {
+    buf->resize(frame_bytes);
+  } catch (const std::length_error&) {
+    return Status::kTooBigData;
+  } catch (const std::bad_alloc&) {
+    return Status::kMemoryLimitExceeded;
+  }
   if (frame_bytes > 0) {
     RETURN_IF_FAIL(reader->ReadExact(buf->data(), frame_bytes));
   }

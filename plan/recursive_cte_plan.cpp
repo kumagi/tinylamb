@@ -46,6 +46,7 @@ Schema BuildRecursiveCteSchema(
   }
   if (body) {
     std::vector<Column> cols;
+    cols.reserve(body->SelectList().size());
     for (const NamedExpression& item : body->SelectList()) {
       cols.emplace_back(ColumnName(cte_name, item.name), ValueType::kNull);
     }

@@ -131,6 +131,7 @@ constexpr const char* kDdl =
 std::vector<std::string> FormatRows(
     const std::vector<std::vector<Value>>& rows) {
   std::vector<std::string> out;
+  out.reserve(rows.size());
   for (const auto& cells : rows) {
     std::string row;
     for (const Value& v : cells) {
@@ -196,6 +197,7 @@ bool RowAlmostEqual(const std::string& lhs, const std::string& rhs) {
   // A formatted row is a run of "NULL," or "|body|," cells.
   const auto cells = [](const std::string& row) {
     std::vector<std::string> out;
+    out.reserve(row.size());
     size_t i = 0;
     while (i < row.size()) {
       if (row[i] == '|') {
@@ -458,6 +460,7 @@ struct AggSpec {
 std::vector<MRow> FilteredRows(const AggSpec& spec,
                                const std::vector<MRow>& input) {
   std::vector<MRow> out;
+  out.reserve(input.size());
   for (const MRow& r : input) {
     if (!spec.filter || spec.filter->Eval(r) == 'T') {
       out.push_back(r);
@@ -477,6 +480,7 @@ std::vector<MRow> FilteredRows(const AggSpec& spec,
       }
     }
     std::vector<MRow> gated;
+    gated.reserve(out.size());
     for (const MRow& r : out) {
       if (any && CellOf(r, spec.having_col) == extremum) {
         gated.push_back(r);
@@ -504,9 +508,25 @@ std::vector<MRow> PreparedRows(const AggSpec& spec,
   }
   if (spec.kind == AggSpec::Kind::kArrayAgg && spec.distinct) {
     std::unordered_set<int64_t> seen;
+    seen.reserve(rows.size());
     std::erase_if(rows, [&](const MRow& row) {
       return !seen.insert(CellOf(row, spec.col)).second;
     });
+    // DISTINCT orders by the aggregated value (see generation): ASC puts
+    // NULL first, DESC puts it last (GoogleSQL default null ordering).
+    std::stable_sort(rows.begin(), rows.end(),
+                     [&](const MRow& x, const MRow& y) {
+                       const int64_t vx = CellOf(x, spec.col);
+                       const int64_t vy = CellOf(y, spec.col);
+                       if (vx == vy) {
+                         return false;
+                       }
+                       if (vx == kNullRepr || vy == kNullRepr) {
+                         return spec.order_desc ? vy == kNullRepr
+                                                : vx == kNullRepr;
+                       }
+                       return spec.order_desc ? vx > vy : vx < vy;
+                     });
   }
   if (spec.inner_limit > 0 &&
       rows.size() > static_cast<size_t>(spec.inner_limit)) {
@@ -540,6 +560,7 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
       bool any = false;
       int128_t sum = 0;  // extremes must not UB the mirror
       std::vector<int64_t> seen;
+      seen.reserve(rows.size());
       for (const MRow& r : rows) {
         const int64_t v = CellOf(r, spec.col);
         if (v == kNullRepr ||
@@ -604,6 +625,7 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
         bool any = false;
         double sum = 0.0;
         std::vector<double> seen;
+        seen.reserve(rows.size());
         for (const MRow& r : rows) {
           const double v = r.f;
           if (r.f_null ||
@@ -625,6 +647,7 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
     }
     case AggSpec::Kind::kCountDistinct: {
       std::vector<int64_t> seen;
+      seen.reserve(rows.size());
       for (const MRow& r : rows) {
         const int64_t v = CellOf(r, spec.col);
         if (v != kNullRepr &&
@@ -678,6 +701,8 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       int64_t cnt = 0;
       std::vector<int64_t> seen;
       std::vector<double> fseen;
+      seen.reserve(rows.size());
+      fseen.reserve(rows.size());
       for (const MRow& r : rows) {
         if (IsDblCol(spec.col)) {
           const double v = r.f;
@@ -1122,8 +1147,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             (aa.distinct ? std::string("DISTINCT ") : std::string()) +
             ColName(aa.col);
         aa.where_pos = base.size();
+        // GoogleSQL: with DISTINCT the inner ORDER BY may only name the
+        // aggregated argument, so DISTINCT orders by the value itself.
+        const std::string order_key =
+            aa.distinct ? ColName(aa.col) : std::string("u");
         aa.sql =
-            base + (aa.order_desc ? " ORDER BY u DESC" : " ORDER BY u") +
+            base + " ORDER BY " + order_key + (aa.order_desc ? " DESC" : "") +
             (aa.inner_limit != 0 ? " LIMIT " + std::to_string(aa.inner_limit)
                                  : "") +
             ")";
@@ -1247,6 +1276,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           all_subsets.push_back(gcols);
         }
         std::vector<int> picked;
+        picked.reserve(all_subsets.size());
         const int nsets = g.Pick(2, static_cast<int>(all_subsets.size()));
         for (int i = 0; i < nsets; ++i) {
           int idx = g.Pick(0, static_cast<int>(all_subsets.size()) - 1);
@@ -1310,6 +1340,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       // set's columns and apply HAVING; columns outside the set emit NULL.
       // The `()` grouping set yields one row even when nothing survives.
       std::vector<MRow> survivors;
+      survivors.reserve(mirror.size());
       for (const MRow& r : mirror) {
         if (where != nullptr && where->Eval(r) != 'T') {
           continue;
@@ -2199,6 +2230,7 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
       std::sort(expected.begin(), expected.end());
       if (actual != expected && !RowsAlmostEqual(actual, expected)) {
         std::string report = std::string(tag) + " " + q.sql + "\n";
+        report.reserve(expected.size() + actual.size());
         report += "  expected:\n";
         for (const std::string& r : expected) {
           report += "    " + r + "\n";

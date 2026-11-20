@@ -476,6 +476,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         ++stats->queries;
       }
       std::vector<std::string> actual;
+      actual.reserve(got->size());
       for (const EngineRow& r : *got) {
         std::string row;
         for (size_t i = 0; i < r.cells.size() && i < proj.size(); ++i) {
@@ -690,6 +691,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
             continue;
           }
           std::string row;
+          row.reserve(proj.size());
           for (const ProjCol& c : proj) {
             row += FormatJoined(c, f, d) + ",";
           }
@@ -962,6 +964,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       }
     }
     std::vector<std::string> actual;
+    actual.reserve(got->size());
     for (const EngineRow& r : *got) {
       std::string row;
       for (const Value& v : r.cells) {
@@ -1040,6 +1043,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         return report;
       }
       std::vector<std::string> actual;
+      actual.reserve(got->size());
       for (const EngineRow& r : *got) {
         std::string row;
         for (const Value& v : r.cells) {
@@ -1102,6 +1106,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       }
     }
     std::vector<std::string> h_expected;
+    h_expected.reserve(h_groups.size());
     for (const auto& [tag, ag] : h_groups) {
       const bool min_ok = ag.any_a && ag.min_a >= -2;
       const bool max_ok = ag.any_u && ag.max_u >= 0;
@@ -1118,6 +1123,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       std::vector<std::string> actual;
       for (const EngineRow& r : *got) {
         std::string row;
+        row.reserve(r.cells.size());
         for (const Value& v : r.cells) {
           row += FormatEngineValue(v) + ",";
         }
@@ -1180,6 +1186,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     std::sort(indf_expected.begin(), indf_expected.end());
     if (auto got = RunQuery(db, ctx, indf_sql, &error); got.has_value()) {
       std::vector<std::string> actual;
+      actual.reserve(got->size());
       for (const EngineRow& r : *got) {
         std::string row;
         for (const Value& v : r.cells) {
@@ -1252,6 +1259,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     std::sort(left_cnt_expected.begin(), left_cnt_expected.end());
     if (auto got = RunQuery(db, ctx, left_cnt_sql, &error); got.has_value()) {
       std::vector<std::string> actual;
+      actual.reserve(got->size());
       for (const EngineRow& r : *got) {
         std::string row;
         for (const Value& v : r.cells) {
@@ -1306,6 +1314,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         }
       }
       std::vector<std::string> big_expected;
+      big_expected.reserve(big_groups.size());
       for (const auto& [tag, ag] : big_groups) {
         const int64_t big_sum =
             static_cast<int64_t>(ag.cnt) * 9007199254740993LL;
@@ -1319,6 +1328,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       if (auto got = RunQuery(db, ctx, big_having_sql, &error);
           got.has_value()) {
         std::vector<std::string> actual;
+        actual.reserve(got->size());
         for (const EngineRow& r : *got) {
           std::string row;
           for (const Value& v : r.cells) {
@@ -1396,6 +1406,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         continue;
       }
       std::vector<std::string> actual;
+      actual.reserve(got->size());
       for (const EngineRow& r : *got) {
         std::string row;
         for (const Value& v : r.cells) {
@@ -1473,6 +1484,7 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
         return "query failed: " + q.sql + " :: " + error;
       }
       std::vector<std::string> actual;
+      actual.reserve(got->size());
       for (const EngineRow& r : *got) {
         std::string row;
         for (const Value& v : r.cells) {
@@ -1485,6 +1497,7 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
       std::sort(expected.begin(), expected.end());
       if (actual != expected) {
         std::string report = std::string(tag) + " " + q.sql + "\n";
+        report.reserve(report.size() + expected.size() + actual.size());
         report += "  expected:\n";
         for (const std::string& r : expected) {
           report += "    " + r + "\n";
@@ -1547,6 +1560,8 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
 std::string SerializeJoinTest(uint64_t seed, const JoinTrace& trace,
                               const std::string& failure_summary) {
   std::string out = std::string(kTestHeader) + "\n";
+  out.reserve(out.size() + trace.setup.size() + trace.queries.size() +
+              failure_summary.size());
   out += "-- seed: " + std::to_string(seed) + "\n";
   for (const std::string& sql : trace.setup) {
     out += "-- setup: " + sql + "\n";

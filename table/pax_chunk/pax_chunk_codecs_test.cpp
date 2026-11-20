@@ -17,6 +17,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -77,6 +78,17 @@ TEST(PaxChunkCodecsTest, AuditBuilderRejectsCorruptRowsAndUnsortedKeys) {
         if (corruption == 4) {
           std::fill_n(blob.data() + entries[1].key_offset_, 4, char(-1));
         }
+#ifndef NDEBUG
+        if (corruption == 2 || corruption == 3) {
+          // SortedRun's ctor CHECK rejects an unsorted index before
+          // BuildFromSortedRun can see it, so the kCorrupt arm is
+          // unreachable through the public ctor; pin the earlier death.
+          EXPECT_DEATH(
+              { SortedRun bad(std::move(blob), std::move(entries), 0); },
+              "not sorted");
+          continue;
+        }
+#endif
         const SortedRun bad(std::move(blob), std::move(entries), 0);
         const auto built =
             PaxChunk::BuildFromSortedRun(bad, schema, compressed);
@@ -595,6 +607,7 @@ TEST(PaxChunkCodecsTest, ConstAndRleAndRleBpAndRleIdxRoundTrip) {
 
   // 2. Sorted runs for kRle / kRleBp / kRleIdx
   std::vector<int64_t> runs;
+  runs.reserve(16);
   for (int r = 0; r < 16; ++r) {
     for (int k = 0; k < 20; ++k) {
       runs.push_back(100 + (r * 10));
@@ -834,6 +847,81 @@ TEST(PaxChunkCodecsTest, Float64AndVarcharCodecsRoundTrip) {
     ASSERT_TRUE(DecodeFrontCodeAtInto(fc.buf.data(), fc.param, sn, i,
                                       fc.buf.data() + fc.buf.size(), &out));
     EXPECT_EQ(out, svs[i]);
+  }
+}
+
+TEST(PaxChunkCodecsTest, AuditHuffDictCheckpointBitPositionsArePinned) {
+  // kHuffDict's ckpt[e] records the bit position at which row 64e starts.
+  // HuffDictValueAt seeks to it verbatim while DecodeHuffDictAll walks from
+  // bit 0, so ValidateWalk's semantic replay must pin every checkpoint
+  // against the walk. The structural checks alone (ckpt[0]==0, monotone,
+  // < slen*8) admit a checkpoint landing MID-SYMBOL -- a Kraft-complete
+  // tree decodes every bit pattern -- which would make point reads return
+  // different values than a scan of the same committed rows.
+  const Schema schema("huffdict_ckpt", {Column("k", ValueType::kInt64)});
+  // 200 sorted rows over 8 distinct values: one row group (ncp = 4), so
+  // ckpt[1] (row 64's start) has a successor checkpoint to stay monotone
+  // against and >= 64 stream bits separating it from ckpt[2].
+  const std::vector<uint64_t> freq_of_distinct{100, 40, 25, 15, 10, 5, 3, 2};
+  std::vector<Row> rows;
+  rows.reserve(200);
+  int64_t v = 0;
+  for (const uint64_t f : freq_of_distinct) {
+    for (uint64_t k = 0; k < f; ++k) {
+      rows.emplace_back(Row({Value(v)}));
+    }
+    ++v;
+  }
+  ASSERT_EQ(rows.size(), 200U);
+
+  const char* prev_forced = std::getenv("TINYLAMB_FORCE_SCHEME");
+  const std::string saved_forced =
+      prev_forced != nullptr ? std::string(prev_forced) : std::string();
+  setenv("TINYLAMB_FORCE_SCHEME", "HUFFDICT", 1);
+  const auto built =
+      PaxChunk::BuildFromSortedRun(fuzz::MakeRun(rows, schema), schema);
+  if (prev_forced != nullptr) {
+    setenv("TINYLAMB_FORCE_SCHEME", saved_forced.c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_FORCE_SCHEME");
+  }
+  ASSERT_TRUE(built.HasValue());
+  const PaxChunk& chunk = built.Value();
+  ASSERT_FALSE(chunk.GetFooter().encodings.empty());
+  ASSERT_EQ(chunk.GetFooter().encodings[0],
+            static_cast<uint8_t>(Scheme::kHuffDict));
+
+  // Control: the pristine wire image must validate, or the rejections below
+  // would prove nothing about the tamper.
+  ASSERT_EQ(PaxChunk::ValidateChunkBytes(chunk.Data()), Status::kSuccess);
+
+  std::vector<char> bytes = chunk.Data();
+  const PaxChunk::Footer& f = chunk.GetFooter();
+  ASSERT_FALSE(f.column_offsets.empty());
+  const size_t reg = f.column_offsets[0];
+  ASSERT_LT(reg, bytes.size());
+  // Region: [d u16][dict 8d][lens (d+1)/2][freq 2d][ncp u16]
+  //         [ckpt 4ncp][stream_len u32][stream]
+  const uint64_t d = ReadBE16(bytes.data() + reg);
+  const size_t ncp_off = reg + 2 + (8 * d) + ((d + 1) / 2) + (2 * d);
+  const uint64_t ncp = ReadBE16(bytes.data() + ncp_off);
+  const size_t ckpt_off = ncp_off + 2;
+  ASSERT_GE(ncp, 3U);
+  const uint32_t ckpt1 = ReadBE32(bytes.data() + ckpt_off + 4);
+  const uint32_t ckpt2 = ReadBE32(bytes.data() + ckpt_off + 8);
+  ASSERT_GT(ckpt2, ckpt1 + 1U);  // +1 stays strictly monotone vs ckpt[2]
+
+  for (const uint32_t tampered : {ckpt1 + 1U, ckpt2}) {
+    SCOPED_TRACE(tampered);
+    std::vector<char> bad = bytes;
+    // Both values keep ckpt[0]==0, monotonicity and the < slen*8 bound --
+    // every structural gate passes -- but neither is the bit position the
+    // replay actually reaches after 64 symbols. Re-sign the CRCs so the
+    // integrity gate is not what rejects the image.
+    fuzz::StoreBE32(bad, ckpt_off + 4, tampered);
+    fuzz::ResignChunkCrc(bad);
+    EXPECT_EQ(PaxChunk::ValidateChunkBytes(bad), Status::kCorruption);
+    EXPECT_FALSE(PaxChunk::Deserialize(bad).HasValue());
   }
 }
 

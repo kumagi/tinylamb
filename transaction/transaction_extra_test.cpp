@@ -627,6 +627,7 @@ TEST_F(QueueTableTest, PointRangeOnKeyPrefixResolvesHeapRows) {
   ASSERT_EQ(heap_counts.size(), static_cast<size_t>(kOrders));
 
   std::vector<int> mismatches;
+  mismatches.reserve(heap_counts.size());
   {
     TransactionContext probe_ctx = database_->BeginReadOnlyContext();
     StatusOr<std::shared_ptr<Table>> ptable = probe_ctx.GetTable("new_order_t");

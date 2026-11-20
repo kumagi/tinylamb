@@ -31,6 +31,8 @@ graph TD
 
 ## 適用条件
 
+LIMIT の押し込みは ON 述語の評価回数を減らします。揮発性関数を含む場合や、評価を省くとエラーが消える場合は適用しません。
+
 パターンは `Limit(Any("input"))`、`target = kLimit` です。変換ラムダのガードは
 次のとおりです。
 
@@ -56,7 +58,9 @@ graph TD
 ```cpp
             if (ojoin.operation != LogicalOperator::kOuterJoin ||
                 ojoin.join_type != 0 || ojoin.children.size() != 2 ||
-                !ojoin.predicate.has_value() || !*ojoin.predicate) {
+                !ojoin.predicate.has_value() || !*ojoin.predicate ||
+                !SafeToReduceEvaluationCount(*ojoin.predicate) ||
+                !ExpressionCannotThrowForPlanner(*ojoin.predicate)) {
               continue;
             }
 ```

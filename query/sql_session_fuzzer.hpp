@@ -14,9 +14,8 @@ namespace tinylamb {
 
 // State-tracking session fuzzing.  Unlike the metamorphic oracles in
 // sql_oracle_fuzzer (which check properties of single queries), this harness
-// verifies the *whole database state* after every statement: it maintains a
-// row-level mirror of every table in C++ and compares a full-table dump
-// against the engine after each INSERT / UPDATE / DELETE / DDL step.
+// updates a C++ row-level mirror as statements execute. At generated check
+// steps it compares a table dump or an index probe against that mirror.
 //
 // DML and CREATE/DROP TABLE run as SQL.  Index creation uses the harness's
 // own slot-based pseudo-DDL ("CREATE [UNIQUE] INDEX n ON t KEY(slots)

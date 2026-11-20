@@ -155,6 +155,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   const size_t rows = 1 + (c.Next() % 24);
   DataChunk source(schema);
   std::vector<Row> model;
+  model.reserve(rows);
   for (size_t row = 0; row < rows && !c.Done(); ++row) {
     Row r({MakeInt(c), MakeDouble(c), MakeString(c)});
     source.Append(r, RowPosition{static_cast<page_id_t>(row),
@@ -194,6 +195,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
 
   // (3b) AppendRowFromColumns over the source's column vectors.
   std::vector<const ColumnVector*> column_sources;
+  column_sources.reserve(source.ColumnCount());
   for (size_t col = 0; col < source.ColumnCount(); ++col) {
     column_sources.push_back(&source.ColumnAt(col));
   }

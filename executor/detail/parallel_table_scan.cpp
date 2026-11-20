@@ -962,6 +962,7 @@ bool TryParallelTableScan(
     bool empty{false};
   };
   std::vector<ScanIntInterval> scan_intervals;
+  scan_intervals.reserve(integer_peeks.size());
   for (const auto& peek : integer_peeks) {
     if (peek.op == BinaryOperation::kNotEquals) { continue;
 }
@@ -1034,9 +1035,12 @@ bool TryParallelTableScan(
   };
   std::vector<LSTableDictColFilter> lstable_dict_filters;
   std::vector<LSTableWideDictFilter> lstable_wide_filters;
+  lstable_wide_filters.reserve(scan_filter ? scan_filter->simple.size() : 0);
   std::vector<DisjBranchFilter> lstable_disj_branches;
   std::vector<LSTableDoubleZonePredicate> lstable_double_zones;
+  lstable_double_zones.reserve(scan_filter ? scan_filter->simple.size() : 0);
   std::vector<LSTableIntColCompare> lstable_col_compares;
+  lstable_col_compares.reserve(scan_filter ? scan_filter->simple.size() : 0);
   std::vector<LSTableExtraRf> lstable_extra_rfs;
   std::vector<uint8_t> simple_covered_by_dict;
   std::vector<uint8_t> prefix_covered_by_dict;

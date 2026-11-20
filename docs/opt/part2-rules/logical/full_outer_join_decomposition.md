@@ -5,7 +5,7 @@
 
 ## 概要
 
-`full_outer_join_decomposition` は、完全外部結合 `FullOuterJoin(L, R, p)` を、左外部結合とアンチ結合の多重集合和 `UnionAll(LeftOuterJoin(L, R, p), AntiJoin(R, L, p))` へと代数的に分解する論理 Rule です。
+`full_outer_join_decomposition` は、完全外部結合 `FullOuterJoin(L, R, p)` を、左外部結合とアンチ結合の多重集合和 `UnionAll(LeftOuterJoin(L, R, p), Project(NULL_L, R, AntiJoin(R, L, p)))` へと代数的に分解する論理 Rule です。
 
 物理実行エンジンにおいて実装難易度が高くバッファリング負荷の大きい完全外部結合の専用アルゴリズムを要求せず、既存の左外部結合およびアンチ結合の組み合わせによって計画・実行可能にします。
 
@@ -17,9 +17,10 @@ graph TD
     F1["OuterJoin FULL (predicate p)"] --> L1["Group L"]
     F1 --> R1["Group R"]
   end
-  subgraph after["変換後: UnionAll(LeftOuter(L,R), AntiJoin(R,L))"]
+  subgraph after["変換後: UnionAll(LeftOuter(L,R), Project(NULL_L,R,AntiJoin(R,L)))"]
     U1["UnionAll"] --> LO["派生 Group full_to_left_outer:<br>OuterJoin LEFT p"]
-    U1 --> AJ["派生 Group full_to_anti_join:<br>AntiJoin R ⋈ L"]
+    U1 --> PJ["full_to_padded_anti: 左列を NULL で補う Projection"]
+    PJ --> AJ["派生 Group full_to_anti_join:<br>AntiJoin R ⋈ L"]
     LO --> L2["Group L"]
     LO --> R2["Group R"]
     AJ --> R3["Group R"]
@@ -35,19 +36,20 @@ graph TD
 
 1. 演算子が `kOuterJoin` であり、子がちょうど 2 個であること。
 2. `join_type == 2`（FULL OUTER JOIN）であること。
-3. 生成される 2 つの派生 Group（`"full_to_left_outer"` および `"full_to_anti_join"`）のいずれも、現在の親 Group 自身と一致しないこと（循環参照防止）。
+3. 左右のスキーマを確定でき、生成される 3 つの派生 Group（`full_to_left_outer`、`full_to_anti_join`、`full_to_padded_anti`）のいずれも、現在の親 Group 自身と一致しないこと（循環参照防止）。
 
 ```cpp
-          if (expression.join_type == 2) {  // 2 = FullOuter
-            const GroupId left_id = bindings.at("left");
-            const GroupId right_id = bindings.at("right");
-            const std::vector<std::string> cur_relations =
-                memo.Get(group).relations;
-            const GroupId left_outer_group =
-                memo.EnsureDerivedGroup(cur_relations, "full_to_left_outer");
-            const GroupId anti_join_group =
-                memo.EnsureDerivedGroup(cur_relations, "full_to_anti_join");
-            if (left_outer_group == group || anti_join_group == group) {
+            const GroupId left_outer_group = memo.EnsureDerivedGroup(
+                cur_relations,
+                "full_to_left_outer:" + child_key + ":" + predicate_key);
+            const GroupId anti_join_group = memo.EnsureDerivedGroup(
+                cur_relations,
+                "full_to_anti_join:" + child_key + ":" + predicate_key);
+            const GroupId padded_group = memo.EnsureDerivedGroup(
+                cur_relations,
+                "full_to_padded_anti:" + child_key + ":" + predicate_key);
+            if (left_outer_group == group || anti_join_group == group ||
+                padded_group == group) {
               return;
             }
 ```
@@ -66,7 +68,7 @@ graph TD
 
 ## 実装の詳細
 
-変換処理は、元の Group と同一のリレーション集合 `cur_relations` を持つ 2 つの派生 Group を確保し、それぞれの Group に対応する論理演算式を登録した上で、親 Group に `kUnionAll` 式を追加します。
+変換処理は、元の Group と同一のリレーション集合 `cur_relations` を持つ 3 つの派生 Group を確保し、それぞれの Group に対応する論理演算式を登録した上で、親 Group に `kUnionAll` 式を追加します。
 
 ```cpp
             memo.AddExpression(
@@ -75,23 +77,29 @@ graph TD
                                   .children = {left_id, right_id},
                                   .predicate = expression.predicate,
                                   .target_list = expression.target_list,
-                                  .join_type = 0,  // 0 = LeftOuter
-                                  .output_schema = expression.output_schema});
+                                  .join_type = 0,
+                                  .output_schema = full_schema});
 
             memo.AddExpression(
                 anti_join_group,
                 LogicalExpression{.operation = LogicalOperator::kAntiJoin,
                                   .children = {right_id, left_id},
                                   .predicate = expression.predicate,
-                                  .target_list = expression.target_list,
-                                  .output_schema = expression.output_schema});
+                                  .output_schema = right_schema});
 
             memo.AddExpression(
-                group, LogicalExpression{
-                           .operation = LogicalOperator::kUnionAll,
-                           .children = {left_outer_group, anti_join_group},
-                           .target_list = expression.target_list,
-                           .output_schema = expression.output_schema});
+                padded_group,
+                LogicalExpression{.operation = LogicalOperator::kProjection,
+                                  .children = {anti_join_group},
+                                  .target_list = std::move(padded_targets),
+                                  .output_schema = full_schema});
+
+            memo.AddExpression(
+                group,
+                LogicalExpression{.operation = LogicalOperator::kUnionAll,
+                                  .children = {left_outer_group, padded_group},
+                                  .target_list = expression.target_list,
+                                  .output_schema = full_schema});
 ```
 
 アンチ結合枝では入力順序を反転させ、右側テーブル（`right_id`）をプローブ側、左側テーブル（`left_id`）をビルド側として配置します。
@@ -111,4 +119,4 @@ graph TD
 ## 検証テスト
 
 - `plan/cascades_test_part2.cpp`: `CascadesTest.FullOuterJoinDecomposition`
-  - `join_type = 2` の `OuterJoin` 式が、`full_to_left_outer` および `full_to_anti_join` タグを持つ 2 つの派生 Group を子とする `kUnionAll` 式へと分解されることを検証。
+  - `join_type = 2` の `OuterJoin` 式が、`full_to_left_outer` および `full_to_padded_anti` タグを持つ 2 つの派生 Group を子とする `kUnionAll` 式へと分解されることを検証。

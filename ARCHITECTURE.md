@@ -117,12 +117,12 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
   この運用が最大の負債領域で機能しなくなる (2026-11-18: 全 7 パターンを
   実エッジへ展開済み)。
 
-## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 116 辺)
+## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 114 辺)
 
 `python3 scripts/check_layering.py` のサマリ (2026-11-18 検証):
 
 ```
-116 upward edge(s): common->type=6, executor->sql=6, expression->executor=2, index->table=4, plan->executor=2, plan->sql=14, relational->executor=45, relational->sql=29, table->expression=7, type->storage=1; allowlisted=116
+114 upward edge(s): common->type=6, executor->sql=6, expression->executor=2, index->table=4, plan->executor=2, plan->sql=14, relational->executor=45, relational->sql=27, table->expression=7, type->storage=1; allowlisted=114
 ```
 
 - **主要区分:**

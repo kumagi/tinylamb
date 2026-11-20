@@ -104,6 +104,7 @@ TEST(JsonTextValidator, BoundsNestingDepth) {
   // descent would crash the process instead of reporting invalid input.
   // 255 levels stay valid, and the depth cap (256) is rejected.
   std::string deep_ok;
+  deep_ok.reserve(255);
   for (int i = 0; i < 255; ++i) {
     deep_ok += "[";
   }
@@ -111,6 +112,7 @@ TEST(JsonTextValidator, BoundsNestingDepth) {
   EXPECT_TRUE(Valid(deep_ok + "1" + close_ok));
 
   std::string deep_rejected;
+  deep_rejected.reserve(257);
   for (int i = 0; i < 257; ++i) {
     deep_rejected += "[";
   }

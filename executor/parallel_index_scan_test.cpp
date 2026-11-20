@@ -179,6 +179,7 @@ TEST_F(ParallelIndexScanTest, BatchPathMatchesSerialScan) {
   ParallelIndexScan scan(ctx.txn_, *table, index, begin, end, true,
                          /*worker_count=*/4, /*leaves_per_morsel=*/1);
   std::vector<std::pair<Row, RowPosition>> batched;
+  batched.reserve(serial.size());
   DataChunk chunk;
   while (scan.NextBatch(&chunk, 64) != 0) {
     for (size_t i = 0; i < chunk.Size(); ++i) {

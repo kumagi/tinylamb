@@ -1000,7 +1000,9 @@ TEST_F(PlanTest, JoinPlansPreserveExplicitManyToManyCardinality) {
   const Schema left_schema("l", {Column("id", ValueType::kInt64)});
   const Schema right_schema("r", {Column("id", ValueType::kInt64)});
   std::vector<Row> left_rows;
+  left_rows.reserve(10);
   std::vector<Row> right_rows;
+  right_rows.reserve(10);
   for (int64_t i = 0; i < 10; ++i) {
     left_rows.push_back(Row({Value(i % 2)}));
     right_rows.push_back(Row({Value(i % 2)}));

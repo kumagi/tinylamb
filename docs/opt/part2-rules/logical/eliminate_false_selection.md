@@ -25,6 +25,8 @@ graph TD
 
 ## 適用条件
 
+実行時に値が決まるパラメータスロットを含む述語は、定数 FALSE や NULL として扱えません。
+
 パターンは `Selection(Any())`、対象演算子は `LogicalOperator::kSelection` です。変換ラムダ内で述語の値を評価します（`plan/cascades.cpp`）。
 
 ```cpp
@@ -32,8 +34,9 @@ graph TD
         "eliminate_false_selection", Selection(Any()),
         [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (!expression.predicate ||
-              (*expression.predicate)->Type() != TypeTag::kConstantValue) {
+          if (!expression.predicate || !*expression.predicate ||
+              (*expression.predicate)->Type() != TypeTag::kConstantValue ||
+              ContainsParameterSlot(*expression.predicate)) {
             return;
           }
           const Value value =

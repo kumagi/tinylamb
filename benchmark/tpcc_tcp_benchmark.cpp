@@ -204,6 +204,7 @@ class Session final : public TpccSqlSession {
         }
         size_t offset = 2;
         std::vector<Value> values;
+        values.reserve(types.size());
         for (uint32_t type : types) {
           if (offset + 4 > body.size()) {
             return Status::kCorrupt;

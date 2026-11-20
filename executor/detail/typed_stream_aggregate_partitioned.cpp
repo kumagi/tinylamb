@@ -471,8 +471,60 @@ QueryMemoryCharge& SurvivorChargeFor(
   return *charges[shard];
 }
 
+// Takes budget from `charge` in kChunk steps so per-element accounting does
+// not hit the process-wide reservation atomic on every insert: with 16
+// workers that contended cache line cost TPC-H Q21 about a sixth of its time.
+// The unused remainder goes back when this object dies, so the extra
+// reservation is bounded by kChunk per live instance (one per worker).
+class ChunkedCharge {
+ public:
+  explicit ChunkedCharge(QueryMemoryCharge* charge) noexcept
+      : charge_(charge) {}
+  ChunkedCharge(const ChunkedCharge&) = delete;
+  ChunkedCharge& operator=(const ChunkedCharge&) = delete;
+  ChunkedCharge(ChunkedCharge&&) = delete;
+  ChunkedCharge& operator=(ChunkedCharge&&) = delete;
+  ~ChunkedCharge() {
+    if (slack_ != 0) {
+      charge_->Release(slack_);
+    }
+  }
+  [[nodiscard]] bool TryAdd(size_t bytes) {
+    if (bytes <= slack_) {
+      slack_ -= bytes;
+      return true;
+    }
+    const size_t want = std::max(bytes, kChunk);
+    if (charge_->TryAdd(want)) {
+      slack_ += want - bytes;
+      return true;
+    }
+    return charge_->TryAdd(bytes);  // close to the limit: stay exact
+  }
+  void Add(size_t bytes) {
+    if (bytes <= slack_) {
+      slack_ -= bytes;
+      return;
+    }
+    const size_t want = std::max(bytes, kChunk);
+    charge_->Add(want);
+    slack_ += want - bytes;
+  }
+
+ private:
+  static constexpr size_t kChunk = size_t{256} << 10;
+  QueryMemoryCharge* charge_;
+  size_t slack_{0};
+};
+
 void PushChargedSurvivor(std::vector<SurvivorGroupRow>* rows,
                          QueryMemoryCharge* charge, SurvivorGroupRow row) {
+  charge->Add(EstimateSurvivorGroupRowBytes(row));
+  rows->push_back(std::move(row));
+}
+
+void PushChargedSurvivor(std::vector<SurvivorGroupRow>* rows,
+                         ChunkedCharge* charge, SurvivorGroupRow row) {
   charge->Add(EstimateSurvivorGroupRowBytes(row));
   rows->push_back(std::move(row));
 }
@@ -803,6 +855,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
   }
   int distinct_agg_idx = -1;
   std::vector<size_t> non_distinct_idxs;
+  non_distinct_idxs.reserve(req.agg_specs.size());
   for (size_t a = 0; a < req.agg_specs.size(); ++a) {
     const auto k = req.agg_specs[a].kind;
     if (IsDistinctAggKind(k)) {
@@ -1267,7 +1320,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
           RunParallelTasks(std::min(workers, num_shards), [&](size_t tid) {
             std::unordered_map<uint32_t, uint64_t>& my_counts =
                 thread_counts[tid];
-            QueryMemoryCharge& my_charge = count_charges[tid];
+            ChunkedCharge my_charge(&count_charges[tid]);
             QueryMemoryCharge pair_charge;
             FlatGidIntPairSet pset(&pair_charge);
 
@@ -1723,6 +1776,12 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
         }
         pairs.clear();
         pairs.reserve(shard_bytes / 24);
+        // Records of one group arrive back to back when the scan is
+        // clustered on the group key (lineitem by l_orderkey: ~4 per order,
+        // all hashed to this shard in scan order), so the previous record's
+        // group answers most lookups without touching the hash table.
+        uint32_t last_gid = std::numeric_limits<uint32_t>::max();
+        uint64_t last_kh = 0;
 
         for (size_t w = 0; w < workers; ++w) {
           SlabChunkReader chunk_reader(spill_store,
@@ -1769,14 +1828,25 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
               // bytes live: resident chunks outlive the shard table, but a
               // spilled chunk resolves into the reader's scratch and must be
               // interned into the table arena instead.
-              auto gid_or =
-                  wt.FindOrInsert(probe_keys.data(), kh,
-                                  /*borrow_strings=*/c.data != nullptr);
-              if (!gid_or.HasValue()) {
-                p2_status[tid] = gid_or.GetStatus();
-                return;
+              uint32_t gid = 0;
+              if (last_gid != std::numeric_limits<uint32_t>::max() &&
+                  kh == last_kh &&
+                  GroupKeySliceHasher::Equals(wt.KeysAt(last_gid),
+                                              probe_keys.data(),
+                                              km.phys_specs)) {
+                gid = last_gid;
+              } else {
+                auto gid_or =
+                    wt.FindOrInsert(probe_keys.data(), kh,
+                                    /*borrow_strings=*/c.data != nullptr);
+                if (!gid_or.HasValue()) {
+                  p2_status[tid] = gid_or.GetStatus();
+                  return;
+                }
+                gid = gid_or.Value();
+                last_gid = gid;
+                last_kh = kh;
               }
-              const uint32_t gid = gid_or.Value();
               if (has_dist) {
                 pairs.push_back({.gid = gid, .val = dv});
               }
@@ -1909,6 +1979,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
         auto& out_vec = shard_survivors[s];
         QueryMemoryCharge& survivor_charge =
             SurvivorChargeFor(shard_survivor_charges, s);
+        ChunkedCharge survivor_batch(&survivor_charge);
         const bool use_shard_heap =
             bounded_topk && topk_cap > 0 && ng > topk_cap;
         const SurvivorComparator local_cmp{
@@ -2024,17 +2095,17 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
 
           if (use_shard_heap) {
             if (out_vec.size() < topk_cap) {
-              PushChargedSurvivor(&out_vec, &survivor_charge, std::move(row));
+              PushChargedSurvivor(&out_vec, &survivor_batch, std::move(row));
               std::push_heap(out_vec.begin(), out_vec.end(), local_cmp);
             } else {
               std::pop_heap(out_vec.begin(), out_vec.end(), local_cmp);
               survivor_charge.Release(
                   EstimateSurvivorGroupRowBytes(out_vec.back()));
-              PushChargedSurvivor(&out_vec, &survivor_charge, std::move(row));
+              PushChargedSurvivor(&out_vec, &survivor_batch, std::move(row));
               std::push_heap(out_vec.begin(), out_vec.end(), local_cmp);
             }
           } else {
-            PushChargedSurvivor(&out_vec, &survivor_charge, std::move(row));
+            PushChargedSurvivor(&out_vec, &survivor_batch, std::move(row));
             if (req.order_bindings.empty() && req.stmt.HasLimit() &&
                 out_vec.size() >= topk_cap) {
               break;
@@ -2249,6 +2320,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
 
   // Identify which aggs actually read a column vs `COUNT(*)`.
   std::vector<size_t> active_agg_cols;
+  active_agg_cols.reserve(naggs);
   for (size_t a = 0; a < naggs; ++a) {
     if (req.agg_specs[a].kind != ColAggKind::kCountStar) {
       active_agg_cols.push_back(a);
@@ -2861,6 +2933,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
         auto& out_vec = shard_survivors[s];
         QueryMemoryCharge& survivor_charge =
             SurvivorChargeFor(shard_survivor_charges, s);
+        ChunkedCharge survivor_batch(&survivor_charge);
         const bool use_shard_heap =
             bounded_topk && topk_cap > 0 && ng > topk_cap;
         const SurvivorComparator local_cmp{
@@ -3050,7 +3123,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
                 p2_status[tid] = row_or.GetStatus();
                 return;
               }
-              PushChargedSurvivor(&out_vec, &survivor_charge,
+              PushChargedSurvivor(&out_vec, &survivor_batch,
                                   std::move(row_or.Value()));
             }
             shard_worker_chunks[s].clear();
@@ -3276,6 +3349,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
       num_shards, std::vector<SpillSegmentId>(workers, kInvalidSpillSegmentId));
 
   std::vector<size_t> active_agg_cols;
+  active_agg_cols.reserve(naggs);
   for (size_t a = 0; a < naggs; ++a) {
     if (req.agg_specs[a].kind != ColAggKind::kCountStar) {
       active_agg_cols.push_back(a);
@@ -4520,6 +4594,8 @@ StatusOr<std::optional<Relation>> TryRunKeyFiberUnorderedLimitAggregate(
   }
   std::vector<slot_t> extra_cols;
   std::vector<uint8_t> extra_len_only;
+  extra_cols.reserve(ncols);
+  extra_len_only.reserve(ncols);
   for (size_t c = 0; c < ncols; ++c) {
     if (extra_need[c] != 0U && in_seed[c] == 0U) {
       extra_cols.push_back(static_cast<slot_t>(c));

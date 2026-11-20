@@ -66,14 +66,10 @@ graph TD
 
 ## 実装の詳細
 
-推定出力行数は、等値キーによる `JoinCardinality` の計算結果と、左側（プローブ側）の推定行数 $|L|$ の最小値として算出されます。
+等値キーの組と残余述語を `JoinCardinality` に渡し、その結果を `RowEstimate` として `MergeJoinPlan` に渡します。代替案の推定行数は構築後のプランから取得します。
 
 ```cpp
-  if (kind == JoinAlternativeKind::kAnti) {
-    estimated_rows = left.estimated_rows;
-  } else if (kind == JoinAlternativeKind::kSemi) {
-    estimated_rows = std::min(left.estimated_rows, estimated_rows);
-  }
+  const auto estimated_rows = static_cast<double>(merge->EmitRowCount());
 ```
 
 局所コスト（`local_cost`）は、左右の走査コスト $|L| + |R|$ に加え、入力ノードがキー順序を満たしていない場合に挿入される `SortPlan` のソート費用（$N \log_2 N$）を加算した値となります。

@@ -678,6 +678,7 @@ namespace {
 
 std::string MaterializedViewKey(std::string_view name) {
   std::string key(Database::kMaterializedViewKeyPrefix);
+  key.reserve(key.size() + name.size());
   for (char c : name) {
     key.push_back(
         static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
@@ -739,6 +740,7 @@ std::string ViewKey(std::string_view name) {
 // avoids needing a range-scan primitive on the functions tree.
 StatusOr<std::vector<std::string>> DecodeViewIndex(std::string_view record) {
   std::vector<std::string> names;
+  names.reserve(record.size());
   size_t start = 0;
   while (start <= record.size()) {
     const size_t newline = record.find('\n', start);
@@ -1262,10 +1264,16 @@ StatusOr<TableStatistics> Database::GetStatistics(
   // estimate cache thread-local so lookup is lock-free. A rare DDL/ANALYZE
   // race can only use a conservative old estimate for one epoch; execution
   // never depends on statistics for correctness.
+  struct NameHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view name) const noexcept {
+      return std::hash<std::string_view>{}(name);
+    }
+  };
   struct ThreadStatsCache {
     const Database* owner{nullptr};
     uint64_t epoch{0};
-    std::unordered_map<std::string, TableStatistics> entries;
+    std::unordered_map<std::string, TableStatistics, NameHash, std::equal_to<>> entries;
   };
   thread_local ThreadStatsCache cache;
   const uint64_t epoch = SchemaEpoch();
@@ -1274,8 +1282,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
     cache.epoch = epoch;
     cache.entries.clear();
   }
-  const std::string name(schema_name);
-  if (const auto found = cache.entries.find(name);
+  if (const auto found = cache.entries.find(schema_name);
       found != cache.entries.end()) {
     return found->second;
   }
@@ -1289,7 +1296,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
     if (!Deserialize(meta, &ts)) {
       return Status::kCorrupt;
     }
-    cache.entries.emplace(name, ts);
+    cache.entries.emplace(schema_name, ts);
     return ts;
   }
   uint64_t magic = 0;
@@ -1330,7 +1337,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
     columns.push_back(std::move(stats));
   }
   ts.Assign(rows, std::move(columns), layout_generation);
-  cache.entries.emplace(name, ts);
+  cache.entries.emplace(schema_name, ts);
   return ts;
 }
 

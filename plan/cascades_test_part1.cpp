@@ -43,7 +43,9 @@ TEST(CascadesTest, ReconsidersParentAfterChildAlternativeAppears) {
 TEST(CascadesTest, LargeJoinSeedUsesFilteredRowsAndPreservesConnectivity) {
   Memo memo;
   std::vector<std::string> relations;
+  relations.reserve(17);
   std::vector<ConjunctInfo> predicates;
+  predicates.reserve(17);
   std::unordered_map<std::string, double> rows;
   for (int i = 0; i < 17; ++i) {
     const std::string name = "t" + std::to_string(i);
@@ -935,6 +937,7 @@ TEST(CascadesTest, ExploreConvergesOnWideJoinGraphsWithoutPassCap) {
   // (the old implementation capped exploration at 64 passes).
   Memo memo;
   std::vector<std::string> relations;
+  relations.reserve(8);
   for (char name = 'a'; name < 'i'; ++name) {
     relations.emplace_back(1, name);
   }
@@ -951,6 +954,7 @@ TEST(CascadesTest, ExpressionCapDegradesGracefully) {
   // per-group cap allows.
   Memo memo(64);
   std::vector<std::string> relations;
+  relations.reserve(8);
   for (char name = 'a'; name < 'i'; ++name) {
     relations.emplace_back(1, name);
   }

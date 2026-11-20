@@ -555,6 +555,7 @@ bool HavingRejectsNullsOnPaddedSide(
     normalized_selects.push_back(std::move(norm));
   }
   std::vector<Expression> normalized_groups;
+  normalized_groups.reserve(statement.GroupBy().size());
   if (!statement.IsGroupAll()) {
     for (const Expression& gk : statement.GroupBy()) {
       Expression norm = normalize(gk, true);
@@ -572,6 +573,7 @@ bool HavingRejectsNullsOnPaddedSide(
   inspect_expr(normalized_having);
 
   std::vector<Expression> normalized_orders;
+  normalized_orders.reserve(statement.OrderBy().size());
   for (const auto& term : statement.OrderBy()) {
     Expression norm = normalize(term.expression, true);
     if (!norm) {
@@ -648,7 +650,9 @@ bool ReduceOuterJoins(SelectStatement* statement, TransactionContext* ctx) {
     return source.alias.empty() ? source.table : source.alias;
   };
   std::vector<std::shared_ptr<Table>> table_holders;
+  table_holders.reserve(sources.size());
   std::vector<std::pair<std::string, const Schema*>> catalog_rels;
+  catalog_rels.reserve(sources.size());
   bool catalog_complete = ctx != nullptr;
   if (ctx != nullptr) {
     for (const SelectSource& src : sources) {
@@ -689,6 +693,7 @@ bool ReduceOuterJoins(SelectStatement* statement, TransactionContext* ctx) {
       continue;
     }
     std::unordered_set<std::string> prefix;
+    prefix.reserve(i);
     for (size_t j = 0; j < i; ++j) {
       const std::string name = source_name(sources[j]);
       if (!name.empty()) {

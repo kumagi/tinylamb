@@ -59,6 +59,19 @@ class IndexSkipScanPlan final : public PlanBase {
       const std::vector<std::optional<bool>>& nulls_first) const override {
     return inner_->IsOrderedBy(expressions, ascending, nulls_first);
   }
+  [[nodiscard]] bool EnforcesLimit(size_t limit_count,
+                                   size_t limit_offset) const override {
+    return inner_->EnforcesLimit(limit_count, limit_offset);
+  }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return inner_->EnforcesDistinct();
+  }
+  [[nodiscard]] Collation OrderCollation() const override {
+    return inner_->OrderCollation();
+  }
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return inner_->OrderIsMeasured();
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

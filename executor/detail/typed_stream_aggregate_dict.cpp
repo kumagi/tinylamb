@@ -331,6 +331,7 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
     return std::optional<Relation>{};
   }
   std::vector<const int64_t*> keys;
+  keys.reserve(plan.key_offsets.size());
   for (const auto offset : plan.key_offsets) {
     const auto& column_schema = schema.GetColumn(offset);
     const slot_t column = projection.empty() ? offset : projection[offset];
@@ -343,6 +344,7 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
     keys.push_back(store.integer_columns[column].data());
   }
   std::vector<const int64_t*> inputs;
+  inputs.reserve(plan.aggregates.size());
   std::vector<size_t> slots(plan.aggregates.size(), SIZE_MAX);
   for (size_t a = 0; a < plan.aggregates.size(); ++a) {
     const auto& input = plan.aggregates[a];
@@ -359,6 +361,7 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
   }
   QueryMemoryCharge filter_charge;
   std::vector<EncodedDictionaryPredicate> filters;
+  filters.reserve(plan.filter_compares.size());
   for (const auto& filter : plan.filter_compares) {
     auto compiled =
         CompileDictionaryPredicate(store, filter, projection, filter_charge);
@@ -605,6 +608,7 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
   }
   for (const auto& candidate : retained) {
     std::vector<Value> values;
+    values.reserve(plan.emit_items.size());
     for (const auto& item : plan.emit_items) {
       if (item.constant) {
         values.push_back(*item.constant);
@@ -756,6 +760,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
   std::vector<bool> key_arguments(plan.aggregates.size(), false);
   const LSTableColumnDictionary* distinct_dictionary = nullptr;
   std::vector<const int64_t*> numeric_inputs;
+  numeric_inputs.reserve(plan.aggregates.size());
   std::vector<size_t> numeric_slots(plan.aggregates.size(), SIZE_MAX);
   for (size_t i = 0; i < plan.aggregates.size(); ++i) {
     const auto& input = plan.aggregates[i];
@@ -942,6 +947,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
   };
   std::vector<uint8_t> allowed(domain, 1);
   std::vector<TypedFilterCompare> filters;
+  filters.reserve(plan.filter_compares.size());
   for (const auto& compare : plan.filter_compares) {
     if (compare.string_payload && column_at(compare.left) == key_column) {
       for (size_t code = 0; code < null_code; ++code) {
@@ -962,6 +968,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
     }
   }
   std::vector<EncodedDictionaryPredicate> encoded_filters;
+  encoded_filters.reserve(filters.size());
   bool all_encoded = true;
   for (const auto& compare : filters) {
     auto encoded = CompileDictionaryPredicate(store, compare, {}, charge);
@@ -1100,6 +1107,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
       return;
     }
     std::vector<const TypedFilterCompare*> remaining;
+    remaining.reserve(filters.size());
     for (size_t b = store.blocks.size() * worker / workers;
          b < store.blocks.size() * (worker + 1) / workers; ++b) {
       const auto& block = store.blocks[b];
@@ -1280,6 +1288,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
         }
         std::ranges::sort(samples);
         std::vector<uint64_t> cuts;
+        cuts.reserve(workers - 1);
         for (size_t i = 1; i < workers; ++i) {
           cuts.push_back(
               samples.empty() ? 0 : samples[samples.size() * i / workers]);
@@ -1685,6 +1694,7 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
     return std::optional<Relation>{};
   }
   std::vector<const int64_t*> numeric_inputs;
+  numeric_inputs.reserve(plan.aggregates.size());
   std::vector<size_t> numeric_slots(plan.aggregates.size(), SIZE_MAX);
   for (size_t i = 0; i < plan.aggregates.size(); ++i) {
     const auto& input = plan.aggregates[i];
@@ -1899,6 +1909,7 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
     }
   }
   std::vector<EncodedDictionaryPredicate> filters;
+  filters.reserve(plan.filter_compares.size());
   for (const auto& filter : plan.filter_compares) {
     auto compiled =
         CompileDictionaryPredicate(store, filter, projection, transform_charge);
@@ -2435,12 +2446,16 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryExpressions(
     const std::vector<const AggregateExpression*>& aggregates,
     const std::vector<Expression>& predicates, const CteMap& ctes) {
   std::vector<Expression> columns;
+  columns.reserve(statement.GroupBy().size());
   std::vector<size_t> offsets;
+  offsets.reserve(statement.GroupBy().size());
   std::vector<bool> computed;
+  computed.reserve(statement.GroupBy().size());
   bool any_computed = false;
   bool any_scalar = false;
   bool any_case = false;
   std::vector<std::optional<DictionaryCaseInput>> cases;
+  cases.reserve(statement.GroupBy().size());
   for (const auto& key : statement.GroupBy()) {
     const bool is_computed = key && key->Type() != TypeTag::kColumnValue;
     Expression column;
@@ -3181,6 +3196,7 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
     // finalizer. Every admitted argument is non-throwing after key evaluation,
     // and the exact length bound above covers every complete AVG group.
     std::vector<TypedAggregateInput> inputs;
+    inputs.reserve(aggregates.size());
     for (const auto* aggregate : aggregates) {
       TypedAggregateInput input;
       input.aggregate = aggregate;

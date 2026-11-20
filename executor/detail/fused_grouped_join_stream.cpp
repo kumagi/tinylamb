@@ -149,8 +149,11 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     return decline();
   }
   std::vector<Expression> predicates;
+  predicates.reserve(all_predicates.size());
   std::vector<Expression> probe_local_predicates;
+  probe_local_predicates.reserve(all_predicates.size());
   std::vector<Expression> build_local_predicates;
+  build_local_predicates.reserve(all_predicates.size());
   for (const Expression& pred : all_predicates) {
     const std::vector<PredicateInfo> analyzed =
         AnalyzePredicates(pred, schemas);
@@ -177,6 +180,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     int64_t constant{0};
   };
   std::vector<BuildIntFilter> build_int_filters;
+  build_int_filters.reserve(build_local_predicates.size());
   for (const Expression& pred : build_local_predicates) {
     std::optional<SimpleComparePredicate> cmp =
         TryCompileSimpleCompare(pred, build_schema);
@@ -214,8 +218,11 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     int64_t constant{0};
   };
   std::vector<ProbeLikeFilter> probe_like_filters;
+  probe_like_filters.reserve(probe_local_predicates.size());
   std::vector<ProbeIntFilter> probe_int_filters;
+  probe_int_filters.reserve(probe_local_predicates.size());
   std::vector<IntegerPeekCompare> probe_int_peeks;
+  probe_int_peeks.reserve(probe_local_predicates.size());
   for (const Expression& pred : probe_local_predicates) {
     if (std::optional<SimpleComparePredicate> cmp =
             TryCompileSimpleCompare(pred, probe_schema);
@@ -601,6 +608,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   bool frequency_fold = true;
   std::optional<size_t> count_probe_col;
   std::vector<size_t> sum_columns;
+  sum_columns.reserve(arguments.size());
   for (size_t a = 0; a < arguments.size(); ++a) {
     if (arguments[a] < 0) {
       continue;
@@ -1545,6 +1553,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   };
   const auto started = std::chrono::steady_clock::now();
   std::vector<std::jthread> threads;
+  threads.reserve(workers);
   try {
     if (!key_counts) {
       for (size_t w = 1; w < workers; ++w) {
@@ -1965,7 +1974,9 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
 
         bool gk_type_uniform_match = true;
         std::vector<BsRfSpec> gk0_rfs_spec;
+        gk0_rfs_spec.reserve(all_rfs.size());
         std::vector<BsRfSpec> other_rfs;
+        other_rfs.reserve(all_rfs.size());
         for (const BsRfSpec& spec : all_rfs) {
           if (spec.full_col == full_gk0 &&
               (spec.type == gk_types[0] || spec.group->RejectsAll())) {
@@ -1989,6 +2000,7 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
           picked_other_idx = 0;
         }
         std::vector<BsRfSpec> extra_rf_specs;
+        extra_rf_specs.reserve(other_rfs.size());
         if (picked_other_idx < other_rfs.size()) {
           full_rf_col = other_rfs[picked_other_idx].full_col;
           active_rf_group = other_rfs[picked_other_idx].group;

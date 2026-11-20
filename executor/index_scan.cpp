@@ -218,6 +218,7 @@ void IndexScan::CompileIntegerPeeks() {
     return;
   }
   std::vector<Expression> residual;
+  residual.reserve(cond_conjuncts_.size());
   for (const Expression& conjunct : cond_conjuncts_) {
     if (auto peek = CompileIntegerPeek(conjunct, schema_)) {
       iter_->integer_peeks_.push_back(*peek);
@@ -402,6 +403,7 @@ bool IndexScan::TrySetProjection(const std::vector<NamedExpression>& columns,
     return false;
   }
   std::vector<slot_t> slots;
+  slots.reserve(columns.size());
   for (const auto& column : columns) {
     if (!column.expression ||
         column.expression->Type() != TypeTag::kColumnValue) {

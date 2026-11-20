@@ -226,6 +226,7 @@ TEST(PostgresServerExtraTest, AuditExplicitWorkerCountRespectsBucketCapacity) {
     std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
     StopGuard stop{&server};
     std::vector<int> clients;
+    clients.reserve(24);
     for (int i = 0; i < 24; ++i) {
       const int client = ConnectClient(server.BoundPort());
       ASSERT_GE(client, 0);
@@ -259,6 +260,7 @@ TEST(PostgresServerExtraTest, PendingDurableRepliesDoNotOccupySqlWorkers) {
             "CREATE TABLE durable_rows (id BIGINT PRIMARY KEY, v BIGINT)")));
     ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(control)), 'I');
     std::vector<int> writers;
+    writers.reserve(8);
     for (int i = 0; i < 8; ++i) {
       writers.push_back(ConnectClient(server.BoundPort()));
       ASSERT_GE(writers.back(), 0);
@@ -553,6 +555,7 @@ TEST(PostgresServerExtraTest, DistinctKeyChurnKeepsOtherSessionsIndependent) {
     std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
     StopGuard stop{&server};
     std::vector<int> clients;
+    clients.reserve(16);
     for (int i = 0; i < 16; ++i) {
       clients.push_back(ConnectClient(server.BoundPort()));
       ASSERT_GE(clients.back(), 0);
@@ -1347,6 +1350,7 @@ TEST(PostgresServerExtraTest, CompletionBurstsKeepEveryReplyAndCommitBarrier) {
       QueryMessage("CREATE TABLE bursts (k INT64 PRIMARY KEY, v INT64)")));
   ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(admin)), 'I');
   std::vector<int> clients;
+  clients.reserve(24);
   for (int i = 0; i < 24; ++i) {
     ASSERT_TRUE(SendAll(admin, QueryMessage("INSERT INTO bursts VALUES (" +
                                             std::to_string(i) + ",0)")));

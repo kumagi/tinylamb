@@ -1385,7 +1385,7 @@ StatusOr<std::optional<Relation>> BuildScalarDirectOutputChecked(
   output_columns.reserve(stmt.SelectList().size());
   for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
     Column col(ProjectionName(stmt.SelectList()[i], i),
-               ValueTypeOf(row_values[i]));
+               row_values[i].IsNull() ? ValueTypeFromTypeTag(stmt.SelectList()[i].expression->ResultType(qualified_schema).GetType()) : ValueTypeOf(row_values[i]));
     col.SetUnsigned(row_values[i].IsUnsigned());
     output_columns.push_back(std::move(col));
   }
@@ -2460,6 +2460,7 @@ StatusOr<std::optional<Relation>> TryRunFusedLinearIntSums(
   std::vector<Term> terms;
   terms.reserve(bindings.size());
   std::vector<ColGroup> groups;
+  groups.reserve(bindings.size());
   std::vector<int> col_to_group(store.column_has_null.size(), -1);
   std::vector<uint8_t> agg_bind_cols(store.column_has_null.size(), 0);
 
@@ -4189,7 +4190,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   output_columns.reserve(stmt.SelectList().size());
   for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
     output_columns.emplace_back(ProjectionName(stmt.SelectList()[i], i),
-                                ValueType::kNull);
+                                ValueTypeFromTypeTag(stmt.SelectList()[i].expression->ResultType(qualified_schema).GetType()));
   }
   Relation output(runtime);
   size_t total_out_rows = 0;
@@ -4206,6 +4207,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   }
   if (!output.rows.empty()) {
     for (size_t i = 0; i < output_columns.size(); ++i) {
+      if (output.rows[0][i].IsNull()) { continue; }
       output_columns[i] =
           Column(output_columns[i].Name(), ValueTypeOf(output.rows[0][i]));
       output_columns[i].SetUnsigned(output.rows[0][i].IsUnsigned());
@@ -5852,8 +5854,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   };
   bool fast_dict_double_agg = false;
   std::vector<FastDictDoubleTerm> fast_dict_terms;
+  fast_dict_terms.reserve(plan.aggregates.size());
   std::vector<std::pair<size_t, size_t>> fast_dict_dup_aggs;
+  fast_dict_dup_aggs.reserve(plan.aggregates.size());
   std::vector<std::pair<slot_t, bool>> fast_empty_filters;
+  fast_empty_filters.reserve(plan.filter_compares.size());
   bool all_fast_dict_filters_covered = use_direct_lstable;
   if (use_direct_lstable) {
     for (size_t fi = 0; fi < plan.filter_compares.size(); ++fi) {
@@ -6297,6 +6302,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         if (arena != nullptr) {
           const size_t stride = arena->stride;
           std::vector<Value> fallback_row_values;
+          fallback_row_values.reserve(stride);
           constexpr size_t kArenaPrefetchDistance = 8;
           for (size_t index = begin; index < end; ++index) {
             if (worker_errors[worker] != Status::kSuccess) {
@@ -9639,6 +9645,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
     };
     std::vector<std::jthread> emit_threads;
+    emit_threads.reserve(worker_count - 1);
     for (size_t w = 1; w < worker_count; ++w) {
       try {
         emit_threads.emplace_back([&, w] { emit_worker(w); });
@@ -9898,6 +9905,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     size_t sequence{0};
   };
   std::vector<KeyedRow> sortable;
+  sortable.reserve(bounded ? std::min(topn_capacity, merged.GroupCount())
+                           : merged.GroupCount());
   const auto precedes = [&plan](const KeyedRow& left, const KeyedRow& right) {
     for (size_t i = 0; i < plan.order_items.size(); ++i) {
       const Value& a = left.keys[i];

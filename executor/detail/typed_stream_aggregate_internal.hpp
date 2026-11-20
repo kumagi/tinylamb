@@ -85,6 +85,9 @@
 
 namespace tinylamb::relational_detail {
 
+ValueType ValueTypeFromTypeTag(TypeTag tag);
+
+
 // Chunked storage for the flat per-group accumulator states.  A plain
 // std::vector<AggregateAccumulator> reallocates on geometric growth, and the
 // realloc transient (old buffer + new buffer live together) peaks at ~3x the

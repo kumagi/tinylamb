@@ -55,6 +55,7 @@ Status CoerceElementsToDeclaredType(Value* array_val) {
     return Status::kSuccess;
   }
   std::vector<Value> coerced;
+  coerced.reserve(array_val->ArrayElements().size());
   bool changed = false;
   for (const Value& element : array_val->ArrayElements()) {
     if (element.IsNull() || element.type != ValueType::kVarChar) {

@@ -21,6 +21,7 @@
 
 #include "common/exception_status.hpp"
 #include "table/pax_chunk/pax_chunk.hpp"
+#include "common/parallel_work.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
 namespace tinylamb {
@@ -984,16 +985,6 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
   const uint16_t rc = footer_.row_counts[g];
   if (rc == 0) {
     return;  // every scheme below writes out[0] unconditionally
-  }
-  if (decoded_int_cache_ready_ &&
-      static_cast<size_t>(off_idx) + 1 < decoded_int_offsets_.size() &&
-      decoded_int_offsets_[off_idx + 1] > decoded_int_offsets_[off_idx]) {
-    const size_t begin = decoded_int_offsets_[off_idx];
-    if (begin + rc <= decoded_int_cache_.size()) {
-      std::memcpy(out, decoded_int_cache_.data() + begin,
-                  static_cast<size_t>(rc) * sizeof(int64_t));
-      return;
-    }
   }
   // Offset-VALUE validation: the array checks above only prove the entry
   // exists; a hostile value (e.g. 0xFFFFFFFF) must not form the pointer.
@@ -4903,8 +4894,6 @@ StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
     nthreads = std::max(nthreads, 1);
     // Persistent pool: threads are spawned ONCE and reused across all sweeps
     // (re-spawning per sweep would dominate the cost for small row groups).
-    std::vector<std::thread> ths;
-    ths.reserve(static_cast<size_t>(nthreads));
     std::vector<ScanResult> res(static_cast<size_t>(nthreads));
     // DecodeInt64ColumnRg throws std::out_of_range on hostile offsets; an
     // exception escaping a std::thread invocable calls std::terminate, so
@@ -4913,8 +4902,7 @@ StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
     // on the caller's thread after the join.
     std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
                                       Status::kSuccess);
-    for (int t = 0; t < nthreads; ++t) {
-      ths.emplace_back([&, t]() {
+    RETURN_IF_FAIL(RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
         try {
           for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
             for (auto g = static_cast<uint32_t>(t); g < rg;
@@ -4926,11 +4914,7 @@ StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
           worker_errors[static_cast<size_t>(t)] =
               StatusFromCurrentException("pax chunk scan worker failed");
         }
-      });
-    }
-    for (auto& th : ths) {
-      th.join();
-    }
+    }));
     for (const Status& worker_status : worker_errors) {
       if (worker_status != Status::kSuccess) {
         return worker_status;
@@ -5408,13 +5392,10 @@ StatusOr<ScanResult> VectorizedScanColumnInList(
     // Same threading contract as VectorizedScanColumn: per-worker result
     // slots and a per-worker exception_ptr (a shared slot written by two
     // simultaneous throwers would itself race).
-    std::vector<std::thread> ths;
-    ths.reserve(static_cast<size_t>(nthreads));
     std::vector<ScanResult> res(static_cast<size_t>(nthreads));
     std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
                                       Status::kSuccess);
-    for (int t = 0; t < nthreads; ++t) {
-      ths.emplace_back([&, t]() {
+    RETURN_IF_FAIL(RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
         try {
           for (auto g = static_cast<uint32_t>(t); g < rg;
                g += static_cast<uint32_t>(nthreads)) {
@@ -5424,11 +5405,7 @@ StatusOr<ScanResult> VectorizedScanColumnInList(
           worker_errors[static_cast<size_t>(t)] =
               StatusFromCurrentException("pax chunk scan worker failed");
         }
-      });
-    }
-    for (auto& th : ths) {
-      th.join();
-    }
+    }));
     for (const Status& worker_status : worker_errors) {
       if (worker_status != Status::kSuccess) {
         return worker_status;
@@ -8166,6 +8143,7 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
     return sv;
   }
   std::vector<slot_t> pcols;
+  pcols.reserve(preds.size());
   for (const auto& p : preds) {
     if (std::find(pcols.begin(), pcols.end(), p.col) == pcols.end()) {
       pcols.push_back(p.col);
@@ -8527,8 +8505,6 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
     }
     nthreads = std::min(nthreads, static_cast<int>(rg));
     nthreads = std::max(nthreads, 1);
-    std::vector<std::thread> ths;
-    ths.reserve(static_cast<size_t>(nthreads));
     std::vector<AggResult> res(static_cast<size_t>(nthreads));
     // Same contract as VectorizedScanColumn: decode errors on hostile
     // footers surface as exceptions; catch into the worker's own slot (no
@@ -8537,8 +8513,7 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
     // std::terminate.
     std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
                                       Status::kSuccess);
-    for (int t = 0; t < nthreads; ++t) {
-      ths.emplace_back([&, t]() {
+    RETURN_IF_FAIL(RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
         try {
           // One decode scratch per worker: the term buffers are reused
           // across the row groups this worker visits.
@@ -8554,11 +8529,7 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
           worker_errors[static_cast<size_t>(t)] =
               StatusFromCurrentException("pax chunk scan worker failed");
         }
-      });
-    }
-    for (auto& th : ths) {
-      th.join();
-    }
+    }));
     for (const Status& worker_status : worker_errors) {
       if (worker_status != Status::kSuccess) {
         return worker_status;

@@ -83,6 +83,7 @@ bool IsAscending(const std::vector<int64_t>& values) {
 
 std::string InsertRows(std::string_view table, int64_t first, int64_t last) {
   std::string sql = "INSERT INTO " + std::string(table) + " (id, tag) VALUES ";
+  sql.reserve(last - first);
   for (int64_t i = first; i < last; ++i) {
     if (i > first) {
       sql += ", ";
@@ -387,6 +388,7 @@ TEST_F(SqlClusteredOrderTest, NullableUniqueKeyNeverClaimsAnOrder) {
   RunSql(setup, *database_,
          "CREATE TABLE nullable_key (id INT64, tag STRING(MAX));");
   std::string values;
+  values.reserve(20);
   for (int64_t i = 0; i < 20; ++i) {
     if (i > 0) {
       values += ", ";

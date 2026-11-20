@@ -174,7 +174,7 @@ TEST_F(FragmentAuditTest, TopKPreservesRowIdentity) {
   ASSERT_TRUE(result.HasValue());
   EXPECT_TRUE(result.Value().rejected);
 }
-TEST_F(FragmentAuditTest, SumWrapsWithoutSignedOverflow) {
+TEST_F(FragmentAuditTest, SumRejectsSignedOverflow) {
   const Schema schema("sums", {Column(ColumnName{"", "k"}, ValueType::kInt64),
                                Column(ColumnName{"", "v"}, ValueType::kInt64)});
   std::vector<Row> rows{Row({Value(1), Value(INT64_MAX)}),
@@ -186,12 +186,10 @@ TEST_F(FragmentAuditTest, SumWrapsWithoutSignedOverflow) {
   fragment.aggregate =
       Aggregate{.kind = AggregateKind::kSum, .col = 1, .coeff = 2, .terms = {}};
   auto result = Execute(Runtime::kNative, {artifact}, fragment, schema);
-  ASSERT_TRUE(result.HasValue());
-  EXPECT_EQ(result.Value().scalar_value, -4);
+  EXPECT_EQ(result.GetStatus(), Status::kIsInfinity);
   fragment.aggregate->terms = {{.coeff = 2, .cols = {1, 1, 1, 1}}};
   result = Execute(Runtime::kNative, {artifact}, fragment, schema);
-  ASSERT_TRUE(result.HasValue());
-  EXPECT_EQ(result.Value().scalar_value, 4);
+  EXPECT_EQ(result.GetStatus(), Status::kIsInfinity);
 }
 
 TEST_F(FragmentAuditTest, GroupAggregateHonorsAccessMultiplierAndGeneration) {

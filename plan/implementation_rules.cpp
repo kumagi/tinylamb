@@ -333,7 +333,8 @@ std::optional<std::pair<std::string, std::string>> LikePrefixBounds(
 // CTE inline / derived flattening, so guard these walks explicitly.
 constexpr size_t kMaxImplementationRuleDepth = 512;
 thread_local size_t tls_impl_rule_depth = 0;
-struct ImplementationRuleDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+struct
+    ImplementationRuleDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
   bool entered{false};
   ImplementationRuleDepthGuard() {
     if (tls_impl_rule_depth < kMaxImplementationRuleDepth) {
@@ -469,6 +470,7 @@ double EstimateDistinctRows(const Plan& input,
   const Schema& schema = input->GetSchema();
   const TableStatistics& statistics = input->GetStats();
   std::vector<size_t> offsets;
+  offsets.reserve(columns.size());
   for (const Expression& column : columns) {
     if (!column || column->Type() != TypeTag::kColumnValue) {
       return rows;
@@ -512,6 +514,7 @@ Plan BuildIndexScan(const Table& table, const Index& index,
     touched.merge(item.expression->TouchedColumns());
   }
   std::unordered_set<slot_t> touched_offsets;
+  touched_offsets.reserve(touched.size());
   for (const ColumnName& column : touched) {
     const int offset = table.GetSchema().Offset(column);
     if (offset >= 0) {
@@ -699,6 +702,7 @@ std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
       }
     }
     std::vector<Value> prefix;
+    prefix.reserve(index.sc_.key_.size());
     for (slot_t slot : index.sc_.key_) {
       const auto value = equalities.find(slot);
       if (value == equalities.end()) {
@@ -811,6 +815,7 @@ std::vector<PlanAlternative> ScanAlternatives(
       !filter || (filter->Type() == TypeTag::kConstantValue &&
                   filter->AsConstantValue().GetValue().Truthy());
   std::vector<NamedExpression> fallback_select;
+  fallback_select.reserve(schema.ColumnCount());
   if (const auto found = context.scan_projections.find(relation);
       found != context.scan_projections.end()) {
     // An empty required-column list is meaningful: queries such as
@@ -832,9 +837,10 @@ std::vector<PlanAlternative> ScanAlternatives(
   const double filter_selectivity = Selectivity(statistics, schema, filter);
 
   // A descending leading ORDER BY key is deliverable natively: the LSM index
-  // iterator walks the range backwards with a stable leaf cache.  Offer a reverse twin only when the root
-  // ordering actually asks for it so unordered queries keep a stable
-  // candidate set (the forward twin is always emitted first).
+  // iterator walks the range backwards with a stable leaf cache.  Offer a
+  // reverse twin only when the root ordering actually asks for it so unordered
+  // queries keep a stable candidate set (the forward twin is always emitted
+  // first).
   const bool wants_descending = [&] {
     if (required.ordering.empty()) {
       return false;
@@ -889,6 +895,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         const ValueType column_type =
             schema.GetColumn(static_cast<size_t>(offset)).Type();
         std::vector<Value> points;
+        points.reserve(in.list_.size());
         bool indexable = true;
         for (const Expression& item : in.list_) {
           const Value& point = item->AsConstantValue().GetValue();
@@ -1086,7 +1093,9 @@ std::vector<PlanAlternative> ScanAlternatives(
         and_bitmap_built = true;
         // AND: every independent indexed predicate contributes one bitmap.
         std::vector<BitmapIndexRange> and_ranges;
+        and_ranges.reserve(table.IndexCount());
         std::unordered_set<slot_t> seen_leading_slots;
+        seen_leading_slots.reserve(table.IndexCount());
         for (size_t other_offset = 0; other_offset < table.IndexCount();
              ++other_offset) {
           const Index& other = table.GetIndex(other_offset);
@@ -1136,6 +1145,7 @@ std::vector<PlanAlternative> ScanAlternatives(
           }
           const auto disjuncts = relational_detail::SplitDisjuncts(disjunction);
           std::vector<BitmapIndexRange> or_ranges;
+          or_ranges.reserve(disjuncts.size());
           for (const Expression& disjunct : disjuncts) {
             const auto disjunct_ranges = ComparisonRanges(disjunct, schema);
             const auto found = disjunct_ranges.find(index.sc_.key_.front());
@@ -1232,6 +1242,7 @@ std::vector<PlanAlternative> ScanAlternatives(
       // correctness independent of bound construction.
       size_t point_key_offset = 0;
       std::vector<Value> equality_prefix_values;
+      equality_prefix_values.reserve(index.sc_.key_.size());
       while (point_key_offset < index.sc_.key_.size()) {
         const slot_t slot = index.sc_.key_[point_key_offset];
         if (point_sets.contains(slot)) {
@@ -1301,12 +1312,16 @@ std::vector<PlanAlternative> ScanAlternatives(
       }
 
       std::vector<Value> begin_key;
+      begin_key.reserve(index.sc_.key_.size());
       std::vector<Value> end_key;
+      end_key.reserve(index.sc_.key_.size());
       std::unordered_set<slot_t> consumed;
+      consumed.reserve(index.sc_.key_.size());
       // Slots fully pinned by equality. Only these are provably exact in the
       // scan output. Range-bound slots still need the scan's residual check
       // and contribute the range I/O penalty below.
       std::unordered_set<slot_t> equality_slots;
+      equality_slots.reserve(index.sc_.key_.size());
       size_t equality_prefix = 0;
       // Key construction contract: begin/end vectors may differ in length
       // beyond an equality prefix. EncodeParts encodes begin verbatim while
@@ -1359,6 +1374,7 @@ std::vector<PlanAlternative> ScanAlternatives(
       }
 
       std::vector<ColumnName> provided_order;
+      provided_order.reserve(index.sc_.key_.size() - equality_prefix);
       for (size_t key = equality_prefix; key < index.sc_.key_.size(); ++key) {
         provided_order.push_back(schema.GetColumn(index.sc_.key_[key]).Name());
       }
@@ -1475,7 +1491,9 @@ std::vector<PlanAlternative> ScanAlternatives(
       // range on a non-retained index (a retained entry is not the committed
       // image the covering read serves).
       std::vector<BitmapIndexRange> participants;
+      participants.reserve(table.IndexCount());
       std::unordered_set<slot_t> seen_leading;
+      seen_leading.reserve(table.IndexCount());
       for (size_t index_offset = 0; index_offset < table.IndexCount();
            ++index_offset) {
         const Index& candidate = table.GetIndex(index_offset);
@@ -1502,8 +1520,10 @@ std::vector<PlanAlternative> ScanAlternatives(
       }
       // Greedy minimal cover over the touched columns.
       std::vector<BitmapIndexRange> chosen;
+      chosen.reserve(participants.size());
       {
         std::unordered_set<slot_t> covered;
+        covered.reserve(touched.size());
         std::vector<bool> used(participants.size(), false);
         while (!Covered(covered, touched)) {
           size_t best = participants.size();
@@ -1546,6 +1566,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         pruned = false;
         for (size_t i = 0; i < chosen.size() && !pruned; ++i) {
           std::unordered_set<slot_t> others;
+          others.reserve(touched.size());
           for (size_t j = 0; j < chosen.size(); ++j) {
             if (i == j) {
               continue;
@@ -1612,8 +1633,9 @@ std::vector<PlanAlternative> ScanAlternatives(
         CanPushLimitIntoFullScan(filter, required, context)
             ? required.limit_hint
             : std::numeric_limits<size_t>::max();
-    // Extract integer peek-compare predicates from the filter so the scan iterator
-    // can reject rows at the raw-byte level before full deserialization.
+    // Extract integer peek-compare predicates from the filter so the scan
+    // iterator can reject rows at the raw-byte level before full
+    // deserialization.
     relational_detail::CompiledScanFilter peek_filter;
     if (filter) {
       const std::vector<Expression> conjuncts = SplitConjuncts(filter);
@@ -1644,6 +1666,7 @@ std::vector<PlanAlternative> ScanAlternatives(
     // aligned; DML sources (require_row_position maps to lock_rows) and
     // peek-compare scans keep the previous shapes.
     std::vector<slot_t> scan_slots;
+    scan_slots.reserve(fallback_select.size());
     // Decode-floor hatch (default OFF): narrowing only pays on plans that
     // execute through Cascades cores (the bridge route); the default
     // relational route prunes scan columns itself, and under plan feedback
@@ -2288,7 +2311,9 @@ std::vector<PlanAlternative> JoinAlternatives(
   }
 
   std::vector<ColumnName> left_columns;
+  left_columns.reserve(equalities.size());
   std::vector<ColumnName> right_columns;
+  right_columns.reserve(equalities.size());
   for (const auto& [left_column, right_column] : equalities) {
     left_columns.push_back(left_column);
     right_columns.push_back(right_column);
@@ -2500,6 +2525,7 @@ std::vector<PlanAlternative> JoinAlternatives(
         // of these routes.
         std::vector<Expression> residual_pool = all_conjuncts;
         std::unordered_set<std::string> pooled;
+        pooled.reserve(all_conjuncts.size());
         for (const Expression& conjunct : all_conjuncts) {
           pooled.insert(conjunct->ToString());
         }
@@ -2586,9 +2612,10 @@ std::vector<PlanAlternative> JoinAlternatives(
               right_physical, *stats_it->second, declared_output, index_rows);
           bool range_adopted = false;
           for (const LookupRangeCandidate& range : ranges) {
-            if (static_cast<ProductPlan&>(*join).SetLookupRange(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
-                    prefix_len, range.left_column, range.right_physical,
-                    range.operation)) {
+            if (static_cast<ProductPlan&>(*join)
+                    .SetLookupRange(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+                        prefix_len, range.left_column, range.right_physical,
+                        range.operation)) {
               range_adopted = true;
               enforced.insert(range.conjunct->ToString());
             }
@@ -2600,6 +2627,7 @@ std::vector<PlanAlternative> JoinAlternatives(
           // rejected and the inner relation's whole filter all end up: the
           // probe over-fetches and the predicate decides the rows.
           std::vector<Expression> lookup_residual;
+          lookup_residual.reserve(residual_pool.size());
           for (const Expression& conjunct : residual_pool) {
             const std::string printed = conjunct->ToString();
             if (enforced.contains(printed) || pushed.contains(printed)) {
@@ -2751,7 +2779,9 @@ std::vector<PlanAlternative> LateMaterializationAlternative(
     return {};
   }
   std::vector<ColumnName> left_columns;
+  left_columns.reserve(equalities.size());
   std::vector<ColumnName> right_columns;
+  right_columns.reserve(equalities.size());
   for (const auto& [left_column, right_column] : equalities) {
     left_columns.push_back(left_column);
     right_columns.push_back(right_column);
@@ -3155,6 +3185,7 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     return {};
   }
   std::unordered_set<std::string> equalities;
+  equalities.reserve(equality_expressions.size());
   for (const Expression& expression : equality_expressions) {
     equalities.insert(expression->ToString());
   }
@@ -3677,8 +3708,9 @@ Expression FoldAntiJoinColumnsToNull(
     }
     if (col_type == ValueType::kNull) {
       for (const auto& [name, table] : context.tables) {
-        if (!table) { continue;
-}
+        if (!table) {
+          continue;
+        }
         const Schema& schema = table->GetSchema();
         const int off = schema.Offset(ColumnName("", col.name));
         if (off >= 0) {
@@ -4441,8 +4473,11 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           }
           for (size_t count = prepared->keys.size() - 1; count > 0; --count) {
             std::vector<Expression> expressions;
+            expressions.reserve(count);
             std::vector<bool> directions;
+            directions.reserve(count);
             std::vector<std::optional<bool>> nulls;
+            nulls.reserve(count);
             for (size_t i = 0; i < count; ++i) {
               expressions.push_back(prepared->keys[i].expression);
               directions.push_back(prepared->keys[i].ascending);

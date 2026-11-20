@@ -914,6 +914,7 @@ TEST_F(OptimizerTest, LimitWithOrderedIndexStreamsOnlyTopKRows) {
   // Assert: exactly the first five keys of the ordered range arrive.
   Row row;
   std::vector<int64_t> keys;
+  keys.reserve(5);
   while (executor->Next(&row, nullptr)) {
     keys.push_back(row[0].value.int_value);
   }
@@ -1657,6 +1658,7 @@ TEST_F(OptimizerTest, BandJoinSurvivesJoinCommutativity) {
 
   // The nested-loop mirror: every (a, k) pair with a <= k.
   std::vector<std::pair<int64_t, int64_t>> expected;
+  expected.reserve(9);
   for (const int64_t a : {10, 2, 4}) {
     for (const int64_t k : {1, 3, 5}) {
       if (a <= k) {

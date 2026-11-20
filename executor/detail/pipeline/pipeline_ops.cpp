@@ -99,36 +99,11 @@ StatusOr<bool> RowVectorSource::NextBatch(PipelineContext* /*ctx*/,
   return true;
 }
 
-class FilterOp::FeedAdapter final : public ExecutorBase {
- public:
-  void SetChunk(const DataChunk* chunk) {
-    chunk_ = chunk;
-    fed_ = false;
-  }
-  size_t NextBatch(DataChunk* destination, size_t /*max_rows*/) override {
-    destination->Reset();
-    if (fed_ || chunk_ == nullptr || chunk_->Empty()) {
-      return 0;
-    }
-    fed_ = true;
-    *destination = *chunk_;
-    return destination->Size();
-  }
-  void Dump(std::ostream& output, int indent) const override {
-    output << std::string(static_cast<size_t>(indent), ' ') << "FeedAdapter";
-  }
-
- private:
-  const DataChunk* chunk_{nullptr};
-  bool fed_{false};
-};
-
 FilterOp::FilterOp(Expression predicate, Schema input_schema)
     : predicate_(std::move(predicate)),
       input_schema_(std::move(input_schema)),
-      feed_(std::make_shared<FeedAdapter>()),
       selection_(
-          std::make_unique<Selection>(predicate_, input_schema_, feed_)) {}
+          std::make_unique<Selection>(predicate_, input_schema_, nullptr)) {}
 
 Status FilterOp::Process(PipelineContext* /*ctx*/, const DataChunk& input,
                          DataChunk* output, bool* exhausted) {
@@ -137,11 +112,8 @@ Status FilterOp::Process(PipelineContext* /*ctx*/, const DataChunk& input,
   if (input.Empty()) {
     return Status::kSuccess;
   }
-  feed_->SetChunk(&input);
-  // The feed only exposes the actual input chunk, so asking for a full
-  // 1024-row batch makes the child reserve storage it never fills.
-  const size_t n = std::max<size_t>(input.Size(), 1);
-  selection_->NextBatch(output, n);
+  output->Reset(input_schema_, input.Size());
+  selection_->AppendSelected(input, output);
   if (selection_->GetStatus() != Status::kSuccess) {
     return selection_->GetStatus();
   }
@@ -158,37 +130,12 @@ void FilterOp::DumpExplain(std::ostream& out, int indent) const {
   }
 }
 
-class ProjectOp::FeedAdapter final : public ExecutorBase {
- public:
-  void SetChunk(const DataChunk* chunk) {
-    chunk_ = chunk;
-    fed_ = false;
-  }
-  size_t NextBatch(DataChunk* destination, size_t /*max_rows*/) override {
-    destination->Reset();
-    if (fed_ || chunk_ == nullptr || chunk_->Empty()) {
-      return 0;
-    }
-    fed_ = true;
-    *destination = *chunk_;
-    return destination->Size();
-  }
-  void Dump(std::ostream& output, int indent) const override {
-    output << std::string(static_cast<size_t>(indent), ' ') << "FeedAdapter";
-  }
-
- private:
-  const DataChunk* chunk_{nullptr};
-  bool fed_{false};
-};
-
 ProjectOp::ProjectOp(std::vector<NamedExpression> expressions,
                      Schema input_schema)
     : expressions_(std::move(expressions)),
       input_schema_(std::move(input_schema)),
-      feed_(std::make_shared<FeedAdapter>()),
       projection_(
-          std::make_unique<Projection>(expressions_, input_schema_, feed_)) {}
+          std::make_unique<Projection>(expressions_, input_schema_, nullptr)) {}
 
 Status ProjectOp::Process(PipelineContext* /*ctx*/, const DataChunk& input,
                           DataChunk* output, bool* exhausted) {
@@ -197,11 +144,8 @@ Status ProjectOp::Process(PipelineContext* /*ctx*/, const DataChunk& input,
   if (input.Empty()) {
     return Status::kSuccess;
   }
-  feed_->SetChunk(&input);
-  // The feed only exposes the actual input chunk, so asking for a full
-  // 1024-row batch makes the child reserve storage it never fills.
-  const size_t n = std::max<size_t>(input.Size(), 1);
-  projection_->NextBatch(output, n);
+  output->Reserve(input.Size());
+  projection_->ProjectChunk(input, output);
   if (projection_->GetStatus() != Status::kSuccess) {
     return projection_->GetStatus();
   }

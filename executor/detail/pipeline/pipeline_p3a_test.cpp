@@ -598,6 +598,7 @@ TEST(PipelineP3aTest, OocHashJoinCoversAllKindsSpillAndSkewFallback) {
       Row({Value(int64_t{1}), Value("b1")}),
       Row({Value(int64_t{2}), Value("b2")}),
   };
+  ro_build.reserve(602);
   for (int i = 0; i < 600; ++i) {
     ro_build.push_back(Row({Value(int64_t{100 + i}), Value(std::string(pad))}));
   }
@@ -744,6 +745,7 @@ TEST(PipelineP3aTest,
 
     std::vector<Row> build_rows;
     std::vector<Row> probe_rows;
+    probe_rows.reserve(64);
     for (int64_t i = 0; i < 64; ++i) {
       build_rows.push_back(Row({Value(i), Value(std::string(pad))}));
       probe_rows.push_back(Row({Value(i), Value(std::string(pad))}));

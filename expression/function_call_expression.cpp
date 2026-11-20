@@ -131,6 +131,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
              s[end_digits] <= '9') {
         ++end_digits;
       }
+      if (end_digits == dot + 1) {
+        return false;  // A '.' must be followed by at least one digit.
+      }
       std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
       while (frac_str.size() < 9) {
         frac_str.push_back('0');
@@ -157,6 +160,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       while (end_digits < s.size() && s[end_digits] >= '0' &&
              s[end_digits] <= '9') {
         ++end_digits;
+      }
+      if (end_digits == dot + 1) {
+        return false;  // A '.' must be followed by at least one digit.
       }
       std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
       while (frac_str.size() < 9) {
@@ -390,8 +396,16 @@ bool FormatTimeYieldsEmpty(std::string_view fmt) {
 StatusOr<Value> AddOrSubInterval(const std::string& func_name,
                                  const Value& date,
                                  const IntervalExpression& interval) {
-  const int64_t amount =
-      func_name == "date_sub" ? -interval.Amount() : interval.Amount();
+  int64_t amount = interval.Amount();
+  if (func_name == "date_sub") {
+    // Negating INT64_MIN is signed overflow (UB); unary minus rejects the
+    // same literal in unary_expression.cpp.
+    if (amount == std::numeric_limits<int64_t>::min()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         func_name + " interval amount out of range");
+    }
+    amount = -amount;
+  }
   // Only DATE and VARCHAR carry a parseable operand; for any other type
   // `date.value.varchar_value` overlays the wrong union member and the
   // string_view would hold a garbage pointer/length (fuzz-found SEGV).
@@ -414,41 +428,10 @@ StatusOr<Value> AddOrSubInterval(const std::string& func_name,
 
 // Decodes one proto-text scalar token (`5`, `1.5`, `true`, `"str"`).
 StatusOr<Value> TryProtoTextScalar(std::string_view raw) {
-  while (!raw.empty() &&
-         (std::isspace(static_cast<unsigned char>(raw.front())) != 0)) {
-    raw.remove_prefix(1);
-  }
-  while (!raw.empty() &&
-         (std::isspace(static_cast<unsigned char>(raw.back())) != 0)) {
-    raw.remove_suffix(1);
-  }
-  if (raw.empty() || raw == "null") {
-    return Value();
-  }
-  if (raw == "true") {
-    return Value(int64_t{1});
-  }
-  if (raw == "false") {
-    return Value(int64_t{0});
-  }
-  if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
-    return Value(std::string(raw.substr(1, raw.size() - 2)));
-  }
-  // Parse directly from the string_view; only an unparseable token needs an
-  // owning copy for the returned string value.
-  int64_t as_int = 0;
-  const char* const begin = raw.data();
-  const char* const end = raw.data() + raw.size();
-  auto [ip, iec] = std::from_chars(begin, end, as_int);
-  if (iec == std::errc() && ip == end) {
-    return Value(as_int);
-  }
-  double as_double = 0.0;
-  auto [dp, dec] = std::from_chars(begin, end, as_double);
-  if (dec == std::errc() && dp == end) {
-    return Value(as_double);
-  }
-  return Value(std::string(raw));
+  // Delegate to the interpreter-side decoder: quote/escape handling,
+  // integer-shaped overflow and sign edge cases must never diverge
+  // between this AST shim and DecodeScalarToken again.
+  return DecodeProtoTextScalarToken(raw);
 }
 
 // Minimal proto text-format field extraction: repeated `field: value`
@@ -672,6 +655,7 @@ void AppendUtf8(std::string* output, uint32_t code_point) {
 // yield Unicode code points).
 std::vector<uint32_t> CodePointsOf(std::string_view value) {
   std::vector<uint32_t> out;
+  out.reserve(value.size());
   size_t offset = 0;
   while (offset < value.size()) {
     const auto decoded = DecodeUtf8(value, offset);
@@ -752,6 +736,7 @@ std::string ConvertUnicodeCase(std::string_view value, UnicodeCaseMode mode,
                                std::string_view delimiters,
                                bool has_delimiters) {
   std::vector<uint32_t> delimiter_code_points;
+  delimiter_code_points.reserve(delimiters.size());
   if (has_delimiters) {
     for (size_t offset = 0; offset < delimiters.size();) {
       const auto decoded = DecodeUtf8(delimiters, offset);
@@ -1180,8 +1165,8 @@ StatusOr<Value> FormatFunction(const std::string& name,
         const size_t pad_begin = ZeroPadStart(formatted_item);
         const size_t digits = formatted_item.size() - pad_begin;
         if (std::cmp_less(digits, precision)) {
-          formatted_item.insert(
-              pad_begin, static_cast<size_t>(precision) - digits, '0');
+          formatted_item.insert(pad_begin,
+                                static_cast<size_t>(precision) - digits, '0');
         }
       }
       // Sign ('+' / ' ') and grouping ('\'') flags apply to numeric
@@ -1484,6 +1469,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       std::string b;
     };
     std::vector<Pair> pairs;
+    pairs.reserve(values[0].ArrayElements().size());
     for (const Value& element : values[0].ArrayElements()) {
       if (element.IsNull()) {
         continue;
@@ -1890,6 +1876,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       }
       const std::string mode_text = raw_str(values[1]);
       std::string mode;
+      mode.reserve(mode_text.size());
       for (char c : mode_text) {
         mode.push_back(
             static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
@@ -2229,9 +2216,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], name));
     if (name_view == "log10") {
+      // Mirror the LN guard: x <= 0 is a domain error, not -inf/NaN.
+      if (v <= 0.0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "LOG10 of non-positive number");
+      }
       return Value(std::log10(v));
     }
     if (values.size() == 1) {
+      if (v <= 0.0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "LOG of non-positive number");
+      }
       return Value(std::log(v));
     }
     ASSIGN_OR_RETURN(double, base, to_numeric_double(values[1], "LOG base"));
@@ -2249,6 +2245,17 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     if (v == 1.0 && std::isinf(base)) {
       return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+    // Domain: x > 0 and base > 0 (base == 1 handled above).  Without these
+    // guards LOG(x, 0) returned +-0 and LOG(-1, b) / LOG(x, -b) returned
+    // NaN instead of erroring like LN/SQRT.
+    if (v <= 0.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOG of non-positive number");
+    }
+    if (base <= 0.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOG base must be positive");
     }
     return Value(std::log(v) / std::log(base));
   }
@@ -2542,8 +2549,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // SAFE_DIVIDE suppresses the errors DIVIDE raises: division by zero and
     // overflow of finite operands (1e308 / 1e-308). A non-finite input keeps
     // its IEEE result (SAFE_DIVIDE(0, NaN) is NaN), matching GoogleSQL.
-    if (name_view == "safe_divide" && !std::isfinite(res) &&
-        std::isfinite(l) && std::isfinite(r)) {
+    if (name_view == "safe_divide" && !std::isfinite(res) && std::isfinite(l) &&
+        std::isfinite(r)) {
       return Value();
     }
     return Value(res);
@@ -2746,12 +2753,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value(int64_t{0});
     }
     std::vector<size_t> matches;
+    matches.reserve(s_cps + 1);
     if (position > 0) {
       auto start_cp = static_cast<size_t>(position - 1);
       for (size_t cp = start_cp; cp + t_cps <= s_cps; ++cp) {
         const size_t b_start = s_offsets[cp];
         const size_t b_end = s_offsets[cp + t_cps];
-        if (source.substr(b_start, b_end - b_start) == target) {
+        // compare() avoids materializing a candidate substring per window.
+        if (source.compare(b_start, b_end - b_start, target) == 0) {
           matches.push_back(cp + 1);
         }
       }
@@ -2762,7 +2771,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
           if (static_cast<size_t>(cp) + t_cps <= s_cps) {
             const size_t b_start = s_offsets[static_cast<size_t>(cp)];
             const size_t b_end = s_offsets[static_cast<size_t>(cp) + t_cps];
-            if (source.substr(b_start, b_end - b_start) == target) {
+            if (source.compare(b_start, b_end - b_start, target) == 0) {
               matches.push_back(static_cast<size_t>(cp) + 1);
             }
           }
@@ -2815,6 +2824,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     const size_t needed = static_cast<size_t>(target_len) - total_cps;
     std::string pad_str;
+    pad_str.reserve((needed / pad_cps + 1) * pad.size());
     for (size_t i = 0; i < needed / pad_cps; ++i) {
       pad_str += pad;
     }
@@ -2840,7 +2850,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     const std::string s = raw_str(values[0]);
     const std::string cutset =
-        values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
+        values.size() == 2 ? raw_str(values[1]) : kDefaultTrimCutset;
     // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
@@ -2856,7 +2866,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     const std::string s = raw_str(values[0]);
     const std::string cutset =
-        values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
+        values.size() == 2 ? raw_str(values[1]) : kDefaultTrimCutset;
     // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
@@ -2872,7 +2882,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     const std::string s = raw_str(values[0]);
     const std::string cutset =
-        values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
+        values.size() == 2 ? raw_str(values[1]) : kDefaultTrimCutset;
     // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/false,
@@ -2939,7 +2949,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return false;  // NULL elements never match (GoogleSQL semantics)
       }
       if (v.type == ValueType::kArray) {
-        for (const Value& element : v.ArrayElements()) {  // NOLINT(readability-use-anyofallof)
+        for (const Value& element :
+             v.ArrayElements()) {  // NOLINT(readability-use-anyofallof)
           if (walk(element)) {
             return true;
           }
@@ -3082,6 +3093,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "cannot format array element");
     };
     std::string out;
+    out.reserve(values[0].ArrayElements().size());
     bool first = true;
     for (const Value& element : values[0].ArrayElements()) {
       if (element.IsNull()) {
@@ -3304,7 +3316,17 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "CHR requires an integer argument");
     }
-    const int64_t code = values[0].value.int_value;
+    int64_t code = values[0].value.int_value;
+    if (values[0].IsUnsigned()) {
+      // UINT64 keeps the kInt64 tag; the bit pattern is the true value and
+      // >= 2^63 would otherwise read back as a negative int64.
+      const uint64_t u = static_cast<uint64_t>(code);
+      if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
+        return StatusError(StatusCode::kIsInfinity,
+                           "CHR argument out of range");
+      }
+      code = static_cast<int64_t>(u);
+    }
     std::string res;
     if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
       return StatusError(StatusCode::kIsInfinity, "CHR argument out of range");
@@ -3341,8 +3363,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "TO_CODE_POINTS requires a STRING or BYTES argument");
     }
     std::vector<Value> elements;
+    elements.reserve(values[0].value.varchar_value.size());
     for (const uint32_t cp : CodePointsOf(values[0].value.varchar_value)) {
-      elements.push_back(Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
+      elements.push_back(
+          Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
     }
     return Value::Array(std::move(elements), "INT64");
   }
@@ -3396,6 +3420,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     std::string res;
+    res.reserve(arr.ArrayElements().size());
     for (const Value& elem : arr.ArrayElements()) {
       if (elem.IsNull()) {
         return Value();
@@ -3404,7 +3429,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kInvalidArgument,
                            "CODE_POINTS_TO_STRING requires INT64 elements");
       }
-      const int64_t cp = elem.value.int_value;
+      int64_t cp = elem.value.int_value;
+      if (elem.IsUnsigned()) {
+        // UINT64 elements keep the kInt64 tag; diagnose by the true value
+        // instead of letting >= 2^63 surface as a negative code point.
+        const uint64_t u = static_cast<uint64_t>(cp);
+        if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid code point for CODE_POINTS_TO_STRING: " +
+                                 std::to_string(u));
+        }
+        cp = static_cast<int64_t>(u);
+      }
       if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "invalid code point for CODE_POINTS_TO_STRING: " +
@@ -3442,6 +3478,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     std::string res;
+    res.reserve(arr.ArrayElements().size());
     for (const Value& elem : arr.ArrayElements()) {
       if (elem.IsNull()) {
         return Value();
@@ -3450,7 +3487,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kInvalidArgument,
                            "CODE_POINTS_TO_BYTES requires INT64 elements");
       }
-      const int64_t b = elem.value.int_value;
+      int64_t b = elem.value.int_value;
+      if (elem.IsUnsigned()) {
+        // UINT64 elements keep the kInt64 tag; diagnose by the true value
+        // instead of letting >= 2^63 surface as a negative byte.
+        const uint64_t u = static_cast<uint64_t>(b);
+        if (u > 255) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "invalid byte for CODE_POINTS_TO_BYTES: " + std::to_string(u));
+        }
+        b = static_cast<int64_t>(u);
+      }
       if (b < 0 || b > 255) {
         return StatusError(
             StatusCode::kInvalidArgument,
@@ -3625,6 +3673,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string delim = values.size() == 2 ? raw_str(values[1]) : ",";
     std::vector<Value> elems;
+    elems.reserve(s.size() + 1);
     if (delim.empty()) {
       if (s.empty()) {
         elems.emplace_back(std::string());
@@ -3669,6 +3718,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const int64_t occ = values.size() >= 3 ? to_i64(values[2], 1) : 1;
 
     std::vector<std::string> parts;
+    parts.reserve(str.size() + 1);
     if (delim.empty()) {
       parts.push_back(str);
     } else {
@@ -3708,6 +3758,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     int64_t end_idx =
         std::min(start_idx + len, static_cast<int64_t>(parts.size()));
     std::string res = parts[static_cast<size_t>(start_idx)];
+    res.reserve(static_cast<size_t>(end_idx - start_idx));
     for (int64_t i = start_idx + 1; i < end_idx; ++i) {
       res += delim + parts[static_cast<size_t>(i)];
     }
@@ -3840,8 +3891,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const size_t byte_start = offsets[static_cast<size_t>(pos_arg - 1)];
     try {
       ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      const std::string search_str = s.substr(byte_start);
-      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
+      // Iterate the tail in place: s.substr() used to copy the remainder
+      // of the string once per row before the regex scan.
+      std::sregex_iterator it(s.cbegin() + byte_start, s.cend(), re);
       std::sregex_iterator end;
       for (int64_t current_occ = 1; it != end; ++it, ++current_occ) {
         if (current_occ == occ_arg) {
@@ -3895,6 +3947,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // will number, so character classes and non-capturing groups are skipped).
     std::string plain;
     std::vector<size_t> named_index;
+    named_index.reserve(pat.size());
     {
       size_t group_counter = 0;
       bool in_class = false;
@@ -3956,8 +4009,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const size_t byte_start = offsets[static_cast<size_t>(pos_arg - 1)];
     try {
       ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(plain));
-      const std::string search_str = s.substr(byte_start);
-      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
+      // Iterate the tail in place (see REGEXP_EXTRACT above).
+      std::sregex_iterator it(s.cbegin() + byte_start, s.cend(), re);
       std::sregex_iterator end;
       std::vector<Value> out;
       int64_t current_occ = 0;
@@ -3970,7 +4023,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         entry.reserve(named_index.size());
         for (const size_t gi : named_index) {
           if (gi < it->size() && (*it)[gi].matched) {
-            entry.push_back(Value(it->str(gi)));  // NOLINT(modernize-use-emplace)
+            entry.push_back(
+                Value(it->str(gi)));  // NOLINT(modernize-use-emplace)
           } else {
             entry.push_back(Value());  // NOLINT(modernize-use-emplace)
           }
@@ -4850,9 +4904,21 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "invalid TIMESTAMP: " + raw_str(values[0]));
     }
     auto floor_div = [](platform::Int128 a, platform::Int128 b) -> int64_t {
-      const platform::Int128 q = a / b;
-      return static_cast<int64_t>(((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1
-                                                                         : q);
+      platform::Int128 q = a / b;
+      if ((a % b) != 0 && ((a < 0) != (b < 0))) {
+        --q;
+      }
+      // Proto-text timestamps can land far outside the SQL literal range;
+      // the quotient then exceeds int64. Saturate instead of narrowing.
+      if (q >
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::max())) {
+        return std::numeric_limits<int64_t>::max();
+      }
+      if (q <
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::min())) {
+        return std::numeric_limits<int64_t>::min();
+      }
+      return static_cast<int64_t>(q);
     };
     if (name_view == "unix_date") {
       return Value(floor_div(*nanos, 86400000000000LL));
@@ -5226,7 +5292,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         }
         const uint64_t begin =  // NOLINT(modernize-use-auto)
             static_cast<uint64_t>(values[0].value.int_value);
-        const uint64_t end =  // NOLINT(modernize-use-auto)
+        const uint64_t end =                 // NOLINT(modernize-use-auto)
             static_cast<uint64_t>(           // NOLINT(modernize-use-auto)
                 values[1].value.int_value);  // NOLINT(modernize-use-auto)
         const uint64_t step =                // NOLINT(modernize-use-auto)
@@ -5293,6 +5359,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                            "GENERATE_SERIES generated too many elements");
       }
       std::vector<Value> elements;
+      elements.reserve(static_cast<size_t>(diff / abs_step) + 1);
       for (int64_t current = begin;;) {
         if (elements.size() == kMaxGeneratedElements) {
           return StatusError(StatusCode::kInvalidArgument,
@@ -5535,7 +5602,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
               "unsupported GENERATE_TIMESTAMP_ARRAY step unit: the step must "
               "be DAY or smaller");
         }
-        step_us = parsed.days * kDayMicros + parsed.nanos / 1000;  // NOLINT(readability-math-missing-parentheses)
+        step_us = parsed.days * kDayMicros +
+                  parsed.nanos /
+                      1000;  // NOLINT(readability-math-missing-parentheses)
       }
     }
     if (step_us == 0) {
@@ -5568,12 +5637,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         std::string text(buffer.data());
         if (frac != 0) {
           std::array<char, 12> digits{};
-          std::snprintf(digits.data(), digits.size(), ".%06lld",  // NOLINT(cert-err33-c)
+          std::snprintf(digits.data(), digits.size(),
+                        ".%06lld",  // NOLINT(cert-err33-c)
                         static_cast<long long>(frac));
           text += digits.data();
         }
         text += "+00";
-        elements.push_back(Value(std::move(text)));  // NOLINT(modernize-use-emplace)
+        elements.push_back(
+            Value(std::move(text)));  // NOLINT(modernize-use-emplace)
         if (__builtin_add_overflow(t, step_us, &t)) {
           break;
         }
@@ -5957,11 +6028,78 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
   }
+  if (trimmed.front() == '[' && trimmed.back() == ']') {
+    // JSON array member: struct cells store ARRAY fields as JSON arrays
+    // (TryEncodeStructMemberJson).  Bare `[...]` cannot be a quoted STRING
+    // (writers quote strings), so decode it as an array.  Elements reuse
+    // this same decoder recursively; the declared element type is inferred
+    // from the first non-null element like array literals do.
+    const std::string body = trimmed.substr(1, trimmed.size() - 2);
+    std::vector<Value> elements;
+    std::string element_type;
+    auto note_type = [&](const Value& v) {
+      if (!element_type.empty() || v.IsNull()) {
+        return;
+      }
+      if (v.type == ValueType::kArray) {
+        element_type = "ARRAY<" + v.ArrayElementSqlType() + ">";
+        return;
+      }
+      const std::string_view name = ElementSqlTypeName(v.type);
+      element_type = name.empty() ? "STRING" : std::string(name);
+    };
+    if (TrimJson(body).empty()) {
+      *parsed = Value::Array({}, "STRING");
+      return true;
+    }
+    // Split on top-level commas: quotes and nested brackets shield theirs.
+    std::vector<std::string> items;
+    {
+      int depth = 0;
+      bool quoted = false;
+      bool escaped = false;
+      size_t start = 0;
+      for (size_t i = 0; i <= body.size(); ++i) {
+        const bool at_end = i == body.size();
+        const char c = at_end ? ',' : body[i];
+        if (quoted && !at_end && escaped) {
+          escaped = false;
+        } else if (quoted && !at_end && c == '\\') {
+          escaped = true;
+        } else if (!at_end && c == '"') {
+          quoted = !quoted;
+        } else if (!quoted && !at_end && (c == '[' || c == '{' || c == '(')) {
+          ++depth;
+        } else if (!quoted && !at_end && (c == ']' || c == '}' || c == ')')) {
+          --depth;
+        }
+        if (at_end || (!quoted && depth == 0 && c == ',')) {
+          items.push_back(TrimJson(body.substr(start, i - start)));
+          start = i + 1;
+        }
+      }
+    }
+    for (const std::string& item : items) {
+      Value element;
+      if (item == "null") {
+        element = Value();
+      } else if (!JsonTextToValue(item, &element)) {
+        // Lenient like the scalar arms: undecodable text stays a string.
+        element = Value(std::string(item));
+      }
+      note_type(element);
+      elements.push_back(std::move(element));
+    }
+    if (element_type.empty()) {
+      element_type = "STRING";
+    }
+    *parsed = Value::Array(std::move(elements), std::move(element_type));
+    return true;
+  }
   if (!trimmed.empty() && ((trimmed.front() == '{' && trimmed.back() == '}') ||
-                           (trimmed.front() == '[' && trimmed.back() == ']') ||
                            lowered_head == "array")) {
-    // Objects / bare arrays / canonical ARRAY<T>[...] tokens stay as raw
-    // struct-member text.
+    // Objects / canonical ARRAY<T>[...] tokens stay as raw struct-member
+    // text.
     *parsed = Value(std::string(trimmed));
     return true;
   }
@@ -5979,10 +6117,20 @@ StatusOr<std::string> TryEncodeStructMemberJson(const Value& value) {
       }
       return std::to_string(value.value.int_value);
     case ValueType::kDouble: {
+      const double d = value.value.double_value;
+      // JSON has no NaN/Infinity literals: emit the quoted spellings the
+      // struct-literal encoder (EncodeStructMemberText) uses so both
+      // producers agree and the cell stays parseable JSON.
+      if (std::isnan(d)) {
+        return std::string("\"NaN\"");
+      }
+      if (std::isinf(d)) {
+        return d > 0 ? std::string("\"Infinity\"")
+                     : std::string("\"-Infinity\"");
+      }
       std::array<char, 64> buffer{};
       auto [ptr, ec] =
-          std::to_chars(buffer.data(), buffer.data() + buffer.size(),
-                        value.value.double_value);
+          std::to_chars(buffer.data(), buffer.data() + buffer.size(), d);
       (void)ec;
       return std::string{buffer.data(),
                          static_cast<size_t>(ptr - buffer.data())};
@@ -5991,18 +6139,20 @@ StatusOr<std::string> TryEncodeStructMemberJson(const Value& value) {
       return "\"" + EscapeJsonText(FormatDateDays(value.DateDays())) + "\"";
     case ValueType::kVarChar: {
       std::string text(value.value.varchar_value);
-      // Nested structs and arrays are already JSON-shaped; embed verbatim.
-      if (text.size() >= 2 && ((text.front() == '{' && text.back() == '}') ||
-                               (text.front() == '[' && text.back() == ']'))) {
+      // Nested struct payloads are already JSON-shaped; embed verbatim.
+      // `[...]` text is NOT embedded: a JSON array now decodes back to an
+      // ARRAY member, so a plain string "[1,2]" must stay quoted to keep
+      // its STRING type on read-back.
+      if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
         return text;
       }
       return "\"" + EscapeJsonText(text) + "\"";
     }
-    case ValueType::kArray: {
-      // Match the canonical struct-constructor storage text, which embeds
-      // arrays via Value::AsString(): "ARRAY<INT64>[50, NULL, 52]".
-      return value.AsString();
-    }
+    case ValueType::kArray:
+      // A struct member that is an ARRAY must render as a JSON array;
+      // Value::AsString()'s "ARRAY<INT64>[1, 2]" display text is not JSON
+      // and broke every later struct-field read.
+      return json_text::ToJsonText(value);
     default:
       break;
   }
@@ -6855,8 +7005,9 @@ Status FunctionCallExpression::Validate(EvaluationContext& context,
     }
   }
   // Function registration goes through the abstract context; the production
-  // implementation forwards to Database::GetOrAddFunction. Type check is
-  // still TODO.
+  // implementation forwards to Database::GetOrAddFunction. The static result
+  // type is already resolved by ResultType; argument-type checking still
+  // happens at evaluation time.
   return context.GetOrAddFunction(func_name_, static_cast<int>(args_.size()));
 }
 

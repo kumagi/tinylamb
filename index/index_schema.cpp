@@ -52,6 +52,7 @@ std::ostream& operator<<(std::ostream& o, const IndexMode& mode) {
 
 std::string IndexSchema::GenerateKey(const Row& row) const {
   std::string key;
+  key.reserve(key_.size());
   for (const auto& k : key_) {
     key += row[k].EncodeMemcomparableFormat();
   }

@@ -1099,6 +1099,7 @@ TEST_F(AggregateShapeTest, EveryAlternativeIsExactlyOneStrategy) {
         ApplyAggregationRule(child, {K()});
     ASSERT_GE(alternatives.size(), 2U) << ShapeList(alternatives);
     std::vector<std::string> names;
+    names.reserve(alternatives.size());
     for (const PlanAlternative& alternative : alternatives) {
       const auto plan =
           std::dynamic_pointer_cast<AggregationPlan>(alternative.plan);

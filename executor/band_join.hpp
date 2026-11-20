@@ -13,6 +13,7 @@
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -65,6 +66,7 @@ class BandJoin final : public ExecutorBase {
   size_t left_width_{0};
   size_t right_width_{0};
 
+  QueryMemoryCharge materialized_charge_;
   std::vector<PositionedRow> left_rows_;
   std::vector<PositionedRow> right_rows_;
   std::vector<RightKey> right_keys_;

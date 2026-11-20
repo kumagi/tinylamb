@@ -26,12 +26,31 @@
 namespace tinylamb {
 
 namespace {
-// Smallest/hargest doubles that still convert to int64_t without undefined
+// Smallest/largest doubles that still convert to int64_t without undefined
 // behaviour.  The old ±9.3e18 guards let values in (INT64_MAX, 9.3e18] reach
 // the cast (UBSan: "9.24222e+18 is outside the range of representable values
 // of type 'long'", found by INTERVAL fuzzing).
 constexpr double kInt64MinAsDouble = -9223372036854775808.0;  // -2^63 exact
 constexpr double kInt64MaxExclusive = 9223372036854775808.0;  // 2^63
+
+// Index of a unit name inside a composite "X to Y" range (0=year ..
+// 5=second), or -1. Trailing 's' letters are stripped for the plural
+// spelling, then the name must match EXACTLY: a prefix match would let
+// "yearxyz to month" parse as a year-month range.
+int RangeUnitIndex(std::string_view name) {
+  std::string base(name);
+  while (!base.empty() && base.back() == 's') {
+    base.pop_back();
+  }
+  static constexpr std::array<std::string_view, 6> kNames = {
+      "year", "month", "day", "hour", "minute", "second"};
+  for (int i = 5; i >= 0; --i) {
+    if (base == kNames[static_cast<size_t>(i)]) {
+      return i;
+    }
+  }
+  return -1;
+}
 }  // namespace
 
 namespace {
@@ -201,7 +220,14 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
   std::string s = Trim(text);
   std::string u = ToLower(Trim(unit_str));
   if (s.empty()) {
-    return IntervalValue{};
+    if (u.empty()) {
+      return IntervalValue{};
+    }
+    // An empty amount still owes the unit string a validation pass:
+    // TryParse("", "BOGUS") must not silently become a zero interval.
+    // Parsing "0" routes through every unit check below and yields the
+    // same zero result for a well-formed unit.
+    s = "0";
   }
 
   // Saturate-with-error instead of wrapping: plain int64 arithmetic on
@@ -285,9 +311,9 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       }
       char desig =
           static_cast<char>(std::toupper(static_cast<unsigned char>(s[pos++])));
-      // std::stod raises std::invalid_argument ("." alone) / std::out_of_range
-      // (400-digit runs) on scanner-accepted input; reject through fail
-      // instead of unwinding.
+      // std::from_chars reports failure (errc::invalid_argument on "." alone,
+      // errc::result_out_of_range on 400-digit runs) for scanner-accepted
+      // input; reject through fail instead of unwinding.
       double parsed = 0;
       const char* num_begin = num_str.data();
       const char* num_end = num_begin + num_str.size();
@@ -305,7 +331,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       // literal like P9e300Y must be rejected, not cast to garbage.  from_
       // chars also happily parses "nan"/"inf" spellings, which slip past
       // plain range comparisons.
-      if (!std::isfinite(val) || val <= kInt64MinAsDouble ||
+      if (!std::isfinite(val) || val < kInt64MinAsDouble ||
           val >= kInt64MaxExclusive) {
         return fail_range();
       }
@@ -343,7 +369,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         checked_add(checked_mul(parsed_h, 3600), checked_mul(parsed_min, 60)),
         1000000000LL);
     const double sec_nanos = std::round(parsed_sec * 1000000000.0);
-    if (sec_nanos <= kInt64MinAsDouble || sec_nanos >= kInt64MaxExclusive) {
+    if (sec_nanos < kInt64MinAsDouble || sec_nanos >= kInt64MaxExclusive) {
       return fail_range();
     }
     int64_t tot_nanos =
@@ -530,26 +556,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
   // Explicit unit ranges ("month to hour", "day to second", ...) assign one
   // component per whitespace-separated number starting at the low unit.
   if (u.find(" to ") != std::string::npos) {
-    static constexpr std::array<std::string_view, 6> kUnitNames = {
-        "year", "month", "day", "hour", "minute", "second"};
     const std::string& range = u;
     const size_t split = range.find(" to ");
     const std::string lo_unit = range.substr(0, split);
     const std::string hi_unit = range.substr(split + 4);
-    auto unit_index = [&](const std::string& name) -> int {
-      std::string base = name;
-      while (!base.empty() && base.back() == 's') {
-        base.pop_back();
-      }
-      for (int i = 5; i >= 0; --i) {
-        if (base.starts_with(kUnitNames[static_cast<size_t>(i)])) {
-          return i;
-        }
-      }
-      return -1;
-    };
-    const int fi = unit_index(lo_unit);
-    const int ti = unit_index(hi_unit);
+    const int fi = RangeUnitIndex(lo_unit);
+    const int ti = RangeUnitIndex(hi_unit);
     if (fi >= 0 && ti >= fi &&
         static_cast<int>(parts.size()) == (ti - fi + 1)) {
       bool ok = true;
@@ -663,6 +675,15 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       iv = IntervalValue{};
     }
   }
+  // A two-field H:M time component is complete only when the unit context
+  // allows it: a bare composite literal, or a range ending at minutes
+  // ("HOUR TO MINUTE"). "HOUR TO SECOND" still owes its seconds field.
+  bool allow_two_field_time = u.empty();
+  if (!allow_two_field_time) {
+    if (const size_t sp = u.find(" to "); sp != std::string::npos) {
+      allow_two_field_time = RangeUnitIndex(u.substr(sp + 4)) == 4;
+    }
+  }
   for (size_t idx = 0; idx < parts.size(); ++idx) {
     const auto& p = parts[idx];
     if (p.find(':') != std::string::npos) {
@@ -675,14 +696,42 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       }
       int64_t th = 0, tm = 0;
       double ts = 0.0;
-      // Failed conversions leave the zero-initialized fields, which is the
-      // accepted parse result for malformed composite parts here.
-      sscanf(  // NOLINT(cert-err33-c,cert-err34-c)
-          time_part.c_str(), "%" SCNd64 ":%" SCNd64 ":%lf", &th, &tm, &ts);
+      // sscanf returns a short count on partial input ("1:2" yields 2) and
+      // happily stops before trailing garbage; %n records the consumed
+      // length so a partially parsed time component is rejected instead of
+      // silently becoming a shorter interval (same contract as the
+      // unit-range arm above). %n is not reached on a short conversion, so
+      // the two-field H:M spelling gets its own pass.
+      int consumed = 0;
+      const int converted =
+          sscanf(time_part.c_str(),  // NOLINT(cert-err34-c)
+                 "%" SCNd64 ":%" SCNd64 ":%lf%n", &th, &tm, &ts,
+                 &consumed);
+      bool time_ok = converted == 3 && consumed > 0 &&
+                     static_cast<size_t>(consumed) == time_part.size();
+      if (!time_ok && allow_two_field_time) {
+        int consumed_hm = 0;
+        int64_t hm_th = 0;
+        int64_t hm_tm = 0;
+        const int converted_hm =
+            sscanf(time_part.c_str(),  // NOLINT(cert-err34-c)
+                   "%" SCNd64 ":%" SCNd64 "%n", &hm_th, &hm_tm,
+                   &consumed_hm);
+        if (converted_hm == 2 && consumed_hm > 0 &&
+            static_cast<size_t>(consumed_hm) == time_part.size()) {
+          th = hm_th;
+          tm = hm_tm;
+          ts = 0.0;
+          time_ok = true;
+        }
+      }
+      if (!time_ok) {
+        return fail("'" + s + "': malformed time component '" + p + "'");
+      }
       // sscanf happily yields inf/1e300 for e.g. "0:0:1e999"; converting a
       // value outside int64 range (or NaN) is UB, not a wrap (fuzz-found via
       // UBSan: "inf is outside the range of representable values of long").
-      if (!std::isfinite(ts) || ts <= kInt64MinAsDouble ||
+      if (!std::isfinite(ts) || ts < kInt64MinAsDouble ||
           ts >= kInt64MaxExclusive) {
         return fail_range();
       }
@@ -708,29 +757,49 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         sign = -1;
         ym_part.erase(0, 1);
       }
-      size_t dash = ym_part.find('-');
-      int64_t y = 0, m = 0;
-      if (dash != std::string::npos && dash > 0 && dash + 1 < ym_part.size()) {
-        try {
-          y = std::stoll(ym_part.substr(0, dash));
-          m = std::stoll(ym_part.substr(dash + 1));
-        } catch (...) {
-          y = 0;
-          m = 0;
+      const size_t dash = ym_part.find('-');
+      // Both sides must be plain unsigned integers consumed in full:
+      // std::stoll used to accept "1-2abc" as y=1,m=2 (trailing garbage
+      // dropped) and its catch-all turned total garbage into 0.
+      const auto parse_component = [](std::string_view text,
+                                      int64_t* out) -> bool {
+        if (text.empty()) {
+          return false;
         }
+        for (const char c : text) {
+          if (c < '0' || c > '9') {
+            return false;
+          }
+        }
+        const auto [end, ec] =
+            std::from_chars(text.data(), text.data() + text.size(), *out);
+        return ec == std::errc() && end == text.data() + text.size();
+      };
+      int64_t y = 0;
+      int64_t m = 0;
+      const std::string_view ym = ym_part;
+      if (dash == std::string::npos ||
+          !parse_component(ym.substr(0, dash), &y) ||
+          !parse_component(ym.substr(dash + 1), &m)) {
+        return fail("'" + s + "': malformed year-month component '" + p +
+                    "'");
       }
       const int64_t signed_y_months = checked_mul(checked_mul(y, sign), 12);
       const int64_t signed_m = checked_mul(m, sign);
       iv.months =
           checked_add(iv.months, checked_add(signed_y_months, signed_m));
     } else {
-      // Numerical part
+      // Numerical part: the whole token must be one integer. std::stoll
+      // used to accept "3junk" as 3 (prefix match) and its catch-all
+      // turned total garbage into a silent 0.
       int64_t val = 0;
-      try {
-        val = std::stoll(p);
-      } catch (...) {
-        val = 0;
+      char* num_end = nullptr;
+      errno = 0;
+      const long long parsed = std::strtoll(p.c_str(), &num_end, 10);
+      if (num_end == p.c_str() || *num_end != '\0' || errno == ERANGE) {
+        return fail("'" + s + "': invalid numeric component '" + p + "'");
       }
+      val = static_cast<int64_t>(parsed);
       if (parts.size() == 3) {
         if (idx == 1) {
           iv.days = checked_add(iv.days, val);
@@ -770,19 +839,23 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           }
         }
       } else {
-        // The unit prefixes intentionally share the same accumulation shape.
+        // A range unit names its accumulation by the LEADING unit only (the
+        // span itself is validated after the loop); match it exactly --
+        // starts_with used to let "yearxyz to month" accumulate as years.
+        const int uidx =
+            u.empty() ? 2 : RangeUnitIndex(u.substr(0, u.find(" to ")));
         // NOLINTNEXTLINE(bugprone-branch-clone)
-        if (u.starts_with("year")) {
+        if (uidx == 0) {
           iv.months = checked_add(iv.months, checked_mul(val, 12));
-        } else if (u.starts_with("month")) {
+        } else if (uidx == 1) {
           iv.months = checked_add(iv.months, val);
-        } else if (u.starts_with("hour")) {
+        } else if (uidx == 3) {
           iv.nanos =
               checked_add(iv.nanos, checked_mul(val, 3600LL * 1000000000LL));
-        } else if (u.starts_with("minute")) {
+        } else if (uidx == 4) {
           iv.nanos =
               checked_add(iv.nanos, checked_mul(val, 60LL * 1000000000LL));
-        } else if (u.empty() || u.starts_with("day")) {
+        } else if (uidx == 2) {
           iv.days = checked_add(iv.days, val);
         } else {
           // An unknown unit must not silently become a day count.
@@ -800,21 +873,8 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
   // generic composite reading above can place a mismatched literal into
   // months/days ('1 2' HOUR TO SECOND became 1 month 2 days).
   if (const size_t split = u.find(" to "); split != std::string::npos) {
-    static constexpr std::array<std::string_view, 6> kRangeUnits = {
-        "year", "month", "day", "hour", "minute", "second"};
-    auto range_index = [&](std::string name) -> int {
-      while (!name.empty() && name.back() == 's') {
-        name.pop_back();
-      }
-      for (int i = 5; i >= 0; --i) {
-        if (name.starts_with(kRangeUnits[static_cast<size_t>(i)])) {
-          return i;
-        }
-      }
-      return -1;
-    };
-    const int lo = range_index(u.substr(0, split));
-    const int hi = range_index(u.substr(split + 4));
+    const int lo = RangeUnitIndex(u.substr(0, split));
+    const int hi = RangeUnitIndex(u.substr(split + 4));
     if (lo < 0 || hi < lo) {
       return fail("'" + s + "': Invalid INTERVAL unit range '" + u + "'");
     }

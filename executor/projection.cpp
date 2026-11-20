@@ -210,6 +210,7 @@ Projection::Projection(std::vector<NamedExpression> expressions,
     CountCseCandidates(expression.expression, &counts, &samples);
   }
   std::vector<std::string> keys;
+  keys.reserve(counts.size());
   for (const auto& [key, count] : counts) {
     if (count >= 2 && IsCseSafe(samples.at(key))) {
       keys.push_back(key);
@@ -274,7 +275,11 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     return 0;
   }
-  const DataChunk* expression_input = &input_batch_;
+  return ProjectChunk(input_batch_, destination);
+}
+
+size_t Projection::ProjectChunk(const DataChunk& input, DataChunk* destination) {
+  const DataChunk* expression_input = &input;
   if (!cse_bytecodes_.empty()) {
     std::vector<ColumnVector> cse_values;
     cse_values.reserve(cse_bytecodes_.size());
@@ -282,7 +287,7 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       if (!program) {
         continue;
       }
-      StatusOr<ColumnVector> batch = program->TryEvaluateBatch(input_batch_);
+      StatusOr<ColumnVector> batch = program->TryEvaluateBatch(input);
       if (!batch.HasValue()) {
         FailWith(batch.GetStatus());
         return 0;
@@ -291,16 +296,16 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     cse_input_batch_.Reset();
     std::vector<const ColumnVector*> sources;
-    sources.reserve(input_batch_.ColumnCount() + cse_values.size());
-    for (size_t i = 0; i < input_batch_.ColumnCount(); ++i) {
-      sources.push_back(&input_batch_.ColumnAt(i));
+    sources.reserve(input.ColumnCount() + cse_values.size());
+    for (size_t i = 0; i < input.ColumnCount(); ++i) {
+      sources.push_back(&input.ColumnAt(i));
     }
     for (const ColumnVector& value : cse_values) {
       sources.push_back(&value);
     }
-    for (size_t row_index = 0; row_index < input_batch_.Size(); ++row_index) {
+    for (size_t row_index = 0; row_index < input.Size(); ++row_index) {
       cse_input_batch_.AppendRowFromColumns(sources, row_index,
-                                            input_batch_.PositionAt(row_index));
+                                            input.PositionAt(row_index));
     }
     expression_input = &cse_input_batch_;
   }
@@ -412,20 +417,20 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
         !expression_input->ColumnAt(jit.column).IsUnsigned() &&
         expression_input->ZoneMapAt(jit.column).Initialized() &&
         expression_input->ZoneMapAt(jit.column).NullCount() == 0) {
-      std::vector<int64_t> output(expression_input->Size());
+      jit_out_values_.resize(expression_input->Size());
       bool mul_overflow = false;
       bool add_overflow = false;
       try {
         jit.kernel->ProjectChecked(
             expression_input->ColumnAt(jit.column).IntegerData().data(),
-            output.data(), output.size(), jit.multiplier, jit.addend,
+            jit_out_values_.data(), jit_out_values_.size(), jit.multiplier, jit.addend,
             &mul_overflow, &add_overflow);
       } catch (const std::logic_error&) {
         // Unchecked kernel fallback (checked unavailable): verify with
         // scalar overflow checks to preserve AST throw semantics.
         jit.kernel->Project(
             expression_input->ColumnAt(jit.column).IntegerData().data(),
-            output.data(), output.size(), jit.multiplier, jit.addend);
+            jit_out_values_.data(), jit_out_values_.size(), jit.multiplier, jit.addend);
         const auto& inputs =
             expression_input->ColumnAt(jit.column).IntegerData();
         for (size_t r = 0; r < inputs.size(); ++r) {
@@ -445,7 +450,7 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
                                  "integer overflow on '+'"));
             return 0;
           }
-          output[r] = projected;
+          jit_out_values_[r] = projected;
         }
       }
       if (mul_overflow) {
@@ -459,10 +464,9 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
         return 0;
       }
       ColumnVector& evaluated_column =
-          evaluated[index].emplace(ValueType::kInt64, output.size());
-      for (int64_t value : output) {
-        evaluated_column.Append(Value(value));
-      }
+          evaluated[index].emplace(ValueType::kInt64, jit_out_values_.size());
+      evaluated_column.AppendIntBatch(ValueType::kInt64, false, jit_out_values_.data(),
+                                      nullptr, jit_out_values_.size());
       ++jit_batches_;
     } else if (const std::optional<BytecodeProgram>& program =
                    bytecodes_[index]) {
@@ -489,7 +493,7 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
     for (size_t row_index = 0; row_index < expression_input->Size();
          ++row_index) {
       destination->AppendRowFromColumns(sources, row_index,
-                                        input_batch_.PositionAt(row_index));
+                                        input.PositionAt(row_index));
     }
     return destination->Size();
   }
@@ -529,7 +533,7 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       result.push_back(value.MoveValue());
     }
     destination->Append(Row(std::move(result)),
-                        input_batch_.PositionAt(row_index));
+                        input.PositionAt(row_index));
   }
   return destination->Size();
 }

@@ -478,6 +478,7 @@ ReboundIndexKeys ReboundIndexKeysFromPredicate(const Expression& predicate,
       const ValueType column_type =
           schema.GetColumn(static_cast<size_t>(offset)).Type();
       std::vector<Value> points;
+      points.reserve(in.list_.size());
       bool indexable = true;
       for (const Expression& item : in.list_) {
         const Value* point = BoundConstant(item);
@@ -535,6 +536,7 @@ ReboundIndexKeys ReboundIndexKeysFromPredicate(const Expression& predicate,
   if (want_points) {
     size_t point_key_offset = 0;
     std::vector<Value> equality_prefix;
+    equality_prefix.reserve(index.sc_.key_.size());
     while (point_key_offset < index.sc_.key_.size()) {
       const slot_t slot = index.sc_.key_[point_key_offset];
       if (point_sets.contains(slot)) {

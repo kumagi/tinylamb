@@ -964,6 +964,7 @@ TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
       "index_scan", "full_scan", "hash_join", "index_join", "nested_loop_join"};
 
   std::vector<uint32_t> physical_masks;
+  physical_masks.reserve(1U << physical_rules.size());
   for (uint32_t mask = 0; mask < (1U << physical_rules.size()); ++mask) {
     const bool has_scan = (mask & 0b00011U) != 0;
     const bool has_join = (mask & 0b11100U) != 0;
@@ -1175,6 +1176,7 @@ TEST_F(OptimizerTest, StrictRangePredicatesDriveIndexBounds) {
   };
   auto range = [](int64_t begin, int64_t end) {
     std::vector<int64_t> values;
+    values.reserve(end > begin ? static_cast<size_t>(end - begin) : 0);
     for (int64_t i = begin; i < end; ++i) {
       values.push_back(i);
     }
@@ -1184,6 +1186,7 @@ TEST_F(OptimizerTest, StrictRangePredicatesDriveIndexBounds) {
   // Act + Assert: NOT-EQUALS never narrows a range; upper/lower bounds and
   // constant-on-left comparisons all produce the matching key sets.
   std::vector<int64_t> all_but_five;
+  all_but_five.reserve(100);
   for (int64_t i = 0; i < 100; ++i) {
     if (i != 5) {
       all_but_five.push_back(i);

@@ -139,6 +139,7 @@ std::string AggregateExpression::ToString() const {
     std::string delim = secondary_arg_->ToString();
     if (secondary_arg_->Type() == TypeTag::kConstantValue) {
       std::string quoted = "\"";
+      quoted.reserve(delim.size() * 2 + 2);
       for (char c : delim) {
         if (c == '"' || c == '\\') quoted += '\\';  // NOLINT(readability-braces-around-statements)
         quoted += c;

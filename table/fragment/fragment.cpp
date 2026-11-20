@@ -351,7 +351,7 @@ bool ChunkConjunctProvesEmpty(const PaxChunk& chunk, uint32_t g, slot_t col,
 // The int64 key value behind a memcomparable key blob. The encoding is
 // [tag 1B][8B big-endian of (value ^ (1 << 63))]; anything else (a varchar
 // key, a truncated blob) has no int64 value.
-bool MemcomparableInt64Key(const std::string& key, int64_t* out) {
+bool MemcomparableInt64Key(std::string_view key, int64_t* out) {
   if (key.size() != 9) {
     return false;
   }
@@ -838,7 +838,7 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
       row.generation = run.Generation();
       row.artifact_index = artifact_index;
       row.row_index = i;
-      const std::string key = run.GetEntry(i).BuildKey(run.Blob());
+      const std::string_view key = run.GetEntry(i).KeyView(run.Blob());
       if (MemcomparableInt64Key(key, &row.key)) {
         row.has_key = true;
       }
@@ -1169,7 +1169,7 @@ struct RowReader {
   }
 };
 
-void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
+Status AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
                    const RowReader& reader, Accumulator* acc) {
   const auto value_of = [&](slot_t col) -> int64_t {
     return reader.Value(row, col);
@@ -1191,29 +1191,28 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
         if (null_of(agg.col)) {
           break;
         }
-        acc->sum =
-            std::bit_cast<int64_t>(static_cast<uint64_t>(acc->sum) +
-                                   (static_cast<uint64_t>(agg.coeff) *
-                                    static_cast<uint64_t>(value_of(agg.col))));
+        int64_t product = 0;
+        if (__builtin_mul_overflow(agg.coeff, value_of(agg.col), &product) ||
+            __builtin_add_overflow(acc->sum, product, &acc->sum)) {
+          return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+        }
         acc->count += 1;
         break;
       }
       bool any_term = false;
       for (const AggTerm& term : agg.terms) {
-        auto product = static_cast<uint64_t>(term.coeff);
-        bool null_term = false;
-        for (slot_t col : term.cols) {
-          if (null_of(col)) {
-            null_term = true;
-            break;
-          }
-          product *= static_cast<uint64_t>(value_of(col));
-        }
-        if (null_term) {
+        if (std::ranges::any_of(term.cols, null_of)) {
           continue;
         }
-        acc->sum =
-            std::bit_cast<int64_t>(static_cast<uint64_t>(acc->sum) + product);
+        int64_t product = term.coeff;
+        for (slot_t col : term.cols) {
+          if (__builtin_mul_overflow(product, value_of(col), &product)) {
+            return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+          }
+        }
+        if (__builtin_add_overflow(acc->sum, product, &acc->sum)) {
+          return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+        }
         any_term = true;
       }
       // count==0 is how callers detect "SUM is NULL" (same contract as the
@@ -1253,6 +1252,7 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
     case AggregateKind::kNone:
       break;
   }
+  return Status::kSuccess;
 }
 
 // The group key of a row: the values of the GROUP BY columns.
@@ -1962,7 +1962,7 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
           GroupKeyOf(row, fragment.group_cols, reader);
       Accumulator& acc = groups[key];
       if (fragment.aggregate.has_value()) {
-        AccumulateRow(*fragment.aggregate, row, reader, &acc);
+        RETURN_IF_FAIL(AccumulateRow(*fragment.aggregate, row, reader, &acc));
       } else {
         acc.count += 1;
       }
@@ -1991,7 +1991,7 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
                            schema.ColumnCount());
     Accumulator acc;
     for (const SurvivingRow& row : rows) {
-      AccumulateRow(*fragment.aggregate, row, reader, &acc);
+      RETURN_IF_FAIL(AccumulateRow(*fragment.aggregate, row, reader, &acc));
     }
     result.scalar_value = acc.sum;
     result.scalar_count = acc.count;

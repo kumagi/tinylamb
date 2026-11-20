@@ -588,6 +588,7 @@ TEST_F(FullScanMvccFastPathTest, CachedPageVerdictIsInvalidatedAfterLatchDrop) {
   auto setup = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(setup, "SampleTable"));
   std::vector<RowPosition> positions;
+  positions.reserve(3);
   for (int i = 0; i < 3; ++i) {
     ASSIGN_OR_ASSERT_FAIL(
         RowPosition, position,
@@ -664,7 +665,9 @@ TEST_F(FullScanMvccFastPathTest, TypedProjectionEndsBeforeUnneededSuffix) {
           .GetStatus());
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "Narrow"));
   std::vector<Row> expected;
+  expected.reserve(73);
   std::vector<RowPosition> positions;
+  positions.reserve(73);
   for (int i = 0; i < 73; ++i) {
     expected.emplace_back(
         Row({((i % 3) != 0) ? Value(i) : Value(),
@@ -736,7 +739,9 @@ TEST_F(FullScanMvccFastPathTest,
           .GetStatus());
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "MixedPeek"));
   std::vector<Row> rows;
+  rows.reserve(97);
   std::vector<RowPosition> positions;
+  positions.reserve(97);
   for (int i = 0; i < 97; ++i) {
     rows.emplace_back(Row(
         {Value(i), ((i % 7) != 0) ? Value(i + .5) : Value(),

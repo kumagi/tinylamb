@@ -717,6 +717,7 @@ struct HashJoin::JoinState {
         return;
       }
       std::vector<PositionedRow> loaded;
+      loaded.reserve(spills.size());
       for (SpillFile& file : spills) {
         if (file.Empty()) {
           continue;
@@ -1824,6 +1825,7 @@ Status HashJoin::BuildShards() {
   std::vector<bool> valid_keys(rows.size(), false);
   std::vector<std::pair<size_t, size_t>> byte_spans(rows.size(), {0, 0});
   std::string key_arena;
+  key_arena.reserve(rows.size());
   for (size_t i = 0; i < rows.size(); ++i) {
     const KeyRef k = KeyOf(rows[i].first, cols, s.key_mode, s.int_mode_type,
                            &scratch, NullSafeArg());
@@ -2515,12 +2517,13 @@ Status HashJoin::MaterializeHybrid() {
   };
 
   std::vector<Row> resident_right;
+  DataChunk batch;
+  resident_right.reserve(batch.Size());
   QueryMemoryCharge resident_charge;
   std::vector<SpillFile> right_spill(partitions);
   std::vector<SpillFile> left_spill(partitions);
   std::string key;
 
-  DataChunk batch;
   while (right_->NextBatch(&batch) != 0) {
     for (size_t i = 0; i < batch.Size(); ++i) {
       Row row = batch.RowAt(i);

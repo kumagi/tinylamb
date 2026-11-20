@@ -2229,6 +2229,7 @@ TransactionManager::IndexKeyChangesSinceSnapshot(
   }
   try {
     std::vector<std::string> keys;
+    keys.reserve(history.pending.size());
     for (const auto& pending : history.pending) {
       if (pending.root == index_root) {
         keys.insert(keys.end(), pending.keys.begin(), pending.keys.end());
@@ -2853,6 +2854,7 @@ void TransactionManager::SpillColdVersionPayloadsLockedSweep() {
       VersionShard& shard =
           version_shards_[(start_shard + i) % kVersionShardCount];
       std::vector<SpillCandidate> batch;
+      batch.reserve(shard.versions.size());
       size_t batch_bytes = 0;
       {
         std::scoped_lock lock(shard.mutex);

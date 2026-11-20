@@ -1,6 +1,8 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
 #include "query/sql_ooc_fuzzer.hpp"
+#include "query/sql_ooc_query_gen.hpp"
+#include <stdexcept>
 
 #include <algorithm>
 #include <atomic>
@@ -21,6 +23,13 @@
 
 namespace tinylamb {
 namespace {
+
+TEST(OocRngTest, EmptyChoicesRaiseAndSingletonReturnsMember) {
+  OocRng rng(nullptr, 0, 42);
+  EXPECT_THROW(rng.OneOf(std::vector<int>{}), std::out_of_range);
+  const std::vector<int> one{7};
+  EXPECT_EQ(&rng.OneOf(one), &one.front());
+}
 
 bool Verbose() { return std::getenv("TINYLAMB_OOC_FUZZ_VERBOSE") != nullptr; }
 

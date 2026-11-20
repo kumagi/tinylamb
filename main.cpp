@@ -62,6 +62,7 @@ int main(int argc, char** argv) {
   // Reject unknown options the way postgres_server_main.cpp does, and give
   // --help a real answer.
   std::vector<std::string> args;
+  args.reserve(argc - 1);
   for (int i = 1; i < argc; ++i) {
     const std::string arg(argv[i]);
     if (arg == "--force") {
@@ -121,6 +122,7 @@ int main(int argc, char** argv) {
   // commit's durability barrier, so no row reaches the user before the
   // commits it observed are durable.
   std::vector<std::string> pending_output;
+  pending_output.reserve(statements.size());
   const auto interrupted = [&context](const char* phase) {
     std::cerr << "interrupted " << phase
               << "; rolling back implicit "

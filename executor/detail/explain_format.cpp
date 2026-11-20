@@ -26,6 +26,7 @@
 #include "common/memory_budget.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
+#include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/planning_heuristics.hpp"
@@ -756,6 +757,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     CountPureProjectionSubexpressions(item.expression, &cse_counts, &cse_kinds);
   }
   std::vector<std::string> cse_keys;
+  cse_keys.reserve(cse_counts.size());
   for (const auto& [key, count] : cse_counts) {
     if (count >= 2) {
       cse_keys.push_back(key);
@@ -792,7 +794,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         if (key.size() >= 2 && key.front() == '(' && key.back() == ')') {
           key = key.substr(1, key.size() - 2);
         }
-        const std::string slot = "$cse" + std::to_string(cse_slot++);
+        const std::string slot = "$cse" + IntegerToString(cse_slot++);
         output << pad << "TopN key=" << key << " slot=" << slot << "\n"
                << pad << "ComputeScalar " << slot << " once\n";
         break;
@@ -1138,6 +1140,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     // Collect projected table aliases for join elimination detection.
     // SELECT * has null expressions, so mark all aliases as projected.
     std::unordered_set<std::string> projected_aliases;
+    projected_aliases.reserve(statement.SelectList().size());
     bool select_all = false;
     for (const NamedExpression& item : statement.SelectList()) {
       if (!item.expression) {
@@ -1310,6 +1313,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         std::unordered_set<size_t> after = joined;
         after.insert(next);
         std::vector<Expression> applicable;
+        applicable.reserve(predicates.size());
         for (const PredicateInfo& predicate : predicates) {
           if (!predicate.resolved || predicate.contains_query ||
               predicate.sources.size() < 2 ||
@@ -1486,6 +1490,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   // Window function detection.
   // Collect window functions from SELECT list.
   std::vector<const WindowFunctionCallExpression*> window_fns;
+  window_fns.reserve(statement.SelectList().size());
   for (const NamedExpression& item : statement.SelectList()) {
     if (item.expression &&
         item.expression->Type() == TypeTag::kWindowFunctionExp) {
@@ -1735,6 +1740,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     // the same partition/order but different aggregate functions.
     if (window_fns.size() >= 2) {
       std::vector<std::string> fused_names;
+      fused_names.reserve(window_fns.size());
       for (size_t i = 0; i < window_fns.size(); ++i) {
         for (size_t j = i + 1; j < window_fns.size(); ++j) {
           if (layout_keys[i] == layout_keys[j] &&
@@ -1894,6 +1900,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             // row per group, so the aggregate node can be elided. Consider
             // every unique column (composite keys included), not just col 0.
             std::unordered_set<std::string> unique_columns;
+            unique_columns.reserve(table_schema.ColumnCount());
             for (size_t ci = 0; ci < table_schema.ColumnCount(); ++ci) {
               if (table_schema.GetColumn(ci).GetConstraint().IsUnique()) {
                 unique_columns.insert(table_schema.GetColumn(ci).Name().name);

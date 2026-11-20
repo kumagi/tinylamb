@@ -34,6 +34,15 @@ graph TD
 
 ## 適用条件
 
+半結合述語の評価回数を変えても安全であることを確認します。
+
+```cpp
+if (expression.operation != LogicalOperator::kSemiJoin ||
+              expression.children.size() != 2 || !expression.predicate ||
+              !*expression.predicate ||
+              !SafeToReduceEvaluationCount(*expression.predicate)) {
+```
+
 パターンは `SemiJoin(Any("inner_join"), Any("c"))` で、対象演算子は
 `LogicalOperator::kSemiJoin` です。登録コメントが 2 つの変換先を列挙します。
 
@@ -48,7 +57,7 @@ guard の列挙は次のとおりです。
 
 - 式が `kSemiJoin` で子 2 個であること。
 - `inner_join` グループ内の式のうち `kJoin`(子 2 個)だけが候補。
-- semi 側の述語 `p_semi` が存在すること。
+- semi 側の述語 `p_semi` が存在し、`SafeToReduceEvaluationCount(*expression.predicate)` を満たすこと。押し込みで評価回数が変わるため、揮発性関数やサブクエリを含む述語は除外します。
 - `p_semi` が触れるすべての列が A・B・C のいずれかに属すること
   (`touches_only_valid`。範囲外の列があれば不発)。
 - 分類結果が「A のみ + C」(`touches_a && !touches_b`)か

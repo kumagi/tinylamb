@@ -293,6 +293,7 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
     // consumer_guard_ stays alive through skew_sorter_ usage.
     const size_t gcnt = group_keys_.size();
     std::vector<OocSortKey> sort_keys;
+    sort_keys.reserve(gcnt);
     if (partial_mode_) {
       for (size_t i = 0; i < gcnt; ++i) {
         sort_keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(i)});

@@ -35,10 +35,14 @@ graph TD
                 c->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
               const Expression& l = c->AsBinaryExpression().Left();
               const Expression& r = c->AsBinaryExpression().Right();
-              if (l && r && !IsConstant(l) && !IsConstant(r)) {
+              if (l && r && !IsConstant(l) && !IsConstant(r) &&
+                  SafeToReduceEvaluationCount(l) &&
+                  SafeToReduceEvaluationCount(r)) {
 ```
 
 - 連言が等号二項演算（`kEquals`）であり、左右の被演算子が**ともに非定数**であること（定数との比較 $x = 1$ からは新たな有益述語を推論できないため）。
+
+- 両辺が追加評価できること。揮発性関数やサブクエリを含む場合は、追加の NULL 判定で評価回数が増えるため推論を見送ります。
 
 この条件を満たす等号述語 1 本につき、$x \text{ IS NOT NULL}$ および $y \text{ IS NOT NULL}$ のうち**まだ連言列に存在しないもののみ**を $x = y \land \dots$ の連言列末尾に追加します。重複判定は `already_present` ラムダが、入力連言列と当該パスで追加済みの連言列の双方に対してノード内容（`Same()`）に基づき行います。
 

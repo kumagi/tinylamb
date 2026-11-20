@@ -1592,18 +1592,20 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
          (lm->RightIndex() != nullptr &&
           !ctx.txn_.IndexKeysMayBeStale(lm->RightIndex()->Root())));
     if (use_lookup) {
-      LoweredStream left_stream;
-      RETURN_IF_FAIL(
-          LowerNode(lm->Left(), ctx, custom_hook, graph, &left_stream));
       const Table* rtbl = lm->RightTable();
       const Index* ridx = lm->RightIndex();
       std::vector<slot_t> lcols;
       std::vector<slot_t> rcols;
-      if (lm->Identity() != LateMaterializationIdentity::kRowId) {
-        (void)ResolveKeyOffsets(lm->Left()->GetSchema(), lm->LeftKeys(),
-                                &lcols);
-        (void)ResolveKeyOffsets(rtbl->GetSchema(), lm->RightKeys(), &rcols);
+      if (lm->Identity() != LateMaterializationIdentity::kRowId &&
+          (!ResolveKeyOffsets(lm->Left()->GetSchema(), lm->LeftKeys(), &lcols) ||
+           !ResolveKeyOffsets(rtbl->GetSchema(), lm->RightKeys(), &rcols) ||
+           lcols.empty() || lcols.size() != rcols.size())) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Unresolved late materialization join keys");
       }
+      LoweredStream left_stream;
+      RETURN_IF_FAIL(
+          LowerNode(lm->Left(), ctx, custom_hook, graph, &left_stream));
       auto lsrc = std::move(left_stream.source);
       auto lops = std::move(left_stream.operators);
       out->source = std::make_shared<LazyAdaptedPipelineSource>(
@@ -1798,7 +1800,7 @@ StatusOr<PipelineGraph> PipelineLowering::Lower(
     // Same contract as case 9: when no post sort follows, the caller relies
     // on the plan's own ordering surviving the distinct, spilled or not.
     auto dist_sink = std::make_shared<OocDistinctSink>(
-        stream.schema, std::vector<slot_t>{}, "Distinct",
+        stream.schema, options.post_distinct_key_cols, "Distinct",
         std::vector<Expression>{},
         options.post_sort_keys.empty() && ChildHasAnyOrder(plan));
     RETURN_IF_FAIL(BreakWithSink(&graph, &stream, std::move(dist_sink),

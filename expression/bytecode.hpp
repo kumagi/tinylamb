@@ -183,7 +183,8 @@ class BytecodeProgram {
       std::span<const BytecodeColumnView> cols, const uint32_t* sel,
       size_t row_count, BytecodeColumnSink* sink, Status* error) const;
   // True when every instruction is in the fast interpreter's supported set
-  // and the constants it loads are numeric (the Compile-time shape scan).
+  // and every loaded constant is a supported scalar (NULL/INT64/DOUBLE/DATE,
+  // or a non-collated VARCHAR) -- the Compile-time shape scan.
   [[nodiscard]] bool FastInterpretable() const { return fast_interpretable_; }
   [[nodiscard]] const std::vector<BytecodeInstruction>& Instructions() const {
     return instructions_;

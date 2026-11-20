@@ -29,6 +29,7 @@ namespace {
 
 std::string EncodeParts(const std::vector<Value>& parts) {
   std::string encoded;
+  encoded.reserve(parts.size());
   for (const Value& value : parts) {
     // NULL has a valid memcomparable encoding (the smallest marker). Breaking
     // at the first NULL truncates a composite prefix and makes the subsequent
@@ -185,6 +186,7 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       // Same prefix, seek past this prefix using LsmIndex seek with prefix
       // upper bound!
       std::vector<Value> prefix_values;
+      prefix_values.reserve(prefix_cols_);
       for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count();
            ++col) {
         prefix_values.push_back(prev_key[col]);

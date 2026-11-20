@@ -29,7 +29,7 @@ class DuckDBReportTest(unittest.TestCase):
             self.records.extend([dict(kind='load', engine=engine, rows=100, valid=True),
                                  dict(kind='olap', suite='micro', engine=engine, rows=100,
                                       workload='count', correct=True, stable=True,
-                                      status='ok', samples_ms=[1., 2.])])
+                                      status='ok', samples_ms=[1., 2.], median_ms=1.5)])
 
     def save(self, env=None, records=None):
         (self.directory / 'environment.json').write_text(json.dumps(self.env if env is None else env))
@@ -51,7 +51,9 @@ class DuckDBReportTest(unittest.TestCase):
         incomplete = copy.deepcopy(self.env)
         incomplete.pop('finished')
         cases.append((incomplete, self.records))
-        for key, value in [('correct', False), ('stable', False), ('samples_ms', [1.]), ('status', 'error')]:
+        for key, value in [('correct', False), ('stable', False), ('samples_ms', [1.]),
+                           ('samples_ms', [float('inf'), 1]), ('samples_ms', [float('nan'), 2]),
+                           ('median_ms', 3), ('median_ms', float('nan')), ('status', 'error')]:
             records = copy.deepcopy(self.records)
             records[-1][key] = value
             cases.append((self.env, records))

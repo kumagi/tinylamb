@@ -998,6 +998,7 @@ TEST_F(TableTest, Insert_ManyRows_AllRowsAreReadable) {
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                               ctx.GetTable(kTableName));
   std::unordered_set<Row> rows;
+  rows.reserve(1000);
   std::unordered_set<RowPosition> rps;
 
   for (int i = 0; i < 1000; ++i) {
@@ -1071,6 +1072,7 @@ TEST_F(TableTest, Insert_WhenPageIsFull_AllocatesNewPage) {
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                               ctx.GetTable(kTableName));
   std::vector<RowPosition> rps;
+  rps.reserve(600);
   std::string payload(300, 'x');
 
   for (int i = 0; i < 600; ++i) {

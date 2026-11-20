@@ -223,6 +223,7 @@ std::vector<std::string> Text(const std::vector<Row>& rows) {
   out.reserve(rows.size());
   for (const Row& row : rows) {
     std::string text;
+    text.reserve(row.values_.size());
     for (size_t i = 0; i < row.values_.size(); ++i) {
       if (i > 0) {
         text += "|";
@@ -257,6 +258,7 @@ std::vector<std::string> Sorted(std::vector<std::string> values) {
 // group set is joined into one line when a test wants to show what it got.
 std::string Join(const std::vector<std::string>& values) {
   std::string out;
+  out.reserve(values.size() * 2);
   for (size_t i = 0; i < values.size(); ++i) {
     if (i > 0) {
       out += ", ";

@@ -166,7 +166,7 @@ class TpcdsQueryTest : public ::testing::Test {
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
     engine_ = std::make_unique<SqlEngine>(*database_);
     for (const std::string_view ddl : tpcds::Ddl()) {
-      EXPECT_TRUE(RunDdl(ddl));
+      RunDdl(ddl);
     }
     fixture_ = tpcds::Generate(1);
     for (const std::string_view ddl : tpcds::Ddl()) {
@@ -204,21 +204,19 @@ class TpcdsQueryTest : public ::testing::Test {
     std::filesystem::remove(db_name_ + ".last_checkpoint");
   }
 
-  bool RunDdl(std::string_view sql) {
+  void RunDdl(std::string_view sql) {
     SqlEngine engine(*database_);
     TransactionContext context = database_->BeginContext();
     StatusOr<QueryResult> result = engine.Execute(context, sql);
     if (!result.HasValue()) {
       ADD_FAILURE() << sql << " -> " << engine.LastError();
       context.Abort();
-      return false;
+      return;
     }
     result.Value().Drain();
     if (context.PreCommit() != Status::kSuccess) {
       ADD_FAILURE() << "DDL commit failed";
-      return false;
     }
-    return true;
   }
 
   // Batched commits (10k rows) mirror the benchmark's load flow so both

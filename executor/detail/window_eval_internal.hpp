@@ -152,12 +152,19 @@ struct WindowRuntime {
 struct WindowColTypeSummary {
   bool seen_non_null{false};
   bool mixed{false};
+  // kArray cells or IsCaseInsensitive tags break the uniform_cell_types
+  // contract ("never kArray, never IsCaseInsensitive()") even when every
+  // cell shares one ValueType — mirror ColumnTypeTracker::saw_unsafe.
+  bool saw_unsafe{false};
   bool is_unsigned{false};
   bool is_interval{false};
   ValueType first_type{ValueType::kNull};
   ValueType type{ValueType::kNull};
 
   void Observe(const Value& v) {
+    if (v.type == ValueType::kArray || v.IsCaseInsensitive()) {
+      saw_unsafe = true;
+    }
     if (v.IsNull()) {
       return;
     }
@@ -179,13 +186,17 @@ struct WindowColTypeSummary {
   }
 
   void MergeFrom(const WindowColTypeSummary& other) {
+    const bool unsafe = saw_unsafe || other.saw_unsafe;
     if (!other.seen_non_null) {
+      saw_unsafe = unsafe;
       return;
     }
     if (!seen_non_null) {
       *this = other;
+      saw_unsafe = unsafe;
       return;
     }
+    saw_unsafe = unsafe;
     if (other.mixed || type != other.type || is_unsigned != other.is_unsigned ||
         is_interval != other.is_interval) {
       mixed = true;
@@ -200,6 +211,12 @@ struct WindowColTypeSummary {
       *col = Column(col->Name(), type);
       col->SetInterval(is_interval);
       col->SetUnsigned(is_unsigned);
+      if (saw_unsafe || type == ValueType::kArray) {
+        *all_uniform = false;
+      }
+    } else if (saw_unsafe || col->Type() == ValueType::kNull ||
+               col->Type() == ValueType::kArray) {
+      *all_uniform = false;
     }
   }
 };

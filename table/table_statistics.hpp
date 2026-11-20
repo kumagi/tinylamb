@@ -165,7 +165,10 @@ class TableStatistics {
   TableStatistics(TableStatistics&&) = default;
   TableStatistics& operator=(const TableStatistics&) = default;
   TableStatistics& operator=(TableStatistics&&) = default;
-  bool operator==(const TableStatistics&) const = default;
+  bool operator==(const TableStatistics& other) const {
+    return row_count_ == other.row_count_ && layout_generation_ == other.layout_generation_ &&
+           *stats_ == *other.stats_;
+  }
   ~TableStatistics() = default;
 
   Status Update(Transaction& txn, const Table& target);
@@ -178,13 +181,13 @@ class TableStatistics {
                                            const Expression& predicate) const;
 
   [[nodiscard]] size_t Rows() const { return row_count_; }
-  [[nodiscard]] size_t Columns() const { return stats_.size(); }
+  [[nodiscard]] size_t Columns() const { return stats_->size(); }
   // Group cardinality with duplicate keys removed and exponential backoff
   // when no joint distribution has been measured. NULL is one group.
   [[nodiscard]] double EstimateDistinctRows(
       const std::vector<size_t>& columns) const;
   [[nodiscard]] const ColumnStats& Column(size_t index) const {
-    return stats_.at(index);
+    return stats_->at(index);
   }
 
   // Table::LayoutGeneration() at the moment these statistics were measured
@@ -227,7 +230,14 @@ class TableStatistics {
 
  private:
   size_t row_count_{0};
-  std::vector<ColumnStats> stats_;
+  std::vector<ColumnStats>& MutableColumns() {
+    if (stats_.use_count() != 1) {
+      stats_ = std::make_shared<std::vector<ColumnStats>>(*stats_);
+    }
+    return *stats_;
+  }
+  std::shared_ptr<std::vector<ColumnStats>> stats_ =
+      std::make_shared<std::vector<ColumnStats>>();
   uint64_t layout_generation_{0};
 };
 

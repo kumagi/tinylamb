@@ -25,49 +25,32 @@ Memo は追記型のデータ構造であるため、元の `Join(L, R)` は保�
 
 ## 適用条件
 
-パターンは `Join(Any("left"), Any("right"))` であり、子ノードを 2 つ持つ任意の `kJoin` 式に一致します。事前条件ガード（guard）はありません。
+パターンは `Join(Any("left"), Any("right"))` であり、子ノードを 2 つ持つ任意の `kJoin` 式に一致します。結合列挙器が担当するグループを除外し、左右の交換時に元の結合述語を引き継ぎます。
 
 ```cpp
     built.Add(Rule(
         "join_commutativity", Join(Any("left"), Any("right")),
         [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          memo.AddExpression(group, memo.NewJoin(expression.children[1],
-                                                 expression.children[0]));
+          if (memo.JoinEnumerationClaimed(group)) {
+            return;
+          }
+          memo.AddExpression(
+              group,
+              memo.NewJoin(
+                  expression.children[1], expression.children[0],
+                  expression.predicate ? *expression.predicate : Expression{}));
         },
         LogicalOperator::kJoin));
 ```
 
-この規則が実質的に新しい式を追加しないケースは以下の 2 通りに限られます。
-
-1. Memo の登録上限（`expression_cap_`）に達し、`Memo::AddExpression` が追加を拒否した場合（縮退モードへの移行）。
-2. 交換後の式が既存の式と指紋（fingerprint）一致した場合。左右が同一の Group を参照する自己結合 `Join(L, L)` では、交換後の指紋が元の式と同一になるため、`AddExpression` の指紋検査によって重複排除されます。
-
 ## 意味論的根拠と述語の導出
 
-事前条件ガードが存在しない理由は、内側結合（inner join）の交換操作が無条件に関係代数の恒等式 $L \bowtie R = R \bowtie L$ を満たし、行集合および重複度を完全に保存するためです。
-
-実装上の注意点は、変換処理が元の式の述語を直接コピーしていない点です。ヘルパー関数 `memo.NewJoin`（`plan/cascades.cpp`）は、子グループの関係集合に基づいて適切な結合条件を再導出します。
-
-```cpp
-LogicalExpression Memo::NewJoin(GroupId left, GroupId right) const {
-  LogicalExpression join{.operation = LogicalOperator::kJoin,
-                         .children = {left, right}};
-  const Expression condition = JoinConditionFor(Get(left), Get(right));
-  if (condition) {
-    join.predicate = condition;
-  }
-  return join;
-}
-```
-
-`JoinConditionFor` は、左辺グループと右辺グループの境界をまたぐ連言述語のみを抽出して結合条件を構成します。したがって、左右を交換した場合でも、`t1.a = t2.b` のようなまたがり述語は自動的に新たな結合式へ付与されます。述語の配置判断を一元化することで、木構造を組み替える規則が述語の移動や複製を誤る余地を排除しています。
+内側結合では、同じ述語を使って左右を交換しても行の多重度は変わりません。`Memo::NewJoin` は渡された述語を正規化し、述語が省略された場合に限り `JoinConditionFor` で関係集合から再導出します。
 
 なお、本 Rule は `kOuterJoin`（外部結合）には適用されません。外部結合は一般に交換律が成立しないため（$L \text{ LOJ } R \neq R \text{ LOJ } L$）、左右交換には別途 `right_to_left_outer_join` による結合型の変換が必要です。
 
 ## 実装の詳細
-
-Rule の処理本体は `memo.AddExpression(group, memo.NewJoin(expression.children[1], expression.children[0]))` の呼び出しです。
 
 1. **探索エンジンとの連携**: 探索エンジンのワークリストから Group 内の各代替式に対して順次 Rule が評価されます。`expression.children` に格納された左右の子 GroupId を反転させて `NewJoin` に渡します。
 2. **重複排除の動作**: `Memo::AddExpression` は式を追加する前に指紋を計算し、グループ内に既に同一指紋が存在する場合は登録を破棄します。

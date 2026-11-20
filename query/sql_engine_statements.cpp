@@ -87,6 +87,7 @@ StatusOr<std::vector<ForeignKeyCheck>> ResolveForeignKeyChecks(
     TransactionContext& ctx, const Table& target) {
   std::vector<ForeignKeyCheck> checks;
   const Schema& schema = target.GetSchema();
+  checks.reserve(schema.ColumnCount());
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     const Constraint& constraint = schema.GetColumn(i).GetConstraint();
     if (constraint.ctype != Constraint::kForeign) {
@@ -364,10 +365,12 @@ bool ExpandStructInsertValue(const Value& single, size_t width,
 
   const auto split_top_level = [](const std::string& body) {
     std::vector<std::string> parts;
+    parts.reserve(body.size());
     int depth = 0;
     bool in_str = false;
     char quote = '\0';
     std::string current;
+    current.reserve(body.size());
     for (size_t i = 0; i < body.size(); ++i) {
       const char c = body[i];
       if (in_str) {
@@ -902,6 +905,7 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
   resolved.reserve(update.NestedItems().size());
   for (const NestedDmlItem& item : update.NestedItems()) {
     std::vector<std::string> path;
+    path.reserve(item.target_path.size() + 1);
     size_t start = 0;
     for (size_t pos = 0; pos <= item.target_path.size(); ++pos) {
       if (pos == item.target_path.size() || item.target_path[pos] == '.') {
@@ -1221,6 +1225,7 @@ namespace {
 
 std::string EscapeStructKey(std::string_view text) {
   std::string escaped;
+  escaped.reserve(text.size() * 2);
   for (const char c : text) {
     switch (c) {
       case '"':
@@ -1268,6 +1273,7 @@ Value DecodeStructMember(const std::string& text) {
 std::optional<std::vector<int>> FindStructPathOrdinals(
     const std::string& json, const std::vector<std::string>& segs) {
   std::vector<int> ordinals;
+  ordinals.reserve(segs.size());
   std::string current = json;
   for (const std::string& seg : segs) {
     if (current.size() < 2 || current.front() != '{' || current.back() != '}') {
@@ -1396,12 +1402,15 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     std::vector<int> ordinals;
   };
   std::vector<FieldTarget> field_targets;
+  field_targets.reserve(update.SetClause().size());
   std::vector<std::pair<ColumnName, const Expression*>> plain_targets;
+  plain_targets.reserve(update.SetClause().size());
   for (const auto& [target, expression] : update.SetClause()) {
     if (!target.schema.empty() && !target.name.empty()) {
       const int base = column_index(target.schema);
       if (base >= 0) {
         std::vector<std::string> segments;
+        segments.reserve(target.name.size() + 1);
         size_t start = 0;
         for (size_t pos = 0; pos <= target.name.size(); ++pos) {
           if (pos == target.name.size() || target.name[pos] == '.') {
@@ -1895,6 +1904,7 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
   std::vector<std::pair<RowPosition, Row>> pending_updates;
   std::vector<RowPosition> pending_deletes;
   std::vector<Row> pending_inserts;
+  pending_inserts.reserve(source_rows.size());
   std::vector<bool> source_matched(source_rows.size(), false);
 
   auto eval_truth =
@@ -2011,6 +2021,7 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
     // Matching source rows: ON condition TRUE (source scope chained as the
     // outer of the target scope).
     std::vector<size_t> matches;
+    matches.reserve(candidates.size());
     for (size_t row_index : candidates) {
       relational_detail::Scope source_scope{.row = &source_rows[row_index],
                                             .schema = &source_schema,
@@ -3255,6 +3266,7 @@ StatusOr<Executor> SqlEngine::ExecuteUpdate(TransactionContext& ctx,
   // Unmatched targets on single-column (proto) tables address fields of
   // that column's TEXT payload ("SET int64_key_1 = 100").
   std::vector<std::pair<std::string, const Expression*>> proto_sets;
+  proto_sets.reserve(applied.size());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const Column& column = schema.GetColumn(i);
     Expression expression = ColumnValueExp(column.Name());

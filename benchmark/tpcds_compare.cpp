@@ -30,6 +30,7 @@ using namespace tinylamb;
 
 std::string Json(std::string_view text) {
   std::string out = "\"";
+  out.reserve(text.size() * 6 + 2);
   constexpr std::string_view hex = "0123456789abcdef";
   for (const char raw_c : text) {
     const auto c = static_cast<unsigned char>(raw_c);

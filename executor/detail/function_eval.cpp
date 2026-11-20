@@ -13,7 +13,6 @@
 #endif
 
 #include <algorithm>
-#include <ranges>
 #include <array>
 #include <bit>
 #include <cctype>
@@ -33,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <ranges>
 #if defined(__GNUC__) && !defined(__clang__)
 // GCC 15 reports -Wmaybe-uninitialized inside <regex>'s NFA construction when
 // instantiating std::regex in sanitizer builds; the library code is fine.
@@ -148,6 +148,7 @@ namespace {
 
 [[nodiscard]] std::vector<uint32_t> CodePointsOfBatch(std::string_view value) {
   std::vector<uint32_t> out;
+  out.reserve(value.size());
   size_t offset = 0;
   while (offset < value.size()) {
     const auto decoded = DecodeUtf8Pair(value, offset);
@@ -1344,6 +1345,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       std::string b;
     };
     std::vector<Pair> pairs;
+    pairs.reserve(arguments[0].ArrayElements().size());
     for (const Value& element : arguments[0].ArrayElements()) {
       if (element.IsNull()) {
         continue;
@@ -1529,7 +1531,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       int week_num =
           yday < first_sunday
               ? 0
-              : (yday - first_sunday) /  // NOLINT(readability-math-missing-parentheses)
+              : (yday -
+                 first_sunday) /  // NOLINT(readability-math-missing-parentheses)
                         7 +  // NOLINT(readability-math-missing-parentheses)
                     1;       // NOLINT(readability-math-missing-parentheses)
       return Value(static_cast<int64_t>(week_num));
@@ -2562,6 +2565,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return arguments[1];
     }
     std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(3);
     for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
       Value value;
       if (TryProtoTextGetField(raw_str(arguments[1]), field, &value)) {
@@ -2583,6 +2587,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return arguments[1];
     }
     std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(3);
     const std::string payload = raw_str(arguments[1]);
     for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
       if (!ProtoTextHasField(payload, field)) {
@@ -2679,9 +2684,21 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     auto floor_div_unix = [](platform::Int128 a,
                              platform::Int128 b) -> int64_t {
-      const platform::Int128 q = a / b;
-      return static_cast<int64_t>(((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1
-                                                                         : q);
+      platform::Int128 q = a / b;
+      if ((a % b) != 0 && ((a < 0) != (b < 0))) {
+        --q;
+      }
+      // Proto-text timestamps can land far outside the SQL literal range;
+      // the quotient then exceeds int64. Saturate instead of narrowing.
+      if (q >
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::max())) {
+        return std::numeric_limits<int64_t>::max();
+      }
+      if (q <
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::min())) {
+        return std::numeric_limits<int64_t>::min();
+      }
+      return static_cast<int64_t>(q);
     };
     if (name_view == "unix_date") {
       return Value(floor_div_unix(*nanos, 86400000000000LL));
@@ -2811,10 +2828,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         // position.
         std::string inner = s0.substr(1, s0.size() - 2);
         std::vector<std::string> fields;
+        fields.reserve(inner.size());
         int depth = 0;
         bool in_str = false;
         char quote = '\0';
         std::string current;
+        current.reserve(inner.size());
         for (const char c : inner) {
           if (in_str) {
             current.push_back(c);
@@ -3657,10 +3676,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (fmt == "%W%y") {
       if (val.size() < 3 || val.size() > 4 ||
-          !std::ranges::all_of(val, [](char c) { return c >= '0' && c <= '9'; })) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "Failed to parse input string " +
-                               Value(std::move(val)).AsString());
+          !std::ranges::all_of(val,
+                               [](char c) { return c >= '0' && c <= '9'; })) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "Failed to parse input string " + Value(std::move(val)).AsString());
       }
       int w = 0, y = 0;
       if (val.size() == 3) {
@@ -4022,6 +4042,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // String functions
   if (name_view == "concat") {
     std::string result;
+    result.reserve(arguments.size());
     for (const Value& value : arguments) {
       if (value.IsNull()) {
         return Value();
@@ -4137,6 +4158,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                            name + " normalization mode must be a STRING");
       }
       std::string mode;
+      mode.reserve(raw_str(arguments[1]).size());
       for (char c : raw_str(arguments[1])) {
         mode.push_back(
             static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
@@ -4167,7 +4189,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string s = raw_str(arguments[0]);
     const std::string cutset =
-        arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
+        arguments.size() == 2 ? raw_str(arguments[1]) : kDefaultTrimCutset;
     // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
@@ -4184,7 +4206,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string s = raw_str(arguments[0]);
     const std::string cutset =
-        arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
+        arguments.size() == 2 ? raw_str(arguments[1]) : kDefaultTrimCutset;
     // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
@@ -4201,7 +4223,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string s = raw_str(arguments[0]);
     const std::string cutset =
-        arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
+        arguments.size() == 2 ? raw_str(arguments[1]) : kDefaultTrimCutset;
     // Code-point matching (see TrimCodePoints): byte-set matching cuts
     // multi-byte characters apart.
     return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/false,
@@ -4330,6 +4352,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       bounds = heap_bounds.data();
     }
     std::vector<int64_t> matches;  // every match cp+1, ascending
+    matches.reserve(source.size());
     size_t b_count = 0;
     size_t i = 0;
     for (;;) {
@@ -4368,6 +4391,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const size_t s_cps = b_count;
 
     std::vector<int64_t> ordered;
+    ordered.reserve(matches.size());
     if (position > 0) {
       const int64_t start_cp = position - 1;
       for (const int64_t cp1 : matches) {
@@ -4823,7 +4847,17 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "CHR requires an integer argument");
     }
-    const int64_t code = arguments[0].value.int_value;
+    int64_t code = arguments[0].value.int_value;
+    if (arguments[0].IsUnsigned()) {
+      // UINT64 keeps the kInt64 tag; the bit pattern is the true value and
+      // >= 2^63 would otherwise read back as a negative int64.
+      const uint64_t u = static_cast<uint64_t>(code);
+      if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
+        return StatusError(StatusCode::kIsInfinity,
+                           "CHR argument out of range");
+      }
+      code = static_cast<int64_t>(u);
+    }
     std::string res;
     if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
       return StatusError(StatusCode::kIsInfinity, "CHR argument out of range");
@@ -4860,9 +4894,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          "TO_CODE_POINTS requires a STRING or BYTES argument");
     }
     std::vector<Value> elements;
+    elements.reserve(arguments[0].value.varchar_value.size());
     for (const uint32_t cp :
          CodePointsOfBatch(arguments[0].value.varchar_value)) {
-      elements.push_back(Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
+      elements.push_back(
+          Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
     }
     return Value::Array(std::move(elements), "INT64");
   }
@@ -4914,6 +4950,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     std::string res;
+    res.reserve(arr.ArrayElements().size());
     for (const Value& elem : arr.ArrayElements()) {
       if (elem.IsNull()) {
         return Value();
@@ -4922,7 +4959,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return StatusError(StatusCode::kInvalidArgument,
                            "CODE_POINTS_TO_STRING requires INT64 elements");
       }
-      const int64_t cp = elem.value.int_value;
+      int64_t cp = elem.value.int_value;
+      if (elem.IsUnsigned()) {
+        // UINT64 elements keep the kInt64 tag; diagnose by the true value
+        // instead of letting >= 2^63 surface as a negative code point.
+        const uint64_t u = static_cast<uint64_t>(cp);
+        if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid code point for CODE_POINTS_TO_STRING: " +
+                                 std::to_string(u));
+        }
+        cp = static_cast<int64_t>(u);
+      }
       if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "invalid code point for CODE_POINTS_TO_STRING: " +
@@ -4960,6 +5008,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     std::string res;
+    res.reserve(arr.ArrayElements().size());
     for (const Value& elem : arr.ArrayElements()) {
       if (elem.IsNull()) {
         return Value();
@@ -4968,7 +5017,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return StatusError(StatusCode::kInvalidArgument,
                            "CODE_POINTS_TO_BYTES requires INT64 elements");
       }
-      const int64_t b = elem.value.int_value;
+      int64_t b = elem.value.int_value;
+      if (elem.IsUnsigned()) {
+        // UINT64 elements keep the kInt64 tag; diagnose by the true value
+        // instead of letting >= 2^63 surface as a negative byte.
+        const uint64_t u = static_cast<uint64_t>(b);
+        if (u > 255) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "invalid byte for CODE_POINTS_TO_BYTES: " + std::to_string(u));
+        }
+        b = static_cast<int64_t>(u);
+      }
       if (b < 0 || b > 255) {
         return StatusError(
             StatusCode::kInvalidArgument,
@@ -5242,6 +5302,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     int64_t end_idx =
         std::min(start_idx + len, static_cast<int64_t>(parts.size()));
     std::string res = parts[static_cast<size_t>(start_idx)];
+    res.reserve(static_cast<size_t>(end_idx - start_idx));
     for (int64_t i = start_idx + 1; i < end_idx; ++i) {
       res += delim + parts[static_cast<size_t>(i)];
     }
@@ -5261,6 +5322,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string delim =
         arguments.size() == 2 ? raw_str(arguments[1]) : ",";
     std::vector<Value> elems;
+    elems.reserve(s.size());
     if (delim.empty()) {
       if (s.empty()) {
         elems.emplace_back(std::string());
@@ -5309,6 +5371,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::string());
     }
     std::string res;
+    res.reserve(4);
     char first_letter = static_cast<char>(
         std::toupper(static_cast<unsigned char>(s[first_char])));
     res.push_back(first_letter);
@@ -5924,9 +5987,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], name));
     if (name_view == "log10") {
+      // Mirror the LN guard: x <= 0 is a domain error, not -inf/NaN.
+      if (v <= 0.0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "LOG10 of non-positive number");
+      }
       return Value(std::log10(v));
     }
     if (arguments.size() == 1) {
+      if (v <= 0.0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "LOG of non-positive number");
+      }
       return Value(std::log(v));
     }
     ASSIGN_OR_RETURN(double, base, to_numeric_double(arguments[1], "LOG base"));
@@ -5942,6 +6014,17 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (v == 1.0 && std::isinf(base)) {
       return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+    // Domain: x > 0 and base > 0 (base == 1 handled above).  Without these
+    // guards LOG(x, 0) returned +-0 and LOG(-1, b) / LOG(x, -b) returned
+    // NaN instead of erroring like LN/SQRT.
+    if (v <= 0.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOG of non-positive number");
+    }
+    if (base <= 0.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOG base must be positive");
     }
     return Value(std::log(v) / std::log(base));
   }
@@ -6238,8 +6321,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     // Only overflow of finite operands is suppressed; non-finite inputs keep
     // their IEEE result (SAFE_DIVIDE(0, NaN) is NaN), matching GoogleSQL and
     // the AST evaluator.
-    if (name_view == "safe_divide" && !std::isfinite(res) &&
-        std::isfinite(l) && std::isfinite(r)) {
+    if (name_view == "safe_divide" && !std::isfinite(res) && std::isfinite(l) &&
+        std::isfinite(r)) {
       return Value();
     }
     return Value(res);
@@ -6540,6 +6623,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          "cannot format array element");
     };
     std::string out;
+    out.reserve(arguments[0].ArrayElements().size());
     bool first = true;
     for (const Value& element : arguments[0].ArrayElements()) {
       if (element.IsNull()) {
@@ -6655,6 +6739,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          "ARRAY_CONCAT requires at least 1 argument");
     }
     std::vector<Value> merged;
+    merged.reserve(arguments.size());
     std::string element_type;
     for (const Value& arr : arguments) {
       if (arr.IsNull()) {
@@ -6741,6 +6826,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     begin = std::max<int64_t>(begin, 0);
     end = std::min<int64_t>(end, n);
     std::vector<Value> picked;
+    picked.reserve(static_cast<size_t>(std::max<int64_t>(0, end - begin)));
     for (int64_t i = begin; i < end; ++i) {
       picked.push_back(elements[static_cast<size_t>(i)]);
     }
@@ -7242,7 +7328,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     static constexpr std::string_view kAlphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    static constexpr size_t kPadChars[] = {0, 6, 4, 3, 1};  // NOLINT(modernize-avoid-c-arrays)
+    static constexpr size_t kPadChars[] = {
+        0, 6, 4, 3, 1};  // NOLINT(modernize-avoid-c-arrays)
     const std::string input = raw_str(arguments[0]);
     std::string out;
     out.reserve((input.size() + 4) / 5 * 8);

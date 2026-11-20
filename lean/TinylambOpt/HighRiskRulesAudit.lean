@@ -37,8 +37,7 @@ def setOpSame : DoubleSqlVal → DoubleSqlVal → Bool
   | .num a, .num b => a == b
   | _,      _      => false
 
-/-- `tinylamb` の `BinaryOperation::kIsNotDistinctFrom` (`binary_expression.cpp:451-455`) の実際の評価:
-    両側非 `NULL` のとき `kEquals` に委譲するため、`NaN` 同士が **`false`** になる！ -/
+/-- 修正前の IS NOT DISTINCT FROM のモデル。現行 C++ は両辺が NaN の場合に真を返し、集合演算と一致する。 -/
 def cppIsNotDistinctFromDouble : DoubleSqlVal → DoubleSqlVal → SqlBool
   | .null,  .null  => .tTrue
   | .null,  _      => .tFalse
@@ -47,7 +46,7 @@ def cppIsNotDistinctFromDouble : DoubleSqlVal → DoubleSqlVal → SqlBool
   | _,      .nan   => .tFalse
   | .num a, .num b => if a == b then .tTrue else .tFalse
 
-/-- 🚨 **実在バグ証明 H1a (`intersect_to_semijoin` / `except_to_antijoin` の `NaN` 不整合)**:
+/-- 🚨 **修正前の実装に対する反例 H1a (`intersect_to_semijoin` / `except_to_antijoin` の `NaN` 不整合)**:
     `DOUBLE` 列に `NaN` が含まれるとき、`INTERSECT` は `[NaN]` を返すが
     `IS NOT DISTINCT FROM` による `SemiJoin` は `[]` を返し、
     `EXCEPT` は `[]` を返すが `AntiJoin` は `[NaN]` を残してしまう！ -/
@@ -990,9 +989,7 @@ theorem boolean_eq_true_false_three_valued_sound (x : SqlBool) :
   cases x <;> decide
 
 /-- SQL の `x IN (list)` の三値評価（`Option Int` 要素リスト）。 -/
-def sqlInList (x : SqlVal Int) : List (SqlVal Int) → SqlBool
-  | [] => .tFalse
-  | y :: ys => (sqlEq x y).or (sqlInList x ys)
+abbrev sqlInList (x : SqlVal Int) := evalInList x
 
 private theorem sqlOr_assoc (a b c : SqlBool) : (a.or b).or c = a.or (b.or c) := by
   cases a <;> cases b <;> cases c <;> rfl
@@ -1001,10 +998,10 @@ private theorem sqlInList_append (x : SqlVal Int) (l1 l2 : List (SqlVal Int)) :
     sqlInList x (l1 ++ l2) = (sqlInList x l1).or (sqlInList x l2) := by
   induction l1 with
   | nil =>
-    simp only [List.nil_append, sqlInList]
-    cases sqlInList x l2 <;> rfl
+    simp only [List.nil_append, sqlInList, empty_in_is_false]
+    cases evalInList x l2 <;> rfl
   | cons y tl ih =>
-    simp only [List.cons_append, sqlInList, ih, sqlOr_assoc]
+    simp only [List.cons_append, sqlInList, evalInList_cons, ih, sqlOr_assoc]
 
 /-- ✅ **完全正当性定理 (`contradiction_from_null_eq`, `in_single_null`, `not_in_null_semantics`)**:
     `NOT (x IN (c1, ..., cn, NULL))` は任意の `x : SqlVal Int`（`NULL` 含む）および任意の定数リスト `cs` に対して

@@ -425,6 +425,7 @@ TEST(SortCollationTest, CollatedSortFoldsEveryKeyOfACompositeOrder) {
   auto names = std::make_shared<SortExecutor>(
       std::make_shared<ConstantExecutor>(rows), TextSchema(), TwoKeys());
   std::vector<std::string> texts;
+  texts.reserve(rows.size());
   Row row;
   RowPosition position;
   while (names->Next(&row, &position)) {
@@ -451,6 +452,7 @@ TEST(SortCollationTest, MixedBinaryAndCiCompositeKeysKeepGroupOrder) {
       std::make_shared<ConstantExecutor>(rows), TwoTextSchema(),
       std::move(keys));
   std::vector<std::string> texts;
+  texts.reserve(rows.size());
   Row row;
   RowPosition position;
   while (sort->Next(&row, &position)) {

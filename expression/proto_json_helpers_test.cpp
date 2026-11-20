@@ -96,7 +96,16 @@ TEST(JsonStructHelpersTest, EncodeStructMemberJsonCoversValueTypes) {
   auto nested =
       TryEncodeStructMemberJson(Value::Array({Value(int64_t{1})}, "INT64"));
   ASSERT_TRUE(nested.HasValue());
-  EXPECT_EQ(nested.MoveValue(), "ARRAY<INT64>[1]");
+  // Array members encode as JSON arrays (T2819): the bespoke struct reader
+  // decodes `[...]` back to an ARRAY instead of the lossy display text.
+  EXPECT_EQ(nested.MoveValue(), "[1]");
+  Value round_tripped;
+  ASSERT_TRUE(JsonTextToValue("[1, null, 3]", &round_tripped));
+  ASSERT_TRUE(round_tripped.IsArray());
+  EXPECT_EQ(round_tripped.ArrayElements().size(), 3);
+  EXPECT_EQ(round_tripped.ArrayElements()[0].value.int_value, 1);
+  EXPECT_TRUE(round_tripped.ArrayElements()[1].IsNull());
+  EXPECT_EQ(round_tripped.ArrayElements()[2].value.int_value, 3);
 }
 
 TEST(JsonStructHelpersTest, TryStructSetFieldCreatesAndUpdates) {

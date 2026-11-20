@@ -488,8 +488,11 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
   // no branch column (their branch cell is a placeholder), so terms naming a
   // window alias stay unresolved and bind to the wrapper's own output.
   std::unordered_map<std::string, size_t> entry_by_name;
+  entry_by_name.reserve(statement->SelectList().size());
   std::unordered_map<std::string, size_t> entry_by_text;
+  entry_by_text.reserve(statement->SelectList().size());
   std::unordered_set<std::string> window_entry_names;
+  window_entry_names.reserve(statement->SelectList().size());
   const std::vector<NamedExpression>& base_list = statement->SelectList();
   for (size_t j = 0; j < base_list.size(); ++j) {
     const NamedExpression& item = base_list[j];
@@ -553,6 +556,7 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
     return WithExpressionChildren(expression, std::move(children));
   };
   std::vector<SelectStatement::OrderByTerm> wrapper_terms;
+  wrapper_terms.reserve(statement->OrderBy().size());
   for (SelectStatement::OrderByTerm term : statement->OrderBy()) {
     if (term.expression && term.expression->Type() == TypeTag::kConstantValue) {
       // Ordinal terms resolve against the wrapper's select list, whose entry
@@ -609,6 +613,7 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
   const auto inactive_bare_key_aliases =
       [&](const GroupingSetBranchContext& context) {
         std::unordered_set<std::string> out;
+        out.reserve(context.all_key_texts.size());
         for (const auto& set : pending_grouping_sets) {
           for (const Expression& key : set) {
             if (!key || key->Type() != TypeTag::kColumnValue) {
@@ -769,7 +774,8 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
 // UNPIVOT subquery source. Everything that describes how this source joins
 // to its siblings must survive that replacement, otherwise a PIVOT on the
 // right operand of a JOIN silently turns the join into a cross product.
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
 static void CarryPivotJoinContext(const SelectSource& from, SelectSource* to) {
   to->join_type = from.join_type;
   to->join_condition = from.join_condition;
@@ -812,6 +818,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
     bool distinct{false};
   };
   std::vector<PivotAggInfo> aggs;
+  aggs.reserve(expr_list->Children("PivotExpression").size());
   for (const GoogleSqlAstNode* pe : expr_list->Children("PivotExpression")) {
     PivotAggInfo info;
     ASSIGN_OR_RETURN(std::string, hv156297_0, (Alias(*pe)));
@@ -828,7 +835,8 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
     if (fn_call != nullptr) {
       // `COUNT(DISTINCT x)` carries distinct=true in the AST node detail;
       // dropping it would count duplicate inputs and produce wrong pivots.
-      info.distinct = fn_call->detail.find("distinct=true") != std::string::npos;
+      info.distinct =
+          fn_call->detail.find("distinct=true") != std::string::npos;
       if (const GoogleSqlAstNode* fn_path = fn_call->Child("PathExpression")) {
         ASSIGN_OR_RETURN(std::string, hv156707_0, (Path(*fn_path)));
         info.func_name = std::move(hv156707_0);
@@ -851,7 +859,9 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
   }
 
   std::vector<NamedExpression> projections;
+  projections.reserve(base.query->SelectList().size());
   std::unordered_set<std::string> agg_column_names;
+  agg_column_names.reserve(aggs.size());
   for (const auto& agg : aggs) {
     // Only a plain column-reference aggregate argument is an implicit GROUP BY
     // candidate. COUNT(1) / COUNTIF(p) / MAX(CASE ...) etc. are expressions;
@@ -863,6 +873,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
   }
 
   std::vector<Expression> group_by_exprs;
+  group_by_exprs.reserve(base.query->SelectList().size());
   if (base.query) {
     for (const NamedExpression& named : base.query->SelectList()) {
       if (Lower(named.name) != Lower(pivot_col_name) &&
@@ -891,8 +902,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
     std::string val_alias = std::move(hv158283_0);
     if (val_alias.empty()) {
       if (val_node->kind == "StringLiteral") {
-        ASSIGN_OR_RETURN(std::string, decoded_alias,
-                         (DecodeString(*val_node)));
+        ASSIGN_OR_RETURN(std::string, decoded_alias, (DecodeString(*val_node)));
         val_alias = std::move(decoded_alias);
       }
       if (val_alias.empty()) {
@@ -974,12 +984,14 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
   auto pivot_subquery = std::make_shared<SelectStatement>();
   pivot_subquery->SetSelectList(std::move(projections));
   std::string saved_alias = base.alias;
-  const SelectSource saved_join_context = base;  // base is moved into the subquery
+  const SelectSource saved_join_context =
+      base;  // base is moved into the subquery
   pivot_subquery->SetSources({std::move(base)});
   if (!group_by_exprs.empty()) {
     pivot_subquery->SetGroupBy(std::move(group_by_exprs));
   } else {
     std::vector<Expression> inferred;
+    inferred.reserve(pivot_subquery->SelectList().size());
     for (const NamedExpression& named : pivot_subquery->SelectList()) {
       if (named.expression && !ContainsAggregate(named.expression)) {
         inferred.push_back(named.expression);
@@ -1043,8 +1055,7 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
             item->Child("UnpivotInItemLabel")) {
       if (const GoogleSqlAstNode* str_node =
               label_node->Child("StringLiteral")) {
-        ASSIGN_OR_RETURN(std::string, decoded_label,
-                         (DecodeString(*str_node)));
+        ASSIGN_OR_RETURN(std::string, decoded_label, (DecodeString(*str_node)));
         in_label = std::move(decoded_label);
       } else if (!label_node->children.empty()) {
         in_label = label_node->children[0]->detail;
@@ -1056,7 +1067,9 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
     // the branch would keep the original IN columns as duplicate output.
     // Expand the base select list explicitly, skipping every IN source column.
     std::unordered_set<std::string> in_columns;
+    in_columns.reserve(in_items->Children("UnpivotInItem").size());
     std::vector<std::string> except_cols;
+    except_cols.reserve(in_items->Children("UnpivotInItem").size());
     for (const GoogleSqlAstNode* other : in_items->Children("UnpivotInItem")) {
       if (const GoogleSqlAstNode* list = other->Child("ExpressionList")) {
         if (!list->children.empty()) {
@@ -1074,11 +1087,12 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
         if (named.expression &&
             named.expression->Type() == TypeTag::kColumnValue &&
             named.expression->AsColumnValue().GetColumnName().name != "*") {
-          const std::string col = Lower(
-              named.name.empty()
-                  ? named.expression->AsColumnValue().GetColumnName().name
-                  : named.name);
-          if (in_columns.contains(col)) continue;  // NOLINT(readability-braces-around-statements)
+          const std::string col =
+              Lower(named.name.empty()
+                        ? named.expression->AsColumnValue().GetColumnName().name
+                        : named.name);
+          if (in_columns.contains(col))
+            continue;  // NOLINT(readability-braces-around-statements)
           branch_select.emplace_back(
               named.name,
               ColumnValueExp(ColumnName(
@@ -1574,8 +1588,7 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
         return AstError<std::unique_ptr<Statement>>(
             "PRIMARY KEY column not found: " + key_columns[0]);
       }
-      const Constraint::ConstraintType existing =
-          target->GetConstraint().ctype;
+      const Constraint::ConstraintType existing = target->GetConstraint().ctype;
       if (existing == Constraint::kPrimaryKey) {
         continue;
       }
@@ -1689,9 +1702,9 @@ InsertMode InsertModeFromDetail(const std::string& detail) {
   if (pos == std::string::npos) {
     return InsertMode::kDefault;
   }
-  if (pos > 0 && (std::isalnum(static_cast<unsigned char>(detail[pos - 1])) !=
-                      0 ||
-                  detail[pos - 1] == '_')) {
+  if (pos > 0 &&
+      (std::isalnum(static_cast<unsigned char>(detail[pos - 1])) != 0 ||
+       detail[pos - 1] == '_')) {
     return InsertMode::kDefault;
   }
   size_t end = pos + kKey.size();
@@ -1807,8 +1820,7 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
         return AstStatus(
             "GoogleSQL AST: nested DML RETURNING is not supported");
       }
-      if (child->kind == "Alias" ||
-          child->kind == "FromClause") {
+      if (child->kind == "Alias" || child->kind == "FromClause") {
         continue;
       }
       candidates.push_back(child.get());

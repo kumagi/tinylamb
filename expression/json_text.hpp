@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -332,9 +333,21 @@ inline std::string ToJsonText(const Value& value) {
       }
       return value.AsString();
     case ValueType::kDouble:
+      // JSON has no NaN/Infinity literals; keep the output parseable by
+      // quoting non-finite values, matching the struct-member encoder's
+      // "NaN" / "Infinity" / "-Infinity" convention.
+      if (std::isnan(value.value.double_value)) {
+        return "\"NaN\"";
+      }
+      if (std::isinf(value.value.double_value)) {
+        return value.value.double_value > 0 ? "\"Infinity\"" : "\"-Infinity\"";
+      }
       return FormatDoubleShortest(value.value.double_value);
+    case ValueType::kNull:
+      return "null";
     case ValueType::kArray: {
       std::string out = "[";
+      out.reserve(value.ArrayElements().size() + 2);
       bool first = true;
       for (const Value& element : value.ArrayElements()) {
         if (!first) {

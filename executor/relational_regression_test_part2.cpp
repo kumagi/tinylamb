@@ -49,6 +49,7 @@ TEST_F(RelationalRegressionTest, TypedAggregateUsesResolvedOrderNodes) {
           relational_detail::Relation, result,
           relational_detail::ExecuteQuery(context, statement, nullptr, {}));
       std::vector<Row> expected;
+      expected.reserve(3);
       for (int64_t k = 2; k < 5; ++k) {
         expected.emplace_back(hidden ? Row({Value(k)})
                                      : Row({Value(k), Value(20)}));
@@ -232,6 +233,7 @@ TEST_F(RelationalRegressionTest,
   for (int64_t target = 0; target < 20; ++target) {
     const std::string value = std::to_string(target);
     std::vector<Row> expected;
+    expected.reserve(40000);
     for (int64_t i = 0; i < 40000; ++i) {
       if (i % 29 != 0 && (i % 10003) * 3 == target) {
         expected.emplace_back(std::vector<Value>{Value(target), Value(i)});
@@ -1167,6 +1169,7 @@ TEST_F(RelationalRegressionTest, ResidentSetOperationsPreserveMultiplicities) {
 
 TEST_F(RelationalRegressionTest, WindowProjectionTransfersVisibleColumns) {
   std::vector<Row> expected;
+  expected.reserve(60);
   for (int64_t key = 0; key < 3; ++key) {
     for (int64_t duplicate = 0; duplicate < 20; ++duplicate) {
       expected.emplace_back(Row({Value(key), Value(1), Value((key * 20) + 1)}));
@@ -1213,6 +1216,7 @@ TEST_F(RelationalRegressionTest, OuterMatchUnionKeepsNullsAndMultiplicity) {
   RelationalRun(*rs_,
                 "INSERT INTO MatchB VALUES (1,1,3),(3,3,5),(3,3,5),(NULL,1,4)");
   std::vector<Row> probes;
+  probes.reserve(8192);
   {
     auto setup = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
@@ -1637,8 +1641,11 @@ TEST_F(RelationalRegressionTest, CompactStatisticsKeepSequentialMoments) {
       AggregationType::kVarPop,    AggregationType::kVarSamp,
       AggregationType::kStddevPop, AggregationType::kStddevSamp};
   std::vector<std::shared_ptr<AggregateExpression>> owned;
+  owned.reserve(kinds.size());
   std::vector<const AggregateExpression*> aggregates;
+  aggregates.reserve(kinds.size());
   std::vector<NamedExpression> items{NamedExpression("g", ColumnValueExp("g"))};
+  items.reserve(kinds.size() + 2);
   for (size_t i = 0; i < kinds.size(); ++i) {
     owned.push_back(std::make_shared<AggregateExpression>(
         kinds[i], ColumnValueExp(i == 0 ? "*" : "v")));
@@ -2356,6 +2363,7 @@ TEST_F(RelationalRegressionTest, NullLeadingProjectionRetainsUniformTypes) {
         }
         const auto original = input.rows;
         std::vector<NamedExpression> items;
+        items.reserve(width);
         for (size_t i = 0; i < width; ++i) {
           Expression value = ColumnValueExp("v");
           if (computed) {

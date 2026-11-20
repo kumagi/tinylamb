@@ -256,6 +256,7 @@ Result Run(const std::string& mode, const Options& o,
   locals.reserve(producers);
   std::vector<WorkerStats> stats(producers);
   std::vector<std::unique_ptr<Ring>> rings;
+  rings.reserve(producers);
   std::vector<std::vector<std::vector<Partial>>> buffered(producers);
   for (size_t w = 0; w < producers; ++w) {
     locals.emplace_back(o.local_groups);
@@ -273,6 +274,7 @@ Result Run(const std::string& mode, const Options& o,
   std::barrier phase(static_cast<std::ptrdiff_t>(o.threads));
   std::atomic<bool> start{false};
   std::vector<std::jthread> team;
+  team.reserve(producers);
   const auto produce = [&](size_t w) {
     if (pipeline) {
       Ring& ring = *rings[w];
@@ -476,6 +478,7 @@ void SelfTest() {
     o.batch_entries = 3;
     o.morsel_rows = 19;
     std::vector<Row> rows;
+    rows.reserve(n);
     std::vector<State> expected(101);
     for (size_t i = 0; i < n; ++i) {
       const size_t key = Mix(i) % expected.size();

@@ -420,6 +420,7 @@ TEST_F(ExecutorTest, RelationalNumericAndVarcharBinaryOperators) {
       "BY key;");
   ASSERT_EQ(numeric.size(), 4U);
   std::unordered_set<int64_t> seen;
+  seen.reserve(numeric.size());
   for (const Row& row : numeric) {
     seen.insert(row[0].value.int_value - 1);  // undo "key + 1"
     EXPECT_EQ(row[0].value.int_value, row[1].value.int_value + 2);
@@ -619,7 +620,9 @@ TEST_F(ExecutorTest, HashJoinUnsignedBoundaryDoesNotCollide) {
 
 TEST_F(ExecutorTest, HashJoinNextBatchSplitsOutput) {
   std::vector<Row> left_rows;
+  left_rows.reserve(5);
   std::vector<Row> right_rows;
+  right_rows.reserve(5);
   for (int64_t i = 0; i < 5; ++i) {
     left_rows.emplace_back(Row({Value(i)}));
     right_rows.emplace_back(Row({Value(i)}));
@@ -628,6 +631,7 @@ TEST_F(ExecutorTest, HashJoinNextBatchSplitsOutput) {
                 std::make_shared<ConstantExecutor>(std::move(right_rows)), {0},
                 HashJoinMode::kInMemory, 2);
   std::unordered_set<Row> expected;
+  expected.reserve(5);
   for (int64_t i = 0; i < 5; ++i) {
     expected.insert(Row({Value(i), Value(i)}));
   }
@@ -652,7 +656,9 @@ TEST_F(ExecutorTest, HashJoinReactiveSpillIntKeyUnderBudget) {
   // 400 x ~232B rows exceed the 65536B soft budget, so MaterializeInMemory
   // reactively spills the build side to disk and probes against it.
   std::vector<Row> left_rows;
+  left_rows.reserve(400);
   std::vector<Row> right_rows;
+  right_rows.reserve(400);
   for (int64_t i = 0; i < 400; ++i) {
     std::string payload = "row-" + std::to_string(i);
     payload.resize(96, 'x');
@@ -709,7 +715,9 @@ TEST_F(ExecutorTest, HashJoinReactiveSpillRightSideTriggersFlush) {
   // the spill flush branch must move the resident left_rows AND right_rows
   // into their spill partitions before probing from disk.
   std::vector<Row> left_rows;
+  left_rows.reserve(50);
   std::vector<Row> right_rows;
+  right_rows.reserve(400);
   for (int64_t i = 0; i < 50; ++i) {
     std::string payload = "row-" + std::to_string(i);
     payload.resize(96, 'x');
@@ -743,7 +751,9 @@ TEST_F(ExecutorTest, HashJoinReactiveSpillStringKeyUnderBudget) {
   // String (VARCHAR) join key: both build and probe sides spill, then each
   // hash partition is joined from its spill file.
   std::vector<Row> left_rows;
+  left_rows.reserve(300);
   std::vector<Row> right_rows;
+  right_rows.reserve(300);
   for (int64_t i = 0; i < 300; ++i) {
     std::string name = "name-" + std::to_string(i);
     name.resize(96, 'x');
@@ -770,7 +780,9 @@ TEST_F(ExecutorTest, HashJoinHybridAllSpilledUnderBudget) {
   // 256B budget: even partition 0 cannot stay resident, so every build and
   // probe row is spilled and all 32 partitions are joined back from disk.
   std::vector<Row> left_rows;
+  left_rows.reserve(200);
   std::vector<Row> right_rows;
+  right_rows.reserve(200);
   for (int64_t i = 0; i < 200; ++i) {
     std::string payload = "row-" + std::to_string(i);
     payload.resize(96, 'x');
@@ -799,7 +811,9 @@ TEST_F(ExecutorTest, HashJoinHybridResidentProbeImmediate) {
   // Unlimited budget: partition 0 stays resident and left rows are probed
   // against it immediately; every other partition spills to disk.
   std::vector<Row> left_rows;
+  left_rows.reserve(200);
   std::vector<Row> right_rows;
+  right_rows.reserve(200);
   for (int64_t i = 0; i < 200; ++i) {
     std::string payload = "row-" + std::to_string(i);
     payload.resize(96, 'x');
@@ -826,7 +840,9 @@ TEST_F(ExecutorTest, HashJoinHybridResidentOverflowFoldsBuild) {
   // overflows into right_spill[0]; the resident build rows are folded into the
   // spilled partition before the join.
   std::vector<Row> left_rows;
+  left_rows.reserve(2000);
   std::vector<Row> right_rows;
+  right_rows.reserve(2000);
   for (int64_t i = 0; i < 2000; ++i) {
     std::string payload = "row-" + std::to_string(i);
     payload.resize(96, 'x');
@@ -1059,6 +1075,7 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
   // 300 wide rows descending under a 16384B budget; every row's RowPosition
   // must survive the spill/merge round trip.
   std::vector<Row> rows;
+  rows.reserve(300);
   for (int64_t i = 0; i < 300; ++i) {
     std::string payload = "row-" + std::to_string(i);
     payload.resize(96, 'x');
@@ -1119,7 +1136,9 @@ TEST_F(ExecutorTest, HashJoinVarcharAndDoubleKeysAndGrowth) {
                                     Column("dkey", ValueType::kDouble),
                                     Column("val", ValueType::kInt64)}}));
   std::vector<Row> left_rows;
+  left_rows.reserve(30);
   std::vector<Row> right_rows;
+  right_rows.reserve(30);
   for (int i = 0; i < 30; ++i) {
     std::string v = "long_varchar_key_" + std::to_string(i);
     double d = static_cast<double>(i) * 1.5;
@@ -1361,6 +1380,7 @@ TEST_F(ExecutorTest, OptimizerAndRelationalPathsAgree) {
   for (const auto& [optimizer_sql, relational_sql] : pairs) {
     const auto normalize = [](const std::vector<Row>& rows) {
       std::vector<std::string> lines;
+      lines.reserve(rows.size());
       for (const Row& row : rows) {
         std::ostringstream out;
         out << row;
@@ -1757,6 +1777,7 @@ TEST_F(ExecutorTest, AffineSumFoldsShareColumnsAndPreserveNullsAndOverflow) {
     const std::string name = "AffineSum" + std::to_string(test);
     const Schema schema(name, {Column("value", ValueType::kInt64)});
     std::vector<Row> reference;
+    reference.reserve(cases[test].size());
     {
       auto writer = rs_->BeginContext();
       ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
@@ -1996,6 +2017,7 @@ TEST_F(ExecutorTest, DictionaryTopNUsesProvenOrderAndPreservesSecondaryTies) {
                                Column("padding", ValueType::kVarChar),
                                Column("g", ValueType::kInt64)});
     std::vector<Row> reference;
+    reference.reserve(8192);
     {
       auto writer = rs_->BeginContext();
       ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
@@ -2383,6 +2405,7 @@ TEST_F(ExecutorTest, WideDictionaryDistinctAndMembershipUseVisibleRows) {
                                           Column("n", ValueType::kInt64)});
   std::vector<Value> texts{Value(), Value(""), Value("0-12 0 0:0:0"),
                            Value("1-0 0 0:0:0")};
+  texts.reserve(texts.size() + 300);
   for (size_t i = 0; i < 300; ++i) {
     std::string text(80, 'x');
     text += std::to_string(i);
@@ -2408,6 +2431,7 @@ TEST_F(ExecutorTest, WideDictionaryDistinctAndMembershipUseVisibleRows) {
                         reader.GetTable("EncodedDistinct"));
   for (const int64_t bound : {int64_t{0}, int64_t{30}, kRows * 3}) {
     std::unordered_set<Value> expected;
+    expected.reserve(static_cast<size_t>(bound / 3) + 1);
     for (int64_t i = 0; i * 3 < bound; ++i) {
       const auto& text = texts[static_cast<size_t>(i) % texts.size()];
       if (!text.IsNull()) {

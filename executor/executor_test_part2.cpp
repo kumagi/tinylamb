@@ -60,6 +60,7 @@ TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
   // Values 1..100 with one interior and one trailing null: the columnar fast
   // path must skip nulls exactly like the generic per-row path.
   std::vector<Row> rows;
+  rows.reserve(100);
   for (int64_t value = 1; value <= 100; ++value) {
     rows.push_back(Row({Value(value)}));
   }
@@ -510,7 +511,9 @@ TEST_F(ExecutorTest, ParallelMergeJoinEmittedForLargeSortedInputs) {
 
 TEST_F(ExecutorTest, SequentialMergeJoinEmittedForSmallInputs) {
   std::vector<Row> left_rows;
+  left_rows.reserve(100);
   std::vector<Row> right_rows;
+  right_rows.reserve(100);
   for (int64_t i = 0; i < 100; ++i) {
     left_rows.emplace_back(Row({Value(i), Value(i)}));
     right_rows.emplace_back(Row({Value(i), Value(i * 2)}));
@@ -1381,6 +1384,7 @@ TEST_F(ExecutorTest, RelationalHybridHashJoinSpillsUnderBudget) {
   const auto rows = RelationalRun(*rs_, sql);
   ASSERT_EQ(rows.size(), 200U);
   std::unordered_set<int64_t> keys;
+  keys.reserve(rows.size());
   for (const Row& row : rows) {
     EXPECT_TRUE(keys.insert(row[0].value.int_value).second);
     ASSERT_EQ(row.Count(), 3U);
@@ -1543,6 +1547,7 @@ TEST_F(ExecutorTest, RelationalNullableJoinKeysDoNotMatch) {
       "a.k = b.k;");
   ASSERT_EQ(left_rows.size(), 3U);
   std::unordered_set<Row> null_extended;
+  null_extended.reserve(left_rows.size());
   for (const Row& row : left_rows) {
     null_extended.insert(row);
   }

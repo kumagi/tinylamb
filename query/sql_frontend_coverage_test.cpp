@@ -410,6 +410,7 @@ TEST_F(SqlFrontendCoverageTest, RejectedSyntax) {
   ExpectError("SELECT s FROM t WHERE ILIKE");
   // Deeply nested expressions hit the visitor's depth guard.
   std::string deep = "SELECT";
+  deep.reserve(deep.size() + 120 * 20 + 2 + 120 * 4);
   for (int i = 0; i < 120; ++i) {
     deep += " CASE WHEN TRUE THEN";
   }

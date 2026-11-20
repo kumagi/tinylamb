@@ -54,15 +54,13 @@ graph TD
 
 (2) PARTITION BY 式が**単純な列参照**(`kColumnValue`)であるものだけを
 パーティション列の集合に加えます。式(例: `p + 1`)は列集合に寄与しません。
-列参照が 1 つも集まらなければ発火しません。
+各ウィンドウ関数の PARTITION BY にも現れる列だけを残します。この共通部分が空なら発火しません。
 
 ```cpp
-            std::unordered_set<std::string> partition_cols;
+            std::vector<ColumnName> partition_cols;
             for (const auto& p : win_expr.partition_by) {
               if (p && p->Type() == TypeTag::kColumnValue) {
-                const auto& c = p->AsColumnValue().GetColumnName();
-                partition_cols.insert(c.ToString());
-                partition_cols.insert(c.name);
+                partition_cols.push_back(p->AsColumnValue().GetColumnName());
               }
             }
 ```
@@ -70,15 +68,17 @@ graph TD
 (3) 連言の各項は次の全てを満たすとき「押せる」になります。
 
 ```cpp
-              bool can_push = true;
+              bool can_push = SafeToReduceEvaluationCount(conjunct);
               auto touched = conjunct->TouchedColumns();
               if (touched.empty()) {
                 can_push = false;
               }
               for (const auto& col : touched) {
-                if (window_outputs.contains(col.name) ||
-                    (!partition_cols.contains(col.ToString()) &&
-                     !partition_cols.contains(col.name))) {
+                const bool in_partition = std::ranges::any_of(
+                    partition_cols, [&](const ColumnName& partition) {
+                      return SameColumnReference(col, partition);
+                    });
+                if (window_outputs.contains(col.name) || !in_partition) {
                   can_push = false;
                   break;
                 }
@@ -87,7 +87,7 @@ graph TD
 
 - 触れる列が 1 つもない(定数述語など)場合は押しません。
 - 触れる列が 1 つでも**ウィンドウの出力名**(`rn` など)であれば押しません。
-- 触れる列が 1 つでもパーティション列(修飾名・非修飾名のどちらでも)に
+- 触れる列が 1 つでも共通のパーティション列（`SameColumnReference` で照合）に
   含まれなければ押しません。
 
 (4) 押せる項が 1 つもなければ発火しません。派生グループ

@@ -855,6 +855,7 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
     GTEST_SKIP() << "skipped";
   }
   std::string sql = "SELECT 1";
+  sql.reserve(sql.size() + 600 * 2 + 1);
   for (int i = 0; i < 600; ++i) {
     sql += "+1";
   }
@@ -920,6 +921,7 @@ TEST(GoogleSqlAstTest, DeeplyIndentedDumpParsesIteratively) {
   // Iterative construction accepts the maximum supported depth. The next
   // level is rejected by BoundsDepthBeforeRecursiveWalks.
   std::string dump = "root\n";
+  dump.reserve(2 * kMaxGoogleSqlAstDepth * kMaxGoogleSqlAstDepth);
   for (size_t i = 1; i < kMaxGoogleSqlAstDepth; ++i) {
     dump.append(i * 2, ' ');
     dump.append("node\n");

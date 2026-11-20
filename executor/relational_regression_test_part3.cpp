@@ -3170,6 +3170,7 @@ TEST_F(RelationalRegressionTest, LeftNullKeyFilterKeepsOnlyUnmatchedRows) {
       " FROM AntiFact f LEFT JOIN AntiDim d "
       "ON f.a=d.a AND f.b=d.b";
   std::vector<Row> expected;
+  expected.reserve(5);
   for (const int v : {3, 4, 6, 7, 8}) {
     expected.emplace_back(Row({Value(v), Value()}));
   }
@@ -3235,6 +3236,7 @@ TEST_F(RelationalRegressionTest, ParallelUnmatchedLeftJoinPreservesRows) {
                 "INSERT INTO AntiBuild VALUES "
                 "(1,10,2),(1,10,NULL),(2,20,3),(NULL,10,4),(3,NULL,5)");
   std::vector<Row> expected;
+  expected.reserve(65536);
   {
     auto context = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,

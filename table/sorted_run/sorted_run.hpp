@@ -51,6 +51,7 @@ class SortedRun final {
         : key_offset_(k), row_offset_(r), is_deleted_(del) {}
     [[nodiscard]] int Compare(std::string_view rhs,
                               const std::vector<char>& blob) const;
+    [[nodiscard]] std::string_view KeyView(const std::vector<char>& blob) const;
     [[nodiscard]] std::string BuildKey(const std::vector<char>& blob) const;
     [[nodiscard]] Row BuildRow(const std::vector<char>& blob,
                                const Schema& sc) const;

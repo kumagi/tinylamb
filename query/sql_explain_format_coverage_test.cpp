@@ -86,6 +86,7 @@ class SqlExplainFormatCoverageTest : public ::testing::Test {
     const auto rows = RunSql(engine_.get(), context_.get(), sql);
     ASSERT_FALSE(rows.empty());
     std::string plan;
+    plan.reserve(rows.size());
     for (const Row& row : rows) {
       ASSERT_EQ(row.values_.size(), 1U);
       plan += row[0].AsString();
@@ -108,6 +109,7 @@ class SqlExplainFormatCoverageTest : public ::testing::Test {
     const auto rows = RunSql(engine_.get(), context_.get(), sql);
     ASSERT_FALSE(rows.empty());
     std::string plan;
+    plan.reserve(rows.size());
     for (const Row& row : rows) {
       plan += row[0].AsString();
       plan += "\n";

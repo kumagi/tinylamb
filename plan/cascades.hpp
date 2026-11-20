@@ -409,8 +409,13 @@ class Pattern {
                            Bindings* bindings) const;
 
  private:
-  [[nodiscard]] bool MatchGroup(const Memo& memo, GroupId group,
-                                Bindings* bindings) const;
+  using CaptureLog = std::vector<const std::string*>;
+  bool MatchExpression(const Memo& memo, GroupId group,
+                       const LogicalExpression& expression, Bindings* bindings,
+                       CaptureLog* inserted) const;
+  bool Capture(GroupId group, Bindings* bindings, CaptureLog* inserted) const;
+  bool MatchGroup(const Memo& memo, GroupId group, Bindings* bindings,
+                  CaptureLog* inserted) const;
   [[nodiscard]] bool MatchPayload(const Memo& memo,
                                   const LogicalExpression& expression,
                                   const Bindings& bindings) const;

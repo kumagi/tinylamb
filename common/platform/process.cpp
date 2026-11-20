@@ -211,6 +211,7 @@ int RunProcess(
   }
 
   std::vector<std::pair<std::string, std::string>> saved_env;
+  saved_env.reserve(env_overrides.size());
   for (const auto& [k, v] : env_overrides) {
     // T2621: SetEnv/CommandLine both stop at an embedded NUL; reject up
     // front like the POSIX branch does instead of applying a truncated

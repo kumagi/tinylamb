@@ -33,14 +33,81 @@ graph TD
 3. そのソート式の最初の子 Group が、現在の親 Group 自身と一致しないこと（循環参照防止）。
 
 ```cpp
-    // eliminate_sort_under_unordered_consumer: Aggregation(Sort(X)) ->
-    // Aggregation(X) when the aggregation does not have order-sensitive
-    // requirements.
     built.Add(Rule(
         "eliminate_sort_under_unordered_consumer",
         Aggregation(Sort(Any(), "inner")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
+          const auto expr_order_insensitive =
+              [](const auto& self, const Expression& expr) -> bool {
+            if (!expr) {
+              return true;
+            }
+            if (expr->Type() == TypeTag::kAggregateExp) {
+              const auto& aggregate = static_cast<const AggregateExpression&>(
+                  *expr);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+              if (!aggregate.InnerOrderBy().empty()) {
+                return false;  // WITHIN GROUP orders its own input.
+              }
+              switch (aggregate.GetType()) {
+                case AggregationType::kCount:
+                case AggregationType::kSum:
+                case AggregationType::kAvg:
+                case AggregationType::kMin:
+                case AggregationType::kMax:
+                case AggregationType::kLogicalAnd:
+                case AggregationType::kLogicalOr:
+                case AggregationType::kCountIf:
+                case AggregationType::kVarSamp:
+                case AggregationType::kVarPop:
+                case AggregationType::kStddevSamp:
+                case AggregationType::kStddevPop:
+                case AggregationType::kCovarSamp:
+                case AggregationType::kCovarPop:
+                case AggregationType::kCorr:
+                case AggregationType::kBitAnd:
+                case AggregationType::kBitOr:
+                case AggregationType::kBitXor:
+                case AggregationType::kApproxCountDistinct:
+                case AggregationType::kMode:
+                case AggregationType::kRegrSlope:
+                case AggregationType::kRegrIntercept:
+                case AggregationType::kRegrCount:
+                case AggregationType::kRegrR2:
+                case AggregationType::kRegrAvgX:
+                case AggregationType::kRegrAvgY:
+                case AggregationType::kRegrSxx:
+                case AggregationType::kRegrSyy:
+                case AggregationType::kRegrSxy:
+                  break;
+                default:
+                  return false;
+              }
+            }
+            // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is
+            // clearer here
+            for (const Expression& child : ExpressionChildren(expr)) {
+              if (!self(self, child)) {
+                return false;
+              }
+            }
+            return true;
+          };
+          const auto order_insensitive = [&](const LogicalExpression& agg) {
+            if (agg.predicate && *agg.predicate &&
+                !expr_order_insensitive(expr_order_insensitive,
+                                        *agg.predicate)) {
+              return false;
+            }
+            return std::ranges::all_of(
+                agg.target_list, [&](const NamedExpression& target) {
+                  return expr_order_insensitive(expr_order_insensitive,
+                                                target.expression);
+                });
+          };
+          if (!order_insensitive(expression)) {
+            return;
+          }
           const Group& inner_group = memo.Get(bindings.at("inner"));
           for (const LogicalExpression& inner : inner_group.expressions) {
             if (inner.operation != LogicalOperator::kSort ||
@@ -51,13 +118,17 @@ graph TD
                 group,
                 LogicalExpression{.operation = LogicalOperator::kAggregation,
                                   .children = inner.children,
-                                  .target_list = expression.target_list});
+                                  .predicate = expression.predicate,
+                                  .target_list = expression.target_list,
+                                  .output_schema = expression.output_schema,
+                                  .partition_by = expression.partition_by,
+                                  .grouping_sets = expression.grouping_sets});
           }
         },
         LogicalOperator::kAggregation));
 ```
 
-現行の実装コードでは、集約関数が順序依存性（例: 文字列集約 `STRING_AGG` や配列集約 `ARRAY_AGG` など）を持つか否かの個別判定ガードは存在せず、すべての `Aggregation` を順序非感受として扱います。
+`expr_order_insensitive` が集約式を再帰的に検査します。`InnerOrderBy()` を持つ集約や、順序非依存として列挙した型に含まれない STRING_AGG・ARRAY_AGG などがあれば、入力の Sort を保持します。
 
 ## 意味論的根拠と物理実行の契約
 

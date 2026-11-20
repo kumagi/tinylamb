@@ -245,6 +245,7 @@ class DifferentialTally {
                const std::vector<std::pair<std::string, Attempt>>& paths,
                const std::optional<Value>& oracle = std::nullopt) {
     std::vector<std::pair<const std::string*, const Attempt*>> available;
+    available.reserve(paths.size());
     for (const auto& path : paths) {
       if (path.second.kind == Attempt::Kind::kUnsupported) {
         std::cout << "[differential][skip] " << cell << " path=" << path.first
@@ -799,6 +800,60 @@ TEST(DifferentialTest,
       ColumnValueExp("s"), {ConstantValueExp(Value("a").WithCollation(1)),
                             ConstantValueExp(Value("A").WithCollation(2))});
   EXPECT_EQ(short_circuit->TryEvaluate(row, schema).MoveValue(), Value(true));
+}
+
+TEST(DifferentialTest, FloatingPointIdentitiesPreservePromotedValues) {
+  const Schema schema("t", {Column("x", ValueType::kDouble)});
+  const Expression x = ColumnValueExp("x");
+  const Expression one = ConstantValueExp(Value(int64_t{1}));
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  rewriter.set_schema(&schema);
+  for (const Expression& expr :
+       {BinaryExpressionExp(x, BinaryOperation::kDivide, one),
+        FunctionCallExp("pow", {x, one})}) {
+    const Expression rewritten = rewriter.Rewrite(expr);
+    ASSERT_NE(rewritten->Type(), expr->Type());
+    for (const auto& value :
+         {Value(), Value(-0.0),
+          Value(std::numeric_limits<double>::denorm_min()),
+          Value(std::numeric_limits<double>::max()),
+          Value(-std::numeric_limits<double>::infinity()),
+          Value(std::numeric_limits<double>::quiet_NaN())}) {
+      const Row row({value});
+      for (const Expression& form : {expr, rewritten}) {
+        auto result = form->TryEvaluate(row, schema);
+        ASSERT_TRUE(result.HasValue());
+        EXPECT_TRUE(SameValue(result.Value(), value));
+        if (!value.IsNull() && value.value.double_value == 0.0) {
+          EXPECT_TRUE(std::signbit(result.Value().value.double_value));
+        }
+      }
+    }
+  }
+}
+
+TEST(DifferentialTest, EmptyInPreservesProbeErrorsAndReturnsFalseForNull) {
+  const Schema& schema = IntSchema();
+  const Expression probe =
+      BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(int64_t{1})));
+  const Expression expr = InExpressionExp(probe, {});
+  const auto program = BytecodeCompiler::Compile(expr, schema);
+  ASSERT_TRUE(program.has_value());
+  DifferentialTally tally;
+  for (const Value& v : {Value(), Value(1), Value(kInt64Max)}) {
+    const Row row({v, Value(0)});
+    const auto ast = EvaluateAst(expr, row, schema);
+    const bool overflow = !v.IsNull() && v.value.int_value == kInt64Max;
+    if (overflow) {
+      EXPECT_EQ(ast.kind, Attempt::Kind::kThrow);
+    }
+    tally.Compare("empty IN", DescribeRow(schema, row),
+                  {{"ast", ast},
+                   {"bytecode", EvaluateBytecode(program, schema, row)},
+                   {"executor", EvaluateDetailPath(expr, row, schema)}},
+                  overflow ? std::nullopt : std::optional(Value(false)));
+  }
 }
 
 TEST(DifferentialTest, Evaluate_CaseAndIn_MatchesAcrossPaths) {

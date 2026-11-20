@@ -25,7 +25,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P1 実装済み: `StatusCode::
 |---|---|
 | クエリへのメモリ付与が時間内に得られなかった | `kMemoryLimitExceeded` |
 | 予約が失敗し、スピルもできない（最小予算を満たせない） | `kMemoryLimitExceeded` |
-| 1 行、または集約結果の 1 値が演算子予算の 1/4 を超えた | `kTooBigData` |
+| 単一フレームの符号化上限、または分割できない集約状態の上限を超えた | `kTooBigData` |
 | スピルのディスク上限を超えた、またはディスクが尽きた | `kNoSpace` |
 | `std::bad_alloc` を捕まえた | `kMemoryLimitExceeded` |
 

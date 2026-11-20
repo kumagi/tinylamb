@@ -3,9 +3,7 @@ import TinylambOpt.AggBase
 /-
 # Step 4-B: Join 越しの多段集約（Eager / Split / Factorized Aggregation）の新ルール探索と証明
 
-`tinylamb` の Cascades オプティマイザには現在 `aggregate_union_transpose`（`UNION ALL` 越しの集約押し込み）はありますが、
-**Join 越しの事前集約（Eager Aggregation）ルール群**はまだ未開拓の領域です
-（`optimizer_star_schema_high_expectations.test` 等で `# Future: PartialAggregate below dimension joins` と記載）。
+現行の `plan/cascades.cpp` には `eager_aggregation_over_join` が登録されています。本稿は、この実装が引用する事前集約の成立条件と、その拡張を扱います。
 
 Join 越しの多段集約は OLAP / Star Schema で数桁の高速化をもたらす一方、
 SQL の **NULL・空集合・重複キー（M:N fan-out）・外部結合の NULL パディング** が絡むため、

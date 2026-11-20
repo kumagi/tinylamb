@@ -139,6 +139,7 @@ const GoogleSqlAstNode* GoogleSqlAstNode::Child(std::string_view child_kind,
 std::vector<const GoogleSqlAstNode*> GoogleSqlAstNode::Children(
     std::string_view child_kind) const {
   std::vector<const GoogleSqlAstNode*> result;
+  result.reserve(children.size());
   for (const auto& child : children) {
     if (child->kind == child_kind) {
       result.push_back(child.get());

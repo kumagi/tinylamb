@@ -48,7 +48,10 @@ CheckpointManager::CheckpointManager(std::string_view path,
   // copies a std::function and can throw bad_alloc; if the constructor body
   // throws after a joinable thread was started, ~thread calls terminate
   // instead of letting the caller map the failure to a Status.
-  if (pm_ != nullptr && interval_seconds_ != 0) {
+  if (interval_seconds_ == 0) {
+    return;
+  }
+  if (pm_ != nullptr) {
     pm_->SetCompactionCallback([this] { RequestCompaction(); });
   }
   checkpoint_worker_ = std::thread([this] { WorkerThreadTask(); });
@@ -62,7 +65,7 @@ void CheckpointManager::Start() {
   // register the compaction callback and spawn a fresh worker; the old
   // behaviour was a silent no-op that left every later compaction request
   // unconsumed (WAL grew forever).
-  if (stop_.load(std::memory_order_acquire) && interval_seconds_ == 0) {
+  if (interval_seconds_ == 0) {
     LOG(WARN) << "CheckpointManager::Start() ignored: checkpointing is "
                  "disabled (interval_seconds == 0)";
     return;

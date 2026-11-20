@@ -819,6 +819,7 @@ StatusOr<std::optional<Relation>> TryNullSignatureFullAggregate(
     return std::optional<Relation>{};
   }
   std::vector<slot_t> left_keys, right_keys;
+  right_keys.reserve(keys.size());
   for (const auto& key : keys) {
     const auto type = left.schema.GetColumn(key.left).Type();
     if (key.null_safe || key.left_offset != 0 || key.right_offset != 0 ||
@@ -982,6 +983,7 @@ StatusOr<std::optional<Relation>> TryNullSignatureFullAggregate(
   }
   Row output;
   std::vector<Column> columns;
+  columns.reserve(fusion.select_items.size());
   for (size_t i = 0; i < fusion.select_items.size(); ++i) {
     ASSIGN_OR_RETURN(
         Value, value,
@@ -1269,6 +1271,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                               context_kind);
   };
   std::vector<BytecodeProgram> residual_programs;
+  residual_programs.reserve(residuals.size());
   for (const Expression& predicate : residuals) {
     std::optional<BytecodeProgram> program =
         compile_or(predicate, BytecodeCompiler::Context::kFilter);
@@ -1278,6 +1281,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     residual_programs.push_back(std::move(*program));
   }
   std::vector<BytecodeProgram> key_programs;
+  key_programs.reserve(fusion->group_keys.size());
   for (const Expression& key : fusion->group_keys) {
     std::optional<BytecodeProgram> program =
         compile_or(key, BytecodeCompiler::Context::kValue);
@@ -1287,6 +1291,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     key_programs.push_back(std::move(*program));
   }
   std::vector<BytecodeProgram> child_programs;
+  child_programs.reserve(fusion->aggregates.size());
   for (size_t aggregate_index = 0; aggregate_index < fusion->aggregates.size();
        ++aggregate_index) {
     if (fusion->count_star[aggregate_index]) {
@@ -1333,6 +1338,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     // null-extends the probe row exactly the same.  Any evaluation error
     // abandons the hoist (the per-pair path keeps its exact error behavior).
     std::vector<size_t> hoisted_indices;
+    hoisted_indices.reserve(residual_programs.size());
     for (size_t i = 0; i < residual_programs.size(); ++i) {
       if (!ExpressionCannotThrowForPlanner(residuals[i])) {
         continue;
@@ -1350,6 +1356,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       const Relation& rmat = *rmat_ptr;
       std::vector<slot_t> hoist_cells;
       std::vector<ProgramShape> hoist_shapes;
+      hoist_shapes.reserve(hoisted_indices.size());
       for (const size_t i : hoisted_indices) {
         CollectLoadCells(residual_programs[i], &hoist_cells);
         hoist_shapes.push_back(residual_shapes[i]);
@@ -2302,6 +2309,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
   }
   std::vector<size_t> int_key_indices;
+  int_key_indices.reserve(key_programs.size());
   bool has_unique_int_key = false;
   for (size_t k = 0; k < key_programs.size(); ++k) {
     if (key_shapes[k].direct_column >= 0) {
@@ -4591,6 +4599,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     // Factor finite right and deferred-PK dimension tuples once per query so
     // every surviving probe row probes one exact packed 64-bit integer key.
     std::vector<size_t> dimension_columns;
+    dimension_columns.reserve(key_shapes.size());
     std::vector<std::vector<size_t>> pk_group_key_lookups(def_pk_groups.size());
     std::optional<size_t> probe_key;
     size_t left_key_count = 0;
@@ -5198,6 +5207,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       !(raw_count_fusion && count_star_only &&
         (fusion->having || fusion->post_having_active))) {
     std::vector<size_t> lp_right_cols;
+    lp_right_cols.reserve(key_shapes.size());
     std::vector<size_t> lp_dict_cols;
     std::vector<LeftPackedIntCol> lp_ints;
     const bool right_ok = right_row_count > 0 && right_row_count <= 262144;
@@ -8631,6 +8641,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
   }
   std::vector<size_t> dense_pk_group_indices;
+  dense_pk_group_indices.reserve(def_pk_groups.size());
   size_t dense_split_domain = 0;
   std::shared_ptr<QueryMemoryCharge> dense_split_charge;
   bool use_dense_split_direct_gid =
@@ -13717,6 +13728,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           }
         }));
         std::vector<RankedCount> ordered;
+        ordered.reserve(accepted.size());
         for (auto& part : accepted) {
           ordered.insert(ordered.end(), std::make_move_iterator(part.begin()),
                          std::make_move_iterator(part.end()));
@@ -14024,37 +14036,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
       cd_counts[cur_gid] = cur_cnt;
     };
-    if (workers <= 1) {
-      sort_partition(0);
-    } else {
-      std::vector<std::jthread> cd_threads;
-      cd_threads.reserve(workers - 1);
-      // Contain worker exceptions: an uncaught throw in a jthread function
-      // calls std::terminate and kills the whole process.
-      std::exception_ptr cd_error;
-      std::mutex cd_error_mu;
-      try {
-        for (size_t p = 1; p < workers; ++p) {
-          cd_threads.emplace_back([&, p] {
-            try {
-              sort_partition(p);
-            } catch (...) {
-              std::scoped_lock lock(cd_error_mu);
-              if (!cd_error) {
-                cd_error = std::current_exception();
-              }
-            }
-          });
-        }
-      } catch (...) {  // NOLINT(bugprone-empty-catch)
-        // A failed thread spawn still needs the main-thread partition done
-        // so the per-worker result arrays stay in a consistent state.
-      }
-      sort_partition(0);
-      if (cd_error) {
-        std::rethrow_exception(cd_error);
-      }
-    }
+    RETURN_IF_FAIL(RunParallelTasks(workers, sort_partition));
     groups.reserve(pre_group_count);
     for (size_t gid = 0; gid < pre_group_count; ++gid) {
       bool any_matched = (cd_counts[gid] > 0);
@@ -14657,7 +14639,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   };
   std::vector<DirectEmitItem> direct_emit;
   std::vector<slot_t> emit_needed_cols;
+  emit_needed_cols.reserve(fusion->select_items.size());
   std::vector<size_t> emit_needed_aggs;
+  emit_needed_aggs.reserve(fusion->select_items.size());
   bool has_emit_program = false;
   size_t emit_row_width = result.schema.ColumnCount();
   std::optional<BytecodeProgram> having_prog;

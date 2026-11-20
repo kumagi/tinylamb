@@ -1566,7 +1566,9 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   if (g.Chance(30)) {
     const int n = g.Pick(1, 3);
     std::string list;
+    list.reserve(n);
     std::string ors;
+    ors.reserve(n);
     for (int i = 0; i < n; ++i) {
       const std::string lit = std::to_string(g.Pick(-2, 5));
       if (i > 0) {
@@ -1592,6 +1594,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
 
     auto filtered_a = [](const std::vector<MirrorRow>& rows, const RPred& p) {
       std::vector<int64_t> out;
+      out.reserve(rows.size());
       for (const MirrorRow& m : rows) {
         if (p.Eval(m) == 'T') {
           out.push_back(m.a);
@@ -1705,6 +1708,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
         break;
     }
     std::vector<const MirrorRow*> rows;
+    rows.reserve(mirror.size());
     for (const MirrorRow& m : mirror) {
       if (pred->Eval(m) == 'T') {
         rows.push_back(&m);
@@ -1824,6 +1828,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     }
     const bool doubled = shape == 2;
     std::vector<const MirrorRow*> rows;
+    rows.reserve(mirror.size() * 2);
     for (const MirrorRow& row : mirror) {
       if (pred->Eval(row) != 'T') {
         continue;
@@ -2047,6 +2052,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     }
     if (variant == 0) {
       std::string arr = "[";
+      arr.reserve(elems.size());
       for (size_t i = 0; i < elems.size(); ++i) {
         arr += i == 0 ? "" : ", ";
         arr += elems[i] == kNull ? "NULL" : std::to_string(elems[i]);
@@ -2059,6 +2065,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
       t.unnest_ordered = false;
     } else if (variant == 1) {
       std::string arr = "[";
+      arr.reserve(elems.size());
       for (size_t i = 0; i < elems.size(); ++i) {
         arr += i == 0 ? "" : ", ";
         arr += elems[i] == kNull ? "NULL" : std::to_string(elems[i]);
@@ -2083,6 +2090,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
         elems.push_back(g.Chance(15) ? kNull : g.Pick(-3, 3));
       }
       std::string arr = "[";
+      arr.reserve(elems.size());
       for (size_t i = 0; i < elems.size(); ++i) {
         arr += i == 0 ? "" : ", ";
         arr += elems[i] == kNull ? "NULL" : std::to_string(elems[i]);
@@ -2551,6 +2559,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
         auto plan = RunRows(db, ctx, "EXPLAIN " + t.tlp[0], &error);
         if (plan.has_value()) {
           std::string fingerprint;
+          fingerprint.reserve(plan->size());
           for (const Row& r : *plan) {
             fingerprint += r.ToString() + ";";
           }
@@ -3131,6 +3140,7 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
       return std::string{};
     }
     std::string plan;
+    plan.reserve(rows->size());
     for (const Row& r : *rows) {
       plan += r.ToString() + ";";
     }

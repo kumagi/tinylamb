@@ -42,7 +42,9 @@ MultiIndexCoveringScanPlan::MultiIndexCoveringScanPlan(
     }
   }
   std::vector<Column> columns;
+  columns.reserve(covered.size());
   std::vector<ColumnStats> stats_columns;
+  stats_columns.reserve(covered.size());
   for (size_t slot = 0; slot < covered.size(); ++slot) {
     if (!covered[slot]) {
       continue;

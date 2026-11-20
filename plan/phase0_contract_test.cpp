@@ -123,6 +123,7 @@ std::string SchemaFingerprint(const Schema& schema) {
 std::vector<Row> EvaluateSet(const Schema& schema, const Expression& predicate,
                              const std::vector<Row>& input) {
   std::vector<Row> result;
+  result.reserve(input.size());
   for (const Row& row : input) {
     if (predicate == nullptr) {
       result.push_back(row);

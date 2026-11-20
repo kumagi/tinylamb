@@ -43,6 +43,13 @@ std::optional<std::string> NormalizeProtoText(std::string_view text);
 // UPPER_SNAKE tokens render bare, other strings quoted, booleans true/false.
 std::string FormatProtoTextScalar(std::string_view raw_token);
 
+// Decodes one stored proto-text scalar token into a Value: quoted strings
+// lose their quotes with escapes resolved, booleans become 0/1, `null`
+// becomes SQL NULL, fully-consumed numbers parse, everything else stays a
+// bare string.  This is the single implementation both the interpreter
+// field extractor and the AST-side shim must agree on.
+Value DecodeProtoTextScalarToken(std::string_view raw_token);
+
 // Extracts `key` (case-insensitive) from a proto TEXT payload (outer braces
 // optional).  A single match yields the scalar/message value; repeated
 // matches yield an array.  Date/timestamp FORMAT annotations implied by the

@@ -221,6 +221,7 @@ void SqlEngine::EnsureViewsRegistered(TransactionContext& ctx) {
     // Forget views whose durable definition is gone (DROP VIEW elsewhere);
     // FROM resolution consults the registry before the catalog.
     std::unordered_set<std::string> live;
+    live.reserve(names.Value().size());
     for (const std::string& name : names.Value()) {
       std::string lowered = name;
       for (char& c : lowered) {
@@ -461,6 +462,7 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
     return false;
   }
   std::unordered_set<std::string> outer_names;
+  outer_names.reserve(statement.Sources().size() * 2);
   for (const SelectSource& source : statement.Sources()) {
     if (source.query || source.unnest ||
         (source.join_type != JoinType::kCross &&
@@ -909,6 +911,7 @@ bool ProjectionContainsUniqueKey(const Plan& plan,
     return false;
   }
   std::unordered_set<slot_t> projected;
+  projected.reserve(std::min(visible_columns, columns.size()));
   const size_t count = std::min(visible_columns, columns.size());
   for (size_t i = 0; i < count; ++i) {
     const Expression& expression = columns[i].expression;
@@ -1206,6 +1209,15 @@ StatusOr<Executor> LowerSelectPlanExecutor(
     PipelineLoweringOptions opts;
     opts.keep_plan_explain_text = keep_plan_explain_text;
     opts.apply_post_distinct = need_distinct;
+    if (need_distinct && visible_columns != final_select_size) {
+      // Hidden ORDER BY carriers ($order<i>) trail the visible select list;
+      // DISTINCT keys on the visible prefix only, matching the grouped
+      // lane's distinct_cols contract.
+      opts.post_distinct_key_cols.reserve(visible_columns);
+      for (size_t c = 0; c < visible_columns; ++c) {
+        opts.post_distinct_key_cols.push_back(static_cast<slot_t>(c));
+      }
+    }
     if (need_sort) {
       opts.post_sort_keys = sort_keys;
     }
@@ -1231,7 +1243,20 @@ StatusOr<Executor> LowerSelectPlanExecutor(
 
   Executor executor = plan->EmitExecutor(ctx);
   if (need_distinct) {
-    executor = std::make_shared<DistinctExecutor>(std::move(executor));
+    if (visible_columns != final_select_size) {
+      // Same visible-prefix contract as the pipeline branch above: hidden
+      // ORDER BY carriers must not widen the duplicate key.
+      std::vector<slot_t> key_cols;
+      key_cols.reserve(visible_columns);
+      for (size_t c = 0; c < visible_columns; ++c) {
+        key_cols.push_back(static_cast<slot_t>(c));
+      }
+      executor = std::make_shared<DistinctExecutor>(
+          std::move(executor), Schema{}, std::vector<Expression>{},
+          std::move(key_cols));
+    } else {
+      executor = std::make_shared<DistinctExecutor>(std::move(executor));
+    }
   }
   if (need_sort) {
     std::vector<SortExecutor::Key> legacy_keys;
@@ -1770,6 +1795,7 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
   const size_t short_circuit_target = select.Limit() + select.Offset();
   size_t accumulated_rows = 0;
   std::vector<std::vector<Row>> term_rows;
+  term_rows.reserve(terms.size());
   std::vector<ValueType> output_types;
   for (auto& term : terms) {
     // This path is only reached for set-op statements without a WITH clause
@@ -1854,7 +1880,9 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
     return folded;
   };
   std::vector<std::vector<Row>> folded_terms;
+  folded_terms.reserve(term_rows.size());
   std::vector<SetOperationKind> low_ops;
+  low_ops.reserve(term_rows.size());
   folded_terms.push_back(std::move(term_rows.front()));
   for (size_t i = 0; i + 1 < term_rows.size(); ++i) {
     const SetOperationKind operation = pair_kinds[i];
@@ -2047,6 +2075,7 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
   }
   Expression where = select.WhereClause();
   std::unordered_set<std::string> seen_relations;
+  seen_relations.reserve(select.Sources().size());
   for (const SelectSource& source : select.Sources()) {
     const std::string relation =
         source.alias.empty() ? source.table : source.alias;
@@ -2271,7 +2300,9 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
       return {"", AsciiToLower(col.name)};
     };
     std::unordered_set<ColumnName> grouped_columns;
+    grouped_columns.reserve(select.GroupBy().size());
     std::unordered_set<std::string> grouped_expr_strings;
+    grouped_expr_strings.reserve(select.GroupBy().size());
     if (!select.IsGroupAll()) {
       for (const Expression& g : select.GroupBy()) {
         const Expression resolved_g = substitute_aliases(g);
@@ -2507,6 +2538,7 @@ Schema InferUnnestOutputSchema(const SelectSource& source,
 StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
                                                   TransactionContext& ctx) {
   std::vector<std::string> table_relations;
+  table_relations.reserve(select.Sources().size());
   std::unordered_map<std::string, std::string> table_aliases;
   for (const SelectSource& source : select.Sources()) {
     if (!source.unnest && !source.query && !source.table.empty() &&
@@ -2588,6 +2620,7 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       const std::string alias =
           source.alias.empty() ? "subquery" : source.alias;
       std::vector<Column> inner_cols;
+      inner_cols.reserve(source.query->SelectList().size());
       for (const NamedExpression& item : source.query->SelectList()) {
         inner_cols.emplace_back(ColumnName(alias, item.name), ValueType::kNull);
       }
@@ -2625,6 +2658,7 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       const RecursiveDepthSpec* depth_spec = select.RecursiveDepthOf(cte_name);
 
       std::vector<Column> cols;
+      cols.reserve(rec_body->SelectList().size());
       for (const NamedExpression& item : rec_body->SelectList()) {
         cols.emplace_back(ColumnName(alias, item.name), ValueType::kNull);
       }
@@ -2774,6 +2808,7 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
   }
 
   std::vector<NamedExpression> projection_items;
+  projection_items.reserve(select.Sources().size());
   if (has_star) {
     for (const SelectSource& source : select.Sources()) {
       if (source.unnest) {
@@ -3202,6 +3237,7 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     std::unique_ptr<SelectStatement> select_statement) {
   fused_sibling_aggregates_ = 0;
   cte_restriction_pushdowns_ = 0;
+  inner_prefix_pullups_ = 0;
   cte_materialization_attempts_ = 0;
   {
     const Status cycle =
@@ -3264,9 +3300,13 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
       plan_cache_fingerprint_.clear();
       plan_cache_parameters_.clear();
     }
-    (void)PullInnerJoinsBeforeLeftJoins(select.get(), ctx);
+    if (PullInnerJoinsBeforeLeftJoins(select.get(), ctx)) {
+      ++inner_prefix_pullups_;
+    }
     if (DistributeZeroPaddedUnionGroupBy(select.get(), ctx)) {
-      (void)PullInnerJoinsBeforeLeftJoins(select.get(), ctx);
+      if (PullInnerJoinsBeforeLeftJoins(select.get(), ctx)) {
+      ++inner_prefix_pullups_;
+    }
       dml_fold_applied_ = true;
       plan_cache_fingerprint_.clear();
       plan_cache_parameters_.clear();
@@ -3350,7 +3390,9 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     post_inline_rewritten |=
         PushSharedGroupedCteKeyRestrictions(select.get(), ctx);
     if (DistributeZeroPaddedUnionGroupBy(select.get(), ctx)) {
-      (void)PullInnerJoinsBeforeLeftJoins(select.get(), ctx);
+      if (PullInnerJoinsBeforeLeftJoins(select.get(), ctx)) {
+      ++inner_prefix_pullups_;
+    }
       post_inline_rewritten = true;
     }
     post_inline_rewritten |= DistributeDistinctUnionDimJoins(select.get(), ctx);

@@ -196,8 +196,7 @@ EncodedCol EncRleIdxI64(const std::vector<int64_t>& vals, size_t budget) {
   const uint32_t nidx =
       (runs + kRleIdxRestartStride - 1) / kRleIdxRestartStride;
   int64_t value_base = run_vals.front();
-  uint64_t length_base =
-      *std::min_element(run_lens.begin(), run_lens.end());
+  uint64_t length_base = *std::min_element(run_lens.begin(), run_lens.end());
   uint64_t max_value_offset = 0;
   uint64_t max_length_offset = 0;
   for (uint32_t i = 0; i < runs; ++i) {
@@ -918,7 +917,9 @@ EncodedCol EncRleDictI64(const std::vector<int64_t>& vals, size_t budget,
   // (mirrors EncDictI64 / EncOpDictI64).
   FlatMapI64 code(vals.size());
   std::vector<int64_t> dict;
+  dict.reserve(vals.size());
   std::vector<std::pair<uint16_t, uint32_t>> runs;
+  runs.reserve(vals.size());
   for (int64_t v : vals) {
     uint16_t cv = 0;
     if (const uint64_t* found = code.Find(v)) {
@@ -2107,7 +2108,8 @@ EncodedCol EncBp128I64(const std::vector<int64_t>& vals, size_t budget) {
     for (uint32_t block = 0; block < blocks; ++block) {
       const size_t start = static_cast<size_t>(block) * kBp128BlockRows;
       const size_t end = std::min(vals.size(), start + kBp128BlockRows);
-      exact += ((end - start) * widths[block] + 7) / 8;  // AppendPackBits rounds up
+      exact +=
+          ((end - start) * widths[block] + 7) / 8;  // AppendPackBits rounds up
     }
     if (exact > budget) {
       return {};
@@ -2475,6 +2477,7 @@ EncodedCol EncTileDictI64(const std::vector<int64_t>& vals, size_t budget) {
     const uint32_t tile_rows =
         (n - begin < kTileDictRows) ? n - begin : kTileDictRows;
     std::vector<int64_t>& s = seen[t];
+    s.reserve(kTileDictMaxD);
     for (uint32_t i = begin; i < begin + tile_rows; ++i) {
       bool found = false;
       for (const int64_t v : s) {
@@ -2848,9 +2851,13 @@ EncodedCol EncPostingsI64(const std::vector<int64_t>& vals, size_t budget,
   // hands out flush cursors). The exact extent is needed for the budget
   // check and the economic gate before any byte is written.
   thread_local std::vector<uint32_t> counts;
+  counts.reserve(distinct);
   thread_local std::vector<uint32_t> firsts;
+  firsts.reserve(distinct);
   thread_local std::vector<uint32_t> ks;
+  ks.reserve(distinct);
   thread_local std::vector<uint32_t> offs;
+  offs.reserve(distinct);
   counts.clear();
   firsts.clear();
   ks.clear();
@@ -3162,6 +3169,7 @@ EncodedCol EncPlaI64(const std::vector<int64_t>& vals, size_t budget) {
     uint64_t d;
   };
   std::vector<PlaRun> runs;
+  runs.reserve(n);
   for (uint32_t i = 0; i < n;) {
     const auto first = static_cast<uint64_t>(vals[i]);
     uint64_t d = 0;
@@ -3904,7 +3912,8 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
       continue;
     }
     f[s] = static_cast<uint32_t>(
-        // NOLINTNEXTLINE(clang-analyzer-core.UndefinedBinaryOperatorResult) intentional pattern in this code
+        // NOLINTNEXTLINE(clang-analyzer-core.UndefinedBinaryOperatorResult)
+        // intentional pattern in this code
         std::max<uint64_t>(static_cast<uint64_t>(cnt[s]) * M / nsym_total, 1));
     sum += f[s];
   }
@@ -4152,6 +4161,7 @@ EncodedCol EncDictXI64(const std::vector<int64_t>& vals, size_t budget,
   }
   // Thread-local scratch: this encoder re-runs for every row group.
   thread_local std::vector<int64_t> dict;
+  dict.reserve(vals.size());
   dict.clear();
   FlatMapI64 code(vals.size());
   thread_local std::vector<int64_t> codes;
@@ -4205,6 +4215,7 @@ EncodedCol EncDictXStr(const std::vector<std::string_view>& sv) {
     return {};
   }
   std::vector<std::string_view> dict;
+  dict.reserve(sv.size());
   std::unordered_map<std::string_view, uint16_t> code;
   std::vector<int64_t> codes;
   codes.reserve(sv.size());
@@ -4225,6 +4236,7 @@ EncodedCol EncDictXStr(const std::vector<std::string_view>& sv) {
   }
   // Pool choice: flat entry list vs FSST-compressed pool, whichever smaller.
   std::vector<char> flat_pool;
+  flat_pool.reserve(dict.size());
   flat_pool.push_back(0);  // pool_scheme = flat
   for (const auto& s : dict) {
     AppendBE32(flat_pool, static_cast<uint32_t>(s.size()));
@@ -4318,6 +4330,7 @@ EncodedCol EncTemplateStr(const std::vector<std::string_view>& sv) {
   std::array<std::vector<int64_t>, kTemplateMaxSegments> seg_vals;
   std::vector<uint8_t> bmp((static_cast<size_t>(n) + 7) / 8, 0);
   std::vector<std::string_view> exceptions;
+  exceptions.reserve(n);
   for (uint32_t row = 0; row < n; ++row) {
     const std::string_view s = sv[row];
     size_t pos = 0;
@@ -4530,8 +4543,10 @@ EncodedCol EncDStreamStr(const std::vector<std::string_view>& sv) {
   std::vector<uint8_t> stream;
   stream.reserve(1024);
   std::vector<uint32_t> restarts;
+  restarts.reserve((n + kDStreamRestart - 1) / kDStreamRestart);
   std::vector<uint8_t> bmp((static_cast<size_t>(n) + 7) / 8, 0);
   std::vector<std::string_view> exceptions;
+  exceptions.reserve(n);
   uint32_t nexc = 0;
   uint32_t nconf = 0;
   std::array<uint8_t, 256>
@@ -4692,6 +4707,7 @@ EncodedCol EncPforI64(const std::vector<int64_t>& vals, size_t budget) {
   AppendBE64(e.buf, mn_u);
   e.buf.push_back(static_cast<char>(best_w));
   std::vector<std::pair<uint16_t, int64_t>> exc;
+  exc.reserve(n);
   std::vector<uint64_t> low;
   low.reserve(n);
   uint64_t lomask = ~0ULL;
@@ -5506,10 +5522,10 @@ EncodedCol EncDeltaBitweaveI64(const std::vector<int64_t>& vals,
 
 // kSimdFor (scheme 53): frame-of-reference + four-lane interleaved bit-packing.
 // See the enum comment for the format. The encoder's only real decision is the
-// width: the smallest ADMITTED width (a divisor of 64) that covers the spread.
-// It does not fall back to the next power of two for a width the layout cannot
-// express -- that would silently inflate the output -- it declines, and the
-// selector picks something else.
+// width: the smallest ADMITTED width that covers the spread. Every width in
+// 1..64 is admitted (SimdForWidthOk), so the search steps one bit at a time
+// and never rounds up to a power of two -- that would silently inflate the
+// output, so a spread needing e.g. 6 or 10 bits keeps its exact width.
 EncodedCol EncSimdForI64(const std::vector<int64_t>& vals, size_t budget) {
   const auto n = static_cast<uint32_t>(vals.size());
   if (n == 0) {
@@ -5699,6 +5715,7 @@ EncodedCol EncExpForF64(const std::vector<uint64_t>& bits, size_t budget) {
   // not the last row's.
   std::vector<uint64_t> gkey, gbase, gwidth;
   std::vector<uint32_t> gstart;
+  gstart.reserve(n);
   uint64_t payload = 0;
   for (size_t i = 0; i < n;) {
     const uint64_t key = keys[i] >> 52;
@@ -6053,8 +6070,8 @@ EncodedCol EncDeltaVarintI64(const std::vector<int64_t>& vals, size_t budget) {
   }
   const uint32_t C = kDeltaCheckpointEvery;
   const auto ncp = static_cast<uint32_t>(((n - 1) / C) + 1);
-  // Minimum wire size: ncp u16 (2) + ncp checkpoints (8*ncp) + ncp offsets (4*ncp)
-  // = 2 + 12*ncp bytes; ncp >= 1 when n >= 1.
+  // Minimum wire size: ncp u16 (2) + ncp checkpoints (8*ncp) + ncp offsets
+  // (4*ncp) = 2 + 12*ncp bytes; ncp >= 1 when n >= 1.
   if (budget < 2 + (12 * static_cast<size_t>(ncp))) {
     return {};
   }
@@ -6096,9 +6113,9 @@ EncodedCol EncDeltaVarintI64(const std::vector<int64_t>& vals, size_t budget) {
     } while (z != 0);
     // Every delta emits at least one byte, so the final stream is never
     // shorter than the bytes written so far: once that prefix alone is over
-    // budget the candidate cannot win. Checked every C rows, which bounds
-    // the abort lag by C bytes while keeping the per-row branch off the
-    // steady-state path.
+    // budget the candidate cannot win. Checked every 32 rows, which keeps the
+    // per-row branch off the steady-state path while bounding the abort lag
+    // to the bytes 32 rows can emit.
     if (i % 32 == 0 && stream.size() > budget) {
       return {};
     }
@@ -6350,6 +6367,7 @@ EncodedCol EncQppI64(const std::vector<int64_t>& vals, size_t budget) {
 
     std::vector<uint8_t> bitmap;
     std::vector<std::pair<uint16_t, int64_t>> exceptions;
+    exceptions.reserve(rows);
     for (size_t local = 0; local < rows; ++local) {
       const auto i = static_cast<platform::Int128>(local);
       const platform::Int128 predicted =
@@ -6791,6 +6809,7 @@ EncodedCol EncAlpF64(const std::vector<uint64_t>& bits) {
   std::vector<int64_t> mant(n);
   std::vector<uint32_t> exc_pos;
   std::vector<uint64_t> exc_val;
+  exc_val.reserve(n);
   for (int exp = 0; exp <= kMaxExp; ++exp) {
     const double f = AlpFactorOf(exp);
     exc_pos.clear();
@@ -6854,6 +6873,7 @@ EncodedCol EncAlpF64(const std::vector<uint64_t>& bits) {
   backends.push_back(EncBitWeaveI64(best_mant));
   {
     std::unordered_set<int64_t> distinct;
+    distinct.reserve(n);
     for (int64_t v : best_mant) {
       distinct.insert(v);
     }
@@ -6965,6 +6985,7 @@ EncodedCol EncAlpRdTansF64(const std::vector<uint64_t>& bits) {
       std::vector<int64_t> tails;
       std::vector<int64_t> exceptions;
       std::vector<int64_t> exception_values;
+      exception_values.reserve(rows);
       codes.reserve(rows);
       tails.reserve(rows);
       for (size_t row = start; row < end; ++row) {
@@ -8329,6 +8350,7 @@ EncodedCol EncodeColumnAdaptive(slot_t col_idx, const Schema& sc,
         candidates.push_back(EncDictXStr(sv));
       }
       std::vector<std::string_view> dict;
+      dict.reserve(sv.size());
       std::unordered_map<std::string_view, uint16_t> code;
       std::vector<uint64_t> codes;
       codes.reserve(sv.size());

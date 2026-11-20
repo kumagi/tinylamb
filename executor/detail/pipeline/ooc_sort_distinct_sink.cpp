@@ -700,13 +700,8 @@ Status OocDistinctSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
       continue;
     }
     const size_t row_bytes = EstimateRowMemoryBytes(row);
-    // ADR-0004 rule 9 applies to the first row too, before any retention.
-    if (budget_bytes_ > 0 && row_bytes > budget_bytes_ / 4) {
-      return StatusError(StatusCode::kTooBigData,
-                         "row exceeds operator budget quarter");
-    }
     const size_t add_bytes = row_bytes + EstimateRowMemoryBytes(key) + 64;
-    if ((budget_bytes_ > 0 && !unique_rows_.empty() &&
+    if ((budget_bytes_ > 0 &&
          mem_bytes_ + add_bytes > budget_bytes_) ||
         (grant_cache_.has_value() && !grant_cache_->Reserve(add_bytes))) {
       RETURN_IF_FAIL(TransitionToSpill(ctx));

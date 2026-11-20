@@ -43,6 +43,7 @@ class Selection : public ExecutorBase {
   Selection& operator=(Selection&&) = delete;
   ~Selection() override = default;
 
+  void AppendSelected(const DataChunk& input, DataChunk* destination);
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
 

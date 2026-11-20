@@ -44,6 +44,7 @@ std::string C(const std::string& alias, const char* col) {
 
 std::string SelectList(const std::vector<OutCol>& cols) {
   std::string out;
+  out.reserve(cols.size());
   for (size_t i = 0; i < cols.size(); ++i) {
     if (i > 0) {
       out += ", ";
@@ -1198,6 +1199,7 @@ class Builder {
         q.shape = "index_in_list";
         q.ordered = true;
         std::string list;
+        list.reserve(8);
         for (int i = 0; i < 8; ++i) {
           list += (i > 0 ? ", " : "") + I(Key(t));
         }

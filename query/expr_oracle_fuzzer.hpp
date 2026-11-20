@@ -23,12 +23,11 @@ namespace tinylamb {
 //       (ground truth is Expression::Evaluate, the AST interpreter);
 //   (b) engine equivalence: `SELECT <sql>` through SqlEngine returns the same
 //       value the AST reference computed;
-//   (c) Python cross-check: the emitted S-expression is the input format of
-//       scripts/expr_oracle.py, an independent reimplementation of the same
-//       GoogleSQL scalar semantics, so auditors can confirm the reference
-//       outside C++.
+//   (c) relational evaluation: run the expression against a one-row table
+//       with relational fallback forced and compare with the AST reference.
+// The emitted S-expression can also be checked manually with scripts/expr_oracle.py.
 //
-// A violation of (a) or (b) is a logic bug. The iteration serializes the
+// A violation of any checked identity is a logic bug. The iteration serializes the
 // failing case to a self-contained `.test` file (seed + SQL + S-expression +
 // reference/actual values) that replays via ParseExprOracleTest +
 // ReplayExprOracleTrace: replay regenerates the expression from the seed, so
@@ -42,7 +41,7 @@ struct ExprOracleTrace {
   std::string actual;     // engine (or rewritten-tree) value, or THROW/E(...)s
   std::string failure;    // one-line summary of the mismatch
   // True when the engine executed the SQL (vs rejecting it as unsupported).
-  // Guards against vacuous sweeps where every iteration skips.
+  // Replay reports a lost engine execution if the recorded run executed SQL.
   bool engine_ran = false;
   // Generator mode (ExprGenConfig::extended_ops) the seed was run under.
   // The libFuzzer path dedicates input-derived bits to it (P612); replay
@@ -60,11 +59,10 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
                                    ExprOracleTrace* trace = nullptr,
                                    const ExprGenConfig& config = {});
 
-// Regenerates the expression from `trace.seed` and re-runs both oracles.
-// Returns "" when the recorded failure no longer reproduces (fixed) or when
-// the regenerated case agrees with the recorded reference/actual pair;
-// otherwise returns the fresh mismatch diagnostic. A trace whose SQL does
-// not match its seed is reported as tampered.
+// Regenerate from the seed and rerun the oracles. An empty string means the
+// mismatch disappeared. A matching reference/actual pair with a live failure
+// returns the failure diagnostic. Changed failures, tampered traces and lost
+// engine executions have separate diagnostics.
 std::string ReplayExprOracleTrace(const ExprOracleTrace& trace,
                                   bool verbose = false);
 

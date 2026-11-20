@@ -511,6 +511,7 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
       std::string_view inner =
           raw.substr(bracket + 1, raw.size() - bracket - 2);
       std::vector<Value> elements;
+      elements.reserve(inner.size());
       const std::string element_type_name(raw.substr(6, raw.find(">[") - 6));
       auto parse_element = [&](std::string_view token) {
         if (element_type_name == "DATE") {
@@ -564,6 +565,7 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
     // Split top-level elements and decode each.
     std::string_view inner = raw.substr(1, raw.size() > 1 ? raw.size() - 2 : 0);
     std::vector<Value> elements;
+    elements.reserve(inner.size());
     int nest = 0;
     bool str = false;
     size_t start = 0;
@@ -655,6 +657,7 @@ std::vector<std::string> SplitDottedName(const std::string& name) {
 Value RowAsStructValue(const Row& row, const Schema& schema) {
   auto normalize_encoded_arrays = [](std::string_view text) {
     std::string result;
+    result.reserve(text.size());
     for (size_t i = 0; i < text.size();) {
       if (text.substr(i, 6) == "ARRAY<") {
         const size_t open = text.find('[', i + 6);
@@ -691,7 +694,8 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
       case ValueType::kDouble:
         return FormatDoubleShortest(v.value.double_value);
       case ValueType::kDate:
-        return "\"__tinylamb_date__:" + FormatDateDays(v.value.int_value) + "\"";
+        return "\"__tinylamb_date__:" + FormatDateDays(v.value.int_value) +
+               "\"";
       case ValueType::kVarChar:
         if (v.value.varchar_value.size() >= 2 &&
             ((v.value.varchar_value.front() == '{' &&
@@ -745,7 +749,8 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
   std::string json = "{";
   // One append chain per field instead of several temporary concatenations,
   // and a capacity hint to avoid repeated full-string reallocations.
-  json.reserve(2 + row.values_.size() * 32);  // NOLINT(readability-math-missing-parentheses)
+  json.reserve(2 + row.values_.size() *
+                       32);  // NOLINT(readability-math-missing-parentheses)
   for (size_t i = 0; i < row.values_.size(); ++i) {
     if (i > 0) {
       json += ",";
@@ -1090,6 +1095,7 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
     if (current->using_columns != nullptr && name.schema.empty() &&
         name.name.find('.') == std::string::npos) {
       std::vector<size_t> matches;
+      matches.reserve(current->schema->ColumnCount());
       for (size_t i = 0; i < current->schema->ColumnCount(); ++i) {
         if (IdentifierEquals(current->schema->GetColumn(i).Name().name,
                              name.name)) {
@@ -1320,6 +1326,7 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
       // first so explicit qualifiers win over bare-name matches.
       for (size_t split = segments.size() - 1; split-- > 0;) {
         std::string qualifier;
+        qualifier.reserve(split);
         for (size_t i = 0; i < split; ++i) {
           if (!qualifier.empty()) {
             qualifier += '.';
@@ -1380,6 +1387,7 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
         continue;
       }
       std::vector<size_t> owned;
+      owned.reserve(schema.ColumnCount());
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         if (IdentifierEquals(schema.GetColumn(i).Name().schema, name.name)) {
           owned.push_back(i);
@@ -1546,9 +1554,9 @@ bool Like(std::string_view value, std::string_view pattern) {
       ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
       pattern_pos = wildcard + 1;
-      retry += std::min(
-          Utf8SequenceLength(static_cast<unsigned char>(value[retry])),
-          value.size() - retry);
+      retry +=
+          std::min(Utf8SequenceLength(static_cast<unsigned char>(value[retry])),
+                   value.size() - retry);
       value_pos = retry;
     } else {
       return false;
@@ -1764,7 +1772,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           (TryEvaluate(value.child_, scope, aggregates, context, ctes)));
 
       bool found = false;
-      bool saw_null = test.IsNull();
+      bool saw_null = !value.list_.empty() && test.IsNull();
       for (const Expression& item : value.list_) {
         ASSIGN_OR_RETURN(Value, candidate,
                          (TryEvaluate(item, scope, aggregates, context, ctes)));
@@ -2163,7 +2171,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           if (row.values_.empty()) {
             return;
           }
-          elements.push_back(ProjectSubqueryRow(row, as_struct, &subquery_schema));
+          elements.push_back(
+              ProjectSubqueryRow(row, as_struct, &subquery_schema));
         });
         std::string element_type = value.ArrayElementSqlType();
         if (element_type.empty()) {
@@ -2359,6 +2368,7 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
       // an alias-qualified reference (`t`, `t.Info`) and as a bare name.
       for (size_t k = 0; k + 1 < parts.size(); ++k) {
         std::string qualifier;
+        qualifier.reserve(k);
         for (size_t i = 0; i < k; ++i) {
           if (!qualifier.empty()) {
             qualifier += '.';
@@ -2452,7 +2462,7 @@ std::string ProjectionName(const NamedExpression& projection, size_t index) {
   if (projection.expression->Type() == TypeTag::kColumnValue) {
     return projection.expression->AsColumnValue().GetColumnName().name;
   }
-  return "$expr" + std::to_string(index);
+  return "$expr" + IntegerToString(index);
 }
 
 }  // namespace tinylamb::relational_detail

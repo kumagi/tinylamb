@@ -64,6 +64,7 @@ inline std::optional<std::string> DecodeJsonString(std::string_view text) {
     return std::nullopt;
   }
   std::string out;
+  out.reserve(text.size());
   size_t offset = 1;
   const size_t end = text.size() - 1;
   const auto hex4 = [&]() -> std::optional<uint32_t> {

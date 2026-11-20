@@ -351,6 +351,13 @@ class FullScanIterator : public IteratorBase {
   page_id_t stub_current_pid_{0};
   page_id_t stub_next_page_id_{0};
   uint32_t stub_block_row_count_{0};
+  // Per-block memo of the block-level checks SeekVisibleRow used to repeat
+  // for every row (each one takes TlcsFile's directory-cache mutex, which
+  // serialized parallel scans).  Reset whenever stub_block_idx_ changes.
+  // Only a "keep reading" zone-map verdict is cached, so a runtime filter
+  // that tightens mid-scan can only cost reads, never drop rows.
+  bool stub_zone_maps_pass_{false};
+  int8_t stub_all_rows_match_{-1};  // -1 unknown, 0 no, 1 yes
   mutable bool stub_row_materialized_{true};
   mutable std::unique_ptr<StubBlockCache> stub_cache_;
   page_id_t stub_decoded_pid_{0};

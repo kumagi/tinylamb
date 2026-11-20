@@ -293,6 +293,7 @@ TEST_F(LoggerSegmentTest, RecordsNeverStraddleAndRecycleKeepsMoving) {
   constexpr size_t kSegmentSize = 64;
   auto logger = Logger::Create(base_, 13, 1, kSegmentSize).MoveValue();
   std::vector<std::pair<lsn_t, std::string>> records;
+  records.reserve(200);
   for (int i = 0; i < 200; ++i) {
     const std::string payload(static_cast<size_t>(3 + ((i * 7) % 23)),
                               static_cast<char>('a' + (i % 26)));
@@ -344,6 +345,7 @@ TEST_F(LoggerSegmentTest, RecoverySkipsPreRollPaddingAcrossSegments) {
   constexpr size_t kSegmentSize = 64;
   auto logger = Logger::Create(base_, 4096, 1, kSegmentSize).MoveValue();
   std::vector<lsn_t> starts;
+  starts.reserve(32);
   for (int i = 0; i < 32; ++i) {
     const auto start =
         logger->AddLog(LogRecord::BeginCheckpointLogRecord().Serialize());

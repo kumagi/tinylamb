@@ -46,18 +46,21 @@ namespace {
 int64_t Utf8CodePointCount(std::string_view s) {
   int64_t count = 0;
   for (size_t i = 0; i < s.size();) {
-    const unsigned char c =  // NOLINT(modernize-use-auto)
+    const unsigned char c =                // NOLINT(modernize-use-auto)
         static_cast<unsigned char>(s[i]);  // NOLINT(modernize-use-auto)
     size_t width = 1;
     if ((c & 0xE0) == 0xC0)  // NOLINT(readability-braces-around-statements)
-      width = 2;  // NOLINT(readability-braces-around-statements)
-    else if ((c & 0xF0) == 0xE0)  // NOLINT(readability-braces-around-statements)
-      width = 3;  // NOLINT(readability-braces-around-statements)
-    else if ((c & 0xF8) == 0xF0)  // NOLINT(readability-braces-around-statements)
-      width = 4;  // NOLINT(readability-braces-around-statements)
+      width = 2;             // NOLINT(readability-braces-around-statements)
+    else if ((c & 0xF0) ==
+             0xE0)  // NOLINT(readability-braces-around-statements)
+      width = 3;    // NOLINT(readability-braces-around-statements)
+    else if ((c & 0xF8) ==
+             0xF0)  // NOLINT(readability-braces-around-statements)
+      width = 4;    // NOLINT(readability-braces-around-statements)
     bool valid = (i + width <= s.size());
     for (size_t k = 1; valid && k < width; ++k) {
-      if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80)  // NOLINT(readability-braces-around-statements)
+      if ((static_cast<unsigned char>(s[i + k]) & 0xC0) !=
+          0x80)         // NOLINT(readability-braces-around-statements)
         valid = false;  // NOLINT(readability-braces-around-statements)
     }
     i += valid ? width : 1;
@@ -330,13 +333,19 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       // compiler cannot lower (subqueries, unsupported functions) fails
       // compilation and the caller falls back to the AST evaluator.
       const InExpression& in = expression->AsInExpression();
+      if (in.list_.empty()) {
+        if (!CompileNode(in.child_, schema, program)) {
+          return false;
+        }
+        program->AddInstruction({.opcode = BytecodeOp::kPop});
+        return CompileNode(ConstantValueExp(Value(false)), schema, program);
+      }
       // String IN with uncollated, non-interval string constants lowers to an
       // O(1) flat string hash-set lookup (Lean proof:
       // lean/TinylambOpt/TpcdsExecCodegen.lean: in_const_set_3vl_sound).
       const Type child_decl_type = in.child_->ResultType(schema);
       // Each constant below is checked for collation/interval explicitly.
-      if (!in.list_.empty() &&
-          ValueTypeFor(child_decl_type) == ValueType::kVarChar) {
+      if (ValueTypeFor(child_decl_type) == ValueType::kVarChar) {
         auto safe_plain_const_string = [](std::string_view text) noexcept {
           if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
             return false;
@@ -425,7 +434,7 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         return type == ValueType::kInt64 || type == ValueType::kDouble ||
                type == ValueType::kDate;
       };
-      if (in.list_.empty() || !numeric_or_date(in.child_) ||
+      if (!numeric_or_date(in.child_) ||
           !std::ranges::all_of(in.list_, numeric_or_date)) {
         return false;
       }
@@ -443,6 +452,7 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         return false;
       }
       std::vector<size_t> truthy_jumps;
+      truthy_jumps.reserve(in.list_.size());
       for (size_t i = 0; i < in.list_.size(); ++i) {
         const std::optional<BytecodeOp> opcode = equality_op(in.list_[i]);
         if (!opcode.has_value()) {
@@ -494,7 +504,9 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         return false;
       }
       std::vector<size_t> then_jumps;
+      then_jumps.reserve(case_expression.when_clauses_.size());
       std::vector<size_t> branch_ends;
+      branch_ends.reserve(case_expression.when_clauses_.size());
       for (const auto& when : case_expression.when_clauses_) {
         if (!when.first || !when.second) {
           return false;
@@ -641,6 +653,7 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
           return false;
         }
         std::vector<size_t> exits;
+        exits.reserve(call.Args().size());
         for (size_t i = 0; i < call.Args().size(); ++i) {
           if (!CompileNode(call.Args()[i], schema, program)) {
             return false;
@@ -1662,6 +1675,7 @@ struct FastSlot {
   ValueType type;
   bool is_null;
   std::string_view text;
+  bool is_substring{false};
 };
 
 bool FastTruthy(const FastSlot& slot) {
@@ -2301,6 +2315,7 @@ FastEvalStatus ExecuteFastProgram(
             .type = ValueType::kVarChar,
             .is_null = false,
             .text = sub_or.Value(),
+            .is_substring = true,
         });
         continue;
       }
@@ -2359,7 +2374,7 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
   const FastEval status = ExecuteFastProgram(
       instructions_, constants_, casts_, string_sets_, load_col, &slot, error);
   if (status == FastEval::kDone) {
-    if (has_substr_ && !slot.is_null && slot.type == ValueType::kVarChar) {
+    if (slot.is_substring && !slot.is_null && slot.type == ValueType::kVarChar) {
       *out = Value(std::string(slot.text));
     } else {
       *out = FastValueFromSlot(slot);
@@ -2578,21 +2593,20 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateColumnarBatch(
   // overflow detection, and the six comparisons (0/1 INT64 result).  Anything
   // else (division, modulo, NULLs, unsigned operands) keeps the generic path.
   if (instructions_.size() == 3 &&
-      instructions_[2].opcode == BytecodeOp::kBinaryInt64 &&
-      sink->is_uniform && sink->ints != nullptr && !sink->is_unsigned &&
-      !sink->is_interval &&
+      instructions_[2].opcode == BytecodeOp::kBinaryInt64 && sink->is_uniform &&
+      sink->ints != nullptr && !sink->is_unsigned && !sink->is_interval &&
       (sink->type == ValueType::kInt64 ||
        (sink->type == ValueType::kNull && sink_rows == 0))) {
     const BinaryOperation bop = instructions_[2].binary;
     const bool is_arith = bop == BinaryOperation::kAdd ||
                           bop == BinaryOperation::kSubtract ||
                           bop == BinaryOperation::kMultiply;
-    const bool is_cmp =
-        bop == BinaryOperation::kEquals || bop == BinaryOperation::kNotEquals ||
-        bop == BinaryOperation::kLessThan ||
-        bop == BinaryOperation::kLessThanEquals ||
-        bop == BinaryOperation::kGreaterThan ||
-        bop == BinaryOperation::kGreaterThanEquals;
+    const bool is_cmp = bop == BinaryOperation::kEquals ||
+                        bop == BinaryOperation::kNotEquals ||
+                        bop == BinaryOperation::kLessThan ||
+                        bop == BinaryOperation::kLessThanEquals ||
+                        bop == BinaryOperation::kGreaterThan ||
+                        bop == BinaryOperation::kGreaterThanEquals;
     const auto int_col = [&](uint16_t c) noexcept -> const int64_t* {
       if (c >= cols.size()) {
         return nullptr;

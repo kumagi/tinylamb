@@ -65,6 +65,14 @@ std::FILE* FdOpenStream(int fd, const char* mode);
 // and -1 with errno set on failure, even on Windows where _dup2 returns 0).
 int Dup2(int oldfd, int newfd);
 
+// Returns a new descriptor referring to the same open file description as
+// `fd` (POSIX fcntl(F_DUPFD_CLOEXEC) / dup, Windows _dup). The returned
+// descriptor stays valid even if `fd` is later closed or reused, which lets
+// long-lived readers (e.g. lazy LSM range cursors) survive file-generation
+// rotation. Returns the new fd (>= 0) on success, -1 with errno set on
+// failure.
+int Dup(int fd);
+
 // Sequential write to `fd` (honours append mode if opened with append=true).
 ssize_t Write(int fd, const void* buf, size_t count);
 

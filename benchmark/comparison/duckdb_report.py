@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import math
 from pathlib import Path
 import statistics
 
@@ -65,7 +66,11 @@ def audit(directory):
         if set(keys) != expected or len(keys) != len(expected):
             raise ValueError('missing, extra or duplicate measurement conditions')
     if not all(r['correct'] and r['stable'] and r['status'] == 'ok'
-               and len(r['samples_ms']) == args['repeats'] for r in olap):
+               and len(r['samples_ms']) == args['repeats'] and r['samples_ms']
+               and all(type(s) in (int, float) and math.isfinite(s) and s > 0 for s in r['samples_ms'])
+               and type(r.get('median_ms')) in (int, float)
+               and math.isclose(statistics.median(r['samples_ms']), r['median_ms'], rel_tol=1e-12)
+               for r in olap):
         raise ValueError('incorrect, failed or incomplete OLAP measurement')
     if not all(r['valid'] and not r['validation_failures'] for r in oltp):
         raise ValueError('OLTP validation failed')

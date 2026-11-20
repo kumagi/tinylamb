@@ -89,6 +89,7 @@ std::vector<std::string> Text(const std::vector<Row>& rows) {
   out.reserve(rows.size());
   for (const Row& row : rows) {
     std::string text;
+    text.reserve(row.values_.size());
     for (size_t i = 0; i < row.values_.size(); ++i) {
       if (i != 0) {
         text.push_back('|');
@@ -768,6 +769,7 @@ TEST_F(HashSemiReductionExecutorTest, DuplicateAndUnmatchedBuildKeysArePruned) {
   // domain is {1, 2, 7}, so 197 keys are out of domain and the 3 surviving keys
   // keep one row each (six duplicates dropped).
   std::vector<Row> build;
+  build.reserve(200 * 3);
   for (int64_t key = 0; key < 200; ++key) {
     for (int64_t copy = 0; copy < 3; ++copy) {
       build.push_back(Row({Value(key)}));
@@ -948,6 +950,7 @@ TEST_F(HashSemiReductionExecutorTest, SpilledBuildSideAgreesWithThePlainPath) {
                             Row({Value(int64_t{7}), Value(int64_t{70})}),
                             Row({Value(), Value(int64_t{99})})};
   std::vector<Row> build;
+  build.reserve(400);
   for (int64_t key = 0; key < 400; ++key) {
     std::string payload = "row-" + std::to_string(key);
     payload.resize(96, 'x');

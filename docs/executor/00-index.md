@@ -35,7 +35,7 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 | 演算子 | 役割 | 詳細 |
 |---|---|---|
 | `FullScan` | 可視な表行を順次走査する | [表の全走査](30-scan-source.md#2-fullscan表の全走査) |
-| `ParallelScan` | ページ範囲を複数ワーカーで動的分配する | [並列走査](30-scan-source.md#4-parallelscan並列表走査) |
+| `ParallelScan` | ワーカー w がモーセル w, w+W, w+2W, … を担当する（W はワーカー数） | [並列走査](30-scan-source.md#4-parallelscan並列表走査) |
 | `IndexScan` | キー範囲を順方向または逆方向に読む | [索引走査](30-scan-source.md#5-indexscan範囲索引走査) |
 | `IndexOnlyScan` | 索引キーと付加列から出力を組み立てる | [索引のみ走査](30-scan-source.md#6-indexonlyscan索引のみ走査) |
 | `BitmapIndexScan` | 索引条件を物理行位置集合へ変換する | [ビットマップ走査](30-scan-source.md#7-bitmapindexscan-と-bitmapheapscan) |

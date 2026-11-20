@@ -217,6 +217,7 @@ TEST_F(IndexTest, Insert_ManyRows_AllRowsAreReadable) {
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                               ctx.GetTable(kTableName));
   std::unordered_set<Row> rows;
+  rows.reserve(1000);
   std::unordered_set<RowPosition> rps;
 
   for (int i = 0; i < 1000; ++i) {

@@ -92,6 +92,7 @@ TEST(RuntimeFilterTest, WideDenseDomainKeepsHolesNullsAndRangeBoundaries) {
   for (int64_t base : {int64_t{-60000000}, int64_t{0}}) {
     RuntimeFilterBuilder builder;
     std::vector<int64_t> keys;
+    keys.reserve(60001);
     for (int64_t i = 0; i <= 60000; ++i) {
       keys.push_back(base + (i * 1000));
       builder.Observe(keys.back());

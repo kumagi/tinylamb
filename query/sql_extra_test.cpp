@@ -381,6 +381,7 @@ TEST_F(WindowSqlTest, InterleavedPartitionsKeepTheirOwnFrames) {
   RunSql(engine_.get(), context_.get(),
          "CREATE TABLE wide (g INT64, v INT64);");
   std::string insert = "INSERT INTO wide VALUES ";
+  insert.reserve(400);
   for (int i = 0; i < 400; ++i) {
     if (i != 0) {
       insert += ", ";

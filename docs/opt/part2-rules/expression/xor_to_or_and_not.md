@@ -47,10 +47,14 @@ graph TD
               !SafeToReduceEvaluationCount(b)) {
             return Expression{};
           }
+          if (StaticallyNonBoolean(a) || StaticallyNonBoolean(b)) {
+            return Expression{};
+          }
 ```
 
 1. **パターン整合**: 二項演算子が `kXor` であること。
-2. **多重評価の安全性**: 左右の被演算子 $a$ および $b$ の双方が `SafeToReduceEvaluationCount` を満たすこと（揮発性関数 `RAND()`、集約式、および相関サブクエリを含まないこと）。
+2. **型エラーの保存**: どちらかの項が静的に非ブール型なら、展開後の簡約で XOR の型エラーが消えるため変換を拒否します。
+3. **多重評価の安全性**: 左右の被演算子 $a$ および $b$ の双方が `SafeToReduceEvaluationCount` を満たすこと（揮発性関数 `RAND()`、集約式、および相関サブクエリを含まないこと）。
 
 なお、片側がブール定数の場合は先行して登録された `xor_boolean_identity` が先に発火するため、本 Rule が実質的に処理するのは両辺が非定数の式木となります。
 

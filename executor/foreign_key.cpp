@@ -331,6 +331,7 @@ Status ForeignKeyCounts::BuildSortedSegment(
     for (size_t i = 0; i < leaf_metas.size(); i += entries_per_dir) {
       const size_t end = std::min(leaf_metas.size(), i + entries_per_dir);
       std::string dir_buf;
+      dir_buf.reserve((end - i) * 16);
       AppendUint32(&dir_buf, static_cast<uint32_t>(end - i));
       for (size_t j = i; j < end; ++j) {
         const LeafMeta& lm = leaf_metas[j];

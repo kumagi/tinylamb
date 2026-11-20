@@ -95,13 +95,10 @@ class ParallelPool {
           threads_.emplace_back([this] { Work(); });
         }
       } catch (...) {
-        // Publication failed: remove the batch and any threads started for
-        // it so the static pool does not accumulate orphaned workers.
+        // Workers already started belong to the shared pool. Joining one
+        // here would deadlock while it waits for this mutex.
         if (!batches_.empty() && batches_.back() == batch) {
           batches_.pop_back();
-        }
-        if (threads_.size() > helpers) {
-          threads_.resize(helpers);
         }
         return false;
       }

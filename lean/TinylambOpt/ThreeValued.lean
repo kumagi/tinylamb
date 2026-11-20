@@ -133,6 +133,22 @@ def sqlEq {α : Type} [DecidableEq α] (a b : SqlVal α) : SqlBool :=
   | some x, some y => if x = y then .tTrue else .tFalse
   | _,      _      => .tNull
 
+/-- 3 値 `IN` リスト評価。 -/
+def evalInList {α : Type} [DecidableEq α] (x : SqlVal α) : List (SqlVal α) → SqlBool
+  | [] => .tFalse
+  | [y] => sqlEq x y
+  | y :: ys => (sqlEq x y).or (evalInList x ys)
+
+theorem empty_in_is_false {α : Type} [DecidableEq α] (x : SqlVal α) :
+    evalInList x [] = .tFalse := rfl
+
+theorem evalInList_cons {α : Type} [DecidableEq α] (x y : SqlVal α)
+    (ys : List (SqlVal α)) :
+    evalInList x (y :: ys) = (sqlEq x y).or (evalInList x ys) := by
+  cases ys with
+  | nil => simp only [evalInList]; cases sqlEq x y <;> rfl
+  | cons => rfl
+
 /-- SQL の `IS NOT DISTINCT FROM`（NULL 安全等価）: `NULL` 同士も `tTrue` になる。 -/
 def sqlIsNotDistinctFrom {α : Type} [DecidableEq α] (a b : SqlVal α) : SqlBool :=
   match a, b with

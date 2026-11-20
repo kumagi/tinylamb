@@ -104,6 +104,20 @@ class ErrorExpression final : public ExpressionBase {
 
 }  // namespace
 
+TEST(BandJoinTest, RefusesOverBudgetMaterializationAndReleasesCharge) {
+  auto& budget = QueryMemoryBudget::Global();
+  const auto prior = budget.Limit();
+  budget.ResetForTest(1024);
+  const auto inputs = std::vector<Row>(32, Row({Value(1)}));
+  auto schema = IntSchema("l", "x") + IntSchema("r", "x");
+  BandJoin join(Source(inputs), {0}, Source(inputs), {0}, BinaryOperation::kLessThan,
+                IntComparison(BinaryOperation::kLessThan), schema);
+  EXPECT_TRUE(Drain(&join).empty());
+  EXPECT_EQ(join.GetStatus().GetCode(), StatusCode::kMemoryLimitExceeded);
+  EXPECT_EQ(budget.Used(), 0U);
+  budget.ResetForTest(prior);
+}
+
 TEST(BandJoinTest, Int64LessThanKeepsLeftMajorOrderDuplicatesAndNulls) {
   const Schema left_schema = IntSchema("l", "x");
   const Schema right_schema = IntSchema("r", "x");

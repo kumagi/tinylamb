@@ -341,6 +341,7 @@ bool ParseStructRow(std::string_view text, size_t* offset,
   }
   ++*offset;
   std::string token;
+  token.reserve(text.size());
   int depth = 1;
   int bracket_depth = 0;
   bool in_string = false;
@@ -724,6 +725,7 @@ std::string Unquote(std::string_view token) {
   if (token.size() >= 2 && ((token.front() == '"' && token.back() == '"') ||
                             (token.front() == '\'' && token.back() == '\''))) {
     std::string out;
+    out.reserve(token.size());
     for (size_t i = 1; i + 1 < token.size(); ++i) {
       if (token[i] == '\\' && i + 2 < token.size()) {
         char next = token[++i];
@@ -758,7 +760,9 @@ std::string Unquote(std::string_view token) {
 
 std::vector<std::string> SplitTopLevel(std::string_view text) {
   std::vector<std::string> parts;
+  parts.reserve(text.size());
   std::string current;
+  current.reserve(text.size());
   int depth = 0;
   bool in_string = false;
   char quote = '\0';
@@ -857,6 +861,7 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
 
 std::string QuoteComplianceString(std::string_view text, bool bytes) {
   std::string out = bytes ? "b\"" : "\"";
+  out.reserve(text.size());
   for (const char c : text) {
     if (c == '"' || c == '\\') {
       out.push_back('\\');
@@ -978,6 +983,7 @@ std::string FormatComplianceValue(const Value& value) {
       const std::string& sql_type = value.ArrayElementSqlType();
       const auto& elements = value.ArrayElements();
       std::string inner;
+      inner.reserve(elements.size());
       if (elements.size() >= 2) {
         inner = "known order:";
       }
@@ -1023,6 +1029,7 @@ bool ProtoIsIdentStart(char c) {
 // brackets); used to normalize golden text before comparison.
 std::string NormalizeWsText(std::string_view str) {
   std::string out;
+  out.reserve(str.size());
   bool in_space = false;
   for (char c : str) {
     if (std::isspace(static_cast<unsigned char>(c)) != 0) {
@@ -1197,6 +1204,7 @@ std::string CanonicalizeProtoBody(const std::string& body) {
   }
   std::sort(canon.begin(), canon.end());
   std::string joined;
+  joined.reserve(canon.size());
   for (const std::string& item : canon) {
     if (!joined.empty()) {
       joined.push_back('|');
@@ -1327,6 +1335,7 @@ bool ComplianceErrorTextMatches(std::string_view expected,
   // differently-worded messages can still agree on.
   auto significant = [](const std::string& text) {
     std::vector<std::string> tokens;
+    tokens.reserve(text.size());
     size_t i = 0;
     while (i < text.size()) {
       while (i < text.size() && text[i] == ' ') {
@@ -1812,6 +1821,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     }
     auto compact_json = [](std::string_view text) {
       std::string compact;
+      compact.reserve(text.size());
       bool quoted = false;
       for (size_t i = 0; i < text.size(); ++i) {
         const char c = text[i];
@@ -1888,6 +1898,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         actual_str.back() == '}') {
       auto split_object_values = [](std::string_view body) {
         std::vector<std::string> values;
+        values.reserve(body.size());
         for (const std::string& member : SplitTopLevel(body)) {
           int depth = 0;
           bool quoted = false;

@@ -331,6 +331,7 @@ SPredPtr GenPred(Gen& g, const MirrorTable& t,
       // subquery (t IN (SELECT ... FROM t)) cannot be decorrelated because
       // inner/outer scopes collide, so the engine rejects it by design.
       std::vector<const MirrorTable*> candidates;
+      candidates.reserve(all.size() + 1);
       for (const MirrorTable& other : all) {
         if (other.name != t.name) {
           candidates.push_back(&other);
@@ -343,6 +344,7 @@ SPredPtr GenPred(Gen& g, const MirrorTable& t,
         const MirrorTable& sub_t = *candidates[static_cast<size_t>(
             g.Pick(0, static_cast<int>(candidates.size()) - 1))];
         std::vector<int> int_cols;
+        int_cols.reserve(sub_t.columns.size());
         for (size_t i = 0; i < sub_t.columns.size(); ++i) {
           if (sub_t.columns[i].type == ColType::kInt) {
             int_cols.push_back(static_cast<int>(i));
@@ -726,6 +728,7 @@ std::pair<int64_t, std::string> GenValue(Gen& g, ColType type) {
 Row BuildRow(int64_t u,
              const std::vector<std::pair<int64_t, ColType>>& values) {
   std::vector<Value> cells;
+  cells.reserve(values.size() + 1);
   cells.emplace_back(u);
   for (const auto& [repr, type] : values) {
     if (repr == kNullRepr) {
@@ -1013,6 +1016,7 @@ std::string CheckTable(Database& db, TransactionContext& ctx,
   }
   const std::vector<std::string> expected = SortedDump(t.rows);
   std::vector<std::string> actual;
+  actual.reserve(got->size());
   for (const Row& r : *got) {
     actual.push_back(r.ToString());
   }
@@ -1103,6 +1107,7 @@ std::string CheckIndexProbe(Database& db, TransactionContext& ctx, Gen& g,
     return "index probe engine error: " + *sql + " :: " + *error + "\n";
   }
   std::vector<Row> want;
+  want.reserve(t.rows.size());
   for (const Row& r : t.rows) {
     const Value& v = r[static_cast<size_t>(slot)];
     if (v.IsNull() || probe.IsNull()) {
@@ -1128,6 +1133,7 @@ std::string CheckIndexProbe(Database& db, TransactionContext& ctx, Gen& g,
   }
   *expected = SortedDump(want);
   std::vector<std::string> actual;
+  actual.reserve(got->size());
   for (const Row& r : *got) {
     actual.push_back(r.ToString());
   }
@@ -1209,6 +1215,7 @@ std::string CheckIndexProbe(Database& db, TransactionContext& ctx, Gen& g,
     spec_sql = "SELECT " + ColName(slot) + ", " + ColName(slot1) + " FROM " +
                t.name + " WHERE " + ColName(slot1) + " = " + lit(probe1) + ";";
     std::vector<Row> spec_want;
+    spec_want.reserve(t.rows.size());
     for (const Row& r : t.rows) {
       const Value& v1 = r[static_cast<size_t>(slot1)];
       if (!v1.IsNull() && !probe1.IsNull() && v1 == probe1) {
@@ -1339,6 +1346,7 @@ struct OwnerInfo {
 std::vector<std::pair<std::string, int64_t>> WrittenKeys(
     const std::map<std::pair<std::string, int64_t>, OwnerInfo>& owner, int x) {
   std::vector<std::pair<std::string, int64_t>> keys;
+  keys.reserve(owner.size());
   for (const auto& [key, holder] : owner) {
     if (holder.txn == x && holder.written) {
       keys.push_back(key);
@@ -1405,6 +1413,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     const int seed_rows = g.Pick(2, 5);
     for (int r = 0; r < seed_rows; ++r) {
       std::vector<std::pair<int64_t, ColType>> values;
+      values.reserve(m.columns.size() - 1);
       std::string tuple = "(" + std::to_string(next_u[m.name]++);
       for (size_t c = 1; c < m.columns.size(); ++c) {
         const auto [repr, lit] = GenValue(g, m.columns[c].type);
@@ -1619,6 +1628,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       // here means an insert slot race — record it and move on).
       const int64_t u = next_u[target->name]++;
       std::vector<std::pair<int64_t, ColType>> values;
+      values.reserve(target->columns.size() - 1);
       std::string tuple = "(" + std::to_string(u);
       for (size_t c = 1; c < target->columns.size(); ++c) {
         const auto [repr, lit] = GenValue(g, target->columns[c].type);
@@ -2045,6 +2055,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           const SPredPtr pred =
               GenPred(g, *target, tables, 1, SubqMode::kAnywhere);
           std::vector<SExprPtr> exprs;
+          exprs.reserve(target->columns.size());
           auto bump_u = std::make_unique<SExpr>();
           bump_u->kind = SExpr::Kind::kArith;
           bump_u->op = "+";
@@ -2069,6 +2080,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           const int64_t next_u = target->next_u;
           const size_t existing = target->rows.size();
           std::vector<Row> added;
+          added.reserve(existing);
           for (size_t i = 0; i < existing; ++i) {
             const Row& row = target->rows[i];
             if (pred->Eval(row) != 'T') {
@@ -2138,6 +2150,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           break;
         }
         std::vector<std::pair<int64_t, ColType>> values;
+        values.reserve(target->columns.size() - 1);
         std::string tuple = "(" + std::to_string(target->next_u++);
         for (size_t i = 1; i < target->columns.size(); ++i) {
           const auto [repr, lit] = GenValue(g, target->columns[i].type);
@@ -2297,6 +2310,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         // collide transiently depending on the engine's scan order, so
         // those degrade to a column no unique index covers.
         std::vector<size_t> match_idx;
+        match_idx.reserve(target->rows.size());
         for (size_t i = 0; i < target->rows.size(); ++i) {
           if (pred->Eval(target->rows[i]) == 'T') {
             match_idx.push_back(i);
@@ -2448,6 +2462,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         }
         t.steps.push_back({.sql = sql});
         std::vector<Row> kept;
+        kept.reserve(target->rows.size());
         for (Row& row : target->rows) {
           if (pred != nullptr && pred->Eval(row) != 'T') {
             kept.push_back(std::move(row));
@@ -2605,6 +2620,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         const int64_t su =
             match_existing ? RowU(target->rows[match_pos]) : target->next_u;
         std::vector<std::pair<int64_t, ColType>> src_values;
+        src_values.reserve(target->columns.size() - 1);
         std::string src_select = "SELECT " + std::to_string(su) + " AS su";
         std::string ins_vals = "(src.su";
         for (size_t i = 1; i < target->columns.size(); ++i) {
@@ -2871,6 +2887,7 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
         return "replay check failed on " + check.table + " :: " + error + "\n";
       }
       std::vector<std::string> actual;
+      actual.reserve(got->size());
       for (const Row& r : *got) {
         actual.push_back(r.ToString());
       }

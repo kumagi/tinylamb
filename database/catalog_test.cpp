@@ -514,6 +514,7 @@ TEST_F(CatalogTest, PageStorageAllocatesGrowingPageIds) {
 
   // Act -- allocate several row pages and record their ids
   std::vector<page_id_t> pids;
+  pids.reserve(5);
   for (int i = 0; i < 5; ++i) {
     PageRef page =
         pm->AllocateNewPage(ctx.txn_, PageType::kRowPage).MoveValue();

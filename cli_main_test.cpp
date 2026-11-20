@@ -72,6 +72,7 @@ class CliMainTest : public ::testing::Test {
     }
     const auto shell_quote = [](const std::string& s) {
       std::string out = "'";
+      out.reserve(s.size() * 4 + 2);
       for (char c : s) {
         if (c == '\'') {
           out += "'\\''";

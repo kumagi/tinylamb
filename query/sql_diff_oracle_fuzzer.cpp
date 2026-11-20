@@ -118,6 +118,7 @@ bool RunStmt(Database& db, TransactionContext& ctx, const std::string& sql,
 std::string JoinSorted(std::vector<std::string> cells) {
   std::sort(cells.begin(), cells.end());
   std::string out;
+  out.reserve(cells.size() * 2);
   for (size_t i = 0; i < cells.size(); ++i) {
     if (i != 0) {
       out += " ;; ";

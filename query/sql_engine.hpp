@@ -132,6 +132,11 @@ class SqlEngine {
   [[nodiscard]] size_t LastCteRestrictionPushdowns() const {
     return cte_restriction_pushdowns_;
   }
+  // Number of inner-join prefix pull-ups performed in front of trailing LEFT
+  // JOINs (including USING joins) while preparing the most recent statement.
+  [[nodiscard]] size_t LastInnerPrefixPullups() const {
+    return inner_prefix_pullups_;
+  }
 
   // Speculative eager CTE drains during the most recent SELECT preparation.
   [[nodiscard]] size_t LastCteMaterializationAttempts() const {
@@ -329,6 +334,7 @@ class SqlEngine {
   std::string plan_cache_fingerprint_;
   size_t fused_sibling_aggregates_{0};
   size_t cte_restriction_pushdowns_{0};
+  size_t inner_prefix_pullups_{0};
   size_t cte_materialization_attempts_{0};
 
   // True when this statement's WHERE/SET carried a subquery folded to

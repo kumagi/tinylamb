@@ -1,7 +1,7 @@
 name = "TinylambOpt"
 version = "0.1.0"
 keywords = ["database", "optimizer", "sql"]
-defaultTargets = ["TinylambOpt", "demo"]
+defaultTargets = ["TinylambOpt", "demo", "CheckProofs"]
 
 [leanOptions]
 pp.unicode.fun = true # pretty-prints `fun a ↦ b`
@@ -14,3 +14,6 @@ name = "TinylambOpt"
 [[lean_exe]]
 name = "demo"
 root = "Main"
+
+[[lean_lib]]
+name = "CheckProofs"

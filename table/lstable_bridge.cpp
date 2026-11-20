@@ -892,6 +892,24 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
   if (generation == 0) {
     return nullptr;
   }
+  std::vector<uint8_t> projection_mask;
+  const auto& incarnation = table.IncarnationState();
+  if (projection != nullptr && incarnation != nullptr) {
+    projection_mask.resize(schema.ColumnCount());
+    for (slot_t col : *projection) {
+      if (col >= projection_mask.size()) { return nullptr; }
+      projection_mask[col] = 1;
+    }
+    if (incarnation->ProjectionRejected(generation, effective_max_bytes, projection_mask)) {
+      return nullptr;
+    }
+  }
+  const auto remember_projection_limit = [&] {
+    if (!projection_mask.empty() && txn.WriteSetEmpty() &&
+        table.LayoutGeneration() == generation) {
+      incarnation->RejectProjection(generation, effective_max_bytes, projection_mask);
+    }
+  };
   const std::shared_ptr<const TlcsFile> backing_tlcs =
       table.GetBackingTlcsStore();
   if (backing_tlcs != nullptr &&
@@ -909,13 +927,15 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
         return nullptr;
       }
     } else {
+      bool capacity_rejected = false;
       if (auto projected = backing_tlcs->BuildProjectedResidentStore(
-              schema, projection, effective_max_bytes);
+              schema, projection, effective_max_bytes, &capacity_rejected);
           projected != nullptr) {
         table.RefillProjectedLSTableStore(projected);
         return projected;
       }
       if (backing_tlcs->IsPaged()) {
+        if (capacity_rejected) { remember_projection_limit(); }
         return nullptr;
       }
     }
@@ -1220,6 +1240,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
         estimated_bytes += restored_raw_bytes;
         if (estimated_bytes > effective_max_bytes ||
             !mem_charge->TryAddWithReclaim(restored_raw_bytes)) {
+          if (estimated_bytes > effective_max_bytes) { remember_projection_limit(); }
           if (projection == nullptr &&
               max_bytes == LSTableStore::kBuildByteLimit &&
               table.LayoutGeneration() == generation) {
@@ -1249,6 +1270,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
     if (store->total_rows > static_cast<uint64_t>(INT64_MAX) ||
         estimated_bytes > effective_max_bytes ||
         !mem_charge->TryAddWithReclaim(block_bytes)) {
+      if (estimated_bytes > effective_max_bytes) { remember_projection_limit(); }
       // Only an unchanged full-store capacity failure suppresses later full
       // builds. Snapshot/IO failures must never become a capacity verdict.
       if (projection == nullptr && max_bytes == LSTableStore::kBuildByteLimit &&
@@ -2038,6 +2060,11 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
       req_mask[c] = 1;
       ++req_unique;
     }
+  }
+  if (const auto& incarnation = table.IncarnationState();
+      incarnation && incarnation->ProjectionRejected(generation,
+          EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit), req_mask)) {
+    return nullptr;
   }
   if (req_unique >= col_count) {
     // All columns were already rejected by the full-table capacity check; do

@@ -2079,6 +2079,7 @@ TEST(CascadesTest, TopNPushThroughProvenKeepsJoinPredicatesSeparate) {
   SearchEngine search(std::move(memo), RuleSet::Default());
   search.Explore(topn);
   std::unordered_set<std::string> pushed_join_tags;
+  pushed_join_tags.reserve(search.GetMemo().GroupCount());
   for (size_t i = 0; i < search.GetMemo().GroupCount(); ++i) {
     const Group& group = search.GetMemo().Get(i);
     if (group.tag.starts_with("topn_proven_join:5:fact:")) {

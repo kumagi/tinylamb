@@ -191,6 +191,7 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
     bool cur_ambiguous = false;
   };
   std::vector<Frame> groups;
+  groups.reserve(pattern.size());
 
   // The element in progress: its fixed length (kVar = variable), the set
   // of characters it can start with, whether it can match the empty
@@ -536,16 +537,16 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
   static thread_local std::array<std::optional<Entry>, 8> cache;
   static thread_local size_t next = 0;
   static thread_local size_t used = 0;
-  for (const auto& entry : cache) {
-    if (entry && entry->pattern == pattern) {
-      return entry->compiled;
-    }
-  }
-  if (RegexPatternHasNestedRepetition(pattern)) {
-    return StatusError(StatusCode::kInvalidArgument,
-                       "regular expression has nested repetition: " + pattern);
-  }
   try {
+    for (const auto& entry : cache) {
+      if (entry && entry->pattern == pattern) {
+        return entry->compiled;
+      }
+    }
+    if (RegexPatternHasNestedRepetition(pattern)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "regular expression has nested repetition: " + pattern);
+    }
     std::regex compiled(Transform(pattern));
     // std::regex exposes no introspection; charge 16x the pattern text as a
     // conservative estimate of its NFA/submatch programs plus fixed overhead.

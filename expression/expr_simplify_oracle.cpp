@@ -144,8 +144,7 @@ TypedExpr GenLeaf(Gen& g, GenType type, const ExprGenConfig& config) {
   }
   switch (type) {
     case GenType::kInt:
-      return {.expr =
-                  ConstantValueExp(MakeIntLeaf(g, config.extended_ops)),
+      return {.expr = ConstantValueExp(MakeIntLeaf(g, config.extended_ops)),
               .type = type};
     case GenType::kFloat:
       return {.expr = ConstantValueExp(MakeFloatLeaf(g, config.extended_ops)),
@@ -330,7 +329,8 @@ TypedExpr GenNumeric(Gen& g, int depth, const ExprGenConfig& config) {
               .type = GenType::kInt};
     }
     case 10: {
-      // Bit shifts: __shift_left, __shift_right with shift amounts around the valid/error boundary
+      // Bit shifts: __shift_left, __shift_right with shift amounts around the
+      // valid/error boundary
       const char* fn = g.Chance(50) ? "__shift_left" : "__shift_right";
       TypedExpr left = GenTyped(g, GenType::kInt, depth - 1, config);
       if (left.type != GenType::kInt) {
@@ -1595,6 +1595,7 @@ std::string SerializeSExpr(const Expression& expr, GenType type) {
       const auto& c = expr->AsCaseExpression();
       GenType branch = InferType(expr);
       std::string out = "(case";
+      out.reserve(c.when_clauses_.size());
       for (const auto& [cond, value] : c.when_clauses_) {
         out += " (" + SerializeSExpr(cond, GenType::kBool) + " " +
                SerializeSExpr(value, branch) + ")";
@@ -1608,6 +1609,7 @@ std::string SerializeSExpr(const Expression& expr, GenType type) {
       const auto& in = expr->AsInExpression();
       GenType element = InferType(in.child_);
       std::string out = "(in " + SerializeSExpr(in.child_, element);
+      out.reserve(in.list_.size());
       for (const Expression& item : in.list_) {
         out += " " + SerializeSExpr(item, element);
       }

@@ -271,6 +271,7 @@ bool ResolvePlainBaseSources(const SelectStatement& stmt,
     return false;
   }
   std::unordered_set<std::string> seen_quals;
+  seen_quals.reserve(stmt.Sources().size());
   out->reserve(stmt.Sources().size());
   for (size_t i = 0; i < stmt.Sources().size(); ++i) {
     const SelectSource& src = stmt.Sources()[i];
@@ -561,6 +562,7 @@ void AppendDisjunctiveIntervalHulls(
   };
   // Collect candidate columns bounded in branch 0.
   std::vector<ResolvedColRef> candidates;
+  candidates.reserve(branch_conjs[0].size());
   auto extract_col_cmp = [&](const Expression& c, ResolvedColRef* ref_out,
                              BinaryOperation* op_out,
                              Expression* rhs_out) -> bool {
@@ -795,6 +797,7 @@ bool FactorAndEnvelopeOneSelect(SelectStatement* stmt,
 
     // (1a) Common Kleene conjunct factoring across all OR branches.
     std::vector<Expression> hoisted;
+    hoisted.reserve(branch_conjs[0].size());
     std::vector<uint8_t> b0_common(branch_conjs[0].size(), 0);
     for (size_t c0 = 0; c0 < branch_conjs[0].size(); ++c0) {
       const Expression& cand = branch_conjs[0][c0];
@@ -895,10 +898,13 @@ bool FactorAndEnvelopeOneSelect(SelectStatement* stmt,
           continue;
         }
         std::vector<Expression> env_disjuncts;
+        env_disjuncts.reserve(res_branch_conjs.size());
         std::vector<std::vector<Expression>> env_branch_conjs;
+        env_branch_conjs.reserve(res_branch_conjs.size());
         bool every_branch_constrains_r = true;
         for (const auto& bcs : res_branch_conjs) {
           std::vector<Expression> r_only;
+          r_only.reserve(bcs.size());
           for (const Expression& bc : bcs) {
             std::unordered_set<size_t> bc_rels;
             if (CollectResolvedExprRelations(bc, rels, &bc_rels) &&
@@ -1080,6 +1086,7 @@ bool PreaggregateLeftJoinOneSelect(SelectStatement* stmt,
   // (never `COUNT(*)`, `COUNT(1)`, or `COUNT(COALESCE(...))`). Outside those
   // aggregates, only `keyL` (or SELECT aliases in ORDER BY) may appear.
   std::unordered_set<std::string> select_aliases;
+  select_aliases.reserve(stmt->SelectList().size());
   for (const NamedExpression& item : stmt->SelectList()) {
     if (!item.name.empty()) {
       select_aliases.insert(AsciiLower(item.name));
@@ -1560,6 +1567,7 @@ bool AbsorbSelfSemijoinOneSelect(SelectStatement* stmt,
       // conjuncts and subquery WHERE conjuncts must be equivalent!
       bool outer_where_ok = true;
       std::vector<std::string> outer_canon_where;
+      outer_canon_where.reserve(outer_t_local_idxs.size());
       for (const size_t idx_w : outer_t_local_idxs) {
         const Expression ce = CanonicalizeSingleTableExpr(
             all_conjs[idx_w], rels, t_idx, "", &outer_where_ok);
@@ -2328,8 +2336,11 @@ bool DeferUniqueDimAfterTopNOneSelect(
   };
 
   std::vector<ResolvedColRef> deferred_cols;
+  deferred_cols.reserve(gb_cols.size());
   std::vector<ResolvedColRef> retained_gb_cols;
+  retained_gb_cols.reserve(gb_cols.size());
   std::unordered_set<size_t> deferred_rels;
+  deferred_rels.reserve(gb_cols.size());
   size_t deferred_varchar_count = 0;
 
   for (const ResolvedColRef& gr : gb_cols) {
@@ -2570,6 +2581,7 @@ bool DeferUniqueDimAfterTopNOneSelect(
   std::ranges::sort(sorted_def_rels);
   std::unordered_map<size_t, std::string> late_dim_alias;
   std::vector<Expression> outer_where;
+  outer_where.reserve(sorted_def_rels.size());
 
   for (const size_t d_rel : sorted_def_rels) {
     const std::string dalias = "__tpch_late_d" + std::to_string(d_rel);
@@ -3091,6 +3103,7 @@ bool DecorrelateCorrelatedSumOneSelect(
     const std::string cs_alias =
         "__tpch_corr_sum_" + std::to_string((*alias_seq)++);
     std::vector<slot_t> unique_inner_keys;
+    unique_inner_keys.reserve(corr_pairs.size());
     for (const CorrPair& cp : corr_pairs) {
       if (std::ranges::find(unique_inner_keys, cp.inner_slot) ==
           unique_inner_keys.end()) {
@@ -3433,6 +3446,13 @@ bool RewriteCteArgmaxSubqueryToTopTies(SelectStatement* outer,
         return IdentifierEqualsCI(n, outer_cn.name);
       });
       if (col_it == cte_cols.end()) {
+        continue;
+      }
+      // A computed scalar can reference input columns hidden by its alias.
+      // WITH TIES evaluates ordering expressions against projected rows.
+      const auto& value_expr = cte_body->SelectList()[col_it - cte_cols.begin()].expression;
+      if (value_expr->Type() != TypeTag::kAggregateExp &&
+          value_expr->Type() != TypeTag::kColumnValue) {
         continue;
       }
       matched_conj_idx = ci;
@@ -3986,6 +4006,7 @@ Expression FactorCommonConjunctsInOrTree(  // NOLINT(misc-no-recursion)
   }
 
   std::vector<Expression> hoisted;
+  hoisted.reserve(branch_conjs[0].size());
   for (const Expression& cand : branch_conjs[0]) {
     bool in_all = true;
     for (size_t bi = 1; bi < branch_conjs.size(); ++bi) {

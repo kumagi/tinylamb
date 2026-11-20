@@ -123,6 +123,7 @@ TEST(ColumnarTlcsFastPathTest, JitLiteralSelectionPreservesRowBoundaries) {
   }
   const std::vector<const TlcsFile::DecodedColumnChunk*> columns{&chunk};
   std::vector<uint32_t> expected;
+  expected.reserve(chunk.row_count);
   for (uint32_t row = 0; row < chunk.row_count; ++row) {
     if (relational_detail::RowMatchesColPtrs(preds, columns, row)) {
       expected.push_back(row);

@@ -67,14 +67,7 @@ def sqlBoolToVal : SqlBool → Option Int
   | .tNull  => none
 
 /-- SQL `IN (...)` の評価: リストが空なら左辺が `NULL` でも常に `FALSE` (`some 0`)！ -/
-def evalInAux (lhs : Option Int) : List (Option Int) → SqlBool
-  | []      => .tFalse
-  | r :: rs =>
-    let headEq : SqlBool :=
-      match lhs, r with
-      | some a, some b => if a == b then .tTrue else .tFalse
-      | _,      _      => .tNull
-    headEq.or (evalInAux lhs rs)
+abbrev evalInAux (lhs : Option Int) := evalInList lhs
 
 /-- `AuditExpr` の評価器（`padded` 関数が `paddedCol` の値を供給。NULL パディング行では `fun _ => none`）。 -/
 def evalAuditExpr (padded other : Nat → Option Int) : AuditExpr → Option Int
@@ -245,7 +238,7 @@ theorem evalInAux_none_nonEmpty (rs : List (Option Int)) (hne : rs ≠ []) :
     | cons r2 tl2 =>
       have htl : r2 :: tl2 ≠ [] := List.cons_ne_nil _ _
       have hrec := ih htl
-      simp only [evalInAux] at hrec ⊢
+      change (sqlEq none r).or (evalInAux none (r2 :: tl2)) = .tNull
       rw [hrec]
       cases r <;> rfl
 

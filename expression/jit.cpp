@@ -2504,6 +2504,7 @@ void EmitBranchlessKernelPair(llvm::Module* module,
       };
 
   std::vector<SsaCutEdge> cut_edges;
+  cut_edges.reserve(num_insts);
   cut_edges.push_back(
       SsaCutEdge{.target = 0, .cond = builder.getTrue(), .stk = {}});
   llvm::Value* row_err = builder.getFalse();

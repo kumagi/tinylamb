@@ -432,13 +432,6 @@ Status ExternalSorter::AddRow(Row&& row) {
 
   const size_t row_bytes = EstimateRowMemoryBytes(row);
   const size_t budget = EffectiveBudgetBytes();
-  // ADR-0004 rule 9: a single row may never exceed 1/4 of the operator
-  // budget. Check before any retention (including the first row, which the
-  // empty-run guards below would otherwise skip).
-  if (budget > 0 && row_bytes > budget / 4) {
-    return StatusError(StatusCode::kTooBigData,
-                       "row exceeds operator budget quarter");
-  }
   const bool always_spill = options_.force_spill ||
                             ProcessMemoryBudget::Global().AlwaysSpillEnabled();
 
@@ -490,12 +483,13 @@ Status ExternalSorter::AddRow(Row&& row) {
 
   const bool need_flush =
       (always_spill && !run_rows_.empty() && run_bytes_ >= 16384) ||
-      (!run_rows_.empty() && budget > 0 && run_bytes_ + row_bytes > budget) ||
+      (budget > 0 && run_bytes_ + row_bytes > budget) ||
       (grant_cache_.has_value() && !grant_cache_->Reserve(row_bytes));
 
   if (need_flush) {
     RETURN_IF_FAIL(FlushCurrentRun());
-    if (grant_cache_.has_value() && !grant_cache_->Reserve(row_bytes)) {
+    if ((budget > 0 && row_bytes > budget) ||
+        (grant_cache_.has_value() && !grant_cache_->Reserve(row_bytes))) {
       if (options_.spill_store == nullptr) {
         return StatusError(
             StatusCode::kMemoryLimitExceeded,

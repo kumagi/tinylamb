@@ -368,6 +368,7 @@ std::shared_ptr<SelectStatement> RestrictUnionInput(
     }
     bool identity = true;
     std::unordered_set<std::string> names;
+    names.reserve(query->SelectList().size());
     for (size_t i = 0; i < query->SelectList().size(); ++i) {
       const auto& item = query->SelectList()[i];
       const auto name = ProjectionName(nested.SelectList()[i], i);
@@ -422,6 +423,7 @@ std::shared_ptr<SelectStatement> RestrictUnionInput(
                                other.alias.empty() ? other.table : other.alias);
   }
   std::vector<Column> projected;
+  projected.reserve(query->SelectList().size());
   for (size_t i = 0; i < query->SelectList().size(); ++i) {
     const auto& item = query->SelectList()[i];
     if (!item.expression ||
@@ -508,6 +510,7 @@ std::shared_ptr<SelectStatement> RestrictUnionInput(
     }
     // Validate every branch's positional key before executing the extra scan.
     std::vector<const SelectStatement*> parts{query};
+    parts.reserve(query->UnionAll().size() + 1);
     for (const auto& branch : query->UnionAll()) {
       parts.push_back(branch.get());
     }
@@ -806,6 +809,7 @@ StatusOr<std::optional<Relation>> TryMaterializedStarJoin(
     const std::vector<PredicateInfo>& predicates,
     const SelectStatement& statement, bool columnar_output) {
   std::vector<size_t> active;
+  active.reserve(relations.size());
   for (size_t i = 0; i < relations.size(); ++i) {
     if (absorbed[i] == 0) {
       if (relations[i].HasSpill() || relations[i].using_columns) {
@@ -830,6 +834,7 @@ StatusOr<std::optional<Relation>> TryMaterializedStarJoin(
     std::vector<uint32_t> dense_rows;
   };
   std::vector<Dimension> dimensions;
+  dimensions.reserve(active.size());
   size_t build_rows = 0;
   for (size_t i : active) {
     if (i != fact) {
@@ -1197,6 +1202,7 @@ StatusOr<std::optional<Relation>> TryMaterializedStarJoin(
       !statement.HasDistinctOn() && !statement.ForUpdate() &&
       output_columns.size() != result.schema.ColumnCount();
   std::vector<size_t> fact_output;
+  fact_output.reserve(output_columns.size());
   std::vector<std::vector<size_t>> dimension_output(dimensions.size());
   if (project_output) {
     const size_t fact_width = relations[fact].schema.ColumnCount();
@@ -1430,12 +1436,15 @@ StatusOr<std::optional<Relation>> TryMaterializedStarJoin(
         ColumnarChunk cur_chunk;
         bool cur_init = false;
         std::vector<std::shared_ptr<ChunkGatherIndex>> cur_fact_gis;
+        cur_fact_gis.reserve(eff_fact_output.size());
         std::vector<const ChunkGatherIndex*> cur_group_src_gi;
+        cur_group_src_gi.reserve(eff_fact_output.size());
         std::vector<size_t> cur_fact_group_id;
         std::vector<const ColumnarTable*> cur_fact_target_table;
         std::vector<size_t> cur_fact_target_col;
         std::vector<uint8_t> cur_fact_was_gathered;
         std::vector<size_t> cur_fact_group_repr;
+        cur_fact_group_repr.reserve(eff_fact_output.size());
         std::array<std::shared_ptr<ChunkGatherIndex>, 8> cur_dim_gis{};
         std::vector<uint32_t> sel;
         sel.reserve(kColumnarChunkRows);
@@ -2099,6 +2108,7 @@ void ReduceUnmatchedOuterProbes(TransactionContext& context,
     }
     std::ranges::sort(keys, {}, &EqualityKey::left);
     std::vector<slot_t> candidate_columns;
+    candidate_columns.reserve(keys.size());
     for (const auto& key : keys) {
       if (key.null_safe || key.left_offset != 0 || key.right_offset != 0) {
         return;

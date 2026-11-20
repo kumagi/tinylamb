@@ -83,6 +83,7 @@ class SqlBugfixRegressionTest : public ::testing::Test {
     std::vector<std::string> rows;
     result.Value().ForEach([&](const Row& row) {
       std::string text;
+      text.reserve(row.Count());
       for (size_t i = 0; i < row.Count(); ++i) {
         if (i > 0) {
           text += ",";
@@ -102,6 +103,20 @@ class SqlBugfixRegressionTest : public ::testing::Test {
   std::unique_ptr<TransactionContext> context_;
   std::unique_ptr<SqlEngine> engine_;
 };
+
+TEST_F(SqlBugfixRegressionTest, JoinDiscardsOverflowingSumGroup) {
+  Exec("CREATE TABLE fact (k INT64, v INT64)");
+  Exec("CREATE TABLE dim (k INT64 PRIMARY KEY)");
+  Exec("INSERT INTO fact VALUES (1, 9223372036854775807), (1, 1), (2, 7)");
+  Exec("INSERT INTO dim VALUES (2)");
+  const std::string sql =
+      "SELECT d.k, SUM(f.v) FROM fact f JOIN dim d ON f.k = d.k GROUP BY d.k";
+  EXPECT_EQ(Query(sql), (std::vector<std::string>{"2,7"}));
+  Exec("INSERT INTO dim VALUES (1)");
+  const auto error = ErrorOf(sql);
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error.value().find("overflow"), std::string::npos) << error.value();
+}
 
 // Single-table aggregation compiled its scan filter against the unqualified
 // scan schema, so a residual conjunct (function call) naming the alias-
@@ -334,6 +349,7 @@ TEST_F(SqlBugfixRegressionTest, LateMaterializationJoinStatisticsCoverPayload) {
       "(2, 1, 3, FALSE), (3, 2, 5, NULL), (4, NULL, 3, NULL), (5, 4, -1, "
       "TRUE)");
   std::string insert = "INSERT INTO t2 VALUES ";
+  insert.reserve(25);
   for (int i = 0; i < 25; ++i) {
     insert += (i > 0 ? ", (" : "(") + std::to_string(i) + ", " +
               std::to_string(i % 6) + ", " + std::to_string(i % 4) + ", TRUE)";
@@ -381,6 +397,7 @@ TEST_F(SqlBugfixRegressionTest, UnsignedInSubqueryNeverMatchesSignedProbe) {
   // enough for the dense-bits + >= 4096 gate that drops the predicate.
   for (int base = 0; base < 4100; base += 820) {
     std::string insert = "INSERT INTO m17 VALUES ";
+    insert.reserve(820);
     for (int k = 0; k < 820; ++k) {
       const uint64_t value =
           18446744073709551615ULL - static_cast<uint64_t>(base + k);
@@ -412,6 +429,7 @@ TEST_F(SqlBugfixRegressionTest, UnsignedInSubqueryNeverMatchesSignedProbe) {
   Exec("CREATE TABLE msgn (v BIGINT)");
   {
     std::string insert = "INSERT INTO msgn VALUES ";
+    insert.reserve(4100);
     for (int k = 0; k < 4100; ++k) {
       insert += (k > 0 ? ", (" : "(") + std::to_string(-1 - k) + ")";
     }
@@ -843,6 +861,129 @@ TEST_F(SqlBugfixRegressionTest, CreateViewRejectsSessionLocalUdfCapture) {
   Exec("CREATE TEMP FUNCTION tf(x INT64) AS (x + 1)");
   Exec("CREATE TEMP VIEW tv AS SELECT tf(k) AS n FROM base");
   EXPECT_EQ(Query("SELECT n FROM tv"), (std::vector<std::string>{"2", "3"}));
+}
+
+// Name-resolution errors must be reported on BOTH evaluator routes (default
+// lowering and the forced relational fallback).  Regressions for griffin_fuzz
+// GRIFFIN-RELATIONAL-PATH MISMATCH findings, where the default route ran
+// queries the reference GoogleSQL analyzer rejects:
+//  * `SELECT u, u FROM ix ORDER BY u`  -> "Column name u is ambiguous"
+namespace {
+
+struct RouteOutcome {
+  bool ran{false};
+  std::string error;
+};
+
+RouteOutcome RunOnRoute(Database* db, TransactionContext* ctx,
+                        const std::string& sql, bool relational) {
+  RouteOutcome out;
+  SqlEngine engine(*db);
+  engine.SetForceRelationalFallback(relational);
+  StatusOr<QueryResult> result = engine.Execute(*ctx, sql);
+  if (!result.HasValue()) {
+    std::ostringstream reason;
+    reason << result.GetStatus() << " " << engine.LastError();
+    out.error = reason.str();
+    return out;
+  }
+  Row row;
+  while (result.Value().Next(&row)) {
+  }
+  if (result.Value().GetStatus() != Status::kSuccess) {
+    std::ostringstream reason;
+    reason << result.Value().GetStatus() << " " << engine.LastError();
+    out.error = reason.str();
+    return out;
+  }
+  out.ran = true;
+  return out;
+}
+
+class RouteNameResolutionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    if (!GoogleSqlFrontend::Available()) {
+      GTEST_SKIP() << "execute_query unavailable";
+    }
+    db_ = Database::Create("route_names_" + RandomString()).MoveValue();
+    ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+    for (const char* sql : {
+             "CREATE TABLE ix (u INT64, v INT64, s STRING)",
+             "CREATE INDEX ix_u ON ix(u)",
+             "INSERT INTO ix VALUES (0, 10, 'a'), (2, 20, 'b'), (NULL, 30, "
+             "'c')",
+             "CREATE TABLE l (lk INT64, lv STRING)",
+             "INSERT INTO l VALUES (1, 'a'), (2, NULL), (NULL, 'c'), (2, 'd')",
+             "CREATE TABLE r (rk INT64, rv INT64)",
+             "INSERT INTO r VALUES (2, 20), (2, 21), (NULL, 0), (3, 30)",
+             "CREATE TABLE rs (r STRING, c STRING, n INT64)",
+             "INSERT INTO rs VALUES ('x', 'p', 1), ('y', NULL, 3)",
+         }) {
+      const RouteOutcome o = RunOnRoute(db_.get(), ctx_.get(), sql, false);
+      ASSERT_TRUE(o.ran) << sql << ": " << o.error;
+    }
+  }
+  void TearDown() override {
+    ctx_.reset();
+    if (db_ != nullptr) {
+      db_->DeleteAll();
+    }
+  }
+
+  void ExpectRejectedOnBothRoutes(const std::string& sql) {
+    for (const bool relational : {false, true}) {
+      const RouteOutcome o = RunOnRoute(db_.get(), ctx_.get(), sql, relational);
+      EXPECT_FALSE(o.ran) << (relational ? "relational" : "default")
+                          << " route accepted: " << sql;
+    }
+  }
+
+  void ExpectAcceptedOnBothRoutes(const std::string& sql) {
+    for (const bool relational : {false, true}) {
+      const RouteOutcome o = RunOnRoute(db_.get(), ctx_.get(), sql, relational);
+      EXPECT_TRUE(o.ran) << (relational ? "relational" : "default")
+                         << " route rejected: " << sql << ": " << o.error;
+    }
+  }
+
+  std::unique_ptr<Database> db_;
+  std::unique_ptr<TransactionContext> ctx_;
+};
+
+}  // namespace
+
+TEST_F(RouteNameResolutionTest, DuplicateSelectAliasInOrderBy) {
+  ExpectRejectedOnBothRoutes("SELECT u, u FROM ix ORDER BY u");
+  ExpectRejectedOnBothRoutes("SELECT v, v FROM ix ORDER BY v");
+  // Distinct aliases, or ordering by an unambiguous key, stay legal.
+  ExpectAcceptedOnBothRoutes("SELECT u, u AS u2 FROM ix ORDER BY u");
+  ExpectAcceptedOnBothRoutes("SELECT u, u FROM ix ORDER BY v");
+  // Ordinals are never ambiguous.  (The relational fallback still rejects
+  // `ORDER BY 1` over duplicated output names; only the default route is
+  // asserted until that is fixed.)
+  {
+    const RouteOutcome o =
+        RunOnRoute(db_.get(), ctx_.get(), "SELECT u, u FROM ix ORDER BY 1",
+                   /*relational=*/false);
+    EXPECT_TRUE(o.ran) << o.error;
+  }
+}
+
+// sql_aggregate_fuzz: GoogleSQL rejects DISTINCT aggregates whose inner
+// ORDER BY names anything but a function argument; the engine used to run
+// them and order collapsed duplicates arbitrarily.
+TEST_F(RouteNameResolutionTest, DistinctAggregateOrderByMustNameArgument) {
+  ExpectRejectedOnBothRoutes("SELECT ARRAY_AGG(DISTINCT u ORDER BY v) FROM ix");
+  ExpectRejectedOnBothRoutes(
+      "SELECT ARRAY_AGG(DISTINCT u ORDER BY v DESC LIMIT 2) FROM ix");
+  ExpectRejectedOnBothRoutes(
+      "SELECT STRING_AGG(DISTINCT s, ',' ORDER BY u) FROM ix");
+  ExpectAcceptedOnBothRoutes(
+      "SELECT ARRAY_AGG(DISTINCT u ORDER BY u DESC LIMIT 1) FROM ix");
+  ExpectAcceptedOnBothRoutes(
+      "SELECT STRING_AGG(DISTINCT s, ',' ORDER BY s) FROM ix");
+  ExpectAcceptedOnBothRoutes("SELECT ARRAY_AGG(u ORDER BY v) FROM ix");
 }
 
 }  // namespace tinylamb

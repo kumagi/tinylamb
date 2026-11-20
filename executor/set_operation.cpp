@@ -640,6 +640,7 @@ Status SetOperationExecutor::MaterializePartitioned() {
   output_.clear();
   output_offset_ = 0;
   std::vector<Positioned> accumulated;
+  accumulated.reserve(kSetOperationPartitions);
   for (size_t partition = 0; partition < kSetOperationPartitions; ++partition) {
     std::vector<std::vector<Positioned>> rows(spill_sources_.size());
     for (size_t source = 0; source < spill_sources_.size(); ++source) {

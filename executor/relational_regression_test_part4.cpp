@@ -696,6 +696,7 @@ TEST_F(RelationalRegressionTest, ColumnarCorrelatedFilterRetainsPayloads) {
                    Column(ColumnName("o", "payload"), ValueType::kVarChar)});
   auto columns = std::make_shared<ColumnarTable>();
   std::vector<Row> expected;
+  expected.reserve(12);
   for (int i = 0; i < 6; ++i) {
     ColumnarChunk chunk;
     chunk.InitFromSchema(input.schema, 2);
@@ -931,6 +932,7 @@ TEST_F(RelationalRegressionTest, ScalarFloatingFiltersKeepAllComparisons) {
   RelationalRun(
       *rs_, "CREATE TABLE FloatSelection(k INT64,v DOUBLE,n DOUBLE NOT NULL)");
   std::vector<Row> rows;
+  rows.reserve(32769);
   {
     auto ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
@@ -1035,6 +1037,7 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
       Value(0),  Value(1),
       Value(2),  Value(std::numeric_limits<int64_t>::max())};
   std::vector<Row> input;
+  input.reserve(18000);
   {
     auto ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
@@ -1114,6 +1117,7 @@ TEST_F(RelationalRegressionTest,
   RelationalRun(*rs_,
                 "CREATE TABLE SecondaryFilter(id INT64 NOT NULL,k INT64)");
   std::vector<Row> input;
+  input.reserve(18000);
   RuntimeFilterBuilder primary_builder, sparse_builder;
   std::vector<std::unique_ptr<RuntimeFilter>> secondary_parts;
   secondary_parts.push_back(std::make_unique<ExactSetRuntimeFilter>(
@@ -1219,6 +1223,7 @@ TEST_F(RelationalRegressionTest, IndexedRuntimeFilterKeepsRunsAndResiduals) {
     RelationalRun(*rs_, "CREATE TABLE " + name +
                             "(k INT64,v INT64,id INT64,d INT64 NOT NULL)");
     std::vector<Row> rows;
+    rows.reserve(9000);
     RuntimeFilterBuilder builder;
     for (int64_t group = 0; group < 1300; ++group) {
       if (group % 31 == 0) { builder.Observe(base + (group * 4));
@@ -1326,6 +1331,7 @@ TEST_F(RelationalRegressionTest, RangePrefilterKeepsResidualsNullsAndBounds) {
   RelationalRun(*rs_,
                 "CREATE TABLE RangeProbe(k INT64,j INT64,tag STRING,id INT64)");
   std::vector<Row> input;
+  input.reserve(9000);
   {
     auto ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
@@ -1697,6 +1703,7 @@ TEST_F(RelationalRegressionTest, DeferredFilteredPkKeepsNullsAndSnapshots) {
     }
   }
   std::vector<Row> date_expected;
+  date_expected.reserve(counts.size() * counts[0].size());
   for (size_t g = 0; g < counts.size(); ++g) {
     for (size_t p = 0; p < counts[g].size(); ++p) {
       date_expected.push_back(Row(
@@ -1725,6 +1732,7 @@ TEST_F(RelationalRegressionTest, DeferredFilteredPkKeepsNullsAndSnapshots) {
           std::pair{"NOT (NOT (f.p IS NULL))", true},
           std::pair{"f.p IS NOT NULL AND f.v=1", false}}) {
       std::vector<Row> filtered;
+      filtered.reserve(date_expected.size());
       for (const Row& row : date_expected) {
         if (row[2].IsNull() == expect_null) {
           filtered.push_back(row);
@@ -3599,6 +3607,7 @@ TEST_F(RelationalRegressionTest, GroupOutputPushChainsBuildsAndKeepsErrors) {
       prefix + tail +
       "WHERE COALESCE(b.v,0)>0 OR COALESCE(c.v,0)>0 ORDER BY a.k";
   std::vector<Row> expected;
+  expected.reserve(4);
   for (int k = 1; k <= 4; ++k) {
     expected.emplace_back(
         std::vector<Value>{Value(k), Value(20), Value(20), Value(20)});
@@ -3735,6 +3744,7 @@ TEST_F(RelationalRegressionTest,
     });
     std::sort(seen.begin(), seen.end());
     std::vector<int64_t> expected;
+    expected.reserve(count);
     for (size_t r = 0; r < count; ++r) {
       if (r % 97 == 7 && r % 11 != 0) {
         expected.push_back(static_cast<int64_t>(r));
@@ -4015,6 +4025,7 @@ TEST_F(RelationalRegressionTest,
       "CREATE TABLE MultiWinT(s1 VARCHAR,s2 VARCHAR,y INT64,m INT64,v DOUBLE)");
   {
     std::string insert_sql = "INSERT INTO MultiWinT VALUES ";
+    insert_sql.reserve(2400);
     for (int i = 0; i < 2400; ++i) {
       if (i > 0) {
         insert_sql += ",";
@@ -4101,6 +4112,7 @@ TEST_F(RelationalRegressionTest,
   RelationalRun(*rs_, "CREATE TABLE FgjFact(k INT64,v DOUBLE)");
   {
     std::string dim_sql = "INSERT INTO FgjDim VALUES ";
+    dim_sql.reserve(8500);
     for (int i = 0; i < 8500; ++i) {
       if (i > 0) {
         dim_sql += ",";

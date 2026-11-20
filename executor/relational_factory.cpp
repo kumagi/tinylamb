@@ -602,6 +602,7 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
               return item.expression->Type() == TypeTag::kColumnValue;
             })) {
       std::vector<slot_t> slots;
+      slots.reserve(projection->Columns().size());
       for (const auto& item : projection->Columns()) {
         const int offset = source->GetSchema().Offset(
             item.expression->AsColumnValue().GetColumnName());
@@ -633,6 +634,7 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
   if (scan != nullptr && scan->CanNarrow() && simple_columns &&
       scan->GetStats().Columns() >= scan->GetSchema().ColumnCount()) {
     std::vector<slot_t> slots;
+    slots.reserve(aggregates.size());
     bool resolved = true;
     for (const auto& named : aggregates) {
       const auto& aggregate = named.expression->AsAggregateExpression();

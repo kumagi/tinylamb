@@ -43,8 +43,8 @@ the server CMake target is not restricted to Linux.
   thread-local). DoS caps: pre-auth input 10,004 B, queued output 4 MiB,
   there is no hard 1M-row result cap; large results are governed by query memory grants. `StatusCode::kMemoryLimitExceeded`
   maps to PostgreSQL SQLSTATE `53200` (`out_of_memory`), and `kNoSpace` maps to
-  `53100` (`disk_full`). `read_worker_threads == 0` defaults to
-  `hardware_concurrency()` (capped at 16).
+  `53100` (`disk_full`). An unset `read_worker_threads` uses hardware concurrency (1–16 workers).
+  An explicit zero runs tasks inline.
 
 Catalog changes stay on epoll and fail with SQLSTATE 55006 while a foreign
 transaction block or worker task/completion/cleanup is outstanding. There is

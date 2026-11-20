@@ -908,4 +908,50 @@ TEST_F(SqlAuditRegressionTest, CountStarOnWideTableScansOneColumn) {
   EXPECT_NE(text.find("columns=1/6"), std::string::npos) << text;
 }
 
+// bugs2.md P847: derived-table flattening could not see inside kQueryExp
+// expressions (ExpressionChildren exposes only the Test() leg), so a
+// `d.col` reference inside a scalar subquery survived substitution and
+// silently rebound to the base column once the derived alias was dropped.
+// The flattener now refuses any outer expression carrying a query
+// expression; the query keeps the materialized derived path and stays exact.
+TEST_F(SqlAuditRegressionTest, DerivedFlattenKeepsSubqueryAliasReferences) {
+  Rows("CREATE TABLE audit_flat_t (k INT64, m INT64)");
+  Rows("INSERT INTO audit_flat_t VALUES (1, 1), (2, 2)");
+  Rows("CREATE TABLE audit_flat_s (k INT64, m2 INT64)");
+  Rows("INSERT INTO audit_flat_s VALUES (1, 100), (2, 200)");
+  for (bool force_relational : {false, true}) {
+    SCOPED_TRACE(force_relational);
+    engine_->SetForceRelationalFallback(force_relational);
+    // d.m is m * 100 (100, 200); the subquery must count s rows per derived
+    // output.  Flattened, `d.m` rebound to base m (1, 2) and counted 0.
+    EXPECT_EQ(Rows(R"sql(
+      SELECT d.k, (SELECT COUNT(*) FROM audit_flat_s s
+                   WHERE s.m2 = d.m)
+      FROM (SELECT k, m * 100 AS m FROM audit_flat_t) d
+      ORDER BY d.k
+    )sql"),
+              (std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{1})}),
+                                Row({Value(int64_t{2}), Value(int64_t{1})})}));
+    // A non-colliding derived name keeps resolving to the derived output
+    // (flattening used to turn it into `column d.ext not found`).
+    EXPECT_EQ(Rows(R"sql(
+      SELECT d.k, (SELECT COUNT(*) FROM audit_flat_s s
+                   WHERE s.m2 = d.ext)
+      FROM (SELECT k, m * 100 AS ext FROM audit_flat_t) d
+      ORDER BY d.k
+    )sql"),
+              (std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{1})}),
+                                Row({Value(int64_t{2}), Value(int64_t{1})})}));
+    // EXISTS carries the same correlated reference through the kQueryExp
+    // boundary.
+    EXPECT_EQ(Rows(R"sql(
+      SELECT d.k FROM (SELECT k, m * 100 AS m FROM audit_flat_t) d
+      WHERE EXISTS (SELECT 1 FROM audit_flat_s s WHERE s.m2 = d.m)
+      ORDER BY d.k
+    )sql"),
+              (std::vector<Row>{Row({Value(int64_t{1})}),
+                                Row({Value(int64_t{2})})}));
+  }
+}
+
 }  // namespace tinylamb

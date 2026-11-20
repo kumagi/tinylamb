@@ -909,6 +909,7 @@ std::string FormatDoubleShortest(double value) {
       return FormatDateDays(value.int_value);
     case ValueType::kVarChar: {
       std::string escaped;
+      escaped.reserve(value.varchar_value.size() + 2);
       json_text::AppendJsonString(escaped, value.varchar_value);
       return escaped;
     }

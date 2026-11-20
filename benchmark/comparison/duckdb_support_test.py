@@ -34,6 +34,9 @@ def write_disjoint(ports, key, result):
 class DuckDBSupportTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        import duckdb
+        if duckdb.__version__ != '2.0.0':
+            raise unittest.SkipTest('Quack integration tests require duckdb==2.0.0')
         cls.environment = patch.dict(os.environ)
         cls.environment.start()
         cls.temporary = tempfile.TemporaryDirectory(prefix='quack-test-')

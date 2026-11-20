@@ -66,6 +66,13 @@ TEST(RegexGuardNestedRepetitionTest, AllowsDeterministicOrBoundedShapes) {
   }
 }
 
+TEST(RegexGuardCompileTest, Utf8DotSkipsBothLineTerminators) {
+  for (bool bytes : {false, true}) {
+    EXPECT_EQ(CheckedRegexPosition("\r\nX", ".", 1, 1, 0, bytes).Value(), 3);
+  }
+  EXPECT_EQ(CheckedRegexPosition("猫", "^.$", 1, 1, 0, false).Value(), 1);
+}
+
 TEST(RegexGuardCompileTest, CompilesHealthyPatterns) {
   auto compiled = CompileCheckedRegex("^[a-z]+_[0-9]{2}$");
   ASSERT_TRUE(compiled.HasValue());

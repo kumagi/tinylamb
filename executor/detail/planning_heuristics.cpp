@@ -103,6 +103,7 @@ bool IsVirtualValueTableField(const Schema& schema, const ColumnName& name) {
 std::vector<size_t> MatchingColumnOffsets(const Schema& schema,
                                           const std::string& name) {
   std::vector<size_t> offsets;
+  offsets.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     if (IdentifierEquals(schema.GetColumn(i).Name().name, name)) {
       offsets.push_back(i);
@@ -156,6 +157,7 @@ bool IsNullRejectingPredicate(const Expression& expression) {
     return false;
   }
   std::unordered_set<std::string> relations;
+  relations.reserve(expression->TouchedColumns().size());
   bool has_unqualified = false;
   for (const ColumnName& column : expression->TouchedColumns()) {
     if (column.schema.empty()) {
@@ -260,6 +262,7 @@ Expression NecessaryLocalDisjunction(const Expression& expression,
   local_branches.reserve(branches.size());
   for (const std::vector<Expression>& branch : conjuncts) {
     std::vector<Expression> local;
+    local.reserve(branch.size());
     for (const Expression& conjunct : branch) {
       if (!conjunct || ContainsQuery(conjunct)) {
         continue;
@@ -421,6 +424,7 @@ std::vector<std::pair<ColumnName, ColumnName>> DisjunctCommonEqualities(
     }
     per_branch.push_back(std::move(pairs));
   }
+  common.reserve(per_branch.front().size());
   for (const auto& [key, pair] : per_branch.front()) {
     const bool shared = std::ranges::all_of(
         per_branch, [&](const auto& branch) { return branch.contains(key); });
@@ -672,6 +676,7 @@ std::vector<EqualityKey> EqualityKeys(
     const Schema& left, const Schema& right,
     const std::vector<Expression>& predicates) {
   std::vector<EqualityKey> keys;
+  keys.reserve(predicates.size());
   for (const Expression& predicate : predicates) {
     if (!predicate || predicate->Type() != TypeTag::kBinaryExp) {
       continue;
@@ -1858,6 +1863,7 @@ std::optional<std::vector<BytecodeProgram>> CompileProbeResiduals(
     return std::nullopt;
   }
   std::vector<BytecodeProgram> programs;
+  programs.reserve(predicates.size());
   for (const auto& predicate : predicates) {
     if (!predicate || ContainsQuery(predicate) ||
         ContainsParameterSlot(predicate) ||
@@ -2573,6 +2579,7 @@ std::vector<size_t> ComputeColumnarBuildGroups(
   const size_t ncols = plan.size();
   std::vector<size_t> group_of(ncols, 0);
   std::vector<size_t> repr_cols;
+  repr_cols.reserve(ncols);
   for (size_t c = 0; c < ncols; ++c) {
     if (!plan[c].same_leaf_target) {
       group_of[c] = repr_cols.size();
@@ -4891,6 +4898,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     std::vector<size_t> right_columns;
   };
   std::vector<UsingJoinKey> using_residuals;
+  using_residuals.reserve(source.using_columns.size());
   for (const std::string& name : source.using_columns) {
     std::vector<size_t> left_columns = MatchingColumnOffsets(left.schema, name);
     std::vector<size_t> right_columns =
@@ -5148,6 +5156,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     std::vector<slot_t> left_columns;
     std::vector<slot_t> right_columns;
     std::vector<int64_t> left_key_offsets;
+    left_key_offsets.reserve(equality_keys.size());
     std::vector<int64_t> right_key_offsets;
     left_columns.reserve(equality_keys.size());
     right_columns.reserve(equality_keys.size());
@@ -5756,7 +5765,9 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
     std::vector<slot_t> left_columns;
     std::vector<slot_t> right_columns;
     std::vector<int64_t> left_key_offsets;
+    left_key_offsets.reserve(equality_keys.size());
     std::vector<int64_t> right_key_offsets;
+    right_key_offsets.reserve(equality_keys.size());
     left_columns.reserve(equality_keys.size());
     right_columns.reserve(equality_keys.size());
     for (const EqualityKey& key : equality_keys) {

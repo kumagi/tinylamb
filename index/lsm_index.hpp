@@ -18,7 +18,9 @@
 #define TINYLAMB_LSM_INDEX_HPP
 
 #include <cstddef>
+#include <deque>
 #include <iosfwd>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -31,6 +33,7 @@ namespace tinylamb {
 
 class Transaction;
 class LsmIndex;
+class LsmScanCursor;
 
 class LsmIndexIterator {
  public:
@@ -38,33 +41,32 @@ class LsmIndexIterator {
   LsmIndexIterator(LsmIndex* tree, Transaction* txn,
                    std::string_view begin = "", std::string_view end = "",
                    bool ascending = true);
+  ~LsmIndexIterator();
+  LsmIndexIterator(LsmIndexIterator&&) noexcept;
+  LsmIndexIterator& operator=(LsmIndexIterator&&) noexcept;
 
   [[nodiscard]] bool IsValid() const { return valid_; }
   [[nodiscard]] Status GetStatus() const { return status_; }
   [[nodiscard]] std::string Key() const;
   [[nodiscard]] std::string Value() const;
 
-  void Clear() {
-    valid_ = false;
-    entries_.clear();
-    idx_ = 0;
-    status_ = Status::kSuccess;
-    stable_leaf_cache_ = false;
-  }
+  // Defined out-of-line: resetting scan_cursor_ needs the complete
+  // LsmScanCursor type, which lives in page/page_lsm_store.hpp.
+  void Clear();
 
   void EnableStableLeafCache() { stable_leaf_cache_ = true; }
   void DisableStableLeafCache() { stable_leaf_cache_ = false; }
   [[nodiscard]] bool StableLeafCacheEnabled() const { return stable_leaf_cache_; }
   [[nodiscard]] bool EnsureLeafCache() const {
-    return valid_ && idx_ < entries_.size();
+    return valid_ && EntryAt(idx_) != nullptr;
   }
   [[nodiscard]] std::string_view CachedKey(size_t i) const {
-    return i < entries_.size() ? std::string_view(entries_[i].first)
-                               : std::string_view{};
+    const auto* e = EntryAt(i);
+    return e != nullptr ? std::string_view(e->first) : std::string_view{};
   }
   [[nodiscard]] std::string_view CachedValue(size_t i) const {
-    return i < entries_.size() ? std::string_view(entries_[i].second)
-                               : std::string_view{};
+    const auto* e = EntryAt(i);
+    return e != nullptr ? std::string_view(e->second) : std::string_view{};
   }
 
   LsmIndexIterator& operator++();
@@ -76,9 +78,23 @@ class LsmIndexIterator {
   size_t idx_{0};
 
  private:
+  // Absolute-position accessor shared by the eager (entries_) and lazy
+  // (emitted_) representations; nullptr when `i` is not materialized.
+  [[nodiscard]] const std::pair<std::string, std::string>* EntryAt(
+      size_t i) const;
+  [[nodiscard]] size_t EntryCount() const;
+  // Lazy mode only: pulls the next resolved entry from scan_cursor_ into
+  // emitted_. Returns false at end-of-range or on cursor error.
+  bool PullNext();
+
   LsmIndex* tree_{nullptr};
   Transaction* txn_{nullptr};
   std::vector<std::pair<std::string, std::string>> entries_;
+  // Ascending lazy scans only: entries pulled so far from scan_cursor_.
+  // `idx_` remains the absolute position, so operator-- revisits earlier
+  // entries without rewinding the forward-only cursor.
+  std::deque<std::pair<std::string, std::string>> emitted_;
+  std::unique_ptr<LsmScanCursor> scan_cursor_;
   bool valid_{false};
   Status status_{Status::kSuccess};
 };

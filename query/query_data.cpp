@@ -435,6 +435,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
         agg->SetSecondaryArg(std::move(resolved));
       }
       std::vector<Expression> trailing;
+      trailing.reserve(src.TrailingArgs().size());
       for (const Expression& arg : src.TrailingArgs()) {
         ASSIGN_OR_RETURN(Expression, resolved, resolve(arg));
         trailing.push_back(std::move(resolved));
@@ -591,6 +592,7 @@ Status ResolveSelect(
             continue;
           }
           std::vector<Expression> args;
+          args.reserve(all_cols.size() * 2);
           for (const ColumnName& column : all_cols) {
             if (!CaseInsensitiveEquals(column.schema, col_name.name)) {
               continue;

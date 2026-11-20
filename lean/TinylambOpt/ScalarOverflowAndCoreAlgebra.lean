@@ -3,8 +3,7 @@ import TinylambOpt.WindowTopNDecorrelate
 /-
 # Step 9: コア関係代数・`INT64` オーバーフロー境界・スカラ式 3 値エラー保存の網羅的 Lean 4 証明
 
-本モジュールでは以下を機械検証し、**Cascades 論理書き換えルール全 91 件中 91 件（100.0%）** および
-**スカラ式書き換えルール 71 件中 67 件（94.4%）** の Lean 4 形式検証を達成します：
+本モジュールでは以下の関係代数とスカラ式書き換えのモデルを検証します。
 1. コア関係代数（Join 交換・結合・列挙、Selection 分割・押し下げ、Projection 合成・透過、集約下の列刈り込み）
    ＋ **実在バグ M2（`push_projection_through_aggregation` の `HAVING` 列消失）**
    ＋ **実在バグ M5（`InferJoinConstants` / `InferJoinInequalities` の `INT64`–`DOUBLE` $2^{53}$ 非推移性・非順序演算子押し下げ）**
@@ -337,8 +336,8 @@ theorem repaired_push_projection_through_aggregation_sound {Row Pruned K AggVal 
 - `reassociate_subtract_add_constants`, `reassociate_add_subtract_constants`
 - `canonicalize_add_negative_constant`, `canonicalize_subtract_negative_constant`
 - `multiply_by_negative_one`, `double_negation_arithmetic`, `double_bitwise_negation`
-- `identity_add_zero`, `identity_subtract_zero`, `identity_multiply_one`, `identity_divide_one`
-- `combine_repeated_addend`, `abs_of_abs`, `pow_identities`
+- `identity_add_zero`, `identity_subtract_zero`, `identity_multiply_one`
+- `combine_repeated_addend`, `abs_of_abs`
 -/
 
 def int64Min : Int := -9223372036854775808
@@ -475,8 +474,8 @@ theorem int64_reassociate_all_four_rules_sound
 
 /-- ✅ **完全正当性 (`canonicalize_add_negative_constant`, `canonicalize_subtract_negative_constant`,
     `multiply_by_negative_one`, `double_negation_arithmetic`, `double_bitwise_negation`,
-    `identity_add_zero`, `identity_subtract_zero`, `identity_multiply_one`, `identity_divide_one`,
-    `combine_repeated_addend`, `abs_of_abs`, `pow_identities`)** -/
+    `identity_add_zero`, `identity_subtract_zero`, `identity_multiply_one`,
+    `combine_repeated_addend`, `abs_of_abs`)** -/
 theorem int64_identities_negation_and_abs_sound
     (x : EvalRes Int)
     (h_valid_x : ∀ v, x = .val v → inInt64 v)
@@ -595,6 +594,23 @@ def evalOrShort (l r : Except Unit SqlBool) : Except Unit SqlBool := do
     | .tTrue => .ok .tTrue
     | _      => .ok .tNull
 
+/-- Repeated evaluations of x agree (including errors), and the discarded
+    boolean operand y always returns a value. Both orders used by the
+    optimizer preserve errors and SQL UNKNOWN under short-circuit evaluation. -/
+theorem guarded_short_circuit_absorption (x : Except Unit SqlBool) (y : SqlBool) :
+    evalAndShort x (evalOrShort x (.ok y)) = x ∧
+    evalAndShort (evalOrShort x (.ok y)) x = x ∧
+    evalOrShort x (evalAndShort x (.ok y)) = x ∧
+    evalOrShort (evalAndShort x (.ok y)) x = x := by
+  cases x with
+  | error e => cases e; exact ⟨rfl, rfl, rfl, rfl⟩
+  | ok v => cases v <;> cases y <;> exact ⟨rfl, rfl, rfl, rfl⟩
+
+theorem absorption_can_drop_error :
+    evalAndShort (.ok .tNull) (evalOrShort (.ok .tNull) (.error ())) ≠ .ok .tNull := by
+  intro h
+  cases h
+
 /-- ✅ **完全正当性 (`boolean_identity` & `fold_*` の短絡エラー非対称性証明)** -/
 theorem boolean_identity_short_circuit_sound (x : Except Unit SqlBool) (vl : SqlBool) :
     evalAndShort (.ok .tTrue) x = x ∧
@@ -682,14 +698,6 @@ theorem null_and_like_rules_sound
   · cases s with
     | none => rfl
     | some sv => simp [sqlNotLike, sqlLike, sqlNeq, sqlEq, h_no_wildcard sv]
-
-/-- 3 値 `IN` リスト評価。 -/
-def evalInList {α : Type} [DecidableEq α] (x : SqlVal α) : List (SqlVal α) → SqlBool
-  | [] => match x with | none => .tNull | some _ => .tFalse
-  | y :: ys =>
-    match ys with
-    | [] => sqlEq x y
-    | _  => (sqlEq x y).or (evalInList x ys)
 
 /-- ✅ **健全性 (`singleton_in`, `dedupe_in_list`, `or_of_ranges_to_in`, `inner_join_not_null_inference`)**:
     とくに `inner_join_not_null_inference` について：

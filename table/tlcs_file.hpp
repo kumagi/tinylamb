@@ -378,7 +378,7 @@ class TlcsFile {
   // when `effective_max_bytes` permits (or returns nullptr when too large).
   [[nodiscard]] std::shared_ptr<const LSTableStore> BuildProjectedResidentStore(
       const Schema& schema, const std::vector<slot_t>* projection,
-      uint64_t effective_max_bytes) const;
+      uint64_t effective_max_bytes, bool* capacity_rejected = nullptr) const;
 
  private:
   [[nodiscard]] static StatusOr<std::shared_ptr<TlcsFile>> OpenInternal(
@@ -430,7 +430,7 @@ class TlcsFile {
   [[nodiscard]] std::shared_ptr<LSTableStore> BuildResidentStoreInternal(
       const Schema& schema, const std::vector<slot_t>* projection,
       uint64_t max_bytes,
-      const std::shared_ptr<const platform::MemoryMap>& mmap) const;
+      const std::shared_ptr<const platform::MemoryMap>& mmap, bool* capacity_rejected = nullptr) const;
 
   std::string path_;
   int fd_{-1};

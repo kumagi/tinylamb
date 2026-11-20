@@ -849,13 +849,6 @@ Status OocHashBuildSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
                               : bucket_writers_.size();
     const size_t active_budget =
         ctx != nullptr ? ctx->OperatorBudgetBytes() : budget_bytes_;
-    // ADR-0004 rule 9: no single build row may exceed 1/4 of the operator
-    // budget, even when it is the first row (the resident budget guards below
-    // are empty-set gated) or when it would otherwise go to a grace bucket.
-    if (active_budget > 0 && rb > active_budget / 4) {
-      return StatusError(StatusCode::kTooBigData,
-                         "build row exceeds operator budget quarter");
-    }
     const size_t batch_cap = GraceWriteBatchBytesFor(active_budget, fanout);
     const size_t total_cap = GraceTotalStagingCapFor(active_budget);
     auto spill_one_row = [&](Row&& srow) -> Status {
@@ -877,7 +870,7 @@ Status OocHashBuildSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
 
     const size_t next_index_bytes =
         EstimateJoinHashIndexBytes(join_ctx_->build_rows.size() + 1);
-    if ((budget_bytes_ > 0 && !join_ctx_->build_rows.empty() &&
+    if ((budget_bytes_ > 0 &&
          mem_bytes_ + rb + next_index_bytes > budget_bytes_) ||
         (join_ctx_->resident_grant_cache != nullptr &&
          !join_ctx_->resident_grant_cache->Reserve(rb))) {

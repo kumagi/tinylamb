@@ -94,21 +94,29 @@ size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
     const RowPosition position = input_batch_.PositionAt(input_offset_);
     ++input_offset_;
     ++input_rows_;
-    if (distinct_on_.empty()) {
+    if (distinct_on_.empty() && key_cols_.empty()) {
       const auto [it, inserted] = seen_.insert(std::move(row));
       if (inserted) {
         destination->Append(*it, position);
       }
     } else {
       Row current_keys;
-      current_keys.values_.reserve(distinct_on_.size());
-      for (const auto& expr : distinct_on_) {
-        StatusOr<Value> key = expr->TryEvaluate(row, schema_);
-        if (!key.HasValue()) {
-          FailWith(key.GetStatus());
-          return 0;  // do not emit a partial DISTINCT ON batch on error
+      if (!distinct_on_.empty()) {
+        current_keys.values_.reserve(distinct_on_.size());
+        for (const auto& expr : distinct_on_) {
+          StatusOr<Value> key = expr->TryEvaluate(row, schema_);
+          if (!key.HasValue()) {
+            FailWith(key.GetStatus());
+            return 0;  // do not emit a partial DISTINCT ON batch on error
+          }
+          current_keys.values_.push_back(key.MoveValue());
         }
-        current_keys.values_.push_back(key.MoveValue());
+      } else {
+        current_keys.values_.reserve(key_cols_.size());
+        for (slot_t c : key_cols_) {
+          current_keys.values_.push_back(
+              c < row.Count() ? row[static_cast<size_t>(c)] : Value());
+        }
       }
       if (seen_keys_.insert(std::move(current_keys)).second) {
         destination->Append(std::move(row), position);

@@ -635,9 +635,11 @@ void FullScanIterator::SeekVisibleRow() {
     if (lock_rows_ || stub_block_idx_ == LSTableStore::kInvalidBlockIndex) {
       break;
     }
-    if (!backing_tlcs_->BlockMatchesZoneMaps(stub_block_idx_, peek_compares_,
-                                             runtime_filter_, key_column_) ||
-        pos_.slot >= stub_block_row_count_) {
+    if (!stub_zone_maps_pass_ && pos_.slot < stub_block_row_count_) {
+      stub_zone_maps_pass_ = backing_tlcs_->BlockMatchesZoneMaps(
+          stub_block_idx_, peek_compares_, runtime_filter_, key_column_);
+    }
+    if (!stub_zone_maps_pass_ || pos_.slot >= stub_block_row_count_) {
       if (!AdvanceFromStubPage()) {
         pos_.page_id = ~0ULL;
         current_row_.Clear();
@@ -646,7 +648,11 @@ void FullScanIterator::SeekVisibleRow() {
       }
       continue;
     }
-    if (StubBlockAllRowsMatch(*backing_tlcs_, stub_block_idx_)) {
+    if (stub_all_rows_match_ < 0) {
+      stub_all_rows_match_ =
+          StubBlockAllRowsMatch(*backing_tlcs_, stub_block_idx_) ? 1 : 0;
+    }
+    if (stub_all_rows_match_ == 1) {
       stub_row_materialized_ = false;
       return;
     }
@@ -1713,6 +1719,8 @@ const std::shared_ptr<const TlcsFile>& FullScanIterator::EnsureBackingTlcs()
 
 void FullScanIterator::ClearStubBlockState() {
   stub_block_idx_ = LSTableStore::kInvalidBlockIndex;
+  stub_zone_maps_pass_ = false;
+  stub_all_rows_match_ = -1;
   stub_current_pid_ = 0;
   stub_next_page_id_ = 0;
   stub_block_row_count_ = 0;
@@ -1764,6 +1772,8 @@ bool FullScanIterator::TryEnterStubPage() {
     return false;
   }
   stub_block_idx_ = bidx;
+  stub_zone_maps_pass_ = false;
+  stub_all_rows_match_ = -1;
   stub_current_pid_ = pid;
   stub_next_page_id_ = next_pid;
   stub_block_row_count_ = rc.Value();

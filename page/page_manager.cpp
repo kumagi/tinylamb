@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <queue>
 #include <ranges>
 #include <shared_mutex>
 #include <string>
@@ -704,6 +705,7 @@ bool TryApplyIndexListDelta(std::string_view before_bytes, bool before_deleted,
     after_pos.insert(new_entry.pos);
   }
   std::unordered_set<RowPosition> removed_pos;
+  removed_pos.reserve(before.size());
   std::unordered_map<RowPosition, const LsmIndexEntry*> before_map;
   before_map.reserve(before.size());
   for (const LsmIndexEntry& old_entry : before) {
@@ -1055,6 +1057,62 @@ StatusOr<bool> PageManager::LsmLookupCommittedLocked(const LsmTreeState& tree,
   }
   if (lsn_out != nullptr) {
     *lsn_out = 0;
+  }
+  return false;
+}
+
+StatusOr<bool> PageManager::LsmLookupCommittedBaselineLocked(
+    const LsmTreeState& tree, std::string_view key, std::string* value_out,
+    bool* deleted_out) const {
+  // Mirrors the committed-source half of the merged map built by
+  // LsmScanRange: newest committed source wins, tombstones included.
+  if (auto cit = tree.committed_mem.find(key);
+      cit != tree.committed_mem.end()) {
+    if (value_out != nullptr) {
+      *value_out = cit->second.value;
+    }
+    if (deleted_out != nullptr) {
+      *deleted_out = cit->second.deleted;
+    }
+    return true;
+  }
+  if (auto iit = tree.immutable_mem.find(key);
+      iit != tree.immutable_mem.end()) {
+    if (value_out != nullptr) {
+      *value_out = iit->second.value;
+    }
+    if (deleted_out != nullptr) {
+      *deleted_out = iit->second.deleted;
+    }
+    return true;
+  }
+  const size_t cache_lim = EffectiveLsmBlockCacheLimit();
+  for (const auto& run : std::ranges::reverse_view(tree.runs)) {
+    auto bit =
+        std::lower_bound(run.blocks.begin(), run.blocks.end(), key,
+                         [](const LsmRunBlockMeta& b, std::string_view k) {
+                           return b.last_key < k;
+                         });
+    if (bit == run.blocks.end()) {
+      continue;
+    }
+    const auto bidx =
+        static_cast<uint32_t>(std::distance(run.blocks.begin(), bit));
+    StatusOr<std::shared_ptr<const DecodedLsmBlock>> blk_or =
+        lsm_cache_.GetOrLoad(lsm_fd_, lsm_file_mu_, run.run_id, bidx, *bit,
+                             cache_lim, /*populate_cache=*/true);
+    if (!blk_or.HasValue()) {
+      return blk_or.GetStatus();
+    }
+    if (const LsmRunEntry* e = blk_or.Value()->Find(key)) {
+      if (value_out != nullptr) {
+        *value_out = e->value;
+      }
+      if (deleted_out != nullptr) {
+        *deleted_out = e->deleted;
+      }
+      return true;
+    }
   }
   return false;
 }
@@ -1925,6 +1983,7 @@ Status PageManager::EvictBatch(size_t target_bytes, bool try_locks_only) {
 
       std::string io_buf;
       std::vector<DirtyCandidate> dirty_items;
+      dirty_items.reserve(batch_pids.size());
       std::vector<std::shared_ptr<Page>> retry_later;
       lsn_t max_batch_lsn = 0;
       size_t clean_evicted_bytes = 0;
@@ -2501,6 +2560,7 @@ PageManager::ReplaceTableChainWithColumnarStubs(
   std::vector<page_id_t> pids;
   pids.reserve(target_count);
   std::vector<uint64_t> retired_overlays;
+  retired_overlays.reserve(old_pids.size());
 
   {
     std::scoped_lock lk(blocks_mu_);
@@ -2887,149 +2947,406 @@ StatusOr<std::string> PageManager::LsmRead(page_id_t tree_id,
   return value;
 }
 
+namespace {
+
+// Copies the [begin, end]-bounded slice of a sorted LSM memory map into a
+// flat snapshot vector. Both bounds are inclusive; an empty `end` is
+// unbounded above. The snapshot is what lets a lazy scan cursor iterate
+// without holding the tree latch.
+template <typename EntryT>
+void CopyLsmSnapshotRange(
+    const std::map<std::string, EntryT, std::less<>>& src,
+    std::string_view begin, std::string_view end,
+    std::vector<std::pair<std::string, EntryT>>* out) {
+  auto it = begin.empty() ? src.begin() : src.lower_bound(begin);
+  for (; it != src.end(); ++it) {
+    if (!end.empty() && end < it->first) {
+      break;
+    }
+    out->emplace_back(it->first, it->second);
+  }
+}
+
+// Lazy ascending range scan over one LSM-Tree's visible entries; implements
+// LsmScanCursor (see page_lsm_store.hpp). PageManager::OpenLsmScanCursor
+// snapshots the tree's committed memory overlays, run metadata and — after
+// resolving foreign-owned uncommitted memtable keys — the memtable under the
+// tree's shared latch, so later writes by any transaction cannot leak into
+// the scan. Disk runs stream through per-run LsmRunCursors on a duplicated
+// LSM file descriptor, which keeps the exact file generation the snapshot
+// was taken from readable even across checkpoint-driven fd rotation.
+//
+// Emission order and contents are identical to draining
+// PageManager::LsmScanRange(..., ascending=true, ...): strictly ascending
+// unique keys, newest-source-wins value resolution, tombstones hidden,
+// inclusive bounds.
+class PageManagerLsmScanCursor final : public LsmScanCursor {
+ public:
+  using CommittedSnap =
+      std::vector<std::pair<std::string, LsmTreeState::CommittedEntry>>;
+  using MemSnap =
+      std::vector<std::pair<std::string, LsmTreeState::MemEntry>>;
+
+  PageManagerLsmScanCursor(
+      int fd, std::mutex& file_mu, LsmBlockCache& cache, size_t cache_limit,
+      CommittedSnap committed, CommittedSnap immutable, MemSnap memtable,
+      std::vector<std::unique_ptr<LsmSortedRun>> runs, std::string begin,
+      std::string end, Status status)
+      : fd_(fd),
+        file_mu_(file_mu),
+        cache_(cache),
+        cache_limit_(cache_limit),
+        committed_(std::move(committed)),
+        immutable_(std::move(immutable)),
+        memtable_(std::move(memtable)),
+        runs_(std::move(runs)),
+        begin_(std::move(begin)),
+        end_(std::move(end)),
+        status_(status) {
+    run_cursors_.reserve(runs_.size());
+    for (const auto& run : runs_) {
+      // runs_ elements are heap-allocated, so the blocks span below stays
+      // valid for the cursor's lifetime regardless of vector moves.
+      run_cursors_.emplace_back(
+          fd_, file_mu_, cache_, run->run_id,
+          std::span<const LsmRunBlockMeta>(run->blocks), cache_limit_,
+          /*populate_cache=*/true);
+    }
+    SeedHeap();
+  }
+
+  ~PageManagerLsmScanCursor() override {
+    if (fd_ >= 0) {
+      platform::CloseFile(fd_);
+    }
+  }
+
+  bool Next(std::pair<std::string, std::string>* out) override {
+    if (status_ != Status::kSuccess || out == nullptr) {
+      return false;
+    }
+    while (!heap_.empty()) {
+      const HeapItem top = heap_.top();
+      heap_.pop();
+      // `key`/`value` view the winner's source storage and stay valid until
+      // AdvanceSource(top.src) runs; loser advances below touch only other
+      // sources' storage.
+      const std::string_view key = top.key;
+      std::string_view value;
+      bool deleted = true;
+      CurrentPayload(top.src, &value, &deleted);
+      const bool emit = !deleted;
+      // Drain equal-key losers: `top` had the smallest src id (highest
+      // precedence), so its payload is the one that survives — but every
+      // duplicate source must still advance past this key.
+      while (!heap_.empty() && heap_.top().key == key) {
+        const HeapItem loser = heap_.top();
+        heap_.pop();
+        AdvanceSource(loser.src);
+        if (status_ != Status::kSuccess) {
+          return false;
+        }
+      }
+      if (emit) {
+        out->first.assign(key);
+        out->second.assign(value);
+      }
+      AdvanceSource(top.src);
+      if (status_ != Status::kSuccess) {
+        return false;
+      }
+      if (emit) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] Status status() const override { return status_; }
+
+ private:
+  // Source ids double as precedence ranks: lower wins a key tie, matching
+  // the merged-map overwrite order memtable > committed_mem > immutable_mem
+  // > runs(newest -> oldest).
+  static constexpr uint32_t kSrcMemtable = 0;
+  static constexpr uint32_t kSrcCommitted = 1;
+  static constexpr uint32_t kSrcImmutable = 2;
+  static constexpr uint32_t kSrcRunBase = 3;
+
+  [[nodiscard]] uint32_t RunSrc(size_t run_index) const {
+    // runs_ is ordered oldest -> newest; the newest run must win ties, so
+    // it receives the smallest run src id.
+    return kSrcRunBase +
+           static_cast<uint32_t>(runs_.size() - 1 - run_index);
+  }
+  [[nodiscard]] size_t RunIndex(uint32_t src) const {
+    return runs_.size() - 1 - static_cast<size_t>(src - kSrcRunBase);
+  }
+  [[nodiscard]] bool PastEnd(std::string_view k) const {
+    return !end_.empty() && std::string_view(end_) < k;
+  }
+
+  struct HeapItem {
+    std::string_view key;
+    uint32_t src;
+  };
+  struct HeapCmp {
+    bool operator()(const HeapItem& a, const HeapItem& b) const {
+      const int c = a.key.compare(b.key);
+      return c > 0 || (c == 0 && a.src > b.src);
+    }
+  };
+  using Heap = std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp>;
+
+  void SeedHeap() {
+    if (status_ != Status::kSuccess) {
+      return;
+    }
+    if (!memtable_.empty()) {
+      heap_.push(HeapItem{std::string_view(memtable_.front().first),
+                          kSrcMemtable});
+    }
+    if (!committed_.empty()) {
+      heap_.push(HeapItem{std::string_view(committed_.front().first),
+                          kSrcCommitted});
+    }
+    if (!immutable_.empty()) {
+      heap_.push(HeapItem{std::string_view(immutable_.front().first),
+                          kSrcImmutable});
+    }
+    for (size_t i = 0; i < run_cursors_.size(); ++i) {
+      const Status st = begin_.empty() ? run_cursors_[i].SeekToFirst()
+                                       : run_cursors_[i].Seek(begin_);
+      if (st != Status::kSuccess) {
+        status_ = st;
+        return;
+      }
+      if (run_cursors_[i].Valid()) {
+        const std::string_view k = run_cursors_[i].Current().key;
+        if (!PastEnd(k)) {
+          heap_.push(HeapItem{k, RunSrc(i)});
+        }
+      }
+    }
+  }
+
+  template <typename EntryT>
+  void AdvanceMapSource(uint32_t src, size_t* pos,
+                        const std::vector<std::pair<std::string, EntryT>>& vec) {
+    ++(*pos);
+    if (*pos < vec.size()) {
+      heap_.push(HeapItem{std::string_view(vec[*pos].first), src});
+    }
+  }
+
+  void AdvanceSource(uint32_t src) {
+    if (src == kSrcMemtable) {
+      AdvanceMapSource(src, &memtable_pos_, memtable_);
+      return;
+    }
+    if (src == kSrcCommitted) {
+      AdvanceMapSource(src, &committed_pos_, committed_);
+      return;
+    }
+    if (src == kSrcImmutable) {
+      AdvanceMapSource(src, &immutable_pos_, immutable_);
+      return;
+    }
+    const size_t ri = RunIndex(src);
+    const Status st = run_cursors_[ri].Next();
+    if (st != Status::kSuccess) {
+      status_ = st;
+      return;
+    }
+    if (run_cursors_[ri].Valid()) {
+      const std::string_view k = run_cursors_[ri].Current().key;
+      if (!PastEnd(k)) {
+        heap_.push(HeapItem{k, src});
+      }
+    }
+  }
+
+  void CurrentPayload(uint32_t src, std::string_view* value,
+                      bool* deleted) const {
+    if (src == kSrcMemtable) {
+      const auto& e = memtable_[memtable_pos_].second;
+      *value = e.value;
+      *deleted = e.deleted;
+      return;
+    }
+    if (src == kSrcCommitted) {
+      const auto& e = committed_[committed_pos_].second;
+      *value = e.value;
+      *deleted = e.deleted;
+      return;
+    }
+    if (src == kSrcImmutable) {
+      const auto& e = immutable_[immutable_pos_].second;
+      *value = e.value;
+      *deleted = e.deleted;
+      return;
+    }
+    const LsmRunEntry& e = run_cursors_[RunIndex(src)].Current();
+    *value = e.value;
+    *deleted = e.deleted;
+  }
+
+  int fd_{-1};
+  std::mutex& file_mu_;
+  LsmBlockCache& cache_;
+  size_t cache_limit_{0};
+  CommittedSnap committed_;
+  CommittedSnap immutable_;
+  MemSnap memtable_;
+  // Heap-allocated so LsmRunCursor block spans stay valid for the cursor's
+  // whole lifetime.
+  std::vector<std::unique_ptr<LsmSortedRun>> runs_;
+  std::vector<LsmRunCursor> run_cursors_;
+  std::string begin_;
+  std::string end_;
+  size_t committed_pos_{0};
+  size_t immutable_pos_{0};
+  size_t memtable_pos_{0};
+  Heap heap_;
+  Status status_{Status::kSuccess};
+};
+
+}  // namespace
+
+std::unique_ptr<LsmScanCursor> PageManager::OpenLsmScanCursor(
+    page_id_t tree_id, std::string_view begin, std::string_view end,
+    const Transaction* reader) const {
+  const txn_id_t reader_txn_id = reader != nullptr ? reader->ID() : 0;
+  cache_hits_.fetch_add(2, std::memory_order_relaxed);
+
+  using Cursor = PageManagerLsmScanCursor;
+  Cursor::CommittedSnap committed_snap;
+  Cursor::CommittedSnap immutable_snap;
+  Cursor::MemSnap memtable_snap;
+  std::vector<std::unique_ptr<LsmSortedRun>> runs_snap;
+  int fd_copy = -1;
+  Status status = Status::kSuccess;
+
+  const bool degenerate = !begin.empty() && !end.empty() && end < begin;
+  LsmTreeState* tree = nullptr;
+  if (!degenerate) {
+    {
+      std::scoped_lock lk(trees_mu_);
+      tree = FindTreeLocked(tree_id);
+    }
+  }
+  if (tree != nullptr) {
+    std::shared_lock tree_lk(tree->mutex);
+    if (!tree->destroyed) {
+      // Snapshot only the in-range slice of each memory overlay; runs carry
+      // only block fence metadata, never entry payloads.
+      CopyLsmSnapshotRange(tree->committed_mem, begin, end, &committed_snap);
+      CopyLsmSnapshotRange(tree->immutable_mem, begin, end, &immutable_snap);
+      CopyLsmSnapshotRange(tree->memtable, begin, end, &memtable_snap);
+      runs_snap.reserve(tree->runs.size());
+      for (const LsmSortedRun& run : tree->runs) {
+        runs_snap.push_back(std::make_unique<LsmSortedRun>(run));
+      }
+      {
+        // Duplicate the LSM fd so the cursor keeps reading the file
+        // generation this snapshot came from even if checkpoint rotation
+        // later swaps or closes lsm_fd_.
+        std::scoped_lock flk(lsm_file_mu_);
+        if (lsm_fd_ >= 0) {
+          fd_copy = platform::Dup(lsm_fd_);
+        }
+      }
+      if (!runs_snap.empty() && fd_copy < 0) {
+        status = StatusError(StatusCode::kIOError,
+                             "failed to duplicate LSM file descriptor");
+      } else {
+        // Resolve foreign-owned uncommitted memtable keys up front — the
+        // same baseline + own-pending-writes computation the merged-map
+        // path performed, at the same point in the scan's lifetime.
+        for (auto& [key, me] : memtable_snap) {
+          const auto& owners = me.uncommitted_owners;
+          const bool has_foreign_uncommitted =
+              reader_txn_id != 0 &&
+              std::ranges::any_of(owners, [&](txn_id_t owner) {
+                return owner != reader_txn_id;
+              });
+          if (!has_foreign_uncommitted) {
+            continue;
+          }
+          std::string cur_val;
+          bool cur_del = true;
+          const StatusOr<bool> base_found_or =
+              LsmLookupCommittedBaselineLocked(*tree, key, &cur_val, &cur_del);
+          if (!base_found_or.HasValue()) {
+            status = base_found_or.GetStatus();
+            break;
+          }
+          const bool base_found = base_found_or.Value();
+          bool has_own = false;
+          reader->ForEachPendingLsmWrite(
+              tree_id, key, [&](const LogRecord& r) {
+                has_own = true;
+                const bool is_del = r.type == LogType::kLsmDelete;
+                const bool before_del = !is_del && !r.lsm_had_prev;
+                const std::string_view before_bytes =
+                    before_del ? std::string_view{}
+                               : std::string_view(r.undo_data);
+                const std::string_view after_bytes =
+                    is_del ? std::string_view{} : std::string_view(r.redo_data);
+                if (!TryApplyIndexListDelta(before_bytes, before_del,
+                                            after_bytes, is_del, &cur_val,
+                                            &cur_del)) {
+                  cur_del = is_del;
+                  cur_val = is_del ? std::string() : r.redo_data;
+                }
+              });
+          if (has_own || base_found) {
+            me.value = std::move(cur_val);
+            me.deleted = cur_del;
+          } else {
+            // No committed baseline and no own writes: the key stays
+            // invisible, represented as a resolved tombstone.
+            me.value.clear();
+            me.deleted = true;
+          }
+          me.uncommitted_owners.clear();
+        }
+      }
+    }
+  }
+
+  return std::unique_ptr<LsmScanCursor>(new Cursor(
+      fd_copy, lsm_file_mu_, lsm_cache_, EffectiveLsmBlockCacheLimit(),
+      std::move(committed_snap), std::move(immutable_snap),
+      std::move(memtable_snap), std::move(runs_snap), std::string(begin),
+      std::string(end), status));
+}
+
 std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
     page_id_t tree_id, std::string_view begin, std::string_view end,
     bool ascending, const Transaction* reader, Status* status_out) const {
   if (status_out != nullptr) {
     *status_out = Status::kSuccess;
   }
-  const txn_id_t reader_txn_id = reader != nullptr ? reader->ID() : 0;
-  cache_hits_.fetch_add(2, std::memory_order_relaxed);
-  if (!begin.empty() && !end.empty() && end < begin) {
-    return {};
-  }
-  LsmTreeState* tree = nullptr;
-  {
-    std::scoped_lock lk(trees_mu_);
-    tree = FindTreeLocked(tree_id);
-  }
-  if (tree == nullptr) {
-    return {};
-  }
-  std::shared_lock tree_lk(tree->mutex);
-  if (tree->destroyed) {
-    return {};
-  }
-
-  // Key selection is direction-agnostic: |ascending| only reverses the
-  // output order below.  Both bounds are inclusive so a scan returns the
-  // same key set regardless of direction (descending callers reverse the
-  // iterator side, e.g. index/lsm_index.cpp).
-  auto in_bounds = [&](std::string_view k) -> bool {
-    if (!begin.empty() && k < begin) {
-      return false;
-    }
-    if (!end.empty() && end < k) {
-      return false;
-    }
-    return true;
-  };
-
-  std::map<std::string, std::pair<std::string, bool>, std::less<>> merged;
-  const size_t cache_lim = EffectiveLsmBlockCacheLimit();
-  for (const LsmSortedRun& run : tree->runs) {
-    LsmRunCursor cursor(lsm_fd_, lsm_file_mu_, lsm_cache_, run.run_id,
-                        run.blocks, cache_lim, /*populate_cache=*/true);
-    const Status st = begin.empty() ? cursor.SeekToFirst() : cursor.Seek(begin);
-    if (st != Status::kSuccess) {
-      if (status_out != nullptr) { *status_out = st;
-}
-      return {};
-    }
-    while (cursor.Valid()) {
-      const LsmRunEntry& e = cursor.Current();
-      if (!end.empty() && end < e.key) {
-        break;
-      }
-      if (in_bounds(e.key)) {
-        merged[e.key] = {e.value, e.deleted};
-      }
-      const Status next = cursor.Next();
-      if (next != Status::kSuccess) {
-        if (status_out != nullptr) { *status_out = next;
-}
-        return {};
-      }
-    }
-  }
-  auto apply_committed_map =
-      [&](const std::map<std::string, LsmTreeState::CommittedEntry,
-                         std::less<>>& cmap) {
-        auto it = begin.empty() ? cmap.begin() : cmap.lower_bound(begin);
-        for (; it != cmap.end(); ++it) {
-          if (!end.empty() && end < it->first) {
-            break;
-          }
-          if (in_bounds(it->first)) {
-            merged[it->first] = {it->second.value, it->second.deleted};
-          }
-        }
-      };
-  apply_committed_map(tree->immutable_mem);
-  apply_committed_map(tree->committed_mem);
-  auto mem_it = begin.empty() ? tree->memtable.begin()
-                              : tree->memtable.lower_bound(begin);
-  for (; mem_it != tree->memtable.end(); ++mem_it) {
-    if (!end.empty() && end < mem_it->first) {
-      break;
-    }
-    if (!in_bounds(mem_it->first)) {
-      continue;
-    }
-    const auto& owners = mem_it->second.uncommitted_owners;
-    const bool has_foreign_uncommitted =
-        reader_txn_id != 0 && std::ranges::any_of(owners, [&](txn_id_t owner) {
-          return owner != reader_txn_id;
-        });
-    if (has_foreign_uncommitted) {
-      // A non-unique index bucket can be updated by several transactions.
-      // Start from the committed baseline and apply only this reader's own
-      // staged logical WAL mutations in chronological order.
-      std::string cur_val;
-      bool cur_del = true;
-      if (const auto base_it = merged.find(mem_it->first);
-          base_it != merged.end()) {
-        cur_val = base_it->second.first;
-        cur_del = base_it->second.second;
-      }
-      bool has_own = false;
-      reader->ForEachPendingLsmWrite(
-          tree_id, mem_it->first, [&](const LogRecord& r) {
-            has_own = true;
-            const bool is_del = r.type == LogType::kLsmDelete;
-            const bool before_del = !is_del && !r.lsm_had_prev;
-            const std::string_view before_bytes =
-                before_del ? std::string_view{} : std::string_view(r.undo_data);
-            const std::string_view after_bytes =
-                is_del ? std::string_view{} : std::string_view(r.redo_data);
-            if (!TryApplyIndexListDelta(before_bytes, before_del, after_bytes,
-                                        is_del, &cur_val, &cur_del)) {
-              cur_del = is_del;
-              cur_val = is_del ? std::string() : r.redo_data;
-            }
-          });
-      if (has_own) {
-        merged[mem_it->first] = {std::move(cur_val), cur_del};
-      }
-      continue;
-    }
-    merged[mem_it->first] = {mem_it->second.value, mem_it->second.deleted};
-  }
-
+  // The lazy cursor emits the same ascending sequence the merged-map path
+  // produced; descending callers get the identical set reversed, matching
+  // the old reverse_view output exactly.
+  std::unique_ptr<LsmScanCursor> cursor =
+      OpenLsmScanCursor(tree_id, begin, end, reader);
   std::vector<std::pair<std::string, std::string>> result;
-  result.reserve(merged.size());
-  if (ascending) {
-    for (auto& [k, val_del] : merged) {
-      if (!val_del.second) {
-        result.emplace_back(k, std::move(val_del.first));
-      }
+  std::pair<std::string, std::string> entry;
+  while (cursor->Next(&entry)) {
+    result.push_back(std::move(entry));
+  }
+  const Status st = cursor->status();
+  if (st != Status::kSuccess) {
+    if (status_out != nullptr) {
+      *status_out = st;
     }
-  } else {
-    for (auto& it : std::ranges::reverse_view(merged)) {
-      if (!it.second.second) {
-        result.emplace_back(it.first, std::move(it.second.first));
-      }
-    }
+    return {};
+  }
+  if (!ascending) {
+    std::reverse(result.begin(), result.end());
   }
   return result;
 }
@@ -3788,6 +4105,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   std::mutex compacted_lsm_mu;
   uint64_t compacted_lsm_offset = 0;
   std::vector<TreeCkptState> tree_ckpts;
+  tree_ckpts.reserve(raw_trees.size());
 
   auto cleanup_compacted_lsm = [&]() {
     if (compacted_lsm_fd >= 0) {
@@ -4178,6 +4496,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
       uint32_t length;
     };
     std::vector<DirtyMeta> dirty_metas;
+    dirty_metas.reserve(batch.size());
     lsn_t batch_dirty_lsn = 0;
 
     for (BatchItem& item : batch) {

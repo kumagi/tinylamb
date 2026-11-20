@@ -2,19 +2,13 @@ import TinylambOpt.BagRel
 
 /-
 # Step 3: バグ発見と「さらにアグレッシブな書き換えルール」の発見
-## ケーススタディ: `outer_to_anti_join`（`plan/cascades.cpp:4749`）
+## ケーススタディ: `outer_to_anti_join`（`plan/cascades.cpp`）
 
 SQL で頻出するアンチ結合イディオム：
 ```sql
 SELECT ... FROM L LEFT JOIN R ON p(L, R) WHERE R.col IS NULL
 ```
-これを `AntiJoin(L, R, p)` に書き換える `tinylamb` の現行ルール（`plan/cascades.cpp:4749-4818`）は、
-安全のため次の **2 つの厳しい制限** を課しています：
-
-1. カタログ上で `R.col` に **`NOT NULL` / `PRIMARY KEY` 制約** が宣言されていること
-   （`CascadesTest.OuterToAntiJoinRefusesNullableNullTestedColumn` で nullable 列を拒否）
-2. `WHERE` 句が `R.col IS NULL` **だけ** で構成され、他の連言 `AND q` が 1 つも混ざっていないこと
-   （`CascadesTest.OuterToAntiJoinRefusesLeftResidualConjunct` で残余条件付きを拒否）
+現行の `outer_to_anti_join` は、右列の NOT NULL 宣言、または ON 述語がその列の NULL を拒否することを検査します。左側だけを参照する残余連言は Selection として保持します。テストは `OuterToAntiJoinFiresOnNullableJoinKeyRejectedByOn` と `OuterToAntiJoinPreservesLeftResidualConjunct` です。
 
 ここでは Lean を使って：
 1. まず「無条件に AntiJoin 化すると本当に壊れるケース（反例）」を確認し、
@@ -80,10 +74,10 @@ theorem bug_when_join_allows_null_match :
 
 これを満たすルートは 2 つあります：
 1. **現行 `tinylamb` の条件 (`CatalogNotNull`)**: そもそもテーブル `r` 内の全行で `col y ≠ none`
-2. **新発見のアグレッシブ条件 (`JoinRejectsNullOnCol`)**:
+2. **ON 述語による条件 (`JoinRejectsNullOnCol`)**:
    テーブル `r` に `NULL` が何百万行入っていても、**結合条件 `onPred` 自体が `col y = none` を弾く**
    （例：`ON L.id = R.id` で `WHERE R.id IS NULL` を書いた場合、`sqlEq _ none = .tNull` なので絶対にマッチしない！）
-   ※しかも `tinylamb` には既に `ExpressionRejectsNullsOnColumn`（`plan/cascades.cpp:2078`）が実装済み！
+   ※しかも `tinylamb` には既に `ExpressionRejectsNullsOnColumn`（`plan/cascades.cpp`）が実装済み！
 -/
 
 /-- 条件1（現行）: カタログ制約等により、右リレーション `r` 内で `col` が一切 NULL を取らない。 -/
@@ -126,7 +120,7 @@ private theorem matched_row_never_passes_is_null {L R Val : Type}
 /-!
 ## 3-3. アグレッシブ版 `outer_to_anti_join`（残余フィルタ押し込み統合版）の完全証明！
 
-さらに欲張って、現行ルールが拒否している 2 つ目の制限：
+さらに欲張って、現行ルールが保持する左側の残余連言を一般化し、
 `WHERE R.col IS NULL AND q(L, R)`（残余フィルタ `q` の混在）も一気に解決します。
 
 `R.col IS NULL` を生き残る行はすべて `(x, none)`（右テーブル側が全列 NULL）なので、

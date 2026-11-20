@@ -1,4 +1,5 @@
 """Answer verification must not hide wrong results behind LIMIT ties."""
+import importlib.util
 import unittest
 import json
 import tempfile
@@ -40,6 +41,7 @@ class SessionTest(unittest.TestCase):
                 clickbench.check_clickhouse_utc(Client(rows))
 
 
+@unittest.skipUnless(importlib.util.find_spec('sqlglot'), 'install requirements-tpcds.txt')
 class VerificationTest(unittest.TestCase):
     meta = [{'name': 'key', 'type': 'String'}, {'name': 'n', 'type': 'UInt64'}]
     sql = 'SELECT key, COUNT(*) AS n FROM hits GROUP BY key ORDER BY n DESC LIMIT 1'
@@ -105,6 +107,8 @@ class VerificationTest(unittest.TestCase):
 
 
 
+@unittest.skipUnless(importlib.util.find_spec('sqlglot'), 'install requirements-tpcds.txt')
+@unittest.skipUnless(importlib.util.find_spec('duckdb'), 'install requirements-tpcds.txt')
 class DuckDBComparisonTest(unittest.TestCase):
     def test_byte_length_and_temporal_normalization(self):
         import duckdb

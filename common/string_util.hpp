@@ -5,13 +5,41 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace tinylamb {
+
+// Appends an integer's decimal representation without allocating a temporary
+// std::string. std::to_chars writes into a stack buffer, so repeated use in a
+// loop (e.g. building signature/tag strings) performs no per-call heap
+// allocation. The fallback keeps the helper valid for exotic integer types.
+template <typename T>
+inline void AppendInteger(std::string& out, T value) {
+  std::array<char, static_cast<size_t>(std::numeric_limits<T>::digits10) + 3>
+      buffer{};
+  const auto result =
+      std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+  if (result.ec == std::errc{}) {
+    out.append(buffer.data(), result.ptr);
+  } else {
+    out += std::to_string(value);
+  }
+}
+
+// std::to_string equivalent that avoids the temporary heap buffer for the
+// integer types used in hot signature-building paths.
+template <typename T>
+[[nodiscard]] inline std::string IntegerToString(T value) {
+  std::string out;
+  AppendInteger(out, value);
+  return out;
+}
 
 [[nodiscard]] constexpr char AsciiToLower(char c) noexcept {
   return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
@@ -113,10 +141,73 @@ namespace tinylamb {
   return 1;
 }
 
+// Canonical UTF-8 well-formedness check: rejects overlong forms, surrogate
+// halves (ED A0..BF), code points beyond U+10FFFF (F4 90+), stray
+// continuation bytes and truncated sequences.  ASCII control bytes are
+// valid UTF-8 (callers that need printable text check separately).
+[[nodiscard]] inline bool IsValidUtf8Text(std::string_view text) {
+  size_t i = 0;
+  while (i < text.size()) {
+    const auto lead = static_cast<uint8_t>(text[i]);
+    size_t continuation_count = 0;
+    uint8_t second_lower = 0x80;
+    uint8_t second_upper = 0xBF;
+    if (lead < 0x80) {
+      ++i;
+      continue;
+    }
+    if (lead >= 0xC2 && lead < 0xDF) {
+      continuation_count = 1;
+    } else if (lead >= 0xE0 && lead < 0xF0) {
+      continuation_count = 2;
+      second_lower = lead == 0xE0 ? 0xA0 : 0x80;
+      second_upper = lead == 0xED ? 0x9F : 0xBF;
+    } else if (lead >= 0xF0 && lead < 0xF5) {
+      continuation_count = 3;
+      second_lower = lead == 0xF0 ? 0x90 : 0x80;
+      second_upper = lead == 0xF4 ? 0x8F : 0xBF;
+    } else {
+      return false;
+    }
+    if (i + continuation_count >= text.size()) {
+      return false;
+    }
+    for (size_t c = 1; c <= continuation_count; ++c) {
+      const auto byte = static_cast<uint8_t>(text[i + c]);
+      const uint8_t lower = c == 1 ? second_lower : 0x80;
+      const uint8_t upper = c == 1 ? second_upper : 0xBF;
+      if (byte < lower || byte > upper) {
+        return false;
+      }
+    }
+    i += continuation_count + 1;
+  }
+  return true;
+}
+
 // GoogleSQL TRIM / LTRIM / RTRIM: strip leading and/or trailing CODE POINTS
 // that occur in `cutset`. Matching individual bytes of a multi-byte cutset
 // cut the lead byte of an unrelated character ('Êx' trimmed by 'É' left an
 // invalid 0xAA). Malformed sequences are compared byte by byte.
+//
+// The DEFAULT cutset (one-argument TRIM) is every Unicode White_Space code
+// point, not just the six ASCII whitespace characters: NEL, NBSP, ogham
+// space, U+2000-U+200A, line/paragraph separators, narrow NBSP, medium
+// math space and ideographic space included.  Multi-byte members stay
+// intact because TrimCodePoints matches whole code points.
+inline constexpr char kDefaultTrimCutset[] =
+    " \t\n\v\f\r"
+    "\xC2\x85"  // U+0085 NEXT LINE
+    "\xC2\xA0"  // U+00A0 NO-BREAK SPACE
+    "\xE1\x9A\x80"  // U+1680 OGHAM SPACE MARK
+    "\xE2\x80\x80\xE2\x80\x81\xE2\x80\x82\xE2\x80\x83\xE2\x80\x84"
+    "\xE2\x80\x85\xE2\x80\x86\xE2\x80\x87\xE2\x80\x88\xE2\x80\x89"
+    "\xE2\x80\x8A"  // U+2000..U+200A
+    "\xE2\x80\xA8\xE2\x80\xA9"  // U+2028 LINE / U+2029 PARAGRAPH SEPARATOR
+    "\xE2\x80\xAF"  // U+202F NARROW NO-BREAK SPACE
+    "\xE2\x81\x9F"  // U+205F MEDIUM MATHEMATICAL SPACE
+    "\xE3\x80\x80";  // U+3000 IDEOGRAPHIC SPACE
+
 [[nodiscard]] inline std::string_view TrimCodePoints(std::string_view text,
                                                      std::string_view cutset,
                                                      bool leading,

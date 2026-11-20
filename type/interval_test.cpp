@@ -318,6 +318,82 @@ TEST(IntervalTest, ParseEdgeCases) {
   EXPECT_THROW(IntervalValue::Parse("123"), std::runtime_error);
 }
 
+TEST(IntervalTest, ParseRejectsTrailingGarbage) {
+  // std::stoll used to accept a numeric prefix and silently drop the rest
+  // ("1-2abc" parsed as 1 year 2 months, "3junk" as 3).
+  EXPECT_FALSE(IntervalValue::TryParse("1-2abc").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1-2-3").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("abc-2").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1-2 3junk 4:5:6").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("-abc-2").HasValue());
+  // sscanf used to accept partial H:M:S conversions and stop before
+  // trailing garbage; every field must be present and fully consumed.
+  // A two-field H:M spelling is complete for a bare literal or a range
+  // ending at minutes, but not when seconds are still owed.
+  EXPECT_EQ(IntervalValue::TryParse("1:2").MoveValue().nanos,
+            3720LL * 1000000000LL);
+  EXPECT_EQ(IntervalValue::TryParse("3:4", "hour to minute").MoveValue()
+                .nanos,
+            11040LL * 1000000000LL);
+  EXPECT_FALSE(
+      IntervalValue::TryParse("1:2", "hour to second").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1:2:").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1:2:3junk").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1:2:3:4").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1:2:3.5.6").HasValue());
+  // Well-formed composites still parse.
+  EXPECT_EQ(IntervalValue::TryParse("1-2 3 4:5:6.789").MoveValue(),
+            Iv(14, 3, 14706789000000));
+  EXPECT_EQ(IntervalValue::TryParse("-4:5:6.789").MoveValue().nanos,
+            -14706789000000LL);
+  EXPECT_EQ(IntervalValue::TryParse("25:0:0").MoveValue().nanos,
+            25LL * 3600LL * 1000000000LL);
+}
+
+TEST(IntervalTest, ParseUnitNamesMatchExactly) {
+  // Unit lookups used starts_with: "monthly" accumulated as months and
+  // "yearxyz to month" passed as a year-month range.
+  EXPECT_FALSE(IntervalValue::TryParse("1", "monthly").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1", "daylight").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1 2", "yearxyz to month").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1 2", "daylight to second").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1 2 3 4", "seconds to minutes")
+                   .HasValue());
+  // Canonical spellings, plurals and ranges are unaffected.
+  EXPECT_EQ(IntervalValue::TryParse("1 2", "YEARS TO MONTHS").MoveValue(),
+            Iv(14, 0, 0));
+  EXPECT_EQ(IntervalValue::TryParse("1 2 3 4", "day to second").MoveValue(),
+            Iv(0, 1, 7384LL * 1000000000LL));
+}
+
+TEST(IntervalTest, ParseEmptyAmountValidatesUnit) {
+  // An empty amount used to return a zero interval before the unit string
+  // was ever checked, so INTERVAL '' BOGUS silently became zero.
+  EXPECT_EQ(IntervalValue::TryParse("", "YEAR").MoveValue(), Iv(0, 0, 0));
+  EXPECT_EQ(IntervalValue::TryParse("   ", "day to second").MoveValue(),
+            Iv(0, 0, 0));
+  EXPECT_FALSE(IntervalValue::TryParse("", "BOGUS").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("", "monthly").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("", "bogus to year").HasValue());
+}
+
+TEST(IntervalTest, ParseAcceptsInt64MinBoundary) {
+  // -2^63 is exactly representable and used to be rejected by an off-by-one
+  // <= comparison against the double boundary.
+  EXPECT_EQ(IntervalValue::TryParse("P-9223372036854775808M").MoveValue()
+                .months,
+            INT64_MIN);
+  EXPECT_EQ(IntervalValue::TryParse("-9223372036854775808", "NANOSECOND")
+                .MoveValue()
+                .nanos,
+            INT64_MIN);
+  // One past the boundary in either direction is still an error.
+  EXPECT_FALSE(
+      IntervalValue::TryParse("P9223372036854775808M").HasValue());
+  EXPECT_FALSE(
+      IntervalValue::TryParse("9223372036854775808", "NANOSECOND").HasValue());
+}
+
 // ----------------------------------------------------- session constants ---
 
 TEST(IntervalTest, SessionConstants) {

@@ -222,6 +222,7 @@ TEST_F(RelationalRegressionTest, ParallelFilterMovesOwnedRowBuffers) {
   relation.schema = Schema("f", {Column("k", ValueType::kInt64),
                                  Column("text", ValueType::kVarChar)});
   std::vector<const Value*> buffers;
+  buffers.reserve(40000);
   for (int64_t k = 0; k < 40000; ++k) {
     relation.AddRow(
         Row({Value(k), k % 3 == 0 ? Value() : Value(std::string(80, 'x'))}));
@@ -692,6 +693,7 @@ TEST_F(RelationalRegressionTest,
        NamedExpression("pb", column("b", "payload"))},
       {}, BinaryExpressionExp(edge_a, BinaryOperation::kAnd, edge_b));
   std::vector<SelectSource> sources;
+  sources.reserve(3);
   for (const char* name : {"f", "a", "b"}) {
     SelectSource source;
     source.table = name;

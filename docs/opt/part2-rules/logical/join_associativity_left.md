@@ -28,6 +28,8 @@ graph TD
 
 ## 適用条件
 
+結合列挙器がグループを担当済みなら発火しません。回転時には結合条件を再導出するため、保存された外側の結合述語が正規の導出結果に一致することも必要です。
+
 パターン照合では、外側 `Join` の左子ノードが `kJoin` 演算子であることを要求します（右子ノードは任意ノード）。
 
 ```cpp
@@ -36,6 +38,20 @@ graph TD
         Join(
             Pattern::Op(LogicalOperator::kJoin, {Any("ll"), Any("lr")}, "left"),
             Any("right")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (memo.JoinEnumerationClaimed(group) ||
+              !HasCanonicalStoredJoinPredicate(memo, expression.children[0],
+                                               expression.children[1],
+                                               expression)) {
+            return;
+          }
+          const GroupId inner = memo.EnsureGroup(
+              UnionRelations(memo.Get(bindings.at("lr")).relations,
+                             memo.Get(bindings.at("right")).relations));
+          memo.AddExpression(group, memo.NewJoin(bindings.at("ll"), inner));
+        },
+        LogicalOperator::kJoin));
 ```
 
 変換ラムダ内の処理は以下のとおりです（`plan/cascades.cpp`）。
@@ -69,7 +85,7 @@ std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
 
 ## 意味論的根拠と重複制御
 
-内部結合の結合則 $((ll \bowtie lr) \bowtie right) \equiv (ll \bowtie (lr \bowtie right))$ は代数的に常に成立するため、述語の整合性を保つ追加のガード条件は不要です。意味論の保存は以下の2 つの設計によって保証されます。
+内部結合の結合則 $((ll \bowtie lr) \bowtie right) \equiv (ll \bowtie (lr \bowtie right))$ は代数的に常に成立するため、実装では回転後に保存済みの述語が脱落しないことを上記のガードで確認します。意味論の保存は以下の2 つの設計によって保証されます。
 
 1. **結合述語の再導出**: 追加される `NewJoin(ll, inner)` の結合述語は、`JoinConditionFor` によって「$ll$ の関係集合」と「$inner$ の関係集合」を跨ぐ連接詞から自動導出されます（第20章 20-6節）。結合木の回転前後で参照される関係の総集合は不変であるため、各述語は過不足なく適切な結合ノードに再配置されます。単一関係に閉じたフィルタ述語はスキャン側に保持されるため影響を受けません。
 2. **中間 Group の自動初期化**: 新規に作成される中間 Group（$lr \cup right$）が未登録であった場合、`EnsureGroup` は関係グラフの連結性に基づいて初期の結合木を構築します（第20章 20-5.2節）。これにより、回転後の部分問題に対しても探索の入口が自動的に用意されます。

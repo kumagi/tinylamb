@@ -286,7 +286,11 @@ Status EncodeRowBlock(std::span<const Row> rows, std::string* dst) {
   AppendPod(uint32_t{0}, dst);  // placeholder for payload_bytes
   const size_t payload_start = dst->size();
   for (const Row& row : rows) {
-    RETURN_IF_FAIL(EncodeSpillRow(row, dst));
+    const Status status = EncodeSpillRow(row, dst);
+    if (status != Status::kSuccess) {
+      dst->resize(header_off);
+      return status;
+    }
   }
   const size_t payload_bytes = dst->size() - payload_start;
   if (payload_bytes > std::numeric_limits<uint32_t>::max()) {

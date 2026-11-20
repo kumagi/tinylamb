@@ -349,6 +349,40 @@ TEST_F(SelectRewritesTest, FlattenDerivedSourcesInlinesSimpleSubquery) {
   EXPECT_EQ(stmt->Sources()[0].table, "items");
 }
 
+TEST_F(SelectRewritesTest,
+       FlattenDerivedSourcesSkipsQueryExpressionOuterReferences) {
+  // A kQueryExp is opaque to ExpressionChildren: a `d.col` reference inside
+  // the subquery would survive substitution and silently rebind to the base
+  // column once the derived alias is dropped. Flattening must refuse.
+  auto stmt = ParseSelect(
+      "SELECT d.id, (SELECT COUNT(*) FROM items i2 WHERE i2.price = d.price) "
+      "FROM (SELECT id, price * 2 AS price FROM items) AS d");
+  ASSERT_NE(stmt, nullptr);
+  ASSERT_EQ(stmt->Sources().size(), 1U);
+  ASSERT_NE(stmt->Sources()[0].query, nullptr);
+  EXPECT_FALSE(FlattenDerivedSources(stmt.get(), *ctx_));
+  EXPECT_NE(stmt->Sources()[0].query, nullptr);
+
+  // The gate is carrier-wide: WHERE, ORDER BY and join/unnest arguments get
+  // the same protection, and an uncorrelated subquery stays conservative.
+  for (const std::string& sql : {
+           "SELECT d.id FROM (SELECT id, price FROM items) AS d "
+           "WHERE d.id IN (SELECT id FROM items)",
+           "SELECT d.id FROM (SELECT id, price FROM items) AS d "
+           "ORDER BY (SELECT COUNT(*) FROM items)",
+           "SELECT d.id, (SELECT COUNT(*) FROM items) FROM "
+           "(SELECT id, price FROM items) AS d",
+       }) {
+    SCOPED_TRACE(sql);
+    auto carrier = ParseSelect(sql);
+    ASSERT_NE(carrier, nullptr);
+    ASSERT_EQ(carrier->Sources().size(), 1U);
+    ASSERT_NE(carrier->Sources()[0].query, nullptr);
+    EXPECT_FALSE(FlattenDerivedSources(carrier.get(), *ctx_));
+    EXPECT_NE(carrier->Sources()[0].query, nullptr);
+  }
+}
+
 TEST_F(SelectRewritesTest, TryNarrowCteBodyPushesOuterBoundsIntoCte) {
   auto stmt = ParseSelect(
       "WITH cte AS (SELECT id, price FROM items) "
@@ -425,6 +459,7 @@ TEST_F(SelectRewritesTest,
                               "(1, CAST('NaN' AS DOUBLE)), (2, 30.0);");
   ASSERT_TRUE(ins.HasValue());
   ins.Value().Drain();
+  ASSERT_EQ(ins.Value().GetStatus(), Status::kSuccess);
 
   auto dbl_stmt = ParseSelect(
       "SELECT grp, MAX(val) FROM dbl_nan GROUP BY grp HAVING MAX(val) > 10.0");
@@ -455,6 +490,7 @@ TEST_F(SelectRewritesTest,
       *ctx_, "INSERT INTO tags VALUES (1, 'x'), (1, 'y'), (1, 'z'), (2, 'w');");
   ASSERT_TRUE(ins.HasValue());
   ins.Value().Drain();
+  ASSERT_EQ(ins.Value().GetStatus(), Status::kSuccess);
 
   auto max_stmt = ParseSelect(
       "SELECT i.category, MAX(i.price), COUNT(DISTINCT i.id) "
@@ -501,10 +537,12 @@ TEST_F(SelectRewritesTest, TpcdsDisjointUnionGroupByBypassAndPlanCacheSafety) {
       *ctx_, "INSERT INTO ch_s VALUES (1, 10), (1, 20), (2, 5);");
   ASSERT_TRUE(ins1.HasValue());
   ins1.Value().Drain();
+  ASSERT_EQ(ins1.Value().GetStatus(), Status::kSuccess);
   auto ins2 = engine_->Execute(
       *ctx_, "INSERT INTO ch_w VALUES (1, 100), (2, 200), (2, 300);");
   ASSERT_TRUE(ins2.HasValue());
   ins2.Value().Drain();
+  ASSERT_EQ(ins2.Value().GetStatus(), Status::kSuccess);
 
   const std::string disjoint_sql =
       "SELECT ch, k, COUNT(*), SUM(v) FROM ("
@@ -524,10 +562,13 @@ TEST_F(SelectRewritesTest, TpcdsDisjointUnionGroupByBypassAndPlanCacheSafety) {
     auto r = engine_->Execute(*ctx_, sql);
     EXPECT_TRUE(r.HasValue()) << engine_->LastError();
     std::vector<Row> out;
-    Row row;
-    while (r.Value().Next(&row)) {
-      out.push_back(row);
-      row = Row();
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(row);
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
     }
     engine_->SetForceRelationalFallback(false);
     return out;
@@ -569,16 +610,20 @@ TEST_F(SelectRewritesTest, TpcdsSelfJoinWindowAndNullKeyGuard) {
                               "(3, NULL, 500.0), (4, NULL, 10.0);");
   ASSERT_TRUE(ins.HasValue());
   ins.Value().Drain();
+  ASSERT_EQ(ins.Value().GetStatus(), Status::kSuccess);
 
   auto run_rows = [&](bool fallback, const std::string& sql) {
     engine_->SetForceRelationalFallback(fallback);
     auto r = engine_->Execute(*ctx_, sql);
     EXPECT_TRUE(r.HasValue()) << engine_->LastError();
     std::vector<Row> out;
-    Row row;
-    while (r.Value().Next(&row)) {
-      out.push_back(row);
-      row = Row();
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(row);
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
     }
     engine_->SetForceRelationalFallback(false);
     return out;
@@ -638,6 +683,7 @@ TEST_F(SelectRewritesTest, TpcdsUnionCtePivotZeroPaddedAndFullOuterIndicators) {
     auto r = engine_->Execute(*ctx_, dml);
     ASSERT_TRUE(r.HasValue()) << engine_->LastError();
     r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess);
   }
 
   auto run_rows = [&](bool fallback, const std::string& sql) {
@@ -645,10 +691,13 @@ TEST_F(SelectRewritesTest, TpcdsUnionCtePivotZeroPaddedAndFullOuterIndicators) {
     auto r = engine_->Execute(*ctx_, sql);
     EXPECT_TRUE(r.HasValue()) << engine_->LastError();
     std::vector<Row> out;
-    Row row;
-    while (r.Value().Next(&row)) {
-      out.push_back(row);
-      row = Row();
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(row);
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
     }
     engine_->SetForceRelationalFallback(false);
     return out;
@@ -692,6 +741,7 @@ TEST_F(SelectRewritesTest, TpcdsUnionCtePivotZeroPaddedAndFullOuterIndicators) {
     auto r = engine_->Execute(*ctx_, sql);
     ASSERT_TRUE(r.HasValue()) << engine_->LastError();
     r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess);
   }
   const std::string q97_nonempty =
       "WITH ssci AS (SELECT c, i FROM foj_a GROUP BY c, i), "
@@ -734,6 +784,7 @@ TEST_F(SelectRewritesTest, TpcdsUnionCtePivotZeroPaddedAndFullOuterIndicators) {
     auto r = engine_->Execute(*ctx_, sql);
     ASSERT_TRUE(r.HasValue()) << engine_->LastError();
     r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess);
   }
   const std::string q5_shape =
       "SELECT d.name, SUM(u.price), SUM(u.loss) "
@@ -777,6 +828,7 @@ TEST_F(SelectRewritesTest,
   auto r = engine_->Execute(*ctx_, "CREATE TABLE cb_empty (x STRING);");
   ASSERT_TRUE(r.HasValue()) << engine_->LastError();
   r.Value().Drain();
+  ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess);
   auto res =
       engine_->Execute(*ctx_, "SELECT 1, COUNT(*) FROM cb_empty GROUP BY 1");
   ASSERT_TRUE(res.HasValue()) << engine_->LastError();
@@ -838,6 +890,7 @@ TEST_F(SelectRewritesTest, TpchSf10DiscoveryRulesAndAllSemanticTraps) {
     auto r = engine_->Execute(*ctx_, sql);
     ASSERT_TRUE(r.HasValue()) << engine_->LastError();
     r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess);
   }
 
   auto run_rows = [&](bool fallback, const std::string& sql) {
@@ -852,6 +905,7 @@ TEST_F(SelectRewritesTest, TpchSf10DiscoveryRulesAndAllSemanticTraps) {
         out.push_back(row);
         row = Row();
       }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
     }
     engine_->SetForceRelationalFallback(false);
     return out;
@@ -976,6 +1030,7 @@ TEST_F(SelectRewritesTest, TpchSf10DiscoveryRulesAndAllSemanticTraps) {
         "INSERT INTO tpch_l VALUES (200, 2, 2, 1.0, 130.0, 0.0, 'R', 'AIR');");
     ASSERT_TRUE(ins.HasValue());
     ins.Value().Drain();
+    ASSERT_EQ(ins.Value().GetStatus(), Status::kSuccess);
   }
   // Supp1 revenue: 100*0.9 + 200*0.95 + 5000 + 9000 = 14280; let's filter
   // `l_okey <= 200` where Supp1 = 280.0 and Supp2 = 150 + 130 = 280.0 (TIE!).
@@ -1134,6 +1189,7 @@ TEST_F(SelectRewritesTest, ClickBenchRound2AffineLinearSumsAndTraps) {
     auto r = engine_->Execute(*ctx_, sql);
     ASSERT_TRUE(r.HasValue()) << engine_->LastError();
     r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess);
   }
   ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
   ctx_ = std::make_unique<TransactionContext>(db_->BeginReadOnlyContext());
@@ -1218,12 +1274,11 @@ TEST_F(SelectRewritesTest, ClickBenchRound2AffineLinearSumsAndTraps) {
   }
   {
     auto prep = engine_->Prepare(*ctx_, ovf_sql);
-    if (prep.HasValue()) {
-      Row row;
-      while (prep.Value()->Next(&row, nullptr)) {
-      }
-      EXPECT_NE(prep.Value()->GetStatus(), Status::kSuccess);
+    ASSERT_TRUE(prep.HasValue()) << prep.GetStatus();
+    Row row;
+    while (prep.Value()->Next(&row, nullptr)) {
     }
+    EXPECT_NE(prep.Value()->GetStatus(), Status::kSuccess);
   }
 
   // 4. Compact `cb_affine` to `.tlcs` and verify `.tlcs` `DirGroup` bounds

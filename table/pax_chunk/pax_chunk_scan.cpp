@@ -3798,67 +3798,30 @@ bool DecodableIntCacheScheme(Scheme scheme) {
 
 }  // namespace
 
-void PaxChunk::BuildDecodedIntCache() {
-  decoded_int_cache_.clear();
-  decoded_int_offsets_.clear();
-  decoded_int_cache_ready_ = false;
-  const size_t cells =
-      static_cast<size_t>(footer_.row_group_count) * footer_.column_count;
-  if (cells == 0 || footer_.row_counts.size() < footer_.row_group_count ||
-      footer_.column_offsets.size() < cells ||
-      footer_.encodings.size() < cells || footer_.params.size() < cells) {
-    return;
+std::span<const int64_t> PaxChunk::DecodedIntCell(slot_t col, uint32_t group) const {
+  const size_t index = static_cast<size_t>(group) * footer_.column_count + col;
+  if (group >= footer_.row_counts.size() || index >= footer_.encodings.size() ||
+      !DecodableIntCacheScheme(static_cast<Scheme>(footer_.encodings[index]))) {
+    return {};
   }
-  constexpr size_t kMaxDecodedIntCells = size_t{1} << 20;
-  if (cells > kMaxDecodedIntCells) {
-    return;
+  const size_t rows = footer_.row_counts[group];
+  std::scoped_lock lock(decoded_cells_->mutex);
+  auto& cells = decoded_cells_->cells;
+  if (const auto it = cells.find(index); it != cells.end()) {
+    return it->second;
   }
-  constexpr size_t kMaxDecodedIntCacheValues = size_t{1} << 20;
-  // The budget is spent CELL BY CELL rather than all-or-nothing. Widening the
-  // eligible set made the old "one cell over the cap drops the whole cache"
-  // behaviour a real regression: a chunk holding, say, a kDeltaFor column
-  // exactly at the cap PLUS several kBitWeave columns used to keep the cache
-  // and would now have lost it entirely. Leaving the over-budget cells with an
-  // empty offset span is safe and needs NO consumer change --
-  // ReadRowIntoImpl already requires a NON-EMPTY span before it reads the
-  // cache, and falls back to Int64AtFast otherwise.
-  std::vector<uint8_t> cacheable(cells, 0);
-  size_t cached_values = 0;
-  for (size_t i = 0; i < cells; ++i) {
-    const auto scheme = static_cast<Scheme>(footer_.encodings[i]);
-    if (!DecodableIntCacheScheme(scheme)) {
-      continue;
-    }
-    const size_t rows = footer_.row_counts[i / footer_.column_count];
-    if (rows == 0 || rows > kMaxDecodedIntCacheValues - cached_values) {
-      continue;  // over budget: leave this cell uncached, keep the others
-    }
-    cacheable[i] = 1;
-    cached_values += rows;
+  if (rows == 0 || rows > (size_t{1} << 20) - decoded_cells_->values) {
+    return {};
   }
-  decoded_int_offsets_.assign(cells + 1, 0);
-  decoded_int_cache_.reserve(cached_values);
-  std::vector<int64_t> decoded;
-  for (size_t i = 0; i < cells; ++i) {
-    decoded_int_offsets_[i] = decoded_int_cache_.size();
-    const auto g = static_cast<uint32_t>(i / footer_.column_count);
-    const auto c = static_cast<slot_t>(i % footer_.column_count);
-    const uint16_t rows = footer_.row_counts[g];
-    if (rows != 0 && cacheable[i] != 0) {
-      decoded.resize(rows);
-      try {
-        DecodeInt64ColumnRg(c, g, decoded.data());
-      } catch (...) {
-        decoded_int_cache_.clear();
-        decoded_int_offsets_.clear();
-        return;
-      }
-      decoded_int_cache_.insert(decoded_int_cache_.end(), decoded.begin(),
-                                decoded.end());
-    }
+  std::vector<int64_t> decoded(rows);
+  try {
+    DecodeInt64ColumnRg(col, group, decoded.data());
+  } catch (const std::out_of_range&) {
+    return {};
   }
-  decoded_int_offsets_[cells] = decoded_int_cache_.size();
-  decoded_int_cache_ready_ = true;
+  auto it = cells.emplace(index, std::move(decoded)).first;
+  decoded_cells_->values += rows;
+  return it->second;
 }
 
 int PaxChunk::ResolveRowGroup(size_t global_row_index, uint32_t* g_out,
@@ -4361,13 +4324,9 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
     }
     const size_t off_idx = (g * footer_.column_count) + c;
     const ValueType vt = sc.GetColumn(c).Type();
-    if (decoded_int_cache_ready_ &&
-        (vt == ValueType::kInt64 || vt == ValueType::kDouble) &&
-        off_idx + 1 < decoded_int_offsets_.size() &&
-        decoded_int_offsets_[off_idx + 1] > decoded_int_offsets_[off_idx] &&
-        static_cast<size_t>(local) <
-            decoded_int_offsets_[off_idx + 1] - decoded_int_offsets_[off_idx]) {
-      const size_t index = decoded_int_offsets_[off_idx] + local;
+    const auto decoded = (vt == ValueType::kInt64 || vt == ValueType::kDouble)
+                             ? DecodedIntCell(c, g) : std::span<const int64_t>{};
+    if (local < decoded.size()) {
       const size_t null_byte =
           null_base + (static_cast<size_t>(c) * null_bytes) + (local >> 3);
       const bool is_null =
@@ -4379,10 +4338,10 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       if (is_null) {
         cached_slot = Value();
       } else if (vt == ValueType::kInt64) {
-        cached_slot.SetInt64(decoded_int_cache_[index]);
+        cached_slot.SetInt64(decoded[local]);
       } else {
         double value = NAN;
-        const auto bits = static_cast<uint64_t>(decoded_int_cache_[index]);
+        const auto bits = static_cast<uint64_t>(decoded[local]);
         memcpy(&value, &bits, sizeof(value));
         cached_slot.SetDouble(value);
       }
@@ -4521,18 +4480,11 @@ Status PaxChunk::ResolveSeqCursors(uint32_t g, const Schema& sc,
     const ValueType vt = sc.GetColumn(c).Type();
     const bool is_num = (vt == ValueType::kInt64 || vt == ValueType::kDouble);
     cur.is_double = (vt == ValueType::kDouble);
-    // Decoded-int cache spans are whole-cell (a cell is either fully cached
-    // or not at all, see BuildDecodedIntCache), so a full-row span covers
-    // every local index the legacy `local < span` check admitted.
-    if (is_num && decoded_int_cache_ready_ &&
-        (static_cast<size_t>(g) * cc) + c + 1 < decoded_int_offsets_.size() &&
-        decoded_int_offsets_[(static_cast<size_t>(g) * cc) + c + 1] -
-                decoded_int_offsets_[(static_cast<size_t>(g) * cc) + c] ==
-            static_cast<size_t>(rc) &&
-        rc != 0) {
+    const auto decoded = is_num ? DecodedIntCell(static_cast<slot_t>(c), g)
+                                : std::span<const int64_t>{};
+    if (!decoded.empty()) {
       cur.kind = 1;
-      cur.vals = decoded_int_cache_.data() +
-                 decoded_int_offsets_[(static_cast<size_t>(g) * cc) + c];
+      cur.vals = decoded.data();
       cur.span = rc;
       continue;
     }
@@ -4671,18 +4623,13 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
   // join's null-key skip depend on that verdict); the cache itself stores
   // the raw-0 clamped value, so the bitmap gate decides which of the two is
   // served. Partial spans fall through to the region decoders below:
-  // BuildDecodedIntCache materializes whole cells only, so span == rc means
-  // every local row of the group is covered.
-  if (decoded_int_cache_ready_ && footer_.row_group_count == 1 &&
-      decoded_int_offsets_.size() > static_cast<size_t>(col_idx) + 1 &&
-      !footer_.row_counts.empty()) {
+  // Each cached cell contains every local row of the group.
+  if (footer_.row_group_count == 1 && !footer_.row_counts.empty()) {
     const ValueType vt = sc.GetColumn(col_idx).Type();
     if (vt == ValueType::kInt64 || vt == ValueType::kDouble) {
-      const size_t span =
-          decoded_int_offsets_[col_idx + 1] - decoded_int_offsets_[col_idx];
+      const auto decoded = DecodedIntCell(col_idx, 0);
       const uint16_t rc = footer_.row_counts[0];
-      if (span == static_cast<size_t>(rc) && rc != 0 &&
-          global_row_index < span) {
+      if (global_row_index < decoded.size()) {
         if (footer_.null_present &&
             footer_.row_counts.size() >= footer_.row_group_count) {
           const size_t null_bytes = (static_cast<size_t>(rc) + 7) / 8;
@@ -4696,8 +4643,7 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
           }
         }
         const int64_t cached =
-            decoded_int_cache_[decoded_int_offsets_[col_idx] +
-                               global_row_index];
+            decoded[global_row_index];
         if (vt == ValueType::kInt64) {
           return Value(cached);
         }
@@ -8777,7 +8723,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           // One-time semantic walk: decode all n symbols with the canonical
           // tables and require the histogram to equal the stored frequency
-          // table exactly.
+          // table exactly. Every 64-symbol group boundary ALSO pins the
+          // recorded checkpoint bit position: the structural checks above
+          // admit a ckpt[e] landing MID-SYMBOL (a Kraft-complete tree decodes
+          // every bit pattern), and HuffDictValueAt seeks to ckpt[i/64]
+          // verbatim -- an unpinned checkpoint would let a point read return
+          // a different value than DecodeHuffDictAll's scan of the same row,
+          // the divergence kS4's seek-word replay exists to refuse.
           {
             HuffDictTables vt;
             HuffDictRegion hr;
@@ -8811,6 +8763,17 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
                 return w;
               }
               ++hist[sym];
+              // ckpt[e] is the bit position at which row 64e starts, so
+              // after decoding 64e symbols the walk must sit exactly there.
+              // The encoder records one checkpoint per group START only, so
+              // a stream ending on a boundary (e == ncp) has none to pin.
+              if ((i + 1) % kHuffDictCheckpoint == 0) {
+                const uint64_t e = (i + 1) / kHuffDictCheckpoint;
+                if (e < ncp && br.bitpos != rd(ckpt_off + (4 * e), 4)) {
+                  trace(153, br.bitpos);
+                  return w;
+                }
+              }
             }
             for (uint64_t s = 0; s < d; ++s) {
               if (hist[static_cast<size_t>(s)] != rd(freq_off + (2 * s), 2)) {

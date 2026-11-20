@@ -118,7 +118,7 @@ int FuzzChunkFooterOneInput(const uint8_t* data, size_t size) {
   const auto shape = static_cast<uint8_t>(data[0] & 15);
   const PaxChunk good = BuildStorageChunk(shape);
 
-  static uint32_t round_trip_done = 0;
+  static thread_local uint32_t round_trip_done = 0;
   if ((round_trip_done & (1U << shape)) == 0) {
     if (!DeserializeRoundTrips(good, sc)) {
       std::cerr << "Deserialize(chunk.Data()) is not lossless (shape "

@@ -29,6 +29,7 @@
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/regex_guard.hpp"
+#include "common/string_util.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/columnar_table.hpp"
@@ -2696,6 +2697,7 @@ StatusOr<bool> DecodeAndFilterBlock(
       return Status::kSuccess;
     }
     std::vector<slot_t> needed;
+    needed.reserve(sched.cond_cols.size());
     for (size_t ci = 0; ci < sched.cond_cols.size(); ++ci) {
       bool any_hit = false;
       for (const uint32_t r : *cand_rows) {
@@ -3089,6 +3091,7 @@ StatusOr<bool> ValidateDeltaKeysNoOverflow(
     const TlcsFile& tlcs, const std::vector<uint32_t>& candidate_blocks,
     const std::vector<ColGroupKeySpec>& key_specs) {
   std::vector<std::pair<slot_t, int64_t>> checks;
+  checks.reserve(key_specs.size());
   for (const auto& ks : key_specs) {
     if (ks.kind == ColKeyKind::kColInt64Delta) {
       checks.emplace_back(ks.full_col, ks.const_int);
@@ -3150,6 +3153,7 @@ StatusOr<KeyProjectionMap> BuildKeyProjectionMap(
   }
 
   std::vector<std::pair<slot_t, int32_t>> int64_bases;
+  int64_bases.reserve(key_specs.size());
   for (size_t i = 0; i < key_specs.size(); ++i) {
     const auto& ks = key_specs[i];
     if (ks.kind == ColKeyKind::kConstInt64) {
@@ -3310,6 +3314,7 @@ StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
   std::vector<BoundRow> rows;
   if (extrema) {
     rows.resize(1);
+    rows[0].aggs.reserve(aggregates.size());
     for (const auto& agg : aggregates) {
       if (agg.kind == ColAggKind::kCountStar) {
         rows[0].aggs.emplace_back(static_cast<int64_t>(tlcs.TotalRows()));
@@ -3354,6 +3359,7 @@ StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
     }
     const auto& s = (*stats)[slot];
     std::vector<ValueFrequency> domain;
+    domain.reserve(s.LowestValues().size() + s.HighestValues().size());
     size_t covered = 0;
     for (const auto* boundary : {&s.LowestValues(), &s.HighestValues()}) {
       for (const auto& item : *boundary) {
@@ -3481,6 +3487,7 @@ StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
       stmt.HasLimit() ? stmt.Offset() + stmt.Limit() : rows.size();
   Relation result(runtime);
   std::vector<Column> out_cols;
+  out_cols.reserve(emit.size());
   for (size_t i = 0; i < emit.size(); ++i) {
     if (i >= output_names.size()) {
       out_cols.emplace_back("col_" + std::to_string(i), ValueType::kInt64);
@@ -3494,6 +3501,7 @@ StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
   }
   for (size_t r = 0; r < std::min(cap, rows.size()); ++r) {
     std::vector<Value> values;
+    values.reserve(emit.size());
     std::vector<Value> cached_keys(keys.size());
     for (size_t i = 0; i < emit.size(); ++i) {
       ASSIGN_OR_RETURN(Value, v,
@@ -4909,6 +4917,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(ncols, nullptr);
 
       std::vector<slot_t> dyn_scalar_cols;
+      dyn_scalar_cols.reserve(plan_agg_specs.size());
       while (true) {
         const size_t bi = next_idx.fetch_add(1, std::memory_order_relaxed);
         if (bi >= candidate_blocks.size()) {
@@ -5437,7 +5446,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                                    finished_aggs, &empty_keys));
           std::string cname = i < plan_select_names.size()
                                   ? ProjectionName(plan_select_names[i], i)
-                                  : ("col_" + std::to_string(i));
+                                  : ("col_" + IntegerToString(i));
           Column c(std::move(cname), ValueTypeOf(v));
           c.SetUnsigned(v.IsUnsigned());
           out_cols.push_back(std::move(c));
@@ -5448,7 +5457,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         for (size_t i = 0; i < plan_emit.size(); ++i) {
           std::string cname = i < plan_select_names.size()
                                   ? ProjectionName(plan_select_names[i], i)
-                                  : ("col_" + std::to_string(i));
+                                  : ("col_" + IntegerToString(i));
           out_cols.emplace_back(std::move(cname), ValueType::kInt64);
         }
       }
@@ -6434,8 +6443,11 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     bool late_has_heavy = false;
     std::vector<size_t> orig_to_early(agg_specs.size(), SIZE_MAX);
     std::vector<ColAggSpec> early_aggs;
+    early_aggs.reserve(agg_specs.size());
     std::vector<size_t> late_orig_idxs;
+    late_orig_idxs.reserve(agg_specs.size());
     std::vector<ColAggSpec> late_aggs;
+    late_aggs.reserve(agg_specs.size());
     for (size_t a = 0; a < agg_specs.size(); ++a) {
       if (is_early[a] != 0U) {
         if (is_heavy_agg(agg_specs[a].kind)) {
@@ -6851,6 +6863,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             // deduplication (handles skewed top-10 regions in ClickBench Q10
             // without building multi-million-entry maps per worker!).
             std::vector<size_t> int_dist_late_idxs;
+            int_dist_late_idxs.reserve(n_late);
             for (size_t la = 0; la < n_late; ++la) {
               if (late_aggs[la].kind == ColAggKind::kCountDistinctInt64 ||
                   late_aggs[la].kind == ColAggKind::kCountDistinctDate ||

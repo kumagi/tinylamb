@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/digest.hpp"
+#include "common/string_util.hpp"
 #include "expression/proto_schema.hpp"
 #include "type/date.hpp"
 #include "type/value.hpp"
@@ -132,12 +133,16 @@ bool ReadQuoted(std::string_view text, size_t* i, std::string* out) {
           out->push_back('"');
           break;
         case 'x': {
-          if (*i + 3 < text.size()) {
+          if (*i + 3 < text.size() &&
+              std::isxdigit(static_cast<unsigned char>(text[*i + 2])) != 0 &&
+              std::isxdigit(static_cast<unsigned char>(text[*i + 3])) != 0) {
             const std::string hex(text.substr(*i + 2, 2));
             const long val = std::strtol(hex.c_str(), nullptr, 16);
             out->push_back(static_cast<char>(val));
             *i += 2;
           } else {
+            // Not two hex digits: keep the 'x' literal instead of letting
+            // strtol's prefix match swallow a non-hex second digit.
             out->push_back('x');
           }
           break;
@@ -162,6 +167,7 @@ bool ReadQuoted(std::string_view text, size_t* i, std::string* out) {
 // Encodes a raw scalar payload for emission inside a quoted token.
 std::string EscapeQuoted(std::string_view raw) {
   std::string out;
+  out.reserve(raw.size() * 2);
   for (const char c : raw) {
     switch (c) {
       case '\n':
@@ -838,6 +844,7 @@ std::optional<std::string> NormalizeProtoTextAtDepth(std::string_view text,
                      return ext_a != ext_b ? ext_b : false;
                    });
   std::string out;
+  out.reserve(entries.size());
   for (const ProtoTextEntry& entry : entries) {
     if (!out.empty()) {
       out.push_back(' ');
@@ -1071,6 +1078,7 @@ const std::vector<std::string>* EnumMembersForField(
   const std::string lower = ToLowerCopy(key);
   const auto& known = KnownEnumFields();
   std::vector<const std::vector<std::string>*> candidates;
+  candidates.reserve(known.size());
   for (const auto& [type_field, members] : known) {
     const size_t slash = type_field.find('/');
     if (slash == std::string::npos) {
@@ -1146,6 +1154,10 @@ std::string FormatScalarValueInProtoText(const std::string& type_name,
 
 }  // namespace
 
+Value DecodeProtoTextScalarToken(std::string_view raw_token) {
+  return DecodeScalarToken(raw_token);
+}
+
 StatusOr<bool> TryProtoTextExtractField(std::string_view text,
                                         std::string_view key, Value* out) {
   std::string_view body = text;
@@ -1193,7 +1205,9 @@ StatusOr<bool> TryProtoTextExtractField(std::string_view text,
       ToLowerCopy(repeated_leaf).find("repeated") != std::string::npos;
 
   std::vector<Value> scalars;
+  scalars.reserve(entries.size());
   std::vector<Value> messages;
+  messages.reserve(entries.size());
   for (const ProtoTextEntry& entry : entries) {
     if (!NameEquals(entry.name, key)) {
       continue;
@@ -1470,6 +1484,7 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
             "Cannot clear required proto field " + type_name + "." + target);
       }
       std::string out;
+      out.reserve(entries.size());
       for (const ProtoTextEntry& entry : entries) {
         if (NameEquals(entry.name, target)) {
           continue;
@@ -1488,6 +1503,7 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
     Value value_to_store = converted.has_value() ? *converted : new_value;
 
     std::vector<ProtoTextEntry> replacement;
+    replacement.reserve(value_to_store.ArrayElements().size());
     if (value_to_store.IsArray()) {
       for (const Value& element : value_to_store.ArrayElements()) {
         if (element.IsNull()) {
@@ -1524,6 +1540,7 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
     }
 
     std::string out;
+    out.reserve(entries.size() + replacement.size());
     bool inserted = replacement.empty();
     for (const ProtoTextEntry& entry : entries) {
       if (!NameEquals(entry.name, target)) {
@@ -1567,6 +1584,7 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
     if (nested.has_value()) {
       entry.text = *nested;
       std::string merged;
+      merged.reserve(rewritten.size());
       for (const ProtoTextEntry& e : rewritten) {
         if (!merged.empty()) {
           merged.push_back(' ');
@@ -1857,6 +1875,7 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
   const bool proto2 =
       ToLowerCopy(type_name).find("kitchensinkenumpb") != std::string::npos;
   std::vector<std::pair<std::string, std::string>> entries;
+  entries.reserve(bytes.size());
   size_t i = 0;
   while (i < bytes.size()) {
     uint64_t tag = 0;
@@ -1966,26 +1985,27 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
       return std::nullopt;
     }
     if (field_it == fields.end()) {
-      entries.emplace_back(std::to_string(field_number),
-                           std::to_string(static_cast<int64_t>(value)));
+      entries.emplace_back(IntegerToString(field_number),
+                           IntegerToString(static_cast<int64_t>(value)));
       continue;
     }
     const std::string name = field_it->second.name;
     const bool known_member =
         !proto2 || (value <= 2);  // TestEnum members TESTENUM0..2
     if (!known_member) {
-      entries.emplace_back(std::to_string(field_number),
-                           std::to_string(static_cast<int64_t>(value)));
+      entries.emplace_back(IntegerToString(field_number),
+                           IntegerToString(static_cast<int64_t>(value)));
       continue;
     }
-    std::string token = proto2 ? ("TESTENUM" + std::to_string(value))
-                               : std::to_string(static_cast<int64_t>(value));
+    std::string token = proto2 ? ("TESTENUM" + IntegerToString(value))
+                               : IntegerToString(static_cast<int64_t>(value));
     entries.emplace_back(name, std::move(token));
   }
   // Proto wire decoding may see a singular field more than once.  Scalar
   // fields use the last value, while embedded messages merge their members;
   // repeated fields remain repeated entries for ProtoTextExtractField.
   std::vector<std::pair<std::string, std::string>> merged;
+  merged.reserve(entries.size());
   for (const auto& entry : entries) {
     auto previous =
         std::find_if(merged.begin(), merged.end(), [&](const auto& candidate) {
@@ -2012,6 +2032,7 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
   }
   entries = std::move(merged);
   std::string out;
+  out.reserve(entries.size());
   for (const auto& [name, token] : entries) {
     if (!out.empty()) {
       out.push_back(' ');
@@ -2255,6 +2276,7 @@ std::string InferProtoTypeName(std::string_view payload,
     entries.clear();
   }
   std::unordered_set<std::string> present;
+  present.reserve(entries.size());
   for (const ProtoTextEntry& entry : entries) {
     present.insert(ToLowerCopy(entry.name));
   }

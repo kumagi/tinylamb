@@ -158,6 +158,16 @@ Status BandJoin::Materialize() {
   output_.clear();
   output_offset_ = 0;
 
+  auto append = [&](std::vector<PositionedRow>& target, Row row,
+                    RowPosition pos, size_t metadata = 0) -> Status {
+    if (!materialized_charge_.TryAdd(EstimateRowBytesFast(row) +
+                                    sizeof(RowPosition) + metadata)) {
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "BandJoin materialization exceeds query memory budget");
+    }
+    target.emplace_back(std::move(row), pos);
+    return Status::kSuccess;
+  };
   DataChunk batch;
   while (left_->NextBatch(&batch) != 0) {
     if (const Status st = Transaction::CheckThreadStatementTimeout();
@@ -166,7 +176,7 @@ Status BandJoin::Materialize() {
       return st;
     }
     for (size_t i = 0; i < batch.Size(); ++i) {
-      left_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+      RETURN_IF_FAIL(append(left_rows_, batch.RowAt(i), batch.PositionAt(i)));
     }
   }
   if (left_->GetStatus() != Status::kSuccess) {
@@ -179,7 +189,7 @@ Status BandJoin::Materialize() {
       return st;
     }
     for (size_t i = 0; i < batch.Size(); ++i) {
-      right_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+      RETURN_IF_FAIL(append(right_rows_, batch.RowAt(i), batch.PositionAt(i), sizeof(RightKey) + 1));
     }
   }
   if (right_->GetStatus() != Status::kSuccess) {
@@ -248,16 +258,16 @@ Status BandJoin::Materialize() {
   const Row null_right{std::vector<Value>(right_width_)};
   const auto emit_combined = [&](const PositionedRow& left_item,
                                  const PositionedRow& right_item) {
-    output_.emplace_back(left_item.first + right_item.first, left_item.second);
+    return append(output_, left_item.first + right_item.first, left_item.second);
   };
   const auto emit_left_only = [&](const PositionedRow& left_item) {
-    output_.emplace_back(left_item.first, left_item.second);
+    return append(output_, left_item.first, left_item.second);
   };
   const auto emit_left_padded = [&](const PositionedRow& left_item) {
-    output_.emplace_back(left_item.first + null_right, left_item.second);
+    return append(output_, left_item.first + null_right, left_item.second);
   };
   const auto emit_right_padded = [&](const PositionedRow& right_item) {
-    output_.emplace_back(null_left + right_item.first, right_item.second);
+    return append(output_, null_left + right_item.first, right_item.second);
   };
 
   have_previous_key = false;
@@ -299,13 +309,13 @@ Status BandJoin::Materialize() {
         ++match_count;
         right_matched[row_index] = 1;
         if (kind_ == JoinKind::kInner || IsOuter(kind_)) {
-          emit_combined(left_item, right_rows_[row_index]);
+          RETURN_IF_FAIL(emit_combined(left_item, right_rows_[row_index]));
         } else if (kind_ == JoinKind::kSingle) {
           if (match_count > 1) {
             return StatusError(StatusCode::kInvalidArgument,
                                "BandJoin single join matched more than once");
           }
-          emit_combined(left_item, right_rows_[row_index]);
+          RETURN_IF_FAIL(emit_combined(left_item, right_rows_[row_index]));
         }
       }
     }
@@ -316,16 +326,16 @@ Status BandJoin::Materialize() {
                                                 kind_ == JoinKind::kFullOuter ||
                                                 kind_ == JoinKind::kSingle);
     if (emits_left_only) {
-      emit_left_only(left_item);
+      RETURN_IF_FAIL(emit_left_only(left_item));
     } else if (emits_left_padded) {
-      emit_left_padded(left_item);
+      RETURN_IF_FAIL(emit_left_padded(left_item));
     }
   }
 
   if (kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter) {
     for (size_t i = 0; i < right_rows_.size(); ++i) {
       if (right_matched[i] == 0) {
-        emit_right_padded(right_rows_[i]);
+        RETURN_IF_FAIL(emit_right_padded(right_rows_[i]));
       }
     }
   }
@@ -338,6 +348,13 @@ void BandJoin::EnsureMaterialized() {
   }
   materialized_ = true;
   materialize_error_ = Materialize();
+  if (!materialize_error_.ok()) {
+    decltype(left_rows_){}.swap(left_rows_);
+    decltype(right_rows_){}.swap(right_rows_);
+    decltype(right_keys_){}.swap(right_keys_);
+    decltype(output_){}.swap(output_);
+    materialized_charge_.ReleaseAll();
+  }
 }
 
 size_t BandJoin::NextBatch(DataChunk* destination, size_t max_rows) {

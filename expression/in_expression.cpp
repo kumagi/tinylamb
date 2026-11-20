@@ -39,7 +39,7 @@ StatusOr<Value> TryMembership(const ExpressionBase& child,
                               const std::vector<Expression>& list,
                               Args&&... args) {
   ASSIGN_OR_RETURN(Value, child_value, child.TryEvaluate(args...));
-  bool saw_null = child_value.IsNull();
+  bool saw_null = !list.empty() && child_value.IsNull();
   // Candidates are tried in order and the first match wins: neither an
   // evaluation error nor a collation conflict in a later candidate is raised
   // (`-1 IN (-1, 1/0)` is TRUE), matching the bytecode/rewrite paths that the

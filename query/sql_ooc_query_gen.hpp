@@ -39,7 +39,7 @@ class OocRng {
   bool Chance(int pct) { return Pick(0, 99) < pct; }
   template <typename T>
   const T& OneOf(const std::vector<T>& v) {
-    return v[static_cast<size_t>(Pick(0, static_cast<int64_t>(v.size()) - 1))];
+    return v.at(static_cast<size_t>(Pick(0, static_cast<int64_t>(v.size()) - 1)));
   }
 
  private:

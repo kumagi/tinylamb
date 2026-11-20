@@ -1135,6 +1135,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
               }
             }
             std::vector<slot_t> needed{col_idx};
+            needed.reserve(1 + local_simple.size() * 2);
             for (const auto& compare : local_simple) {
               needed.push_back(compare.column);
               if (compare.column_payload) {
@@ -1667,6 +1668,7 @@ std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
     return nullptr;
   }
   std::vector<SimpleComparePredicate> comparisons;
+  comparisons.reserve(predicates.size());
   for (const auto& predicate : predicates) {
     auto comparison = TryCompileSimpleCompare(predicate, local_schema);
     if (!comparison ||
@@ -3327,6 +3329,7 @@ CompiledScanFilter CompileScanFilterUncached(
       if (disjuncts.size() >= 2 && (!had_query || env != nullptr)) {
         bool all_branches_usable = true;
         std::vector<CompiledScanFilter::DisjunctiveBranch> new_branches;
+        new_branches.reserve(disjuncts.size());
         for (const Expression& disjunct : disjuncts) {
           auto branch = CompileAndBranch(disjunct, schema, env);
           if (had_query &&
@@ -3349,6 +3352,7 @@ CompiledScanFilter CompileScanFilterUncached(
               if (new_branches.size() + in_disjuncts.size() <=
                   kMaxDisjunctiveBranches) {
                 std::vector<SimpleComparePredicate> in_simples;
+                in_simples.reserve(in_disjuncts.size());
                 bool all_in_simple = true;
                 for (const Expression& id : in_disjuncts) {
                   if (auto sc = TryCompileSimpleCompare(id, schema)) {
@@ -3391,6 +3395,7 @@ CompiledScanFilter CompileScanFilterUncached(
             branches = std::move(new_branches);
           } else {
             std::vector<CompiledScanFilter::DisjunctiveBranch> crossed;
+            crossed.reserve(branches.size() * new_branches.size());
             for (const auto& left : branches) {
               for (const auto& right : new_branches) {
                 CompiledScanFilter::DisjunctiveBranch merged;
@@ -3466,9 +3471,11 @@ CompiledScanFilter CompileScanFilterUncached(
   // the previous tag-everything treatment.
   {
     std::unordered_set<slot_t> referenced;
+    referenced.reserve(schema.ColumnCount());
     bool conservative = false;
     {
       std::unordered_set<std::string> seen_names;
+      seen_names.reserve(schema.ColumnCount());
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         if (!seen_names.insert(schema.GetColumn(i).Name().name).second) {
           conservative = true;
@@ -3549,6 +3556,7 @@ CompiledScanFilter CompileScanFilterUncached(
     bool has_duplicate_cols = false;
     {
       std::unordered_set<std::string> seen_names;
+      seen_names.reserve(schema.ColumnCount());
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         const std::string& col_name = schema.GetColumn(i).Name().name;
         if (!seen_names.insert(col_name).second) {
@@ -4118,6 +4126,7 @@ std::vector<IntegerPeekCompare> BuildIntegerPeeks(
   // every survivor, including holes, NULLs and mixed numeric values.
   if (!filter.disjunctive_branches.empty()) {
     std::unordered_set<slot_t> visited;
+    visited.reserve(filter.disjunctive_branches.front().simple.size());
     for (const auto& candidate : filter.disjunctive_branches.front().simple) {
       if (!signed_payload(candidate) ||
           !visited.insert(candidate.column).second) {
@@ -5083,10 +5092,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
         }
         if (col.is_uniform && pred.runtime_filter == nullptr &&
             !pred.packed_pair_col2.has_value() &&
-            pred.distinct_witness_minmax == nullptr &&
-            !pred.string_values && pred.values != nullptr &&
-            col.type == pred.domain_type && !col.is_unsigned &&
-            (!pred.values->Empty() || pred.contains_null)) {
+            pred.distinct_witness_minmax == nullptr && !pred.string_values &&
+            pred.values != nullptr && col.type == pred.domain_type &&
+            !col.is_unsigned && (!pred.values->Empty() || pred.contains_null)) {
           const FlatIntSet& values = *pred.values;
           const bool neg = pred.negated;
           const bool ex = pred.existence;
@@ -5397,10 +5405,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
               if (branch_ok) {
                 for (const PrebuiltMembershipPredicate& pm :
                      branch.prebuilt_membership) {
-                  slot_t max_col =
-                      pm.distinct_witness_minmax != nullptr
-                          ? std::max(pm.column, pm.witness_column)
-                          : pm.column;
+                  slot_t max_col = pm.distinct_witness_minmax != nullptr
+                                       ? std::max(pm.column, pm.witness_column)
+                                       : pm.column;
                   if (pm.packed_pair_col2.has_value()) {
                     max_col = std::max(max_col, *pm.packed_pair_col2);
                   }
@@ -6071,6 +6078,7 @@ Relation UnnestValueToRelation(const SelectSource& source,
       std::vector<std::string> parts;
       int bracket = 0;
       std::string current;
+      current.reserve(elem_sql_type.size() - open - 1);
       for (size_t i = open + 1; i < elem_sql_type.size(); ++i) {
         const char c = elem_sql_type[i];
         if (c == '<' || c == '(') {
@@ -6482,6 +6490,7 @@ StatusOr<bool> TrySelectiveIndexSource(
     return false;
   }
   std::vector<Expression> early_memberships;
+  early_memberships.reserve(filter.residual.size());
   if (!filter.needs_unsigned_tagging) {
     for (const auto& expression : filter.residual) {
       if (!expression || expression->Type() != TypeTag::kInExp) {
@@ -6503,6 +6512,7 @@ StatusOr<bool> TrySelectiveIndexSource(
     size_t page_ordinal{0};
   };
   std::vector<SourceRow> rows;
+  rows.reserve(kMaxRows);
   size_t bytes = 0, visited = 0;
   const size_t scans = (selected_keys != nullptr) ? selected_keys->size() : 1;
   for (size_t seek = 0; seek < scans; ++seek) {
@@ -7463,7 +7473,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         std::sort(sorted_keys.begin(), sorted_keys.end());
         keyed_cache_key.reserve(
             keyed_cache_key.size() +
-            sorted_keys.size() *  // NOLINT(readability-math-missing-parentheses)
+            sorted_keys
+                    .size() *  // NOLINT(readability-math-missing-parentheses)
                 sizeof(
                     int64_t));  // NOLINT(readability-math-missing-parentheses)
         for (int64_t k : sorted_keys) {

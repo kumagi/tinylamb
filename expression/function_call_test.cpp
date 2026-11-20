@@ -402,12 +402,25 @@ TEST(FunctionCallAstTest, TypeSafetyAndDomainErrors) {
   EXPECT_EQ(eval("sqrt", {Value(-1.0)}).GetStatus(),
             StatusCode::kInvalidArgument);
   // GoogleSQL LN errors on x <= 0 (SAFE_LN returns NULL); see T3885.
+  // LOG(x) is a synonym of LN(x), and LOG(x, base) requires x > 0,
+  // base > 0 and base != 1 (T3149, T3892).
   EXPECT_EQ(eval("ln", {Value(0.0)}).GetStatus(), StatusCode::kInvalidArgument);
   EXPECT_EQ(eval("ln", {Value(-5.0)}).GetStatus(),
             StatusCode::kInvalidArgument);
-  EXPECT_TRUE(std::isinf(eval("log", {Value(0.0)}).Value().value.double_value));
-  EXPECT_DOUBLE_EQ(
-      eval("log", {Value(10.0), Value(0.0)}).Value().value.double_value, 0.0);
+  EXPECT_EQ(eval("log", {Value(0.0)}).GetStatus(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(eval("log", {Value(-5.0)}).GetStatus(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(eval("log", {Value(10.0), Value(0.0)}).GetStatus(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(eval("log", {Value(10.0), Value(-2.0)}).GetStatus(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(eval("log", {Value(-1.0), Value(2.0)}).GetStatus(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(eval("log10", {Value(0.0)}).GetStatus(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(eval("log10", {Value(-5.0)}).GetStatus(),
+            StatusCode::kInvalidArgument);
   // Base 1 divides by log(1) == 0: a GoogleSQL domain error, not +-inf.
   EXPECT_EQ(eval("log", {Value(10.0), Value(1.0)}).GetStatus(),
             StatusCode::kInvalidArgument);

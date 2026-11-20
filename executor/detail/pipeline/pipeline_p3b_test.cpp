@@ -531,6 +531,8 @@ TEST(PipelineP3bTest, SqlEngineP3bOperatorsZeroLegacyAndBudgetInvariant) {
 
     std::string ins_t = "INSERT INTO p3b_t VALUES ";
     std::string ins_u = "INSERT INTO p3b_u VALUES ";
+    ins_t.reserve(120);
+    ins_u.reserve(120);
     for (int i = 0; i < 120; ++i) {
       if (i > 0) {
         ins_t += ',';
@@ -1184,6 +1186,7 @@ TEST(PipelineP3bTest, OocBandJoinCandidatePruningMatchesEveryComparison) {
   // Value() is NULL; the helper above cannot express it via int64_t, so build
   // the left rows explicitly.
   std::vector<Row> lrows{Row({Value()})};
+  lrows.reserve(5);
   for (int64_t k : {int64_t{1}, int64_t{1}, int64_t{3}, int64_t{7}}) {
     lrows.push_back(Row({Value(k)}));
   }
@@ -1196,6 +1199,7 @@ TEST(PipelineP3bTest, OocBandJoinCandidatePruningMatchesEveryComparison) {
     // the next left row's, and pairs inside one left row arrive in right-key
     // order (the right stream is already key-ordered).
     std::vector<Row> expected_rows;
+    expected_rows.reserve(lrows.size() * right_keys.size());
     for (const auto& l : lrows) {
       if (l[0].IsNull()) {
         continue;

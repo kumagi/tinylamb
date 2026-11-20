@@ -682,6 +682,7 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     // lift/inline CTEs differently on a template-cache hit than on the
     // first execution even though the bound values were correct.
     std::vector<std::string> names = select.WithQueryOrder();
+    names.reserve(select.WithQueries().size());
     std::erase_if(names, [&](const std::string& name) {
       return !select.WithQueries().contains(name);
     });

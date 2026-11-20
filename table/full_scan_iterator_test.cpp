@@ -452,6 +452,23 @@ TEST(LSTableIntegerRunsTest, RunBoundsRefuseNullWideAndUnbudgetedColumns) {
   }
 }
 
+TEST_F(FullScanIteratorTest, ProjectionRejectionIsSpecificToGenerationColumnsAndLimit) {
+  auto writer = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(writer, "SampleTable"));
+  ASSERT_SUCCESS(table.Insert(writer.txn_, Row({Value(1), Value("foo"), Value(1.0)})).GetStatus());
+  ASSERT_SUCCESS(writer.PreCommit());
+  auto reader = db_->BeginReadOnlyContext();
+  const std::vector<slot_t> projection{0};
+  ASSERT_EQ(BuildLSTableStore(reader.txn_, table, &projection, 1), nullptr);
+  const auto& state = table.IncarnationState();
+  const auto gen = table.LayoutGeneration();
+  EXPECT_TRUE(state->ProjectionRejected(gen, 1, {1, 0, 0}));
+  EXPECT_FALSE(state->ProjectionRejected(gen, 1, {0, 1, 0}));
+  EXPECT_FALSE(state->ProjectionRejected(gen + 1, 1, {1, 0, 0}));
+  EXPECT_FALSE(state->ProjectionRejected(gen, 4096, {1, 0, 0}));
+  EXPECT_NE(BuildLSTableStore(reader.txn_, table, &projection, 4096), nullptr);
+}
+
 TEST_F(FullScanIteratorTest,
        ProjectionReplacementReleasesIdleImageBeforeBuild) {
   auto load = db_->BeginContext();

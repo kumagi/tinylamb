@@ -487,8 +487,7 @@ theorem eager_left_avg_min_max_left_join_sound {L R K GL G : Type}
 ## Section 3: `DISTINCT` 集約 (`MIN / MAX / COUNT / SUM / AVG (DISTINCT)`) の網羅検証
 ================================================================================
 
-`tinylamb` の現行コード（`executor/detail/aggregate_accumulator.cpp:1312` や `plan/cascades.cpp:7034`）では、
-`COUNT(DISTINCT)` 以外の `DISTINCT` 集約は部分マージ不可として一括除外されています。
+`AggregateAccumulator::CanMerge` は COUNT(DISTINCT) を集合の和でマージし、MIN/MAX(DISTINCT) は冪等なので通常の MIN/MAX と同様にマージします。SUM/AVG(DISTINCT) にはこの扱いを適用しません。
 しかし Lean で「値のサポート集合（どの非 NULL 値が 1 回以上出現したか）」に注目すると、
 実は **通常の `SUM` / `AVG` よりも遥かにアグレッシブな Join 縮退・消去ルール** が成立することが分かります！
 -/
@@ -805,9 +804,8 @@ theorem inner_join_to_semijoin_idempotent_aggs_sound {L R GL : Type} [DecidableE
       exact ⟨x, hx, y, ⟨hy, hMatch⟩, rfl⟩
 
 /-- **定理 3-4 (`unused_left_join_elim_idempotent_aggs_sound` — Unique 制約不要の `LEFT JOIN` 完全消去！)**:
-    `tinylamb` の現行 `unused_left_join_elimination`（`docs/cascades_optimizer.md:332`）は、
-    重複マッチによる行数増加を恐れて **右側キーに `UNIQUE / PK` 制約があるときだけ** `LEFT JOIN` を消去します。
-    しかし上段が `GROUP BY gL(L)` ＋ 冪等集約 `(MIN, MAX, COUNT(DISTINCT), SUM(DISTINCT), AVG(DISTINCT))` なら、
+    現行の `unused_left_join_elimination` は、右キーの一意性が証明できる場合に加え、上段が多重度に依存せず ON 述語が例外を投げない場合にも未参照の右側を消去できます（`docs/cascades_optimizer.md` の同名ルール）。
+    以下の定理は GROUP BY と冪等集約に対して後者の多重集合上の根拠を示します。
     左の各行はマッチ 0 件でも 1 回・マッチ $m \ge 1$ 件でも $m$ 回（常に **1 回以上**！）現れるため、
     **`R` に Unique 制約が一切無くても、どんな `ON` 条件であっても `LEFT JOIN R` ごと丸ごと消去（`L` 単体へ置換）できる**！ -/
 theorem unused_left_join_elim_idempotent_aggs_sound {L R GL : Type} [DecidableEq GL]

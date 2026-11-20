@@ -115,10 +115,8 @@ class FilterOp final : public PipelineOperator {
   void DumpExplain(std::ostream& out, int indent) const override;
 
  private:
-  class FeedAdapter;
   Expression predicate_;
   Schema input_schema_;
-  std::shared_ptr<FeedAdapter> feed_;
   std::unique_ptr<Selection> selection_;
 };
 
@@ -140,10 +138,8 @@ class ProjectOp final : public PipelineOperator {
   void DumpExplain(std::ostream& out, int indent) const override;
 
  private:
-  class FeedAdapter;
   std::vector<NamedExpression> expressions_;
   Schema input_schema_;
-  std::shared_ptr<FeedAdapter> feed_;
   std::unique_ptr<Projection> projection_;
 };
 

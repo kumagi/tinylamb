@@ -4076,6 +4076,7 @@ Status OocWindowSink::BuildGroups() {
   groups_.clear();
   const size_t base_width = input_schema_.ColumnCount() + outputs_.size();
   std::vector<std::string> group_keys;
+  group_keys.reserve(outputs_.size());
   for (size_t i = 0; i < outputs_.size(); ++i) {
     const NamedExpression& item = outputs_[i];
     if (item.expression == nullptr ||

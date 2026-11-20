@@ -249,8 +249,11 @@ TEST_F(RecoveryManagerTest, ReplaysCommittedAndIgnoresUncommittedLosers) {
 TEST_F(RecoveryManagerTest,
        RecoveryTxnBitmapHandlesSpacedAndAbortedTransactions) {
   std::vector<page_id_t> committed_pids;
+  committed_pids.reserve(64);
   std::vector<slot_t> committed_slots;
+  committed_slots.reserve(64);
   std::vector<page_id_t> aborted_pids;
+  aborted_pids.reserve(64);
 
   for (int i = 0; i < 64; ++i) {
     Transaction txn = tm_->Begin();

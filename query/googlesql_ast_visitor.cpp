@@ -36,6 +36,7 @@
 #include "common/platform/time_format.hpp"
 #include "common/platform/time_zone.hpp"
 #include "common/set_operation.hpp"
+#include "common/string_util.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -190,6 +191,59 @@ bool HasExplicitLateral(const GoogleSqlAstNode& table_subquery,
 
 namespace {
 
+// GoogleSQL resolves an unqualified name in ORDER BY against the SELECT-list
+// output names first; a name that more than one output column carries is an
+// error ("Column name u is ambiguous"), even inside an expression
+// (`SELECT u, u FROM t ORDER BY u + 1`).  The default lowering used to pick
+// one of them silently while the relational route rejected the query
+// (griffin_fuzz GRIFFIN-RELATIONAL-PATH MISMATCH).  Ordinals are resolved by
+// the caller before this check, and `*` expansions carry names unknown here,
+// so neither is counted (never a false reject).
+std::optional<std::string> AmbiguousOrderByName(
+    const std::vector<NamedExpression>& projections,
+    const Expression& order_expression) {
+  std::unordered_map<std::string, size_t> output_names;
+  for (const NamedExpression& item : projections) {
+    std::string name = item.name;
+    if (name.empty() && item.expression != nullptr &&
+        item.expression->Type() == TypeTag::kColumnValue) {
+      name = item.expression->AsColumnValue().GetColumnName().name;
+    }
+    if (name.empty() || name == "*") {
+      continue;
+    }
+    ++output_names[AsciiToLower(name)];
+  }
+  std::optional<std::string> ambiguous;
+  std::function<void(const Expression&)> visit = [&](const Expression& e) {
+    if (e == nullptr || ambiguous.has_value()) {
+      return;
+    }
+    switch (e->Type()) {
+      case TypeTag::kQueryExp:   // subqueries resolve names in their own scope
+      case TypeTag::kLambdaExp:  // lambda parameters shadow output names
+        return;
+      case TypeTag::kColumnValue: {
+        const ColumnName& col = e->AsColumnValue().GetColumnName();
+        if (col.schema.empty()) {
+          const auto it = output_names.find(AsciiToLower(col.name));
+          if (it != output_names.end() && it->second > 1) {
+            ambiguous = col.name;
+          }
+        }
+        return;
+      }
+      default:
+        break;
+    }
+    for (const Expression& child : ExpressionChildren(e)) {
+      visit(child);
+    }
+  };
+  visit(order_expression);
+  return ambiguous;
+}
+
 // A lone star projection is sometimes wrapped by the value-table machinery
 // (`SELECT t.*` and `SELECT AS VALUE <star>` fold it into
 // `__value_table_value(<ColumnValue "*">)`); star-shape checks must see
@@ -271,7 +325,8 @@ class UdfExpansionDepthGuard {
 // could ever produce, so enforce an explicit recursion bound.
 constexpr size_t kMaxSubstitutionDepth = 512;
 thread_local size_t tls_substitution_depth = 0;
-struct SubstitutionDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+struct
+    SubstitutionDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
   bool entered{false};
   SubstitutionDepthGuard() {
     if (tls_substitution_depth < kMaxSubstitutionDepth) {
@@ -723,8 +778,8 @@ StatusOr<TableSampleSpec> VisitTableSample(
   for (size_t i = 0; i + 1 < size_text.size();) {
     if (size_text[i] == '/' && size_text[i + 1] == '*') {
       const size_t end = size_text.find("*/", i + 2);
-      size_text.erase(i, end == std::string::npos ? std::string::npos
-                                                  : end + 2 - i);
+      size_text.erase(
+          i, end == std::string::npos ? std::string::npos : end + 2 - i);
     } else {
       ++i;
     }
@@ -1261,6 +1316,7 @@ StatusOr<SelectSource> VisitTableSource(
       source.is_lateral = true;
     } else if (source.query) {
       std::unordered_set<std::string> local_tables;
+      local_tables.reserve(source.query->Sources().size());
       for (const auto& s : source.query->Sources()) {
         if (!s.alias.empty()) {
           local_tables.insert(s.alias);
@@ -1332,6 +1388,7 @@ Status AppendSources(
     return Status::kSuccess;
   }
   std::vector<const GoogleSqlAstNode*> operands;
+  operands.reserve(node.children.size());
   const GoogleSqlAstNode* on = nullptr;
   const GoogleSqlAstNode* using_clause = nullptr;
   for (const auto& child : node.children) {
@@ -1377,6 +1434,7 @@ Status AppendSources(
     // the shared columns. Dropping it silently would turn the statement into
     // a condition-less join.  The names also ride on the right-hand source so
     // execution can coalesce bare references and star expansion.
+    using_columns.reserve(using_clause->Children("Identifier").size());
     for (const GoogleSqlAstNode* column :
          using_clause->Children("Identifier")) {
       ASSIGN_OR_RETURN(std::string, hv173881_0, (Identifier(*column)));
@@ -1430,6 +1488,7 @@ std::shared_ptr<SelectStatement> WrapPipeInput(
 StatusOr<std::vector<NamedExpression>> VisitPipeSelectList(
     const GoogleSqlAstNode& select_list) {
   std::vector<NamedExpression> items;
+  items.reserve(select_list.Children("SelectColumn").size());
   for (const GoogleSqlAstNode* column : select_list.Children("SelectColumn")) {
     const GoogleSqlAstNode* expression_node = nullptr;
     for (const auto& child : column->children) {
@@ -1627,6 +1686,7 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
         const GoogleSqlAstNode* group = select_node->Child("GroupBy");
         if (group != nullptr) {
           std::vector<Expression> keys;
+          keys.reserve(group->Children("GroupingItem").size());
           for (const GoogleSqlAstNode* item : group->Children("GroupingItem")) {
             if (item->Child("GroupingSetList") != nullptr ||
                 item->Child("Rollup") != nullptr ||
@@ -1658,6 +1718,7 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
             "GoogleSQL AST: pipe ORDER BY without keys");
       }
       std::vector<SelectStatement::OrderByTerm> terms;
+      terms.reserve(order->Children("OrderingExpression").size());
       for (const GoogleSqlAstNode* term :
            order->Children("OrderingExpression")) {
         ASSIGN_OR_RETURN(WindowOrderTerm, hvpipe_term,
@@ -1794,6 +1855,8 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
       }
       Expression condition;
       std::vector<std::string> using_columns;
+      using_columns.reserve(
+          using_clause ? using_clause->Children("Identifier").size() : 0);
       if (on != nullptr && !on->children.empty()) {
         // Inside the wrapper the pipe input is only visible under its derived
         // alias: rebind ON qualifiers that name the input's earlier identity
@@ -1847,6 +1910,7 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
       // The parser attaches SetOperationMetadata + the right operand directly
       // under PipeSetOperation (no SetOperation wrapper child).
       std::vector<const GoogleSqlAstNode*> operands;
+      operands.reserve(pipe.children.size());
       for (const auto& sub : pipe.children) {
         if (sub->kind == "Query" || sub->kind == "Select" ||
             sub->kind == "SetOperation") {
@@ -2036,12 +2100,12 @@ void PurgeUdfSessionDefinitions(uint64_t session_id) {
 // WITH clause, the set-operation wrapper and the nested-WITH wrapper: all
 // three build a recursive CTE but only the first used to carry the spec,
 // silently dropping the depth bounds and DEPTH column on those root shapes.
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
 static Status ApplyRecursiveDepthFromAliased(SelectStatement* statement,
-                                      const GoogleSqlAstNode& aliased,
-                                      const std::string& cte_name) {
-  const GoogleSqlAstNode* modifiers =
-      aliased.Child("AliasedQueryModifiers");
+                                             const GoogleSqlAstNode& aliased,
+                                             const std::string& cte_name) {
+  const GoogleSqlAstNode* modifiers = aliased.Child("AliasedQueryModifiers");
   if (modifiers == nullptr) {
     return Status::kSuccess;
   }
@@ -2077,8 +2141,8 @@ static Status ApplyRecursiveDepthFromAliased(SelectStatement* statement,
     return fallback;
   };
   spec.lower = bound_value(0, 0, &lower_is_literal);
-  spec.upper = bound_value(1, std::numeric_limits<int64_t>::max(),
-                           &upper_is_literal);
+  spec.upper =
+      bound_value(1, std::numeric_limits<int64_t>::max(), &upper_is_literal);
   spec.lower_is_literal = lower_is_literal;
   spec.upper_is_literal = upper_is_literal;
   statement->SetRecursiveDepth(cte_name, std::move(spec));
@@ -2104,6 +2168,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     }
     if (set_op != nullptr) {
       std::vector<const GoogleSqlAstNode*> operands;
+      operands.reserve(set_op->children.size());
       for (const auto& child : set_op->children) {
         if (child->kind == "Query" || child->kind == "Select" ||
             child->kind == "SetOperation") {
@@ -2117,6 +2182,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         bool union_by_name = false;
         std::vector<SetOperationKind> per_pair;
         std::vector<SetOperationMatch> per_pair_match;
+        per_pair.reserve(operands.size());
+        per_pair_match.reserve(operands.size());
         SetOperationKind head_kind = SetOperationKind::kUnion;
         const std::string set_detail = UpperCopy(set_op->detail);
         if (set_detail.find("INTERSECT") != std::string::npos) {
@@ -2347,6 +2414,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         }
         if (const GoogleSqlAstNode* order = query.Child("OrderBy")) {
           std::vector<SelectStatement::OrderByTerm> order_by;
+          order_by.reserve(order->Children("OrderingExpression").size());
           for (const GoogleSqlAstNode* term :
                order->Children("OrderingExpression")) {
             ASSIGN_OR_RETURN(WindowOrderTerm, parsed,
@@ -2425,8 +2493,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
             ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv185862_0,
                              (VisitQuery(*body)));
             nested->AddRecursiveWithQuery(cte_name, std::move(hv185862_0));
-            RETURN_IF_FAIL(ApplyRecursiveDepthFromAliased(
-                nested.get(), *aliased, cte_name));
+            RETURN_IF_FAIL(ApplyRecursiveDepthFromAliased(nested.get(),
+                                                          *aliased, cte_name));
           } else {
             ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, h_q,
                              (VisitQuery(*body)));
@@ -2527,6 +2595,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
 
   std::vector<NamedExpression> projections;
   std::vector<const GoogleSqlAstNode*> projection_nodes;
+  projections.reserve(select_list->Children("SelectColumn").size());
+  projection_nodes.reserve(select_list->Children("SelectColumn").size());
   for (const GoogleSqlAstNode* column : select_list->Children("SelectColumn")) {
     const GoogleSqlAstNode* expression_node = nullptr;
     for (const auto& child : column->children) {
@@ -2794,6 +2864,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     }
     if (!type_name.empty()) {
       std::vector<Expression> args;
+      args.reserve(1 +
+                   2 * std::min(projections.size(), projection_nodes.size()));
       args.emplace_back(ConstantValueExp(Value(std::string(type_name))));
       for (size_t i = 0; i < projections.size() && i < projection_nodes.size();
            ++i) {
@@ -2827,6 +2899,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
   std::vector<SelectSource> sources;
 
   std::vector<std::string> tables;
+  tables.reserve(sources.size());
   if (const GoogleSqlAstNode* from = select->Child("FromClause")) {
     for (const auto& child : from->children) {
       Status st197530 =
@@ -2892,6 +2965,12 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           return AstError<std::shared_ptr<SelectStatement>>(
               "GoogleSQL AST: ORDER BY ordinal out of range");
         }
+      }
+      if (const std::optional<std::string> name =
+              AmbiguousOrderByName(projections, parsed.expression);
+          name.has_value()) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "Column name " + *name + " is ambiguous");
       }
       order_by.push_back(
           {std::move(parsed.expression), parsed.ascending, parsed.nulls_first});
@@ -3098,11 +3177,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                                  group->detail.find("ALL") != std::string::npos;
     if (is_group_by_all) {
       std::vector<Expression> expressions;
-      const bool has_unexpanded_star =
-          std::ranges::any_of(statement->SelectList(),
-                              [](const NamedExpression& item) {
-                                return IsUnexpandedStar(item.expression);
-                              });
+      const bool has_unexpanded_star = std::ranges::any_of(
+          statement->SelectList(), [](const NamedExpression& item) {
+            return IsUnexpandedStar(item.expression);
+          });
       for (const NamedExpression& named : statement->SelectList()) {
         if (!named.expression || IsUnexpandedStar(named.expression)) {
           continue;  // the star's expansion isn't known until binding
@@ -3144,6 +3222,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       // constructors contribute lists of sets that combine as a cross
       // product (`GROUP BY a, ROLLUP(b)` == GROUPING SETS ((a,b), (a))).
       std::vector<Expression> plain_expressions;
+      plain_expressions.reserve(group->Children("GroupingItem").size());
       std::vector<std::vector<std::vector<Expression>>> constructor_sets;
       constexpr size_t kMaxGroupingSetBranches = 64;
       // Expands one `Rollup`/`Cube` AST node into its grouping-key sets:
@@ -3153,11 +3232,13 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       const auto expand_rollup_or_cube = [&](const GoogleSqlAstNode& term)
           -> StatusOr<std::vector<std::vector<Expression>>> {
         std::vector<Expression> keys;
+        keys.reserve(term.children.size());
         for (const auto& key_node : term.children) {
           ASSIGN_OR_RETURN(Expression, key, (resolve_grouping_term(*key_node)));
           keys.push_back(std::move(key));
         }
         std::vector<std::vector<Expression>> sets;
+        sets.reserve(keys.size() + 1);
         if (term.kind == "Rollup") {
           // ROLLUP(a, b, c) => (a,b,c), (a,b), (a), ().
           for (size_t len = keys.size(); len > 0; --len) {
@@ -3166,7 +3247,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           }
           sets.emplace_back();
         } else {
-          // CUBE(a, b) => (a,b), (b), (a), () — popcount descending, mask descending.
+          // CUBE(a, b) => (a,b), (b), (a), () — popcount descending, mask
+          // descending.
           std::vector<std::pair<size_t, size_t>> mask_popcount;
           const size_t total = size_t{1} << keys.size();
           mask_popcount.reserve(total);
@@ -3183,6 +3265,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                            });
           for (const auto& [mask, _] : mask_popcount) {
             std::vector<Expression> set;
+            set.reserve(keys.size());
             for (size_t i = 0; i < keys.size(); ++i) {
               if ((mask & (size_t{1} << i)) != 0) {
                 set.push_back(keys[i]);
@@ -3332,8 +3415,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv208575_0,
                            (VisitQuery(*nested)));
           statement->AddRecursiveWithQuery(cte_name, std::move(hv208575_0));
-          RETURN_IF_FAIL(
-              ApplyRecursiveDepthFromAliased(statement.get(), *aliased, cte_name));
+          RETURN_IF_FAIL(ApplyRecursiveDepthFromAliased(statement.get(),
+                                                        *aliased, cte_name));
         } else {
           ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, q_q,
                            (VisitQuery(*nested)));
@@ -3741,8 +3824,11 @@ Status ValidateEnumLiteralValue(const std::string& message_name,
   if (expr.kind == "IntLiteral") {
     const std::string& digits = expr.detail;
     uint64_t magnitude = 0;
-    if (std::from_chars(digits.data(), digits.data() + digits.size(), magnitude)
-                .ec != std::errc() ||
+    const auto [ptr, ec] = std::from_chars(
+        digits.data(), digits.data() + digits.size(), magnitude);
+    // ec alone accepts a numeric prefix ("5junk" -> 5); the token must be
+    // consumed in full.
+    if (ec != std::errc() || ptr != digits.data() + digits.size() ||
         magnitude > static_cast<uint64_t>(2147483647LL)) {
       return reject("Out of range cast of integer " + digits +
                     " to enum type " + enum_short_name);
@@ -3976,7 +4062,8 @@ Status ValidateSelectAsProjections(
 using ViewRegistryMap =
     std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>;
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
 static std::unordered_map<uint64_t, ViewRegistryMap>& AllViewRegistries() {
   static thread_local std::unordered_map<uint64_t, ViewRegistryMap> registries;
   return registries;

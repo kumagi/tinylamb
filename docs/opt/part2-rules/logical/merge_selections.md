@@ -25,12 +25,15 @@ graph TD
 
 ## 適用条件
 
+内側の Selection は子を持ち、その子が親グループと異なる必要があります。親自身に接続すると Memo に閉路ができます。
+
 パターン照合には `Selection(Selection(Any(), "inner"))` を用います（`plan/cascades.hpp`）。変換ラムダ内の処理は以下のとおりです（`plan/cascades.cpp`）。
 
 ```cpp
           const Group& inner_group = memo.Get(bindings.at("inner"));
           for (const LogicalExpression& inner : inner_group.expressions) {
-            if (inner.operation != LogicalOperator::kSelection) {
+            if (inner.operation != LogicalOperator::kSelection ||
+                inner.children.empty() || inner.children[0] == group) {
               continue;
             }
             const Expression merged = CanonicalizeConjuncts(

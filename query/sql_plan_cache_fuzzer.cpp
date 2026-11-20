@@ -19,6 +19,7 @@
 #include "database/database.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
+#include "query/plan_cache.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
@@ -203,6 +204,7 @@ std::vector<std::vector<Value>> ExecuteAll(
     Database& db, const std::vector<std::string>& queries, bool* ok) {
   TransactionContext ctx = db.BeginContext();
   std::vector<std::vector<Value>> all;
+  all.reserve(queries.size());
   for (const std::string& q : queries) {
     std::string error;
     auto rows = RunQuery(db, ctx, q, &error);
@@ -219,7 +221,7 @@ std::vector<std::vector<Value>> ExecuteAll(
 }  // namespace
 
 std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
-                                  PlanCacheStats* stats,
+                                  struct PlanCacheStats* stats,
                                   PlanCacheTrace* trace) {
   Gen g(rng);
   PlanCacheTrace local;
@@ -349,6 +351,7 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
     return "[PLANCACHE FUZZ SETUP ERROR] db_a";
   }
   bool ok = false;
+  const auto phase1_before = PlanCacheStats().fills.load();
   const std::vector<std::vector<Value>> r1 = ExecuteAll(*db_a, t.queries, &ok);
   if (!ok) {
     if (verbose) {
@@ -356,9 +359,16 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
     }
     return "[PLANCACHE FUZZ QUERY ERROR] phase1";
   }
+  if (PlanCacheStats().fills.load() == phase1_before) {
+    return "[PLANCACHE FUZZ COVERAGE ERROR] phase1 observed no fills";
+  }
+  const auto phase2_before = PlanCacheStats().replays.load();
   const std::vector<std::vector<Value>> r2 = ExecuteAll(*db_a, t.queries, &ok);
   if (!ok) {
     return "[PLANCACHE FUZZ QUERY ERROR] phase2";
+  }
+  if (PlanCacheStats().replays.load() == phase2_before) {
+    return "[PLANCACHE FUZZ COVERAGE ERROR] phase2 observed no replays";
   }
 
   // ---- Mutate (cache stays warm). ----
@@ -373,9 +383,13 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
       return "[PLANCACHE FUZZ SETUP ERROR] mutation PreCommit";
     }
   }
+  const auto phase3_before = PlanCacheStats().replays.load();
   const std::vector<std::vector<Value>> r3 = ExecuteAll(*db_a, t.queries, &ok);
   if (!ok) {
     return "[PLANCACHE FUZZ QUERY ERROR] phase3";
+  }
+  if (PlanCacheStats().replays.load() == phase3_before) {
+    return "[PLANCACHE FUZZ COVERAGE ERROR] phase3 observed no replays";
   }
 
   // ---- Phase 4: fresh database, replayed script (all misses). ----
@@ -385,9 +399,13 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
   if (!BuildDatabase(setup_b, &db_b)) {
     return "[PLANCACHE FUZZ SETUP ERROR] db_b";
   }
+  const auto phase4_before = PlanCacheStats().fills.load();
   const std::vector<std::vector<Value>> r4 = ExecuteAll(*db_b, t.queries, &ok);
   if (!ok) {
     return "[PLANCACHE FUZZ QUERY ERROR] phase4";
+  }
+  if (PlanCacheStats().fills.load() == phase4_before) {
+    return "[PLANCACHE FUZZ COVERAGE ERROR] phase4 observed no fills";
   }
 
   const std::vector<std::string> m1 = FormatRows(r1);
@@ -419,6 +437,7 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
   };
 
   std::string report;
+  report.reserve(t.queries.size());
   if (m1 != m2) {
     report += "[PLANCACHE MISMATCH] miss-vs-hit diverged" + diff(m1, m2) + "\n";
   }

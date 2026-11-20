@@ -189,7 +189,9 @@ TEST(StringUtilTest, TrimCodePointsMultiByteCutset) {
   // More multi-byte points than the inline array (8) exercises the overflow
   // bucket.
   std::string big_cutset;
+  big_cutset.reserve(20);
   std::string big_text;
+  big_text.reserve(20);
   for (int i = 0; i < 10; ++i) {
     big_cutset.append("\xC3", 1);
     big_cutset.push_back(static_cast<char>(0x81 + i));

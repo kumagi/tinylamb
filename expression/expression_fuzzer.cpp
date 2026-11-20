@@ -801,7 +801,9 @@ ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
           static_cast<int>(ContainsNeutralArithmetic(exp)),
           exp->ToString().c_str(), fold_dump.c_str());
     }
-    FUZZ_REQUIRE(ast_threw == bc_threw || fold_tolerated);  // NOLINT(readability-simplify-boolean-expr): FUZZ_REQUIRE negates its condition
+    FUZZ_REQUIRE(ast_threw == bc_threw ||
+                 fold_tolerated);  // NOLINT(readability-simplify-boolean-expr):
+                                   // FUZZ_REQUIRE negates its condition
     if (!ast_threw && !bc_threw && !ValuesMatch(ast_result, bc_result) &&
         !PinnedIdentityPromotion(exp, ast_result, bc_result) &&
         (getenv("TINYLAMB_EXPR_FUZZ_PASSES") != nullptr)) {
@@ -942,6 +944,7 @@ std::string ExpressionFuzzReproText(const uint8_t* data, size_t size) {
 StatusOr<std::vector<uint8_t>> DecodeExpressionFuzzRepro(
     std::string_view text) {
   std::vector<uint8_t> bytes;
+  bytes.reserve(text.size() / 2);
   int pending = -1;
   bool in_comment = false;
   for (const char c : text) {
@@ -979,7 +982,9 @@ StatusOr<std::vector<uint8_t>> DecodeExpressionFuzzRepro(
 void WriteExpressionFuzzRepro(const uint8_t* data, size_t size) {
   const std::string path =
       "expression_fuzzer_fuzz-repro-" + Fnv1aHex(data, size) + ".test";
-  std::FILE* file = std::fopen(path.c_str(), "wb");  // NOLINT(cppcoreguidelines-owning-memory): closed below
+  std::FILE* file = std::fopen(
+      path.c_str(),
+      "wb");  // NOLINT(cppcoreguidelines-owning-memory): closed below
   if (file == nullptr) {
     return;
   }

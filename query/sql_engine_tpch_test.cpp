@@ -405,6 +405,7 @@ TEST_F(SqlEngineTpchTest, Q6KeepsDoubleQuantityWithIntegerBoundInParallelScan) {
     constexpr size_t kBatchRows = 256;
     for (size_t begin = 0; begin < kRows; begin += kBatchRows) {
       std::string sql = "INSERT INTO lineitem VALUES ";
+      sql.reserve(kBatchRows);
       for (size_t i = begin; i < begin + kBatchRows; ++i) {
         if (i != begin) {
           sql += ',';

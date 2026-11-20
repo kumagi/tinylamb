@@ -1182,6 +1182,7 @@ TEST_F(IndexScanIteratorTest, ReadOnlyHeapImagesKeepBoundsHolesAndDirections) {
 
 TEST_F(IndexScanIteratorTest, HeapImagesNeverHideOlderSnapshotOrOwnUpdates) {
   std::vector<RowPosition> positions;
+  positions.reserve(8);
   {
     auto writer = db_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,

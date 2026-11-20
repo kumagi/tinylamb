@@ -1,0 +1,14 @@
+name: Lean proofs
+on:
+  push:
+    paths: ['lean/**', '.github/workflows/lean.yml']
+  pull_request:
+    paths: ['lean/**', '.github/workflows/lean.yml']
+jobs:
+  proofs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y elan
+      - run: lake build
+        working-directory: lean

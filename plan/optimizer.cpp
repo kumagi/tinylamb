@@ -203,6 +203,7 @@ std::unordered_set<std::string> ColumnRelations(
     const ColumnName& column,
     const std::unordered_map<std::string, std::shared_ptr<Table>>& tables) {
   std::unordered_set<std::string> result;
+  result.reserve(tables.size());
   if (!column.schema.empty()) {
     // The qualifier is the relation identity (alias when given, else the
     // physical table name).  Accept it only when the column really exists
@@ -533,6 +534,7 @@ std::optional<QueryData> TryEliminateUnusedJoins(
   }
 
   std::unordered_map<std::string, std::shared_ptr<Table>> tables;
+  tables.reserve(query.from_.size());
   for (const std::string& relation : query.from_) {
     const auto aliased = query.aliases_.find(relation);
     const std::string& physical =
@@ -546,6 +548,7 @@ std::optional<QueryData> TryEliminateUnusedJoins(
 
   // Relations referenced by the projection or the ordering keys.
   std::unordered_set<std::string> used;
+  used.reserve(tables.size());
   for (const NamedExpression& item : expanded_select) {
     const RelationRef ref = TouchedRelations(item.expression, tables);
     if (!ref.ok) {
@@ -571,8 +574,10 @@ std::optional<QueryData> TryEliminateUnusedJoins(
     ColumnName right_column;
   };
   std::vector<JoinEdge> edges;
+  edges.reserve(SplitConjuncts(query.where_).size());
   std::unordered_map<std::string, size_t> edge_count;
   std::unordered_set<std::string> pinned;
+  pinned.reserve(tables.size());
   std::vector<Expression> conjuncts = SplitConjuncts(query.where_);
   for (const Expression& conjunct : conjuncts) {
     if (!conjunct) {
@@ -629,6 +634,7 @@ std::optional<QueryData> TryEliminateUnusedJoins(
     ColumnName kept_column;
   };
   std::vector<EliminationPlan> plans;
+  plans.reserve(edges.size());
   for (const JoinEdge& edge : edges) {
     const std::string& dim = used.contains(edge.right_relation)
                                  ? edge.left_relation
@@ -2532,6 +2538,7 @@ std::optional<DecorrelationSpec> TryDecorrelate(const Expression& conjunct,
 
   std::vector<std::pair<std::string, const Schema*>> schemas;
   std::vector<Expression> join_conditions;
+  join_conditions.reserve(sub.Sources().size());
   for (const SelectSource& source : sub.Sources()) {
     // A TABLESAMPLE spec has no place in DecorrelationSpec, and the
     // re-optimized inner_query would scan the full table instead of the
@@ -3591,6 +3598,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   cascades::Memo memo;
   std::unordered_map<std::string, double> relation_rows;
+  relation_rows.reserve(rule_context.statistics.size());
   const bool plan_profile = std::getenv("TINYLAMB_PLAN_PROFILE") != nullptr;
   const auto memo_phase_begin = std::chrono::steady_clock::now();
   for (const auto& [relation, statistics] : rule_context.statistics) {

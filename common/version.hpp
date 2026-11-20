@@ -30,8 +30,8 @@ namespace tinylamb {
 // partitions and tables (unlike MemTable's per-instance generation_ counter,
 // which is only meaningful within one table's read path). A future executor
 // could pin a global read version V to read every partition at V; that
-// cross-partition snapshot path is not yet wired up (global version mode has
-// no callers).
+// cross-partition SQL path is not wired up. Direct MemTable clients can
+// enable global mode before writing and read participating tables at V.
 inline uint64_t NextGlobalVersion() {
   static std::atomic<uint64_t> counter{0};
   return counter.fetch_add(1, std::memory_order_relaxed) + 1;

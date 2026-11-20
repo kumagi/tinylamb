@@ -357,7 +357,7 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
   version 7 (CRC 付き) のみを受理する fail-closed に変更した
   (`docs/wal_format.md`)。
 - 理由: レコード内部のビット劣化をtail以外でも検出し、破損したレコード以降を
-  安全に再生しない。既存ログの読み取り互換性は維持する。
+  検出した時点で再生を停止する。CRC のない旧形式（v1〜v6）は拒否する。
 - 実装範囲: `recovery/log_record.cpp/.hpp`、`recovery/logger.cpp`、
   `recovery/recovery_manager.cpp`、`docs/wal_format.md`、形式互換テスト。
 

@@ -250,6 +250,7 @@ class HashAggregateExecutor final : public GroupedAggregateBase {
   std::vector<bool> aggregate_count_star_;
   AggregateGroupTable table_{&input_schema_, &aggregate_nodes_};
   std::vector<Row> buffer_;
+  std::vector<Value> serial_key_scratch_;
   std::vector<SpillFile> partitions_;
   bool parallel_capable_{false};
   bool spilled_{false};

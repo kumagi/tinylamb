@@ -945,6 +945,7 @@ uint64_t ReadU64(std::string_view raw, size_t pos) {
 std::string EncodeSketch(int typecode, int64_t precision,
                          const std::vector<std::string>& entries) {
   std::string raw;
+  raw.reserve(entries.size());
   raw += kSketchMagic;
   raw.push_back(static_cast<char>(typecode));
   AppendU64(&raw, static_cast<uint64_t>(precision));
@@ -1714,6 +1715,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         }
       }
       std::vector<BufferedRow> gated;
+      gated.reserve(rows.size());
       for (BufferedRow& row : rows) {
         if (saw_threshold && !row.condition.IsNull() &&
             row.condition == threshold) {
@@ -1883,6 +1885,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         return Value();
       }
       std::string out;
+      out.reserve(array_values_.size());
       for (size_t i = 0; i < array_values_.size(); ++i) {
         if (i != 0U) {
           out += delimiter_.value_or(",");

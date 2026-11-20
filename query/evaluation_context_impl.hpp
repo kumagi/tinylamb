@@ -76,7 +76,7 @@ class RelationalEvaluationContext : public EvaluationContext {
     std::vector<Value> projected;
     projected.reserve(relation->TotalRows());
     const bool as_struct = statement.AsStruct();
-    const Schema subquery_schema = relation->schema;
+    const Schema& subquery_schema = relation->schema;
     relation->ForEachRow([&](const Row& row) {
       projected.push_back(relational_detail::ProjectSubqueryRow(
           row, as_struct, &subquery_schema));

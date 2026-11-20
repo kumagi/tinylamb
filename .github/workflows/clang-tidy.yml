@@ -18,6 +18,9 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTINYLAMB_ENABLE_GOOGLESQL=OFF
 
       - name: clang-tidy diff
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
         run: |
           # Ubuntu 24.04 ships the diff helper under a versioned name
           # (clang-tidy-diff-18.py); pick whichever is present.
@@ -26,10 +29,17 @@ jobs:
             echo "clang-tidy-diff helper not found" >&2
             exit 1
           fi
-          CHANGED=$(git diff -U0 origin/master...HEAD -- '*.cpp' '*.hpp')
+          if [ -n "$PR_BASE" ]; then
+            BASE=$(git merge-base "$PR_BASE" HEAD)
+          elif [ "$PUSH_BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=$(git hash-object -w -t tree /dev/null)
+          else
+            BASE="$PUSH_BASE"
+          fi
+          CHANGED=$(git diff -U0 "$BASE" HEAD -- '*.cpp' '*.hpp')
           if [ -z "$CHANGED" ]; then
-            echo "no C++ diff against origin/master (direct push to master?)" >&2
-            exit 1
+            echo "no C++ diff"
+            exit 0
           fi
           printf '%s\n' "$CHANGED" | \
-            "$TIDY_DIFF" -path build -checks='bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' -quiet
+            "$TIDY_DIFF" -path build -quiet

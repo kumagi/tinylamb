@@ -2434,11 +2434,13 @@ uint32_t HuffDictDecodeSym(const HuffDictTables& t, WordBitReader& br) {
 // Bounds-checked structural parse, mirroring ValidateWalk's case 51: header
 // echo (d == param), in-range nibble lengths with an exactly complete Kraft
 // sum, checkpoint monotonicity inside the stream, and frequencies in
-// [1, n] summing to n. The freq-vs-stream histogram match is the validator's
-// one-time job; this parse only proves no reader can walk out of the cell.
-// `end` may be null for callers that validated the cell already (the
-// ByteSliceNullAwareCount precondition): extent checks pass and the
-// structural checks still run.
+// [1, n] summing to n. The freq-vs-stream histogram match AND the per-64-row
+// checkpoint bit-position pin are the validator's one-time job (a checkpoint
+// landing mid-symbol passes every check here yet makes HuffDictValueAt's
+// point reads diverge from DecodeHuffDictAll); this parse only proves no
+// reader can walk out of the cell. `end` may be null for callers that
+// validated the cell already (the ByteSliceNullAwareCount precondition):
+// extent checks pass and the structural checks still run.
 bool ParseHuffDictRegion(const char* r, uint32_t n, uint32_t param,
                          const char* end, HuffDictRegion* out) {
   if (r == nullptr || out == nullptr || (end != nullptr && end < r) ||

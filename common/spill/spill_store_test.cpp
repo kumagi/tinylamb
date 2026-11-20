@@ -124,6 +124,7 @@ TEST(SpillStoreTest, FreeBlockReuseBoundsPhysicalFileGrowth) {
 
   std::vector<uint8_t> block(SpillStore::kBlockSize, 0xAB);
   std::vector<SpillSegmentId> batch1;
+  batch1.reserve(6);
   for (int i = 0; i < 6; ++i) {
     auto id_or = store.AllocateSegment();
     ASSERT_EQ(id_or.GetStatus().GetCode(), StatusCode::kSuccess);

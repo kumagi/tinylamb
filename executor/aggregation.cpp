@@ -286,6 +286,7 @@ struct AffineSumInput {
 std::optional<std::vector<AffineSumInput>> ResolveAffineSums(
     const Schema& schema, const std::vector<NamedExpression>& aggregates) {
   std::vector<AffineSumInput> inputs;
+  inputs.reserve(aggregates.size());
   bool transformed = false;
   for (const auto& named : aggregates) {
     const auto& agg = named.expression->AsAggregateExpression();
@@ -348,6 +349,7 @@ StatusOr<bool> AggregationExecutor::TryFoldAffineSums(Row* dst) {
   }
   const auto& store = *scan->GetLSTableStore();
   std::vector<slot_t> columns;
+  columns.reserve(inputs->size());
   std::vector<size_t> input_columns;
   for (const auto& input : *inputs) {
     const slot_t column = scan->TableColumnSlot(input.column);
@@ -619,7 +621,9 @@ StatusOr<bool> AggregationExecutor::TryFoldDateExtrema(Row* dst) {
     return false;
   }
   std::vector<slot_t> columns;
+  columns.reserve(aggregates_.size());
   std::vector<bool> minimum;
+  minimum.reserve(aggregates_.size());
   for (const auto& named : aggregates_) {
     const auto& aggregate = named.expression->AsAggregateExpression();
     if ((aggregate.GetType() != AggregationType::kMin &&

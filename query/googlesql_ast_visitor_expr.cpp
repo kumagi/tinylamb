@@ -36,6 +36,7 @@
 #include "common/platform/time_format.hpp"
 #include "common/platform/time_zone.hpp"
 #include "common/set_operation.hpp"
+#include "common/string_util.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -247,6 +248,34 @@ StatusOr<uint64_t> ParseUnsignedLiteral(const GoogleSqlAstNode& node) {
   return value;
 }
 
+// Window inner LIMIT is stored as size_t; a uint64 literal that does not
+// fit (32-bit targets) must clamp to "unlimited", never truncate to a
+// smaller limit.
+size_t WindowLimitFromUint64(uint64_t v) {
+  return static_cast<size_t>(std::min<uint64_t>(
+      v, static_cast<uint64_t>(std::numeric_limits<size_t>::max())));
+}
+
+// Leading integer of an INTERVAL literal's raw text.  std::stoll's prefix
+// match used to turn '3junk' into amount 3; strtoll with an end-pointer
+// check plus a trailing-whitespace allowance keeps '+3' and ' 3 ' working
+// while compound forms ('1-2') yield 0 — TryParse stays the validity
+// authority and every Amount() consumer rejects compound units anyway.
+int64_t ParseIntervalAmount(const std::string& raw) {
+  const char* s = raw.c_str();
+  char* end = nullptr;
+  errno = 0;
+  const long long v = std::strtoll(s, &end, 10);
+  if (end == s || errno == ERANGE) {
+    return 0;
+  }
+  while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r' ||
+         *end == '\f' || *end == '\v') {
+    ++end;
+  }
+  return *end == '\0' ? static_cast<int64_t>(v) : 0;
+}
+
 namespace {
 StatusOr<double> ParseFloatLiteral(const GoogleSqlAstNode& node) {
   // std::stod rejects subnormal magnitudes on some libstdc++ versions
@@ -287,6 +316,7 @@ namespace {
 
 StatusOr<std::vector<std::string>> PathParts(const GoogleSqlAstNode& path) {
   std::vector<std::string> result;
+  result.reserve(path.children.size());
   for (const auto& child : path.children) {
     if (child->kind == "Identifier") {
       ASSIGN_OR_RETURN(std::string, hv12266_0, (Identifier(*child)));
@@ -456,25 +486,26 @@ StatusOr<std::string> DecodeStringEscapesImpl(std::string_view value_view,
           decoded.push_back(next);
         }
       } else if (next == 'x' || next == 'X') {
-        if (i + 2 < value.size()) {
-          std::string hex_str = value.substr(i + 1, 2);
-          try {
-            auto raw_byte =
-                static_cast<uint32_t>(std::stoul(hex_str, nullptr, 16));
-            if (is_bytes || raw_byte <= 0x7F) {
-              decoded.push_back(static_cast<char>(raw_byte));
-            } else {
-              decoded.push_back(
-                  static_cast<char>(0xC0 | ((raw_byte >> 6) & 0x1F)));
-              decoded.push_back(static_cast<char>(0x80 | (raw_byte & 0x3F)));
-            }
-            i += 2;
-          } catch (...) {
-            decoded.push_back(next);
-          }
-        } else {
-          decoded.push_back(next);
+        // \xHH requires exactly two hex digits, same discipline as the
+        // \u escape above; stoul's prefix match used to swallow a lone
+        // hex digit plus a following non-hex character.
+        if (value.size() - i - 1 < 2) {
+          return AstError<std::string>("invalid hex escape");
         }
+        const char* begin = value.data() + i + 1;
+        uint32_t raw_byte = 0;
+        const auto [end, error] =
+            std::from_chars(begin, begin + 2, raw_byte, 16);
+        if (error != std::errc{} || end != begin + 2) {
+          return AstError<std::string>("invalid hex escape");
+        }
+        if (is_bytes || raw_byte <= 0x7F) {
+          decoded.push_back(static_cast<char>(raw_byte));
+        } else {
+          decoded.push_back(static_cast<char>(0xC0 | ((raw_byte >> 6) & 0x1F)));
+          decoded.push_back(static_cast<char>(0x80 | (raw_byte & 0x3F)));
+        }
+        i += 2;
       } else if (next == 'u' || next == 'U') {
         const size_t digits = next == 'u' ? 4 : 8;
         if (is_bytes || value.size() - i - 1 < digits) {
@@ -815,45 +846,8 @@ Expression WrapIfBoolean(Expression expr, const GoogleSqlAstNode& node) {
 // Strict UTF-8 validator: BYTES -> STRING casts must reject the sequences
 // GoogleSQL refuses (surrogates, overlong forms, truncated tails) instead of
 // passing mojibake through.
-bool IsValidUtf8Text(std::string_view text) {
-  size_t i = 0;
-  while (i < text.size()) {
-    const auto lead = static_cast<uint8_t>(text[i]);
-    size_t continuation_count = 0;
-    uint8_t second_lower = 0x80;
-    uint8_t second_upper = 0xBF;
-    if (lead < 0x80) {
-      ++i;
-      continue;
-    }
-    if (lead >= 0xC2 && lead < 0xDF) {
-      continuation_count = 1;
-    } else if (lead >= 0xE0 && lead < 0xF0) {
-      continuation_count = 2;
-      second_lower = lead == 0xE0 ? 0xA0 : 0x80;
-      second_upper = lead == 0xED ? 0x9F : 0xBF;
-    } else if (lead >= 0xF0 && lead < 0xF5) {
-      continuation_count = 3;
-      second_lower = lead == 0xF0 ? 0x90 : 0x80;
-      second_upper = lead == 0xF4 ? 0x8F : 0xBF;
-    } else {
-      return false;
-    }
-    if (i + continuation_count >= text.size()) {
-      return false;
-    }
-    for (size_t c = 1; c <= continuation_count; ++c) {
-      const auto byte = static_cast<uint8_t>(text[i + c]);
-      const uint8_t lower = c == 1 ? second_lower : 0x80;
-      const uint8_t upper = c == 1 ? second_upper : 0xBF;
-      if (byte < lower || byte > upper) {
-        return false;
-      }
-    }
-    i += continuation_count + 1;
-  }
-  return true;
-}
+// IsValidUtf8Text now lives in common/string_util.hpp (canonical validator
+// shared with the expression layer's proto-CAST gate).
 // Validate cast coercibility for literal struct sources. Anything not
 // statically checkable is left to the existing runtime behavior untouched.
 Status ValidateStructCastCoercibility(const GoogleSqlAstNode& node, bool safe) {
@@ -868,6 +862,7 @@ Status ValidateStructCastCoercibility(const GoogleSqlAstNode& node, bool safe) {
     return Status::kSuccess;
   }
   std::vector<std::string> field_types;
+  field_types.reserve(node.children[1]->children.size());
   for (const auto& field : node.children[1]->children) {
     if (field->kind != "StructField") {
       continue;
@@ -883,6 +878,7 @@ Status ValidateStructCastCoercibility(const GoogleSqlAstNode& node, bool safe) {
     field_types.push_back(field_type);
   }
   std::vector<const GoogleSqlAstNode*> elements;
+  elements.reserve(source.children.size());
   for (const auto& child : source.children) {
     if (IsAstTrivia(child->kind)) {
       continue;
@@ -980,7 +976,7 @@ bool IsBytesAstNode(const GoogleSqlAstNode& node) {
       // are arbitrary bytes, so LENGTH(MD5(x)) must count bytes (16), not
       // UTF-8 lead bytes.
       static constexpr std::array<std::string_view, 7> kBytesResult = {
-          "md5",    "sha1",        "sha256",     "sha512",
+          "md5",         "sha1",        "sha256",  "sha512",
           "from_base64", "from_base32", "from_hex"};
       if (std::ranges::find(kBytesResult, fn) != kBytesResult.end()) {
         return true;
@@ -1061,6 +1057,7 @@ namespace {
 StatusOr<std::vector<WindowOrderTerm>> ParseOrderingList(
     const GoogleSqlAstNode& order) {
   std::vector<WindowOrderTerm> terms;
+  terms.reserve(order.children.size());
   for (const GoogleSqlAstNode* term : order.Children("OrderingExpression")) {
     ASSIGN_OR_RETURN(WindowOrderTerm, parsed, (ParseOrderingTerm(term)));
     if (parsed.expression) {
@@ -1465,6 +1462,7 @@ StatusOr<Expression> VisitFunction(
     }
   }
   std::vector<Expression> arguments;
+  arguments.reserve(node.children.size());
   AggregateHavingModifier having = AggregateHavingModifier::kNone;
   Expression having_condition;
   Expression where_filter;
@@ -1526,7 +1524,7 @@ StatusOr<Expression> VisitFunction(
       if (const GoogleSqlAstNode* limit_node = child.Child("Limit")) {
         if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
           ASSIGN_OR_RETURN(uint64_t, hv65738_0, (ParseUnsignedLiteral(*value)));
-          inner_limit = static_cast<size_t>(hv65738_0);
+          inner_limit = WindowLimitFromUint64(hv65738_0);
         } else {
           // A non-literal LIMIT (e.g. `1+1`, `CAST(2 AS INT64)`) must not be
           // silently dropped: that would return the whole array instead of
@@ -1537,9 +1535,9 @@ StatusOr<Expression> VisitFunction(
             const Value& cv = limit_expr->AsConstantValue().GetValue();
             if (cv.type == ValueType::kInt64 && !cv.IsNull() &&
                 cv.value.int_value >= 0) {
-              inner_limit = static_cast<size_t>(
+              inner_limit = WindowLimitFromUint64(
                   cv.IsUnsigned() ? static_cast<uint64_t>(cv.value.int_value)
-                                  : cv.value.int_value);
+                                  : static_cast<uint64_t>(cv.value.int_value));
             } else {
               return AstError<Expression>(
                   "aggregate LIMIT must be a non-negative integer constant");
@@ -1576,9 +1574,29 @@ StatusOr<Expression> VisitFunction(
           "GoogleSQL AST: ORDER BY / LIMIT inside an aggregate function is "
           "only supported for ARRAY_AGG, STRING_AGG and ARRAY_CONCAT_AGG");
     }
+    const bool is_distinct =
+        node.detail.find("distinct=true") != std::string::npos;
+    // GoogleSQL: with DISTINCT, the inner ORDER BY may only name the
+    // aggregated argument (`ARRAY_AGG(DISTINCT a ORDER BY u)` is an error:
+    // which `u` would order a collapsed duplicate is undefined).
+    if (is_distinct && !inner_order_by.empty()) {
+      for (const WindowOrderTerm& term : inner_order_by) {
+        const std::string term_text = term.expression->ToString();
+        const bool names_argument =
+            std::any_of(arguments.begin(), arguments.end(),
+                        [&](const Expression& argument) {
+                          return argument->ToString() == term_text;
+                        });
+        if (!names_argument) {
+          return AstError<Expression>(
+              "GoogleSQL AST: an aggregate function that has both DISTINCT "
+              "and ORDER BY arguments can only ORDER BY expressions that are "
+              "arguments to the function");
+        }
+      }
+    }
     auto aggregate = std::make_shared<AggregateExpression>(
-        type, arguments.empty() ? nullptr : arguments[0],
-        node.detail.find("distinct=true") != std::string::npos);
+        type, arguments.empty() ? nullptr : arguments[0], is_distinct);
     if (having != AggregateHavingModifier::kNone) {
       aggregate->SetHaving(having, having_condition);
     }
@@ -1992,6 +2010,7 @@ StatusOr<std::string> SqlTypeFromAst(
           continue;
         }
         std::string params;
+        params.reserve(child->children.size());
         for (const auto& param : child->children) {
           if (param->kind == "IntLiteral" || param->kind == "Identifier" ||
               param->kind == "StringLiteral") {
@@ -2025,6 +2044,7 @@ StatusOr<std::string> SqlTypeFromAst(
     // Render STRUCT<T1, T2> / STRUCT<name T, ...> so runtime casts can walk
     // the declared field list.
     std::string fields;
+    fields.reserve(node.children.size());
     for (const auto& child : node.children) {
       if (child->kind != "StructField") {
         continue;
@@ -2284,6 +2304,7 @@ StatusOr<std::string> InferAggregateArrayElementType(
 
 StatusOr<std::string> DecodeBytes(const GoogleSqlAstNode& node) {
   std::string result;
+  result.reserve(node.children.size());
   bool found_component = false;
   for (const auto& child : node.children) {
     if (child->kind == "BytesLiteralComponent") {
@@ -2620,6 +2641,7 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
   RecoverNullTreatment(*call, &window->respect_nulls, &window->ignore_nulls);
 
   std::vector<WindowOrderTerm> inner_order_by;
+  inner_order_by.reserve(call->children.size());
   for (size_t i = arg_start; i < call->children.size(); ++i) {
     const GoogleSqlAstNode& child = *call->children[i];
     if (child.kind == "Location") {
@@ -2648,7 +2670,7 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
       if (const GoogleSqlAstNode* limit_node = child.Child("Limit")) {
         if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
           ASSIGN_OR_RETURN(uint64_t, hv94767_0, (ParseUnsignedLiteral(*value)));
-          window->inner_limit = static_cast<size_t>(hv94767_0);
+          window->inner_limit = WindowLimitFromUint64(hv94767_0);
         } else {
           ASSIGN_OR_RETURN(Expression, limit_expr,
                            (VisitExpression(*limit_node)));
@@ -2656,9 +2678,9 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
             const Value& cv = limit_expr->AsConstantValue().GetValue();
             if (cv.type == ValueType::kInt64 && !cv.IsNull() &&
                 cv.value.int_value >= 0) {
-              window->inner_limit = static_cast<size_t>(
+              window->inner_limit = WindowLimitFromUint64(
                   cv.IsUnsigned() ? static_cast<uint64_t>(cv.value.int_value)
-                                  : cv.value.int_value);
+                                  : static_cast<uint64_t>(cv.value.int_value));
             } else {
               return AstError<Expression>(
                   "aggregate LIMIT must be a non-negative integer constant");
@@ -2930,6 +2952,7 @@ bool SplitJsonObjectFields(
   bool in_string = false;
   char quote = '\0';
   std::string current;
+  current.reserve(body.size());
   // Position in `current` of the key/value separator colon: the first ':'
   // seen outside a string at depth 0.  A naive find(':') would cut inside a
   // quoted key such as "a:b".
@@ -3078,6 +3101,7 @@ void AlignAnonymousStructFieldNames(
     return std::string(value.value.varchar_value);
   };
   std::vector<std::pair<std::string, std::string>> head_fields;
+  head_fields.reserve(declared == nullptr ? 0 : declared->size());
   if (declared != nullptr) {
     for (const std::string& name : *declared) {
       head_fields.emplace_back(name, "");
@@ -3306,6 +3330,7 @@ StatusOr<Expression> VisitExpression(
     // encoding uses generic fN keys until renamed here.
     std::vector<std::string> struct_field_names;
     std::vector<Expression> elements;
+    elements.reserve(node.children.size());
     // Establish the element kind before visiting values so a mixed typed
     // array such as [TIMESTAMP '...', '...'] coerces later string literals.
     for (const auto& child : node.children) {
@@ -3410,6 +3435,7 @@ StatusOr<Expression> VisitExpression(
   // operands.
   if (node.kind == "BitwiseShiftExpression") {
     std::vector<const GoogleSqlAstNode*> operands;
+    operands.reserve(node.children.size());
     for (const auto& child : node.children) {
       if (child->kind != "Location") {
         operands.push_back(child.get());
@@ -3716,6 +3742,7 @@ StatusOr<Expression> VisitExpression(
                      (VisitExpression(*node.children[0])));
     Expression value_expr = std::move(hv122631_0);
     std::vector<std::pair<Expression, Expression>> clauses;
+    clauses.reserve(node.children.size());
     size_t pair_end = node.children.size();
     Expression otherwise = ConstantValueExp(Value());
     if ((pair_end - 1) % 2 == 1) {
@@ -3741,6 +3768,7 @@ StatusOr<Expression> VisitExpression(
       return AstError<Expression>("GoogleSQL AST: empty CASE");
     }
     std::vector<std::pair<Expression, Expression>> clauses;
+    clauses.reserve(node.children.size());
     size_t pair_end = node.children.size();
     Expression otherwise = ConstantValueExp(Value());
     if (pair_end % 2 == 1) {
@@ -3760,6 +3788,7 @@ StatusOr<Expression> VisitExpression(
   }
   if (node.kind == "BetweenExpression") {
     std::vector<const GoogleSqlAstNode*> operands;
+    operands.reserve(node.children.size());
     for (const auto& child : node.children) {
       if (child->kind != "Location") {
         operands.push_back(child.get());
@@ -3936,12 +3965,7 @@ StatusOr<Expression> VisitExpression(
       if (value_node->kind == "StringLiteral") {
         ASSIGN_OR_RETURN(std::string, hv129471_0, (DecodeString(*value_node)));
         std::string str_val = std::move(hv129471_0);
-        int64_t amount = 0;
-        try {
-          amount = std::stoll(str_val);
-        } catch (const std::exception& error) {
-          (void)error;
-        }
+        const int64_t amount = ParseIntervalAmount(str_val);
         // The IntervalExpression constructor parses eagerly and its EXC-SHIM
         // wrapper THROWS on unparsable text (fuzz-found: INTERVAL '<empty>'
         // with no unit aborted the process).  Reject through Status instead.
@@ -3970,12 +3994,7 @@ StatusOr<Expression> VisitExpression(
         }
         if (v.type == ValueType::kVarChar) {
           std::string str_val = std::string(v.value.varchar_value);
-          int64_t amount = 0;
-          try {
-            amount = std::stoll(str_val);
-          } catch (const std::exception& error) {
-            (void)error;
-          }
+          const int64_t amount = ParseIntervalAmount(str_val);
           if (!IntervalValue::TryParse(
                    (str_val.empty() ? std::to_string(amount) : str_val), unit)
                    .HasValue()) {
@@ -4020,12 +4039,7 @@ StatusOr<Expression> VisitExpression(
         }
         if (v.Value().type == ValueType::kVarChar) {
           std::string str_val = std::string(v.Value().value.varchar_value);
-          int64_t amount = 0;
-          try {
-            amount = std::stoll(str_val);
-          } catch (const std::exception& error) {
-            (void)error;
-          }
+          const int64_t amount = ParseIntervalAmount(str_val);
           if (!IntervalValue::TryParse(
                    (str_val.empty() ? std::to_string(amount) : str_val), unit)
                    .HasValue()) {
@@ -4239,6 +4253,7 @@ StatusOr<Expression> VisitExpression(
       Expression deferred;  // set when eager evaluation failed
     };
     std::vector<StructFieldJson> fields;
+    fields.reserve(node.children.size());
     bool any_ci = false;
     size_t arg_idx = 0;
     for (const auto& child : node.children) {

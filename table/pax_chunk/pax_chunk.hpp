@@ -20,7 +20,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <ostream>
 #include <span>
 #include <string>
@@ -1616,7 +1619,6 @@ class PaxChunk final {
     BuildNullBitmapSummary();
     BuildEfSelectDirs();
     BuildFsstDirs();
-    BuildDecodedIntCache();
   }
   // Construct from a plaintext (scannable) buffer plus its compressed wire
   // form. `is_compressed` records that the chunk is persisted in `compressed`
@@ -1632,7 +1634,6 @@ class PaxChunk final {
     BuildNullBitmapSummary();
     BuildEfSelectDirs();
     BuildFsstDirs();
-    BuildDecodedIntCache();
   }
   PaxChunk(const PaxChunk&) = default;
   PaxChunk(PaxChunk&&) = default;
@@ -1772,7 +1773,7 @@ class PaxChunk final {
       // null-free columns skip the test entirely.
       bool has_null_bits = false;
       const uint8_t* null_bits = nullptr;  // column's bitmap base
-      const int64_t* vals = nullptr;       // kind 1: decoded_int_cache_ span
+      const int64_t* vals = nullptr;       // kind 1: immutable decoded cell
       uint32_t span = 0;                   // kind 1: rows available
       const char* region = nullptr;        // kinds 2/3
       const char* region_end = nullptr;    // kinds 2/3
@@ -1998,7 +1999,7 @@ class PaxChunk final {
   // hand-built footer) fall back to the stateless SelectBit.
   void BuildEfSelectDirs();
   void BuildFsstDirs();
-  void BuildDecodedIntCache();
+  std::span<const int64_t> DecodedIntCell(slot_t col, uint32_t group) const;
   // Resolves a global row index to (row group, local index).
   // Returns 0 on success, 1 when the prefix is unavailable (hostile footer),
   // 2 when the row index is past the end of the chunk.
@@ -2022,9 +2023,12 @@ class PaxChunk final {
   std::vector<FsstDecodeMeta> fsst_meta_;
   std::vector<uint32_t> fsst_symbol_offsets_;
   std::vector<uint8_t> fsst_symbol_lengths_;
-  std::vector<int64_t> decoded_int_cache_;
-  std::vector<size_t> decoded_int_offsets_;
-  bool decoded_int_cache_ready_{false};
+  struct DecodedCells {
+    std::mutex mutex;
+    size_t values{0};
+    std::unordered_map<size_t, std::vector<int64_t>> cells;
+  };
+  std::shared_ptr<DecodedCells> decoded_cells_{std::make_shared<DecodedCells>()};
 };
 
 // Metadata-only range aggregate across multiple chunks whose key ranges are

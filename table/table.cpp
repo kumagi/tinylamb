@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -457,6 +458,24 @@ bool KeyColumnChanged(const Value& a, const Value& b) {
       return false;
   }
   return true;
+}
+
+bool SameIndexKey(const Index& index, const Row& left, const Row& right) {
+  return std::ranges::all_of(index.sc_.key_, [&](slot_t key) {
+    const Value& a = left[key];
+    const Value& b = right[key];
+    if (a.type != b.type) {
+      return false;
+    }
+    if (a.type == ValueType::kArray || a.IsInterval() || b.IsInterval()) {
+      return a.EncodeMemcomparableFormat() == b.EncodeMemcomparableFormat();
+    }
+    if (a.type == ValueType::kDouble) {
+      return a.value.double_value == b.value.double_value ||
+             (std::isnan(a.value.double_value) && std::isnan(b.value.double_value));
+    }
+    return !KeyColumnChanged(a, b);
+  });
 }
 
 // True when no column feeding this index (key or include) differs between
@@ -1216,7 +1235,7 @@ Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
           }
           StatusOr<Row> conflicting = ReadLatest(txn, existing.pos);
           if (conflicting.HasValue() &&
-              idx.GenerateKey(conflicting.Value()) == key) {
+              SameIndexKey(idx, conflicting.Value(), new_row)) {
             return Status::kDuplicates;
           }
           RETURN_IF_FAIL(bpt.Update(txn, key, Encode(val), &cursor));
@@ -1259,7 +1278,7 @@ Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
           // for old snapshots, and the key here is free.
           StatusOr<Row> conflicting = ReadLatest(txn, value.pos);
           if (conflicting.HasValue() &&
-              idx.GenerateKey(conflicting.Value()) == key) {
+              SameIndexKey(idx, conflicting.Value(), new_row)) {
             return Status::kDuplicates;
           }
         }

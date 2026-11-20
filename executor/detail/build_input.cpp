@@ -489,6 +489,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                     ? inner_table_schema
                     : QualifySchema(inner_table_schema, inner_qual);
             std::vector<slot_t> group_key_offs;
+            group_key_offs.reserve(derived->GroupBy().size());
             bool group_keys_ok = true;
             for (const Expression& g : derived->GroupBy()) {
               const auto off = LocalColumnOffset(
@@ -578,7 +579,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               std::vector<Column> derived_cols;
               derived_cols.reserve(derived->SelectList().size());
               std::vector<slot_t> group_out_slots;
+              group_out_slots.reserve(derived->SelectList().size());
               std::vector<slot_t> inner_col_for_proj;
+              inner_col_for_proj.reserve(derived->SelectList().size());
               bool schema_ok = !derived->SelectList().empty();
               for (size_t s = 0; s < derived->SelectList().size(); ++s) {
                 const Expression& expr = derived->SelectList()[s].expression;
@@ -722,6 +725,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       // qualified schema may be missing from it; projecting fewer columns
       // than this source needs breaks evaluation downstream.
       std::vector<slot_t> merged(projections[i]);
+      merged.reserve(projections[i].size() + shared->size());
       for (const slot_t slot : *shared) {
         if (std::ranges::find(merged, slot) == merged.end()) {
           merged.push_back(slot);
@@ -1291,6 +1295,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           return a.rows < b.rows;
         });
         std::unordered_set<slot_t> bound_left_cols;
+        bound_left_cols.reserve(candidates.size());
         for (const LeftFilterCandidate& cand : candidates) {
           if (bound_left_cols.contains(cand.left_col)) {
             continue;
@@ -1419,6 +1424,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // so dimension chains join before the fact-to-fact joins that need
     // their filters (TPC-DS q72 joins the 2002 date slice before inventory).
     std::vector<size_t> visit_order;
+    visit_order.reserve(relations.size());
     {
       const auto reorderable = [&](size_t i) {
         const SelectSource& s = statement.Sources()[i];
@@ -1560,6 +1566,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           return false;
         }
         std::vector<slot_t> cand_cols;
+        cand_cols.reserve(eq_edges.size());
         for (const OrderedEqEdge& edge : eq_edges) {
           if (edge.a == cand && joined.contains(edge.b)) {
             if (std::ranges::find(cand_cols, edge.col_a) == cand_cols.end()) {
@@ -1640,6 +1647,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         // every start ties on peak; the smallest filtered member is the
         // robust anchor).  Then greedily append connected candidates.
         std::unordered_set<size_t> prefix;
+        prefix.reserve(run_begin);
         for (size_t i = 0; i < run_begin; ++i) {
           prefix.insert(i);
         }
@@ -1674,9 +1682,12 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           continue;
         }
         std::vector<size_t> order{start};
+        order.reserve(run_end - run_begin);
         std::unordered_set<size_t> sim_joined = prefix;
+        sim_joined.reserve(relations.size());
         sim_joined.insert(start);
         std::vector<size_t> remaining;
+        remaining.reserve(run_end - run_begin);
         for (size_t i = run_begin; i < run_end; ++i) {
           if (i != start) {
             remaining.push_back(i);
@@ -1775,6 +1786,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       }
       SelectStatement future(statement);
       std::vector<SelectSource> remaining_sources;
+      remaining_sources.reserve(statement.Sources().size());
       for (size_t r = 0; r < statement.Sources().size(); ++r) {
         if (!available.contains(r)) {
           auto source = statement.Sources()[r];
@@ -1786,6 +1798,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       }
       future.SetSources(std::move(remaining_sources));
       std::vector<Expression> remaining_predicates;
+      remaining_predicates.reserve(ordered_predicates.size() + 1);
       // If any WHERE term stays above BuildInput, its caller re-evaluates
       // the original whole WHERE. Keep that complete dependency set until
       // every term has been placed, including query-bearing predicates.
@@ -1861,7 +1874,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         return std::optional<Relation>{};
       }
       std::vector<slot_t> left_columns;
+      left_columns.reserve(keys.size());
       std::vector<slot_t> right_store;
+      right_store.reserve(keys.size());
       for (const EqualityKey& key : keys) {
         const Column& left_col = result.schema.GetColumn(key.left);
         const Column& right_col = projected.GetColumn(key.right);
@@ -1890,6 +1905,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         BinaryOperation op{BinaryOperation::kLessThan};
       };
       std::vector<FastIntColPairPred> fast_residuals;
+      fast_residuals.reserve(residual.size());
       auto find_unique_col = [&](const Schema& s, const ColumnName& name,
                                  size_t* out_idx) -> int {
         int hits = 0;
@@ -3036,10 +3052,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             for (size_t off = 0; off < ms.size(); off += kColumnarChunkRows) {
               built_chunks[group_base[w] + (off / kColumnarChunkRows)] =
                   build_chunk_from_matches(
-                      std::span<const StreamMatch>(ms)
-                          .subspan(off,
-                                   std::min(kColumnarChunkRows,
-                                            ms.size() - off)));
+                      std::span<const StreamMatch>(ms).subspan(
+                          off, std::min(kColumnarChunkRows, ms.size() - off)));
             }
           }));
           for (ColumnarChunk& ch : built_chunks) {
@@ -3100,6 +3114,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       if (source.join_type == JoinType::kCross ||
           source.join_type == JoinType::kInner) {
         std::vector<Expression> applicable;
+        applicable.reserve(ordered_predicates.size());
         for (size_t p = 0; p < ordered_predicates.size(); ++p) {
           const PredicateInfo& predicate = ordered_predicates[p];
           if (predicate_placed[p] || !placeable(predicate) ||
@@ -3132,15 +3147,20 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       // WHERE (or, for a trailing LEFT JOIN, where every remaining unplaced
       // WHERE conjunct is a null-rejecting `right.col IS NULL` anti-join test —
       // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
-      //   (fused_antijoin_groupby_sound)):
+      //   (fused_antijoin_groupby_sound))
+      // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+      //   (eager_channel_preagg_before_left_join_sound,
+      //    eager_channel_preagg_requires_unique_dimension):
       // the join feeds the aggregation directly and never materializes.
       bool can_fuse_anti_left = false;
       std::vector<size_t> anti_where_indices;
+      anti_where_indices.reserve(ordered_predicates.size());
       if (fusion != nullptr && fusion->eligible &&
           available.size() == relations.size() && !all_where_placed() &&
           source.join_type == JoinType::kLeft && last_null_extension[i] == i &&
           source.using_columns.empty() && source.join_condition) {
         std::vector<slot_t> is_null_cols;
+        is_null_cols.reserve(ordered_predicates.size());
         bool all_unplaced_are_right_is_null = true;
         for (size_t p = 0; p < ordered_predicates.size(); ++p) {
           if (predicate_placed[p]) {
@@ -3216,6 +3236,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         if (pure_int_equijoin) {
           SelectStatement future(statement);
           std::vector<SelectSource> remaining_sources;
+          remaining_sources.reserve(statement.Sources().size());
           for (size_t r = 0; r < statement.Sources().size(); ++r) {
             if (!available.contains(r)) {
               auto rem = statement.Sources()[r];
@@ -3227,6 +3248,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           }
           future.SetSources(std::move(remaining_sources));
           std::vector<Expression> remaining_predicates;
+          remaining_predicates.reserve(ordered_predicates.size());
           if (!all_where_placed() && statement.WhereClause()) {
             remaining_predicates.push_back(statement.WhereClause());
           } else {
@@ -3413,6 +3435,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               !result.HasSpill() && !result.using_columns) {
             SelectStatement future(statement);
             std::vector<SelectSource> remaining_sources;
+            remaining_sources.reserve(statement.Sources().size());
             for (size_t r = 0; r < statement.Sources().size(); ++r) {
               if (!available.contains(r)) {
                 auto remaining = statement.Sources()[r];
@@ -3424,6 +3447,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             }
             future.SetSources(std::move(remaining_sources));
             std::vector<Expression> remaining_predicates;
+            remaining_predicates.reserve(ordered_predicates.size());
             if (!all_where_placed() && statement.WhereClause()) {
               remaining_predicates.push_back(statement.WhereClause());
             } else {
@@ -3488,6 +3512,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       // once no later RIGHT/FULL join can manufacture a new NULL for it.
       // This also allows subsequent inner joins to fuse their aggregation.
       std::vector<Expression> post_join;
+      post_join.reserve(where_predicate_count);
       for (size_t p = 0; p < where_predicate_count; ++p) {
         const auto& predicate = ordered_predicates[p];
         if (predicate_placed[p] || !placeable(predicate) ||
@@ -3585,6 +3610,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // Populate the residual list from all analyzed ON conjuncts so any
     // unplaced conjunct is evaluated (or rejected if unresolvable) post-join.
     std::unordered_set<const ExpressionBase*> from_joins;
+    from_joins.reserve(predicates.size());
     for (size_t i = 1; i < statement.Sources().size(); ++i) {
       for (const Expression& conjunct :
            SplitConjuncts(statement.Sources()[i].join_condition)) {
@@ -4292,6 +4318,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     }
     if (!transitive_filter_disabled && key_class_node.size() > 2) {
       std::unordered_set<std::string> known_pairs;
+      known_pairs.reserve(predicates.size());
       for (const PredicateInfo& predicate : predicates) {
         if (!predicate.resolved || predicate.contains_query ||
             predicate.sources.size() != 2 ||
@@ -5287,6 +5314,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             slot_t o_col{0};
           };
           std::vector<PreJoinEdge> edges;
+          edges.reserve(predicates.size());
           bool predicates_ok = true;
           for (const PredicateInfo& p : predicates) {
             if (!p.resolved || !p.sources.contains(idx)) {
@@ -6964,6 +6992,7 @@ deferred_multi_payload_phase:
         continue;
       }
       std::vector<slot_t> payloads;
+      payloads.reserve(outer_referenced.size());
       for (const auto& name : outer_referenced) {
         if (const auto column = LocalColumnOffset(relations[d].schema, name);
             column && std::ranges::find(payloads, *column) == payloads.end()) {
@@ -8389,6 +8418,7 @@ run_zero_payload_first:
     size_t sim_total = 0;
     std::unordered_set<size_t> sim_joined{start};
     std::unordered_set<size_t> sim_remaining;
+    sim_remaining.reserve(relations.size());
     for (size_t i = 0; i < relations.size(); ++i) {
       if (i != start && (absorbed[i] == 0U)) {
         sim_remaining.insert(i);

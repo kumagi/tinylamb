@@ -47,6 +47,7 @@ namespace {
 
 std::vector<std::string> SplitTokens(std::string_view line) {
   std::vector<std::string> out;
+  out.reserve(line.size() / 2 + 1);
   size_t p = 0;
   while (p < line.size()) {
     while (p < line.size() && line[p] == ' ') {
@@ -1021,6 +1022,7 @@ class OocSession {
 
   static std::vector<std::string> SplitCells(const std::string& row) {
     std::vector<std::string> out;
+    out.reserve(row.size() + 1);
     size_t p = 0;
     while (true) {
       const size_t bar = row.find('|', p);
@@ -1147,6 +1149,10 @@ class OocSession {
       }
     }
     std::string sql;
+    sql.reserve(values
+                    ? static_cast<size_t>(hi - lo + 1) *
+                          (static_cast<size_t>(t->pad_min + t->pad_span) + 128)
+                    : 0);
     if (values) {
       sql = "INSERT INTO " + t->name + " VALUES ";
       for (int64_t x = lo; x <= hi; ++x) {
@@ -1187,6 +1193,7 @@ class OocSession {
       return "malformed ins_copy op\n";
     }
     std::vector<std::pair<int64_t, MRow>> added;
+    added.reserve(src->rows.size());
     for (auto it = src->rows.lower_bound(lo);
          it != src->rows.end() && it->first <= hi; ++it) {
       if (dst->rows.contains(it->first + off)) {
@@ -1269,6 +1276,7 @@ class OocSession {
     return RunDml("UPDATE", sql, count, max_pad > 24000, [&, name]() {
       MTable* tt = FindTable(work_, name);
       std::vector<std::pair<int64_t, MRow>> changed;
+      changed.reserve(tt->rows.size());
       for (const auto& [k, r] : tt->rows) {
         if (w.Eval(k, r)) {
           MRow nr = r;
@@ -1298,6 +1306,7 @@ class OocSession {
     return RunDml("DELETE", sql, count, false, [&, name]() {
       MTable* tt = FindTable(work_, name);
       std::vector<int64_t> gone;
+      gone.reserve(tt->rows.size());
       for (const auto& [k, r] : tt->rows) {
         if (w.Eval(k, r)) {
           gone.push_back(k);
@@ -1615,16 +1624,9 @@ class OocSession {
     SqlOutcome o = RunSql(ctx, spec.sql);
     if (!o.ok) {
       const StatusCode code = o.status.GetCode();
-      // ADR-0004 rule 9: a row wider than a quarter of the operator budget
-      // fails with kTooBigData by design. The sweep arm already tolerates
-      // that once a stored pad can reach the quarter; checks must agree.
-      const size_t opmem =
-          ProcessMemoryBudget::Global().OpMemoryOverrideBytes();
-      const bool row_over_quarter = code == StatusCode::kTooBigData &&
-                                    opmem > 0 && MaxPadLen() * 4 >= opmem;
       if (((injecting_ || TempCapped()) && TolerableUnderInjection(code)) ||
           (injecting_ && o.why.find("injected") != std::string::npos) ||
-          code == StatusCode::kMemoryLimitExceeded || row_over_quarter) {
+          code == StatusCode::kMemoryLimitExceeded) {
         Bump(&OocStats::tolerated_failures);
         NoteFailedRead(ctx);
         return "";
@@ -1656,6 +1658,7 @@ class OocSession {
       return "malformed check op (no table " + tok[2] + ")\n";
     }
     std::vector<int64_t> args;
+    args.reserve(tok.size() - 3);
     for (size_t i = 3; i < tok.size(); ++i) {
       int64_t v = 0;
       if (!ParseI64(tok[i], &v)) {
@@ -1899,6 +1902,7 @@ class OocSession {
             " WHERE k BETWEEN " + I(lo) + " AND " + I(hi) +
             " ORDER BY k DESC LIMIT " + I(limit) + " OFFSET " + I(offset);
     std::vector<std::string> all;
+    all.reserve(t.rows.size());
     for (auto it = t.rows.upper_bound(hi); it != t.rows.begin();) {
       --it;
       if (it->first < lo) {
@@ -1969,6 +1973,7 @@ class OocSession {
         return a.first > b.first;
       });
       std::string agg;
+      agg.reserve(members.size() * (4 + 1));  // tag length + comma
       int64_t cnt = 0;
       for (const auto& [k, tag] : members) {
         if (tag == 0) {
@@ -2236,14 +2241,6 @@ class OocSession {
     force_relational_ = k.route;
   }
 
-  [[nodiscard]] size_t MaxPadLen() const {
-    size_t longest = 0;
-    for (const MTable& t : work_) {
-      longest = std::max(longest, t.pad_hi);
-    }
-    return longest;
-  }
-
   // True when `sql` names a fuzz table (t<digits>) the mirror does not have.
   [[nodiscard]] bool MentionsMissingTable(std::string_view sql,
                                           bool snapshot) const {
@@ -2444,7 +2441,7 @@ class OocSession {
             (injected && got.why.find("injected") != std::string::npos) ||
             ((injected || k.temp > 0) && TolerableUnderInjection(code)) ||
             (code == StatusCode::kTooBigData &&
-             (heavy != 0 || (k.opmem > 0 && MaxPadLen() * 4 >= k.opmem)));
+             heavy != 0);
         if (tolerated) {
           Bump(&OocStats::diff_tolerated);
           NoteFailedRead(ctx);
@@ -3971,6 +3968,7 @@ std::string OocStats::Summary() const {
 
 std::vector<std::string> OocFlavorNames() {
   std::vector<std::string> names;
+  names.reserve(std::size(kFlavors));
   for (const Flavor& f : kFlavors) {
     names.emplace_back(f.name);
   }
@@ -4207,6 +4205,7 @@ OocTrace MinimizeOocTrace(const OocTrace& trace, std::string_view report,
 std::string OocTraceDigest(uint64_t seed, std::string_view profile_text,  // NOLINT(misc-use-internal-linkage)
                            const std::vector<std::string>& ops) {
   std::string canonical = std::to_string(seed) + "\n";
+  canonical.reserve(canonical.size() + profile_text.size() + ops.size());
   canonical += profile_text;
   canonical += "\n";
   for (const std::string& op : ops) {

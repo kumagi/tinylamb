@@ -1325,6 +1325,7 @@ StatusOr<bool> TryBuildPackedGroupingSets(
   const bool need_row_groups = !row_groups.empty();
   const size_t count = plans.size();
   std::vector<slot_t> unique_cols;
+  unique_cols.reserve(plans.size());
   for (const auto& plan : plans) {
     for (const slot_t col : plan.key_offsets) {
       if (std::ranges::find(unique_cols, col) == unique_cols.end()) {
@@ -3743,6 +3744,7 @@ class ColumnarGroupLookup {
 // overflow exactly, in both directions.
 std::vector<size_t> CheckedSlimSumMeasures(const TypedAggregationPlan& plan) {
   std::vector<size_t> out;
+  out.reserve(plan.slim_kinds.size());
   if (!plan.slim) {
     return out;
   }
@@ -4582,6 +4584,7 @@ StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
     return std::optional<Relation>{};
   }
   std::vector<slot_t> keys;
+  keys.reserve(statement.GroupBy().size());
   for (const auto& key : statement.GroupBy()) {
     if (!key || key->Type() != TypeTag::kColumnValue) {
       return std::optional<Relation>{};
@@ -4778,7 +4781,7 @@ StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
   columns.reserve(statement.SelectList().size());
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
     columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
-                         ValueType::kNull);
+                         ValueTypeFromTypeTag(statement.SelectList()[i].expression->ResultType(input.schema).GetType()));
   }
   const auto finish_row_into = [&](size_t r, AggregateResultMap* finished,
                                    const std::vector<Value*>& agg_slots,
@@ -4893,6 +4896,7 @@ StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
   }
   if (!output.rows.empty()) {
     for (size_t i = 0; i < columns.size(); ++i) {
+      if (output.rows.front()[i].IsNull()) { continue; }
       columns[i] =
           Column(columns[i].Name(), ValueTypeOf(output.rows.front()[i]));
       columns[i].SetUnsigned(output.rows.front()[i].IsUnsigned());
@@ -7143,6 +7147,7 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
       RETURN_IF_FAIL(input.EnsureRowsMaterialized());
     }
     std::vector<size_t> mapping;
+    mapping.reserve(input.rows.size());
     std::vector<Value> keys, coarse, values;
     keys.reserve(plans[0].key_offsets.size());
     coarse.reserve(plans[0].key_offsets.size());

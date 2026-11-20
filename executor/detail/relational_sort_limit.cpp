@@ -508,6 +508,7 @@ Status ApplyOrderBy(TransactionContext& context,
   std::vector<Expression> key_expressions;
   key_expressions.reserve(order_by.size());
   std::vector<std::optional<slot_t>> ordinal_columns;
+  ordinal_columns.reserve(order_by.size());
   for (const auto& key : order_by) {
     Expression expression = key.expression;
     std::optional<slot_t> ordinal_column;
@@ -661,6 +662,7 @@ Status ApplyOrderBy(TransactionContext& context,
     std::vector<Value> best_keys;
     std::vector<Value> cur_keys(key_expressions.size());
     std::vector<size_t> winner_indices;
+    winner_indices.reserve(output->rows.size());
     for (size_t ri = 0; ri < output->rows.size(); ++ri) {
       const Row& row = output->rows[ri];
       Scope scope{.row = &row, .schema = &output->schema, .outer = outer};

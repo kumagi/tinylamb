@@ -3243,7 +3243,8 @@ Status TlcsFile::ForEachBlockRowByPid(
 std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
     const Schema& schema, const std::vector<slot_t>* projection,
     uint64_t max_bytes,
-    const std::shared_ptr<const platform::MemoryMap>& mmap) const {
+    const std::shared_ptr<const platform::MemoryMap>& mmap, bool* capacity_rejected) const {
+  if (capacity_rejected != nullptr) { *capacity_rejected = false; }
   if (schema.ColumnCount() != column_count_ ||
       !LSTableStore::SupportsSchema(schema)) {
     return nullptr;
@@ -3354,6 +3355,7 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
   // resident-mmap vs paged mode, matching the TlcsFile class contract.
   const uint64_t mapped_bytes = using_mmap ? file_size_ : 0;
   if (mapped_bytes > max_bytes || alloc_bytes > max_bytes) {
+    if (capacity_rejected != nullptr) { *capacity_rejected = true; }
     return nullptr;
   }
   const uint64_t total_reserve = mapped_bytes + alloc_bytes;
@@ -3751,14 +3753,14 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
 
 std::shared_ptr<const LSTableStore> TlcsFile::BuildProjectedResidentStore(
     const Schema& schema, const std::vector<slot_t>* projection,
-    uint64_t effective_max_bytes) const {
+    uint64_t effective_max_bytes, bool* capacity_rejected) const {
   std::shared_ptr<const platform::MemoryMap> mmap_copy;
   {
     std::scoped_lock lk(resident_mu_);
     mmap_copy = resident_mmap_;
   }
   return BuildResidentStoreInternal(schema, projection, effective_max_bytes,
-                                    mmap_copy);
+                                    mmap_copy, capacity_rejected);
 }
 
 StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::Open(const std::string& path,

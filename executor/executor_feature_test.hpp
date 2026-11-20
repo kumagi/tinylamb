@@ -191,6 +191,7 @@ class PositionedSource : public ExecutorBase {
 // `dup` times.  Merge-join inputs must arrive ordered.
 inline std::vector<Row> SortedKeyRows(int64_t begin, int64_t end, int64_t dup) {
   std::vector<Row> rows;
+  rows.reserve(static_cast<size_t>((end - begin) * dup));
   for (int64_t k = begin; k < end; ++k) {
     for (int64_t d = 0; d < dup; ++d) {
       rows.push_back(Row({Value(k), Value((k * 10) + d)}));

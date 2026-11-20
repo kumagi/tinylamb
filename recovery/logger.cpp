@@ -686,7 +686,11 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
     platform::CloseFile(dst);
     ++index;
   }
-  RETURN_IF_FAIL(SyncDirectoryOf(base));
+  const Status synced = SyncDirectoryOf(base);
+  if (synced != Status::kSuccess) {
+    close_src();
+    return synced;
+  }
   if (platform::Truncate(src, static_cast<int64_t>(segment_size)) != 0) {
     const int saved = errno;
     close_src();

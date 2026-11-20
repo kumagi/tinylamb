@@ -372,8 +372,8 @@ std::optional<SchemaBoundExprType> MakeConstantSchemaBoundType(
         .type = val.type,
         .is_unsigned = val.IsUnsigned(),
         .is_interval = val.IsInterval(),
-        .collation =
-            val.type == ValueType::kVarChar ? CollationOf(val) : Collation::kNone,
+        .collation = val.type == ValueType::kVarChar ? CollationOf(val)
+                                                     : Collation::kNone,
         .is_constant = true,
         .const_val = val,
     };
@@ -437,8 +437,8 @@ TryResolveSchemaBoundNonThrowingType(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expr->AsUnaryExpression();
-      const auto ct =
-          TryResolveSchemaBoundNonThrowingType(unary.Child(), schema, depth + 1);
+      const auto ct = TryResolveSchemaBoundNonThrowingType(unary.Child(),
+                                                           schema, depth + 1);
       if (!ct.has_value()) {
         return std::nullopt;
       }
@@ -581,13 +581,14 @@ TryResolveSchemaBoundNonThrowingType(  // NOLINT(misc-no-recursion)
         }
       }
       if (c.else_clause_) {
-        const auto et = TryResolveSchemaBoundNonThrowingType(
-            c.else_clause_, schema, depth + 1);
+        const auto et = TryResolveSchemaBoundNonThrowingType(c.else_clause_,
+                                                             schema, depth + 1);
         if (!et.has_value() || !merge_branch(*et)) {
           return std::nullopt;
         }
       }
-      return result_type.value_or(SchemaBoundExprType{.type = ValueType::kNull});
+      return result_type.value_or(
+          SchemaBoundExprType{.type = ValueType::kNull});
     }
     case TypeTag::kFunctionCallExp: {
       const auto& fn = expr->AsFunctionCallExpression();
@@ -699,10 +700,9 @@ TryResolveSchemaBoundNonThrowingType(  // NOLINT(misc-no-recursion)
         }
         return SchemaBoundExprType{.type = ValueType::kInt64};
       }
-      if (std::ranges::all_of(arg_types,
-                              [](const SchemaBoundExprType& a) {
-                                return a.is_constant;
-                              }) &&
+      if (std::ranges::all_of(
+              arg_types,
+              [](const SchemaBoundExprType& a) { return a.is_constant; }) &&
           !ContainsParameterSlot(expr) && expr->TouchedColumns().empty()) {
         StatusOr<Value> ev = expr->TryEvaluate(Row{}, Schema{});
         if (ev.HasValue()) {
@@ -725,11 +725,12 @@ TryResolveSchemaBoundNonThrowingType(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kIntervalExp: {
       const auto children = ExpressionChildren(expr);
-      const bool all_const = std::ranges::all_of(children, [&](const Expression& ch) {
-        const auto cht =
-            TryResolveSchemaBoundNonThrowingType(ch, schema, depth + 1);
-        return cht.has_value() && cht->is_constant;
-      });
+      const bool all_const =
+          std::ranges::all_of(children, [&](const Expression& ch) {
+            const auto cht =
+                TryResolveSchemaBoundNonThrowingType(ch, schema, depth + 1);
+            return cht.has_value() && cht->is_constant;
+          });
       if (all_const && !ContainsParameterSlot(expr) &&
           expr->TouchedColumns().empty()) {
         StatusOr<Value> ev = expr->TryEvaluate(Row{}, Schema{});
@@ -1001,7 +1002,8 @@ bool StaticallyNonNumeric(const Expression& expression) {
   try {
     const Schema* schema = ActiveRewriteSchema();
     const TypeTag type =
-        expression->ResultType(schema != nullptr ? *schema : Schema()).GetType();
+        expression->ResultType(schema != nullptr ? *schema : Schema())
+            .GetType();
     return type != TypeTag::kBigInt && type != TypeTag::kDouble &&
            type != TypeTag::kInvalid;
   } catch (const std::exception&) {
@@ -1020,7 +1022,8 @@ bool StaticallyNumeric(const Expression& expression) {
   try {
     const Schema* schema = ActiveRewriteSchema();
     const TypeTag type =
-        expression->ResultType(schema != nullptr ? *schema : Schema()).GetType();
+        expression->ResultType(schema != nullptr ? *schema : Schema())
+            .GetType();
     return type == TypeTag::kBigInt || type == TypeTag::kDouble;
   } catch (const std::exception&) {
     return false;
@@ -1100,12 +1103,12 @@ bool StaticallyNonBoolean(const Expression& expression) {
   if (expression->Type() == TypeTag::kFunctionCallExp) {
     const std::string& name = expression->AsFunctionCallExpression().FuncName();
     static const std::unordered_set<std::string> kNonBooleanFuncs = {
-        "abs",           "sign",          "round",       "trunc",
-        "truncate",      "ceil",          "ceiling",     "floor",
-        "safe_negate",   "mod",           "safe_add",    "safe_subtract",
-        "safe_multiply", "length",        "char_length", "character_length",
-        "byte_length",   "strpos",        "instr",       "div",
-        "__bit_and",     "__bit_or",      "__bit_xor",   "__shift_left",
+        "abs",           "sign",     "round",       "trunc",
+        "truncate",      "ceil",     "ceiling",     "floor",
+        "safe_negate",   "mod",      "safe_add",    "safe_subtract",
+        "safe_multiply", "length",   "char_length", "character_length",
+        "byte_length",   "strpos",   "instr",       "div",
+        "__bit_and",     "__bit_or", "__bit_xor",   "__shift_left",
         "__shift_right"};
     if (kNonBooleanFuncs.contains(name) || name.starts_with("extract_")) {
       return true;
@@ -1264,10 +1267,14 @@ Expression FactorCommonAndImpl(const Expression& expression) {
   //    ahead of it could evaluate to FALSE and skip evaluating the throwing
   //    preceding conjunct, silently erasing an error.
   std::vector<Expression> common;
+  common.reserve(left.size());
   std::vector<Expression> left_rest;
+  left_rest.reserve(left.size());
   std::vector<Expression> right_rest;
+  right_rest.reserve(right.size());
 
   std::vector<size_t> matched_right_indices;
+  matched_right_indices.reserve(right.size());
   bool left_saw_throwing = false;
 
   for (const Expression& l : left) {
@@ -1608,6 +1615,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression& expression, const ExpressionBindings&) {
           const auto& source = expression->AsCaseExpression();
           std::vector<std::pair<Expression, Expression>> clauses;
+          clauses.reserve(source.when_clauses_.size());
           Expression otherwise = source.else_clause_;
           bool changed = false;
           for (const auto& [condition, result] : source.when_clauses_) {
@@ -1787,7 +1795,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // INT64) <= c) OR NULL`) must not be erased.  Fire only if y is total.
     // Furthermore, x must be safe to reduce evaluations and cannot be
     // non-boolean.
-    // Lean proof: lean/TinylambOpt/ThreeValued.lean (absorption_and_sound)
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (guarded_short_circuit_absorption)
     built.Add(ExpressionRule(
         "absorption_and",
         Binary(BinaryOperation::kAnd, Any("x"),
@@ -1800,7 +1809,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
-    // Lean proof: lean/TinylambOpt/ThreeValued.lean (absorption_and_sound)
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (guarded_short_circuit_absorption)
     built.Add(ExpressionRule(
         "absorption_and_reversed",
         Binary(BinaryOperation::kAnd,
@@ -1813,8 +1823,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
-    //   (three_valued_distributive_and_absorption_sound)
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (guarded_short_circuit_absorption)
     built.Add(ExpressionRule(
         "absorption_or",
         Binary(BinaryOperation::kOr, Any("x"),
@@ -1827,8 +1837,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return x;
         }));
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
-    //   (three_valued_distributive_and_absorption_sound)
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (guarded_short_circuit_absorption)
     built.Add(ExpressionRule(
         "absorption_or_reversed",
         Binary(BinaryOperation::kOr,
@@ -1904,8 +1914,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return Expression{};
         }));
-    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
-    //   (int64_identities_negation_and_abs_sound)
+    // Lean proof: lean/TinylambOpt/FloatIdentities.lean
+    // (identity_divide_one_sound)
     built.Add(ExpressionRule(
         "identity_divide_one",
         Binary(BinaryOperation::kDivide, Any("left"), Any("right")),
@@ -2151,6 +2161,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression& expression, const ExpressionBindings&) {
           const auto& in = expression->AsInExpression();
           std::vector<Expression> items;
+          items.reserve(in.list_.size());
           bool changed = false;
           for (const Expression& item : in.list_) {
             // Dropping a duplicate removes one evaluation of the item; for a
@@ -2599,6 +2610,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           const auto& in = bindings.at("in")->AsInExpression();
           bool has_null = false;
           std::vector<Expression> non_null_items;
+          non_null_items.reserve(in.list_.size());
           for (const auto& item : in.list_) {
             if (IsConstant(item) &&
                 item->AsConstantValue().GetValue().IsNull()) {
@@ -2671,9 +2683,10 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
            const ExpressionBindings&) -> Expression {
           const auto& fn = expression->AsFunctionCallExpression();
           std::string func_lower = fn.FuncName();
-          std::ranges::transform(func_lower, func_lower.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-          });
+          std::ranges::transform(func_lower, func_lower.begin(),
+                                 [](unsigned char c) {
+                                   return static_cast<char>(std::tolower(c));
+                                 });
           if (func_lower == "array_concat") {
             if (fn.Args().empty()) {
               return Expression{};
@@ -2684,10 +2697,10 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               if (arg && arg->Type() == TypeTag::kFunctionCallExp) {
                 const auto& inner = arg->AsFunctionCallExpression();
                 std::string inner_lower = inner.FuncName();
-                std::ranges::transform(inner_lower, inner_lower.begin(),
-                                       [](unsigned char c) {
-                                         return static_cast<char>(std::tolower(c));
-                                       });
+                std::ranges::transform(
+                    inner_lower, inner_lower.begin(), [](unsigned char c) {
+                      return static_cast<char>(std::tolower(c));
+                    });
                 if (inner_lower == "array_concat") {
                   for (const Expression& inner_arg : inner.Args()) {
                     flattened_args.push_back(inner_arg);
@@ -2745,6 +2758,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             // Strip empty array literals: array_concat(x, []) -> x
             if (flattened_args.size() >= 2) {
               std::vector<Expression> non_empty;
+              non_empty.reserve(flattened_args.size());
               for (const auto& arg : flattened_args) {
                 if (arg && arg->Type() == TypeTag::kArrayExp &&
                     arg->AsArrayExpression().Elements().empty()) {
@@ -2958,6 +2972,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               return Expression{};
             }
             std::vector<Expression> new_args;
+            new_args.reserve(fn.Args().size());
             bool changed = false;
             for (const Expression& arg : fn.Args()) {
               if (!arg) {
@@ -3125,11 +3140,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (!in.list_.empty()) {
             return Expression{};
           }
-          // Three-valued logic: the AST reference yields NULL (not FALSE)
-          // for a NULL child even against an empty list, so only fold when
-          // the child is a known non-NULL constant.
-          if (!IsConstant(in.child_) ||
-              in.child_->AsConstantValue().GetValue().IsNull()) {
+          // The AST still evaluates the probe. Folding a literal preserves
+          // probe errors and observable evaluations of nonconstant expressions.
+          if (!IsConstant(in.child_)) {
             return Expression{};
           }
           return ConstantValueExp(Value(false));
@@ -3583,13 +3596,19 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               std::optional<IntervalValue> justified;
               if (fn.FuncName() == "justify_hours") {
                 auto r = iv.TryJustifyHours();
-                if (r.HasValue()) justified = r.MoveValue();  // NOLINT(readability-braces-around-statements)
+                if (r.HasValue())
+                  justified =
+                      r.MoveValue();  // NOLINT(readability-braces-around-statements)
               } else if (fn.FuncName() == "justify_days") {
                 auto r = iv.TryJustifyDays();
-                if (r.HasValue()) justified = r.MoveValue();  // NOLINT(readability-braces-around-statements)
+                if (r.HasValue())
+                  justified =
+                      r.MoveValue();  // NOLINT(readability-braces-around-statements)
               } else if (fn.FuncName() == "justify_interval") {
                 auto r = iv.TryJustifyInterval();
-                if (r.HasValue()) justified = r.MoveValue();  // NOLINT(readability-braces-around-statements)
+                if (r.HasValue())
+                  justified =
+                      r.MoveValue();  // NOLINT(readability-braces-around-statements)
               } else {
                 return Expression{};
               }
@@ -4163,8 +4182,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return CombineConjuncts(distributed);
         }));
-    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
-    //   (int64_identities_negation_and_abs_sound)
+    // Lean proof: lean/TinylambOpt/FloatIdentities.lean
+    // (pow_one_after_promotion_sound)
     built.Add(ExpressionRule(
         "pow_identities", Any(),
         [](const Expression& expression,
@@ -4332,6 +4351,8 @@ std::vector<Expression> ExpressionChildren(const Expression& expression) {
     case TypeTag::kWindowFunctionExp: {
       const auto& window = expression->AsWindowFunctionCallExpression();
       std::vector<Expression> children = window.args;
+      children.reserve(window.args.size() + window.inner_order_by.size() +
+                       window.partition_by.size() + window.order_by.size() + 3);
       if (window.where_filter) {
         children.push_back(window.where_filter);
       }
@@ -4779,11 +4800,11 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
       binary.Left()->Type() == TypeTag::kColumnValue &&
       IsNumericOperand(binary.Left(), input_schema)) {
     // x + x -> x * 2. Exact doubling for integers and IEEE doubles. Unlike
-    // the schema-free combine_repeated_addend rule, this typed form deliberately
-    // includes dynamic INT64 columns: for a statically numeric column the
-    // current evaluator gives both spellings the same result (including the
-    // wraparound at the overflow boundary), so only the operator name in a
-    // hypothetical overflow diagnostic could differ. Test
+    // the schema-free combine_repeated_addend rule, this typed form
+    // deliberately includes dynamic INT64 columns: for a statically numeric
+    // column the current evaluator gives both spellings the same result
+    // (including the wraparound at the overflow boundary), so only the operator
+    // name in a hypothetical overflow diagnostic could differ. Test
     // ExpressionRewriteTest.TypedSignAbsorptionAndRepeatedAddend pins this.
     return BinaryExpressionExp(
         binary.Left(), BinaryOperation::kMultiply,
@@ -5033,11 +5054,10 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
       // Window partition/order keys, arguments and frame offsets can all
       // hide a NOT(ordered double comparison); inspect every child the
       // same way the aggregate arm does.
-      return std::ranges::any_of(ExpressionChildren(expression),
-                                 [&schema](const Expression& child) {
-                                   return ContainsNotOfOrderedDoubleComparison(
-                                       child, schema);
-                                 });
+      return std::ranges::any_of(
+          ExpressionChildren(expression), [&schema](const Expression& child) {
+            return ContainsNotOfOrderedDoubleComparison(child, schema);
+          });
     default:
       return false;
   }

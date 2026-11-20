@@ -126,9 +126,9 @@ class MemTable final {
   // Put/Delete stamps the RowEntry with a process-wide monotonically
   // increasing version, and each Sync assigns the flush generation from the
   // same counter. Generations then become COMPARABLE ACROSS all memtables
-  // (partitions/tables), so an executor can pin a read version V and read each
-  // partition at V. Off by default to preserve per-instance generation_ values
-  // that existing tests rely on.
+  // participating memtables. Direct callers opt in before writing, pin V,
+  // and call Snapshot(V). SQL execution uses its own MVCC snapshot path.
+  // The default mode retains per-instance generations.
   void SetGlobalVersionMode(bool on) {
     // Atomic: toggling while writers are calling Put/Delete on other threads
     // was a plain-bool data race (TSan).

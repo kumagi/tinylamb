@@ -81,10 +81,10 @@ constexpr size_t kMaxCachedStatementsPerShard =
 // pin gigabytes while staying under the count limit.
 constexpr size_t kMaxParseCacheKeyBytesPerShard = 4ULL << 20;
 // Failed parses are remembered briefly so retries of the same broken SQL do
-// not fork one parser process per attempt (§7.11).
+// not fork one parser process per attempt.
 constexpr std::chrono::seconds kNegativeCacheTtl{1};
 // Hard bound for one parse round trip; a stuck or flooded child is killed
-// instead of blocking the worker forever (§7.2).
+// instead of blocking the worker forever.
 constexpr std::chrono::seconds kParseTimeout{5};
 
 size_t MaxCachedStatementsPerShard() {
@@ -236,7 +236,12 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     return {.ok = false, .ast = {}, .error = "cannot start GoogleSQL"};
   }
 
-  std::thread writer([stdin_write, sql]() {
+  std::string output;
+  bool output_truncated = false;
+  std::thread writer;
+  std::thread reader;
+  try {
+    writer = std::thread([stdin_write, sql]() {
     size_t written = 0;
     while (written < sql.size()) {
       const DWORD chunk = static_cast<DWORD>(
@@ -250,9 +255,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     ::CloseHandle(stdin_write);
   });
 
-  std::string output;
-  bool output_truncated = false;
-  std::thread reader([stdout_read, &output, &output_truncated]() {
+    reader = std::thread([stdout_read, &output, &output_truncated]() {
     std::array<char, 4096> buffer{};
     for (;;) {
       DWORD n = 0;
@@ -269,6 +272,20 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     }
     ::CloseHandle(stdout_read);
   });
+
+  } catch (...) {
+    (void)::TerminateProcess(pi.hProcess, 1);
+    (void)::WaitForSingleObject(pi.hProcess, INFINITE);
+    if (writer.joinable()) {
+      writer.join();
+    } else {
+      ::CloseHandle(stdin_write);
+    }
+    ::CloseHandle(stdout_read);
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    return {.ok = false, .ast = {}, .error = "cannot start parser pipe workers"};
+  }
 
   const auto timeout_ms =
       static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -508,7 +525,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   bool output_truncated = false;
   // Interleave writes and reads via poll: the child emits its AST while
   // still consuming the query, so a large result cannot deadlock a parent
-  // that is stuck in write() (§7.2). One syscall per readiness event keeps
+  // that is stuck in write(). One syscall per readiness event keeps
   // the blocking descriptors from stalling the loop.
   while (input_open || output_open) {
     const auto remaining = deadline - std::chrono::steady_clock::now();

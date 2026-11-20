@@ -375,6 +375,7 @@ TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
           seed, Schema("PredicateKeys", {Column("k", ValueType::kInt64),
                                          Column("v", ValueType::kInt64)})));
   std::vector<Row> original;
+  original.reserve(100);
   RowPosition updated;
   for (int i = 0; i < 100; ++i) {
     original.emplace_back(
@@ -427,6 +428,7 @@ TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
     for (size_t predicate = 0; predicate < predicates.size(); ++predicate) {
       for (bool ascending : {true, false}) {
         std::vector<Row> expected;
+        expected.reserve(visible.size());
         for (const auto& row : visible) {
           const auto value =
               predicates[predicate]->TryEvaluate(row, current.GetSchema());
@@ -1894,6 +1896,7 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
   EXPECT_EQ(scan.WorkerCount(), 4U);
 
   std::unordered_set<int64_t> keys;
+  keys.reserve(kRows);
   DataChunk chunk;
   while (scan.NextBatch(&chunk, 37) != 0) {
     ASSERT_LE(chunk.Size(), 37U);
@@ -1911,6 +1914,7 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
 TEST_F(ExecutorTest, FusedTypedScanAggregatesNullableOldSnapshot) {
   constexpr std::string_view name = "FoldSnapshot";
   std::vector<RowPosition> positions;
+  positions.reserve(2000);
   {
     auto writer = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(
@@ -2006,6 +2010,7 @@ TEST_F(ExecutorTest, FusedTypedScanPreservesIntermediateSumOverflow) {
                                       ColumnValueExp("value")))};
     Row expected;
     std::vector<Row> reference_rows;
+    reference_rows.reserve(cases[i].size());
     for (int64_t value : cases[i]) {
       reference_rows.emplace_back(std::vector<Value>{Value(value)});
     }
@@ -2136,6 +2141,7 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanWorkerFilterDecidesRows) {
   scan.SetRowFilter(conjuncts, filter, std::move(programs));
 
   std::unordered_set<int64_t> keys;
+  keys.reserve(kRows);
   DataChunk chunk;
   while (scan.NextBatch(&chunk, 53) != 0) {
     for (size_t row = 0; row < chunk.Size(); ++row) {
@@ -2203,6 +2209,7 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanSurfacesDeferredRowErrors) {
   scan.SetRowFilter(conjuncts, filter, std::move(programs));
 
   std::unordered_set<int64_t> keys;
+  keys.reserve(kRows);
   DataChunk chunk;
   while (scan.NextBatch(&chunk, 53) != 0) {
     for (size_t row = 0; row < chunk.Size(); ++row) {
@@ -2682,6 +2689,7 @@ TEST_F(ExecutorTest, ParallelScanNextScalarPath) {
   ParallelScan scan(reader.txn_, *table, 2, 1);
   LOG(INFO) << scan;
   std::unordered_set<int64_t> keys;
+  keys.reserve(static_cast<size_t>(kRows));
   Row row;
   RowPosition pos;
   size_t count = 0;
@@ -2720,6 +2728,7 @@ TEST_F(ExecutorTest, ParallelScanProjectedColumns) {
   DataChunk chunk;
   size_t total = 0;
   std::unordered_set<std::string> names;
+  names.reserve(static_cast<size_t>(kRows));
   while (scan.NextBatch(&chunk, 64) != 0) {
     ASSERT_EQ(chunk.ColumnCount(), 2U);
     for (size_t row = 0; row < chunk.Size(); ++row) {

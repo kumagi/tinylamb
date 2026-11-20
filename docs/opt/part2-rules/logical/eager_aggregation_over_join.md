@@ -6,7 +6,7 @@
 
 ## 概要
 
-内部等価結合 $\text{Join}(L, R, p_{\text{equi}})$ の直上にあるグループ集約について、全集約演算（`SUM`, `COUNT`, `MIN`, `MAX`）が片側 $S \in \{L, R\}$ のみに依存する場合、結合前に $S$ を `(S 内の外部 GROUP BY キー ∪ S 内の結合キー)` で事前集約（2 段階 Eager Aggregation）します。
+内部等価結合 $\text{Join}(L, R, p_{\text{equi}})$ の直上にあるグループ集約について、全集約演算（`COUNT`, `MIN`, `MAX`）が片側 $S \in \{L, R\}$ のみに依存する場合、結合前に $S$ を `(S 内の外部 GROUP BY キー ∪ S 内の結合キー)` で事前集約（2 段階 Eager Aggregation）します。
 
 $$\gamma_{G,\, \text{AGG}(S.x)}(L \bowtie_{L.jk = R.jk} R) \equiv \gamma_{G,\, \text{FINAL\_AGG}(\text{partial})}\bigl(\gamma_{G_S \cup \{S.jk\},\, \text{PARTIAL\_AGG}(S.x)}(\sigma_{S.jk \text{ IS NOT NULL}}(S)) \bowtie R\bigr)$$
 
@@ -15,11 +15,13 @@ $$\gamma_{G,\, \text{AGG}(S.x)}(L \bowtie_{L.jk = R.jk} R) \equiv \gamma_{G,\, \
 ## 適用条件と安全性制約
 
 1. `GROUP BY` キーが空でないこと（空グループ時のスカラー集約 1 行生成境界を回避）。
-2. 全集約が `DISTINCT` / `FILTER` / `NeedsGroupContext()` を持たない `SUM`, `COUNT`, `MIN`, `MAX` であり、参照列が $S$ 側のみに収まること（`COUNT` の最終段は `SUM($pre_agg)` で合算）。
-3. **浮動小数点丸め・オーバーフロー順序保護**: 非 `INT64`（`DOUBLE` 等）の `SUM` を含む場合は、反対側の結合キーが一意制約（`candidate_keys`）を満たす 1:1 / N:1 結合に限定し、M:N 重複加算による IEEE-754 オーバーフロー順序の変化を防ぎます。
+2. 全集約が `DISTINCT` / `FILTER` / `NeedsGroupContext()` を持たない `COUNT`, `MIN`, `MAX` であり、参照列が $S$ 側のみに収まること（`COUNT` の最終段は `SUM($pre_agg)` で合算）。
+3. 入力に `SUM` がある場合は適用しません。結合で消えるキーを先に集約すると、元のクエリでは発生しないオーバーフローが起こります。反対側のキーが一意でも起こります。
 4. **無益な事前集約の抑止**: 事前集約キーが既に $S$ の候補キー（主キー・UNIQUE）を被覆している場合は行数が減らないため発火をスキップします。
 5. 結合キーが `NOT NULL` と証明されていない場合は、事前集約の前に `IS NOT NULL` 選択を挿入して結合不能な `NULL` バケットを早期除去します。
 
 ## 検証テスト
 
 - `CascadesTest.EagerAggregationOverJoinPushesTwoStagePreAgg`
+- `CascadesTest.EagerAggregationSkipsSumEvenWithUniqueJoinPartner`
+- `SqlBugfixRegressionTest.JoinDiscardsOverflowingSumGroup`

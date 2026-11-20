@@ -24,8 +24,9 @@ std::string Utf8RegexPattern(std::string_view pattern) {
   // std::regex searches bytes. An unescaped wildcard in a STRING pattern
   // consumes a full code point; in a BYTES pattern it consumes one byte.
   constexpr std::string_view dot =
-      R"((?:[\x00-\x09\x0B-\x7F]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}))";
+      R"((?:[\x00-\x09\x0B\x0C\x0E-\x7F]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}))";
   std::string converted;
+  converted.reserve(pattern.size() * dot.size());
   bool in_class = false;
   for (size_t i = 0; i < pattern.size(); ++i) {
     const char ch = pattern[i];
@@ -190,6 +191,7 @@ class LinearPrefixVM {
       } else if (step.kind == StepKind::kOptLiteral &&
                  description.prefixes.size() < 8) {
         std::vector<std::string> alternatives;
+        alternatives.reserve(description.prefixes.size());
         for (const auto& prefix : description.prefixes) {
           alternatives.push_back(prefix + step.literal);
           alternatives.push_back(prefix);
@@ -568,6 +570,7 @@ class LinearPrefixVM {
 #ifdef TINYLAMB_HAVE_RE2
 std::optional<std::string> LinearPattern(std::string_view pattern) {
   std::string result;
+  result.reserve(pattern.size());
   bool in_class = false;
   for (size_t i = 0; i < pattern.size(); ++i) {
     const char c = pattern[i];
@@ -703,6 +706,7 @@ StatusOr<ReplacementProgram> CompileReplacement(std::string_view pattern,
   std::string format;
   format.reserve(replacement.size());
   std::vector<RewritePiece> rewrite_pieces;
+  rewrite_pieces.reserve(replacement.size());
   uint8_t nsubmatch = 0;
   auto push_literal_char = [&](char ch) {
     if (!rewrite_pieces.empty() && !rewrite_pieces.back().is_capture) {

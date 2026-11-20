@@ -107,7 +107,7 @@ class GroupedNumericHash {
   template <typename Fn>
   void Matches(std::span<const Value> probe, std::span<const size_t> keys,
                Fn&& consume) const {
-    if (keys.size() != keys_.size()) {
+    if (!Supported() || keys.size() != keys_.size()) {
       return;
     }
     for (size_t key : keys) {

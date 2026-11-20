@@ -959,17 +959,18 @@ double TableStatistics::EstimateDistinctRows(
     return 1.0;
   }
   std::vector<size_t> seen;
+  seen.reserve(columns.size());
   std::vector<double> counts;
   const auto rows = static_cast<double>(row_count_);
   for (size_t column : columns) {
-    if (column >= stats_.size()) {
+    if (column >= stats_->size()) {
       return rows;
     }
     if (std::ranges::find(seen, column) != seen.end()) {
       continue;
     }
     seen.push_back(column);
-    const auto& stats = stats_[column];
+    const auto& stats = (*stats_)[column];
     const double ndv = static_cast<double>(stats.Distinct()) +
                        (stats.NullCount() > 0 ? 1.0 : 0.0);
     if (ndv == 0.0) {
@@ -1182,9 +1183,9 @@ ColumnStats ColumnStats::FromRawParts(
 }
 
 TableStatistics::TableStatistics(const Schema& schema) : row_count_(0) {
-  stats_.reserve(schema.ColumnCount());
+  stats_->reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    stats_.emplace_back(schema.GetColumn(i).Type());
+    stats_->emplace_back(schema.GetColumn(i).Type());
   }
 }
 
@@ -1233,7 +1234,7 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     auto decoded = DecodeTlcsColumnStats(encoded, schema.ColumnCount());
     if (decoded && target.LayoutGeneration() == generation) {
       row_count_ = static_cast<size_t>(total_rows);
-      stats_ = std::move(*decoded);
+      stats_ = std::make_shared<std::vector<ColumnStats>>(std::move(*decoded));
       layout_generation_ = generation;
       return true;
     }
@@ -1293,7 +1294,7 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     rebuilt.push_back(std::move(stats));
   }
   row_count_ = scanned_rows;
-  stats_ = std::move(rebuilt);
+  stats_ = std::make_shared<std::vector<ColumnStats>>(std::move(rebuilt));
   layout_generation_ = stable ? generation : 0;
   if (stable && !target.RowsRewrittenInPlace()) {
     const auto existing = target.GetLSTableStore();
@@ -1325,12 +1326,12 @@ double TableStatistics::ReductionFactor(const Schema& schema,
 double TableStatistics::EstimateCount(int column_index, const Value& from,
                                       const Value& to) const {
   const bool index_valid =
-      column_index >= 0 && static_cast<size_t>(column_index) < stats_.size();
+      column_index >= 0 && static_cast<size_t>(column_index) < stats_->size();
   CHECK_MSG(index_valid, "statistics column index");
   if (!index_valid) {
     return 0;
   }
-  const ColumnStats& column_stats = stats_[static_cast<size_t>(column_index)];
+  const ColumnStats& column_stats = (*stats_)[static_cast<size_t>(column_index)];
   std::optional<Value> lower;
   std::optional<Value> upper;
   if (!from.IsNull()) {
@@ -1370,7 +1371,7 @@ TableStatistics TableStatistics::TransformBy(int column_index,
   const double multiplier =
       row_count_ == 0 ? 0 : estimated / static_cast<double>(row_count_);
   result.row_count_ = ScaleCount(row_count_, multiplier);
-  for (ColumnStats& stats : result.stats_) {
+  for (ColumnStats& stats : result.MutableColumns()) {
     stats *= multiplier;
   }
   // A rewritten column no longer describes the stored values, so the physical
@@ -1384,7 +1385,7 @@ TableStatistics TableStatistics::Filter(const Schema& schema,
   TableStatistics result(*this);
   const double multiplier = EstimateSelectivity(schema, predicate);
   result.row_count_ = ScaleCount(row_count_, multiplier);
-  for (ColumnStats& stats : result.stats_) {
+  for (ColumnStats& stats : result.MutableColumns()) {
     stats *= multiplier;
   }
   // The estimate is a projection of this table, not the table itself: a
@@ -1400,7 +1401,7 @@ TableStatistics TableStatistics::ScaleToRows(size_t rows) const {
           ? 0
           : static_cast<double>(rows) / static_cast<double>(row_count_);
   result.row_count_ = rows;
-  for (ColumnStats& stats : result.stats_) {
+  for (ColumnStats& stats : result.MutableColumns()) {
     stats *= multiplier;
   }
   result.layout_generation_ = 0;
@@ -1416,8 +1417,8 @@ TableStatistics TableStatistics::ScaleCardinality(size_t rows) const {
           : static_cast<double>(rows) / static_cast<double>(row_count_);
   const double distinct_multiplier =
       multiplier < 1 ? std::sqrt(std::max(0.0, multiplier)) : 1;
-  result.stats_.reserve(stats_.size());
-  for (const ColumnStats& stats : stats_) {
+  result.stats_->reserve(stats_->size());
+  for (const ColumnStats& stats : *stats_) {
     ColumnStats scaled;
     scaled.type_ = stats.type_;
     scaled.non_null_count_ = ScaleCount(stats.non_null_count_, multiplier);
@@ -1426,16 +1427,18 @@ TableStatistics TableStatistics::ScaleCardinality(size_t rows) const {
         std::min(scaled.non_null_count_,
                  ScaleCount(stats.distinct_count_, distinct_multiplier));
     scaled.correlation_ = stats.correlation_;
-    result.stats_.push_back(std::move(scaled));
+    result.stats_->push_back(std::move(scaled));
   }
   return result;
 }
 
 void TableStatistics::Concat(const TableStatistics& rhs) {
-  if (stats_.empty()) {
+  if (stats_->empty()) {
     row_count_ = rhs.row_count_;
   }
-  stats_.insert(stats_.end(), rhs.stats_.begin(), rhs.stats_.end());
+  auto source = rhs.stats_;
+  auto& columns = MutableColumns();
+  columns.insert(columns.end(), source->begin(), source->end());
   // Two row sources are not one table's chain: no clustering proof survives.
   layout_generation_ = 0;
 }
@@ -1443,7 +1446,7 @@ void TableStatistics::Concat(const TableStatistics& rhs) {
 void TableStatistics::Assign(size_t rows, std::vector<ColumnStats> columns,
                              uint64_t layout_generation) {
   row_count_ = rows;
-  stats_ = std::move(columns);
+  stats_ = std::make_shared<std::vector<ColumnStats>>(std::move(columns));
   layout_generation_ = layout_generation;
 }
 
@@ -1451,7 +1454,7 @@ TableStatistics TableStatistics::operator*(size_t multiplier) const {
   TableStatistics result(*this);
   result.row_count_ =
       ScaleCount(result.row_count_, static_cast<double>(multiplier));
-  for (ColumnStats& stats : result.stats_) {
+  for (ColumnStats& stats : result.MutableColumns()) {
     stats.Duplicate(multiplier);
   }
   result.layout_generation_ = 0;
@@ -1522,10 +1525,10 @@ Decoder& operator>>(Decoder& decoder, ColumnStats& stats) {
 }
 
 Encoder& operator<<(Encoder& encoder, const TableStatistics& stats) {
-  // Callers must keep stats_.size() <= kMaxStatisticsColumns: the decoder
+  // Callers must keep stats_->size() <= kMaxStatisticsColumns: the decoder
   // enforces that bound on readback and Encoder has no failure channel.
   encoder << kStatisticsMagic << kStatisticsVersion
-          << static_cast<uint64_t>(stats.row_count_) << stats.stats_
+          << static_cast<uint64_t>(stats.row_count_) << *stats.stats_
           << stats.layout_generation_;
   return encoder;
 }
@@ -1557,14 +1560,14 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
       decoder.Fail();
       return decoder;
     }
-    stats.stats_.clear();
-    stats.stats_.resize(static_cast<size_t>(column_count));
+    stats.stats_ = std::make_shared<std::vector<ColumnStats>>();
+    stats.stats_->resize(static_cast<size_t>(column_count));
     // v3 writes the correlation tail per column; v2 does not.  Read it
     // explicitly per element -- AtEnd() inside operator>> would see the
     // remaining columns (and, for the last one, layout_generation_) rather
     // than this column's own fields.
     const bool has_correlation = version == kStatisticsVersion;
-    for (ColumnStats& column : stats.stats_) {
+    for (ColumnStats& column : *stats.stats_) {
       column.DecodeFixedFields(decoder);
       column.correlation_ = 1.0;
       if (has_correlation) {
@@ -1595,11 +1598,11 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
     decoder.Fail();
     return decoder;
   }
-  stats.stats_.clear();
-  stats.stats_.resize(marker);
+  stats.stats_ = std::make_shared<std::vector<ColumnStats>>();
+  stats.stats_->resize(marker);
   stats.row_count_ = 0;
   stats.layout_generation_ = 0;
-  for (ColumnStats& column : stats.stats_) {
+  for (ColumnStats& column : *stats.stats_) {
     decoder >> column.type_;
     uint64_t count = 0;
     uint64_t distinct = 0;
@@ -1705,8 +1708,8 @@ std::ostream& operator<<(std::ostream& out, const TableStatistics& stats) {
   // T2112: ColumnStats carries no column identity (no Schema here), so at
   // least label each line with its ordinal -- previously a 20-column dump
   // could only be read by counting lines against a catalog.
-  for (size_t i = 0; i < stats.stats_.size(); ++i) {
-    out << "col" << i << ": " << stats.stats_[i] << "\n";
+  for (size_t i = 0; i < stats.stats_->size(); ++i) {
+    out << "col" << i << ": " << (*stats.stats_)[i] << "\n";
   }
   return out;
 }

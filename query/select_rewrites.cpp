@@ -6,7 +6,9 @@
 #include "query/select_rewrites.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -67,6 +69,22 @@
 namespace tinylamb {
 
 namespace {
+
+// Defined in a later anonymous-namespace block of this translation unit.
+std::string LoweredStarName(std::string_view text);
+
+// Stack-buffer decimal formatting for repeated signature/name construction in
+// the rewrite loops (avoids one std::string allocation per call).
+template <typename T>
+std::string IntegerToName(T value) {
+  std::array<char, 32> buffer{};
+  const auto [ptr, ec] =
+      std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+  if (ec == std::errc{}) {
+    return std::string(buffer.data(), ptr);
+  }
+  return std::to_string(value);
+}
 
 bool IdentifierEquals(std::string_view left, std::string_view right) {
   return left.size() == right.size() &&
@@ -285,6 +303,7 @@ bool DerivedSourceIsLocal(const SelectSource& source) {
     return true;
   }
   std::unordered_set<std::string> local;
+  local.reserve(source.query->Sources().size() * 2);
   for (const SelectSource& inner : source.query->Sources()) {
     if (!inner.alias.empty()) {
       local.insert(inner.alias);
@@ -393,6 +412,7 @@ bool InlineSingleUseCtes(SelectStatement* outer) {
   // after at most map-size passes (chained CTEs resolve inside-out).
   for (size_t pass = 0; pass <= outer->WithQueries().size(); ++pass) {
     std::unordered_set<std::string> names;
+    names.reserve(outer->WithQueries().size());
     for (const auto& [name, body] : outer->WithQueries()) {
       (void)body;
       if (!outer->IsRecursiveWith(name)) {
@@ -579,6 +599,7 @@ bool InlineSingleUseGroupedCtes(SelectStatement* outer,
     return false;
   }
   std::unordered_set<std::string> names;
+  names.reserve(outer->WithQueries().size());
   for (const auto& [name, body] : outer->WithQueries()) {
     (void)body;
     names.insert(name);
@@ -817,6 +838,7 @@ struct SharedCteSite {
 bool CollectSharedCteSites(SelectStatement* outer, const std::string& name,
                            std::vector<SharedCteSite>* sites) {
   std::vector<SelectStatement*> consumers{outer};
+  consumers.reserve(1 + outer->WithQueries().size());
   for (const auto& [entry, body] : outer->WithQueries()) {
     if (entry != name && body != nullptr) {
       consumers.push_back(body.get());
@@ -851,7 +873,12 @@ bool CollectSharedCteSites(SelectStatement* outer, const std::string& name,
 // base column names.
 bool CteBodyTakesRestriction(const SelectStatement& body,
                              std::unordered_set<std::string>* outputs) {
-  if (body.Sources().size() != 1 || !body.GroupBy().empty() || body.Having() ||
+  // GROUP BY bodies are allowed when the pushed predicate names only grouping
+  // keys (see the group_keys filter below): the disjunction is a WHERE on the
+  // base relation, so aggregate outputs do not exist yet at that point.
+  // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+  //   (shared_cte_disjunct_pushdown_sound)
+  if (body.Sources().size() != 1 || body.Having() ||
       body.Distinct() || !body.DistinctOn().empty() || body.HasLimit() ||
       body.Offset() != 0 || body.Qualify() || !body.UnionAll().empty() ||
       body.GetSetOperationTree() != nullptr || !body.WithQueries().empty() ||
@@ -865,9 +892,25 @@ bool CteBodyTakesRestriction(const SelectStatement& body,
       source.join_condition) {
     return false;
   }
+  std::unordered_set<std::string> group_keys;
+  if (!body.GroupBy().empty()) {
+    for (const Expression& key : body.GroupBy()) {
+      if (!key || ContainsQueryExpression(key)) {
+        return false;
+      }
+      for (const ColumnName& col : key->TouchedColumns()) {
+        group_keys.insert(LoweredStarName(col.name));
+      }
+    }
+  }
   for (const NamedExpression& item : body.SelectList()) {
     if (item.expression == nullptr ||
         item.expression->Type() != TypeTag::kColumnValue) {
+      // An aggregate output cannot be named by a pushed WHERE; skip it rather
+      // than rejecting the whole body (other grouping-key outputs may remain).
+      if (!body.GroupBy().empty()) {
+        continue;
+      }
       return false;
     }
     const ColumnName& column = item.expression->AsColumnValue().GetColumnName();
@@ -878,6 +921,10 @@ bool CteBodyTakesRestriction(const SelectStatement& body,
     if (column.name != item.name) {
       return false;
     }
+    if (!group_keys.empty() &&
+        !group_keys.contains(LoweredStarName(column.name))) {
+      continue;
+    }
     outputs->insert(item.name);
   }
   return !outputs->empty();
@@ -885,12 +932,17 @@ bool CteBodyTakesRestriction(const SelectStatement& body,
 
 }  // namespace
 
+// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+// (shared_cte_disjunct_pushdown_sound, cte_materialize_halves_body_evaluations,
+//  cte_volatile_inline_unsound — the body must not be inlined twice when
+//  volatile calls are present)
 size_t PushSharedCteRestrictions(SelectStatement* outer,
                                  TransactionContext& ctx) {
   if (outer == nullptr || outer->WithQueries().empty()) {
     return 0;
   }
   std::vector<std::string> entries;
+  entries.reserve(outer->WithQueries().size());
   for (const auto& [name, body] : outer->WithQueries()) {
     if (!outer->IsRecursiveWith(name) && body != nullptr &&
         outer->RecursiveDepthOf(name) == nullptr) {
@@ -910,6 +962,7 @@ size_t PushSharedCteRestrictions(SelectStatement* outer,
       continue;
     }
     std::vector<Expression> restrictions;
+    restrictions.reserve(sites.size());
     bool every_site_restricts = true;
     for (const SharedCteSite& site : sites) {
       std::vector<Expression> local;
@@ -1091,6 +1144,12 @@ SubstituteDerivedOutputs(  // NOLINT(misc-no-recursion)
   if (!expression) {
     return expression;
   }
+  // A query expression is opaque here: ExpressionChildren exposes only its
+  // Test() leg, so a `d.col` reference inside the subquery would survive
+  // substitution and silently rebind once the derived alias is dropped.
+  if (expression->Type() == TypeTag::kQueryExp) {
+    return std::nullopt;
+  }
   if (expression->Type() == TypeTag::kColumnValue) {
     const ColumnName& column = expression->AsColumnValue().GetColumnName();
     if (column.name == "*") {
@@ -1195,11 +1254,13 @@ void ExpandStarWithModifiers(
     std::unordered_set<std::string>* resolved_replace) {
   const StarModifiers& modifiers = *item.star_modifiers;
   std::unordered_set<std::string> base_column_names;
+  base_column_names.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     base_column_names.insert(LoweredStarName(schema.GetColumn(i).Name().name));
   }
   const std::string lowered_relation = LoweredStarName(relation);
   std::unordered_set<std::string> except;
+  except.reserve(modifiers.except_columns.size());
   for (const std::string& entry : modifiers.except_columns) {
     const std::string lowered = LoweredStarName(entry);
     const size_t dot = lowered.find('.');
@@ -1218,6 +1279,7 @@ void ExpandStarWithModifiers(
     resolved_except->insert(lowered);
   }
   std::unordered_map<std::string, const Expression*> replace;
+  replace.reserve(modifiers.replace_items.size());
   for (const StarReplaceItem& item_replace : modifiers.replace_items) {
     const std::string lowered = LoweredStarName(item_replace.column);
     if (!base_column_names.contains(lowered)) {
@@ -2264,6 +2326,7 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
     }
     const SelectStatement& body = *source.query;
     std::string signature = body.Sources()[0].table;
+    signature.reserve(body.GroupBy().size());
     signature.push_back('\x1f');
     signature += body.Sources()[0].alias;
     signature.push_back('\x1f');
@@ -2557,7 +2620,7 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
     }
     if (member.where != nullptr) {
       fused_list.emplace_back(
-          "__fw" + std::to_string(member.index),
+          "__fw" + IntegerToName(member.index),
           AggregateExpressionExp(
               AggregationType::kCount,
               CaseExpressionExp(
@@ -2592,12 +2655,12 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
       }
     }
     if (member.where != nullptr) {
+      const std::string fw_name = "__fw" + IntegerToName(member.index);
       appended.push_back(BinaryExpressionExp(
-          ColumnValueExp(
-              ColumnName(fused_alias, "__fw" + std::to_string(member.index))),
+          ColumnValueExp(ColumnName(fused_alias, fw_name)),
           BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t(0)))));
       append_inner_having(BinaryExpressionExp(
-          ColumnValueExp(ColumnName("", "__fw" + std::to_string(member.index))),
+          ColumnValueExp(ColumnName("", fw_name)),
           BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t(0)))));
     }
   }
@@ -2680,6 +2743,7 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
     return 0;
   }
   std::vector<Expression> rebound_select;
+  rebound_select.reserve(outer->SelectList().size());
   for (const NamedExpression& item : outer->SelectList()) {
     std::optional<Expression> rebound = rebind_outer(item.expression);
     if (!rebound.has_value()) {
@@ -2704,6 +2768,7 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
     return 0;
   }
   std::vector<Expression> rebound_distinct_on;
+  rebound_distinct_on.reserve(outer->DistinctOn().size());
   for (const Expression& term : outer->DistinctOn()) {
     std::optional<Expression> rebound = rebind_outer(term);
     if (!rebound.has_value()) {
@@ -2841,6 +2906,11 @@ bool FlattenDerivedSources(SelectStatement* outer, TransactionContext& ctx,
       changed = true;
     }
   }
+  // WITH TIES compares the ORDER BY keys again on projected rows. Expanding
+  // a derived column there can introduce input columns absent from those rows.
+  if (outer->WithTies()) {
+    return changed;
+  }
   // M5+ slice: a lone derived table over a plain inner-join core (TPC-H
   // Q9's profit subquery) flattens even under GROUP BY, whose output
   // references substitute to the inner expressions verbatim.  It fires only
@@ -2950,6 +3020,12 @@ bool FlattenGroupedDerivedJoinCore(SelectStatement* outer) {
       [&](const Expression& expression) -> std::optional<Expression> {
     if (!expression) {
       return expression;
+    }
+    // A query expression is opaque to ExpressionChildren (only its Test()
+    // leg is exposed): a `d.col` reference inside the subquery would
+    // survive substitution and silently rebind to a spliced base column.
+    if (expression->Type() == TypeTag::kQueryExp) {
+      return std::nullopt;
     }
     if (expression->Type() == TypeTag::kAggregateExp) {
       const auto& agg = expression->AsAggregateExpression();
@@ -3156,6 +3232,16 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
       })) {
     return false;
   }
+  // A lateral sibling's inner query is another nested scope that can
+  // reference the derived alias (`d.col`, or a bare name resolving
+  // outward): SubstituteDerivedOutputs never descends into it, so the
+  // reference would silently rebind to a base column after flattening.
+  // (derived.is_lateral itself is rejected by the shape gate above.)
+  if (std::ranges::any_of(sources, [](const SelectSource& source) {
+        return source.is_lateral;
+      })) {
+    return false;
+  }
   const SelectSource& base = inner->Sources()[0];
   // The flattened source keeps neither sampling clause in the right place:
   // an inner TABLESAMPLE would be dropped outright, and an outer one would
@@ -3253,6 +3339,7 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
   // flattened base itself): a bare outer reference colliding with one never
   // substitutes a derived output.
   std::unordered_set<std::string> base_column_names;
+  base_column_names.reserve(sources.size());
   for (size_t i = 0; i < sources.size(); ++i) {
     if (i == index) {
       continue;
@@ -3355,6 +3442,15 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
     }
   }
   for (const Expression& expression : outer_exprs) {
+    // A kQueryExp is opaque to ExpressionChildren (only its Test() leg is
+    // exposed), so neither the scans below nor SubstituteDerivedOutputs can
+    // see a `d.col` reference inside a scalar/EXISTS/IN subquery:
+    // flattening would drop the `d` alias and silently rebind that
+    // reference to a base column. Keep such queries unflattened, matching
+    // the inner-side subquery gate above.
+    if (ContainsQueryExpression(expression)) {
+      return false;
+    }
     for (const std::string& name : outer_bare_names(expression)) {
       if (scope.hidden_columns.contains(name)) {
         return false;
@@ -3396,6 +3492,12 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
     }
   }
   if (outer->Qualify()) {
+    // Same kQueryExp opacity as the outer_exprs gate above: QUALIFY is
+    // scanned but never substituted, so a subquery hiding a `d.col`
+    // reference would survive flattening and silently rebind.
+    if (ContainsQueryExpression(outer->Qualify())) {
+      return false;
+    }
     for (const std::string& name : outer_bare_names(outer->Qualify())) {
       if (scope.hidden_columns.contains(name) || scope.outputs.contains(name)) {
         return false;
@@ -4585,6 +4687,7 @@ bool PushHavingExtremumBounds(SelectStatement* select,
   // aggregates, since dropping non-extremum rows could alter which arbitrary
   // row represents the group.
   std::unordered_set<ColumnName> grouped_cols;
+  grouped_cols.reserve(select->GroupBy().size());
   if (!select->IsGroupAll()) {
     for (const Expression& gk : select->GroupBy()) {
       const Expression resolved_gk = substitute_aliases(gk);
@@ -5339,6 +5442,7 @@ void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
     std::vector<Row> rows;
   };
   std::vector<LiftedRows> lifted_rows;
+  lifted_rows.reserve(plain_names.size());
   for (const std::string& name : plain_names) {
     const auto body_it = outer->WithQueries().find(name);
     if (body_it == outer->WithQueries().end() || body_it->second == nullptr) {
@@ -5583,6 +5687,7 @@ void SqlEngine::LiftRecursiveCtes(SelectStatement* outer, LiftedCtes* lifted) {
       continue;
     }
     std::vector<Column> columns;
+    columns.reserve(body->SelectList().size());
     for (const NamedExpression& item : body->SelectList()) {
       columns.emplace_back(ColumnName(alias, item.name), ValueType::kNull);
     }
@@ -5851,6 +5956,9 @@ bool ExtractPureUnionAllBranches(  // NOLINT(misc-no-recursion)
   return out_branches->size() >= 2;
 }
 
+// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+// (using_join_inner_prefix_reorder_and_filter_sound,
+//  outer_and_using_join_prefix_reorder_sound)
 bool PullInnerJoinsBeforeLeftJoinsOne(
     SelectStatement* stmt, TransactionContext& ctx,
     const std::unordered_map<std::string, std::shared_ptr<SelectStatement>>&
@@ -5864,11 +5972,11 @@ bool PullInnerJoinsBeforeLeftJoinsOne(
     std::string alias;
     std::string table;
     std::unordered_set<std::string> lowered_cols;
+    std::vector<std::string> using_columns;
   };
   auto resolve_source_info =
       [&](const SelectSource& src) -> std::optional<SourceInfo> {
     if (src.is_lateral || src.unnest || src.sample || src.from_nested_join ||
-        !src.using_columns.empty() ||
         (src.join_type != JoinType::kCross &&
          src.join_type != JoinType::kInner &&
          src.join_type != JoinType::kLeft)) {
@@ -5877,6 +5985,7 @@ bool PullInnerJoinsBeforeLeftJoinsOne(
     SourceInfo info;
     info.table = src.table;
     info.alias = src.alias.empty() ? src.table : src.alias;
+    info.using_columns = src.using_columns;
     if (info.alias.empty()) {
       return std::nullopt;
     }
@@ -5967,6 +6076,24 @@ bool PullInnerJoinsBeforeLeftJoinsOne(
               break;
             }
           }
+        }
+      }
+      // USING joins carry their predicate in `using_columns` rather than in
+      // `join_condition`.  Moving `c_src` below the LEFT JOIN changes what its
+      // USING columns resolve against, so refuse the swap whenever a USING
+      // column names a column of the source being crossed.  Symmetrically, the
+      // LEFT source's own USING predicate must not read the moved-in source.
+      // This is the C++ guard corresponding to the two Lean theorems above.
+      if (ok) {
+        const auto using_reads = [](const std::vector<std::string>& cols,
+                                    const SourceInfo& other) {
+          return std::ranges::any_of(cols, [&](const std::string& col) {
+            return other.lowered_cols.contains(LoweredStarName(col));
+          });
+        };
+        if (using_reads(c_src.using_columns, b_info) ||
+            using_reads(sources[i].using_columns, infos[i + 1])) {
+          ok = false;
         }
       }
       if (!ok) {
@@ -6079,7 +6206,9 @@ bool DistributeOneUnionGroupBy(SelectStatement* stmt, TransactionContext& ctx) {
     return false;
   }
   std::vector<std::string> u_col_names;
+  u_col_names.reserve(u_arity);
   std::unordered_map<std::string, size_t> u_col_index;
+  u_col_index.reserve(u_arity);
   for (size_t c = 0; c < u_arity; ++c) {
     const std::string out_nm =
         ExplicitOrColumnOutputName(branches[0]->SelectList()[c]);
@@ -6401,6 +6530,7 @@ bool DistributeOneUnionGroupBy(SelectStatement* stmt, TransactionContext& ctx) {
     };
 
     std::vector<SelectSource> merged_sources;
+    merged_sources.reserve(br->Sources().size());
     for (SelectSource bs : br->Sources()) {
       if (bs.alias.empty()) {
         bs.alias = bs.table;
@@ -6825,7 +6955,9 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
 
     // Resolve body relations and certified PK relations.
     std::vector<std::shared_ptr<Table>> body_holders;
+    body_holders.reserve(body.Sources().size());
     std::vector<GroupingRelation> body_rels;
+    body_rels.reserve(body.Sources().size());
     bool body_rels_ok = true;
     for (const SelectSource& bs : body.Sources()) {
       if (bs.table.empty() || bs.query != nullptr || bs.is_lateral ||
@@ -6966,6 +7098,7 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
     // Step 3b: Push disjunctive filter `(disc = v_0 OR ... OR disc = v_{r-1})`
     // into `body.WhereClause()` (sound even if Step 3c below declines!).
     std::vector<Value> unique_disc_vals;
+    unique_disc_vals.reserve(site_disc_vals.size());
     for (const Value& v : site_disc_vals) {
       if (!std::ranges::any_of(unique_disc_vals,
                                [&](const Value& u) { return u == v; })) {
@@ -7116,6 +7249,7 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
       Expression agg_arg;
     };
     std::vector<BodyItemSpec> item_specs;
+    item_specs.reserve(body.SelectList().size());
     bool items_ok = true;
     std::unordered_set<std::string> seen_body_out;
     for (const NamedExpression& item : body.SelectList()) {
@@ -7194,6 +7328,7 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
     // Build replacement map `(lowered_site_alias, lowered_col_name) ->
     // Expression`.
     std::vector<NamedExpression> piv_select;
+    piv_select.reserve(item_specs.size());
     std::unordered_map<std::string, Expression> site_col_map;
     for (size_t idx = 0; idx < item_specs.size(); ++idx) {
       const BodyItemSpec& spec = item_specs[idx];
@@ -7894,7 +8029,7 @@ bool RewriteSiblingDerivedAggToWindow(SelectStatement* outer) {
         }
         win_aggs.push_back({.sb_out_name = item.name,
                             .win_col_name = "__tpcds_sb_win_" +
-                                            std::to_string(win_aggs.size()),
+                                            IntegerToName(win_aggs.size()),
                             .fn_name = *fn,
                             .arg_on_base = std::move(base_arg)});
         continue;
@@ -8190,6 +8325,7 @@ bool RewriteCorrelatedCteScalarAggToWindow(SelectStatement* outer) {
     }
     std::unordered_set<std::string> cte_cols_lower;
     std::vector<std::string> cte_col_names;
+    cte_col_names.reserve(cte_body.SelectList().size());
     bool cols_ok = true;
     for (const NamedExpression& item : cte_body.SelectList()) {
       if (item.name.empty() ||
@@ -8634,6 +8770,7 @@ bool BypassDisjointUnionGroupBy(SelectStatement* select) {
   }
   std::vector<std::string> branch0_names;
   std::unordered_map<std::string, size_t> col_to_idx;
+  col_to_idx.reserve(arity);
   for (size_t c = 0; c < arity; ++c) {
     const std::string nm =
         ExplicitOrColumnOutputName(branches[0]->SelectList()[c]);
@@ -10909,7 +11046,7 @@ bool RewriteOneDistinctBranchSurrogateKeys(SelectStatement* br,
         outer_select.emplace_back(
             slots[s].out_name,
             ColumnValueExp(ColumnName(
-                "__tpcds_sk_pre", "__k" + std::to_string(slot_pre_idx[s]))));
+                "__tpcds_sk_pre", "__k" + IntegerToName(slot_pre_idx[s]))));
       }
     }
 
@@ -11650,6 +11787,9 @@ bool DeferOneUniqueDimJoinPastGroupBy(SelectStatement* stmt,
 
 // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
 //   (rollup_sum_homomorphic_arbitrary_expr_sound)
+// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+//   (rollup_two_level_state_combine_sound, rollup_three_level_state_combine_sound,
+//    rollup_grand_total_requires_coalesce)
 // Preserves identical FROM+WHERE input shape across ROLLUP / GROUPING SETS
 // UNION ALL branches (including DOUBLE aggregates such as Q67) so the executor
 // scans and joins the base tables once instead of per-branch.
@@ -13278,6 +13418,7 @@ bool RewriteAdjacentRankSelfJoinToLagLead(SelectStatement* outer) {
     const size_t lg_i = 1;
     const size_t ld_i = 2;
     std::unordered_set<std::string> eq_lg_cols;
+    eq_lg_cols.reserve(v2_conjs.size());
     std::unordered_set<std::string> eq_ld_cols;
     bool has_lag_rn = false;
     bool has_lead_rn = false;
@@ -14151,6 +14292,7 @@ bool CollapseSharedUniqueDimAcrossJoinedSubqueries(SelectStatement* outer,
     // each site's derived query to drop `dim_src` and expose `__shared_fk`.
     std::unordered_map<std::string, Expression> qualified_dim_map;
     std::unordered_set<std::string> collapsed_site_aliases;
+    collapsed_site_aliases.reserve(gidxs.size());
     std::vector<SelectSource> new_outer_sources = outer->Sources();
     std::vector<std::pair<std::string, std::string>> site_fk_cols;
     site_fk_cols.reserve(gidxs.size());
@@ -14184,7 +14326,7 @@ bool CollapseSharedUniqueDimAcrossJoinedSubqueries(SelectStatement* outer,
         fk_out_name = "__shared_fk";
         size_t fk_suf = 1;
         while (existing_names.contains(LoweredStarName(fk_out_name))) {
-          fk_out_name = "__shared_fk_" + std::to_string(fk_suf++);
+          fk_out_name = "__shared_fk_" + IntegerToName(fk_suf++);
         }
         stripped_sel.emplace_back(
             fk_out_name,

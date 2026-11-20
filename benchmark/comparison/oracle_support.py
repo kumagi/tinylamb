@@ -1,6 +1,7 @@
 """Optional Oracle Free backend; all services and credentials are disposable."""
 
 import datetime
+import json
 import os
 import re
 import secrets
@@ -122,9 +123,15 @@ class Container:
         self.started = True
         deadline = time.monotonic() + 900
         while True:
-            ready = subprocess.check_output(['docker', 'inspect', '--format', '{{.State.Health.Status}}', self.name], text=True).strip()
-            if ready == 'healthy':
+            state = json.loads(subprocess.check_output(
+                ['docker', 'inspect', '--format', '{{json .State}}', self.name], text=True))
+            status = state['Status']
+            health = state.get('Health', {}).get('Status')
+            if status == 'running' and health == 'healthy':
                 break
+            if status != 'running' or health != 'starting':
+                raise RuntimeError(f'Oracle Free startup failed (state={status}, health={health}, '
+                                   f'exit={state.get("ExitCode")})')
             if time.monotonic() > deadline:
                 raise RuntimeError('Oracle Free did not become healthy in 900 seconds')
             time.sleep(2)

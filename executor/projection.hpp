@@ -42,6 +42,7 @@ class Projection : public ExecutorBase {
   Projection& operator=(Projection&&) = delete;
   ~Projection() override = default;
 
+  size_t ProjectChunk(const DataChunk& input, DataChunk* destination);
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;

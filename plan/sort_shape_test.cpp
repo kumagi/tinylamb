@@ -226,7 +226,9 @@ TEST_F(SortShapeTest, SpillingSemiAntiJoinCannotElideParentSort) {
                      << "," << reduction);
         QueryMemoryBudget::Global().ResetForTest(1024);
         std::vector<Row> probe;
+        probe.reserve(128);
         std::vector<Row> build;
+        build.reserve(128);
         for (int64_t key = 0; key < 128; ++key) {
           probe.emplace_back(Row({Value(key), Value(std::string(64, 'x'))}));
           if (key % 2 == 0) {

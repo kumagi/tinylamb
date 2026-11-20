@@ -739,6 +739,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     const size_t ncols = spec_.table_schema.ColumnCount();
     std::vector<uint8_t> in_stage1a(ncols, 0);
     std::vector<slot_t> stage1a_cols;
+    stage1a_cols.reserve(spec_.preds.contains_prechecks.size());
     for (const auto& pc : spec_.preds.contains_prechecks) {
       if (in_stage1a[pc.full_col] == 0U) {
         in_stage1a[pc.full_col] = 1;
@@ -764,6 +765,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
       }
     }
     std::vector<slot_t> deferred_sort_cols;
+    deferred_sort_cols.reserve(spec_.sort_specs.size());
     std::vector<uint8_t> is_deferred_sort_col(ncols, 0);
     for (size_t k = 1; k < spec_.sort_specs.size(); ++k) {
       const slot_t kc = spec_.sort_specs[k].full_col;
@@ -781,7 +783,9 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     }
 
     std::vector<slot_t> stage1b_cols;
+    stage1b_cols.reserve(ncols);
     std::vector<uint8_t> stage1b_len_only;
+    stage1b_len_only.reserve(ncols);
     for (size_t c = 0; c < ncols; ++c) {
       if (in_stage1b[c] != 0U) {
         stage1b_cols.push_back(static_cast<slot_t>(c));

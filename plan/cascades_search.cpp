@@ -225,6 +225,7 @@ void PushEquivalenceClass(LogicalProperties& props,
   std::vector<std::string> members(ec.begin(), ec.end());
   std::ranges::sort(members);
   std::string key;
+  key.reserve(members.size());
   for (const std::string& member : members) {
     key += member;
     key += '\x1f';
@@ -263,6 +264,7 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
       std::vector<std::string> members(ec.begin(), ec.end());
       std::ranges::sort(members);
       std::string key;
+      key.reserve(members.size());
       for (const std::string& member : members) {
         key += member;
         key += '\x1f';
@@ -345,6 +347,7 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
         }
         for (const auto& key : child.candidate_keys) {
           std::unordered_set<std::string> mapped;
+          mapped.reserve(key.size());
           for (const auto& member : key) {
             const auto found =
                 std::ranges::find_if(columns, [&](const auto& column) {
@@ -708,37 +711,30 @@ struct PatternMatchDepthGuard {  // NOLINT(cppcoreguidelines-special-member-func
 };
 }  // namespace
 
-bool Pattern::MatchGroup(
-    const Memo& memo,
-    GroupId group,  // NOLINT(misc-no-recursion) // Cascades pattern matching
-                    // recurses over the expression tree by design.
-    Bindings* bindings) const {
+bool Pattern::Capture(GroupId group, Bindings* bindings, CaptureLog* inserted) const {
+  if (capture_.empty()) {
+    return true;
+  }
+  auto [it, added] = bindings->emplace(capture_, group);
+  if (added) {
+    inserted->push_back(&capture_);
+  }
+  return it->second == group;
+}
+
+bool Pattern::MatchGroup(const Memo& memo, GroupId group, Bindings* bindings,
+                         CaptureLog* inserted) const {
   PatternMatchDepthGuard depth_guard;
   if (!depth_guard.entered) {
     return false;
   }
-  if (!capture_.empty()) {
-    auto [iter, inserted] = bindings->emplace(capture_, group);
-    if (!inserted && iter->second != group) {
-      return false;
-    }
-  }
   if (!operation_) {
-    return true;
+    return Capture(group, bindings, inserted);
   }
-  return std::ranges::any_of(
-      memo.Get(group).expressions,
-      [&](const LogicalExpression&
-              expression) {  // NOLINT(misc-no-recursion) // Part of
-                             // Pattern::MatchGroup recursion; bounded by the
-                             // finite memo.
-        Bindings local = *bindings;
-        if (Match(memo, group, expression, &local)) {
-          *bindings = std::move(local);
-          return true;
-        }
-        return false;
-      });
+  return std::ranges::any_of(memo.Get(group).expressions,
+                             [&](const LogicalExpression& expression) {
+    return MatchExpression(memo, group, expression, bindings, inserted);
+  });
 }
 
 bool Pattern::MatchPayload(const Memo& memo,
@@ -779,29 +775,35 @@ bool Pattern::Match(
                     // recurses over the expression tree by design; depth is
                     // bounded by the memo built from a finite query.
     const LogicalExpression& expression, Bindings* bindings) const {
+  CaptureLog inserted;
+  return MatchExpression(memo, group, expression, bindings, &inserted);
+}
+
+bool Pattern::MatchExpression(const Memo& memo, GroupId group,
+                              const LogicalExpression& expression,
+                              Bindings* bindings, CaptureLog* inserted) const {
   if (operation_ && expression.operation != *operation_) {
     return false;
   }
   if (!children_.empty() && children_.size() != expression.children.size()) {
     return false;
   }
-  Bindings local = *bindings;
-  if (!capture_.empty()) {
-    auto [iter, inserted] = local.emplace(capture_, group);
-    if (!inserted && iter->second != group) {
-      return false;
-    }
-  }
-  for (size_t i = 0; i < children_.size(); ++i) {
-    if (!children_[i].MatchGroup(memo, expression.children[i], &local)) {
-      return false;
-    }
-  }
-  if (!MatchPayload(memo, expression, local)) {
+  const size_t checkpoint = inserted->size();
+  if (!Capture(group, bindings, inserted)) {
     return false;
   }
-  *bindings = std::move(local);
-  return true;
+  bool matched = true;
+  for (size_t i = 0; matched && i < children_.size(); ++i) {
+    matched = children_[i].MatchGroup(memo, expression.children[i], bindings, inserted);
+  }
+  if (matched && MatchPayload(memo, expression, *bindings)) {
+    return true;
+  }
+  while (inserted->size() > checkpoint) {
+    bindings->erase(*inserted->back());
+    inserted->pop_back();
+  }
+  return false;
 }
 
 bool Rule::Apply(Memo& memo, GroupId group,
@@ -850,6 +852,7 @@ std::vector<std::string> RuleSet::Names() const {
 
 std::string PhysicalProperties::Key() const {
   std::string key = require_row_position ? "rowpos:1" : "rowpos:0";
+  key.reserve(ordering.size());
   key.append(wait_for_write_intent ? "|wait:1" : "|wait:0");
   for (size_t i = 0; i < ordering.size(); ++i) {
     key.push_back('|');
@@ -889,7 +892,7 @@ std::string PhysicalProperties::Key() const {
   }
   if (join_multiplicity != JoinMultiplicity::kUnknown) {
     key.append("|mult:");
-    key.append(std::to_string(static_cast<int>(join_multiplicity)));
+    AppendInteger(key, static_cast<int>(join_multiplicity));
   }
   if (is_unique) {
     key.append("|uniq:1");
@@ -1328,6 +1331,7 @@ std::optional<BestPlan> SearchEngine::Optimize(
           const std::vector<BestPlan>& children,
           const PhysicalProperties& required, const RuleContext& ctx) {
         std::vector<PlanAlternative> alternatives;
+        alternatives.reserve(implementation_rules.Rules().size());
         for (const ImplementationRule& rule : implementation_rules.Rules()) {
           if (!rule.MayApply(expression.operation)) {
             continue;
@@ -1586,6 +1590,7 @@ SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades
         (expression.operation == LogicalOperator::kAggregation ||
          expression.operation == LogicalOperator::kSort)) {
       std::vector<Expression> keys;
+      keys.reserve(expression.target_list.size());
       if (expression.operation == LogicalOperator::kAggregation) {
         keys = expression.grouping_sets.empty() ? expression.partition_by
                                                 : expression.grouping_sets;

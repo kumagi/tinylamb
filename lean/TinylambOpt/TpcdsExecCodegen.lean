@@ -34,10 +34,7 @@ namespace TinylambOpt
 
 /-- SQL の基準セマンティクス: `v IN (c_1, ..., c_n)` の逐次 OR 評価。
     空リストなら `.tFalse`、非空リストなら `sqlEq v c_1 OR ... OR sqlEq v c_n`。 -/
-def evalInSequential {α : Type} [DecidableEq α] (v : SqlVal α) : List (SqlVal α) → SqlBool
-  | [] => .tFalse
-  | [c] => sqlEq v c
-  | c :: rest => (sqlEq v c).or (evalInSequential v rest)
+abbrev evalInSequential {α : Type} [DecidableEq α] (v : SqlVal α) := evalInList v
 
 /-- バイトコード `BytecodeOp::kInStringSet` / `FlatIntSet` コンパイル時表現:
     非 NULL 定数リスト `nonNulls`（実行時は O(1) フラットハッシュ集合）と `hasNull` フラグ、および元リスト非空フラグ `nonEmpty`。 -/
@@ -109,7 +106,7 @@ theorem in_const_set_3vl_sound {α : Type} [DecidableEq α]
     evalCompiledInConstSet v (compileInConstSet cs) = evalInSequential v cs := by
   cases cs with
   | nil =>
-    simp [compileInConstSet, evalCompiledInConstSet, evalInSequential]
+    simp [compileInConstSet, evalCompiledInConstSet, evalInList]
   | cons c rest =>
     cases v with
     | none =>
@@ -120,12 +117,12 @@ theorem in_const_set_3vl_sound {α : Type} [DecidableEq α]
       | nil =>
         cases c with
         | none =>
-          simp [compileInConstSet, evalCompiledInConstSet, evalInSequential, sqlEq]
+          simp [compileInConstSet, evalCompiledInConstSet, evalInList, sqlEq]
         | some y =>
           by_cases hxy : x = y
           · subst hxy
-            simp [compileInConstSet, evalCompiledInConstSet, evalInSequential, sqlEq]
-          · simp [compileInConstSet, evalCompiledInConstSet, evalInSequential, sqlEq, hxy]
+            simp [compileInConstSet, evalCompiledInConstSet, evalInList, sqlEq]
+          · simp [compileInConstSet, evalCompiledInConstSet, evalInList, sqlEq, hxy]
       | cons d ds ih =>
         have hStep : evalInSequential (some x) (c :: d :: ds) =
             (sqlEq (some x) c).or (evalInSequential (some x) (d :: ds)) := rfl

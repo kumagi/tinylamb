@@ -19,7 +19,7 @@ cd lean
 ~/.elan/bin/lake build
 ```
 
-- `Build completed successfully` と出れば、全ファイル内の `theorem` が **抜け穴（`sorry`）ゼロで全入力パターンに対して数学的に検証済み** です。
+- 既定ターゲットの `CheckProofs` は、インポートされたプロジェクトの定理が直接・間接に `sorryAx` に依存すると失敗します。各定理の保証範囲はその型と仮定で決まります。
 - わざと誤った書き換えルールを `theorem` として書くと、コンパイルが通らず止まります。
 
 ### 2. 反例・書き換え比較デモを実行する
@@ -51,6 +51,7 @@ VS Code 拡張 **`lean4` (`leanprover.lean4`)** を入れて [`./TinylambOpt/`](
    - 可換モノイド集約のバケット分割定理（`aggFold_split_by_key`）と二重走査交換（`aggFold_comm`）
 5. `TinylambOpt/AggJoinDiscovery.lean` — **Step 4-B: Join 越しの多段集約（Eager / Factorized Aggregation）4 候補の発見と証明**
    - **候補1**: 対向側に Unique 制約が無い M:N 結合でも成立する 2 段片側事前集約 ＋ `NULL` キー早期刈り込み（`eager_group_agg_over_mn_join_sound`）とスカラー `COUNT` 空結合 `NULL` バグの修復（`coalesce_sqlSum_eq_countFold`）
+   - この事前集約定理は全域的な可換モノイドを仮定します。C++ の `eager_aggregation_over_join` は途中で失敗し得る `SUM` を対象外とします。未結合キーの具体例は `eager_sum_unmatched_key_overflow` です。
    - **候補2**: M:N 結合の**両側同時事前集約**によるテーブル横断式 `SUM(L.x * R.y)`・`SUM(L.x + R.y)` の分解定理（`dual_eager_cross_expr_over_mn_join_sound`）と `COUNT(*)` 重み付けバグの反例
    - **候補3**: `LEFT OUTER JOIN` 右側の事前集約における `COUNT(*)` の `COALESCE(cnt_star, 1)` 定理（`eager_agg_right_of_left_join_sound`）
    - **候補4**: `Fact ⋈ Dim1 ⋈ Dim2` で Join の段ごとに不要外部キーを消去する 3 段スター・カスケード集約（`star_cascade_two_hop_agg_sound`）
@@ -64,10 +65,10 @@ VS Code 拡張 **`lean4` (`leanprover.lean4`)** を入れて [`./TinylambOpt/`](
    - 集合演算（`intersect_to_semijoin` / `except_to_antijoin` の `DOUBLE NaN` 不整合＆計算式エイリアス誤解決バグを含む 9 ルール）、外部結合結合律・完全外部結合分解・準結合リオーダ（8 ルール）、主キー/一意性による結合・重複消去（`distinct_eager_over_join` の対向側自己等号バグを含む 7 ルール）、等価クラス・冗長等号消去（`redundant_join_predicate_elimination` の自己等号 `x = x` 誤削除バグ・`in_list_to_semi_join` の `;` タグ衝突バグを含む 5 ルール）、Sort/Limit 合成（`eliminate_sort_under_unordered_consumer` の `HAVING` 消失＆入れ子 `STRING_AGG` 見逃しバグを含む 3 ルール）、および三値論理スカラー式（`XOR` / `NOT IN (..., NULL)` / `IS TRUE = FALSE` / `COALESCE` / `NULLIF` 等 12 ルール）を機械証明
 9. `TinylambOpt/WindowTopNDecorrelate.lean` — **Step 8: Window / Sort / Limit / TopN / 相関除去 / Unnest / 再帰CTE / SARGable 境界の監査（第 3 弾前半）**
    - Window 関数代数（`push_selection_through_window` の混在 `PARTITION BY` バグ、`split_window` の非連続列順スワップバグ＆`Memo::groups_` 再確保ダングリング参照バグ、`no_op_window_elimination` の `SELECT *` / 修飾列見落としバグ、`limit_prefix_{unordered,ordered}_window`）、安定ソート・TopN 押し下げ（`sort_merge_of_compatible_orders` 双方向、`union_all_push_limit`、`topn_push_through_union_all`、`push_limit_through_left_join`、`topn_push_through_proven_one_to_one_join`）、`TryDecorrelate` / `DecorrelateOneLateralSource`（`SELECT *` 幽霊列混入バグ） / `MergeCompatibleUnionBranches`、`unnest_filter_pushdown`（既定列 `unnest`・空配列例外バグ）、`recursive_termination_predicate_pushdown`、`cast_pushdown_on_comparison`、`extract_year_sargable` 全 9 方向、`dynamic_filter_pushdown_join`（派生サブプラン消去バグ）、および `ParameterSlot` 定数凍結ガードを完全証明
-10. `TinylambOpt/ScalarOverflowAndCoreAlgebra.lean` — **Step 9: コア関係代数・`INT64` オーバーフロー境界・スカラ式 3 値エラー保存の網羅証明（第 3 弾後半：Cascades 91/91 = 100% 達成！）**
+10. `TinylambOpt/ScalarOverflowAndCoreAlgebra.lean` — **Step 9: コア関係代数・`INT64` オーバーフロー境界・スカラ式 3 値エラー保存の網羅証明（第 3 弾後半。登録ルールの現行一覧は `docs/optimizer_rule_audit.md` を参照）**
    - コア関係代数（Join 交換・結合・列挙、Selection 分割・押し下げ、Projection 合成・透過、`push_projection_through_aggregation` の `HAVING` 列刈り落としバグ、`InferJoinConstants` / `InferJoinInequalities` / `PropagateEqualityConstants` の IEEE-754 $2^{53}$ `INT64`/`DOUBLE` 非推移性バグ）
    - 符号付き 64-bit 整数 (`INT64`) の厳密オーバーフロー検査付き再結合 4 ルール・符号正規化・二重否定・ビット反転・`abs(abs(x))` の全 $2^{64}$ 領域＋例外一致証明
-   - 短絡エラー非対称性（`boolean_identity`）、`NaN` 対応 `FlipComparison`、`CASE`/`IF` 分配、`IN`/`LIKE`、`inner_join_not_null_inference` の値文脈反例とフィルタ文脈健全性を証明（`expression/rewrite.cpp` 68/71 = 95.8% カバー）
+   - 短絡エラー非対称性（`boolean_identity`）、`NaN` 対応 `FlipComparison`、`CASE`/`IF` 分配、`IN`/`LIKE`、`inner_join_not_null_inference` の値文脈反例とフィルタ文脈健全性を証明。`FloatIdentities.lean` は、表現可能な値の丸めがその値を保つという仮定の下で、DOUBLE の 1 除算と、数値を FLOAT64 に変換した後の 1 乗が符号付きゼロ・無限大・NaN・NULL・先行エラーを保存することを証明します。C++ の型変換と libm は証明の対象外です。
 11. `TinylambOpt/TpcdsDiscovery.lean` — **Step 10: TPC-DS クエリ群に向けた新規アグレッシブ最適化ルール 6 系統の探索と証明**
     - 実測 SF=1 ベンチマーク（Q76, Q65, Q4/Q11/Q74, Q5/Q75, Q72/Q78, Q38/Q87/Q97）のボトルネックに対する 6 系統の書き換え定理と 7 つの三値論理・NULL・空集合トラップ反例を `sorry` ゼロで完全証明
 12. `TinylambOpt/ClickBenchDiscovery.lean` — **Step 11: ClickBench（全 43 クエリ・1 億行単一ワイド表）向け新規最適化ルール 6 系統の探索と証明**
@@ -92,7 +93,13 @@ VS Code 拡張 **`lean4` (`leanprover.lean4`)** を入れて [`./TinylambOpt/`](
     - 統計で返す最小値・最大値・件数、ブロック範囲とフィンガープリントによる除外、重複候補を保持するビット演算、保存した選択行を再利用した場合の同値性を証明。
 22. `TinylambOpt/DelimitedCaptureJit.lean` — 貪欲なオプション接頭辞の展開、最初の区切りによるキャプチャ、範囲のビットパックの同値性。
 23. `TinylambOpt/SimdGroupHash.lean` — ハッシュのレーン単位同値性、UTC 時・分の読み出し、文字列フィンガープリントの境界、重複候補リプレイの位置・タグの保存。
-24. `Main.lean` — 具体的な行データで反例と新ルール・C++ バグ監査・TPC-DS / ClickBench / TPC-H SF=10 探索デモを確認する実行エントリポイント
+24. `TinylambOpt/TpcdsNextDiscovery.lean` — **Step 16: DuckDB の TPC-DS プラン比較から導いた次世代アグレッシブルルール A〜E の形式的正当化**
+    - A: ROLLUP 階層の状態再利用（`rollup_two_level_state_combine_sound` / `rollup_three_level_state_combine_sound`、Q67 の集約入力 4.87M → ~1M を狙う。DOUBLE の加算順序と `COUNT` の空集合トラップは反例として固定）
+    - B: outer / USING 配下の内側 inner プレフィックス並べ替え（`using_join_inner_prefix_reorder_and_filter_sound` / `outer_and_using_join_prefix_reorder_sound`、Q72）
+    - C: 等価キー経由の動的フィルタ移送（`filter_transfer_preserves_matches` / `filter_transfer_two_hop_preserves_matches` / `transfer_filter_through_dimension_sound`、Q72/Q78/Q23。上位集合性だけを要求し、NULL/NaN 安全）
+    - D: 共有 CTE の述語和押し込みと実体化判断（`shared_cte_disjunct_pushdown_sound` / `cte_materialize_halves_body_evaluations`、非決定的本体の inline は `cte_volatile_inline_unsound` で反例固定）
+    - E: 外部結合前のチャネル別事前集約（`eager_channel_preagg_before_left_join_sound`、次元キー一意が必須なことを `eager_channel_preagg_requires_unique_dimension` で固定）
+25. `Main.lean` — 具体的な行データで反例と新ルール・C++ バグ監査・TPC-DS / ClickBench / TPC-H SF=10 探索デモを確認する実行エントリポイント
 
 ## C++ コード側の対応コメント規約
 

@@ -143,6 +143,15 @@ tests (added via `add_replay_test`) instead link `tinylamb::sql` /
   `query/testdata/ooc_regressions/`).
   Logic bugs (wrong results), not just crashes, fail the run; run them long
   after touching optimizer/executor/expression code.
+- `.fuzz_findings/` (and `.fuzz_findings_small/`) is an add-only store:
+  `scripts/oci_fuzz.sh collect|deploy` and `scripts/oci_small_fuzz.sh collect`
+  merge remote findings into it and never delete or overwrite a local file.
+  Remove a finding only after you have verified the bug is absent or turned
+  it into a committed regression test, and only via
+  `python3 scripts/fuzz_collector.py --findings-dir .fuzz_findings --retire <id>...
+  --reason {bug-absent,regression-test} --evidence "<test name / replay cmd>"`
+  (`--retire-bug-id` retires every record of a bug_id); it logs to
+  `retired.jsonl`. Never `rm` files there by hand.
 - Out-of-Core bug hunting: `sql_ooc_fuzzer` (`query/sql_ooc_fuzzer.*`,
   `query/sql_ooc_query_gen.*`) shrinks the memory knobs so a few MiB of data
   is many times the buffer pool, then holds the engine to exact results with

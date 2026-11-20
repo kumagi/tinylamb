@@ -973,6 +973,7 @@ TEST_F(QueryTest, BatchInsertChunking) {
 
   // Construct a large batch INSERT statement with 150 rows (> 2 chunks of 64)
   std::string sql = "INSERT INTO batch_tbl VALUES ";
+  sql.reserve(150);
   for (int i = 0; i < 150; ++i) {
     if (i > 0) {
       sql += ", ";
@@ -1577,6 +1578,7 @@ TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
       {Value(4), Value(100), Value(4), Value(1.0)}};
   const auto mirror = [&](const std::string& sql_extra, int comparison) {
     std::vector<std::pair<int64_t, int64_t>> expected;
+    expected.reserve(probe_left.size() * probe_right.size());
     for (const Row& l : probe_left) {
       for (const Row& r : probe_right) {
         if (l[0].value.int_value != r[0].value.int_value) {
@@ -1625,6 +1627,7 @@ TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
   // key order and returned nothing here.)
   {
     std::vector<std::pair<int64_t, int64_t>> expected;
+    expected.reserve(probe_left.size() * probe_right.size());
     for (const Row& l : probe_left) {
       for (const Row& r : probe_right) {
         if (l[0].value.int_value == r[0].value.int_value &&
@@ -1645,6 +1648,7 @@ TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
   // the key prefix both decline, so the whole predicate decides the rows.
   {
     std::vector<std::pair<int64_t, int64_t>> expected;
+    expected.reserve(probe_left.size() * probe_right.size());
     for (const Row& l : probe_left) {
       for (const Row& r : probe_right) {
         if (l[0].value.int_value == r[0].value.int_value &&
@@ -1712,6 +1716,7 @@ TEST_F(QueryTest, CompositeIndexLookupJoinIntervalProbe) {
                                {Value(3), Value(21)}, {Value(3), Value(30)}};
   const auto mirror = [&](bool lower_inclusive, bool upper_inclusive) {
     std::vector<std::pair<int64_t, int64_t>> expected;
+    expected.reserve(left.size() * right.size());
     for (const Row& l : left) {
       for (const Row& r : right) {
         if (l[0].value.int_value != r[0].value.int_value) {

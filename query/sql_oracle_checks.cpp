@@ -37,6 +37,7 @@ namespace {
 std::vector<MirrorRow> MirrorFromSetup(const std::vector<std::string>& setup,
                                        const std::string& table) {
   std::vector<MirrorRow> mirror;
+  mirror.reserve(setup.size());
   // Only the base table feeds the mirror: sibling tables (e.g. the `_s`
   // copy used by the set-operation oracle) share the schema but not the
   // probe's FROM clause.
@@ -50,7 +51,9 @@ std::vector<MirrorRow> MirrorFromSetup(const std::vector<std::string>& setup,
       continue;
     }
     std::vector<std::string> fields;
+    fields.reserve(sql.size() - open);
     std::string cur;
+    cur.reserve(sql.size() - open);
     bool in_quote = false;
     for (size_t i = open + 1; i < sql.size(); ++i) {
       const char c = sql[i];
@@ -611,6 +614,7 @@ bool CheckTlp(Database& db, TransactionContext& ctx,
   std::vector<std::string> s2 = SerializeSorted(*r2);
   std::vector<std::string> s3 = SerializeSorted(*r3);
   std::vector<std::string> merged = s1;
+  merged.reserve(s1.size() + s2.size() + s3.size());
   merged.insert(merged.end(), s2.begin(), s2.end());
   merged.insert(merged.end(), s3.begin(), s3.end());
   std::sort(merged.begin(), merged.end());
@@ -1402,6 +1406,7 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
     return sql;
   };
   std::vector<std::pair<std::string, std::vector<std::string>>> baseline;
+  baseline.reserve(t.window_probes.size());
   std::string error;
   for (const std::string& spec : t.window_probes) {
     int kind = 0;
@@ -1427,6 +1432,7 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
       continue;
     }
     std::vector<std::string> rendered;
+    rendered.reserve(rows->size());
     const std::map<int64_t, int64_t> expected =
         WindowModel(mirror, kind, p1, p2, arg, part, flags, def);
     for (const Row& r : *rows) {
@@ -1452,6 +1458,7 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
   // Reversed physical order.
   TransactionContext ctx2 = db.BeginContext();
   std::vector<std::string> inserts;
+  inserts.reserve(t.setup.size());
   for (const std::string& sql : t.setup) {
     if (sql.starts_with("INSERT ")) {
       inserts.push_back(substitute(sql));
@@ -1490,6 +1497,7 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
         continue;
       }
       std::vector<std::string> got;
+      got.reserve(rows->size());
       for (const Row& r : *rows) {
         got.push_back(std::to_string(CellInt(r[0])) + "=" +
                       std::to_string(CellInt(r[1])));
@@ -1548,6 +1556,7 @@ bool CheckSkip(Database& db, TransactionContext& ctx, const OracleTrace& t,
     return true;
   }
   std::vector<std::pair<std::string, std::string>> before;
+  before.reserve(t.skip_probes.size());
   for (const std::string& probe : t.skip_probes) {
     auto out = render(ctx, substitute(probe));
     if (!out.has_value()) {

@@ -322,6 +322,18 @@ class PageManager {
       page_id_t tree_id, std::string_view begin, std::string_view end,
       bool ascending, const Transaction* reader = nullptr,
       Status* status_out = nullptr) const;
+
+  // Lazy ascending variant of LsmScanRange: takes the same one-shot
+  // visibility snapshot at open time, then yields resolved live
+  // (key, value) pairs on demand so early-terminating consumers (LIMIT
+  // pushdown) never materialize the whole range. The emitted sequence is
+  // identical to draining LsmScanRange(..., ascending=true, ...). The
+  // returned cursor owns a duplicated LSM file descriptor, so it stays
+  // readable across LSM file-generation rotation; `reader` provides the
+  // same MVCC/transaction-local visibility rules as LsmScanRange.
+  std::unique_ptr<LsmScanCursor> OpenLsmScanCursor(
+      page_id_t tree_id, std::string_view begin, std::string_view end,
+      const Transaction* reader = nullptr) const;
   Status LsmDestroy(Transaction& txn, page_id_t tree_id);
 
   // Transaction lifecycle hooks (commit baseline promotion & in-memory undo).
@@ -471,6 +483,15 @@ class PageManager {
                                           std::string_view key,
                                           std::string* value_out,
                                           lsn_t* lsn_out = nullptr) const;
+  // Committed-source lookup used by the lazy scan cursor's open-time
+  // resolution of foreign-owned uncommitted memtable keys: checks
+  // committed_mem -> immutable_mem -> disk runs (newest first) and reports
+  // the winning entry including tombstones. Returns false when no committed
+  // source holds `key`.
+  StatusOr<bool> LsmLookupCommittedBaselineLocked(const LsmTreeState& tree,
+                                                  std::string_view key,
+                                                  std::string* value_out,
+                                                  bool* deleted_out) const;
   Status FlushTreeCommittedMemToDisk(page_id_t tree_id, LsmTreeState* tree);
   Status CompactTreeRunsToDisk(page_id_t tree_id, LsmTreeState* tree,
                                bool drop_tombstones);

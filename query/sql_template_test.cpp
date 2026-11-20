@@ -1013,6 +1013,7 @@ TEST(SqlTemplateTest, BindsCachedMergeTree) {
       "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (9, 'ins');");
   ASSERT_EQ(templated.parameters.size(), 5U);
   std::vector<Value> rebound;
+  rebound.reserve(templated.parameters.size());
   for (const Value& v : templated.parameters) {
     if (v.IsNull()) {
       rebound.emplace_back(int64_t{0});

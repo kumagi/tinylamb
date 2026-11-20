@@ -924,6 +924,7 @@ TEST(CascadesTest, LimitPrefixThroughUnorderedWindowFires) {
   // registers the relation in the join graph.
   (void)memo.Build({"t1"});
   std::vector<Row> wide_rows;
+  wide_rows.reserve(1000);
   for (int64_t i = 1; i <= 1000; ++i) {
     wide_rows.push_back(Row({Value(i), Value(int64_t{i % 5})}));
   }
@@ -3122,12 +3123,12 @@ TEST(CascadesTest, HavingExtremumBoundPushdownFiresForIntAndRefusesDoubleNaN) {
     const GroupId having_group = memo.EnsureDerivedGroup({"t1"}, "having");
     memo.AddExpression(
         having_group,
-        LogicalExpression{.operation = LogicalOperator::kSelection,
-                          .children = {agg_group},
-                          .predicate = BinaryExpressionExp(
-                              ColumnValueExp(ColumnName("", "mx")),
-                              BinaryOperation::kGreaterThan,
-                              ConstantValueExp(bound_val))});
+        LogicalExpression{
+            .operation = LogicalOperator::kSelection,
+            .children = {agg_group},
+            .predicate = BinaryExpressionExp(
+                ColumnValueExp(ColumnName("", "mx")),
+                BinaryOperation::kGreaterThan, ConstantValueExp(bound_val))});
     SearchEngine search(std::move(memo), RuleSet::Default());
     search.Explore(having_group);
     return std::ranges::any_of(
@@ -3216,7 +3217,7 @@ TEST(CascadesTest, OuterToInnerOnHavingDemotesStrictAggAndRefusesCountStar) {
   EXPECT_FALSE(run_test(/*include_count_star=*/true));
 }
 
-TEST(CascadesTest, EagerAggregationOverJoinPushesTwoStagePreAgg) {
+static bool OffersEagerAggregation(AggregationType aggregate) {
   Memo memo;
   const GroupId join_root = memo.Build(
       {"sales", "dept"}, {{BinaryExpressionExp(ColumnValueExp("sales.dept_id"),
@@ -3237,9 +3238,9 @@ TEST(CascadesTest, EagerAggregationOverJoinPushesTwoStagePreAgg) {
           .children = {join_root},
           .target_list =
               {NamedExpression("region", ColumnValueExp("dept.region")),
-               NamedExpression("total", AggregateExpressionExp(
-                                            AggregationType::kSum,
-                                            ColumnValueExp("sales.amt"))),
+               NamedExpression("measure",
+                               AggregateExpressionExp(
+                                   aggregate, ColumnValueExp("sales.amt"))),
                NamedExpression("n", AggregateExpressionExp(
                                         AggregationType::kCount, nullptr))},
           .grouping_sets = {ColumnValueExp("dept.region")}});
@@ -3267,7 +3268,15 @@ TEST(CascadesTest, EagerAggregationOverJoinPushesTwoStagePreAgg) {
                          .tag.starts_with("eager_pre_agg:");
             });
       });
-  EXPECT_TRUE(found_two_stage);
+  return found_two_stage;
+}
+
+TEST(CascadesTest, EagerAggregationOverJoinPushesTwoStagePreAgg) {
+  EXPECT_TRUE(OffersEagerAggregation(AggregationType::kMax));
+}
+
+TEST(CascadesTest, EagerAggregationSkipsSumEvenWithUniqueJoinPartner) {
+  EXPECT_FALSE(OffersEagerAggregation(AggregationType::kSum));
 }
 
 TEST(CascadesTest, OuterJoinRightSelfEqualityDoesNotCertifyLeftCandidateKey) {

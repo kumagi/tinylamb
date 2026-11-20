@@ -42,6 +42,11 @@ using CustomPlanLowerer =
 
 struct PipelineLoweringOptions {
   bool apply_post_distinct{false};
+  // Positional columns forming the post-distinct duplicate key. Empty means
+  // the whole row is the key; a non-empty prefix (e.g. the visible select
+  // list when hidden ORDER BY carriers trail it) dedupes on those columns
+  // only while the full row still flows to the sort/limit stages.
+  std::vector<slot_t> post_distinct_key_cols;
   std::vector<OocSortSink::KeySpec> post_sort_keys;
   std::optional<size_t> post_limit;
   size_t post_offset{0};

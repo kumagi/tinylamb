@@ -529,7 +529,11 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
         if ((flags & platform::kPollReadable) != 0U ||
             ((flags & platform::kPollPeerClosed) != 0U &&
              !clients_.at(fd).read_query_in_flight)) {
-          alive = ReadClient(fd);
+          try {
+            alive = ReadClient(fd);
+          } catch (const std::bad_alloc&) {
+            alive = false;
+          }
         }
         if (alive && clients_.contains(fd) &&
             (flags & platform::kPollWritable) != 0U) {
@@ -2472,47 +2476,43 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
   // [TEMP] CONSTANT).  Missing a spelling here offloads a later all-SELECT
   // message to a worker whose thread-local registries never saw the object.
   static bool RegistersTempObject(std::string_view sql) {
-    std::vector<std::string> words;
+    std::array<std::string_view, 6> words;
+    size_t count = 0;
     sql = StripLeadingComments(sql);
     size_t pos = sql.find_first_not_of(" \t\r\n");
-    while (pos != std::string_view::npos && words.size() < 6) {
+    while (pos != std::string_view::npos && count < words.size()) {
       const size_t end = sql.find_first_of(" \t\r\n", pos);
-      std::string word(sql.substr(
-          pos, end == std::string_view::npos ? sql.size() - pos : end - pos));
-      for (char& c : word) {
-        c = AsciiToUpper(c);
-      }
-      words.push_back(std::move(word));
+      words[count++] = sql.substr(pos, end - pos);
       pos = sql.find_first_not_of(" \t\r\n", end);
     }
-    if (words.empty() || words[0] != "CREATE") {
+    if (count == 0 || !IdentifierEquals(words[0], "CREATE")) {
       return false;
     }
     size_t index = 1;
-    if (index < words.size() && words[index] == "OR") {
-      if (++index >= words.size() || words[index] != "REPLACE") {
+    if (index < count && IdentifierEquals(words[index], "OR")) {
+      if (++index >= count || !IdentifierEquals(words[index], "REPLACE")) {
         return false;
       }
       ++index;
     }
     // "CREATE TEMP VIEW" / "CREATE TEMPORARY AGGREGATE FUNCTION ..." land in
     // the same thread-local tables; skip the location modifiers.
-    while (index < words.size() &&
-           (words[index] == "TEMP" || words[index] == "TEMPORARY")) {
+    while (index < count &&
+           (IdentifierEquals(words[index], "TEMP") || IdentifierEquals(words[index], "TEMPORARY"))) {
       ++index;
     }
-    if (index < words.size() && words[index] == "AGGREGATE") {
+    if (index < count && IdentifierEquals(words[index], "AGGREGATE")) {
       ++index;
     }
-    if (index >= words.size()) {
+    if (index >= count) {
       return false;
     }
-    if (words[index] == "VIEW" || words[index] == "FUNCTION" ||
-        words[index] == "CONSTANT") {
+    if (IdentifierEquals(words[index], "VIEW") || IdentifierEquals(words[index], "FUNCTION") ||
+        IdentifierEquals(words[index], "CONSTANT")) {
       return true;
     }
-    return words[index] == "TABLE" && index + 1 < words.size() &&
-           words[index + 1] == "FUNCTION";
+    return IdentifierEquals(words[index], "TABLE") && index + 1 < count &&
+           IdentifierEquals(words[index + 1], "FUNCTION");
   }
 
   void EnqueueSqlTask(ReadTask task) {
@@ -2640,6 +2640,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     session->reply_durability_target = 0;
     session->transaction = std::move(client.transaction);
     session->transaction_status = client.transaction_status;
+    session->open_block_has_ddl = std::exchange(client.open_block_has_ddl, false);
     session->plan_cache = std::move(client.plan_cache);
     client.read_query_in_flight = true;
     client.read_started_at = std::chrono::steady_clock::now();
@@ -2654,7 +2655,11 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
   }
 
   void ScheduleSessionCleanup(std::unique_ptr<Client> session) {
-    if (!session || !session->transaction) {
+    if (!session) {
+      return;
+    }
+    EndOpenBlockDdl(*session);
+    if (!session->transaction) {
       return;
     }
     EnqueueSqlTask({.client_fd = -1,
@@ -3339,6 +3344,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
         }
         client.transaction = std::move(completion.session->transaction);
         client.transaction_status = completion.session->transaction_status;
+        client.open_block_has_ddl = std::exchange(completion.session->open_block_has_ddl, false);
         client.output_overflow |= completion.session->output_overflow;
         if (!completion.active_stream && completion.session->active_stream) {
           completion.active_stream =
@@ -3454,6 +3460,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     if (found == clients_.end()) {
       return;
     }
+    EndOpenBlockDdl(found->second);
     CleanupActiveStream(found->second);
     if (found->second.session_has_temp_objects) {
       // These registries are thread-local on the event-loop thread; a

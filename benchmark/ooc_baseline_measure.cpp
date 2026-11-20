@@ -129,6 +129,7 @@ int main() {
     // Load 50,000 rows in batches to measure storage + query + RSS delta.
     for (int b = 0; b < 50; ++b) {
       std::string ins = "INSERT INTO t VALUES ";
+      ins.reserve(1000);
       for (int i = 0; i < 1000; ++i) {
         const int64_t id = (static_cast<int64_t>(b) * 1000) + i;
         if (i > 0) {

@@ -68,7 +68,7 @@ int SortedRun::Entry::Compare(std::string_view rhs,
   return my_key_bytes.compare(rhs);  // neg/0/pos like string_view::compare
 }
 
-std::string SortedRun::Entry::BuildKey(const std::vector<char>& blob) const {
+std::string_view SortedRun::Entry::KeyView(const std::vector<char>& blob) const {
   if (static_cast<size_t>(key_offset_) + sizeof(uint32_t) > blob.size()) {
     return {};
   }
@@ -80,6 +80,10 @@ std::string SortedRun::Entry::BuildKey(const std::vector<char>& blob) const {
                                 sizeof(uint32_t));
   }
   return {blob.data() + key_offset_ + sizeof(uint32_t), len};
+}
+
+std::string SortedRun::Entry::BuildKey(const std::vector<char>& blob) const {
+  return std::string(KeyView(blob));
 }
 
 Row SortedRun::Entry::BuildRow(const std::vector<char>& blob,

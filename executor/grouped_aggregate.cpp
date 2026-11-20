@@ -212,6 +212,7 @@ std::vector<const AggregateExpression*> AggregateNodes(
 // uses ('\0' never collides with a real encoding prefix).
 size_t PartitionOf(const std::vector<Value>& key, size_t partitions) {
   std::string encoded;
+  encoded.reserve(key.size());
   for (const Value& value : key) {
     if (value.IsNull()) {
       encoded.push_back('\0');
@@ -492,18 +493,16 @@ HashAggregateExecutor::HashAggregateExecutor(
 
 Status HashAggregateExecutor::AccumulateRow(AggregateGroupTable* table,
                                             const Row& row) {
-  std::vector<Value> scratch;
   RETURN_IF_FAIL(
-      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &scratch));
-  ASSIGN_OR_RETURN(size_t, group, table->FindOrCreate(scratch));
+      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &serial_key_scratch_));
+  ASSIGN_OR_RETURN(size_t, group, table->FindOrCreate(serial_key_scratch_));
   return table->Accumulate(group, row);
 }
 
 Status HashAggregateExecutor::AppendToPartition(const Row& row) {
-  std::vector<Value> scratch;
   RETURN_IF_FAIL(
-      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &scratch));
-  return partitions_[PartitionOf(scratch, partitions_.size())].Append(row);
+      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &serial_key_scratch_));
+  return partitions_[PartitionOf(serial_key_scratch_, partitions_.size())].Append(row);
 }
 
 Status HashAggregateExecutor::StartPartitioning(const std::vector<Row>& rows) {
@@ -540,10 +539,11 @@ void HashAggregateExecutor::NoteResidentGroups(
 
 Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
                                                    const DataChunk& chunk) {
+  std::vector<Value> scratch;
+  scratch.reserve(key_offsets_.size());
   for (size_t row = 0; row < chunk.Size(); ++row) {
     const Row image = chunk.RowAt(row);
-    std::vector<Value> scratch;
-    scratch.reserve(key_offsets_.size());
+    scratch.clear();
     for (const std::optional<slot_t>& offset : key_offsets_) {
       if (!offset.has_value()) {
         return StatusError(StatusCode::kInvalidArgument,
@@ -842,11 +842,11 @@ Status SortAggregateExecutor::Build() {
                                      /*worker_count=*/1, sort_options);
   sorted_ = true;
   DataChunk batch;
+  std::vector<Value> scratch;
   while (sorter_->NextBatch(&batch) != 0) {
     input_rows_ += batch.Size();
     for (size_t row = 0; row < batch.Size(); ++row) {
       const Row image = batch.RowAt(row);
-      std::vector<Value> scratch;
       RETURN_IF_FAIL(EvaluateKeys(group_keys_, input_schema_, key_offsets_,
                                   image, &scratch));
       const Row key(scratch);
@@ -954,11 +954,11 @@ Status StreamAggregateExecutor::EmitGroup() {
 
 Status StreamAggregateExecutor::Build() {
   DataChunk batch;
+  std::vector<Value> scratch;
   while (child_->NextBatch(&batch) != 0) {
     input_rows_ += batch.Size();
     for (size_t row = 0; row < batch.Size(); ++row) {
       const Row image = batch.RowAt(row);
-      std::vector<Value> scratch;
       RETURN_IF_FAIL(EvaluateKeys(group_keys_, input_schema_, key_offsets_,
                                   image, &scratch));
       const Row key(scratch);

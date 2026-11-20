@@ -26,7 +26,7 @@ graph TD
 3. **Top-N キーの局所性**: `topn_keys` が参照するすべての列が修飾済みかつ押し込み側リレーション `pushed_rel` のみに属すること。
 4. **対向側の一意・NOT NULL 性（高々 1 件の証明）**: `other_id` の `LogicalProperties::IsUniqueOn(other_join_cols)` と全結合キーの `IsNotNull` が成り立つこと（NULL 同士は一致せず、nullable UNIQUE は複数行になり得るため一意性だけでは不足）。
 5. **少なくとも 1 件一致の証明**: `memo.IsProvenOneToOne(pushed_rel, other_rel)` が真であるか、または `pushed_id` 側の結合キー列が `other_rel` の同キーを参照する `Constraint::kForeign` を持ち、かつ押し込み側キー列も `IsNotNull` であること（NULL キーは外部キー参照先があっても一致せず 0 行になるため NOT NULL が必須）。
-6. **対向側グループに scan filter がないこと**（FK フォールバックのみ）: `memo.Get(other_id).filter` が空であること。カタログの `Constraint::kForeign` 宣言は「参照先の行が存在する」ことだけを保証し、参照整合検査自体は未実装（`type/constraint.hpp` の `kForeign` は "Won't implemented"）であるため、オプティマイザはデータを見ずにこの証明を信用します。一方 `WHERE b.v > 5` のような単一リレーション述語は `push_selection_through_join` が対向側グループの scan filter にmergeしてしまうため、FK が保証する「ちょうど 1 行」をフィルタが落とし得ます。その場合、上位 `limit + offset` に入った押し込み側の行は素の結合では脱落する行を出力してしまいます。スナップショット証明（`MarkProvenOneToOneJoins`）は探索より前にスキャンを行いデータで包含を検証する代替経路であり、そちらの述語ゲート（後述）が同じ落とし穴を防ぎます。
+6. **対向側グループに scan filter がないこと**（FK フォールバックのみ）: `memo.Get(other_id).filter` が空であること。カタログの `Constraint::kForeign` 宣言は「参照先の行が存在する」ことだけを保証し、DML 時の検査は `executor/foreign_key.hpp` に実装されています。この証明は対向側フィルタを通過することまで保証しません。一方 `WHERE b.v > 5` のような単一リレーション述語は `push_selection_through_join` が対向側グループの scan filter にmergeしてしまうため、FK が保証する「ちょうど 1 行」をフィルタが落とし得ます。その場合、上位 `limit + offset` に入った押し込み側の行は素の結合では脱落する行を出力してしまいます。スナップショット証明（`MarkProvenOneToOneJoins`）は探索より前にスキャンを行いデータで包含を検証する代替経路であり、そちらの述語ゲート（後述）が同じ落とし穴を防ぎます。
 
 ## 意味論的根拠（D5）
 

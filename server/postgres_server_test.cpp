@@ -307,6 +307,7 @@ TEST(PostgresServerTest, ExecutesIndependentReadsConcurrently) {
     close(setup);
 
     std::vector<int> clients;
+    clients.reserve(8);
     for (size_t i = 0; i < 8; ++i) {
       const int client = ConnectClient(server.BoundPort());
       ASSERT_GE(client, 0);
@@ -1812,6 +1813,7 @@ TEST(PostgresServerTest, ConcurrentWriteTransactionsOverTcp) {
     // Act -- four sessions each hold an open write transaction at the same
     // time and commit after all of them have inserted.
     std::vector<int> clients;
+    clients.reserve(4);
     for (size_t i = 0; i < 4; ++i) {
       const int client = ConnectClient(server.BoundPort());
       ASSERT_GE(client, 0);
@@ -2328,6 +2330,38 @@ TEST(PostgresServerTest, GssEncRequestDeclinedThenNormalStartup) {
   CHECK(database_holder != nullptr);
   Database& database = *database_holder;
   database.DeleteAll();
+}
+
+TEST(PostgresServerTest, DisconnectReleasesOpenDdlBlock) {
+  const std::string path = "postgres_server_ddl_disconnect-" + RandomString();
+  {
+    PostgresServerOptions options;
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string error;
+    ASSERT_TRUE(server.Listen(&error)) << error;
+    std::jthread worker([&] { server.Run(&error); });
+    StopGuard stop_guard{&server};
+    const int first = ConnectClient(server.BoundPort());
+    ASSERT_GE(first, 0);
+    ASSERT_TRUE(SendAll(first, QueryMessage("BEGIN")));
+    ASSERT_NE(ReadUntilReady(first).find("BEGIN"), std::string::npos);
+    ASSERT_TRUE(SendAll(first, QueryMessage("CREATE TABLE abandoned (k INT64)")));
+    ASSERT_NE(ReadUntilReady(first).find("CREATE TABLE"), std::string::npos);
+    close(first);
+    const int next = ConnectClient(server.BoundPort());
+    ASSERT_GE(next, 0);
+    std::string reply;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      ASSERT_TRUE(SendAll(next, QueryMessage("CREATE TABLE after_close (k INT64)")));
+      reply = ReadUntilReady(next);
+      if (reply.find("55006") == std::string::npos) { break; }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_NE(reply.find("CREATE TABLE"), std::string::npos);
+    close(next);
+  }
+  Database::Create(path).MoveValue()->DeleteAll();
 }
 
 TEST(PostgresServerTest, MultiStatementDdlInsertSelectOverTcp) {

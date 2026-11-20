@@ -258,6 +258,14 @@ int Dup2(int oldfd, int newfd) {
 #endif
 }
 
+int Dup(int fd) {
+#ifdef TINYLAMB_OS_WINDOWS
+  return ::_dup(fd);
+#else
+  return ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+#endif
+}
+
 ssize_t Write(int fd, const void* buf, size_t count) {
 #ifdef TINYLAMB_OS_WINDOWS
   const auto capped = static_cast<unsigned int>(

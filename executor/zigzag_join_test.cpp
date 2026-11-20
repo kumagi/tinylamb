@@ -192,6 +192,7 @@ TEST(ZigZagJoinTest, EveryIntegerRangeMatchesNestedLoopSemantics) {
        {BinaryOperation::kLessThan, BinaryOperation::kLessThanEquals,
         BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals}) {
     std::vector<Row> expected_rows;
+    expected_rows.reserve(left_rows.size() * right_rows.size());
     for (const Row& left_row : left_rows) {
       if (left_row[0].IsNull()) {
         continue;

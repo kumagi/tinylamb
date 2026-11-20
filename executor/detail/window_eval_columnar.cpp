@@ -862,6 +862,7 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
         }));
         for (size_t step = 1; step < sort_workers; step *= 2) {
           std::vector<std::pair<size_t, size_t>> merges;
+          merges.reserve(sort_workers);
           for (size_t w = 0; w + step < sort_workers; w += 2 * step) {
             const size_t lo = n * w / sort_workers;
             const size_t hi =
@@ -908,11 +909,11 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
     };
     const auto run_partitioned_buckets = [&]<size_t kBuckets>() -> Status {
       const size_t scatter_workers =
-          n < 8192 ? 1
-                   : std::min<size_t>(
-                         {8, n / 4096,
-                          QueryParallelWorkerLimit(
-                              std::thread::hardware_concurrency())});
+          n < 8192
+              ? 1
+              : std::min<size_t>({8, n / 4096,
+                                  QueryParallelWorkerLimit(
+                                      std::thread::hardware_concurrency())});
       std::vector<std::array<std::vector<FlatBucketItem>, kBuckets>>
           worker_buckets(scatter_workers);
       const size_t approx =
@@ -931,22 +932,21 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
           if (!has_order) {
             for (size_t r = begin; r < end; ++r) {
               const int64_t pk = pvals[r];
-              const size_t b =
-                  static_cast<size_t>(SplitMix64Window(static_cast<uint64_t>(pk))) &
-                  (kBuckets - 1);
-              wb[b].push_back(FlatBucketItem{
-                  .part_key = pk,
-                  .ord_key = 0,
-                  .row = static_cast<uint32_t>(r),
-                  .flags = 0});
+              const size_t b = static_cast<size_t>(SplitMix64Window(
+                                   static_cast<uint64_t>(pk))) &
+                               (kBuckets - 1);
+              wb[b].push_back(FlatBucketItem{.part_key = pk,
+                                             .ord_key = 0,
+                                             .row = static_cast<uint32_t>(r),
+                                             .flags = 0});
             }
           } else if (ord_vt == ValueType::kDouble) {
             const double* ovals = ord_dbl_col.vals;
             for (size_t r = begin; r < end; ++r) {
               const int64_t pk = pvals[r];
-              const size_t b =
-                  static_cast<size_t>(SplitMix64Window(static_cast<uint64_t>(pk))) &
-                  (kBuckets - 1);
+              const size_t b = static_cast<size_t>(SplitMix64Window(
+                                   static_cast<uint64_t>(pk))) &
+                               (kBuckets - 1);
               wb[b].push_back(FlatBucketItem{
                   .part_key = pk,
                   .ord_key = EncodeDoubleOrderKey(ovals[r], ord_asc),
@@ -957,9 +957,9 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
             const int64_t* ovals = ord_int_col.vals;
             for (size_t r = begin; r < end; ++r) {
               const int64_t pk = pvals[r];
-              const size_t b =
-                  static_cast<size_t>(SplitMix64Window(static_cast<uint64_t>(pk))) &
-                  (kBuckets - 1);
+              const size_t b = static_cast<size_t>(SplitMix64Window(
+                                   static_cast<uint64_t>(pk))) &
+                               (kBuckets - 1);
               wb[b].push_back(FlatBucketItem{
                   .part_key = pk,
                   .ord_key = EncodeSignedIntOrderKey(ovals[r], ord_asc),
@@ -1045,10 +1045,9 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
             while (pos < bsize) {
               size_t end = pos + 1;
               const FlatBucketItem& head = bdata[pos];
-              while (end < bsize &&
-                     bdata[end].PartNull() == head.PartNull() &&
-                     (head.PartNull() ||
-                      bdata[end].part_key == head.part_key)) {
+              while (
+                  end < bsize && bdata[end].PartNull() == head.PartNull() &&
+                  (head.PartNull() || bdata[end].part_key == head.part_key)) {
                 ++end;
               }
               if (!eval_partition(bdata, pos, end, slot_null, local_ovf)) {
@@ -1433,6 +1432,7 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
   };
 
   std::vector<WindowGroup> groups;
+  groups.reserve(win_count);
   std::vector<ValueType> out_types(win_count, ValueType::kNull);
 
   for (size_t w = 0; w < win_count; ++w) {
@@ -1579,8 +1579,11 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
   }
 
   std::vector<FlatNumericColumn<int64_t>> int_cols;
+  int_cols.reserve(cols.size());
   std::vector<FlatNumericColumn<double>> dbl_cols;
+  dbl_cols.reserve(cols.size());
   std::vector<FlatStringColumn> str_cols;
+  str_cols.reserve(cols.size());
   for (ColRef& c : cols) {
     if (c.type == ValueType::kInt64 || c.type == ValueType::kDate) {
       c.typed_idx = int_cols.size();
@@ -2491,6 +2494,7 @@ StatusOr<Relation> RunGeneralColumnarWindows(
   }
 
   std::vector<size_t> eval_src_cols;
+  eval_src_cols.reserve(base_width);
   bool compact_schema =
       !need_all && !HasDuplicateColumnNamesCaseInsensitive(base_schema);
   if (compact_schema) {

@@ -381,6 +381,7 @@ void CountStatementTablesImpl(  // NOLINT(misc-no-recursion)
     std::unordered_map<std::string, size_t>* counts,
     const std::unordered_set<std::string>& inherited_ctes) {
   std::unordered_set<std::string> visible_ctes = inherited_ctes;
+  visible_ctes.reserve(inherited_ctes.size() + statement.WithQueries().size());
   for (const auto& [name, query] : statement.WithQueries()) {
     (void)query;
     visible_ctes.insert(name);
@@ -572,6 +573,7 @@ std::shared_ptr<SelectStatement> PushGroupedCteJoinDomains(
     }
   }
   std::vector<Schema> body_schemas;
+  body_schemas.reserve(body.Sources().size());
   for (const auto& source : body.Sources()) {
     if (source.unnest || source.sample || source.is_lateral) {
       return nullptr;
@@ -579,6 +581,7 @@ std::shared_ptr<SelectStatement> PushGroupedCteJoinDomains(
     const auto& alias = source.alias.empty() ? source.table : source.alias;
     if (source.query) {
       std::vector<Column> columns;
+      columns.reserve(source.query->SelectList().size());
       for (size_t i = 0; i < source.query->SelectList().size(); ++i) {
         const auto& item = source.query->SelectList()[i];
         if (!item.expression ||
@@ -769,6 +772,7 @@ std::shared_ptr<SelectStatement> PushGroupedCteJoinDomains(
                 continue;
               }
               std::vector<Expression> local;
+              local.reserve(predicates.size());
               std::vector<slot_t> projection{static_cast<slot_t>(*offset)};
               for (const auto& filter : predicates) {
                 if (filter.resolved && !filter.contains_query &&
@@ -887,6 +891,7 @@ std::shared_ptr<SelectStatement> PushSharedGroupedCtePredicates(
   }
   const auto& body = *consumer.WithQueries().at(name);
   std::vector<const SelectStatement*> parts{&body};
+  parts.reserve(1 + body.UnionAll().size());
   for (size_t i = 0; i < body.UnionAll().size(); ++i) {
     const auto match = body.MatchFor(i);
     if (match.by_name || match.corresponding || !match.columns.empty() ||
@@ -1030,6 +1035,7 @@ std::shared_ptr<SelectStatement> PushSharedGroupedCtePredicates(
             break;
           }
           std::vector<const SelectStatement*> branches{&derived};
+          branches.reserve(1 + derived.UnionAll().size());
           for (size_t j = 0; j < derived.UnionAll().size(); ++j) {
             const auto match = derived.MatchFor(j);
             if (match.by_name || match.corresponding ||
@@ -1104,6 +1110,7 @@ std::shared_ptr<SelectStatement> PushSharedGroupedCtePredicates(
       continue;
     }
     std::vector<int64_t> values;
+    values.reserve(consumer.Sources().size());
     for (const auto& source : consumer.Sources()) {
       if (source.table != name) {
         continue;
@@ -1476,7 +1483,9 @@ std::shared_ptr<SelectStatement> GroupPresenceOnlyCte(
     return nullptr;
   }
   std::vector<Column> columns;
+  columns.reserve(body.SelectList().size());
   std::unordered_set<std::string> output_names;
+  output_names.reserve(body.SelectList().size());
   for (size_t i = 0; i < body.SelectList().size(); ++i) {
     const auto& item = body.SelectList()[i];
     if (!item.expression || item.expression->Type() != TypeTag::kColumnValue ||
@@ -1605,7 +1614,9 @@ std::shared_ptr<SelectStatement> GroupPresenceOnlyCte(
     return nullptr;
   }
   std::vector<NamedExpression> projection;
+  projection.reserve(needed.size());
   std::vector<Expression> keys;
+  keys.reserve(needed.size());
   for (size_t i = 0; i < needed.size(); ++i) {
     if (needed[i]) {
       projection.push_back(body.SelectList()[i]);
@@ -1824,6 +1835,7 @@ std::shared_ptr<SelectStatement> PushSingleUseCtePredicates(
     return found;
   };
   std::vector<Expression> predicates = SplitConjuncts(body.WhereClause());
+  predicates.reserve(predicates.size() + outputs.size());
   const size_t original = predicates.size();
   for (size_t i = 0; i < outputs.size(); ++i) {
     const auto& output = outputs[i];
@@ -2309,6 +2321,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // cache entry, so an unrelated or later outer context can never
       // narrow another scan.
       std::vector<std::pair<slot_t, ColumnName>> correlation_equalities;
+      correlation_equalities.reserve(key_predicates.size());
       for (const Expression& predicate : key_predicates) {
         if (predicate->Type() != TypeTag::kBinaryExp) {
           continue;
@@ -2360,6 +2373,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // is owned by the statement that derived it; applying it to correlated
       // subqueries silently narrowed unrelated scans.
       std::vector<Expression> scan_predicates;
+      scan_predicates.reserve(key_predicates.size());
       for (const Expression& predicate : key_predicates) {
         if (IsNonThrowingScanComparison(predicate, peek_schema)) {
           scan_predicates.push_back(predicate);
@@ -4414,6 +4428,7 @@ bool StatementUsesOnlyScopes(  // NOLINT(misc-no-recursion)
     }
   }
   std::vector<Expression> expressions = SplitConjuncts(statement.WhereClause());
+  expressions.reserve(statement.SelectList().size());
   for (const NamedExpression& item : statement.SelectList()) {
     expressions.push_back(item.expression);
   }
@@ -4601,7 +4616,10 @@ std::string UncorrelatedCacheKey(const SelectStatement& statement,
   static thread_local FingerprintMemo memo;
   const uint64_t id = statement.RuntimeId();
   if (memo.stmt != &statement || memo.stmt_id != id) {
-    memo = FingerprintMemo{&statement, id, statement.Fingerprint()};  // NOLINT(modernize-use-designated-initializers)
+    memo = FingerprintMemo{
+        &statement, id,
+        statement
+            .Fingerprint()};  // NOLINT(modernize-use-designated-initializers)
   }
   std::string key = memo.text;
   key += exists_only ? "|mode=exists" : "|mode=rows";
@@ -5045,6 +5063,7 @@ void CollectStatementTableRefs(const SelectStatement& statement,
                                const std::unordered_set<std::string>& shadowed,
                                std::unordered_set<std::string>* names) {
   std::unordered_set<std::string> local = shadowed;
+  local.reserve(local.size() + statement.WithQueries().size());
   for (const auto& [cte_name, body] : statement.WithQueries()) {
     (void)body;
     local.insert(cte_name);

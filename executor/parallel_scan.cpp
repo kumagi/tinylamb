@@ -84,6 +84,7 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
   if ((txn_->IsReadOnly() || txn_->WriteSetEmpty()) &&
       !txn_->HasAnyPageVersionChains()) {
     std::vector<slot_t> needed;
+    needed.reserve(peek_compares_.size());
     if (projection_) {
       needed = *projection_;
       for (const auto& compare : peek_compares_) {
@@ -408,6 +409,8 @@ StatusOr<bool> ParallelScan::PrepareLSTableColumns(
     return false;
   }
   std::vector<slot_t> needed = required_columns;
+  needed.reserve(required_columns.size() + peek_compares_.size() +
+                 (row_filter_ ? row_filter_->simple.size() : 0));
   for (const auto& pred : peek_compares_) {
     needed.push_back(pred.column);
   }

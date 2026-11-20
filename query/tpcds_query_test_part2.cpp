@@ -112,6 +112,7 @@ TEST_F(TpcdsQueryTest, Q42MatchesCppReference) {
     std::string category;
   };
   std::vector<Entry> expected;
+  expected.reserve(fixture_.store_sales.size());
   for (const Row& sale : fixture_.store_sales) {
     const auto date =
         std::find_if(fixture_.date_dim.begin(), fixture_.date_dim.end(),
@@ -250,6 +251,7 @@ TEST_F(TpcdsQueryTest, Q89WindowAverageMatchesCppReference) {
     ++partition.groups;
   }
   std::vector<Expected> expected;
+  expected.reserve(group_totals.size());
   for (const auto& [key, sum] : group_totals) {
     const auto& partition = partitions.at(
         std::make_tuple(key.category, key.brand, key.store, key.company));

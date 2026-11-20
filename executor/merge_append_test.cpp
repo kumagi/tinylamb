@@ -99,6 +99,7 @@ TEST(MergeAppendExecutorTest, AuditNaNOrderMatchesSortInBothDirections) {
         std::move(sources), {schema, schema}, schema,
         {{.expression = ColumnValueExp("k"), .ascending = ascending}});
     std::vector<Value> result;
+    result.reserve(first.size() + second.size());
     Row row;
     while (merge.Next(&row, nullptr)) {
       result.push_back(row[0]);

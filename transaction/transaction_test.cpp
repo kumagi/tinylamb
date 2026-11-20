@@ -859,6 +859,7 @@ TEST_F(TransactionTest, GcRearmsForSuccessiveQuietBursts) {
   for (int burst = 0; burst < 2; ++burst) {
     auto old = tm_->Begin(true);
     std::vector<RowPosition> rows;
+    rows.reserve(3);
     for (int i = 0; i < 3; ++i) {
       const RowPosition position(
           static_cast<page_id_t>(1000 + (burst * 10) + i), 0);

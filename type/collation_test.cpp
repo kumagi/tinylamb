@@ -211,6 +211,7 @@ TEST(CollationTest, CompareWithCollationIsATotalOrder) {
   // and ci "b" > "a" while "B" < "a"); SQL never compares such a set under
   // one ORDER BY key, so only the binary-collation values are chained here.
   std::vector<Value> binary_values;
+  binary_values.reserve(values.size());
   for (const Value& v : values) {
     if (CollationOf(v) != Collation::kCaseInsensitive) {
       binary_values.push_back(v);

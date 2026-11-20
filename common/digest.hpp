@@ -412,6 +412,7 @@ class Sha512 {
   std::string Finalize() {
     const uint64_t bits = static_cast<uint64_t>(total_) * 8;
     std::string padding = "\x80";
+    padding.reserve(128);
     while ((buffer_.size() + padding.size()) % 128 != 112) {
       padding.push_back('\0');
     }

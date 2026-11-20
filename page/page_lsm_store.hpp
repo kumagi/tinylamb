@@ -268,6 +268,39 @@ Status MergeLsmSourcesToFd(
     bool drop_tombstones, std::vector<LsmRunBlockMeta>* blocks_out,
     uint64_t* entry_count_out, bool* has_tombstones_out);
 
+// Ascending, lazy view over one LSM-Tree's visible entries inside an
+// inclusive [begin, end] key range. The implementation snapshots the tree's
+// committed memory overlays and run metadata once at open time (so later
+// writes by other transactions cannot leak into the scan), resolves
+// MVCC/transaction-local visibility up front, and then yields resolved live
+// (key, value) pairs one at a time via a heap merge across the sources.
+// Unlike PageManager::LsmScanRange — which materializes every entry in the
+// range before the first one is consumed — callers that stop early (e.g.
+// LIMIT pushdown) never pay for entries they never read.
+//
+// The emitted sequence is identical to draining
+// PageManager::LsmScanRange(..., ascending=true, ...) into a vector:
+// strictly ascending unique keys, tombstones hidden, newest-source-wins
+// value resolution, inclusive bounds (empty `end` means unbounded above).
+// On I/O or decode failure Next() returns false and status() reports the
+// error; entries already emitted stay valid.
+class LsmScanCursor {
+ public:
+  LsmScanCursor() = default;
+  virtual ~LsmScanCursor() = default;
+  LsmScanCursor(const LsmScanCursor&) = delete;
+  LsmScanCursor& operator=(const LsmScanCursor&) = delete;
+
+  // Advances to the next live entry. On success `out` receives an owned copy
+  // of the resolved (key, value) pair and true is returned. Returns false at
+  // end-of-range or on error (see status()).
+  virtual bool Next(std::pair<std::string, std::string>* out) = 0;
+
+  // Status of the scan: kSuccess while healthy (including clean
+  // end-of-range), or the first error encountered.
+  [[nodiscard]] virtual Status status() const = 0;
+};
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_PAGE_LSM_STORE_HPP

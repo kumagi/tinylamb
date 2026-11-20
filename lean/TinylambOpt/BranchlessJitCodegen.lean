@@ -830,7 +830,7 @@ theorem zonemap_interval_add_sub_abs_neg_sound
   omega
 
 /-- 基準（Reference）の逐次オーバーフロー検査付き NULL スキップ `SUM` アキュムレータ
-    （`executor/aggregation.cpp:209-220` と完全同一：1 行でも途中で `InI64` を外れたら `none` = エラー！）。 -/
+    各行を加算するたびに InI64 を検査する参照モデル。C++ は安全性を示せるバッチをまとめて処理し、必要な場合に逐次の検査に戻る。 -/
 def foldCheckedSum : Int → List (Option Int) → Option Int
   | acc, [] => some acc
   | acc, none :: xs => foldCheckedSum acc xs
@@ -840,6 +840,17 @@ def foldCheckedSum : Int → List (Option Int) → Option Int
       foldCheckedSum next xs
     else
       none
+
+/-- SUM after the join sees only key 2. Eagerly computing the key-1 partial
+    instead raises an overflow, even with a unique key on the opposite side. -/
+theorem eager_sum_unmatched_key_overflow :
+    let fact : List (Nat × Int) := [(1, i64MaxInt), (1, 1), (2, 7)]
+    let groupValues := fun k => (fact.filter (fun r => r.1 == k)).map (fun r => some r.2)
+    let aggregate := fun k => (foldCheckedSum 0 (groupValues k)).map (k, ·)
+    let matched := fun (row : Nat × Int) => row.1 == 2
+    ([2] : List Nat).mapM aggregate = some [(2, 7)] ∧
+      (([1, 2] : List Nat).mapM aggregate).map (List.filter matched) = none ∧
+      ([1, 2] : List Nat).mapM aggregate = none := by decide
 
 /-- ブランチレス SIMD `SUM` カーネル：NULL スロットを `0` にマスク置換して単純総和する。 -/
 def simdZeroMaskedSum (acc : Int) (xs : List (Option Int)) : Int :=

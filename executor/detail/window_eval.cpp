@@ -84,11 +84,10 @@ size_t WindowPartitionKeyHash(const std::vector<Value>& key) {
   uint64_t hash = 0x9e3779b97f4a7c15ULL;
   // EqualUnderCollation folds BOTH sides when either operand is CI, so a key
   // containing any CI value must fold every VARCHAR component the same way.
-  const bool any_ci =
-      std::ranges::any_of(key, [](const Value& v) {
-        return v.type == ValueType::kVarChar &&
-               CollationOf(v) == Collation::kCaseInsensitive;
-      });
+  const bool any_ci = std::ranges::any_of(key, [](const Value& v) {
+    return v.type == ValueType::kVarChar &&
+           CollationOf(v) == Collation::kCaseInsensitive;
+  });
   for (const Value& value : key) {
     const Value canonical =
         (any_ci && value.type == ValueType::kVarChar)
@@ -110,7 +109,9 @@ using WindowNodeMap = std::map<const WindowFunctionCallExpression*,
 
 const WindowFunctionCallExpression* AsWindow(const Expression& expression) {
   if (expression && expression->Type() == TypeTag::kWindowFunctionExp) {
-    return static_cast<const WindowFunctionCallExpression*>(expression.get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+    return static_cast<const WindowFunctionCallExpression*>(
+        expression
+            .get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   }
   return nullptr;
 }
@@ -377,8 +378,7 @@ bool DistanceWithin(const Value& key, const Value& candidate, double off,
   const platform::ExtendedFloat diff =
       static_cast<platform::ExtendedFloat>(NumericOf(key)) -
       static_cast<platform::ExtendedFloat>(NumericOf(candidate));
-  const auto bound =
-      static_cast<platform::ExtendedFloat>(off);
+  const auto bound = static_cast<platform::ExtendedFloat>(off);
   return inclusive_le ? diff <= bound : diff >= bound;
 }
 
@@ -586,9 +586,8 @@ StatusOr<std::pair<size_t, size_t>> WindowRuntime::ResolveFrame(
         return 0;
       }
       if (val.type == ValueType::kDouble && value != std::floor(value)) {
-        frame_error = StatusError(
-            StatusCode::kInvalidArgument,
-            "GROUPS offset must be an integer");
+        frame_error = StatusError(StatusCode::kInvalidArgument,
+                                  "GROUPS offset must be an integer");
         return 0;
       }
       return static_cast<size_t>(value);
@@ -1113,6 +1112,7 @@ StatusOr<std::vector<size_t>> WindowRuntime::FrameSurvivors(
     std::span<const size_t> ordered, const WindowOrderValues& order_values,
     size_t current, size_t lo, size_t hi) const {
   std::vector<size_t> survivors;
+  survivors.reserve(hi - lo + 1);
   for (size_t p = lo; p <= hi; ++p) {
     bool excluded = false;
     switch (window.exclusion) {
@@ -1201,6 +1201,10 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
   ASSIGN_OR_RETURN(
       std::vector<size_t>, frame_survivors,
       (FrameSurvivors(window, rows, ordered, order_values, current, lo, hi)));
+  values.reserve(frame_survivors.size());
+  if (need_order_keys) {
+    order_keys.reserve(frame_survivors.size());
+  }
   for (const size_t p : frame_survivors) {
     const Row& row = rows[ordered[p]];
     Scope scope{.row = &row, .schema = schema, .outer = outer};
@@ -1243,6 +1247,11 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
     std::vector<Value> unique;
     std::vector<Value> unique_canonical;
     std::vector<std::vector<Value>> unique_keys;
+    unique.reserve(values.size());
+    unique_canonical.reserve(values.size());
+    if (!order_keys.empty()) {
+      unique_keys.reserve(values.size());
+    }
     for (size_t i = 0; i < values.size(); ++i) {
       Value& candidate = values[i];
       Value canonical = CanonicalDistinctValue(candidate);
@@ -1302,6 +1311,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
   }
   if (fn == "APPROX_COUNT_DISTINCT") {
     std::vector<Value> unique;
+    unique.reserve(non_null.size());
     for (const Value& candidate : non_null) {
       bool duplicate = false;
       for (const Value& kept : unique) {
@@ -1375,6 +1385,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
     });
     // APPROX_QUANTILES returns NUM+1 percentiles including both endpoints.
     std::vector<Value> quantiles;
+    quantiles.reserve(static_cast<size_t>(num) + 1);
     for (int64_t i = 0; i <= num; ++i) {
       // Compute in Int128: i * (n-1) can overflow int64 for very large frames
       // even though i and num are bounded.
@@ -1382,7 +1393,8 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
           static_cast<platform::Int128>(i) *
           static_cast<platform::Int128>(sorted.size() - 1) /
           static_cast<platform::Int128>(num);
-      const int64_t idx = static_cast<int64_t>(idx128);  // NOLINT(modernize-use-auto)
+      const int64_t idx =
+          static_cast<int64_t>(idx128);  // NOLINT(modernize-use-auto)
       quantiles.push_back(sorted[static_cast<size_t>(idx)]);
     }
     return Value::Array(std::move(quantiles), ElementSqlTypeOf(sorted[0]));
@@ -1437,6 +1449,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
     ASSIGN_OR_RETURN(
         std::vector<size_t>, approx_survivors,
         (FrameSurvivors(window, rows, ordered, order_values, current, lo, hi)));
+    stats.reserve(approx_survivors.size());
     for (const size_t r : approx_survivors) {
       const size_t row = ordered[r];
       const Scope scope{.row = &rows[row], .schema = schema, .outer = outer};
@@ -1495,23 +1508,23 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
         }
       }
       if (!found) {
-        stats.push_back(TopStat{v, 0.0, 0});  // NOLINT(modernize-use-designated-initializers)
+        stats.push_back(TopStat{
+            v, 0.0, 0});  // NOLINT(modernize-use-designated-initializers)
         if (has_weight) {
           stats.back().total = weight;
           stats.back().weights = 1;
         }
       }
     }
-    std::stable_sort(stats.begin(), stats.end(),
-                     [&](const TopStat& a, const TopStat& b) {
-                       if (fn == "APPROX_TOP_SUM" &&
-                           (a.weights == 0 || b.weights == 0)) {
-                         // Entries with all-NULL weights rank last, as in the
-                         // grouped accumulator's Finish.
-                         return a.weights != 0 && b.weights == 0;
-                       }
-                       return a.total > b.total;
-                     });
+    std::stable_sort(
+        stats.begin(), stats.end(), [&](const TopStat& a, const TopStat& b) {
+          if (fn == "APPROX_TOP_SUM" && (a.weights == 0 || b.weights == 0)) {
+            // Entries with all-NULL weights rank last, as in the
+            // grouped accumulator's Finish.
+            return a.weights != 0 && b.weights == 0;
+          }
+          return a.total > b.total;
+        });
     auto json_of = [](const Value& v) -> std::string {
       if (v.IsNull()) {
         return "null";
@@ -1523,8 +1536,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
           // The grouped accumulator renders DATE entries through
           // FormatDateDays; emitting the raw day count here made the same
           // input produce different STRUCT payloads on the two paths.
-          return json_text::EncodeJsonString(
-              FormatDateDays(v.value.int_value));
+          return json_text::EncodeJsonString(FormatDateDays(v.value.int_value));
         case ValueType::kDouble: {
           const double d = v.value.double_value;
           if (std::isnan(d)) {
@@ -1535,7 +1547,8 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
           }
           std::array<char, 64> buf{};
           (void)snprintf(buf.data(), buf.size(), "%.17g", d);
-          return std::string(buf.data());  // NOLINT(modernize-return-braced-init-list)
+          return std::string(
+              buf.data());  // NOLINT(modernize-return-braced-init-list)
         }
         case ValueType::kVarChar:
           // Quotes, backslashes and control bytes must be escaped or the
@@ -1546,6 +1559,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
       }
     };
     std::vector<Value> out;
+    out.reserve(stats.size());
     std::string element_type;
     for (size_t i = 0; i < stats.size() && std::cmp_less(i, k); ++i) {
       const std::string metric =
@@ -1705,6 +1719,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
       };
       std::string sep = delimiter.IsNull() ? "," : raw_text(delimiter);
       std::string out;
+      out.reserve(final_values.size());
       for (size_t i = 0; i < final_values.size(); ++i) {
         if (i != 0U) {
           out += sep;
@@ -1801,6 +1816,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
       pairs_error = survivors_or.GetStatus();
       return std::nullopt;
     }
+    pairs.reserve(survivors_or.Value().size());
     for (const size_t r : survivors_or.Value()) {
       const size_t row = ordered[r];
       const Scope pair_scope{
@@ -2201,10 +2217,14 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
         continue;
       }
       if (is_avg) {
-        out.emplace_back(Value((double_sum + static_cast<double>(int_sum)) /  // NOLINT(modernize-use-emplace)
-                               static_cast<double>(seen)));
+        out.emplace_back(Value(
+            (double_sum +
+             static_cast<double>(int_sum)) /  // NOLINT(modernize-use-emplace)
+            static_cast<double>(seen)));
       } else if (any_double) {
-        out.emplace_back(Value(double_sum + static_cast<double>(int_sum)));  // NOLINT(modernize-use-emplace)
+        out.emplace_back(Value(
+            double_sum +
+            static_cast<double>(int_sum)));  // NOLINT(modernize-use-emplace)
       } else {
         out.emplace_back(Value(int_sum));  // NOLINT(modernize-use-emplace)
       }
@@ -4439,6 +4459,7 @@ Status FinalizeWindowedStatement(TransactionContext& context,
   std::vector<NamedExpression> rewritten_select;
   rewritten_select.reserve(statement.SelectList().size());
   std::unordered_map<std::string, Expression> aliases;
+  aliases.reserve(statement.SelectList().size());
   for (const NamedExpression& projection : statement.SelectList()) {
     Expression rebuilt = Rebuild(projection.expression, replacements);
     rewritten_select.emplace_back(projection.name, rebuilt);
@@ -4492,6 +4513,7 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
   if (windows.empty()) {
     if (statement.Qualify()) {
       std::unordered_map<std::string, Expression> aliases;
+      aliases.reserve(statement.SelectList().size());
       for (const NamedExpression& projection : statement.SelectList()) {
         if (!projection.name.empty()) {
           aliases.emplace(projection.name, projection.expression);

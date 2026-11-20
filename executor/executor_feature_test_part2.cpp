@@ -215,7 +215,9 @@ TEST(ParallelMergeJoinTest, AllEqualKeysFormOneGiantCluster) {
   // Every row shares one key: the steering partitioner walks past the whole
   // cluster and the trailing partition holds the full 50 x 50 cross product.
   std::vector<Row> left_rows;
+  left_rows.reserve(50);
   std::vector<Row> right_rows;
+  right_rows.reserve(50);
   for (int64_t i = 0; i < 50; ++i) {
     left_rows.push_back(Row({Value(int64_t{1}), Value(i)}));
     right_rows.push_back(Row({Value(int64_t{1}), Value(i)}));
@@ -386,7 +388,9 @@ TEST(SharedBuildParallelHashJoinTest, WideKeyNeverTruncatesBelowFifthColumn) {
 TEST(SharedBuildParallelHashJoinTest, BatchPathAndFailurePropagation) {
   {
     std::vector<Row> left_rows;
+    left_rows.reserve(40);
     std::vector<Row> right_rows;
+    right_rows.reserve(40);
     for (int64_t i = 0; i < 40; ++i) {
       left_rows.push_back(IRow(i));
       right_rows.push_back(IRow(i));
@@ -477,7 +481,9 @@ TEST(SetOperationExecutorTest, TextAndNumericUnifyToVarchar) {
 
 TEST(SetOperationExecutorTest, SpillPathNormalizesIntDoubleAndDedups) {
   std::vector<Row> left_rows;
+  left_rows.reserve(300);
   std::vector<Row> right_rows;
+  right_rows.reserve(300);
   for (int64_t i = 0; i < 300; ++i) {
     left_rows.push_back(Row({Value(i % 30)}));
     right_rows.push_back(Row({Value(static_cast<double>(i % 30))}));
@@ -501,7 +507,9 @@ TEST(SetOperationExecutorTest, SpillPathNormalizesIntDoubleAndDedups) {
 
 TEST(SetOperationExecutorTest, SpillPathRejectsWidthMismatch) {
   std::vector<Row> wide_rows;
+  wide_rows.reserve(100);
   std::vector<Row> narrow_rows;
+  narrow_rows.reserve(100);
   for (int64_t i = 0; i < 100; ++i) {
     wide_rows.push_back(Row({Value(i), Value(i)}));
     narrow_rows.push_back(Row({Value(i)}));
@@ -929,6 +937,7 @@ TEST_F(SkipScanDistinctTest, DistinctOverIndexedColumnSkipsDuplicates) {
   const Schema schema(
       "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kVarChar)});
   std::vector<Row> rows;
+  rows.reserve(3 * 20);
   for (int64_t round = 0; round < 3; ++round) {
     for (int64_t k = 1; k <= 20; ++k) {
       rows.push_back(Row({Value(k), Value("v" + std::to_string(k))}));
@@ -994,6 +1003,7 @@ TEST_F(SkipScanDistinctTest, PrefixDistinctJumpsCompoundIndexGroups) {
   const Schema schema(
       "pt", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
   std::vector<Row> rows;
+  rows.reserve(5 * 4);
   for (int64_t a = 1; a <= 5; ++a) {
     for (int64_t b = 1; b <= 4; ++b) {
       rows.push_back(Row({Value(a), Value(b)}));

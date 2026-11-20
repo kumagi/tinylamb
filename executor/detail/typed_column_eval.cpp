@@ -944,8 +944,6 @@ Value EvaluateTypedCoalesceDoubleOnRow(const TypedCoalesceDoubleInput& coalesce,
   return value;
 }
 
-namespace {
-
 ValueType ValueTypeFromTypeTag(TypeTag tag) {
   switch (tag) {
     case TypeTag::kInteger:
@@ -963,6 +961,8 @@ ValueType ValueTypeFromTypeTag(TypeTag tag) {
       return ValueType::kNull;
   }
 }
+
+namespace {
 
 std::shared_ptr<const PostAggExpr> BuildPostAggExpr(
     const Expression& expression, const Schema& scan_schema,
@@ -1116,6 +1116,7 @@ TypedAggregationPlan PlanTypedAggregation(
   // every input column is already a plain key. Keep its checked evaluation
   // for every group so removing it from the hash key cannot erase errors.
   std::vector<Expression> dependent_keys;
+  dependent_keys.reserve(stmt.GroupBy().size());
   for (const Expression& key : stmt.GroupBy()) {
     if (key && key->Type() == TypeTag::kConstantValue &&
         !ContainsParameterSlot(key)) {
@@ -1133,6 +1134,7 @@ TypedAggregationPlan PlanTypedAggregation(
     plan.key_offsets.push_back(static_cast<slot_t>(*offset));
   }
   std::vector<std::string> dependent_identities;
+  dependent_identities.reserve(dependent_keys.size());
   if (!dependent_keys.empty()) {
     // HAVING reclamation can discard partial groups during the scan. Keep
     // that shape on the ordinary evaluator until it also validates keys.
@@ -1140,6 +1142,7 @@ TypedAggregationPlan PlanTypedAggregation(
       return plan;
     }
     std::vector<Column> key_columns;
+    key_columns.reserve(plan.key_offsets.size());
     for (const auto offset : plan.key_offsets) {
       const auto& column = scan_schema.GetColumn(offset);
       if (column.Type() != ValueType::kInt64 || column.IsUnsigned()) {
@@ -1874,6 +1877,7 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
   }
   std::optional<SelectStatement> partial;
   std::vector<SelectStatement> rewritten;
+  rewritten.reserve(sets.size());
   struct PartialAggSpec {
     AggregationType type;
     Expression child;

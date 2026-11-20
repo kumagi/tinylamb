@@ -1,4 +1,5 @@
 import TinylambOpt.ThreeValued
+import TinylambOpt.FloatIdentities
 import TinylambOpt.BagRel
 import TinylambOpt.Discovery
 import TinylambOpt.AggBase
@@ -21,3 +22,4 @@ import TinylambOpt.QuotientFusion
 import TinylambOpt.FusedAggregateJit
 import TinylambOpt.FilterHashProbe
 import TinylambOpt.TlcsBoundaryAggregate
+import TinylambOpt.TpcdsNextDiscovery

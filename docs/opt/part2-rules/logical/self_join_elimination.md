@@ -24,6 +24,12 @@ graph TD
 
 ## 適用条件
 
+一意キーにも NULL を許容する列があります。NULL 同士は等値結合で一致しないため、結合を除去するにはキー列の NOT NULL 宣言も必要です。
+
+```cpp
+if (!ColumnIsDeclaredNonNull(memo, r1, ColumnName("", *unique_key))) {
+```
+
 パターンは `Join(Any("left"), Any("right"))` です。以下の5 つのガード条件をすべて満たす必要があります（`plan/cascades.cpp`）。
 
 ```cpp

@@ -85,6 +85,7 @@ struct CfRelease {
 bool ZoneFileExistsExactCase(std::string_view name) {
   if (name.empty() || name.front() == '/' || name.back() == '/') return false;
   std::string dir = "/usr/share/zoneinfo";
+  dir.reserve(dir.size() + name.size() + 1);
   size_t begin = 0;
   while (begin <= name.size()) {
     const size_t slash = name.find('/', begin);

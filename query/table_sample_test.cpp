@@ -128,6 +128,7 @@ TEST_F(TableSampleTest, ReservoirPartitionWeight) {
              "PARTITION BY grp) WITH WEIGHT AS w");
   ASSERT_EQ(rows.size(), 3U);
   std::vector<std::pair<int64_t, double>> actual;
+  actual.reserve(rows.size());
   for (const Row& row : rows) {
     ASSERT_EQ(row.values_.size(), 2U);
     actual.emplace_back(row[0].value.int_value, row[1].value.double_value);

@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_FUNCTION_HPP
 #define TINYLAMB_FUNCTION_HPP
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,13 @@ class Function {
   friend Decoder& operator>>(Decoder& d, Function& f) {
     int64_t argument_count = 0;
     d >> f.name_ >> f.args_ >> f.return_type_ >> argument_count;
+    // Name/arity-only signatures have no argument type vector.
+    if (d.Failed() || argument_count < 0 ||
+        argument_count > std::numeric_limits<int>::max() ||
+        (!f.args_.empty() && static_cast<size_t>(argument_count) != f.args_.size())) {
+      d.Fail();
+      return d;
+    }
     f.argument_count_ = static_cast<int>(argument_count);
     return d;
   }

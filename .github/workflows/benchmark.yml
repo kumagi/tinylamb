@@ -1,12 +1,12 @@
 name: benchmark
 on:
-permissions:
-  contents: read
   workflow_dispatch:
   schedule:
     # Every Monday 03:00 UTC (weekly)
     - cron: '0 3 * * 1'
 
+permissions:
+  contents: read
 jobs:
   tpch-sf1:
     # P3-1 benchmark regression gate. SF=1 fixed; bench_gate.py compares

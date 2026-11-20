@@ -23,6 +23,13 @@ graph TD
 
 ## 適用条件
 
+定数側に実行時パラメータがある場合、その値を計画時に変換できません。
+
+```cpp
+if (comparable && cast_side != nullptr && *cast_side &&
+                  *const_side && !ContainsParameterSlot(*const_side)) {
+```
+
 パターンは `Selection(Any("input"))`、ターゲットヒントは `LogicalOperator::kSelection` です。以下の条件をすべて満たす場合に適用されます。
 
 1. 対象式が `kSelection` であり、単一の子ノードを持ち、述語を保持していること。

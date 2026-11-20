@@ -45,6 +45,9 @@ graph TD
           if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
             return Expression{};
           }
+          if (pattern.IsInterval()) {
+            return Expression{};
+          }
           if (HasLikeWildcard(pattern.value.varchar_value) ||
               TimestampShapedConstant(pattern.value.varchar_value)) {
             return Expression{};
@@ -58,7 +61,8 @@ graph TD
 1. **左辺の列名制約**: 左辺が列参照である場合、その列名が予約的なベンチマーク列名（`key`, `id`, `score`, `val`）でないこと。
 2. **パターンの型制約**: 右辺の定数値が非 NULL であり、かつ `kVarChar` 型であること。
 3. **ワイルドカード非含有制約**: `HasLikeWildcard` により、パターン文字列に `%` および `_` が含まれていないこと。
-4. **タイムスタンプ形状拒絶制約**: `TimestampShapedConstant` により、パターンが日時形式に合致しないこと。
+4. **INTERVAL フラグ**: LIKE が無視するフラグを文字列比較は型判定に使うため、フラグ付きの定数を除外します。
+5. **タイムスタンプ形状拒絶制約**: `TimestampShapedConstant` により、パターンが日時形式に合致しないこと。
 
 これらを満たす場合に限り、二項不等号演算子（`kNotEquals`）ノードを返します。
 
