@@ -812,7 +812,7 @@ theorem decorrelate_exists_in_not_in_sound {L R α : Type} [DecidableEq α]
 
 /-- 🚨 **実在バグ証明 M7 (`DecorrelateOneLateralSource` の `SELECT *` 幽霊列混入バグ)**:
     `SELECT * FROM t1, LATERAL (SELECT b FROM t2 WHERE t2.a = t1.a) AS lat` において、
-    旧 C++ (`query/select_rewrites.cpp:1704-1900`) は `inner->SelectList()` の `*` しか検査せず `outer->SelectList()` の `*` を見落としていた。
+    修正前の `DecorrelateOneLateralSource` (`query/select_rewrites.cpp`) は `inner->SelectList()` の `*` しか検査せず `outer->SelectList()` の `*` を見落としていた。
     そのため相関キー `a` を `new_inner` に追加 (`SELECT b, a`) した直後に `FlattenOneDerivedSource` が外側の `*` で中断し、
     結果として `SELECT *` に本来存在しない幽霊列 `a` が漏出する！ -/
 theorem cpp_lateral_decorrelate_star_phantom_col_bug :
@@ -1049,7 +1049,7 @@ def dateGe (a b : SimpleDate) : Prop := ¬dateLt a b
 def jan1 (y : Int) : SimpleDate := ⟨y, 1, by omega, by omega⟩
 
 /-- ✅ **健全性 (`extract_year_sargable` 全 9 方向境界テーブルの完全証明)**:
-    `lower = Jan1(y)`, `upper = Jan1(y + 1)` に対して、`cascades.cpp:9222-9265` の
+    `lower = Jan1(y)`, `upper = Jan1(y + 1)` に対して、`plan/cascades.cpp` の `extract_year_sargable` の
     全比較方向（`extract <op> y` および反転 `y <op> extract`）の半開区間変換が
     1 日たりともズレずに数学的に同値であることを `omega` で完全証明する！ -/
 theorem extract_year_sargable_sound (d : SimpleDate) (y : Int) :

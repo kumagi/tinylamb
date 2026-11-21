@@ -59,6 +59,9 @@ class LateMaterializationJoinPlan final : public PlanBase {
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending,
       const std::vector<std::optional<bool>>& nulls_first) const override;
+  [[nodiscard]] Collation OrderCollation() const override {
+    return left_->OrderCollation();
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

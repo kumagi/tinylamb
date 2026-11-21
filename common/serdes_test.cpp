@@ -18,6 +18,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -35,9 +36,8 @@ struct RoundTripCase {
   std::string_view payload;
 };
 
-// Short strings exercise the inline fast path. Length-prefix decoding is
-// checked against truncated input (6 vs 5 bytes) and the canary byte after a
-// write; no 64KiB boundary or explicit length-overflow case is covered here.
+// Short strings exercise the inline fast path. Separate cases cover
+// truncation and the 64 KiB length boundary.
 constexpr std::array<RoundTripCase, 5> kRoundTrip = {
     {RoundTripCase{.name = "empty", .payload = std::string_view()},
      RoundTripCase{.name = "one byte", .payload = std::string_view("x")},
@@ -69,6 +69,21 @@ TEST(SerdesStringTest, RoundTripsThroughLengthPrefix) {
   }
 }
 
+TEST(SerdesStringTest, LargestLengthRoundTripsAndOverflowIsRejected) {
+  constexpr size_t max_length = std::numeric_limits<uint16_t>::max();
+  std::string payload(max_length, 'x');
+  std::string buffer(sizeof(uint16_t) + max_length + 1, '\0');
+  const auto encoded = SerializeStringView(buffer.data(), payload);
+  ASSERT_EQ(encoded, sizeof(uint16_t) + max_length);
+  std::string_view decoded;
+  EXPECT_EQ(DeserializeStringView(buffer.data(), buffer.data() + encoded, &decoded),
+            encoded);
+  EXPECT_EQ(decoded, payload);
+  payload.push_back('x');
+  EXPECT_DEATH(SerializeStringView(buffer.data(), payload),
+               "string too long to serialize");
+}
+
 TEST(SerdesStringTest, DeserializeRejectsTruncatedPrefix) {
   const std::string payload = "abc";
   std::string buf(kBufSize, '\0');
@@ -94,6 +109,13 @@ TEST(SerdesStringTest, DeserializeRejectsTruncatedPayload) {
   EXPECT_EQ(decoded, "untouched");
 }
 
+TEST(SerdesStringTest, DeserializeRejectsReversedRange) {
+  constexpr char input[] = "abc";
+  std::string_view out = "unchanged";
+  EXPECT_EQ(DeserializeStringView(input + 2, input + 1, &out), 0U);
+  EXPECT_EQ(out, "unchanged");
+}
+
 TEST(SerdesStringTest, DeserializeRejectsNullEnd) {
   std::string buf(kBufSize, '\0');
   SerializeStringView(buf.data(), "abc");
@@ -112,9 +134,9 @@ TEST(SerdesStringTest, FixedWidthScalarsRoundTripBigEndian) {
   off += SerializeU32(buf.data() + off, u32);
   off += SerializeU64(buf.data() + off, u64);
   // Big-endian wire order: the most significant byte first.
-  EXPECT_EQ(buf[0], '\x12');
-  EXPECT_EQ(buf[1], '\x34');
-  EXPECT_EQ(buf[2], '\xde');
+  constexpr std::string_view wire(
+      "\x12\x34\xde\xad\xbe\xef\x01\x02\x03\x04\x05\x06\x07\x08", 14);
+  EXPECT_EQ(std::string_view(buf.data(), off), wire);
 
   uint16_t out16 = 0;
   uint32_t out32 = 0;

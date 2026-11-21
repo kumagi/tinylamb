@@ -94,5 +94,6 @@ class TableSampleExecutor final : public ExecutorBase {
   size_t output_offset_{0};
 };
 
-#endif
-}
+}  // namespace tinylamb
+
+#endif  // TINYLAMB_EXECUTOR_TABLE_SAMPLE_HPP

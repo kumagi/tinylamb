@@ -305,12 +305,13 @@ TEST_F(SiblingAggregateFusionTest, CrossJoinMembersAreNotFused) {
                            "(SELECT g, SUM(v) AS total FROM events GROUP BY g) b "
                            "ORDER BY a.g, b.total;");
   EXPECT_EQ(engine_->LastFusedSiblingAggregates(), 0U);
-  // Ground truth: the unfused cross product.
-  ExpectSameMultiset(
+  // Ground truth: the unfused cross product in the requested order.
+  EXPECT_EQ(
       rows, RunSql(engine_.get(), context_.get(),
                    "SELECT a.g, a.n, b.total FROM "
                    "(SELECT g, COUNT(*) AS n FROM events GROUP BY g) a CROSS JOIN "
-                   "(SELECT g, SUM(v) AS total FROM events GROUP BY g) b;"));
+                   "(SELECT g, SUM(v) AS total FROM events GROUP BY g) b "
+                   "ORDER BY a.g, b.total;"));
 }
 
 TEST_F(SiblingAggregateFusionTest, NonKeyJoinMembersAreNotFused) {

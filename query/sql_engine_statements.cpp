@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1985,6 +1986,13 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
     return Row(std::move(values));
   };
 
+  std::vector<size_t> all_candidates;
+  if (!use_hash) {
+    all_candidates.reserve(source_rows.size());
+    for (size_t i = 0; i < source_rows.size(); ++i) {
+      all_candidates.push_back(i);
+    }
+  }
   auto source = table->BeginFullScan(ctx.txn_);
   while (source.IsValid()) {
     const Row row = *source;
@@ -1994,7 +2002,7 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
         .row = &row, .schema = &schema, .outer = nullptr};
 
     // Candidate source rows for this target row.
-    std::vector<size_t> candidates;
+    std::span<const size_t> candidates = all_candidates;
     if (use_hash) {
       std::vector<Value> key_values(join_keys.size());
       bool null_key = false;
@@ -2010,11 +2018,6 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
         if (found != source_index.end()) {
           candidates = found->second;
         }
-      }
-    } else {
-      candidates.resize(source_rows.size());
-      for (size_t i = 0; i < candidates.size(); ++i) {
-        candidates[i] = i;
       }
     }
 

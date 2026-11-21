@@ -42,6 +42,7 @@ Decoder& Decoder::operator>>(std::string& str) {
     is_->read(str.data(), size);
     // A truncated stream must not silently yield a zero-padded string.
     if (is_->gcount() != static_cast<std::streamsize>(size)) {
+      str.clear();
       is_->setstate(std::ios::failbit);
     }
   }

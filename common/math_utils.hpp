@@ -22,10 +22,9 @@
 
 namespace tinylamb {
 
-// std::cbrt is not required to be correctly rounded, and some libm
-// implementations (e.g. clang's on Linux) return 3.0000000000000004 for
-// cbrt(27). One Newton-Raphson step recovers the correctly rounded result
-// and makes the value identical across toolchains.
+// A Newton-Raphson step refines the estimate from std::cbrt. For example,
+// some libm implementations return 3.0000000000000004 for cbrt(27), and
+// this refinement yields 3.0 in that case.
 inline double AccurateCbrt(double v) {
   const double c = std::cbrt(v);
   if (v == 0.0 || !std::isfinite(c)) {

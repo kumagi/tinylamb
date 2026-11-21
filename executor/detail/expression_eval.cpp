@@ -712,6 +712,7 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
       case ValueType::kArray: {
         std::string inner;
         const std::vector<Value>& elements = v.ArrayElements();
+        inner.reserve(elements.size() * 16);
         for (size_t i = 0; i < elements.size(); ++i) {
           if (i > 0) {
             inner += ",";
@@ -733,8 +734,9 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
             case ValueType::kDate:
               // ScalarFromText decodes this marker back to a DATE; without it
               // a row-encoded DATE is read back as a plain INT64 day count.
-              inner += "\"__tinylamb_date__:" +
-                       FormatDateDays(element.value.int_value) + "\"";
+              inner += "\"__tinylamb_date__:";
+              inner += FormatDateDays(element.value.int_value);
+              inner += "\"";
               break;
             default:
               inner += element.AsString();
@@ -760,7 +762,8 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
       key = schema.GetColumn(i).Name().name;
     }
     if (key.empty()) {
-      key = "f" + std::to_string(i + 1);
+      key.push_back('f');
+      AppendInteger(key, i + 1);
     }
     json.push_back('"');
     json.append(key);

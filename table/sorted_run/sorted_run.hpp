@@ -65,6 +65,7 @@ class SortedRun final {
     friend std::ostream& operator<<(std::ostream& o, const Entry& e);
   };
 
+  // The run and the schema must outlive every iterator built from them.
   class Iterator {
    public:
     Iterator(const SortedRun* parent, const Schema& sc, size_t offset = 0)
@@ -83,7 +84,8 @@ class SortedRun final {
       return *this;
     }
     bool operator==(const Iterator& rhs) const {
-      return offset_ == rhs.offset_ && parent_ == rhs.parent_;
+      return offset_ == rhs.offset_ && parent_ == rhs.parent_ &&
+             schema_ == rhs.schema_;
     }
     bool operator!=(const Iterator& rhs) const { return !operator==(rhs); }
     [[nodiscard]] size_t Generation() const { return parent_->generation_; }

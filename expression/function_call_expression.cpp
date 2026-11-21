@@ -1057,9 +1057,9 @@ StatusOr<Value> FormatFunction(const std::string& name,
         } else if (arg.type == ValueType::kInt64) {
           if (arg.IsUnsigned()) {
             formatted_item =
-                std::to_string(static_cast<uint64_t>(arg.value.int_value));
+                IntegerToString(static_cast<uint64_t>(arg.value.int_value));
           } else {
-            formatted_item = std::to_string(arg.value.int_value);
+            formatted_item = IntegerToString(arg.value.int_value);
           }
         } else if (arg.type == ValueType::kDouble) {
           // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized buffer
@@ -1106,9 +1106,9 @@ StatusOr<Value> FormatFunction(const std::string& name,
             formatted_item = buf.data();
           } else if (spec == 'u' || arg.IsUnsigned()) {
             formatted_item =
-                std::to_string(static_cast<uint64_t>(arg.value.int_value));
+                IntegerToString(static_cast<uint64_t>(arg.value.int_value));
           } else {
-            formatted_item = std::to_string(arg.value.int_value);
+            formatted_item = IntegerToString(arg.value.int_value);
           }
         } else if (arg.type == ValueType::kDouble) {
           const double d = arg.value.double_value;
@@ -1119,7 +1119,7 @@ StatusOr<Value> FormatFunction(const std::string& name,
                 StatusCode::kInvalidArgument,
                 "FORMAT: float argument out of range for integer specifier");
           }
-          formatted_item = std::to_string(static_cast<int64_t>(d));
+          formatted_item = IntegerToString(static_cast<int64_t>(d));
         } else {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -1350,6 +1350,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return std::string(val.value.varchar_value);
     }
     return val.AsString();
+  };
+  const auto raw_view = [&](const Value& value, std::string& storage)
+      -> std::string_view {
+    if (value.type == ValueType::kVarChar) {
+      return value.AsStringView();
+    }
+    storage = raw_str(value);
+    return storage;
   };
   auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
     if (v.type == ValueType::kInt64) {
@@ -4513,7 +4521,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (values[2].IsNull()) {
         return Value();
       }
-      std::string tz_str = raw_str(values[2]);
+      std::string time_zone_storage;
+      const std::string_view tz_str = raw_view(values[2], time_zone_storage);
       {
         // FORMAT_TIMESTAMP renders an instant: `ct` is the UTC reading, so
         // the zone's offset must be resolved AT that instant (at_utc), not
@@ -5045,8 +5054,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
-    const std::string path = values.size() == 2 ? raw_str(values[1]) : "$";
-    return EvaluateJsonFunctionCall(name, raw_str(values[0]), path);
+    std::string path_storage;
+    const std::string_view path =
+        values.size() == 2 ? raw_view(values[1], path_storage) : "$";
+    std::string text_storage;
+    return EvaluateJsonFunctionCall(name, raw_view(values[0], text_storage),
+                                    path);
   }
 
   // The JSON document family (JSON_TYPE/KEYS/ARRAY_LENGTH/SET/INSERT/REPLACE/
@@ -5763,7 +5776,7 @@ bool IsJsonSpace(char c) {
   return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-std::string TrimJson(std::string s) {
+std::string_view TrimJson(std::string_view s) {
   size_t b = 0;
   while (b < s.size() && IsJsonSpace(s[b])) {
     ++b;
@@ -5822,7 +5835,7 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
   char quote = '\0';
   std::string current;
   auto flush = [&]() {
-    const std::string member = TrimJson(current);
+    const std::string_view member = TrimJson(current);
     if (member.empty()) {
       return;
     }
@@ -5852,15 +5865,14 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
         break;
       }
     }
-    std::string key =
-        colon == std::string::npos ? member : member.substr(0, colon);
-    std::string value_text =
-        colon == std::string::npos ? "" : member.substr(colon + 1);
-    key = TrimJson(key);
+    std::string_view key = TrimJson(member.substr(0, colon));
+    const std::string_view value_text =
+        colon == std::string_view::npos ? std::string_view{}
+                                       : member.substr(colon + 1);
     if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
       key = key.substr(1, key.size() - 2);
     }
-    members.emplace_back(std::move(key), TrimJson(value_text));
+    members.emplace_back(key, TrimJson(value_text));
     current.clear();
   };
   for (size_t i = 0; i < body.size(); ++i) {
@@ -5894,8 +5906,8 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
   return members;
 }
 
-bool JsonTextToValue(const std::string& text, Value* parsed) {
-  const std::string trimmed = TrimJson(text);
+bool JsonTextToValue(std::string_view text, Value* parsed) {
+  const std::string_view trimmed = TrimJson(text);
   if (trimmed == "null") {
     *parsed = Value();
     return true;
@@ -5930,12 +5942,13 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
   if (!trimmed.empty()) {
     size_t consumed = 0;
     try {
-      const int64_t as_int = std::stoll(trimmed, &consumed);
+      const std::string token(trimmed);
+      const int64_t as_int = std::stoll(token, &consumed);
       if (consumed == trimmed.size()) {
         *parsed = Value(as_int);
         return true;
       }
-      const double as_double = std::stod(trimmed, &consumed);
+      const double as_double = std::stod(token, &consumed);
       if (consumed == trimmed.size()) {
         *parsed = Value(as_double);
         return true;
@@ -5951,8 +5964,8 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
   if (trimmed.starts_with("ARRAY<") && trimmed.back() == ']') {
     const size_t type_end = trimmed.find(">[");
     if (type_end != std::string::npos) {
-      const std::string element_type = trimmed.substr(6, type_end - 6);
-      const std::string body =
+      const std::string element_type(trimmed.substr(6, type_end - 6));
+      const std::string_view body =
           trimmed.substr(type_end + 2, trimmed.size() - type_end - 3);
       std::vector<Value> elements;
       size_t start = 0;
@@ -5981,7 +5994,7 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
           --depth;
         }
         if (at_end || (!quoted && depth == 0 && c == ',')) {
-          const std::string item = TrimJson(body.substr(start, i - start));
+          const std::string_view item = TrimJson(body.substr(start, i - start));
           if (item.empty() || item == "NULL" || item == "null") {
             elements.emplace_back();
           } else if (item.front() == '"' && item.back() == '"' &&
@@ -6003,11 +6016,12 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
           } else {
             try {
               size_t consumed = 0;
-              const int64_t integer = std::stoll(item, &consumed);
+              const std::string token(item);
+              const int64_t integer = std::stoll(token, &consumed);
               if (consumed == item.size()) {
                 elements.emplace_back(integer);
               } else {
-                const double real = std::stod(item, &consumed);
+                const double real = std::stod(token, &consumed);
                 elements.emplace_back(real);
               }
             } catch (const std::exception&) {
@@ -6034,7 +6048,7 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
     // (writers quote strings), so decode it as an array.  Elements reuse
     // this same decoder recursively; the declared element type is inferred
     // from the first non-null element like array literals do.
-    const std::string body = trimmed.substr(1, trimmed.size() - 2);
+    const std::string_view body = trimmed.substr(1, trimmed.size() - 2);
     std::vector<Value> elements;
     std::string element_type;
     auto note_type = [&](const Value& v) {
@@ -6053,7 +6067,7 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
       return true;
     }
     // Split on top-level commas: quotes and nested brackets shield theirs.
-    std::vector<std::string> items;
+    std::vector<std::string_view> items;
     {
       int depth = 0;
       bool quoted = false;
@@ -6079,7 +6093,7 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
         }
       }
     }
-    for (const std::string& item : items) {
+    for (const std::string_view item : items) {
       Value element;
       if (item == "null") {
         element = Value();

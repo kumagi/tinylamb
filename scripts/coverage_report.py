@@ -72,16 +72,28 @@ def main() -> int:
 
     files: dict[str, list[int]] = {}
     current = None
-    for line in open(args.info, encoding="utf-8"):
-        if line.startswith("SF:"):
-            current = line[3:].strip()
-            files[current] = [0, 0]
-        elif line.startswith("DA:"):
-            parts = line[3:].split(",")
-            hit = int(parts[1])
-            files[current][1] += 1
-            if hit == 0:
-                files[current][0] += 1
+    with open(args.info, encoding="utf-8") as info:
+        for line_number, line in enumerate(info, start=1):
+            if line.startswith("SF:"):
+                current = line[3:].strip()
+                files[current] = [0, 0]
+            elif line.startswith("DA:"):
+                parts = line[3:].split(",")
+                try:
+                    hit = int(parts[1])
+                except (IndexError, ValueError):
+                    print(f"{args.info}:{line_number}: invalid DA record",
+                          file=sys.stderr)
+                    return 1
+                if current is None:
+                    print(f"{args.info}:{line_number}: DA record before SF",
+                          file=sys.stderr)
+                    return 1
+                files[current][1] += 1
+                if hit == 0:
+                    files[current][0] += 1
+            elif line.startswith("end_of_record"):
+                current = None
 
     total_unc = sum(v[0] for v in files.values())
     total = sum(v[1] for v in files.values())

@@ -701,10 +701,12 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
         // (one row group), so a fixed 16-word mask covers it; the tail bits
         // past nconf are masked off before the popcount (a partial row
         // group leaves them stale otherwise).
-        std::array<uint64_t, (PaxChunk::kRowGroupSize + 63) / 64> mask{};
+        std::array<uint64_t, (PaxChunk::kRowGroupSize + 63) / 64> mask;
         mask.fill(~UINT64_C(0));
         thread_local std::vector<int64_t> col;
-        col.resize(t.nconf);
+        if (col.size() < t.nconf) {
+          col.resize(t.nconf);
+        }
         for (uint32_t seg = 0; seg < t.nseg; ++seg) {
           // The digit planes are narrow (a few bits per row), so the tight
           // bulk walk is the hot path; anything else falls back to the

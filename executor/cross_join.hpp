@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"

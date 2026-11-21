@@ -45,7 +45,8 @@ PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
     setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
     PaxChunk chunk =
         PaxChunk::BuildFromSortedRun(
-            MakeRun(MakeStorageRows(c.shapes[static_cast<size_t>(s)]), sc), sc)
+            MakeRun(MakeStorageRowsForScheme(c.shapes[static_cast<size_t>(s)],
+                                              c.expected), sc), sc)
             .MoveValue();
     unsetenv("TINYLAMB_FORCE_SCHEME");
     const auto& enc = chunk.GetFooter().encodings;

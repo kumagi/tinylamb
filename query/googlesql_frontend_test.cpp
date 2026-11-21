@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -497,9 +498,20 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   // The 2 MB input parses far slower under sanitizer builds on a loaded
   // machine; this test targets EINTR retry, not the parse-round-trip budget,
   // so lift the production timeout for the process under test.
-  struct RestoreParseTimeoutEnv {  // NOLINT(clang-diagnostic-error,cppcoreguidelines-special-member-functions)
-    ~RestoreParseTimeoutEnv() { (void)unsetenv("TINYLAMB_PARSE_TIMEOUT_SEC"); }
-  } restore_parse_timeout_env;
+  struct RestoreParseTimeoutEnv {
+    std::optional<std::string> previous;
+    ~RestoreParseTimeoutEnv() {
+      if (previous.has_value()) {
+        (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", previous->c_str(), 1);
+      } else {
+        (void)unsetenv("TINYLAMB_PARSE_TIMEOUT_SEC");
+      }
+    }
+  };
+  const char* previous = std::getenv("TINYLAMB_PARSE_TIMEOUT_SEC");
+  const RestoreParseTimeoutEnv restore_parse_timeout_env{
+      previous == nullptr ? std::nullopt
+                          : std::optional<std::string>(previous)};
   (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "300", 1);  // NOLINT(clang-diagnostic-error)
   // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
   // Without SA_RESTART the blocking read/write returns EINTR and must retry.

@@ -38,13 +38,14 @@ Encoder& Encoder::operator<<(std::string_view sv) {
   // oversize string here is an invariant violation, not a runtime error.
   if (sv.size() > std::numeric_limits<bin_size_t>::max()) {
     LOG(FATAL) << "string too long to encode: " << sv.size();
-    abort();
   }
   const auto sz = static_cast<bin_size_t>(sv.size());
   std::array<char, sizeof(bin_size_t)> prefix{};
   SerializeU16(prefix.data(), sz);
   Write(prefix.data(), prefix.size());
-  Write(sv.data(), sv.size());
+  if (!sv.empty()) {
+    Write(sv.data(), sv.size());
+  }
   return *this;
 }
 

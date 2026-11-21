@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -133,9 +134,8 @@ inline std::vector<Row> RunPrepared(SqlEngine* engine, TransactionContext* ctx,
   return rows;
 }
 
-// Runs a scalar SELECT to completion; execution-time errors (overflow, divide
-// by zero) surface as exceptions from Next(), matching how the engine reports
-// them to callers.
+// Runs a scalar SELECT to completion and throws std::runtime_error if the
+// executor reports a failure after the Next() loop.
 inline std::vector<Row> RunScalar(TransactionContext& ctx, Database& db,
                                   std::string_view sql) {
   SqlEngine engine(db);

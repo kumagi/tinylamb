@@ -28,7 +28,8 @@ namespace tinylamb {
 [[nodiscard]] StatusOr<std::optional<PipelineGraph>>
 TryLowerGroupedStatementToPipeline(
     const SelectStatement& select, const Plan& core_plan,
-    TransactionContext& ctx, const std::string& explain_text = {},
+    TransactionContext& ctx,
+    std::function<std::string()> explain_text_producer = {},
     const std::function<Expression(const Expression&)>& resolve_alias = {});
 
 }  // namespace tinylamb

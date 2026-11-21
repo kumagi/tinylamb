@@ -102,14 +102,17 @@ Status SpillableStore::TransitionToSpill() {
         StatusCode::kMemoryLimitExceeded,
         "SpillableStore exceeded memory budget with no SpillStore configured");
   }
-  writer_ = std::make_unique<SpillSegmentWriter>(options_.spill_store,
-                                                 EffectiveIoBufferBytes());
-  RETURN_IF_FAIL(writer_->EnsureOpen());
-  for (DataChunk& c : mem_chunks_) {
-    RETURN_IF_FAIL(SpillChunk(c));
-    c.Reset();
+  auto writer = std::make_unique<SpillSegmentWriter>(
+      options_.spill_store, EffectiveIoBufferBytes());
+  RETURN_IF_FAIL(writer->EnsureOpen());
+  for (const DataChunk& chunk : mem_chunks_) {
+    RETURN_IF_FAIL(WriteDataChunk(writer.get(), chunk, &scratch_codec_,
+                                  StagingFlushBytes()));
+    TrimCodecScratch();
   }
-  mem_chunks_.clear();
+  RETURN_IF_FAIL(writer->Flush());
+  spilled_bytes_ += writer->BytesWritten();
+  writer_ = std::move(writer);
   // T3462: shrink_to_fit may throw bad_alloc out of this Status path.
   std::vector<DataChunk>().swap(mem_chunks_);
   mem_bytes_ = 0;

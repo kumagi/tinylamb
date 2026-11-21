@@ -33,9 +33,13 @@ class OocRng {
     if (hi <= lo) {
       return lo;
     }
-    const auto span = static_cast<uint64_t>(hi - lo + 1);
-    return lo + static_cast<int64_t>(Next32() % span);
+    const uint64_t span = static_cast<uint64_t>(hi) -
+                          static_cast<uint64_t>(lo) + 1;
+    const uint32_t draw = Next32();
+    // A zero span represents the entire INT64 domain (2^64 values).
+    return lo + static_cast<int64_t>(span == 0 ? draw : draw % span);
   }
+  // Percentages outside [0, 100] saturate. Always consume one draw.
   bool Chance(int pct) { return Pick(0, 99) < pct; }
   template <typename T>
   const T& OneOf(const std::vector<T>& v) {
@@ -76,7 +80,8 @@ struct OocGenQuery {
 // Draws one random read-only query over `tables` (at least one table).
 // Every query is deterministic: any two correct executions return the same
 // multiset of rows (the same sequence when `ordered`).  `max_join_rows`
-// bounds the estimated intermediate result of joins.
+// is a soft cap for estimated join intermediates, with a floor of 2,000 rows
+// to preserve the minimum input sizes of the join templates.
 OocGenQuery GenerateOocQuery(OocRng& rng,
                              const std::vector<OocGenTable>& tables,
                              int64_t max_join_rows);

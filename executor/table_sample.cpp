@@ -307,8 +307,8 @@ size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
     destination->Reset(output_schema_, max_rows);
     while (output_offset_ < output_rows_.size() &&
            destination->Size() < max_rows) {
-      const Candidate& candidate = output_rows_[output_offset_++];
-      Row row = candidate.row;
+      Candidate& candidate = output_rows_[output_offset_++];
+      Row row = std::move(candidate.row);
       if (spec_.with_weight) {
         const PartitionState& state = partition_states_[candidate.partition];
         const size_t selected = state.selected;

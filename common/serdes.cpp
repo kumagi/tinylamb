@@ -48,18 +48,24 @@ size_t SerializeStringView(char* pos, std::string_view bin) {
   }
   const auto len = static_cast<bin_size_t>(bin.size());
   SerializeU16(pos, len);
-  memcpy(pos + sizeof(len), bin.data(), bin.size());
+  if (!bin.empty()) {
+    memcpy(pos + sizeof(len), bin.data(), bin.size());
+  }
   return sizeof(len) + bin.size();
 }
 
 size_t DeserializeStringView(const char* pos, const char* end,
                              std::string_view* out) {
-  if (end == nullptr || static_cast<size_t>(end - pos) < sizeof(bin_size_t)) {
+  if (pos == nullptr || end == nullptr || end < pos) {
+    return 0;
+  }
+  const auto available = static_cast<size_t>(end - pos);
+  if (available < sizeof(bin_size_t)) {
     return 0;
   }
   bin_size_t len = 0;
   DeserializeU16(pos, &len);
-  if (static_cast<size_t>(end - pos) - sizeof(bin_size_t) < len) {
+  if (available - sizeof(bin_size_t) < len) {
     return 0;
   }
   *out = {pos + sizeof(len), len};

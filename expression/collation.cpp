@@ -17,7 +17,7 @@ namespace {
 // GoogleSQL requires. Anything else (a column, a parameter, a nested call) is
 // resolved per row at evaluation time instead, so it contributes no static
 // collation — which is why this is optional and not a plain string_view: an
-// an empty spec is NOT accepted (CollationOfSpec rejects it); only a
+// empty spec is NOT accepted (CollationOfSpec rejects it); only a
 // non-empty literal such as "und:ci" is a static collation.
 std::optional<std::string_view> LiteralCollationSpec(
     const Expression& collator) {

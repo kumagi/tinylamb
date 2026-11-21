@@ -10,10 +10,12 @@
 #include "common/decoder.hpp"
 
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <new>
 #include <string>
 #include <thread>
@@ -44,10 +46,8 @@ inline void CountAllocationIfActive() {
 
 }  // namespace
 
-// Replacement placement: this toolchain's <new> does not declare
-// std::operator new, so the replacements delegate to malloc/free directly.
-// Every allocation in the binary still pairs with a matching deallocation
-// because all operator new/delete paths are replaced together.
+// The replaceable global allocation functions delegate to malloc/free.
+// Replace the allocation and deallocation paths together to preserve pairing.
 void* operator new(std::size_t n) {
   CountAllocationIfActive();
   // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) raw-buffer codec test
@@ -72,6 +72,10 @@ void* operator new(std::size_t n, std::align_val_t a) {
   CountAllocationIfActive();
   const auto align = static_cast<std::size_t>(a);
   std::size_t size = n == 0 ? 1 : n;
+  if (!std::has_single_bit(align) ||
+      size > std::numeric_limits<std::size_t>::max() - (align - 1)) {
+    throw std::bad_alloc();
+  }
   size = (size + align - 1) & ~(align - 1);
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)  // raw-buffer codec test
   void* p = std::aligned_alloc(align, size);
@@ -114,20 +118,23 @@ namespace tinylamb {
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 namespace {
 
-struct ScopedAllocationCount {
-  uint64_t count;
+class ScopedAllocationCount {
+ public:
+  ScopedAllocationCount() {
+    g_alloc_count.store(0, std::memory_order_relaxed);
+    g_measuring_thread.store(std::this_thread::get_id(),
+                             std::memory_order_relaxed);
+    g_counting.store(true, std::memory_order_seq_cst);
+  }
+  ~ScopedAllocationCount() {
+    g_counting.store(false, std::memory_order_seq_cst);
+  }
 };
 
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-
-ScopedAllocationCount MeasureAllocations(const std::function<void()>& fn) {
-  g_alloc_count.store(0, std::memory_order_relaxed);
-  g_measuring_thread.store(std::this_thread::get_id(),
-                                  std::memory_order_relaxed);
-  g_counting.store(true, std::memory_order_seq_cst);
+uint64_t MeasureAllocations(const std::function<void()>& fn) {
+  const ScopedAllocationCount measuring;
   fn();
-  g_counting.store(false, std::memory_order_seq_cst);
-  return {g_alloc_count.load(std::memory_order_relaxed)};
+  return g_alloc_count.load(std::memory_order_relaxed);
 }
 
 // Reads an optional trailing double the way ColumnStats::correlation_ does:
@@ -215,6 +222,11 @@ TEST(DecoderTest, AtEndSeesTrueExactlyAtBufferEnd) {
 // #1055's performance contract: decoding a POD payload must not touch the
 // heap at all.  The old body (std::string copy feeding a std::stringstream)
 // allocated at least twice per Decode; the in-place get area does neither.
+TEST(DecoderTest, AllocationMeasurementStopsOnException) {
+  EXPECT_THROW(MeasureAllocations([] { throw std::bad_alloc(); }), std::bad_alloc);
+  EXPECT_FALSE(g_counting.load(std::memory_order_relaxed));
+}
+
 TEST(DecoderTest, DecodeOfPlainPayloadPerformsNoHeapAllocation) {
   std::string payload;
   {
@@ -234,8 +246,8 @@ TEST(DecoderTest, DecodeOfPlainPayloadPerformsNoHeapAllocation) {
     }
   });
   EXPECT_EQ(sink.load(), 700U);
-  EXPECT_EQ(measured.count, 0U)
-      << "Decode of a 16-byte POD payload allocated " << measured.count
+  EXPECT_EQ(measured, 0U)
+      << "Decode of a 16-byte POD payload allocated " << measured
       << " times (copy + stringstream regression?)";
 }
 

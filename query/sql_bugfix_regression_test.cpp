@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -52,10 +53,9 @@ class SqlBugfixRegressionTest : public ::testing::Test {
   }
 
   void Exec(const std::string& sql) {
-    StatusOr<QueryResult> result = engine_->Execute(*context_, sql);
-    ASSERT_TRUE(result.HasValue()) << sql << ": " << engine_->LastError();
-    result.Value().Drain();
-    ASSERT_EQ(result.Value().GetStatus(), Status::kSuccess) << sql;
+    if (const auto error = ErrorOf(sql)) {
+      throw std::runtime_error(sql + ": " + *error);
+    }
   }
 
   // Execution is lazy: a statement may prepare fine and fail while its
@@ -397,7 +397,8 @@ TEST_F(SqlBugfixRegressionTest, UnsignedInSubqueryNeverMatchesSignedProbe) {
   // enough for the dense-bits + >= 4096 gate that drops the predicate.
   for (int base = 0; base < 4100; base += 820) {
     std::string insert = "INSERT INTO m17 VALUES ";
-    insert.reserve(820);
+    // Each tuple contains a UINT64 literal plus punctuation and spacing.
+    insert.reserve(insert.size() + 24 * 820);
     for (int k = 0; k < 820; ++k) {
       const uint64_t value =
           18446744073709551615ULL - static_cast<uint64_t>(base + k);
@@ -692,7 +693,7 @@ TEST_F(SqlBugfixRegressionTest,
     out.push_back(row);
     row = Row();
   }
-  ASSERT_EQ(apply.GetStatus(), Status::kSuccess) << engine_->LastError();
+  ASSERT_EQ(apply.GetStatus(), Status::kSuccess) << apply.GetStatus();
   ASSERT_EQ(out.size(), 1);
   EXPECT_EQ(out[0][0].value.int_value, 1);
 }

@@ -187,6 +187,29 @@ bool ContainsGroupingCall(const Expression& expression) {
 // to constants and replaces references to inactive grouping keys by NULL.
 // Aggregates, window calls and subqueries keep their inner scope untouched
 // (their inputs are pre-grouping row values, not grouped outputs).
+GroupingSetKeyTexts::GroupingSetKeyTexts(
+    const std::vector<std::vector<Expression>>& grouping_sets) {
+  for (const auto& set : grouping_sets) {
+    for (const Expression& key : set) {
+      auto [it, inserted] = by_expression_.try_emplace(key.get());
+      if (inserted) {
+        it->second = key->ToString();
+        all_.insert(it->second);
+      }
+    }
+  }
+}
+
+GroupingSetBranchContext GroupingSetKeyTexts::ForBranch(
+    const std::vector<Expression>& active) const {
+  GroupingSetBranchContext context{.all_key_texts = all_, .active_key_texts = {}};
+  context.active_key_texts.reserve(active.size());
+  for (const Expression& key : active) {
+    context.active_key_texts.insert(TextOf(key));
+  }
+  return context;
+}
+
 StatusOr<Expression> RewriteGroupingSetBranch(
     const Expression& expression, const GroupingSetBranchContext& context) {
   if (!expression) {
@@ -208,8 +231,7 @@ StatusOr<Expression> RewriteGroupingSetBranch(
                                         : "GROUPING argument is malformed");
       }
       const std::string arg_text = grouping_args[i]->ToString();
-      if (std::ranges::find(context.all_key_texts, arg_text) ==
-          context.all_key_texts.end()) {
+      if (!context.all_key_texts.contains(arg_text)) {
         return AstError<Expression>(
             (is_grouping_id ? "GROUPING_ID" : "GROUPING") +
             std::string(" argument must appear in the GROUP BY list: ") +
@@ -240,8 +262,7 @@ StatusOr<Expression> RewriteGroupingSetBranch(
     // wrongly null an inactive key nested inside an active composite key.
     return expression;
   }
-  if (std::ranges::find(context.all_key_texts, text) !=
-      context.all_key_texts.end()) {
+  if (context.all_key_texts.contains(text)) {
     // Inactive grouping key: the branch NULL-pads this output.
     return ConstantValueExp(Value());
   }
@@ -599,17 +620,9 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
     wrapper_terms.push_back(std::move(term));
   }
 
-  // Fingerprint of every key across all sets (deduplicated, insertion
-  // order); a branch NULL-pads references to keys outside its active set.
-  std::vector<std::string> all_key_texts;
-  for (const auto& set : pending_grouping_sets) {
-    for (const Expression& key : set) {
-      const std::string text = key->ToString();
-      if (std::ranges::find(all_key_texts, text) == all_key_texts.end()) {
-        all_key_texts.push_back(text);
-      }
-    }
-  }
+  // Reuse the grouping key fingerprints across all branches.
+  const GroupingSetKeyTexts key_texts(pending_grouping_sets);
+
   const auto inactive_bare_key_aliases =
       [&](const GroupingSetBranchContext& context) {
         std::unordered_set<std::string> out;
@@ -619,7 +632,7 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
             if (!key || key->Type() != TypeTag::kColumnValue) {
               continue;
             }
-            const std::string text = key->ToString();
+            const std::string& text = key_texts.TextOf(key);
             if (context.active_key_texts.contains(text)) {
               continue;
             }
@@ -639,11 +652,7 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
   auto rewrite_window_branch =
       [&](SelectStatement& branch,
           const std::vector<Expression>& active) -> Status {
-    GroupingSetBranchContext context;
-    context.all_key_texts = all_key_texts;
-    for (const Expression& key : active) {
-      context.active_key_texts.insert(key->ToString());
-    }
+    const GroupingSetBranchContext context = key_texts.ForBranch(active);
     const std::unordered_set<std::string> inactive_aliases =
         inactive_bare_key_aliases(context);
 
@@ -1951,6 +1960,7 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
   // a gated feature); they must not masquerade as WHERE candidates. A
   // RETURNING clause is rejected explicitly so it cannot be silently dropped.
   std::vector<const GoogleSqlAstNode*> where_candidates;
+  where_candidates.reserve(root.children.size());
   if (root.Child("ReturningClause") != nullptr) {
     return AstError<std::unique_ptr<Statement>>(
         "GoogleSQL AST: UPDATE ... RETURNING is not supported");
@@ -2090,7 +2100,8 @@ StatusOr<std::unique_ptr<Statement>> VisitDelete(const GoogleSqlAstNode& root) {
   if (path == nullptr) {
     return AstError<std::unique_ptr<Statement>>("GoogleSQL AST: bad DELETE");
   }
-  std::vector<const GoogleSqlAstNode*> where_candidates;
+  const GoogleSqlAstNode* where_candidate = nullptr;
+  bool multiple_where_candidates = false;
   for (const auto& child : root.children) {
     // Skip the target by IDENTITY, not by kind: a bare-column predicate
     // (`WHERE flag`) is itself a PathExpression in the dump, and skipping
@@ -2118,16 +2129,17 @@ StatusOr<std::unique_ptr<Statement>> VisitDelete(const GoogleSqlAstNode& root) {
           "join as a subquery (WHERE EXISTS (SELECT 1 FROM u WHERE u.k = "
           "t.k))");
     }
-    where_candidates.push_back(child.get());
+    multiple_where_candidates |= where_candidate != nullptr;
+    where_candidate = child.get();
   }
-  if (where_candidates.size() > 1) {
+  if (multiple_where_candidates) {
     return AstError<std::unique_ptr<Statement>>(
         "GoogleSQL AST: multiple DELETE WHERE clause candidates");
   }
   Expression where;
-  if (!where_candidates.empty()) {
+  if (where_candidate != nullptr) {
     ASSIGN_OR_RETURN(Expression, hv227907_0,
-                     (VisitExpression(*where_candidates.front())));
+                     (VisitExpression(*where_candidate)));
     where = std::move(hv227907_0);
   }
   ASSIGN_OR_RETURN(std::string, hv227967_0, (Path(*path)));

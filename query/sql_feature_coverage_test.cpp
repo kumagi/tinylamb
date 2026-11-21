@@ -3,7 +3,7 @@
 // End-to-end coverage tests for engine/executor paths that the regression
 // suites do not reach: WITH TIES and LIMIT edge shapes, DISTINCT ON, distinct
 // aggregates over typed columns, set operations, CTE self-references (the
-// the CTE materialization path), outer joins, correlated subqueries, QUALIFY,
+// CTE materialization path), outer joins, correlated subqueries, QUALIFY,
 // window frames, UNNEST shapes, and the parallel morsel-scan aggregation over
 // a table large enough to trigger the multi-worker path.
 

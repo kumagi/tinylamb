@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -600,6 +601,8 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
       const size_t b_end = (total_blocks * (w + 1)) / fold_workers;
       std::vector<uint32_t> matched_rows;
       matched_rows.reserve(256);
+      std::unique_ptr<uint32_t[]> simple_matches;
+      size_t simple_capacity = 0;
       for (size_t b = b_begin; b < b_end; ++b) {
         if (failed.load(std::memory_order_acquire)) {
           return;
@@ -773,15 +776,20 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           }
           continue;
         }
-        matched_rows.clear();
+        // No shared clear(): the compaction fast path below overwrites every
+        // slot it keeps and truncates the tail, while the generic path
+        // clears before push_back (avoiding a full zero-fill per block).
         if (peek_ptr == nullptr && can_inline_simple &&
             row_filter_->simple.size() == 1) {
           const auto& pred = row_filter_->simple[0];
           const LSTableColumnBlock& col = blk.columns[pred.column];
           if (!col.has_null &&
               (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
-            matched_rows.resize(blk.row_count);
-            uint32_t* __restrict out = matched_rows.data();
+            if (simple_capacity < blk.row_count) {
+              simple_matches = std::make_unique_for_overwrite<uint32_t[]>(blk.row_count);
+              simple_capacity = blk.row_count;
+            }
+            uint32_t* __restrict out = simple_matches.get();
             const int64_t* __restrict vals = col.int_cells.data();
             const int64_t c = pred.int_constant;
             const uint32_t n = blk.row_count;
@@ -831,16 +839,14 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                 }
                 break;
             }
-            matched_rows.resize(out_idx);
-            if (matched_rows.size() == blk.row_count) {
+            if (out_idx == blk.row_count) {
               if (Status st = consume(w, blk, nullptr, blk.row_count);
                   st != Status::kSuccess) {
                 fail(st);
                 return;
               }
-            } else if (!matched_rows.empty()) {
-              if (Status st =
-                      consume(w, blk, matched_rows.data(), matched_rows.size());
+            } else if (out_idx != 0) {
+              if (Status st = consume(w, blk, out, out_idx);
                   st != Status::kSuccess) {
                 fail(st);
                 return;
@@ -849,6 +855,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
             continue;
           }
         }
+        matched_rows.clear();
         for (uint32_t r = 0; r < blk.row_count; ++r) {
           if (peek_ptr != nullptr) {
             bool peek_ok = true;

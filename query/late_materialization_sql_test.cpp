@@ -159,7 +159,7 @@ TEST_F(LateMaterializationQueryTest, OuterJoinFallsBackAndNullKeysNeverMatch) {
   size_t null_payloads = 0;
   bool found_match = false;
   for (const Row& row : outer) {
-    if (row[0].value.int_value == 1 && row[1].value.int_value == 11) {
+    if (row[0] == Value(1) && row[1] == Value(11)) {
       found_match = true;
     }
     if (row[1].IsNull()) {

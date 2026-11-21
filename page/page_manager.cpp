@@ -587,8 +587,7 @@ bool TryDecodeIndexEntryList(std::string_view encoded, bool deleted,
       return true;
     }
   }
-  std::string buffer(encoded);
-  std::stringstream ss(buffer);
+  std::istringstream ss{std::string(encoded)};
   Decoder dec(ss);
   std::vector<LsmIndexEntry> parsed;
   dec >> parsed;

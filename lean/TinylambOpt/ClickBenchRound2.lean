@@ -15,7 +15,7 @@ import TinylambOpt.ScalarOverflowAndCoreAlgebra
 - **Q26**: `WHERE SearchPhrase <> '' ORDER BY SearchPhrase ASC LIMIT 10` における空文字列最小値 `""` による
   ブロック Zone-Map 打ち切り不能問題
 
-これらを解決する **6 系統の新規健全性定理群（CB-7..CB-12）** と **7 本の SQL 意味論トラップ反例定理** を
+これらを解決する **6 系統の新規健全性定理群（CB-7..CB-12）** と **8 本の SQL 意味論トラップ反例定理** を
 Lean 4 で機械検証します（`sorry` ゼロ）。
 -/
 

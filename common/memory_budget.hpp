@@ -120,7 +120,7 @@ class ProcessMemoryBudget {
   }
   [[nodiscard]] size_t SoftLimit() const noexcept {
     const size_t l = limit_.load(std::memory_order_acquire);
-    return l == 0 ? static_cast<size_t>(-1) : (l / 5) * 4;
+    return ComputeSoftLimit(l);
   }
   [[nodiscard]] size_t RssWarnLimit() const noexcept {
     // T1383: single source of truth for the ADR 0003 "RSS 警戒" threshold
@@ -208,6 +208,9 @@ class ProcessMemoryBudget {
 
   // Approximate available headroom considering both tracked usage and sampled
   // OS RSS against Limit().
+  // Estimated headroom from accounting and the most recent RSS sample.
+  // Before sampling, RSS headroom uses the warning cap. Reservation paths
+  // enforce the budget and may refresh the RSS sample.
   [[nodiscard]] size_t Available() const noexcept;
 
   // True if `bytes` could be admitted into `pool` under the soft cap and live
@@ -269,8 +272,8 @@ class ProcessMemoryBudget {
   void SetPoolFloorsForTest(size_t storage_floor, size_t columnar_floor,
                             size_t query_floor, size_t tx_floor) noexcept;
 
-  // Returns true when live tracked bytes or sampled OS RSS exceed the high
-  // water mark (~80% of Limit()).
+  // Tracked reservations signal pressure at SoftLimit() (approximately 80%).
+  // Sampled RSS, when enabled, signals pressure at RssWarnLimit() (87.5%).
   [[nodiscard]] bool UnderMemoryPressure() const noexcept;
 
   // Refreshes and returns sampled process RSS in bytes (throttled across high
@@ -345,6 +348,10 @@ class ProcessMemoryBudget {
   void ResetTestKnobs() noexcept;
 
  private:
+  static constexpr size_t ComputeSoftLimit(size_t limit) noexcept {
+    return limit == 0 ? static_cast<size_t>(-1) : (limit / 5) * 4;
+  }
+
   ProcessMemoryBudget();
 
   static void UpdatePeak(std::atomic<size_t>& peak, size_t val) noexcept;
@@ -373,7 +380,7 @@ class ProcessMemoryBudget {
 
   std::atomic<size_t> limit_{kDefaultLimitBytes};
   std::atomic<size_t> storage_limit_{size_t{4} << 30};
-  std::atomic<size_t> columnar_limit_{size_t{2} << 30};
+  std::atomic<size_t> columnar_limit_{0};
   std::atomic<size_t> storage_floor_{0};
   std::atomic<size_t> columnar_floor_{0};
   std::atomic<size_t> query_floor_{0};

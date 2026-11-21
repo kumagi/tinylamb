@@ -96,12 +96,18 @@ Status DecodeRowBlockPayload(uint32_t row_count, std::string_view payload,
   if (static_cast<uint64_t>(row_count) > payload.size() / sizeof(uint32_t)) {
     return StatusError(StatusCode::kCorrupt, "corrupt row count in row block");
   }
-  rows_out->reserve(rows_out->size() + row_count);
+  const size_t initial_size = rows_out->size();
+  rows_out->reserve(initial_size + row_count);
   for (uint32_t i = 0; i < row_count; ++i) {
-    ASSIGN_OR_RETURN(Row, row, DecodeSpillRow(&payload));
-    rows_out->push_back(std::move(row));
+    StatusOr<Row> row = DecodeSpillRow(&payload);
+    if (!row.HasValue()) {
+      rows_out->resize(initial_size);
+      return row.GetStatus();
+    }
+    rows_out->push_back(row.MoveValue());
   }
   if (!payload.empty()) {
+    rows_out->resize(initial_size);
     return StatusError(StatusCode::kCorrupt,
                        "trailing unconsumed bytes in row block");
   }
@@ -141,12 +147,12 @@ size_t EstimateRowMemoryBytes(const Row& row) noexcept {
   return total;
 }
 
-Status EncodeSpillValue(const Value& val, std::string* dst) {
+Status EncodeSpillValue(const Value& val, std::string* dst, int max_depth) {
   if (dst == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
                        "null dst in EncodeSpillValue");
   }
-  return EncodeValueImpl(val, dst, 64);
+  return EncodeValueImpl(val, dst, max_depth);
 }
 
 StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
@@ -167,8 +173,11 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
                        "corrupt collation tag in row spill stream");
   }
   switch (vt) {
-    case ValueType::kNull:
-      return Value();
+    case ValueType::kNull: {
+      Value out;
+      out.SetCollation(collation);
+      return out;
+    }
     case ValueType::kInt64: {
       int64_t v = 0;
       RETURN_IF_FAIL(ReadPod(src, &v));
@@ -180,6 +189,10 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
       int64_t v = 0;
       RETURN_IF_FAIL(ReadPod(src, &v));
       Value out = Value::DateFromDays(v);
+      if (out.DateDays() != v) {
+        return StatusError(StatusCode::kCorrupt,
+                           "out-of-range DATE in row spill stream");
+      }
       out.SetCollation(collation);
       return out;
     }

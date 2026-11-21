@@ -428,13 +428,15 @@ TEST_F(PageManagerTest, TableTailWaiterProceedsAfterHolderRelease) {
   constexpr txn_id_t kB = 404;
   constexpr page_id_t kT = 21;
   ASSERT_SUCCESS(pm_->ReserveTableTail(kB, kT, kT));
+  std::promise<void> entering;
+  auto entered = entering.get_future();
   std::future<Status> waiter = std::async(std::launch::async, [&] {
+    entering.set_value();
     return pm_->ReserveTableTail(kA, kT, kT);
   });
-  // Long enough that the waiter is parked in cv.wait_for (5 ms slices) for
-  // several rounds before the release lands.
-  std::this_thread::sleep_for(std::chrono::milliseconds(60));
-  ASSERT_EQ(waiter.wait_for(std::chrono::milliseconds(10)),
+  EXPECT_EQ(entered.wait_for(std::chrono::seconds(4)),
+            std::future_status::ready);
+  EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(10)),
             std::future_status::timeout);
   pm_->ResolveTableTailReservations(kB, TableTailResolution::kDiscard);
   ASSERT_EQ(waiter.wait_for(std::chrono::seconds(4)),

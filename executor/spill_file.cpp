@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/spill_file.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -246,11 +247,13 @@ StatusOr<SpillFile::RowReader> SpillFile::OpenRowReader() {
   }
   RowReader reader;
   reader.path_ = path_;
-  reader.io_buffer_.assign(RowReader::kReadBufferBytes, '\0');
+  const auto bytes = static_cast<size_t>(
+      std::clamp<uint64_t>(file_bytes_, 4096, RowReader::kReadBufferBytes));
+  reader.io_buffer_.assign(bytes, '\0');
   reader.stream_ = std::make_unique<std::ifstream>();
   reader.stream_->rdbuf()->pubsetbuf(
       reader.io_buffer_.data(),
-      static_cast<std::streamsize>(RowReader::kReadBufferBytes));
+      static_cast<std::streamsize>(bytes));
   reader.stream_->open(path_, std::ios::binary | std::ios::in);
   if (!*reader.stream_) {
     return StatusError(StatusCode::kIOError,
@@ -272,6 +275,10 @@ StatusOr<SpillFile::RowReader> SpillFile::OpenRowReader() {
 }
 
 Status SpillFile::RowReader::Next(Row* out, bool* has_row) {
+  if (out == nullptr || has_row == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spill row reader requires row and presence outputs");
+  }
   if (!stream_ || remaining_ == 0) {
     *has_row = false;
     stream_.reset();

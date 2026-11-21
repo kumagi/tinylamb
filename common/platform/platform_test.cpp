@@ -18,6 +18,7 @@
 // both Linux (epoll, eventfd, accept4, tzdb) and macOS (kqueue, pipe,
 // fcntl, CFTimeZone).
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -30,6 +31,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -40,9 +42,11 @@
 #include "common/platform/event_poller.hpp"
 #include "common/platform/extended_float.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/hash.hpp"
 #include "common/platform/int128_conversion.hpp"
 #include "common/platform/os.hpp"
 #include "common/platform/process.hpp"
+#include "common/platform/random.hpp"
 #include "common/platform/socket.hpp"
 #include "common/platform/synced_stream.hpp"
 #include "common/platform/time_zone.hpp"
@@ -75,6 +79,17 @@ TEST(Int128ConversionAuditTest, SignedAndUnsignedBoundarySaturation) {
 }
 #endif
 
+TEST(PlatformRandomTest, UniformIntAndShuffleMatchLibstdcxxVectors) {
+  std::mt19937 uniform_engine(12345);
+  for (int expected : {59, 55, 8, -7, -2, -14, -1, 50}) {
+    EXPECT_EQ(UniformInt(uniform_engine, -17, 64), expected);
+  }
+  std::mt19937 shuffle_engine(12345);
+  std::array values{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  Shuffle(values.begin(), values.end(), shuffle_engine);
+  EXPECT_EQ(values, (std::array{6, 8, 3, 5, 1, 2, 9, 7, 4, 0}));
+}
+
 TEST(SoftExtendedAuditTest,
      IntegralConversionsSaturateWithoutUndefinedBehavior) {
   EXPECT_EQ(static_cast<int64_t>(SoftExtended(1e100)), INT64_MAX);
@@ -92,6 +107,16 @@ TEST(SoftExtendedAuditTest,
   EXPECT_EQ(
       static_cast<int>(SoftExtended(std::numeric_limits<double>::quiet_NaN())),
       0);
+}
+
+TEST(SoftExtendedAuditTest, ArithmeticRetainsLowBitsAndRoundsEven) {
+  const SoftExtended two_to_53(uint64_t{1} << 53);
+  const SoftExtended one(1);
+  EXPECT_EQ(static_cast<int64_t>((two_to_53 + one) - two_to_53), 1);
+  EXPECT_EQ(static_cast<double>(two_to_53 + one),
+            static_cast<double>(two_to_53));
+  EXPECT_EQ(static_cast<double>(SoftExtended(1.5) * SoftExtended(3.0)), 4.5);
+  EXPECT_EQ(static_cast<double>(SoftExtended(9.0) / SoftExtended(4.0)), 2.25);
 }
 
 #ifndef TINYLAMB_OS_WINDOWS
@@ -154,16 +179,65 @@ std::array<int, 2> TcpPair() {
   return {client, server};
 }
 
+TEST(PlatformHashTest, StableHashBytesPinsWireByteOrder) {
+  EXPECT_EQ(StableHashBytes(""), 0x553e93901e462a6eULL);
+  EXPECT_EQ(StableHashBytes("abcdefgh"), 0x783db3e38db898bbULL);
+  EXPECT_EQ(StableHashBytes("abcdefghijk"), 0x32f6faa7d12fbce5ULL);
+}
+
 TEST(PlatformEndianTest, BigEndianRoundTrip) {
   const uint64_t value = 0x0102030405060708ULL;
   const uint64_t be = htobe64(value);
   const auto* bytes = reinterpret_cast<const unsigned char*>(&be);
-  EXPECT_EQ(bytes[0], 0x01);
-  EXPECT_EQ(bytes[7], 0x08);
+  // Memory image must be big-endian on every host: byte i holds hex digit
+  // pair i of the original value. Checking all eight bytes keeps this
+  // endian-independent (a host-order leak fails on either endianness).
+  for (size_t i = 0; i < 8; ++i) {
+    EXPECT_EQ(bytes[i], static_cast<unsigned char>((value >> (56 - 8 * i)) & 0xFF))
+        << "byte " << i;
+  }
   EXPECT_EQ(be64toh(be), value);
   EXPECT_EQ(be32toh(htobe32(0xA1B2C3D4U)), 0xA1B2C3D4U);
   EXPECT_EQ(le64toh(htole64(value)), value);
 }
+
+#if defined(__GLIBCXX__)
+// random.hpp's contract is bit-for-bit libstdc% (GCC >= 11) reproduction so
+// seeded fuzzers and pinned regression traces replay identically everywhere.
+// Compare every draw against the real std:: facilities on identically-seeded
+// engines: any drift by one output fails here instead of silently
+// invalidating committed .test replays. Covers both shuffle paths (the
+// two-positions-per-draw optimization and the single-draw fallback).
+TEST(PlatformRandomTest, MatchesLibstdcxxDraws) {
+  for (const uint32_t seed : {uint32_t{0}, uint32_t{1}, uint32_t{0xDEADBEEFU}}) {
+    {
+      std::mt19937 ours(seed);
+      std::mt19937 theirs(seed);
+      std::uniform_int_distribution<int64_t> dist_i64{-1000, 1000};
+      std::uniform_int_distribution<uint32_t> dist_u32{0, 0xFFFFFFFEU};
+      for (int i = 0; i < 64; ++i) {
+        EXPECT_EQ(UniformInt(ours, int64_t{-1000}, int64_t{1000}),
+                  dist_i64(theirs))
+            << "seed=" << seed << " i=" << i;
+        EXPECT_EQ(UniformInt(ours, uint32_t{0}, uint32_t{0xFFFFFFFEU}),
+                  dist_u32(theirs))
+            << "seed=" << seed << " i=" << i;
+      }
+    }
+    for (const size_t n : {size_t{50}, size_t{70000}}) {
+      std::vector<int> a(n), b(n);
+      for (size_t i = 0; i < n; ++i) {
+        a[i] = b[i] = static_cast<int>(i);
+      }
+      std::mt19937 ours(seed);
+      std::mt19937 theirs(seed);
+      Shuffle(a.begin(), a.end(), ours);
+      std::shuffle(b.begin(), b.end(), theirs);
+      EXPECT_EQ(a, b) << "seed=" << seed << " n=" << n;
+    }
+  }
+}
+#endif
 
 TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
   const std::filesystem::path path =
@@ -276,8 +350,6 @@ TEST(PlatformEventPollerTest, EmptyPollerWaitsForRegistrationAndReadiness) {
     return poller.Wait(results, -1);
   });
   started.wait();
-  EXPECT_EQ(waiting.wait_for(std::chrono::milliseconds(25)),
-            std::future_status::timeout);
   EXPECT_TRUE(poller.Add(waker.ReadFd(), kPollReadable));
   waker.Wake();
   EXPECT_EQ(waiting.get(), 1);

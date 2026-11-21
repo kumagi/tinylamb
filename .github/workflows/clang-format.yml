@@ -26,5 +26,5 @@ jobs:
           # Quote the pathspecs: an unquoted *.{...} glob expands against the
           # repo root only, so nested files silently dropped out of the check.
           git ls-files '*.c' '*.h' '*.cc' '*.cpp' '*.hpp' | \
-            xargs clang-format-22 -style=file -i
+            xargs -r clang-format-22 -style=file -i
           git diff --exit-code

@@ -66,10 +66,21 @@ class SamplePlan final : public PlanBase {
     return child_->EnforcesDistinct();
   }
   [[nodiscard]] Collation OrderCollation() const override {
-    return child_->OrderCollation();
+    return spec_.method == TableSampleMethod::kReservoir ||
+                   spec_.method == TableSampleMethod::kSystem
+               ? Collation::kNone
+               : child_->OrderCollation();
   }
   [[nodiscard]] bool OrderIsMeasured() const override {
-    return child_->OrderIsMeasured();
+    return spec_.method != TableSampleMethod::kReservoir &&
+           spec_.method != TableSampleMethod::kSystem &&
+           child_->OrderIsMeasured();
+  }
+  // Sampling only ever shrinks the child's row stream, so a limit the child
+  // already enforces still bounds this node's output exactly.
+  [[nodiscard]] bool EnforcesLimit(size_t limit_count,
+                                   size_t limit_offset) const override {
+    return child_->EnforcesLimit(limit_count, limit_offset);
   }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;

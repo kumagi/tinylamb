@@ -7459,13 +7459,21 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           h_sum += m;
           h_xor ^= m;
         }
-        keyed_cache_key =
-            "__keyed__:" + source.table + ":" +
-            std::to_string(*full_key_column) + ":" +
-            std::to_string(static_cast<int>(int_runtime_filter->type)) + ":" +
-            std::to_string(exact_keys.size()) + ":" + std::to_string(fg.Lo()) +
-            ":" + std::to_string(fg.Hi()) + ":" + std::to_string(h_sum) + ":" +
-            std::to_string(h_xor);
+        keyed_cache_key = "__keyed__:" + source.table + ":";
+        AppendInteger(keyed_cache_key, *full_key_column);
+        keyed_cache_key.push_back(':');
+        AppendInteger(keyed_cache_key,
+                      static_cast<int>(int_runtime_filter->type));
+        keyed_cache_key.push_back(':');
+        AppendInteger(keyed_cache_key, exact_keys.size());
+        keyed_cache_key.push_back(':');
+        AppendInteger(keyed_cache_key, fg.Lo());
+        keyed_cache_key.push_back(':');
+        AppendInteger(keyed_cache_key, fg.Hi());
+        keyed_cache_key.push_back(':');
+        AppendInteger(keyed_cache_key, h_sum);
+        keyed_cache_key.push_back(':');
+        AppendInteger(keyed_cache_key, h_xor);
         // The 64-bit digest can collide across different key sets; embed the
         // key bytes so a cache hit can only mean an identical key set.  Sort
         // first so build order does not split equivalent probes.

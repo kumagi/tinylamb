@@ -1168,8 +1168,8 @@ Status HashJoin::MaterializeMarkJoin() {
   const auto process_probe_spilled =
       [&](const std::vector<PositionedRow>& rows) -> Status {
     std::vector<int> match_state(rows.size(), 0);
+    std::string scratch_key;
     for (size_t i = 0; i < rows.size(); ++i) {
-      std::string scratch_key;
       const KeyRef k =
           KeyOf(rows[i].first, left_cols_, JoinHashIndex::KeyMode::kBytes,
                 ValueType::kInt64, &scratch_key, NullSafeArg());

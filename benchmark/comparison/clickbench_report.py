@@ -36,7 +36,7 @@ def report(duck, click, output):
     for field in ('rows', 'sources', 'query_sha256', 'timezone', 'upstream_commit'):
         if dm['dataset'][field] != cm['dataset'][field]:
             raise ValueError('datasets differ: ' + field)
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(parents=True, exist_ok=True)
     totals = {'tinylamb_vs_duckdb': sum(r['tinylamb']['median_ms'] for r in dr),
               'tinylamb_vs_clickhouse': sum(r['tinylamb']['median_ms'] for r in cr),
               'duckdb': sum(r['duckdb']['median_ms'] for r in dr),

@@ -14,8 +14,8 @@ namespace tinylamb {
 
 // Multi-table join oracle.  Builds a fact table (u, k, a) and a dimension
 // table (k, tag) whose exact contents the harness mirrors in C++, then runs
-// random equi-joins (INNER/LEFT, either direction, optional post-join WHERE,
-// random projections) and compares the full result multiset against the
+// random INNER, LEFT, RIGHT, FULL, and CROSS joins, including optional
+// post-join filters and random projections, and compares the results against the
 // mirror's nested-loop join.  Exercises hash join, nested loop join, merge
 // join plan choices and NULL join-key semantics.
 

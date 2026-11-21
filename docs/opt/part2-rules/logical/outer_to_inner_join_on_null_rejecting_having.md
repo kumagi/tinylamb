@@ -2,7 +2,7 @@
 
 - 状態: draft   /   執筆基準リビジョン: `9ce7837` + Lean拡張 (2026-11-18)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録名 `"outer_to_inner_join_on_null_rejecting_having"`）、および `query/join_reduction.cpp` の `ReduceOuterJoins`
-- Lean 形式証明: `lean/TinylambOpt/AvgMinMaxHavingDistinct.lean`（定理 `leftJoin_having_demotes_to_innerJoin`、反例 `having_demote_breaks_count_star_on_coarse_group`）
+- Lean 形式証明: `lean/TinylambOpt/AvgMinMaxHavingDistinct.lean`（定理 `having_null_rejecting_demotes_left_join_sound`、反例 `having_demote_breaks_count_star_on_coarse_group`）
 
 ## 概要
 

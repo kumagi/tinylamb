@@ -181,6 +181,15 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 
 ## Additional active controls (source audit, 2026-11-11)
 
+| Variable | Effect |
+| --- | --- |
+| `TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG` | If present, disables columnar TLCS aggregation for A/B comparisons. |
+| `TINYLAMB_EXPR_FUZZ_REGRESSION_DIR` | Directory of expression fuzzer regression cases to replay. |
+| `TINYLAMB_FORCE_COLOR` | If present, enables colored log output even when stderr is redirected. |
+| `TINYLAMB_LOG_LEVEL` | Minimum log level at process startup (default: TRACE). Accepts TRACE, DEBUG, USER, INFO, NOTICE, WARN, ERROR, ALERT, and FATAL, case-insensitively. |
+| `TINYLAMB_PIPELINE_METRICS` | If present, enables optional pipeline timing metrics. |
+| `TINYLAMB_PLANCACHE_REGRESSION_DIR` | Directory of SQL plan-cache fuzzer regression cases to replay. |
+
 | Variable | Meaning |
 | --- | --- |
 | `TINYLAMB_AUDIT_SPAWN_ENV` | Test fixture for `SpawnOverridesEnvironmentOnlyInChild` (`platform_test`): set in the parent, verified overridden only inside the spawned child. |

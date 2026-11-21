@@ -17,6 +17,7 @@
 #include "type/column_name.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <sstream>
 
 #include "gtest/gtest.h"
@@ -64,8 +65,13 @@ TEST(ColumnNameTest,
   EXPECT_TRUE(empty_schema.name.empty());
   EXPECT_FALSE(empty_schema.Empty());
   EXPECT_TRUE(dot.schema.empty());
-  EXPECT_TRUE(dot.name.empty());
-  EXPECT_TRUE(dot.Empty());
+  EXPECT_EQ(dot.name, ".");
+  EXPECT_FALSE(dot.Empty());
+  for (const std::string_view spelling : {".", ".x", "..x", "t..x"}) {
+    const ColumnName parsed(spelling);
+    EXPECT_EQ(parsed.ToString(), spelling);
+    EXPECT_EQ(ColumnName(parsed.ToString()), parsed);
+  }
 }
 
 TEST(ColumnNameTest,

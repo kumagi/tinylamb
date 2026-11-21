@@ -33,7 +33,17 @@ std::ostream& operator<<(std::ostream& o, const ColumnName& c) {
 }
 
 std::string ColumnName::ToString() const {
-  return schema.empty() ? name : schema + "." + name;
+  if (schema.empty()) {
+    return name;
+  }
+  // `schema + "." + name` builds a "schema." temporary and then reallocates
+  // for the append; reserve once and append in place instead.
+  std::string out;
+  out.reserve(schema.size() + 1 + name.size());
+  out.append(schema);
+  out.push_back('.');
+  out.append(name);
+  return out;
 }
 
 bool ColumnName::operator<(const ColumnName& rhs) const {

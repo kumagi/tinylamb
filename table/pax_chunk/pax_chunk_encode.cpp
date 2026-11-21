@@ -276,7 +276,10 @@ EncodedCol EncStreamVByteI64(const std::vector<int64_t>& vals, size_t budget) {
   ctrl.assign(ctrl_len, 0);
   payload.clear();
   payload.reserve(static_cast<size_t>(n) * 2);
-  block_off.assign(static_cast<size_t>(nblk) * 2, 0);
+  const auto offset_bytes = static_cast<size_t>(nblk) * 2;
+  if (block_off.size() < offset_bytes) {
+    block_off.resize(offset_bytes);
+  }
   for (uint32_t i = 0; i < n; ++i) {
     if (i % kStreamVByteBlock == 0) {
       const size_t b = i / kStreamVByteBlock;
@@ -317,7 +320,8 @@ EncodedCol EncStreamVByteI64(const std::vector<int64_t>& vals, size_t budget) {
   e.param = static_cast<uint32_t>(payload.size());
   AppendBE32(e.buf, static_cast<uint32_t>(payload.size()));
   AppendBE16(e.buf, static_cast<uint16_t>(nblk));
-  e.buf.insert(e.buf.end(), block_off.begin(), block_off.end());
+  e.buf.insert(e.buf.end(), block_off.data(),
+               block_off.data() + offset_bytes);
   e.buf.insert(e.buf.end(), ctrl.begin(), ctrl.end());
   e.buf.insert(e.buf.end(), payload.begin(), payload.end());
   return e;
@@ -4016,8 +4020,12 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   // allocator for nothing whenever another scheme wins the column.
   thread_local std::vector<uint32_t> ck_state, ck_pos;
   thread_local std::vector<uint8_t> stream;
-  ck_state.assign(ncp, 0);
-  ck_pos.assign(ncp, 0);
+  if (ck_state.size() < ncp) {
+    ck_state.resize(ncp);
+  }
+  if (ck_pos.size() < ncp) {
+    ck_pos.resize(ncp);
+  }
   stream.clear();
   stream.reserve(nsym_total);
   uint32_t x = kAnsL;

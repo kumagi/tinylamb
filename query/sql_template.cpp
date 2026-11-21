@@ -6,7 +6,10 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
+#include <array>
+#include <cerrno>
+#include <charconv>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -47,35 +50,35 @@ namespace {
 
 bool IsIdentChar(unsigned char c) { return std::isalnum(c) != 0 || c == '_'; }
 
-// std::stod/std::stoll throw out_of_range on tokens like "1e999" or 20-digit
-// integers; template extraction must never leak that exception through
-// SqlEngine::Prepare's StatusOr contract. Parse defensively instead.
-bool TryParseDouble(const std::string& token, double* out) {
-  try {
-    size_t consumed = 0;
-    const double value = std::stod(token, &consumed);
-    if (consumed != token.size()) {
-      return false;
-    }
-    *out = value;
-    return true;
-  } catch (const std::exception&) {
+bool TryParseDouble(std::string_view token, double* out) {
+  // strtod preserves the old decimal and range behavior, including ERANGE
+  // for underflow. Most tokens fit on the stack. Very long literals still
+  // use the same parser with an owned NUL-terminated buffer.
+  std::array<char, 64> stack;
+  std::string fallback;
+  const char* text = nullptr;
+  if (token.size() < stack.size()) {
+    token.copy(stack.data(), token.size());
+    stack[token.size()] = '\0';
+    text = stack.data();
+  } else {
+    fallback = token;
+    text = fallback.c_str();
+  }
+  char* end = nullptr;
+  errno = 0;
+  const double parsed = std::strtod(text, &end);
+  if (errno == ERANGE || end == text || end != text + token.size()) {
     return false;
   }
+  *out = parsed;
+  return true;
 }
 
-bool TryParseInt64(const std::string& token, int64_t* out) {
-  try {
-    size_t consumed = 0;
-    const int64_t value = std::stoll(token, &consumed);
-    if (consumed != token.size()) {
-      return false;
-    }
-    *out = value;
-    return true;
-  } catch (const std::exception&) {
-    return false;
-  }
+bool TryParseInt64(std::string_view token, int64_t* out) {
+  const char* end = token.data() + token.size();
+  const auto result = std::from_chars(token.data(), end, *out);
+  return result.ec == std::errc{} && result.ptr == end;
 }
 
 bool KeywordAt(std::string_view sql, size_t pos, std::string_view keyword) {
@@ -1345,7 +1348,7 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
           ++i;
         }
       }
-      const std::string token(sql.substr(begin, i - begin));
+      const std::string_view token = sql.substr(begin, i - begin);
       if (is_float) {
         double parsed = 0;
         if (TryParseDouble(token, &parsed)) {

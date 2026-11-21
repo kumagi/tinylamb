@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -112,10 +114,17 @@ TEST_F(SelectRewritesTest, DisjunctiveSemiFilterRequiresDirectComparisons) {
       "FROM items GROUP BY category) "
       "SELECT sk, total FROM s LEFT JOIN a ON ak = sk "
       "LEFT JOIN b ON bk = sk WHERE ";
-  auto direct = ParseSelect(prefix + "a_total > 0 OR 0 < b_total");
+  const std::string direct_sql = prefix + "a_total > 0 OR 0 < b_total";
+  auto direct = ParseSelect(direct_sql);
   ASSERT_NE(direct, nullptr);
   EXPECT_TRUE(
       PushDisjunctiveNullRejectingLeftJoinSemiFilter(direct.get(), *ctx_));
+
+  auto direct_result = engine_->Execute(*ctx_, direct_sql);
+  ASSERT_TRUE(direct_result.HasValue()) << direct_result.GetStatus();
+  EXPECT_EQ(direct_result.Value().Collect(),
+            std::vector<Row>({Row({Value(10), Value(300)})}));
+  EXPECT_EQ(direct_result.Value().GetStatus(), Status::kSuccess);
 
   const std::string sql =
       prefix + "COALESCE(a_total, 0) > 0 OR COALESCE(b_total, 0) > 0";
@@ -323,15 +332,24 @@ TEST_F(SelectRewritesTest, ExpandStarWithModifiersAppliesExceptAndReplace) {
 }
 
 TEST_F(SelectRewritesTest, MergeCompatibleUnionBranchesFusesSameTableScan) {
-  auto stmt = ParseSelect(
+  const std::string sql =
       "SELECT id, name FROM items WHERE category = 10 "
       "UNION ALL "
-      "SELECT id, name FROM items WHERE category = 20");
+      "SELECT id, name FROM items WHERE category = 20";
+  auto stmt = ParseSelect(sql);
   ASSERT_NE(stmt, nullptr);
   ASSERT_EQ(stmt->UnionAll().size(), 1U);
   EXPECT_TRUE(MergeCompatibleUnionBranches(stmt.get(), *ctx_));
   EXPECT_TRUE(stmt->UnionAll().empty());
   EXPECT_NE(stmt->WhereClause(), nullptr);
+  auto result = engine_->Execute(*ctx_, sql);
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+  auto rows = result.Value().Collect();
+  std::ranges::sort(rows, {}, [](const Row& row) { return row[0].AsInt64(); });
+  EXPECT_EQ(rows, (std::vector<Row>{Row({Value(1), Value("a")}),
+                                    Row({Value(2), Value("b")}),
+                                    Row({Value(3), Value("c")})}));
+  EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
 }
 
 TEST_F(SelectRewritesTest, FlattenDerivedSourcesInlinesSimpleSubquery) {
@@ -476,6 +494,7 @@ TEST_F(SelectRewritesTest,
     rows.push_back(row);
     row = Row();
   }
+  ASSERT_EQ(res.Value().GetStatus(), Status::kSuccess);
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{2}));
 }

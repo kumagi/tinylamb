@@ -110,7 +110,8 @@ to copy.
   HAVING lifts to an outer conjunction. Filtered members require a
   `COUNT(CASE WHEN p THEN 1 END) > 0` witness to preserve group membership.
   The rewrite is all-or-nothing: bare member references, outer stars and outer
-  subqueries prevent it. ORDER BY member references map to SELECT output names.
+  subqueries prevent it. A member with its own ORDER BY stays unfused. The
+  outer ORDER BY can refer to member columns through the SELECT output names.
   `TINYLAMB_FUSE_SIBLING_AGG=0` disables it; `LastFusedSiblingAggregates()` counts
   firings. Tests: `sibling_aggregate_fusion_test` and
   `QueryTest.SiblingDerivedAggregatesFuseIntoSingleScan`.

@@ -298,7 +298,7 @@ struct GroupedRewriter {
 
 StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
     const SelectStatement& select, const Plan& core_plan,
-    TransactionContext& ctx, const std::string& explain_text,
+    TransactionContext& ctx, std::function<std::string()> explain_text_producer,
     const std::function<Expression(const Expression&)>& resolve_alias) {
   if (!core_plan || !select.WithQueries().empty() || select.WithTies() ||
       select.Qualify() != nullptr || select.HasDistinctOn() ||
@@ -513,7 +513,7 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   }
 
   PipelineGraph graph;
-  graph.plan_explain_text = explain_text;
+  graph.plan_explain_producer = std::move(explain_text_producer);
   LoweredStream stream;
   RETURN_IF_FAIL(
       PipelineLowering::LowerNode(core_plan, ctx, {}, &graph, &stream));

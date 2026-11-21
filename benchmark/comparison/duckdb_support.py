@@ -109,12 +109,18 @@ def main():
             connection.execute('INSTALL quack')
             connection.execute('LOAD quack')
         return
-    if not all((args.database, args.port, args.threads, args.memory_mib)):
+    if None in (args.database, args.port, args.threads, args.memory_mib):
         parser.error('server database, port, threads and memory are required')
+    if not 1 <= args.port <= 65535:
+        parser.error('--port must be in [1, 65535] for the benchmark client')
+    if args.threads < 1:
+        parser.error('--threads must be positive')
+    if args.memory_mib < 0:
+        parser.error('--memory-mib must be nonnegative')
     stopped = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopped.set())
-    connection = connect_local(args.threads, args.database, args.memory_mib)
+    connection = connect_local(args.threads, args.database, args.memory_mib or None)
     uri = f'quack:127.0.0.1:{args.port}'
     token = os.environ['TINYLAMB_BENCH_DUCKDB_TOKEN']
     connection.execute(f"CALL quack_serve('{uri}', token='{token}')").fetchall()

@@ -1173,75 +1173,46 @@ void ColumnarColumn::AppendSliceFrom(const ColumnarColumn& src,
   if (type == ValueType::kNull) {
     return;
   }
+  const auto append_slice = [sel, count](auto& dest, const auto& source) {
+    if (sel == nullptr) {
+      dest.insert(dest.end(), source.data(), source.data() + count);
+    } else {
+      for (size_t i = 0; i < count; ++i) {
+        dest.push_back(source[sel[i]]);
+      }
+    }
+  };
   if (src.has_null && !has_null) {
     EnsureNullBitmap(prev_rows);
   }
   if (has_null) {
-    nulls.resize(prev_rows + count);
-    uint8_t* __restrict dst_n = nulls.data() + prev_rows;
-    if (!src.has_null) {
-      std::memset(dst_n, 0, count);
-    } else if (sel == nullptr) {
-      std::memcpy(dst_n, src.nulls.data(), count);
+    if (src.has_null) {
+      append_slice(nulls, src.nulls);
     } else {
-      const uint8_t* __restrict src_n = src.nulls.data();
-      for (size_t i = 0; i < count; ++i) {
-        dst_n[i] = src_n[sel[i]];
-      }
+      nulls.insert(nulls.end(), count, uint8_t{0});
     }
   }
   switch (type) {
     case ValueType::kInt64:
-    case ValueType::kDate: {
-      ints.resize(prev_rows + count);
-      int64_t* __restrict dst = ints.data() + prev_rows;
-      const int64_t* __restrict s = src.ints.data();
-      if (sel == nullptr) {
-        std::memcpy(dst, s, count * sizeof(int64_t));
-      } else {
-        for (size_t i = 0; i < count; ++i) {
-          dst[i] = s[sel[i]];
-        }
-      }
+    case ValueType::kDate:
+      append_slice(ints, src.ints);
       break;
-    }
-    case ValueType::kDouble: {
-      doubles.resize(prev_rows + count);
-      double* __restrict dst = doubles.data() + prev_rows;
-      const double* __restrict s = src.doubles.data();
-      if (sel == nullptr) {
-        std::memcpy(dst, s, count * sizeof(double));
-      } else {
-        for (size_t i = 0; i < count; ++i) {
-          dst[i] = s[sel[i]];
-        }
-      }
+    case ValueType::kDouble:
+      append_slice(doubles, src.doubles);
       break;
-    }
-    case ValueType::kVarChar: {
-      strings.resize(prev_rows + count);
-      std::string_view* __restrict dst = strings.data() + prev_rows;
-      const std::string_view* __restrict s = src.strings.data();
+    case ValueType::kVarChar:
       if (arena == nullptr) {
-        if (sel == nullptr) {
-          std::memcpy(dst, s, count * sizeof(std::string_view));
-        } else {
-          for (size_t i = 0; i < count; ++i) {
-            dst[i] = s[sel[i]];
-          }
-        }
+        append_slice(strings, src.strings);
         RetainOwnersFrom(src);
       } else {
-        const uint8_t* __restrict sn =
-            src.has_null ? src.nulls.data() : nullptr;
         for (size_t i = 0; i < count; ++i) {
-          const size_t r = sel != nullptr ? sel[i] : i;
-          dst[i] = (sn != nullptr && sn[r] != 0) ? std::string_view{}
-                                                 : arena->Store(s[r]);
+          const size_t row = sel != nullptr ? sel[i] : i;
+          strings.push_back(src.has_null && src.nulls[row] != 0
+                                ? std::string_view{}
+                                : arena->Store(src.strings[row]));
         }
       }
       break;
-    }
     default:
       break;
   }
@@ -2224,13 +2195,22 @@ std::shared_ptr<ColumnarTable> SliceColumnarTable(const ColumnarTable& input,
             sub_count);
         continue;
       }
-      if (scol.encoding == ColumnarColumn::Encoding::kGathered &&
-          scol.gather_index != nullptr &&
-          hi <= scol.gather_index->src_rows.size() &&
-          hi <= scol.gather_index->src_chunks.size()) {
-        sub.columns[c].SetGathered(
-            slice_gather(scol.gather_index), scol.gather_col, scol.type,
-            scol.is_unsigned, scol.is_interval, scol.is_uniform, scol.has_null);
+      if (scol.encoding == ColumnarColumn::Encoding::kGathered) {
+        if (scol.gather_index != nullptr &&
+            hi <= scol.gather_index->src_rows.size() &&
+            hi <= scol.gather_index->src_chunks.size()) {
+          sub.columns[c].SetGathered(
+              slice_gather(scol.gather_index), scol.gather_col, scol.type,
+              scol.is_unsigned, scol.is_interval, scol.is_uniform,
+              scol.has_null);
+        } else {
+          // Missing mappings are read as NULL. AppendValue builds a null
+          // bitmap even when the input advertised an all-non-null slice.
+          sub.columns[c].InitEmptyLike(scol, sub_count);
+          for (size_t row = lo; row < hi; ++row) {
+            sub.columns[c].AppendValue(scol.ValueAt(row), nullptr, row - lo);
+          }
+        }
         continue;
       }
       if (sel.empty()) {

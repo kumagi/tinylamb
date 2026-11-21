@@ -3,7 +3,9 @@
 #define TINYLAMB_PLAN_SKIP_SCAN_DISTINCT_PLAN_HPP
 
 #include <memory>
+#include <optional>
 #include <ostream>
+#include <string>
 #include <vector>
 
 #include "index/index_schema.hpp"

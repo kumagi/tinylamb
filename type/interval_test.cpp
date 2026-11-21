@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -23,6 +24,21 @@ IntervalValue Iv(int64_t months, int64_t days, int64_t nanos) {
 }  // namespace
 
 // ------------------------------------------------------------- arithmetic ---
+
+TEST(IntervalTest, IntegerUnitsAreScaledExactly) {
+  constexpr auto max = std::numeric_limits<int64_t>::max();
+  constexpr auto min = std::numeric_limits<int64_t>::min();
+  EXPECT_EQ(IntervalValue::TryFromInteger(max, "  DAYS ").MoveValue(),
+            Iv(0, max, 0));
+  EXPECT_EQ(IntervalValue::TryFromInteger(min, "nanosecond").MoveValue(),
+            Iv(0, 0, min));
+  EXPECT_EQ(IntervalValue::TryFromInteger(-2, "quarters").MoveValue(),
+            Iv(-6, 0, 0));
+  EXPECT_EQ(IntervalValue::TryFromInteger(3, "week").MoveValue(),
+            Iv(0, 21, 0));
+  EXPECT_FALSE(IntervalValue::TryFromInteger(max, "second").HasValue());
+  EXPECT_FALSE(IntervalValue::TryFromInteger(1, "invalid").HasValue());
+}
 
 TEST(IntervalTest, TotalNanosAndFieldEquality) {
   EXPECT_EQ(IntervalValue{}.TryTotalNanos().MoveValue(), 0);

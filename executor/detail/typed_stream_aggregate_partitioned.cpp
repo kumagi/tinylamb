@@ -471,52 +471,6 @@ QueryMemoryCharge& SurvivorChargeFor(
   return *charges[shard];
 }
 
-// Takes budget from `charge` in kChunk steps so per-element accounting does
-// not hit the process-wide reservation atomic on every insert: with 16
-// workers that contended cache line cost TPC-H Q21 about a sixth of its time.
-// The unused remainder goes back when this object dies, so the extra
-// reservation is bounded by kChunk per live instance (one per worker).
-class ChunkedCharge {
- public:
-  explicit ChunkedCharge(QueryMemoryCharge* charge) noexcept
-      : charge_(charge) {}
-  ChunkedCharge(const ChunkedCharge&) = delete;
-  ChunkedCharge& operator=(const ChunkedCharge&) = delete;
-  ChunkedCharge(ChunkedCharge&&) = delete;
-  ChunkedCharge& operator=(ChunkedCharge&&) = delete;
-  ~ChunkedCharge() {
-    if (slack_ != 0) {
-      charge_->Release(slack_);
-    }
-  }
-  [[nodiscard]] bool TryAdd(size_t bytes) {
-    if (bytes <= slack_) {
-      slack_ -= bytes;
-      return true;
-    }
-    const size_t want = std::max(bytes, kChunk);
-    if (charge_->TryAdd(want)) {
-      slack_ += want - bytes;
-      return true;
-    }
-    return charge_->TryAdd(bytes);  // close to the limit: stay exact
-  }
-  void Add(size_t bytes) {
-    if (bytes <= slack_) {
-      slack_ -= bytes;
-      return;
-    }
-    const size_t want = std::max(bytes, kChunk);
-    charge_->Add(want);
-    slack_ += want - bytes;
-  }
-
- private:
-  static constexpr size_t kChunk = size_t{256} << 10;
-  QueryMemoryCharge* charge_;
-  size_t slack_{0};
-};
-
 void PushChargedSurvivor(std::vector<SurvivorGroupRow>* rows,
                          QueryMemoryCharge* charge, SurvivorGroupRow row) {
   charge->Add(EstimateSurvivorGroupRowBytes(row));

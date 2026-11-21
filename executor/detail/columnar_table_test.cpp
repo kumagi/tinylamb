@@ -159,8 +159,8 @@ TEST(ColumnarTableTest, GatheredSliceFallsBackWhenChunksShorterThanRows) {
   auto malformed_gi = std::make_shared<ChunkGatherIndex>();
   malformed_gi->source_table = base;
   malformed_gi->src_rows = {0, 1};
-  // src_chunks is intentionally shorter than src_rows; the slice taken by
-  // this test only touches the first row, so the length guard is not reached.
+  // A partial slice containing the second row cannot preserve the gathered
+  // encoding because the matching source chunk index is missing.
   malformed_gi->src_chunks = {0};
 
   ColumnarTable tbl;
@@ -172,14 +172,17 @@ TEST(ColumnarTableTest, GatheredSliceFallsBackWhenChunksShorterThanRows) {
   tbl.AppendChunk(std::move(ch));
 
   std::shared_ptr<ColumnarTable> sliced =
-      relational_detail::SliceColumnarTable(tbl, 0, 1);
+      relational_detail::SliceColumnarTable(tbl, 1, 1);
   ASSERT_EQ(sliced->total_rows, 1U);
+  ASSERT_EQ(sliced->chunks.size(), 1U);
+  EXPECT_NE(sliced->chunks[0].columns[0].encoding,
+            ColumnarColumn::Encoding::kGathered);
   std::vector<Row> out;
   ASSERT_EQ(relational_detail::MaterializeColumnarTableToRows(*sliced, schema,
                                                               &out, nullptr),
             Status::kSuccess);
   ASSERT_EQ(out.size(), 1U);
-  EXPECT_EQ(out[0][0], Value(int64_t{10}));
+  EXPECT_TRUE(out[0][0].IsNull());
 }
 
 TEST(ColumnarTableTest, EstimatedBytesDeduplicatesMoreThanFourGatherIndices) {
@@ -219,7 +222,7 @@ TEST(ColumnarTableTest, EstimatedBytesDeduplicatesMoreThanFourGatherIndices) {
   twelve_distinct_gi_chunk.columns.resize(12);
   std::vector<std::shared_ptr<ChunkGatherIndex>> gis;
   gis.reserve(6);
-for (size_t c = 0; c < 6; ++c) {
+  for (size_t c = 0; c < 6; ++c) {
     gis.push_back(make_gi());
   }
   for (size_t c = 0; c < 12; ++c) {

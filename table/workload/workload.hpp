@@ -96,7 +96,7 @@ class WorkloadTracker {
   void Reset();
 
  private:
-  // Lock-free inference core (callers hold mu_).
+  // Inference helper. Callers hold mu_ while accessing tracked workload.
   static AccessHint InferLocked(const ColumnWorkload& w);
 
   mutable std::mutex mu_;

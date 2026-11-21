@@ -18,7 +18,9 @@
 #define TINYLAMB_FUNCTION_HPP
 
 #include <limits>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/decoder.hpp"
@@ -30,13 +32,19 @@ namespace tinylamb {
 class Function {
  public:
   Function() = default;
+  // Catalog entries can record name and arity before a typed signature is
+  // available. Such entries serialize with an empty argument type vector.
   Function(std::string name, int argument_count)
       : name_(std::move(name)), argument_count_(argument_count) {}
   Function(std::string name, std::vector<Type> args, Type return_type)
       : name_(std::move(name)),
         args_(std::move(args)),
-        return_type_(return_type),
-        argument_count_(static_cast<int>(args_.size())) {}
+        return_type_(return_type) {
+    if (!std::in_range<int>(args_.size())) {
+      throw std::length_error("function argument count exceeds INT_MAX");
+    }
+    argument_count_ = static_cast<int>(args_.size());
+  }
 
   friend Encoder& operator<<(Encoder& e, const Function& f) {
     e << f.name_ << f.args_ << f.return_type_

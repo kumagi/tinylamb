@@ -51,7 +51,7 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
     const std::string& body);
 
 // Parses one JSON scalar/object/array token into a Value.
-bool JsonTextToValue(const std::string& text, Value* parsed);
+bool JsonTextToValue(std::string_view text, Value* parsed);
 
 // Encodes an evaluated value as struct-member JSON text (strings quoted and
 // escaped, numbers bare, nested objects/arrays embedded verbatim).

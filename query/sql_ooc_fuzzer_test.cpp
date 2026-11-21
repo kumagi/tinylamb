@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -23,6 +24,15 @@
 
 namespace tinylamb {
 namespace {
+
+TEST(OocRngTest, PickHandlesFullWidthAndHighestInt64Intervals) {
+  constexpr int64_t low = std::numeric_limits<int64_t>::min();
+  constexpr int64_t high = std::numeric_limits<int64_t>::max();
+  OocRng baseline(nullptr, 0, 42);
+  OocRng rng(nullptr, 0, 42);
+  EXPECT_EQ(rng.Pick(low, high), low + baseline.Next32());
+  EXPECT_EQ(rng.Pick(high - 1, high), high - 1 + baseline.Next32() % 2);
+}
 
 TEST(OocRngTest, EmptyChoicesRaiseAndSingletonReturnsMember) {
   OocRng rng(nullptr, 0, 42);

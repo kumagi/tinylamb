@@ -141,9 +141,10 @@ void LateMaterializationJoinPlan::InitializeProjection(const Schema& declared) {
     }
   }
   if (derived.empty()) {
-    derived.resize(right_table_->GetSchema().ColumnCount());
-    for (size_t i = 0; i < derived.size(); ++i) {
-      derived[i] = static_cast<slot_t>(i);
+    const size_t width = right_table_->GetSchema().ColumnCount();
+    derived.reserve(width);
+    for (size_t i = 0; i < width; ++i) {
+      derived.push_back(static_cast<slot_t>(i));
     }
   }
   right_projection_ = std::move(derived);

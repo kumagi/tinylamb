@@ -190,9 +190,7 @@ ProcessMemoryBudget::ProcessMemoryBudget() {
   columnar_limit_.store(
       ReadEnvBytes("TINYLAMB_COLUMNAR_CACHE_BYTES", default_columnar),
       std::memory_order_relaxed);
-  const size_t soft =
-      lim -
-      lim / 5;  // 80% of lim  // NOLINT(readability-math-missing-parentheses)
+  const size_t soft = lim == 0 ? 0 : ComputeSoftLimit(lim);
   size_t s_pct = ReadEnvBytes("TINYLAMB_STORAGE_FLOOR_PCT", 25);
   size_t q_pct = ReadEnvBytes("TINYLAMB_QUERY_FLOOR_PCT", 25);
   size_t t_pct = ReadEnvBytes("TINYLAMB_TX_FLOOR_PCT", 5);
@@ -305,8 +303,7 @@ size_t ProcessMemoryBudget::PoolFloorBytes(MemoryPoolKind pool) const noexcept {
       if (lim == 0) {
         return base + srv;
       }
-      const size_t soft =
-          lim - lim / 5;  // NOLINT(readability-math-missing-parentheses)
+      const size_t soft = ComputeSoftLimit(lim);
       const size_t other = storage_floor_.load(std::memory_order_acquire) +
                            columnar_floor_.load(std::memory_order_acquire) +
                            query_floor_.load(std::memory_order_acquire);
@@ -941,6 +938,11 @@ void ProcessMemoryBudget::ResetForTest(size_t limit_bytes,
   query_floor_.store(0, std::memory_order_release);
   tx_floor_.store(0, std::memory_order_release);
   server_tx_floor_.store(0, std::memory_order_release);
+  emergency_limit_.store(limit_bytes == 0
+                             ? (size_t{64} << 20)
+                             : std::min<size_t>(size_t{64} << 20, limit_bytes / 20),
+                         std::memory_order_release);
+  tx_floor_clamp_warned_.store(false, std::memory_order_release);
   emergency_used_.store(0, std::memory_order_release);
   storage_used_.store(0, std::memory_order_release);
   columnar_used_.store(0, std::memory_order_release);

@@ -3829,6 +3829,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     const SelectStatement& stmt = plan_stmt;
     bool plan_any_byte_len = false;
     bool plan_any_distinct = false;
+    bool plan_any_varchar_distinct = false;
     for (const ColAggSpec& spec : plan_agg_specs) {
       if (spec.kind == ColAggKind::kCountByteLen ||
           spec.kind == ColAggKind::kSumByteLen ||
@@ -3842,6 +3843,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           spec.kind == ColAggKind::kCountDistinctDouble ||
           spec.kind == ColAggKind::kCountDistinctVarChar) {
         plan_any_distinct = true;
+      }
+      if (spec.kind == ColAggKind::kCountDistinctVarChar) {
+        plan_any_varchar_distinct = true;
       }
     }
 
@@ -4186,8 +4190,12 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                         : 0;
     const bool mono_bounded_topk = stmt.HasLimit() && !plan_order.empty() &&
                                    mono_topk_cap > 0 && mono_topk_cap <= 4096;
+    // COUNT(DISTINCT int/date/double) folds per run like any other
+    // aggregate (TPC-H Q21's `GROUP BY l_orderkey HAVING COUNT(DISTINCT
+    // l_suppkey)` subqueries); the VARCHAR variant interns into the block
+    // arena and stays on the partitioned path.
     if (filter_memo_out == nullptr && !is_group_all && key_specs.size() == 1 &&
-        !plan_any_distinct && candidate_blocks.size() >= 4 &&
+        !plan_any_varchar_distinct && candidate_blocks.size() >= 4 &&
         (key_specs[0].kind == ColKeyKind::kColInt64 ||
          key_specs[0].kind == ColKeyKind::kColDate) &&
         (!plan_having.empty() || mono_bounded_topk)) {
@@ -4304,7 +4312,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           return a.key < b.key;
         };
         auto emit_interior_or_boundary =
-            [&](int64_t key, RuntimeAggState* ast, QueryMemoryCharge& charge,
+            [&](int64_t key, RuntimeAggState* ast, ChunkedCharge& charge,
                 std::vector<MonoSurvivor>& surv_vec,
                 std::vector<Value>& finished_scratch,
                 std::vector<Value>& cached_keys) -> Status {
@@ -4389,8 +4397,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         std::atomic<uint64_t> mono_interior_groups{0};
 
         auto copy_to_boundary =
-            [&](int64_t key, RuntimeAggState* src_aggs,
-                QueryMemoryCharge& charge, PagedStringArena& barena,
+            [&](int64_t key, RuntimeAggState* src_aggs, ChunkedCharge& charge,
+                PagedStringArena& barena,
                 std::vector<BoundaryGroup>& out_b) -> Status {
           const size_t bbytes =
               sizeof(BoundaryGroup) +
@@ -4411,6 +4419,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         };
 
         auto mono_worker_fn = [&](size_t tid) {
+          // Survivors and boundary groups are charged per group; batch the
+          // reservations (millions of HAVING survivors in TPC-H Q21).
+          ChunkedCharge w_batch(&w_charges[tid]);
           BlockDecodeScratch scratch;
           std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(
               table_schema.ColumnCount(), nullptr);
@@ -4458,12 +4469,12 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 const bool is_boundary = (mb.shared_lo && fk == mb.min_k) ||
                                          (mb.shared_hi && fk == mb.max_k);
                 if (is_boundary) {
-                  return copy_to_boundary(fk, run_aggs.data(), w_charges[tid],
+                  return copy_to_boundary(fk, run_aggs.data(), w_batch,
                                           *b_arenas[tid], w_boundaries[tid]);
                 }
                 ++local_groups;
                 return emit_interior_or_boundary(
-                    fk, run_aggs.data(), w_charges[tid], w_survivors[tid],
+                    fk, run_aggs.data(), w_batch, w_survivors[tid],
                     finished_scratch, cached_keys);
               };
               for (const uint32_t r : cand_rows) {
@@ -4476,7 +4487,17 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                   }
                   cur_k = kv;
                   for (auto& st : run_aggs) {
+                    // Keep a small COUNT(DISTINCT) set allocated across runs:
+                    // a fresh one per group is one allocation per key (15M
+                    // for Q21).  A set that grew large is dropped instead,
+                    // since Clear() costs its capacity.
+                    std::unique_ptr<FlatIntKeyMap<uint8_t>> keep =
+                        std::move(st.distinct_ints);
                     st = RuntimeAggState{};
+                    if (keep != nullptr && keep->Size() <= 64) {
+                      keep->Clear();
+                      st.distinct_ints = std::move(keep);
+                    }
                   }
                 }
                 for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
@@ -4520,11 +4541,11 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                                          (mb.shared_hi && fk == mb.max_k);
                 Status fst =
                     is_boundary
-                        ? copy_to_boundary(fk, btable.AggsAt(g), w_charges[tid],
+                        ? copy_to_boundary(fk, btable.AggsAt(g), w_batch,
                                            *b_arenas[tid], w_boundaries[tid])
                         : (++local_groups, emit_interior_or_boundary(
                                                fk, btable.AggsAt(g),
-                                               w_charges[tid], w_survivors[tid],
+                                               w_batch, w_survivors[tid],
                                                finished_scratch, cached_keys));
                 if (fst != Status::kSuccess) {
                   w_status[tid] = std::move(fst);
@@ -4598,6 +4619,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           }
 
           size_t boundary_distinct_groups = 0;
+          ChunkedCharge final_batch(&final_charge);
           std::vector<Value> f_scratch(plan_agg_specs.size());
           std::vector<Value> c_keys(1);
           bool merge_ok = true;
@@ -4623,7 +4645,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             }
             ++boundary_distinct_groups;
             Status est = emit_interior_or_boundary(
-                all_b[i].key, all_b[i].aggs.data(), final_charge,
+                all_b[i].key, all_b[i].aggs.data(), final_batch,
                 final_survivors, f_scratch, c_keys);
             if (est == StatusCode::kMemoryLimitExceeded) {
               merge_ok = false;
@@ -4918,6 +4940,15 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
 
       std::vector<slot_t> dyn_scalar_cols;
       dyn_scalar_cols.reserve(plan_agg_specs.size());
+      // Dictionary-coded VARCHAR keys (TPC-H Q1's l_returnflag/l_linestatus):
+      // TLCS dictionaries are file-wide, so the tuple of codes names the
+      // group.  Each tuple is resolved through the ordinary FindOrInsert once
+      // per worker (same groups and key bytes as the generic loop) and then
+      // read from a flat array; the aggregates are folded column-wise.
+      std::vector<const LSTableColumnDictionary*> dk_dicts;
+      std::vector<int64_t> dk_gid;  // -1 = tuple not seen yet
+      std::vector<uint32_t> dk_stride;
+      std::vector<uint32_t> dk_row_gid;
       while (true) {
         const size_t bi = next_idx.fetch_add(1, std::memory_order_relaxed);
         if (bi >= candidate_blocks.size()) {
@@ -5316,6 +5347,108 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         }
 
         WorkerGroupTable& wtable = *worker_tables[tid];
+        if (certificate == nullptr && !key_specs.empty() &&
+            !cand_rows.empty()) {
+          bool dict_keys = true;
+          size_t tuples = 1;
+          for (const ColGroupKeySpec& ks : key_specs) {
+            const auto* kch = col_ptrs[ks.full_col];
+            if (ks.kind != ColKeyKind::kColVarChar || kch == nullptr ||
+                !kch->dict_encoded || kch->dict == nullptr ||
+                kch->dict->StringEntryCount() > 255 ||
+                kch->dict_codes.size() <= cand_rows.back()) {
+              dict_keys = false;
+              break;
+            }
+            tuples *= kch->dict->StringEntryCount() + 1;  // + NULL
+            if (tuples > 4096) {
+              dict_keys = false;
+              break;
+            }
+          }
+          if (dict_keys) {
+            bool same_dicts = dk_dicts.size() == key_specs.size();
+            for (size_t k = 0; same_dicts && k < key_specs.size(); ++k) {
+              same_dicts = dk_dicts[k] == col_ptrs[key_specs[k].full_col]->dict;
+            }
+            if (!same_dicts) {
+              dk_dicts.clear();
+              dk_stride.clear();
+              uint32_t stride = 1;
+              for (const ColGroupKeySpec& ks : key_specs) {
+                const auto* kch = col_ptrs[ks.full_col];
+                dk_dicts.push_back(kch->dict);
+                dk_stride.push_back(stride);
+                stride *= static_cast<uint32_t>(
+                    kch->dict->StringEntryCount() + 1);
+              }
+              dk_gid.assign(tuples, -1);
+            }
+            dk_row_gid.resize(cand_rows.size());
+            bool resolved_all = true;
+            for (size_t i = 0; i < cand_rows.size(); ++i) {
+              const uint32_t r = cand_rows[i];
+              uint32_t tuple = 0;
+              for (size_t k = 0; k < key_specs.size(); ++k) {
+                const auto* kch = col_ptrs[key_specs[k].full_col];
+                const size_t nd = kch->dict->StringEntryCount();
+                size_t code = kch->IsNull(r) ? nd : kch->dict_codes[r];
+                if (code > nd) {
+                  resolved_all = false;  // out-of-dictionary code
+                  break;
+                }
+                tuple += static_cast<uint32_t>(code) * dk_stride[k];
+              }
+              if (!resolved_all) {
+                break;
+              }
+              int64_t& slot = dk_gid[tuple];
+              if (slot < 0) {
+                Status key_st = Status::kSuccess;
+                for (size_t k = 0; k < key_specs.size(); ++k) {
+                  if (!ExtractSingleKeyCell(key_specs[k], col_ptrs, r,
+                                            &probe_keys[k], &regex_scratch,
+                                            &ts_cache, &key_st, &regex_cache)) {
+                    worker_status[tid] = std::move(key_st);
+                    return;
+                  }
+                }
+                const uint64_t khash = GroupKeySliceHasher::HashTyped(
+                    probe_keys.data(), key_specs);
+                auto gid_or = wtable.FindOrInsert(probe_keys.data(), khash);
+                if (!gid_or.HasValue()) {
+                  worker_status[tid] = gid_or.GetStatus();
+                  return;
+                }
+                slot = gid_or.Value();
+              }
+              dk_row_gid[i] = static_cast<uint32_t>(slot);
+            }
+            if (resolved_all) {
+              for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
+                const ColAggSpec& as = plan_agg_specs[a];
+                for (size_t i = 0; i < cand_rows.size(); ++i) {
+                  RuntimeAggState& st =
+                      wtable.AggsAt(dk_row_gid[i])[a];
+                  if (as.kind == ColAggKind::kCountStar) {
+                    ++st.count;
+                    st.has_value = true;
+                    continue;
+                  }
+                  Status fold_st = FoldRowIntoAggState(
+                      as, col_ptrs, cand_rows[i], st, wtable.Arena());
+                  if (fold_st != Status::kSuccess) {
+                    worker_status[tid] = std::move(fold_st);
+                    return;
+                  }
+                }
+              }
+              continue;
+            }
+            // An out-of-dictionary code: this block takes the generic loop
+            // from scratch (nothing has been folded for it yet).
+          }
+        }
         for (const uint32_t r : cand_rows) {
           Status key_st = Status::kSuccess;
           for (size_t k = 0; k < key_specs.size(); ++k) {

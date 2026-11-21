@@ -85,7 +85,8 @@ bool DeliversAscendingNullsFirst(
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
     if (!ascending[i] || !keys[i].expression ||
-        keys[i].expression->ToString() != expressions[i]->ToString()) {
+        (keys[i].expression != expressions[i] &&
+         keys[i].expression->ToString() != expressions[i]->ToString())) {
       return false;
     }
     if (nulls_first != nullptr && i < nulls_first->size() &&

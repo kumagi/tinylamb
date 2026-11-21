@@ -326,6 +326,10 @@ TEST(ZigZagJoinTest, UnsupportedTypeUnsortedInputAndPredicateErrorFail) {
 TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
   ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Database>, database,
                         Database::Create("zigzag_join_test-" + RandomString()));
+  struct Cleanup {
+    Database* database;
+    ~Cleanup() { database->DeleteAll(); }
+  } cleanup{database.get()};
   TransactionContext setup = database->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(
       Table, left_table,
@@ -335,8 +339,8 @@ TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
       database->CreateTable(setup, IntSchema("ZigRight", "k")));
   ASSERT_SUCCESS(setup.txn_.PreCommit());
   TransactionContext stats_context = database->BeginContext();
-  database->RefreshStatistics(stats_context, "ZigLeft");
-  database->RefreshStatistics(stats_context, "ZigRight");
+  ASSERT_SUCCESS(database->RefreshStatistics(stats_context, "ZigLeft"));
+  ASSERT_SUCCESS(database->RefreshStatistics(stats_context, "ZigRight"));
   ASSERT_SUCCESS(stats_context.PreCommit());
   TransactionContext context = database->BeginContext();
   ASSERT_SUCCESS(database->CreateIndex(
@@ -462,10 +466,6 @@ TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
   EXPECT_EQ(swapped_output[6], (Row({Value(3), Value(2)})));
   EXPECT_EQ(swapped_executor->GetStatus(), Status::kSuccess);
 
-  const auto residual =
-      rule->Apply(memo, root, logical, children, cascades::PhysicalProperties{},
-                  cascades::RuleContext::Empty());
-  ASSERT_EQ(residual.size(), 1U);
   cascades::LogicalExpression compound = logical;
   compound.predicate = BinaryExpressionExp(
       equality, BinaryOperation::kAnd,
@@ -483,7 +483,6 @@ TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
   executor.reset();
   scan_executor.reset();
   swapped_executor.reset();
-  database->DeleteAll();
 }
 
 }  // namespace

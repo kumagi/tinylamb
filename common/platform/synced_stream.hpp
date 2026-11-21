@@ -50,9 +50,25 @@ class SyncedOStream : public std::ostream {
   SyncedOStream(const SyncedOStream&) = delete;
   SyncedOStream& operator=(const SyncedOStream&) = delete;
   ~SyncedOStream() override {
+    try {
+      emit();
+    } catch (...) {
+      // Destruction cannot throw if the wrapped stream enables exceptions.
+    }
+  }
+
+  void emit() {
+    const std::string pending = buffer_.str();
+    if (pending.empty()) {
+      return;
+    }
     std::scoped_lock lock(Mutex());
-    target_ << buffer_.str();
+    target_ << pending;
     target_.flush();
+    buffer_.str({});
+    if (!target_) {
+      setstate(std::ios::badbit);
+    }
   }
 
  private:

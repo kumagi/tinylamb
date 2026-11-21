@@ -77,8 +77,6 @@ def check_int_range(v):
 
 
 def to_float(v):
-    if isinstance(v, bool):
-        return float(v)
     return float(v)
 
 
@@ -608,7 +606,7 @@ def eval_node(node):
         try:
             res = getattr(math, op)(v)
         except (ValueError, OverflowError):
-            res = float("nan") if op != "atanh" else float("nan")
+            res = float("nan")
         return res
     if op in ("pow", "power"):
         l = eval_node(node[1])
@@ -983,7 +981,7 @@ def values_match(actual_rendered, expected):
         if expected.startswith("THROW:"):
             want_msg = expected.split(":", 1)[1]
         else:
-            want_msg = expected[len("THROW("):].rstrip(")")
+            want_msg = expected[len("THROW("):].removesuffix(")")
         return want_msg in actual_rendered
     if not actual_rendered.startswith("OK "):
         return False

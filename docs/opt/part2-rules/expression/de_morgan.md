@@ -98,7 +98,7 @@ SQL が準拠する Kleene 三値論理系において、ド・モルガンの�
 ## 関連 Rule との相互作用
 
 - `double_negation`: `de_morgan` の直前に登録されており、二重否定 $\neg(\neg x)$ は事前に解消されます。
-- `not_comparison` / `not_like`: `de_morgan` の直後に登録されており、論理積・論理和以外の二項演算子に対する否定を処理します。
+- `not_comparison` / `not_like`: `de_morgan` より後に登録され、対象となる比較演算子や LIKE の否定を処理します。
 - `canonicalize_comparison`: 否定が各葉ノードに到達した後の比較演算子正規化と協調します。
 
 ## 検証テスト

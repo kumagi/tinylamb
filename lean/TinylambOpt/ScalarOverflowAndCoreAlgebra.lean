@@ -283,7 +283,7 @@ theorem projection_transpose_and_merge_sound {A B C : Type} [DecidableEq B]
       · simp [Bool.eq_false_iff.mpr hp, ih]
 
 /-- 🚨 **実在バグ証明 M2 (`push_projection_through_aggregation` の `HAVING` 参照列刈り落としバグ)**:
-    旧 C++ (`plan/cascades.cpp:4368-4376`) は `grouping_sets`, `partition_by`, `target_list` の列しか集めず、
+    旧 C++ (`plan/cascades.cpp:4440`) は `grouping_sets`, `partition_by`, `target_list` の列しか集めず、
     `agg.predicate` (`HAVING`) が参照する列を集め忘れていたため、
     `SELECT g, COUNT(*) FROM t GROUP BY g HAVING SUM(secret) > 10` で `secret` 列が事前射影により消滅していた！ -/
 theorem cpp_push_proj_through_agg_prunes_having_col_bug :
@@ -703,7 +703,7 @@ theorem null_and_like_rules_sound
     とくに `inner_join_not_null_inference` について：
     - フィルタ文脈 (`.inWhere`) では `((x = y) AND x IS NOT NULL AND y IS NOT NULL).inWhere = (x = y).inWhere` が普遍的に成り立つ一方、
     - 値文脈では `x = NULL, y = NULL` のとき `UNKNOWN AND FALSE = FALSE ≠ UNKNOWN` となるため、
-      `optimizer.cpp:2735` / `bytecode.cpp:76` の `value_context_rules.Remove("inner_join_not_null_inference")` が数学的に必須であることも併せて証明する！ -/
+      `plan/optimizer.cpp` と `expression/bytecode.cpp` の `value_context_rules.Remove("inner_join_not_null_inference")` が数学的に必須であることも併せて証明する！ -/
 theorem in_and_join_notnull_rules_sound {α : Type} [DecidableEq α]
     (x y : SqlVal α) (a b : SqlVal α) :
     evalInList x [a] = sqlEq x a ∧

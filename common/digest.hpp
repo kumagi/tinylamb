@@ -26,6 +26,18 @@ inline std::string ToHex(std::string_view raw) {
   return out;
 }
 
+namespace detail {
+
+template <size_t BlockSize, size_t LengthOffset>
+std::string_view Padding(size_t buffered) {
+  static constexpr std::array<char, BlockSize> padding{'\x80'};
+  const size_t size =
+      (BlockSize + LengthOffset - buffered - 1) % BlockSize + 1;
+  return {padding.data(), size};
+}
+
+}  // namespace detail
+
 // ---------------------------------------------------------------- MD5 ----
 class Md5 {
  public:
@@ -56,13 +68,16 @@ class Md5 {
     }
     buffer_.append(data.substr(pos));
   }
-  std::string Finalize() {
+  // Snapshot the digest without consuming the accumulated input.
+  [[nodiscard]] std::string Finalize() const {
+    Md5 snapshot = *this;
+    return snapshot.FinalizeInPlace();
+  }
+
+ private:
+  std::string FinalizeInPlace() {
     const uint64_t bits = static_cast<uint64_t>(total_) * 8;
-    std::string padding = "\x80";
-    while ((buffer_.size() + padding.size()) % 64 != 56) {
-      padding.push_back('\0');
-    }
-    Update(padding);
+    Update(detail::Padding<64, 56>(buffer_.size()));
     for (int i = 0; i < 8; ++i) {
       buffer_.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
     }
@@ -78,8 +93,6 @@ class Md5 {
     }
     return out;
   }
-
- private:
   static uint32_t Rotl(uint32_t v, int s) { return (v << s) | (v >> (32 - s)); }
   void Block(const char* p) {
     static constexpr std::array<uint32_t, 64> kK = {
@@ -177,13 +190,16 @@ class Sha1 {
     }
     buffer_.append(data.substr(pos));
   }
-  std::string Finalize() {
+  // Snapshot the digest without consuming the accumulated input.
+  [[nodiscard]] std::string Finalize() const {
+    Sha1 snapshot = *this;
+    return snapshot.FinalizeInPlace();
+  }
+
+ private:
+  std::string FinalizeInPlace() {
     const uint64_t bits = static_cast<uint64_t>(total_) * 8;
-    std::string padding = "\x80";
-    while ((buffer_.size() + padding.size()) % 64 != 56) {
-      padding.push_back('\0');
-    }
-    Update(padding);
+    Update(detail::Padding<64, 56>(buffer_.size()));
     for (int i = 7; i >= 0; --i) {
       buffer_.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
     }
@@ -197,8 +213,6 @@ class Sha1 {
     }
     return out;
   }
-
- private:
   static uint32_t Rotl(uint32_t v, int s) { return (v << s) | (v >> (32 - s)); }
   void Block(const char* p) {
     std::array<uint32_t, 80> w{};
@@ -286,13 +300,16 @@ class Sha256 {
     }
     buffer_.append(data.substr(pos));
   }
-  std::string Finalize() {
+  // Snapshot the digest without consuming the accumulated input.
+  [[nodiscard]] std::string Finalize() const {
+    Sha256 snapshot = *this;
+    return snapshot.FinalizeInPlace();
+  }
+
+ private:
+  std::string FinalizeInPlace() {
     const uint64_t bits = static_cast<uint64_t>(total_) * 8;
-    std::string padding = "\x80";
-    while ((buffer_.size() + padding.size()) % 64 != 56) {
-      padding.push_back('\0');
-    }
-    Update(padding);
+    Update(detail::Padding<64, 56>(buffer_.size()));
     for (int i = 7; i >= 0; --i) {
       buffer_.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
     }
@@ -306,8 +323,6 @@ class Sha256 {
     }
     return out;
   }
-
- private:
   static uint32_t Rotr(uint32_t v, int s) { return (v >> s) | (v << (32 - s)); }
   void Block(const char* p) {
     static constexpr std::array<uint32_t, 64> kK = {
@@ -409,14 +424,16 @@ class Sha512 {
     }
     buffer_.append(data.substr(pos));
   }
-  std::string Finalize() {
+  // Snapshot the digest without consuming the accumulated input.
+  [[nodiscard]] std::string Finalize() const {
+    Sha512 snapshot = *this;
+    return snapshot.FinalizeInPlace();
+  }
+
+ private:
+  std::string FinalizeInPlace() {
     const uint64_t bits = static_cast<uint64_t>(total_) * 8;
-    std::string padding = "\x80";
-    padding.reserve(128);
-    while ((buffer_.size() + padding.size()) % 128 != 112) {
-      padding.push_back('\0');
-    }
-    Update(padding);
+    Update(detail::Padding<128, 112>(buffer_.size()));
     // SHA-512 appends a 128-bit length field: eight zero bytes followed by
     // the 64-bit bit count.
     for (int i = 0; i < 8; ++i) {
@@ -435,8 +452,6 @@ class Sha512 {
     }
     return out;
   }
-
- private:
   static uint64_t Rotr(uint64_t v, int s) { return (v >> s) | (v << (64 - s)); }
   void Block(const char* p) {
     static constexpr std::array<uint64_t, 80> kK = {

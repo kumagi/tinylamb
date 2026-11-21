@@ -5348,7 +5348,7 @@ int64_t FastPforValueAt(const FastPforRegion& p, uint32_t idx) {
   return static_cast<int64_t>(static_cast<uint64_t>(blk.minimum) + off);
 }
 
-// One block's lanes (AVX2 kernels where compiled in) plus the bitmap-driven
+// One block's lanes (AVX2 kernels when compiled in) plus the bitmap-driven
 // exception patch. Shared by the bulk decode, the predicate mask, and the
 // count/sum kernel's boundary blocks.
 void FastPforDecodeBlock(const FastPforBlock& blk, int64_t* dst) {
@@ -5587,7 +5587,7 @@ bool ParseDeltaFastPforRegion(const char* r, uint32_t n, uint32_t param,
 // Replays one block's value sequence into dst[0..rows): v_0 = base, then
 // v_t = v_{t-1} + delta_t with exception deltas patched from the list and
 // regular deltas read as dmin + lane. The delta lanes unpack through
-// DecodeBp128Block's AVX2 kernels where compiled in (a one-block Bp128Region
+// DecodeBp128Block's AVX2 kernels when compiled in (a one-block Bp128Region
 // view over the rows-1 deltas; that kernel never reads the view's
 // maximum/sum, so they stay unset). The replay itself is an unsigned-wrapping
 // sequential chain -- the one thing a delta transform cannot vectorize away.
@@ -5659,7 +5659,7 @@ int64_t DeltaFastPforValueAt(const DeltaFastPforRegion& p, uint32_t idx) {
     return static_cast<int64_t>(v);
   }
   // Unpack the block's delta lanes ONCE (DecodeBp128Block's AVX2 kernels
-  // where compiled in) and replay to t: per-delta byte-window extraction
+  // when compiled in) and replay to t: per-delta byte-window extraction
   // measures ~3x the probe cost of one batched unpack plus the same
   // <= 127 dependent adds. Exception deltas hold garbage in the unpacked
   // lanes (their low bits + dmin), so the replay takes them from the

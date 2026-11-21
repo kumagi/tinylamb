@@ -631,7 +631,7 @@ ARRAY<STRUCT<key INT64, value STRING>>[unknown order:
 ]
 ==
 
-# Value table as input but the intial scan of the recursive term is not the
+# Value table as input but the initial scan of the recursive term is not the
 # recursive table.
 [name=subquery_value_table_as_input_initial_scan_not_recursive_table]
 select as value 1 as key

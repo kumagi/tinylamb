@@ -3169,7 +3169,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
   }
   if (s == Scheme::kFastPfor) {
     // Same shape as the kBp128 arm: one parse, then a per-block lane decode
-    // (the AVX2 kernels where compiled in) plus a bitmap-driven exception
+    // (the AVX2 kernels when compiled in) plus a bitmap-driven exception
     // patch (the per-row arm would re-walk the metadata per probe).
     FastPforRegion parsed;
     if (!ParseFastPforRegion(region, n, param, region_end, &parsed)) {

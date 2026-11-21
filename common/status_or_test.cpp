@@ -31,6 +31,22 @@ TEST(StatusOrTest, ConvertingValuesAndErrorsRemainDistinct) {
   EXPECT_FALSE(failure.HasValue());
   EXPECT_EQ(failure.GetStatus(), Status::kCorrupt);
 
+  EXPECT_EQ(ToString(StatusCode::kUnknown), "Unknown");
+  EXPECT_EQ(ToString(StatusCode::kSuccess), "Success");
+  EXPECT_EQ(ToString(StatusCode::kNoSpace), "NoSpace");
+  EXPECT_EQ(ToString(StatusCode::kDuplicates), "Duplicates");
+  EXPECT_EQ(ToString(StatusCode::kConflicts), "Conflicts");
+  EXPECT_EQ(ToString(StatusCode::kUnknownType), "UnknownType");
+  EXPECT_EQ(ToString(StatusCode::kNotExists), "NotExists");
+  EXPECT_EQ(ToString(StatusCode::kNotImplemented), "NotImplemented");
+  EXPECT_EQ(ToString(StatusCode::kTooBigData), "TooBigData");
+  EXPECT_EQ(ToString(StatusCode::kAmbiguousQuery), "AmbiguousQuery");
+  EXPECT_EQ(ToString(StatusCode::kIsInfinity), "IsInfinity");
+  EXPECT_EQ(ToString(StatusCode::kDeleted), "Deleted");
+  EXPECT_EQ(ToString(StatusCode::kCorrupt), "Corrupt");
+  EXPECT_EQ(ToString(StatusCode::kIOError), "IOError");
+  EXPECT_EQ(ToString(StatusCode::kInvalidArgument), "InvalidArgument");
+  EXPECT_EQ(ToString(StatusCode::kRuntimeError), "RuntimeError");
   EXPECT_EQ(ToString(StatusCode::kMemoryLimitExceeded), "MemoryLimitExceeded");
   EXPECT_EQ(SqlStateForStatus(Status::kMemoryLimitExceeded), "53200");
   EXPECT_EQ(SqlStateForStatus(Status::kNoSpace), "53100");

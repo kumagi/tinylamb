@@ -3,6 +3,7 @@
 #define TINYLAMB_EXECUTOR_DETAIL_TYPED_STREAM_AGGREGATE_PARTITIONED_HPP
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>

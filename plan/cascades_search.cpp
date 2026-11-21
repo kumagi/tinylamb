@@ -898,11 +898,11 @@ std::string PhysicalProperties::Key() const {
     key.append("|uniq:1");
   }
   key.append("|lim:");
-  key.append(std::to_string(limit_hint));
+  AppendInteger(key, limit_hint);
   key.append("|am:");
-  key.append(std::to_string(static_cast<int>(access_method)));
+  AppendInteger(key, static_cast<int>(access_method));
   key.append("|dist:");
-  key.append(std::to_string(static_cast<int>(distribution)));
+  AppendInteger(key, static_cast<int>(distribution));
   key.append("|distinct:");
   key.push_back(distinct ? '1' : '0');
   return key;
@@ -1535,7 +1535,7 @@ SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades
                               // finite query.
     GroupId group, const PhysicalProperties& properties,
     const Implement& implement, const RuleContext& context) {
-  const std::string cache_key = std::to_string(group) + '/' + properties.Key();
+  const std::string cache_key = IntegerToString(group) + '/' + properties.Key();
   if (const auto found = best_.find(cache_key); found != best_.end()) {
     return found->second;
   }

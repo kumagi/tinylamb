@@ -33,7 +33,7 @@ inline std::random_device& SeedGen() {  // Kept for existing callers seeding
                                         // their own engines (e.g. row_page
                                         // tests).
   // NOLINTNEXTLINE(cert-err58-cpp)
-  static std::random_device seed_gen;
+  static thread_local std::random_device seed_gen;
   return seed_gen;
 }
 

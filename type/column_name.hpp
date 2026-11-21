@@ -42,7 +42,7 @@ struct ColumnName {
 
   explicit ColumnName(std::string_view na) {
     size_t pos = na.find('.');
-    if (pos == std::string::npos) {
+    if (pos == std::string::npos || pos == 0) {
       name = na;
     } else {
       schema = na.substr(0, pos);

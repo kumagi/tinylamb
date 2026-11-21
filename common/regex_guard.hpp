@@ -265,14 +265,13 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
         continue;
       }
       CharSet first;
-      bool nullable = false;
-      if (i + 1 < n && (pattern[i + 1] == 'b' || pattern[i + 1] == 'B')) {
-        nullable = true;  // word boundary: zero-width
-      } else if (i + 1 < n) {
+      const bool word_boundary =
+          i + 1 < n && (pattern[i + 1] == 'b' || pattern[i + 1] == 'B');
+      if (!word_boundary && i + 1 < n) {
         first = regex_guard_detail::EscapeCharSet(pattern[i + 1]);
       }
       i += 2;
-      note_atom(1, first, nullable);
+      note_atom(word_boundary ? 0 : 1, first, word_boundary);
       continue;
     }
     if (c == '[') {
@@ -535,7 +534,8 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
   // Cache any size while the per-thread total stays inside the budget,
   // evicting round-robin-oldest entries first.
   static thread_local std::array<std::optional<Entry>, 8> cache;
-  static thread_local size_t next = 0;
+  static thread_local size_t head = 0;
+  static thread_local size_t count = 0;
   static thread_local size_t used = 0;
   try {
     for (const auto& entry : cache) {
@@ -553,22 +553,18 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
     const size_t bytes = (pattern.size() * 16) + (size_t{1} << 10);
     constexpr size_t kPatternCacheBudget = size_t{2} << 20;
     if (bytes <= kPatternCacheBudget) {
-      // `next` is the FIFO head; free entries until this one fits.
-      for (;;) {
-        auto& slot = cache[next];
-        if (!slot && used + bytes <= kPatternCacheBudget) {
-          break;
-        }
-        if (slot) {
-          used -= slot->bytes;
-          slot.reset();
-        }
-        next = (next + 1) % cache.size();
+      // Evict the oldest entries only while a slot or bytes are needed.
+      while (count == cache.size() || used + bytes > kPatternCacheBudget) {
+        auto& slot = cache[head];
+        used -= slot->bytes;
+        slot.reset();
+        head = (head + 1) % cache.size();
+        --count;
       }
-      auto& entry = cache[next].emplace(
+      auto& entry = cache[(head + count) % cache.size()].emplace(
           Entry{.pattern = pattern, .compiled = compiled, .bytes = bytes});
       used += bytes;
-      next = (next + 1) % cache.size();
+      ++count;
       return entry.compiled;
     }
     return compiled;

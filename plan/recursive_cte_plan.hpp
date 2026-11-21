@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_PLAN_RECURSIVE_CTE_PLAN_HPP
 #define TINYLAMB_PLAN_RECURSIVE_CTE_PLAN_HPP
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,7 +44,12 @@ class RecursiveCtePlan final : public PlanBase {
     return child_ ? child_->AccessRowCount() : 1;
   }
   [[nodiscard]] size_t EmitRowCount() const override {
-    return (child_ ? child_->EmitRowCount() : 1) * 10;
+    constexpr size_t kRecursionEstimate = 10;
+    constexpr size_t kMaxRows = std::numeric_limits<size_t>::max();
+    const size_t anchor_rows = child_ ? child_->EmitRowCount() : 1;
+    return anchor_rows > kMaxRows / kRecursionEstimate
+               ? kMaxRows
+               : anchor_rows * kRecursionEstimate;
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
   [[nodiscard]] const std::string& CteName() const { return cte_name_; }

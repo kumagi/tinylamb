@@ -47,7 +47,7 @@ class UnnestExecutor final : public ExecutorBase {
   Expression unnest_expr_;
   std::string alias_;
   std::string offset_alias_;
-  // LEFT / FULL OUTER UNNEST: when the array is empty (or NULL) the driving
+  // LEFT OUTER UNNEST: when the array is empty (or NULL) the driving
   // row still emits once with NULL-extended unnest columns instead of
   // disappearing.  INNER (the default) drops the row entirely.
   bool left_outer_{false};

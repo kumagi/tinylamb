@@ -5,7 +5,6 @@
 #include <gtest/gtest.h>
 
 #include <memory>
-#include <optional>
 #include <sstream>
 #include <string>
 

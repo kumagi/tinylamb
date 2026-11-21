@@ -33,11 +33,10 @@ struct Capture {
   std::vector<char> blob;
   int calls = 0;
 };
-Capture* g_capture = nullptr;
-
-void CaptureDurability(const char* data, size_t len, void* /*ctx*/) {
-  g_capture->blob.assign(data, data + len);
-  ++g_capture->calls;
+void CaptureDurability(const char* data, size_t len, void* ctx) {
+  auto& capture = *static_cast<Capture*>(ctx);
+  capture.blob.assign(data, data + len);
+  ++capture.calls;
 }
 
 Schema MakeSyncSchema() {
@@ -54,19 +53,13 @@ std::string KeyOf(const Schema& sc, int64_t id) {
 
 class MemTableSyncTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    capture_ = Capture{};
-    g_capture = &capture_;
-  }
-  void TearDown() override { g_capture = nullptr; }
-
   Capture capture_;
 };
 
 TEST_F(MemTableSyncTest, PutSyncFiresDurabilityHookAndDrainsEntryIntoRun) {
   Schema sc = MakeSyncSchema();
   MemTable mt(sc);
-  mt.SetDurabilityCallback(&CaptureDurability, nullptr);
+  mt.SetDurabilityCallback(&CaptureDurability, &capture_);
   ASSERT_SUCCESS(mt.Put(Row{Value(int64_t{7}), Value(int64_t{42})},
                         /*sync=*/true));
   EXPECT_EQ(capture_.calls, 1);
@@ -83,7 +76,7 @@ TEST_F(MemTableSyncTest, DeleteSyncFiresDurabilityHook) {
   Schema sc = MakeSyncSchema();
   MemTable mt(sc);
   ASSERT_SUCCESS(mt.Put(Row{Value(int64_t{9}), Value(int64_t{1})}));
-  mt.SetDurabilityCallback(&CaptureDurability, nullptr);
+  mt.SetDurabilityCallback(&CaptureDurability, &capture_);
   ASSERT_SUCCESS(mt.Delete(KeyOf(sc, 9), /*sync=*/true));
   EXPECT_EQ(capture_.calls, 1);
   // Tombstone drained along with the run (Lookup can no longer observe it,

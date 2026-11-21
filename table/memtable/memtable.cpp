@@ -242,8 +242,8 @@ std::vector<std::pair<std::string, RowEntry>> MemTable::Snapshot(
   // shifted up to kNumShards cursors — while a pop/push_heap merge is
   // O(n log k), mirroring Sync's 16-way merge).
   struct Cursor {
-    const std::pair<std::string, RowEntry>* begin;
-    const std::pair<std::string, RowEntry>* end;
+    std::pair<std::string, RowEntry>* begin;
+    std::pair<std::string, RowEntry>* end;
     [[nodiscard]] bool Valid() const { return begin != end; }
   };
   std::vector<Cursor> cursors;
@@ -264,7 +264,7 @@ std::vector<std::pair<std::string, RowEntry>> MemTable::Snapshot(
   while (!cursors.empty()) {
     std::pop_heap(cursors.begin(), cursors.end(), key_greater);
     Cursor& cur = cursors.back();
-    out.push_back(*cur.begin);
+    out.push_back(std::move(*cur.begin));
     ++cur.begin;
     if (cur.Valid()) {
       std::push_heap(cursors.begin(), cursors.end(), key_greater);

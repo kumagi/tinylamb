@@ -185,7 +185,7 @@ bool UnnestExecutor::NextRow(Row* dst, RowPosition* rp) {
     if (current_unnested_rows_.empty() && left_outer_) {
       // OUTER unnest: an empty (or NULL) array emits one row of NULLs so the
       // driving row survives with NULL-extended unnest columns.
-      const slot_t width = output_schema_.ColumnCount() > 0
+      const size_t width = output_schema_.ColumnCount() > 0
                                ? output_schema_.ColumnCount()
                                : rel.schema.ColumnCount();
       std::vector<Value> nulls(width);

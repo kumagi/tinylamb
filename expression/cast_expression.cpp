@@ -769,7 +769,11 @@ std::string EncodeStructMemberText(const Value& value) {
     // plain STRING and lose the element type.
     return json_text::ToJsonText(value);
   }
-  return "\"" + value.AsString() + "\"";
+  std::string out = value.AsString();
+  out.reserve(out.size() + 2);
+  out.insert(out.begin(), '"');
+  out.push_back('"');
+  return out;
 }
 
 // Parses the field list of a STRUCT<...> target type into

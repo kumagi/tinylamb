@@ -136,7 +136,7 @@ TEST(SchemaTest, SerializeDeserialize_DiverseSchemas_PreservesStructure) {
                              Column(ColumnName("c3"), ValueType::kVarChar)}));
 }
 
-TEST(SchemaTest, Dump_ToLogStream_SucceedsWithoutCrash) {
+TEST(SchemaTest, StreamOutputListsSchemaNameAndColumns) {
   Schema s("sample", {Column(ColumnName("c1"), ValueType::kInt64,
                              Constraint(Constraint::kPrimaryKey)),
                       Column(ColumnName("c2"), ValueType::kDouble)});
@@ -145,8 +145,18 @@ TEST(SchemaTest, Dump_ToLogStream_SucceedsWithoutCrash) {
                            Column(ColumnName("c2"), ValueType::kDouble),
                            Column(ColumnName("c3"), ValueType::kVarChar)});
 
-  LOG(INFO) << s;
-  LOG(WARN) << t;
+  std::ostringstream sample;
+  sample << s;
+  EXPECT_TRUE(sample.str().starts_with("sample [ "));
+  EXPECT_NE(sample.str().find("c1"), std::string::npos);
+  EXPECT_NE(sample.str().find(" | "), std::string::npos);
+  EXPECT_NE(sample.str().find("c2"), std::string::npos);
+
+  std::ostringstream next;
+  next << t;
+  EXPECT_TRUE(next.str().starts_with("next_schema [ "));
+  EXPECT_NE(next.str().find("c3"), std::string::npos);
+  EXPECT_TRUE(next.str().ends_with(" ]"));
 }
 
 TEST(SchemaTest,

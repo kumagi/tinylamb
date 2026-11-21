@@ -86,31 +86,30 @@ TEST_F(TableSampleTest, LimitDoesNotTruncateSamplePopulation) {
 
   // SYSTEM samples whole storage blocks; with a single block it legitimately
   // returns all 100 rows, so only BERNOULLI gives a sample smaller than LIMIT.
-  for (const char* method : {"BERNOULLI (50 PERCENT)"}) {
-    const std::string head =
-        std::string("SELECT v FROM samp_lim TABLESAMPLE ") + method +
-        " REPEATABLE (7)";
-    const std::vector<Row> base = RunSql(*engine_, *context_, head);
-    ASSERT_GT(base.size(), 0U) << method;
-    ASSERT_LT(base.size(), 90U) << method;
-    const std::vector<Row> limited =
-        RunSql(*engine_, *context_, head + " LIMIT 90");
-    ASSERT_EQ(limited.size(), base.size()) << method;
-    std::vector<int64_t> a, b;
-    for (const Row& r : base) {
-      a.push_back(r[0].value.int_value);
-    }
-    for (const Row& r : limited) {
-      b.push_back(r[0].value.int_value);
-    }
-    std::ranges::sort(a);
-    std::ranges::sort(b);
-    EXPECT_EQ(a, b) << method;
+  const char* method = "BERNOULLI (50 PERCENT)";
+  const std::string head =
+      std::string("SELECT v FROM samp_lim TABLESAMPLE ") + method +
+      " REPEATABLE (7)";
+  const std::vector<Row> base = RunSql(*engine_, *context_, head);
+  ASSERT_GT(base.size(), 0U) << method;
+  ASSERT_LT(base.size(), 90U) << method;
+  const std::vector<Row> limited =
+      RunSql(*engine_, *context_, head + " LIMIT 90");
+  ASSERT_EQ(limited.size(), base.size()) << method;
+  std::vector<int64_t> a, b;
+  for (const Row& r : base) {
+    a.push_back(r[0].value.int_value);
   }
+  for (const Row& r : limited) {
+    b.push_back(r[0].value.int_value);
+  }
+  std::ranges::sort(a);
+  std::ranges::sort(b);
+  EXPECT_EQ(a, b) << method;
 }
 
 TEST_F(TableSampleTest, ReservoirRepeatableIsStable) {
-  Seed();
+  ASSERT_NO_FATAL_FAILURE(Seed());
   const std::string sql =
       "SELECT id FROM sample_t TABLESAMPLE RESERVOIR(2 ROWS) "
       "REPEATABLE(42)";
@@ -121,7 +120,7 @@ TEST_F(TableSampleTest, ReservoirRepeatableIsStable) {
 }
 
 TEST_F(TableSampleTest, ReservoirPartitionWeight) {
-  Seed();
+  ASSERT_NO_FATAL_FAILURE(Seed());
   const std::vector<Row> rows =
       RunSql(*engine_, *context_,
              "SELECT grp, w FROM sample_t TABLESAMPLE RESERVOIR(1 ROWS "
@@ -140,7 +139,7 @@ TEST_F(TableSampleTest, ReservoirPartitionWeight) {
 }
 
 TEST_F(TableSampleTest, BernoulliFullWeight) {
-  Seed();
+  ASSERT_NO_FATAL_FAILURE(Seed());
   const std::vector<Row> rows =
       RunSql(*engine_, *context_,
              "SELECT id, w FROM sample_t TABLESAMPLE BERNOULLI(100 PERCENT) "
@@ -155,7 +154,7 @@ TEST_F(TableSampleTest, BernoulliFullWeight) {
 TEST_F(TableSampleTest, SystemMethodSamplesStorageBlocks) {
   // SYSTEM now samples whole storage blocks (page-level include/exclude);
   // 0% and 100% pin the boundary behavior.
-  Seed();
+  ASSERT_NO_FATAL_FAILURE(Seed());
   const std::vector<Row> none =
       RunSql(*engine_, *context_,
              "SELECT id FROM sample_t TABLESAMPLE SYSTEM(0 PERCENT)");
@@ -176,12 +175,18 @@ TEST_F(TableSampleTest, SystemMethodSamplesStorageBlocks) {
 }
 
 TEST_F(TableSampleTest, DerivedRelationUsesRelationalSamplePath) {
-  Seed();
-  const std::vector<Row> rows = RunSql(
-      *engine_, *context_,
+  ASSERT_NO_FATAL_FAILURE(Seed());
+  const std::string sql =
       "SELECT id FROM (SELECT id FROM sample_t) TABLESAMPLE RESERVOIR(2 ROWS) "
-      "REPEATABLE(42)");
-  ASSERT_EQ(rows.size(), 2U);
+      "REPEATABLE(42)";
+  ASSERT_EQ(RunSql(*engine_, *context_, sql).size(), 2U);
+  const auto plan = RunSql(*engine_, *context_, "EXPLAIN ANALYZE " + sql);
+  bool used_relational = false;
+  for (const Row& row : plan) {
+    used_relational |=
+        row[0].AsStringView().find("RelationalExecutor") != std::string_view::npos;
+  }
+  EXPECT_TRUE(used_relational);
 }
 
 // A correlated EXISTS/IN whose subquery source carries a TABLESAMPLE must

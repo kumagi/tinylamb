@@ -7,22 +7,13 @@ Omits differential-privacy / anonymization files. Origin is Apache-2.0.
 from __future__ import annotations
 
 import json
+import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HEADERS = {"User-Agent": "tinylamb-compliance-fetch"}
 
-# Keep this in sync with TINYLAMB_GOOGLESQL_VERSION in CMakeLists.txt.
-REF = "2026.7.2"
-REPO = (
-    "https://api.github.com/repos/google/googlesql/contents/"
-    f"googlesql/compliance/testdata?ref={REF}"
-)
-RAW = (
-    f"https://raw.githubusercontent.com/google/googlesql/{REF}/"
-    "googlesql/compliance/testdata/"
-)
 SKIP = (
     "differential_privacy",
     "anonymization",
@@ -37,10 +28,23 @@ LOCAL_PREFIXES = ("optimizer_",)
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
+    cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
+    version = re.search(r'^set\(TINYLAMB_GOOGLESQL_VERSION\s+"([^"]+)"', cmake, re.M)
+    if version is None:
+        raise SystemExit("TINYLAMB_GOOGLESQL_VERSION is missing from CMakeLists.txt")
+    ref = version.group(1)
+    repo = (
+        "https://api.github.com/repos/google/googlesql/contents/"
+        f"googlesql/compliance/testdata?ref={ref}"
+    )
+    raw = (
+        f"https://raw.githubusercontent.com/google/googlesql/{ref}/"
+        "googlesql/compliance/testdata/"
+    )
     out = root / "query" / "testdata" / "googlesql_compliance"
     out.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(
-        REPO, headers=HEADERS
+        repo, headers=HEADERS
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         listing = json.load(response)
@@ -61,7 +65,7 @@ def main() -> None:
     def fetch(name: str) -> tuple[str, str | None]:
         dest = out / name
         try:
-            request = urllib.request.Request(RAW + name, headers=HEADERS)
+            request = urllib.request.Request(raw + name, headers=HEADERS)
             with urllib.request.urlopen(request, timeout=60) as response:
                 dest.write_bytes(response.read())
             return name, None

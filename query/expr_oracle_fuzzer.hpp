@@ -7,6 +7,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "expression/expr_simplify_oracle.hpp"
 
@@ -38,7 +39,7 @@ struct ExprOracleTrace {
   std::string sql;        // full `SELECT ...;` statement, engine-runnable
   std::string sexpr;      // S-expression for scripts/expr_oracle.py
   std::string reference;  // AST ground-truth value (FormatSimplifyValue)
-  std::string actual;     // engine (or rewritten-tree) value, or THROW/E(...)s
+  std::string actual;     // available rewrite, tier, and SQL engine outcomes
   std::string failure;    // one-line summary of the mismatch
   // True when the engine executed the SQL (vs rejecting it as unsupported).
   // Replay reports a lost engine execution if the recorded run executed SQL.
@@ -52,9 +53,9 @@ struct ExprOracleTrace {
 };
 
 // Runs one iteration from `rng` (which must have been seeded with the trace
-// seed so replay can regenerate it). Returns "" when every oracle held (or
-// the iteration was skipped because the engine rejected the SQL), otherwise
-// a diagnostic. `trace` always receives the executed case.
+// seed so replay can regenerate it). Returns a diagnostic for any failed
+// oracle. Rejected SQL skips the engine comparison but preserves other
+// diagnostics. `trace` receives the executed case.
 std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
                                    ExprOracleTrace* trace = nullptr,
                                    const ExprGenConfig& config = {});
@@ -118,7 +119,9 @@ struct RowExprOracleTrace {
 //       - Ground-truth AST reference filter
 //       - Rewritten tree in-memory filter
 //       - Engine SQL execution: `SELECT id FROM t_fuzz WHERE <predicate_sql>
-//       ORDER BY id;` Must all return the identical set of row IDs.
+//       ORDER BY id;`
+//       - SQL execution with relational fallback forced, when available.
+//       All execution routes must return the same set of row IDs.
 std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
                                       RowExprOracleTrace* trace = nullptr,
                                       const ExprGenConfig& config = {});

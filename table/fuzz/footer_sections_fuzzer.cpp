@@ -274,9 +274,9 @@ bool MapSections(const PaxChunk::Footer& f, const std::vector<char>& b,
 constexpr std::array<uint8_t, 5> kValues = {0x00, 0x01, 0x7F, 0x80, 0xFF};
 
 PaxChunk BuildCompactChunk(uint8_t shape) {
-  static std::array<PaxChunk, 16> cache;
-  static std::array<bool, 16> built = {};
-  const uint8_t idx = shape & 15;
+  static thread_local std::array<PaxChunk, 64> cache;
+  static thread_local std::array<bool, 64> built = {};
+  const uint8_t idx = shape & 63;
   if (built[idx]) {
     return cache[idx];
   }
@@ -286,14 +286,16 @@ PaxChunk BuildCompactChunk(uint8_t shape) {
   const bool two_valued = (idx & 2) != 0;
   const bool keep_nulls = (idx & 4) != 0;
   const bool dense_nulls = (idx & 8) != 0;
+  const bool constant = (idx & 16) != 0;
+  const bool skew = (idx & 32) != 0;
   const Schema sc = MakeStorageSchema();
   std::vector<Row> rows;
   rows.reserve(static_cast<size_t>(kRows));
   for (int64_t i = 0; i < kRows; ++i) {
     rows.push_back(Row{
         Value(i),
-        Value(ramp ? i * 2 : (i * 3) + 1),
-        Value("name-" + std::to_string(i % 61)),
+        Value(constant ? int64_t{7} : (ramp ? i * 2 : (i * 3) + 1)),
+        Value("name-" + std::to_string(skew && i % 8 != 0 ? 0 : i % 61)),
         Value(12.5 + (static_cast<double>(i % 97) * 0.5)),
         Value(two_valued ? static_cast<int64_t>(i & 1)
                          : static_cast<int64_t>(i % 5)),
@@ -314,7 +316,7 @@ PaxChunk BuildCompactChunk(uint8_t shape) {
   return cache[idx];
 }
 
-void CheckCurrent(std::vector<char>& work, char orig, const Schema& sc,
+void CheckCurrent(std::vector<char>& work, const Schema& sc,
                   int64_t key_probe, const char* what) {
   const Status verdict = PaxChunk::ValidateChunkBytes(work);
   const bool accepted = (verdict == Status::kSuccess);
@@ -349,7 +351,6 @@ void CheckCurrent(std::vector<char>& work, char orig, const Schema& sc,
     std::abort();
   }
   HammerChunk(chunk, sc, key_probe);
-  (void)orig;
 }
 
 void SweepSection(std::vector<char>& work, size_t off, size_t len,
@@ -375,7 +376,7 @@ void SweepSection(std::vector<char>& work, size_t off, size_t len,
       }
       if (full_budget > 0) {
         --full_budget;
-        CheckCurrent(work, orig, sc, key_probe, what.data());
+        CheckCurrent(work, sc, key_probe, what.data());
       } else {
         const Status verdict = PaxChunk::ValidateChunkBytes(work);
         if (verdict == Status::kSuccess) {
@@ -402,12 +403,21 @@ void PokeExtreme(std::vector<char>& bytes, size_t off, size_t width,
 
 }  // namespace
 
+size_t FooterSectionCountForSeed(uint8_t shape) {
+  const PaxChunk chunk = BuildCompactChunk(shape);
+  SectionMap map;
+  if (!MapSections(chunk.GetFooter(), chunk.Data(), &map) || !map.mapped) {
+    return 0;
+  }
+  return map.sections.size();
+}
+
 int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
   if (size < 12) {
     return 0;
   }
   const Schema sc = MakeStorageSchema();
-  const auto shape = static_cast<uint8_t>(data[0] & 15);
+  const uint8_t shape = data[0];
   const PaxChunk good = BuildCompactChunk(shape);
   const std::vector<char>& base = good.Data();
   if (base.size() < 128) {
@@ -480,7 +490,7 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
                               static_cast<unsigned long long>(e)) < 0) {
               std::abort();
             }
-            CheckCurrent(bytes, 0, sc, key_probe, what.data());
+            CheckCurrent(bytes, sc, key_probe, what.data());
           }
         }
       }
@@ -491,7 +501,7 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
         std::vector<char> bytes = base;
         bytes[off] = static_cast<char>(base[off] == 0 ? 1 : 0);
         ResignChunkCrc(bytes);
-        CheckCurrent(bytes, 0, sc, key_probe, sec.name);
+        CheckCurrent(bytes, sc, key_probe, sec.name);
         break;
       }
       for (uint8_t v : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{0xFF}}) {
@@ -503,7 +513,7 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
                           v) < 0) {
           std::abort();
         }
-        CheckCurrent(bytes, 0, sc, key_probe, what.data());
+        CheckCurrent(bytes, sc, key_probe, what.data());
       }
       break;
     }
@@ -516,7 +526,7 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
         bytes[at] = static_cast<char>(kValues[(data[6 + k] + k) % 5]);
       }
       ResignChunkCrc(bytes);
-      CheckCurrent(bytes, 0, sc, key_probe, sec.name);
+      CheckCurrent(bytes, sc, key_probe, sec.name);
       break;
     }
   }

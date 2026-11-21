@@ -3,8 +3,10 @@
 #define TINYLAMB_PLAN_MEMO_ORACLE_HPP
 
 #include <cstddef>
+#include <functional>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "plan/cascades.hpp"

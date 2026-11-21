@@ -5,11 +5,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/status_or.hpp"
-#include "common/test_util.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/constraint.hpp"
@@ -56,12 +58,18 @@ TEST(RowSchemaExtraTest, ConstraintsSurviveSchemaSerialization) {
       {Column("id", ValueType::kInt64, Constraint(Constraint::kPrimaryKey)),
        Column("ref", ValueType::kInt64, Constraint(Constraint::kUnique)),
        Column("note", ValueType::kVarChar)});
-  SerializeDeserializeTest(schema);
-  // The primary key counts as unique; a constraint-free column stays so.
-  EXPECT_TRUE(schema.GetColumn(0).GetConstraint().IsUnique());
-  EXPECT_EQ(schema.GetColumn(0).GetConstraint().ctype, Constraint::kPrimaryKey);
-  EXPECT_TRUE(schema.GetColumn(1).GetConstraint().IsUnique());
-  EXPECT_TRUE(schema.GetColumn(2).GetConstraint().IsNothing());
+  std::stringstream buffer;
+  Encoder encoder(buffer);
+  encoder << schema;
+  Schema restored;
+  Decoder decoder(buffer);
+  decoder >> restored;
+  ASSERT_TRUE(buffer);
+  ASSERT_EQ(restored.ColumnCount(), 3U);
+  EXPECT_TRUE(restored.GetColumn(0).GetConstraint().IsUnique());
+  EXPECT_EQ(restored.GetColumn(0).GetConstraint().ctype, Constraint::kPrimaryKey);
+  EXPECT_EQ(restored.GetColumn(1).GetConstraint().ctype, Constraint::kUnique);
+  EXPECT_TRUE(restored.GetColumn(2).GetConstraint().IsNothing());
 }
 
 TEST(RowSchemaExtraTest, ExtractBuildsAnOrderedProjection) {

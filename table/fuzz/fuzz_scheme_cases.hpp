@@ -17,8 +17,8 @@
 #ifndef TINYLAMB_TABLE_FUZZ_SCHEME_CASES_HPP
 #define TINYLAMB_TABLE_FUZZ_SCHEME_CASES_HPP
 
-// The forced-scheme case table shared by region_scheme_fuzzer.cpp and the
-// seed generator.
+// Forced-scheme cases used by region_scheme_fuzzer.cpp and the in-memory
+// corpus replay in pax_storage_fuzzer_test.cpp.
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -313,7 +313,7 @@ inline constexpr auto kSchemeCases = std::to_array<SchemeCase>({
      .nshapes = 4},
     {.name = "SFOR",
      .expected = PaxChunk::Scheme::kSfor,
-     .col = 0,
+     .col = 3,
      .shapes = {0, 1, 2, 4},
      .nshapes = 4},
     {.name = "MOD",
@@ -328,7 +328,7 @@ inline constexpr auto kSchemeCases = std::to_array<SchemeCase>({
      .nshapes = 4},
     {.name = "EXPFOR",
      .expected = PaxChunk::Scheme::kExpFor,
-     .col = 0,
+     .col = 3,
      .shapes = {0, 1, 2, 4},
      .nshapes = 4},
     {.name = "SORTDICT",

@@ -1152,24 +1152,22 @@ TEST(ExpressionRewriteTest, TypedSignAbsorptionAndRepeatedAddend) {
   };
 
   // (-1 * i) and (i * -1) fold to unary minus; NULLs propagate unchanged.
-  for (const BinaryOperation op :
-       {BinaryOperation::kMultiply, BinaryOperation::kMultiply}) {
-    const Expression left_constant =
-        BinaryExpressionExp(ConstantValueExp(Value(-1)), op,
-                            ColumnValueExp(ColumnName("input", "i")));
-    const Expression folded = rewritten(left_constant);
-    ASSERT_EQ(folded->Type(), TypeTag::kUnaryExp) << folded->ToString();
-    EXPECT_EQ(folded->AsUnaryExpression().Op(), UnaryOperation::kMinus);
-    EXPECT_EQ(folded->Evaluate(Row({Value(7), Value(2.5), Value("s")}), schema),
-              Value(-7));
-    EXPECT_TRUE(folded->Evaluate(Row({Value(), Value(2.5), Value("s")}), schema)
-                    .IsNull());
+  constexpr BinaryOperation op = BinaryOperation::kMultiply;
+  const Expression left_constant =
+      BinaryExpressionExp(ConstantValueExp(Value(-1)), op,
+                          ColumnValueExp(ColumnName("input", "i")));
+  const Expression folded = rewritten(left_constant);
+  ASSERT_EQ(folded->Type(), TypeTag::kUnaryExp) << folded->ToString();
+  EXPECT_EQ(folded->AsUnaryExpression().Op(), UnaryOperation::kMinus);
+  EXPECT_EQ(folded->Evaluate(Row({Value(7), Value(2.5), Value("s")}), schema),
+            Value(-7));
+  EXPECT_TRUE(folded->Evaluate(Row({Value(), Value(2.5), Value("s")}), schema)
+                  .IsNull());
 
-    const Expression right_constant =
-        BinaryExpressionExp(ColumnValueExp(ColumnName("input", "i")), op,
-                            ConstantValueExp(Value(-1)));
-    EXPECT_EQ(rewritten(right_constant)->Type(), TypeTag::kUnaryExp);
-  }
+  const Expression right_constant =
+      BinaryExpressionExp(ColumnValueExp(ColumnName("input", "i")), op,
+                          ConstantValueExp(Value(-1)));
+  EXPECT_EQ(rewritten(right_constant)->Type(), TypeTag::kUnaryExp);
 
   // Doubles absorb the sign exactly as well.
   const Expression double_sign = BinaryExpressionExp(

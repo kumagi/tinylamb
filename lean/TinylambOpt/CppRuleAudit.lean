@@ -1,5 +1,5 @@
 /-
-# Step 7: C++ Optimizer 既存実装ルールの直訳監査（Bug Finding & Repair Verification）
+# Step 6: C++ Optimizer 既存実装ルールの直訳監査（Bug Finding & Repair Verification）
 
 「教科書上の理想化されたルール」ではなく、`tinylamb` の C++ 実装（`plan/cascades.cpp`,
 `plan/cascades_search.cpp`, `query/join_reduction.cpp`, `expression/rewrite.cpp`）の
@@ -20,7 +20,7 @@ namespace TinylambOpt
    および `expression/rewrite.cpp` (`IsNullStrictWhere`) の三値論理・整数 Truthy 監査
 
 C++ の `Value::Truthy()` は整数 `0` を偽、非 `0` を真、`NULL` を未知として扱います。
-`query/join_reduction.cpp` の既存実装をそのまま直訳すると、以下の **2 つの実在バグ** が露呈します：
+`query/join_reduction.cpp` の修正前の実装を直訳した監査で、以下の **2 つのバグ** を特定しました。現行実装には修正が反映されています。
 
 1. **Bug 1a（空リスト `IN ()` の Strict 誤判定）**:
    `IsStrictOnQualifiers` の `case kInExp:`（および `expression/rewrite.cpp` の `IsNullStrictWhere`）が

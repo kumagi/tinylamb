@@ -14,11 +14,10 @@ namespace tinylamb {
 
 class TransactionContext;
 
-// The catalog capability required by a transaction/query. Keeping this
-// separate from Database prevents executor state from acquiring DDL, crash,
-// filesystem, and lifecycle operations through TransactionContext.
-// Interface with an implicit copy/move-free lifecycle; no resources are held
-// here.
+// Catalog operations available through TransactionContext: table and
+// statistics lookup, function registration, and cache invalidation. Table
+// DDL, recovery, filesystem access, and database lifecycle live on Database.
+// This interface owns no resources.
 // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 class CatalogReader {
  public:

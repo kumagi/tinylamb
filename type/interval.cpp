@@ -11,6 +11,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -51,6 +52,67 @@ int RangeUnitIndex(std::string_view name) {
   }
   return -1;
 }
+
+std::optional<StatusOr<IntervalValue>> ScaleIntegerInterval(
+    int64_t amount, std::string_view unit) {
+  bool overflowed = false;
+  const auto checked_return = [&](const IntervalValue& value)
+      -> StatusOr<IntervalValue> {
+    if (overflowed) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "generic::out_of_range: INTERVAL value out of range");
+    }
+    return value;
+  };
+  const auto mul = [&](int64_t factor) -> int64_t {
+    int64_t scaled = 0;
+    overflowed |= __builtin_mul_overflow(amount, factor, &scaled);
+    return scaled;
+  };
+  if (unit == "year" || unit == "years") {
+    return checked_return(
+        IntervalValue{.months = mul(12), .days = 0, .nanos = 0});
+  }
+  if (unit == "quarter" || unit == "quarters") {
+    return checked_return(
+        IntervalValue{.months = mul(3), .days = 0, .nanos = 0});
+  }
+  if (unit == "month" || unit == "months") {
+    return checked_return(IntervalValue{.months = amount, .days = 0, .nanos = 0});
+  }
+  if (unit == "week" || unit == "weeks") {
+    return checked_return(
+        IntervalValue{.months = 0, .days = mul(7), .nanos = 0});
+  }
+  if (unit == "day" || unit == "days") {
+    return checked_return(IntervalValue{.months = 0, .days = amount, .nanos = 0});
+  }
+  if (unit == "hour" || unit == "hours") {
+    return checked_return(IntervalValue{
+        .months = 0, .days = 0, .nanos = mul(int64_t{3600} * 1000000000LL)});
+  }
+  if (unit == "minute" || unit == "minutes") {
+    return checked_return(IntervalValue{
+        .months = 0, .days = 0, .nanos = mul(int64_t{60} * 1000000000LL)});
+  }
+  if (unit == "second" || unit == "seconds") {
+    return checked_return(IntervalValue{
+        .months = 0, .days = 0, .nanos = mul(int64_t{1000000000LL})});
+  }
+  if (unit == "millisecond" || unit == "milliseconds") {
+    return checked_return(IntervalValue{
+        .months = 0, .days = 0, .nanos = mul(int64_t{1000000})});
+  }
+  if (unit == "microsecond" || unit == "microseconds") {
+    return checked_return(
+        IntervalValue{.months = 0, .days = 0, .nanos = mul(int64_t{1000})});
+  }
+  if (unit == "nanosecond" || unit == "nanoseconds") {
+    return checked_return(IntervalValue{.months = 0, .days = 0, .nanos = amount});
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 namespace {
@@ -204,6 +266,15 @@ StatusOr<std::string> IntervalValue::TryToString() const {
   }
 
   return std::string(ym_buf.data()) + " " + d_buf.data() + " " + t_buf.data();
+}
+
+StatusOr<IntervalValue> IntervalValue::TryFromInteger(
+    int64_t amount, std::string_view unit) {
+  if (auto scaled = ScaleIntegerInterval(amount, ToLower(Trim(unit)))) {
+    return *scaled;
+  }
+  // Keep the text parser's diagnostics and unit-range rules for unusual units.
+  return TryParse(std::to_string(amount), unit);
 }
 
 StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
@@ -468,54 +539,8 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
             IntervalValue{.months = 0, .days = 0, .nanos = to_int64(dval)});
       }
     }
-    // Each unit conversion checks its multiply up front; checked_return
-    // turns a flagged multiply into the same out-of-range error the old
-    // ternary-throw form produced.
-    const auto mul = [&](int64_t factor) -> int64_t {
-      int64_t scaled = 0;
-      overflowed |= __builtin_mul_overflow(ival, factor, &scaled);
-      return scaled;
-    };
-    if (u == "year" || u == "years") {
-      return checked_return(
-          IntervalValue{.months = mul(12), .days = 0, .nanos = 0});
-    }
-    if (u == "quarter" || u == "quarters") {
-      return checked_return(
-          IntervalValue{.months = mul(3), .days = 0, .nanos = 0});
-    }
-    if (u == "month" || u == "months") {
-      return IntervalValue{.months = ival, .days = 0, .nanos = 0};
-    }
-    if (u == "week" || u == "weeks") {
-      return checked_return(
-          IntervalValue{.months = 0, .days = mul(7), .nanos = 0});
-    }
-    if (u == "day" || u == "days") {
-      return IntervalValue{.months = 0, .days = ival, .nanos = 0};
-    }
-    if (u == "hour" || u == "hours") {
-      return checked_return(IntervalValue{
-          .months = 0, .days = 0, .nanos = mul(int64_t{3600} * 1000000000LL)});
-    }
-    if (u == "minute" || u == "minutes") {
-      return checked_return(IntervalValue{
-          .months = 0, .days = 0, .nanos = mul(int64_t{60} * 1000000000LL)});
-    }
-    if (u == "second" || u == "seconds") {
-      return checked_return(IntervalValue{
-          .months = 0, .days = 0, .nanos = mul(int64_t{1000000000LL})});
-    }
-    if (u == "millisecond" || u == "milliseconds") {
-      return checked_return(IntervalValue{
-          .months = 0, .days = 0, .nanos = mul(int64_t{1000000})});
-    }
-    if (u == "microsecond" || u == "microseconds") {
-      return checked_return(
-          IntervalValue{.months = 0, .days = 0, .nanos = mul(int64_t{1000})});
-    }
-    if (u == "nanosecond" || u == "nanoseconds") {
-      return IntervalValue{.months = 0, .days = 0, .nanos = ival};
+    if (auto scaled = ScaleIntegerInterval(ival, u)) {
+      return *scaled;
     }
   }
 

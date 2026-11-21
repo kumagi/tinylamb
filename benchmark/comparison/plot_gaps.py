@@ -27,6 +27,9 @@ def main():
     rows = json.loads(a.comparison.read_text())
     if len(rows) != 41 or any(r['after'] is None for r in rows):
         p.error('a complete comparison of the original 41 metrics is required')
+    unknown = sorted({row['before']['workload'] for row in rows} - PLANS.keys())
+    if unknown:
+        p.error('unsupported workloads in comparison: ' + ', '.join(unknown))
     groups = {name: [] for name in NAMES}
     for row in rows:
         groups[PLANS[row['before']['workload']]].append(row)

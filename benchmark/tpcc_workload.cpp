@@ -11,6 +11,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -706,9 +707,13 @@ Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
   }
   ++result->sql_statements;
   if (std::getenv("TPCC_SQL_TRACE") != nullptr) {
-    [[maybe_unused]] const int printed =
-        fprintf(stderr, "[tpcc-sql][%d] %s\n", static_cast<int>(result->type),
-                std::string(sql).c_str());
+    if (sql.size() <= static_cast<size_t>(std::numeric_limits<int>::max())) {
+      fprintf(stderr, "[tpcc-sql][%d] %.*s\n", static_cast<int>(result->type),
+              static_cast<int>(sql.size()), sql.empty() ? "" : sql.data());
+    } else {
+      fprintf(stderr, "[tpcc-sql][%d] %s\n", static_cast<int>(result->type),
+              std::string(sql).c_str());
+    }
   }
   try {
     *rows = query_result.Value().Collect();
@@ -736,8 +741,13 @@ bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
     return true;
   }
   if (getenv("TPCC_SQL_TRACE") != nullptr) {
-    [[maybe_unused]] const int printed =
-        fprintf(stderr, "[tpcc-empty] %s\n", std::string(operation).c_str());
+    if (operation.size() <=
+        static_cast<size_t>(std::numeric_limits<int>::max())) {
+      fprintf(stderr, "[tpcc-empty] %.*s\n", static_cast<int>(operation.size()),
+              operation.empty() ? "" : operation.data());
+    } else {
+      fprintf(stderr, "[tpcc-empty] %s\n", std::string(operation).c_str());
+    }
   }
   result->error = std::string(operation) + " returned no rows";
   return false;

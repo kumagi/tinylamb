@@ -136,9 +136,6 @@ TEST(PaxChunkCodecsTest, AuditReduceRejectsScaledOverflowAcrossSchemes) {
        {Scheme::kPlain, Scheme::kConst, Scheme::kRle, Scheme::kBp128}) {
     auto encoded = codec_benchmark::EncodeInt64Block(scheme, values);
     ASSERT_TRUE(encoded.has_value());
-    if (!encoded.has_value()) {
-      continue;
-    }
     auto chunk =
         AuditSingleColumnChunk(scheme, static_cast<slot_t>(values.size()),
                                encoded->bytes, encoded->param);
@@ -166,12 +163,11 @@ TEST(PaxChunkCodecsTest, AuditLanePredicateWithEmptyLaneKeepsOtherLaneOnly) {
   }
   auto encoded = codec_benchmark::EncodeInt64Block(Scheme::kLane, values);
   ASSERT_TRUE(encoded.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
-  ASSERT_EQ(encoded->scheme, Scheme::kLane);
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
-  auto chunk = AuditSingleColumnChunk(Scheme::kLane, kRows, encoded->bytes,
-                                      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
-                                      encoded->param);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  const auto& encoded_block = *encoded;
+  ASSERT_EQ(encoded_block.scheme, Scheme::kLane);
+  auto chunk = AuditSingleColumnChunk(Scheme::kLane, kRows,
+                                      encoded_block.bytes, encoded_block.param);
 
   ReducePlan plan;
   plan.op = AggOp::kCount;
@@ -256,7 +252,7 @@ TEST(PaxChunkCodecsTest, AuditFooterSumsRefuseWrappedColumnStats) {
   std::vector<Row> wrapped{Row({Value(1), Value(INT64_MAX)}),
                            Row({Value(2), Value(1)})};
   // Each row group's own sum stays inside int64 but their fold does not:
-  // 1024 zeros of slack in group 0 keep its subtotal exactly INT64_MAX.
+  // 1023 zeros of slack in group 0 keep its subtotal exactly INT64_MAX.
   std::vector<Row> fold_wrapped{Row({Value(1), Value(INT64_MAX)})};
   for (uint32_t i = 0; i < 1023; ++i) {
     fold_wrapped.push_back(Row({Value(static_cast<int64_t>(i + 2)), Value(0)}));
@@ -588,7 +584,8 @@ TEST(PaxChunkCodecsTest, BitWriterAndWordBitReaderRoundTrip) {
 
 TEST(PaxChunkCodecsTest, ZigZagEncodingRoundTrip) {
   const std::vector<int64_t> inputs = {
-      0, 1, -1, 2, -2, 42, -42, 1000000000LL, -1000000000LL};
+      0, 1, -1, 2, -2, 42, -42, 1000000000LL, -1000000000LL,
+      INT32_MIN, INT32_MAX, INT64_MIN, INT64_MAX};
   for (int64_t v : inputs) {
     const uint64_t zz = StreamVByteZigZag(v);
     EXPECT_EQ(StreamVByteUnZigZag(zz), v);
@@ -809,6 +806,18 @@ TEST(PaxChunkCodecsTest, Float64AndVarcharCodecsRoundTrip) {
                                   chimp128.buf.data() + chimp128.buf.size(),
                                   &c128_reg));
   EXPECT_TRUE(Chimp128MetadataMatches(c128_reg));
+  {
+    std::vector<uint64_t> decoded(fbits.size());
+    size_t offset = 0;
+    for (uint32_t i = 0; i < c128_reg.block_count; ++i) {
+      const auto& block = c128_reg.blocks[i];
+      ASSERT_LE(offset + block.rows, decoded.size());
+      ASSERT_TRUE(DecodeChimp128Block(block, decoded.data() + offset));
+      offset += block.rows;
+    }
+    ASSERT_EQ(offset, fbits.size());
+    EXPECT_EQ(decoded, fbits);
+  }
 
   const EncodedCol patas = EncPatasF64(fbits);
   ASSERT_FALSE(patas.buf.empty());
@@ -817,6 +826,18 @@ TEST(PaxChunkCodecsTest, Float64AndVarcharCodecsRoundTrip) {
                                patas.buf.data() + patas.buf.size(),
                                &patas_reg));
   EXPECT_TRUE(PatasMetadataMatches(patas_reg));
+  {
+    std::vector<uint64_t> decoded(fbits.size());
+    size_t offset = 0;
+    for (uint32_t i = 0; i < patas_reg.block_count; ++i) {
+      const auto& block = patas_reg.blocks[i];
+      ASSERT_LE(offset + block.rows, decoded.size());
+      ASSERT_TRUE(DecodePatasBlock(block, decoded.data() + offset));
+      offset += block.rows;
+    }
+    ASSERT_EQ(offset, fbits.size());
+    EXPECT_EQ(decoded, fbits);
+  }
 
   // Varchar codecs: FrontCode, OpDict
   std::vector<std::string> strs;

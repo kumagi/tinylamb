@@ -20,7 +20,7 @@ namespace {
 TEST(RowBlockCodecTest, RoundTripsAllValueVariantsIncludingLargeStrings) {
   const std::string huge(80000, 'Z');  // > 64 KiB (exceeds Encoder 16-bit max)
   std::vector<Row> rows;
-  rows.push_back(Row({Value(), Value(int64_t{-42}), Value(std::string(huge)),
+  rows.push_back(Row({Value().WithCollation(2), Value(int64_t{-42}), Value(std::string(huge)),
                       Value(std::numbers::pi), Value::DateFromDays(19724)}));
   rows.push_back(
       Row({Value(int64_t{7}).WithUnsigned(), Value("AbC").WithCollation(2),
@@ -37,6 +37,8 @@ TEST(RowBlockCodecTest, RoundTripsAllValueVariantsIncludingLargeStrings) {
   EXPECT_TRUE(sv.empty());
   ASSERT_EQ(decoded.size(), rows.size());
   EXPECT_EQ(decoded[0], rows[0]);
+  EXPECT_EQ(decoded[0][0].Collation(), 2);
+  EXPECT_EQ(decoded[1], rows[1]);
   EXPECT_EQ(decoded[1][0].Collation(), rows[1][0].Collation());
   EXPECT_TRUE(decoded[1][0].IsUnsigned());
   EXPECT_EQ(decoded[1][1].Collation(), 2);
@@ -110,11 +112,29 @@ TEST(RowBlockCodecTest, RejectsCorruptTruncatedStream) {
   std::string encoded;
   ASSERT_EQ(EncodeRowBlock(std::span<const Row>(&r, 1), &encoded),
             Status::kSuccess);
-  encoded.resize(encoded.size() - 2);
-  std::string_view sv(encoded);
-  std::vector<Row> out;
-  const Status st = DecodeRowBlock(&sv, &out);
-  EXPECT_EQ(st.GetCode(), StatusCode::kCorrupt);
+  const std::string full = encoded;
+  for (size_t keep = 1; keep < full.size(); ++keep) {
+    encoded = full.substr(0, keep);
+    std::string_view sv(encoded);
+    std::vector<Row> out;
+    const Status st = DecodeRowBlock(&sv, &out);
+    EXPECT_EQ(st.GetCode(), StatusCode::kCorrupt) << "truncated to " << keep;
+    EXPECT_TRUE(out.empty()) << "truncated to " << keep;
+  }
+}
+
+TEST(RowBlockCodecTest, RejectsTrailingPayloadWithoutAppendingRows) {
+  const std::array<Row, 1> input{Row({Value(7)})};
+  std::string encoded;
+  ASSERT_EQ(EncodeRowBlock(input, &encoded), Status::kSuccess);
+  encoded.push_back('x');
+  const auto payload_size = static_cast<uint32_t>(encoded.size() - 8);
+  std::memcpy(encoded.data() + sizeof(uint32_t), &payload_size,
+              sizeof(payload_size));
+  std::string_view data(encoded);
+  std::vector<Row> output{Row({Value(14)})};
+  EXPECT_EQ(DecodeRowBlock(&data, &output).GetCode(), StatusCode::kCorrupt);
+  EXPECT_EQ(output, (std::vector<Row>{Row({Value(14)})}));
 }
 
 TEST(RowBlockCodecTest, RejectsHugeRowCountAndOversizedPayloadWithoutOom) {
@@ -136,8 +156,12 @@ TEST(RowBlockCodecTest, RejectsHugeRowCountAndOversizedPayloadWithoutOom) {
     const std::filesystem::path dir = std::filesystem::temp_directory_path(ec) /
                                       ("row_codec_corrupt_" + RandomString());
     std::filesystem::create_directories(dir, ec);
-    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
     struct Guard {
+      explicit Guard(std::filesystem::path dir) : d(std::move(dir)) {}
+      Guard(const Guard&) = delete;
+      Guard& operator=(const Guard&) = delete;
+      Guard(Guard&&) = delete;
+      Guard& operator=(Guard&&) = delete;
       std::filesystem::path d;
       ~Guard() {
         std::error_code e;

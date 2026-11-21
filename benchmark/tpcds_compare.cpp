@@ -230,10 +230,10 @@ void WriteValue(const Value& v) {
     } else {
       std::cout << std::setprecision(17) << x;
     }
+  } else if (v.type == ValueType::kVarChar) {
+    std::cout << Json(v.AsStringView());
   } else {
-    std::cout << Json(v.type == ValueType::kVarChar
-                          ? std::string(v.AsStringView())
-                          : v.AsString());
+    std::cout << Json(v.AsString());
   }
 }
 

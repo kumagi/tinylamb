@@ -68,7 +68,7 @@ size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
         }
         left_pos_ = 0;
       }
-      hold_left_ = left_rows_[left_pos_++];
+      hold_left_ = std::move(left_rows_[left_pos_++]);
       right_iter_ = right_table_.begin();
     }
     destination->Append(hold_left_ + *right_iter_++);

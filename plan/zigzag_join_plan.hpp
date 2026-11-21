@@ -18,10 +18,6 @@ class ZigZagJoinPlan final : public PlanBase {
                  ColumnName right_key, BinaryOperation operation,
                  Expression predicate,
                  std::optional<size_t> estimated_rows = std::nullopt);
-  ZigZagJoinPlan(Plan left, std::vector<ColumnName> left_keys, Plan right,
-                 std::vector<ColumnName> right_keys, BinaryOperation operation,
-                 Expression predicate,
-                 std::optional<size_t> estimated_rows = std::nullopt);
   ZigZagJoinPlan(const ZigZagJoinPlan&) = delete;
   ZigZagJoinPlan(ZigZagJoinPlan&&) = delete;
   ZigZagJoinPlan& operator=(const ZigZagJoinPlan&) = delete;
@@ -48,6 +44,9 @@ class ZigZagJoinPlan final : public PlanBase {
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending,
       const std::vector<std::optional<bool>>& nulls_first) const override;
+  [[nodiscard]] Collation OrderCollation() const override {
+    return left_->OrderCollation();
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

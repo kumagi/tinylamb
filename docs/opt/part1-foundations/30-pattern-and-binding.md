@@ -237,20 +237,33 @@ flowchart TB
 ```cpp
     built.Add(Rule(
         "push_selection_into_scan", SelectionWithin(0, Scan("scan")),
-        [](const Bindings& bindings, Memo& memo, GroupId,
+        [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          memo.MergeScanFilter(bindings.at("scan"), *expression.predicate);
+          const GroupId input = bindings.at("scan");
+          if (memo.Get(input).sample_barrier ||
+              memo.Get(group).sample_barrier) {
+            return;
+          }
+          if (memo.Get(input).filter) {
+            memo.MergeScanFilter(group, memo.Get(input).filter);
+          }
+          memo.MergeScanFilter(group, *expression.predicate);
+          for (const auto& scan : memo.Get(input).expressions) {
+            if (scan.operation == LogicalOperator::kScan) {
+              memo.AddExpression(group, scan);
+            }
+          }
         },
         LogicalOperator::kSelection));
 ```
 
 - パターン部 `SelectionWithin(0, Scan("scan"))` は、0 番目の子グループが単一テーブルのスキャンであり、かつ選択述語がそのテーブルのみを参照している場合に適合します。
-- 変換本体はキャプチャされたスキャングループに対し、`memo.MergeScanFilter` を用いて述語を合併するのみです。
-- 述語がスキャン対象の表だけを参照していることは、パターン定義側で検査します。そのため、変換関数内で同じ条件を再判定する必要はありません。
+- 変換本体は入力と結果のサンプリング境界を確認し、既存フィルタと新しい述語を結果 Group に合併します。
+- Scan 式も結果 Group に登録します。入力 Group のフィルタは共有先からも参照されるため、そのまま保持します。
 
 ## 30-5. `Rule::Apply` — 規則の実行と Memo 成長の判定
 
-探索エンジンから各 Rule を呼び出す共通処理が `Rule::Apply` です（`plan/cascades.cpp`）。
+探索エンジンから各 Rule を呼び出す共通処理が `Rule::Apply` です（`plan/cascades_search.cpp`）。
 
 ```cpp
 bool Rule::Apply(Memo& memo, GroupId group,
@@ -264,15 +277,17 @@ bool Rule::Apply(Memo& memo, GroupId group,
   }
   const size_t before_groups = memo.GroupCount();
   const size_t before_expressions = memo.ExpressionCount(group);
+  const auto before_revision = memo.Revision();
   transform_(bindings, memo, group, expression);
   return memo.GroupCount() != before_groups ||
-         memo.ExpressionCount(group) != before_expressions;
+         memo.ExpressionCount(group) != before_expressions ||
+         memo.Revision() != before_revision;
 }
 ```
 
 - `MayApply` による演算子フィルタ: パターン全体の評価に先立ち、対象式の演算子が規則の事前ヒント（`target`）と一致するかを判定し、無駄なマッチング処理を回避します。
-- 戻り値の責務: 戻り値の真偽値は「規則の適用によって Memo に新たなグループまたは式が追加されたか」を表します。変換関数が早期リターンした場合や重複によって追加が棄却された場合を呼び出し側で検知できます。
+- 戻り値の責務: 戻り値の真偽値は「規則の適用によって Memo のグループ、式、またはリビジョンが変わったか」を表します。変換関数が早期リターンした場合や重複によって追加が棄却された場合を呼び出し側で検知できます。
 
-`Rule::Apply` の戻り値により、探索エンジンは Memo が実際に増えた場合だけ
+`Rule::Apply` の戻り値により、探索エンジンは Memo が実際に変わった場合だけ
 後続の探索を進められます。第 40 章では、この Rule 適用を繰り返す
 `SearchEngine` とコスト選択を説明します。

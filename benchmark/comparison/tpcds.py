@@ -40,7 +40,7 @@ def sha(path):
 def freeze_build_inputs(binary, cache_text, output):
     """Keep optional profile/allocator inputs needed to reproduce the build."""
     destination = output / 'build-inputs'
-    destination.mkdir()
+    destination.mkdir(parents=True, exist_ok=True)
     inputs = {'profiles': [], 'libraries': []}
     profile_paths = set()
     for line in cache_text.splitlines():

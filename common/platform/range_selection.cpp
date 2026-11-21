@@ -33,7 +33,7 @@ uint32_t CompactDoubleScalar(const int64_t* values, uint32_t* positions,
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t row = positions[i];
     const auto v = std::bit_cast<double>(values[row]);
-    const bool hit = (lower_inclusive ? v >= lower : v > lower) &
+    const bool hit = (lower_inclusive ? v >= lower : v > lower) &&
                      (upper_inclusive ? v <= upper : v < upper);
     positions[out] = row;
     out += static_cast<uint32_t>(hit);
@@ -117,7 +117,7 @@ CompactDoubleAvx512(const int64_t* values, uint32_t* positions, uint32_t count,
   for (; i < count; ++i) {
     const uint32_t row = positions[i];
     const auto v = std::bit_cast<double>(values[row]);
-    if ((lower_inclusive ? v >= lower : v > lower) &
+    if ((lower_inclusive ? v >= lower : v > lower) &&
         (upper_inclusive ? v <= upper : v < upper)) {
       positions[out++] = row;
 }

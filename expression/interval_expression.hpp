@@ -25,7 +25,8 @@ class IntervalExpression : public ExpressionBase {
     if (!raw_amount_.empty()) {
       value_ = IntervalValue::Parse(raw_amount_, unit_);
     } else {
-      value_ = IntervalValue::Parse(std::to_string(amount_), unit_);
+      value_ = ExcShimUnwrap(IntervalValue::TryFromInteger(amount_, unit_),
+                             "IntervalValue::Parse");
     }
     text_ = value_.ToString();
   }

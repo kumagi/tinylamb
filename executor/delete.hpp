@@ -2,6 +2,10 @@
 #ifndef TINYLAMB_DELETE_EXECUTOR_HPP
 #define TINYLAMB_DELETE_EXECUTOR_HPP
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 #include "executor/executor_base.hpp"
 #include "foreign_key.hpp"
 

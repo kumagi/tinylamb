@@ -38,7 +38,9 @@ std::string IncrementalHex(std::string_view input, size_t step) {
   for (size_t i = 0; i < input.size(); i += step) {
     hash.Update(input.substr(i, step));
   }
-  return digest::ToHex(hash.Finalize());
+  const auto snapshot = hash.Finalize();
+  EXPECT_EQ(hash.Finalize(), snapshot);
+  return digest::ToHex(snapshot);
 }
 
 }  // namespace
@@ -74,18 +76,28 @@ TEST(DigestExtraTest, IncrementalUpdatesEqualOneShotAcrossBlockBoundaries) {
   for (const size_t step : {size_t{1}, size_t{63}, size_t{64}, size_t{65},
                             size_t{127}, size_t{333}}) {
     EXPECT_EQ((IncrementalHex<digest::Md5>(long_input, step)),
-              (IncrementalHex<digest::Md5>(long_input, long_input.size())))
+              OneShot(long_input, 0))
         << "step=" << step;
     EXPECT_EQ((IncrementalHex<digest::Sha1>(long_input, step)),
-              (IncrementalHex<digest::Sha1>(long_input, long_input.size())))
+              OneShot(long_input, 1))
         << "step=" << step;
     EXPECT_EQ((IncrementalHex<digest::Sha256>(long_input, step)),
-              (IncrementalHex<digest::Sha256>(long_input, long_input.size())))
+              OneShot(long_input, 2))
         << "step=" << step;
     EXPECT_EQ((IncrementalHex<digest::Sha512>(long_input, step)),
-              (IncrementalHex<digest::Sha512>(long_input, long_input.size())))
+              OneShot(long_input, 3))
         << "step=" << step;
   }
+}
+
+TEST(DigestExtraTest, FarmFingerprint64MatchesReferenceValues) {
+  EXPECT_EQ(digest::FarmFingerprint64(""),
+            static_cast<uint64_t>(-7286425919675154353LL));
+  EXPECT_EQ(digest::FarmFingerprint64("hello"),
+            static_cast<uint64_t>(-5436999610281751320LL));
+  EXPECT_EQ(digest::FarmFingerprint64("abc"), 2640714258260161385ULL);
+  EXPECT_EQ(digest::FarmFingerprint64(std::string(100, 'x')),
+            6590480085648050719ULL);
 }
 
 TEST(DigestExtraTest, DistinctInputsNeverShareADigest) {

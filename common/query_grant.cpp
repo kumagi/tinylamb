@@ -2,10 +2,12 @@
 #include "common/query_grant.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace tinylamb {
 namespace {
@@ -22,7 +24,7 @@ size_t ReadGrantEnvU64(const char* name, size_t fallback) noexcept {
   errno = 0;
   const unsigned long long parsed = std::strtoull(raw, &end, 10);
   if (errno != 0 || end == raw || *end != '\0' ||
-      parsed > std::numeric_limits<size_t>::max()) {
+      !std::in_range<size_t>(parsed)) {
     return fallback;
   }
   return static_cast<size_t>(parsed);
@@ -141,6 +143,8 @@ QueryMemoryGrant::QueryMemoryGrant(QueryMemoryGrant&& other) noexcept
       used_bytes_(other.used_bytes_.load(std::memory_order_acquire)),
       active_consumers_(
           other.active_consumers_.load(std::memory_order_acquire)),
+      reported_peak_bytes_(other.reported_peak_bytes_.exchange(
+          0, std::memory_order_relaxed)),
       limited_(other.limited_),
       wait_ns_(other.wait_ns_) {
   other.budget_ = nullptr;
@@ -165,6 +169,9 @@ QueryMemoryGrant& QueryMemoryGrant::operator=(
     active_consumers_.store(
         other.active_consumers_.load(std::memory_order_acquire),
         std::memory_order_release);
+    reported_peak_bytes_.store(
+        other.reported_peak_bytes_.exchange(0, std::memory_order_relaxed),
+        std::memory_order_relaxed);
     limited_ = other.limited_;
     wait_ns_ = other.wait_ns_;
     other.budget_ = nullptr;
@@ -317,9 +324,8 @@ size_t QueryMemoryCoordinator::MaxGrantFromEnv() const noexcept {
 uint64_t QueryMemoryCoordinator::WaitTimeoutMsFromEnv() noexcept {
   const uint64_t raw =
       ReadGrantEnvU64("TINYLAMB_GRANT_WAIT_TIMEOUT_MS", kDefaultWaitTimeoutMs);
-  // The deadline arithmetic converts this to std::chrono::milliseconds'
-  // signed rep; values above INT64_MAX would wrap negative and make the
-  // wait expire immediately.
+  // Keep the configured timeout within the signed millisecond range used
+  // by callers displaying this setting.
   return std::min<uint64_t>(raw,
                             static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
 }
@@ -339,15 +345,14 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
     return QueryMemoryGrant(budget_, /*granted_bytes=*/0, /*limited=*/false, 0);
   }
   const size_t target_max = std::max(preferred_bytes, min_bytes);
-  const size_t floor_min = std::min(min_bytes, target_max);
   const size_t pool_ceiling =
       budget_ != nullptr
           ? budget_->EffectivePoolMaxBytes(MemoryPoolKind::kQuery)
           : std::numeric_limits<size_t>::max();
-  if (budget_ != nullptr && !budget_->Unlimited() && floor_min > pool_ceiling) {
+  if (budget_ != nullptr && !budget_->Unlimited() && min_bytes > pool_ceiling) {
     return StatusError(
         StatusCode::kMemoryLimitExceeded,
-        "query minimum memory grant " + std::to_string(floor_min) +
+        "query minimum memory grant " + std::to_string(min_bytes) +
             " bytes exceeds query pool max " + std::to_string(pool_ceiling) +
             " bytes (pool='query')");
   }
@@ -358,7 +363,6 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
 
   const auto start = std::chrono::steady_clock::now();
   const uint64_t timeout = wait_timeout_ms.value_or(WaitTimeoutMsFromEnv());
-  const auto deadline = start + std::chrono::milliseconds(timeout);
 
   auto try_once = [&](size_t* granted_out, Status* err_out) -> bool {
     if (budget_ == nullptr) {
@@ -373,20 +377,20 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
       *granted_out = capped_max;
       return true;
     }
-    // If bounded below `capped_max`, try elastic shrink down to `floor_min`.
-    // Start no lower than floor_min: if floor_min > capped_max/2 a plain
-    // halving would skip the entire [floor_min, capped_max) window.
-    size_t probe = std::max(capped_max / 2, floor_min);
-    while (probe >= std::max<size_t>(1, floor_min)) {
+    // If bounded below `capped_max`, try elastic shrink down to `min_bytes`.
+    // Start no lower than min_bytes: if min_bytes > capped_max/2 a plain
+    // halving would skip the entire [min_bytes, capped_max) window.
+    size_t probe = std::max(capped_max / 2, min_bytes);
+    while (probe >= std::max<size_t>(1, min_bytes)) {
       if (budget_->TryReserveWithReclaim(MemoryPoolKind::kQuery, probe,
                                          err_out)) {
         *granted_out = probe;
         return true;
       }
-      if (probe == floor_min || probe <= 1) {
+      if (probe == min_bytes || probe <= 1) {
         break;
       }
-      probe = std::max(floor_min, probe / 2);
+      probe = std::max(min_bytes, probe / 2);
     }
     return false;
   };
@@ -406,13 +410,14 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
   const auto sig = signal_;  // keep the wake-up target alive across the wait
   while (true) {
     const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
+    const auto elapsed_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
+            .count());
+    if (elapsed_ms >= timeout) {
       break;
     }
-    const auto slice = std::min<std::chrono::milliseconds>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
-            std::chrono::milliseconds(1),
-        std::chrono::milliseconds(10));
+    const auto slice = std::chrono::milliseconds(
+        std::min<uint64_t>(timeout - elapsed_ms, 10));
     sig->cv.wait_for(lk, slice);
     lk.unlock();
     if (try_once(&granted, &last_err)) {
@@ -434,7 +439,7 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
       "timed out after " +
           std::to_string(std::max<int64_t>(0, waited) / 1'000'000) +
           "ms waiting for memory grant of at least " +
-          std::to_string(floor_min > 0 ? floor_min : target_max) +
+          std::to_string(min_bytes > 0 ? min_bytes : target_max) +
           " bytes from pool 'query' (pool_max=" + std::to_string(pool_ceiling) +
           ", soft_limit=" +
           std::to_string(budget_ != nullptr ? budget_->SoftLimit() : 0) + ")");

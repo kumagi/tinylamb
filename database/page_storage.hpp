@@ -30,8 +30,9 @@
 
 namespace tinylamb {
 
-// Member order documents the teardown order (logger, page manager, recovery /
-// transaction / checkpoint managers).
+// Members are destroyed in reverse declaration order, so checkpoint,
+// transaction, and recovery managers release their dependencies before the
+// page manager and logger are destroyed.
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 class PageStorage {
  public:

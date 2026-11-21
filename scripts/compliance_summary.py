@@ -26,7 +26,7 @@ def main() -> None:
     print(f"Running: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     stdout, _ = proc.communicate()
-    if proc.returncode != 0:
+    if proc.returncode not in (0, 1):
         print(f"Error: {binary} exited with {proc.returncode}", file=sys.stderr)
         print(stdout, file=sys.stderr)
         sys.exit(1)
@@ -37,16 +37,25 @@ def main() -> None:
     failures_by_test = {}
 
     for line in stdout.splitlines():
-        m_run = re.search(r'\[ RUN      \] GoogleSqlCompliance/GoogleSqlComplianceFileTest\.RunsFile/(.*)', line)
+        m_run = re.search(r'\[ RUN      \] GoogleSqlCompliance/GoogleSqlComplianceFileTest\.RunsFile/([^,\s]+)', line)
         if m_run:
             current_test = m_run.group(1)
-            failures_by_test[current_test] = []
-        m_ok = re.search(r'\[       OK \] GoogleSqlCompliance/GoogleSqlComplianceFileTest\.RunsFile/(.*)', line)
+            failures_by_test.setdefault(current_test, [])
+        m_ok = re.search(r'\[       OK \] GoogleSqlCompliance/GoogleSqlComplianceFileTest\.RunsFile/([^,\s]+)', line)
         if m_ok:
             passed.append(m_ok.group(1))
-        m_fail = re.search(r'\[  FAILED  \] GoogleSqlCompliance/GoogleSqlComplianceFileTest\.RunsFile/(.*)', line)
+            current_test = None
+            continue
+        m_fail = re.search(r'\[  FAILED  \] GoogleSqlCompliance/GoogleSqlComplianceFileTest\.RunsFile/([^,\s]+)', line)
         if m_fail:
-            failed.append(m_fail.group(1))
+            # GTest repeats failures in the final summary.
+            if current_test is not None:
+                failed.append(m_fail.group(1))
+            current_test = None
+            continue
+        if line.startswith("[  SKIPPED ]"):
+            current_test = None
+            continue
         if current_test and ("Failure" in line or "failed:" in line or "threw:" in line):
             failures_by_test[current_test].append(line.strip())
 
@@ -70,6 +79,11 @@ def main() -> None:
             print(f"  [FAIL] {f}")
             for detail in failures_by_test.get(f, []):
                 print(f"      {detail}")
+
+    if proc.returncode or failed:
+        if not failed:
+            print(stdout, file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

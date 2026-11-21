@@ -3517,18 +3517,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       return expanded;
     }
 
-    // Fingerprint of every key across all sets (deduplicated, insertion
-    // order); a select entry that references a key outside the branch's
-    // active set is NULL-padded.
-    std::vector<std::string> all_key_texts;
-    for (const auto& set : pending_grouping_sets) {
-      for (const Expression& key : set) {
-        const std::string text = key->ToString();
-        if (std::ranges::find(all_key_texts, text) == all_key_texts.end()) {
-          all_key_texts.push_back(text);
-        }
-      }
-    }
+    // Reuse the grouping key fingerprints across all branches.
+    const GroupingSetKeyTexts key_texts(pending_grouping_sets);
 
     // Alias-bound keys: `SELECT a AS k ... GROUP BY ROLLUP(k)` groups by the
     // alias, so a select entry named after an inactive bare-column key must
@@ -3543,7 +3533,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
               if (!key || key->Type() != TypeTag::kColumnValue) {
                 continue;
               }
-              const std::string text = key->ToString();
+              const std::string& text = key_texts.TextOf(key);
               if (context.active_key_texts.contains(text)) {
                 continue;
               }
@@ -3558,11 +3548,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     const auto rewrite_branch =
         [&](SelectStatement& branch,
             const std::vector<Expression>& active) -> Status {
-      GroupingSetBranchContext context;
-      context.all_key_texts = all_key_texts;
-      for (const Expression& key : active) {
-        context.active_key_texts.insert(key->ToString());
-      }
+      const GroupingSetBranchContext context = key_texts.ForBranch(active);
       const std::unordered_set<std::string> inactive_aliases =
           inactive_bare_key_aliases(context);
       // Select list: NULL-pad entries that reference inactive keys (direct
@@ -3579,7 +3565,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
             context.active_key_texts.contains(entry_text);
         const bool entry_is_inactive_key =
             !entry_is_active &&
-            std::ranges::find(all_key_texts, entry_text) != all_key_texts.end();
+            context.all_key_texts.contains(entry_text);
         const bool entry_aliases_inactive_key =
             !item.name.empty() && inactive_aliases.contains(Lower(item.name)) &&
             !entry_is_active;

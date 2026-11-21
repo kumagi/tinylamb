@@ -31,11 +31,6 @@ bool SupportedOperation(BinaryOperation operation) {
   }
 }
 
-ColumnName SingleKey(std::vector<ColumnName> keys) {
-  CHECK_MSG(keys.size() == 1, "ZigZagJoinPlan requires one key per input");
-  return std::move(keys.front());
-}
-
 size_t DefaultEstimatedRows(const Plan& left, const Plan& right,
                             BinaryOperation operation) {
   if (operation == BinaryOperation::kEquals) {
@@ -75,14 +70,6 @@ ZigZagJoinPlan::ZigZagJoinPlan(Plan left, ColumnName left_key, Plan right,
   CHECK_MSG(predicate_ != nullptr, "ZigZagJoinPlan requires a predicate");
   stats_.Concat(right_->GetStats().ScaleCardinality(stats_.Rows()));
 }
-
-ZigZagJoinPlan::ZigZagJoinPlan(Plan left, std::vector<ColumnName> left_keys,
-                               Plan right, std::vector<ColumnName> right_keys,
-                               BinaryOperation operation, Expression predicate,
-                               std::optional<size_t> estimated_rows)
-    : ZigZagJoinPlan(std::move(left), SingleKey(std::move(left_keys)),
-                     std::move(right), SingleKey(std::move(right_keys)),
-                     operation, std::move(predicate), estimated_rows) {}
 
 size_t ZigZagJoinPlan::AccessRowCount() const {
   return left_->AccessRowCount() + right_->AccessRowCount();

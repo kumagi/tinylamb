@@ -126,7 +126,7 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
 ```
 
 - **主要区分:**
-  - `relational->executor=45`, `relational->sql=29`, `executor->sql=6` (V3': statement IR / relational helper 境界)
+  - `relational->executor=45`, `relational->sql=27`, `executor->sql=6` (V3': statement IR / relational helper 境界)
   - `plan->sql=14`, `plan->executor=2` (`plan/product_plan.cpp`, `plan/implementation_rules.cpp` → `executor/hash_join_mode.hpp`, V4)
   - `common->type=6`, `type->storage=1`, `index->table=4`, `table->expression=7`, `expression->executor=2`
 - **不変条件 lint:** out-of-core 契約（強制予約・全行一括回収・一括読込の許可リスト監視）は `python3 scripts/check_ooc_invariants.py` で併せて検査する（詳細は `scripts/check_layering.py` / `scripts/check_ooc_invariants.py` 参照）。

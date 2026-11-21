@@ -39,15 +39,21 @@ inline constexpr uint32_t kSerdesVersion = 1U;
 // Row decode runs these per column of every scanned row, so they live inline
 // here: one bswapped load beats a cross-TU call into a byte-at-a-time loop.
 #if defined(__GNUC__) || defined(__clang__)
-#define TINYLAMB_BSWAP16 __builtin_bswap16
-#define TINYLAMB_BSWAP32 __builtin_bswap32
-#define TINYLAMB_BSWAP64 __builtin_bswap64
+inline constexpr uint16_t TINYLAMB_BSWAP16(uint16_t v) {
+  return __builtin_bswap16(v);
+}
+inline constexpr uint32_t TINYLAMB_BSWAP32(uint32_t v) {
+  return __builtin_bswap32(v);
+}
+inline constexpr uint64_t TINYLAMB_BSWAP64(uint64_t v) {
+  return __builtin_bswap64(v);
+}
 #else
-inline uint16_t TINYLAMB_BSWAP16(uint16_t v) { return v << 8U | v >> 8U; }
-inline uint32_t TINYLAMB_BSWAP32(uint32_t v) {
+inline constexpr uint16_t TINYLAMB_BSWAP16(uint16_t v) { return v << 8U | v >> 8U; }
+inline constexpr uint32_t TINYLAMB_BSWAP32(uint32_t v) {
   return (v << 24U) | (v << 8U & 0xFF0000U) | (v >> 8U & 0xFF00U) | v >> 24U;
 }
-inline uint64_t TINYLAMB_BSWAP64(uint64_t v) {
+inline constexpr uint64_t TINYLAMB_BSWAP64(uint64_t v) {
   return (static_cast<uint64_t>(TINYLAMB_BSWAP32(static_cast<uint32_t>(v)))
           << 32U) |
          TINYLAMB_BSWAP32(static_cast<uint32_t>(v >> 32U));

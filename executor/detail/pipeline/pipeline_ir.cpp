@@ -574,6 +574,9 @@ void PipelineExecutor::RenderStageTree(size_t stage_idx, std::ostream& out,
 void PipelineExecutor::Dump(std::ostream& output, int indent) const {
   ScopedRenderExecutor render_guard(this);
   const std::string pad(static_cast<size_t>(std::max(0, indent)), ' ');
+  if (graph_.plan_explain_text.empty() && graph_.plan_explain_producer) {
+    graph_.plan_explain_text = graph_.plan_explain_producer();
+  }
   if (!graph_.plan_explain_text.empty()) {
     output << graph_.plan_explain_text;
     if (graph_.plan_explain_text.back() != '\n') {
@@ -598,6 +601,9 @@ void PipelineExecutor::Dump(std::ostream& output, int indent) const {
 
 void PipelineExecutor::Explain(std::ostream& output, int indent) const {
   ScopedRenderExecutor render_guard(this);
+  if (graph_.plan_explain_text.empty() && graph_.plan_explain_producer) {
+    graph_.plan_explain_text = graph_.plan_explain_producer();
+  }
   if (!graph_.plan_explain_text.empty()) {
     output << graph_.plan_explain_text;
     return;

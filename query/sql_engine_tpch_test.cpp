@@ -34,7 +34,8 @@ std::vector<Row> DrainForStats(const Executor& executor) {
   std::vector<Row> drained;
   Row row;
   while (executor->Next(&row, nullptr)) {
-    drained.push_back(row);
+    drained.push_back(std::move(row));
+    row = Row();
   }
   return drained;
 }
@@ -283,6 +284,7 @@ class SqlEngineTpchTest : public ::testing::Test {
     while (prepared.Value()->Next(&row, nullptr)) {
       rows.push_back(row);
     }
+    EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
     return rows;
   }
 
@@ -765,6 +767,9 @@ TEST_F(SqlEngineTpchTest, TpchQ8Q9HeuristicPlanGolden) {
 
   auto count_occurrences = [](std::string_view text,
                               std::string_view pattern) -> size_t {
+    if (pattern.empty()) {
+      return 0;
+    }
     size_t count = 0;
     size_t pos = 0;
     while ((pos = text.find(pattern, pos)) != std::string::npos) {

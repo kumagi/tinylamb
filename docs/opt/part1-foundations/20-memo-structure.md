@@ -206,6 +206,7 @@ struct Group {
   std::unordered_map<std::string, size_t> relation_index_;
   std::vector<Expression> conjuncts_;
   std::vector<uint64_t> conjunct_masks_;
+  std::vector<uint8_t> conjunct_root_only_;
   std::vector<GroupId> touched_groups_;
   std::unordered_map<std::string, Schema> table_schemas_;
   const size_t expression_cap_;
@@ -245,6 +246,7 @@ StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
   }
   conjuncts_.clear();
   conjunct_masks_.clear();
+  conjunct_root_only_.clear();
   for (const ConjunctInfo& info : conjuncts) {
     uint64_t mask = 0;
     bool outside = false;
@@ -258,7 +260,8 @@ StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
     }
     // A conjunct that references something outside the join graph stays at
     // the root join (it can never be pushed below).
-    conjunct_masks_.push_back(outside ? ~uint64_t{0} : mask);
+    conjunct_masks_.push_back(mask);
+    conjunct_root_only_.push_back(outside ? 1 : 0);
     conjuncts_.push_back(info.conjunct);
   }
   return EnsureGroup(relations);
@@ -269,7 +272,7 @@ StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
 
 1. **制約の検証**: テーブルリストが空でないこと、重複テーブル名（同名エイリアス）が存在しないこと、テーブル数が 63 以下であることを検証します。テーブル数が 64（`uint64_t` のビット幅）以上の場合は、ビットマスクによる探索管理が行えないためエラーを返し、フォールバック経路へ誘導します。
 2. **関係インデックスの構築**: 正規化されたテーブル名列に対して 0 からの連続整数をビット位置として割り当てる。
-3. **述語ビットマスクの算出**: 各連言述語が参照するテーブルのビットを立てて `conjunct_masks_` に記録します。サブクエリ由来などで FROM 句の外側を参照する述語は、下位結合へ押し下げられないため全ビットを立てたマスク（`~uint64_t{0}`）を割り当て、常に根の結合グループで保持させる。
+3. **述語ビットマスクの算出**: 各連言述語が参照するテーブルのビットを立てて `conjunct_masks_` に記録します。サブクエリ由来などで FROM 句の外側を参照する述語は、`conjunct_root_only_` に印を付け、根の結合グループで保持します。
 4. **グループの再帰生成**: `EnsureGroup(relations)` を呼び出し、初期の結合木に対応する Group 群を生成します。
 
 ### 20-5.2 グループの検索と生成 — `EnsureGroup` と `EnsureDerivedGroup`
@@ -359,6 +362,7 @@ GroupId Memo::EnsureDerivedGroup(const std::vector<std::string>& relations,
 Expression Memo::ScanFilterFor(const Group& group) const {
   std::vector<Expression> matching;
   for (size_t i = 0; i < conjuncts_.size(); ++i) {
+    if (conjunct_root_only_[i] != 0U) continue;
     if (conjunct_masks_[i] == group.relation_mask) {
       matching.push_back(conjuncts_[i]);
     }
@@ -377,6 +381,7 @@ Expression Memo::JoinConditionFor(const Group& left, const Group& right) const {
   const uint64_t union_mask = left.relation_mask | right.relation_mask;
   std::vector<Expression> spanning;
   for (size_t i = 0; i < conjuncts_.size(); ++i) {
+    if (conjunct_root_only_[i] != 0U) continue;
     const uint64_t mask = conjunct_masks_[i];
     if ((mask & ~union_mask) != 0) {
       continue;  // 結合外部のテーブルを参照しているため除外

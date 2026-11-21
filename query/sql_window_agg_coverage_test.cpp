@@ -3,12 +3,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -80,6 +82,55 @@ StatusOr<std::vector<Row>> TryRunSql(SqlEngine* engine, TransactionContext* ctx,
     return StatusError(StatusCode::kRuntimeError, error.what());
   }
 }
+
+// Prepares and drains `sql`, returning the executor's Dump() text so tests can
+// assert route/counter evidence (ParallelScan, HashAggregate, fused typed
+// folds, runtime filters, ...).  Returns nullopt on prepare or run failure.
+std::optional<std::string> DumpSql(SqlEngine* engine, TransactionContext* ctx,
+                                   const std::string& sql) {
+  StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
+  if (!prepared.HasValue()) {
+    return std::nullopt;
+  }
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    row = Row();
+  }
+  if (prepared.Value()->GetStatus() != Status::kSuccess) {
+    return std::nullopt;
+  }
+  std::ostringstream dump;
+  prepared.Value()->Dump(dump, 0);
+  return dump.str();
+}
+
+// Restores an environment variable to the value it held on construction (or
+// unsets it when it was absent) on destruction, so tests that toggle
+// TINYLAMB_EXEC_ENGINE do not leak state into later tests.
+class EnvGuard {
+ public:
+  explicit EnvGuard(const char* name) : name_(name) {
+    if (const char* value = std::getenv(name)) {
+      had_value_ = true;
+      value_ = value;
+    }
+  }
+  EnvGuard(const EnvGuard&) = delete;
+  EnvGuard& operator=(const EnvGuard&) = delete;
+  ~EnvGuard() { Restore(); }
+  void Restore() {
+    if (had_value_) {
+      setenv(name_.c_str(), value_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::string value_;
+  bool had_value_{false};
+};
 
 // First row whose column `col` equals `key`, or nullptr.
 const Row* FindRow(const std::vector<Row>& rows, size_t col, const Value& key) {
@@ -286,38 +337,55 @@ TEST_F(WindowSqlCov, NullsFirstLastExplicitInWindowOrder) {
 }
 
 TEST_F(WindowSqlCov, NanOrderKeysAreOnePeerGroupBeforeFiniteValues) {
+  // A second NaN row makes the peer-group fold observable: if NaN keys ever
+  // split into separate peer groups the two NaN rows would get different
+  // ranks and frame sums instead of sharing one group.
+  ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(),
+                        "INSERT INTO wx VALUES "
+                        "(1, 3, 45, CAST('NaN' AS FLOAT64), "
+                        "DATE '2020-01-05', 'date2');")
+                  .HasValue());
   const auto rows =
       TryRunSql(engine_.get(), context_.get(),
                 "SELECT RANK() OVER (ORDER BY f), SUM(v) OVER (ORDER BY f), "
                 "CUME_DIST() OVER (ORDER BY f DESC) "
                 "FROM wx WHERE g = 1 ORDER BY v");
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
-  ASSERT_EQ(rows.Value().size(), 5U);
+  ASSERT_EQ(rows.Value().size(), 6U);
   const std::vector<Row>& out = rows.Value();
-  EXPECT_EQ(out[0][0], Value(3));
-  EXPECT_EQ(out[1][0], Value(3));
-  EXPECT_EQ(out[2][0], Value(5));
+  // f order: NULL(50) < NaN(40,45) < 1.5(10,20) < 2.5(30).  Peer groups:
+  // {NULL}:rank 1, {NaN,NaN}:rank 2, {1.5,1.5}:rank 4, {2.5}:rank 6.
+  EXPECT_EQ(out[0][0], Value(4));
+  EXPECT_EQ(out[1][0], Value(4));
+  EXPECT_EQ(out[2][0], Value(6));
   EXPECT_EQ(out[3][0], Value(2));
-  EXPECT_EQ(out[4][0], Value(1));
-  EXPECT_EQ(out[0][1], Value(120));
-  EXPECT_EQ(out[1][1], Value(120));
-  EXPECT_EQ(out[2][1], Value(150));
-  EXPECT_EQ(out[3][1], Value(90));
-  EXPECT_EQ(out[4][1], Value(50));
-  EXPECT_DOUBLE_EQ(out[0][2].value.double_value, 0.6);
-  EXPECT_DOUBLE_EQ(out[1][2].value.double_value, 0.6);
-  EXPECT_DOUBLE_EQ(out[2][2].value.double_value, 0.2);
-  EXPECT_DOUBLE_EQ(out[3][2].value.double_value, 0.8);
-  EXPECT_DOUBLE_EQ(out[4][2].value.double_value, 1.0);
+  EXPECT_EQ(out[4][0], Value(2));
+  EXPECT_EQ(out[5][0], Value(1));
+  // RANGE .. CURRENT ROW frames: NaN peers share {NULL,NaN,NaN}=135; the two
+  // 1.5 rows share {NULL,NaN,NaN,1.5,1.5}=165; 2.5 sees all six = 195.
+  EXPECT_EQ(out[0][1], Value(165));
+  EXPECT_EQ(out[1][1], Value(165));
+  EXPECT_EQ(out[2][1], Value(195));
+  EXPECT_EQ(out[3][1], Value(135));
+  EXPECT_EQ(out[4][1], Value(135));
+  EXPECT_EQ(out[5][1], Value(50));
+  // CUME_DIST over f DESC (2.5, 1.5, NaN, NULL): 1/6, 3/6, 5/6, 6/6.
+  EXPECT_DOUBLE_EQ(out[0][2].value.double_value, 0.5);
+  EXPECT_DOUBLE_EQ(out[1][2].value.double_value, 0.5);
+  EXPECT_DOUBLE_EQ(out[2][2].value.double_value, 1.0 / 6.0);
+  EXPECT_DOUBLE_EQ(out[3][2].value.double_value, 5.0 / 6.0);
+  EXPECT_DOUBLE_EQ(out[4][2].value.double_value, 5.0 / 6.0);
+  EXPECT_DOUBLE_EQ(out[5][2].value.double_value, 1.0);
 }
 
 // P349: PERCENTILE_CONT/DISC ignore the frame, and frame-less MODE over an
 // unordered partition sees the whole partition from every row; such
-// whole-partition frames are now evaluated once per partition and
-// broadcast.  The pin locks the broadcast values to the per-row values the
-// old m-times loop produced, covering a multi-row partition, a single-row
-// partition (m=1), a unique-mode partition, and a no-unique-mode partition.
-TEST_F(WindowSqlCov, WholePartitionFrameBroadcastsPerPartitionValue) {
+// whole-partition frames are evaluated once per partition and broadcast.
+// No counter exposes the broadcast itself, so this pin locks the broadcast
+// values to the per-row values the old m-times loop produced, covering a
+// multi-row partition, a single-row partition (m=1), a unique-mode
+// partition, and a no-unique-mode partition.
+TEST_F(WindowSqlCov, WholePartitionFrameValuesArePartitionConstant) {
   ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(),
                         "INSERT INTO wx VALUES "
                         "(3, 7, 70, 9.5, DATE '2020-02-01', 'plum'), "
@@ -418,6 +486,7 @@ TEST_F(WindowSqlCov, RangeOffsetFramesAroundInt64Keys) {
       "SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN 2 FOLLOWING AND 1 "
       "FOLLOWING) FROM wx WHERE g = 1 ORDER BY k NULLS FIRST, v");
   ASSERT_TRUE(past_end.HasValue()) << past_end.GetStatus().GetMessage();
+  ASSERT_EQ(past_end.Value().size(), 5U);
   EXPECT_EQ(past_end.Value()[0], Row({Value(40)}));
   for (size_t i = 1; i < past_end.Value().size(); ++i) {
     EXPECT_TRUE(past_end.Value()[i][0].IsNull());
@@ -441,6 +510,7 @@ TEST_F(WindowSqlCov, RangeOffsetFramesAroundInt64Keys) {
       "UNBOUNDED PRECEDING) FROM wx WHERE g = 1 ORDER BY k NULLS FIRST, v");
   ASSERT_TRUE(unbounded_preceding.HasValue())
       << unbounded_preceding.GetStatus().GetMessage();
+  ASSERT_EQ(unbounded_preceding.Value().size(), 5U);
   EXPECT_EQ(unbounded_preceding.Value()[0], Row({Value(40)}));
   for (size_t i = 1; i < unbounded_preceding.Value().size(); ++i) {
     EXPECT_TRUE(unbounded_preceding.Value()[i][0].IsNull());
@@ -890,6 +960,9 @@ TEST_F(WindowSqlCov, GroupByWindowLimitOffsetAppliesExactlyOnce) {
   }
   ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(), insert).HasValue());
 
+  // Restore the caller's TINYLAMB_EXEC_ENGINE on scope exit instead of
+  // unconditionally unsetting it.
+  EnvGuard engine_env("TINYLAMB_EXEC_ENGINE");
   for (const char* mode : {static_cast<const char*>("legacy"), "pipeline"}) {
     ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", mode, 1), 0);
     const auto rows = TryRunSql(
@@ -897,7 +970,7 @@ TEST_F(WindowSqlCov, GroupByWindowLimitOffsetAppliesExactlyOnce) {
         "SELECT g, COUNT(*) AS c, ROW_NUMBER() OVER (ORDER BY g) AS rn, "
         "SUM(COUNT(*)) OVER () AS total "
         "FROM wg GROUP BY g ORDER BY g LIMIT 10 OFFSET 5;");
-    unsetenv("TINYLAMB_EXEC_ENGINE");
+    engine_env.Restore();
     ASSERT_TRUE(rows.HasValue())
         << mode << ": " << rows.GetStatus().GetMessage();
     ASSERT_EQ(rows.Value().size(), 10U) << "engine " << mode;
@@ -933,81 +1006,112 @@ TEST_F(WindowSqlCov, SpilledOocRangeFramesWithNullAndNaNKeysFollowAst) {
           "(2, 30.0, 30);")
           .HasValue());
 
-  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
-  struct {
+  struct Case {
     const char* sql;
     std::vector<Row> expected;
-  } cases[] = {
-      {.sql="SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 15 FOLLOWING "
-       "AND 25 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k DESC;",
-       .expected={{Value(30), Value(10)},
-        {Value(20), Value()},
-        {Value(10), Value()},
-        {Value(1), Value(3)},
-        {Value(2), Value(3)}}},
-      {.sql="SELECT v, SUM(v) OVER (ORDER BY k RANGE BETWEEN 15 FOLLOWING "
-       "AND 25 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k;",
-       .expected={{Value(1), Value(3)},
-        {Value(2), Value(3)},
-        {Value(10), Value(30)},
-        {Value(20), Value()},
-        {Value(30), Value()}}},
-      {.sql="SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
-       "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
-       .expected={{Value(30), Value()},
-        {Value(20), Value()},
-        {Value(10), Value()},
-        {Value(1), Value(3)},
-        {Value(2), Value(3)}}},
-      {.sql="SELECT v, MIN(v) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
-       "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
-       .expected={{Value(30), Value()},
-        {Value(20), Value()},
-        {Value(10), Value()},
-        {Value(1), Value(1)},
-        {Value(2), Value(1)}}},
-      {.sql="SELECT v, COUNT(*) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
-       "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
-       .expected={{Value(30), Value(0)},
-        {Value(20), Value(0)},
-        {Value(10), Value(0)},
-        {Value(1), Value(2)},
-        {Value(2), Value(2)}}},
-      {.sql="SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 15 PRECEDING "
-       "AND 15 PRECEDING) FROM wn WHERE g = 1 ORDER BY k DESC;",
-       .expected={{Value(30), Value()},
-        {Value(20), Value()},
-        {Value(10), Value()},
-        {Value(1), Value()},
-        {Value(2), Value()}}},
-      {.sql="SELECT v, SUM(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING "
-       "AND 15 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k;",
-       .expected={{Value(1), Value(3)},
-        {Value(2), Value(3)},
-        {Value(10), Value(33)},
-        {Value(20), Value(63)},
-        {Value(30), Value(63)}}},
   };
+  const std::array<Case, 7> cases = {{
+      {.sql =
+           "SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 15 FOLLOWING "
+           "AND 25 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k DESC;",
+       .expected = {{Value(30), Value(10)},
+                    {Value(20), Value()},
+                    {Value(10), Value()},
+                    {Value(1), Value(3)},
+                    {Value(2), Value(3)}}},
+      {.sql = "SELECT v, SUM(v) OVER (ORDER BY k RANGE BETWEEN 15 FOLLOWING "
+              "AND 25 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k;",
+       .expected = {{Value(1), Value(3)},
+                    {Value(2), Value(3)},
+                    {Value(10), Value(30)},
+                    {Value(20), Value()},
+                    {Value(30), Value()}}},
+      {.sql =
+           "SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
+           "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
+       .expected = {{Value(30), Value()},
+                    {Value(20), Value()},
+                    {Value(10), Value()},
+                    {Value(1), Value(3)},
+                    {Value(2), Value(3)}}},
+      {.sql =
+           "SELECT v, MIN(v) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
+           "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
+       .expected = {{Value(30), Value()},
+                    {Value(20), Value()},
+                    {Value(10), Value()},
+                    {Value(1), Value(1)},
+                    {Value(2), Value(1)}}},
+      {.sql = "SELECT v, COUNT(*) OVER (ORDER BY k DESC RANGE BETWEEN 100 "
+              "FOLLOWING "
+              "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
+       .expected = {{Value(30), Value(0)},
+                    {Value(20), Value(0)},
+                    {Value(10), Value(0)},
+                    {Value(1), Value(2)},
+                    {Value(2), Value(2)}}},
+      {.sql =
+           "SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 15 PRECEDING "
+           "AND 15 PRECEDING) FROM wn WHERE g = 1 ORDER BY k DESC;",
+       .expected = {{Value(30), Value()},
+                    {Value(20), Value()},
+                    {Value(10), Value()},
+                    {Value(1), Value()},
+                    {Value(2), Value()}}},
+      {.sql = "SELECT v, SUM(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED "
+              "PRECEDING "
+              "AND 15 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k;",
+       .expected = {{Value(1), Value(3)},
+                    {Value(2), Value(3)},
+                    {Value(10), Value(33)},
+                    {Value(20), Value(63)},
+                    {Value(30), Value(63)}}},
+  }};
+
+  // Restore the caller's TINYLAMB_EXEC_ENGINE and memory-budget knobs on
+  // scope exit instead of unconditionally resetting them.  The knob guard
+  // captures the pre-test values (not ResetTestKnobs defaults) and restores
+  // them both per spill lane and on early ASSERT return.
+  EnvGuard engine_env("TINYLAMB_EXEC_ENGINE");
+  auto& budget = ProcessMemoryBudget::Global();
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) RAII knob guard
+  struct SpillKnobGuard {
+    SpillKnobGuard()
+        : always_spill(ProcessMemoryBudget::Global().AlwaysSpillEnabled()),
+          op_bytes(ProcessMemoryBudget::Global().OpMemoryOverrideBytes()) {}
+    SpillKnobGuard(const SpillKnobGuard&) = delete;
+    SpillKnobGuard& operator=(const SpillKnobGuard&) = delete;
+    ~SpillKnobGuard() { Restore(); }
+    void Restore() {
+      auto& b = ProcessMemoryBudget::Global();
+      b.SetTestAlwaysSpill(always_spill);
+      b.SetTestOpMemoryBytes(op_bytes);
+    }
+    bool always_spill;
+    size_t op_bytes;
+  } spill_knobs;
 
   for (const auto& c : cases) {
     // The AST ground truth itself.
     ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "legacy", 1), 0);
     const auto legacy = TryRunSql(engine_.get(), context_.get(), c.sql);
-    unsetenv("TINYLAMB_EXEC_ENGINE");
+    engine_env.Restore();
     ASSERT_TRUE(legacy.HasValue()) << legacy.GetStatus().GetMessage();
     EXPECT_EQ(legacy.Value(), c.expected) << c.sql;
 
-    // In-memory pipeline lane.
+    // In-memory pipeline lane and the forced-spill (OOC RangeFrameScanner)
+    // lane, both pinned to the pipeline engine regardless of the caller's
+    // TINYLAMB_EXEC_ENGINE.
+    ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "pipeline", 1), 0);
     const auto normal = TryRunSql(engine_.get(), context_.get(), c.sql);
     ASSERT_TRUE(normal.HasValue()) << normal.GetStatus().GetMessage();
     EXPECT_EQ(normal.Value(), c.expected) << c.sql;
 
-    // Forced-spill (OOC RangeFrameScanner) lane.
-    ProcessMemoryBudget::Global().SetTestAlwaysSpill(true);
-    ProcessMemoryBudget::Global().SetTestOpMemoryBytes(4096);
+    budget.SetTestAlwaysSpill(true);
+    budget.SetTestOpMemoryBytes(4096);
     const auto spilled = TryRunSql(engine_.get(), context_.get(), c.sql);
-    ProcessMemoryBudget::Global().SetTestAlwaysSpill(false);
-    ProcessMemoryBudget::Global().SetTestOpMemoryBytes(0);
+    spill_knobs.Restore();
+    engine_env.Restore();
     ASSERT_TRUE(spilled.HasValue()) << spilled.GetStatus().GetMessage();
     EXPECT_EQ(spilled.Value(), c.expected) << "spill lane: " << c.sql;
   }
@@ -1076,7 +1180,10 @@ TEST_F(WindowSqlCov, WindowAggregateDegenerateInputs) {
   const auto overflow = TryRunSql(
       engine_.get(), context_.get(),
       "SELECT SUM(v) OVER () FROM UNNEST([9223372036854775807, 1]) AS v");
-  EXPECT_FALSE(overflow.HasValue());
+  ASSERT_FALSE(overflow.HasValue());
+  EXPECT_NE(overflow.GetStatus().GetMessage().find("integer overflow in SUM"),
+            std::string::npos)
+      << overflow.GetStatus().GetMessage();
 }
 
 TEST_F(WindowSqlCov, PercentileWindowVariants) {
@@ -1107,37 +1214,59 @@ TEST_F(WindowSqlCov, PercentileWindowVariants) {
 
 TEST_F(WindowSqlCov, WindowErrorDiagnostics) {
   const std::string from = " FROM UNNEST([1, 2, 3]) AS v";
-  const std::vector<std::string> bad = {
-      "SELECT NTILE(NULL) OVER (ORDER BY v)" + from,
-      "SELECT NTILE(0) OVER (ORDER BY v)" + from,
-      "SELECT NTILE(1.5) OVER (ORDER BY v)" + from,
-      "SELECT LAG(v, NULL) OVER (ORDER BY v)" + from,
-      "SELECT LAG(v, 1.5) OVER (ORDER BY v)" + from,
-      "SELECT LAG(v, -1) OVER (ORDER BY v)" + from,
-      "SELECT LEAD(v, NULL) OVER (ORDER BY v)" + from,
-      "SELECT NTH_VALUE(v, NULL) OVER (ORDER BY v)" + from,
-      "SELECT NTH_VALUE(v, 1.5) OVER (ORDER BY v)" + from,
-      "SELECT NTH_VALUE(v, 0) OVER (ORDER BY v)" + from,
-      // RANGE offsets need exactly one ORDER BY key.
-      "SELECT SUM(v) OVER (ORDER BY g, v RANGE BETWEEN 1 PRECEDING AND "
-      "CURRENT ROW)" +
-          from,
-      "SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN NULL PRECEDING AND "
-      "CURRENT ROW)" +
-          from,
-      "SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN 'x' PRECEDING AND "
-      "CURRENT ROW)" +
-          from,
-      "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN NULL PRECEDING AND "
-      "CURRENT ROW)" +
-          from,
-      "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1.5 PRECEDING AND "
-      "CURRENT ROW)" +
-          from,
+  // Each case pairs the bad SQL with the diagnostic category fragment its
+  // error must carry, so a silently-wrong error path cannot pass.
+  struct Case {
+    std::string sql;
+    std::string fragment;
   };
-  for (const std::string& sql : bad) {
-    EXPECT_FALSE(TryRunSql(engine_.get(), context_.get(), sql).HasValue())
-        << sql;
+  const std::vector<Case> bad = {
+      {"SELECT NTILE(NULL) OVER (ORDER BY v)" + from,
+       "NTILE function must not be NULL"},
+      {"SELECT NTILE(0) OVER (ORDER BY v)" + from,
+       "NTILE function must be positive"},
+      {"SELECT NTILE(1.5) OVER (ORDER BY v)" + from,
+       "NTILE requires an integer bucket count"},
+      {"SELECT LAG(v, NULL) OVER (ORDER BY v)" + from, "LAG must not be NULL"},
+      {"SELECT LAG(v, 1.5) OVER (ORDER BY v)" + from, "LAG must be an integer"},
+      {"SELECT LAG(v, -1) OVER (ORDER BY v)" + from,
+       "LAG must not be negative"},
+      {"SELECT LEAD(v, NULL) OVER (ORDER BY v)" + from,
+       "LEAD must not be NULL"},
+      {"SELECT NTH_VALUE(v, NULL) OVER (ORDER BY v)" + from,
+       "NthValue function must not be NULL"},
+      {"SELECT NTH_VALUE(v, 1.5) OVER (ORDER BY v)" + from,
+       "NthValue function must be an integer"},
+      {"SELECT NTH_VALUE(v, 0) OVER (ORDER BY v)" + from,
+       "NthValue function must be positive"},
+      // RANGE offsets need exactly one ORDER BY key.
+      {"SELECT SUM(v) OVER (ORDER BY g, v RANGE BETWEEN 1 PRECEDING AND "
+       "CURRENT ROW)" +
+           from,
+       "RANGE offset requires one constant key"},
+      {"SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN NULL PRECEDING AND "
+       "CURRENT ROW)" +
+           from,
+       "cannot be NULL"},
+      {"SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN 'x' PRECEDING AND "
+       "CURRENT ROW)" +
+           from,
+       "RANGE offset must be numeric"},
+      {"SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN NULL PRECEDING AND "
+       "CURRENT ROW)" +
+           from,
+       "cannot be NULL"},
+      {"SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1.5 PRECEDING AND "
+       "CURRENT ROW)" +
+           from,
+       "ROWS offset must be a constant integer"},
+  };
+  for (const Case& c : bad) {
+    const auto result = TryRunSql(engine_.get(), context_.get(), c.sql);
+    ASSERT_FALSE(result.HasValue()) << c.sql;
+    EXPECT_NE(result.GetStatus().GetMessage().find(c.fragment),
+              std::string::npos)
+        << c.sql << " -> " << result.GetStatus().GetMessage();
   }
 }
 
@@ -1674,13 +1803,13 @@ class AggSmallCov : public ::testing::Test {
   std::unique_ptr<SqlEngine> engine_;
 };
 
-TEST_F(AggSmallCov, TypedBatchSweepOverColumns) {
-  const auto rows = TryRunSql(
-      engine_.get(), context_.get(),
+TEST_F(AggSmallCov, TypedColumnAggregateSweep) {
+  const std::string sql =
       "SELECT COUNT(*), COUNT(a), COUNT(nul), SUM(a), AVG(a), MIN(a), "
       "MAX(a), SUM(f), AVG(f), MIN(f), MAX(f), SUM(cnt_uint64), "
       "BIT_AND(a), BIT_OR(a), BIT_XOR(a), LOGICAL_AND(a), LOGICAL_OR(a) "
-      "FROM med");
+      "FROM med";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   ASSERT_EQ(rows.Value().size(), 1U);
   const Row& r = rows.Value()[0];
@@ -1702,14 +1831,20 @@ TEST_F(AggSmallCov, TypedBatchSweepOverColumns) {
   EXPECT_EQ(r[14], Value(int64_t{64}));
   EXPECT_FALSE(r[15].Truthy());
   EXPECT_TRUE(r[16].Truthy());
+  // 66 rows fed all 17 typed column aggregates (66 * 17 = 1122 updates), so
+  // the sweep touched every row/aggregate pair rather than short-circuiting.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("aggregate_input_rows=66"), std::string::npos) << *dump;
+  EXPECT_NE(dump->find("aggregate_updates=1122"), std::string::npos) << *dump;
 }
 
-TEST_F(AggSmallCov, ConstantAggregatesUseTypedShortcuts) {
-  const auto rows =
-      TryRunSql(engine_.get(), context_.get(),
-                "SELECT SUM(5), SUM(2.5), AVG(4), MIN(3), MAX(7), COUNT(2), "
-                "BIT_AND(9), BIT_OR(8), BIT_XOR(7), LOGICAL_AND(TRUE), "
-                "LOGICAL_OR(FALSE) FROM med");
+TEST_F(AggSmallCov, ConstantAggregatesSkipColumnDecoding) {
+  const std::string sql =
+      "SELECT SUM(5), SUM(2.5), AVG(4), MIN(3), MAX(7), COUNT(2), "
+      "BIT_AND(9), BIT_OR(8), BIT_XOR(7), LOGICAL_AND(TRUE), "
+      "LOGICAL_OR(FALSE) FROM med";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row& r = rows.Value()[0];
   EXPECT_EQ(r[0], Value(int64_t{330}));
@@ -1724,14 +1859,19 @@ TEST_F(AggSmallCov, ConstantAggregatesUseTypedShortcuts) {
   EXPECT_EQ(r[8], Value(int64_t{0}));
   EXPECT_TRUE(r[9].Truthy());
   EXPECT_FALSE(r[10].Truthy());
+  // Every aggregate argument is a literal, so the scan decodes no column
+  // values (scan_values_decoded=0) even though it still counts 66 rows.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("scan_values_decoded=0"), std::string::npos) << *dump;
 }
 
-TEST_F(AggSmallCov, AllNullColumnBatchShortCircuits) {
-  const auto rows =
-      TryRunSql(engine_.get(), context_.get(),
-                "SELECT SUM(nul), AVG(nul), MIN(nul), MAX(nul), COUNT(nul), "
-                "BIT_AND(nul), BIT_OR(nul), BIT_XOR(nul), LOGICAL_AND(nul), "
-                "LOGICAL_OR(nul) FROM med");
+TEST_F(AggSmallCov, AllNullColumnAggregatesEvaluateToNull) {
+  const std::string sql =
+      "SELECT SUM(nul), AVG(nul), MIN(nul), MAX(nul), COUNT(nul), "
+      "BIT_AND(nul), BIT_OR(nul), BIT_XOR(nul), LOGICAL_AND(nul), "
+      "LOGICAL_OR(nul) FROM med";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row& r = rows.Value()[0];
   EXPECT_TRUE(r[0].IsNull());
@@ -1744,6 +1884,13 @@ TEST_F(AggSmallCov, AllNullColumnBatchShortCircuits) {
   EXPECT_TRUE(r[7].IsNull());
   EXPECT_TRUE(r[8].IsNull());
   EXPECT_TRUE(r[9].IsNull());
+  // There is no all-NULL short circuit: all 66 rows still feed all 10
+  // aggregates (66 * 10 = 660 updates), each folding NULLs to the shown
+  // NULL/0 results.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("aggregate_input_rows=66"), std::string::npos) << *dump;
+  EXPECT_NE(dump->find("aggregate_updates=660"), std::string::npos) << *dump;
 }
 
 TEST_F(AggSmallCov, GenericMixedListKeepsTypedAggregatesCorrect) {
@@ -1760,16 +1907,25 @@ TEST_F(AggSmallCov, GenericMixedListKeepsTypedAggregatesCorrect) {
   EXPECT_FALSE(r[4].Truthy());
   EXPECT_TRUE(r[5].Truthy());
   EXPECT_FALSE(r[6].IsNull());
-  // All 66 rows are joined: 65 separators.
-  const std::string joined = r[6].AsString();
-  EXPECT_EQ(std::count(joined.begin(), joined.end(), ','), 65);
+  // med.s is CAST(MOD(n,7) AS STRING) for n = 1..64 followed by 'x','y', so
+  // the join is nine "1,2,3,4,5,6,0" cycles, a trailing '1' (n = 64), then
+  // 'x','y' — 66 elements in insertion order.
+  std::string expected_join;
+  for (int i = 0; i < 9; ++i) {
+    if (i > 0) {
+      expected_join += ',';
+    }
+    expected_join += "1,2,3,4,5,6,0";
+  }
+  expected_join += ",1,x,y";
+  EXPECT_EQ(std::string(r[6].AsStringView()), expected_join);
 }
 
 TEST_F(AggSmallCov, DistinctAggregatesRouteThroughAccumulators) {
-  const auto rows =
-      TryRunSql(engine_.get(), context_.get(),
-                "SELECT COUNT(DISTINCT s), SUM(DISTINCT a), MIN(DISTINCT s), "
-                "MAX(DISTINCT s), COUNT(DISTINCT a) FROM med");
+  const std::string sql =
+      "SELECT COUNT(DISTINCT s), SUM(DISTINCT a), MIN(DISTINCT s), "
+      "MAX(DISTINCT s), COUNT(DISTINCT a) FROM med";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row& r = rows.Value()[0];
   EXPECT_EQ(r[0], Value(int64_t{9}));  // '0'..'6', 'x', 'y'.
@@ -1777,26 +1933,42 @@ TEST_F(AggSmallCov, DistinctAggregatesRouteThroughAccumulators) {
   EXPECT_EQ(r[2], Value("0"));
   EXPECT_EQ(r[3], Value("y"));
   EXPECT_EQ(r[4], Value(int64_t{65}));
+  // DISTINCT members are folded through the hash-table accumulator path, not
+  // the typed batch sweep: the plan shows a HashAggregate consuming all 66
+  // input rows into one group.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("HashAggregate"), std::string::npos) << *dump;
+  EXPECT_NE(dump->find("input_rows=66"), std::string::npos) << *dump;
 }
 
 TEST_F(AggSmallCov, FilteredAggregatesSkipNonMatchingRows) {
-  const auto rows =
-      TryRunSql(engine_.get(), context_.get(),
-                "SELECT COUNT(* WHERE a > 32), SUM(a WHERE a > 32), "
-                "MIN(a WHERE a > 32), SUM(a WHERE a > 1000) "
-                "FROM med");
+  const std::string sql =
+      "SELECT COUNT(* WHERE a > 32), SUM(a WHERE a > 32), "
+      "MIN(a WHERE a > 32), SUM(a WHERE a > 1000) "
+      "FROM med";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row& r = rows.Value()[0];
   EXPECT_EQ(r[0], Value(int64_t{32}));
   EXPECT_EQ(r[1], Value(int64_t{1552}));
   EXPECT_EQ(r[2], Value(int64_t{33}));
   EXPECT_TRUE(r[3].IsNull());
+  // The FILTER (WHERE ...) clauses survive into the aggregate plan rather
+  // than being silently dropped — each member keeps its own predicate text.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("a > 32"), std::string::npos) << *dump;
+  EXPECT_NE(dump->find("a > 1000"), std::string::npos) << *dump;
 }
 
 TEST_F(AggSmallCov, SumOverVarcharRaises) {
-  EXPECT_FALSE(
-      TryRunSql(engine_.get(), context_.get(), "SELECT SUM(s) FROM med")
-          .HasValue());
+  const auto result =
+      TryRunSql(engine_.get(), context_.get(), "SELECT SUM(s) FROM med");
+  ASSERT_FALSE(result.HasValue());
+  EXPECT_NE(result.GetStatus().GetMessage().find("numeric value required"),
+            std::string::npos)
+      << result.GetStatus().GetMessage();
 }
 
 TEST_F(AggSmallCov, IntegerAndDoubleSumOverflowRaise) {
@@ -1811,10 +1983,10 @@ TEST_F(AggSmallCov, IntegerAndDoubleSumOverflowRaise) {
 }
 
 TEST_F(AggSmallCov, EmptyInputScalarAggregates) {
-  const auto rows = TryRunSql(
-      engine_.get(), context_.get(),
+  const std::string sql =
       "SELECT SUM(a), AVG(a), COUNT(*), MIN(a), STRING_AGG(s, ',') FROM med "
-      "WHERE 1 = 0");
+      "WHERE 1 = 0";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row& r = rows.Value()[0];
   EXPECT_TRUE(r[0].IsNull());
@@ -1822,17 +1994,30 @@ TEST_F(AggSmallCov, EmptyInputScalarAggregates) {
   EXPECT_EQ(r[2], Value(int64_t{0}));
   EXPECT_TRUE(r[3].IsNull());
   EXPECT_TRUE(r[4].IsNull());
+  // The empty input is observable: the scalar aggregate consumed zero rows
+  // (input_rows=0) yet still emitted the single NULL/0 group row.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("input_rows=0"), std::string::npos) << *dump;
 }
 
-TEST_F(AggSmallCov, SingleSumUsesCheckedJitFallbackPath) {
-  const auto rows =
-      TryRunSql(engine_.get(), context_.get(), "SELECT SUM(a) FROM med");
+TEST_F(AggSmallCov, SingleSumUsesCheckedTypedFoldPath) {
+  const std::string sql = "SELECT SUM(a) FROM med";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   EXPECT_EQ(rows.Value()[0][0], Value(int64_t{2080}));
-  EXPECT_FALSE(TryRunSql(engine_.get(), context_.get(),
-                         "SELECT SUM(v) FROM "
-                         "UNNEST([9223372036854775807, 1]) AS v")
-                   .HasValue());
+  // A lone SUM over a scanned column folds through the checked typed path
+  // (fused-typed-fold), which is what makes the overflow below safe.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("fused-typed-fold"), std::string::npos) << *dump;
+  const auto overflow =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT SUM(v) FROM UNNEST([9223372036854775807, 1]) AS v");
+  ASSERT_FALSE(overflow.HasValue());
+  EXPECT_NE(overflow.GetStatus().GetMessage().find("integer overflow in SUM"),
+            std::string::npos)
+      << overflow.GetStatus().GetMessage();
 }
 
 // ---------------------------------------------------------------------------
@@ -2017,7 +2202,11 @@ TEST_F(AggBigCov, GroupedDistinctAggregatesReplayThroughMerge) {
       static_cast<double>(SumFor(1)) / static_cast<double>(CountFor(1)));
 }
 
-TEST_F(AggBigCov, GroupedDistinctStatisticsForceSingleWorker) {
+// DISTINCT statistical aggregates over a 10k-row GROUP BY must still merge
+// correctly per group.  No runtime counter exposes the worker count and the
+// table is below kParallelAggregationMinRows anyway, so this pins the merged
+// per-group values rather than claiming a single-worker route.
+TEST_F(AggBigCov, GroupedDistinctStatisticsEvaluatePerGroup) {
   const auto rows = TryRunSql(
       engine_.get(), context_.get(),
       "SELECT g, VAR_POP(DISTINCT a), CORR(DISTINCT a, f) FROM big GROUP BY "
@@ -2039,7 +2228,7 @@ TEST_F(AggBigCov, GroupedDistinctStatisticsForceSingleWorker) {
   EXPECT_NEAR((*g1)[2].value.double_value, 1.0, 1e-9);
 }
 
-TEST_F(AggBigCov, GroupedFilteredAggregatesAccumulateGenerically) {
+TEST_F(AggBigCov, GroupedFilteredAggregatesApplyRowFilters) {
   int64_t big_count = 0;
   int64_t big_sum = 0;
   for (int64_t v = 1; v <= kRows; v += 3) {
@@ -2048,11 +2237,11 @@ TEST_F(AggBigCov, GroupedFilteredAggregatesAccumulateGenerically) {
       big_sum += v;
     }
   }
-  const auto rows =
-      TryRunSql(engine_.get(), context_.get(),
-                "SELECT g, COUNT(* WHERE a > 5000), SUM(a WHERE a > "
-                "5000), AVG(a WHERE a > 0), VAR_POP(a WHERE a > 0) "
-                "FROM big GROUP BY g");
+  const std::string sql =
+      "SELECT g, COUNT(* WHERE a > 5000), SUM(a WHERE a > "
+      "5000), AVG(a WHERE a > 0), VAR_POP(a WHERE a > 0) "
+      "FROM big GROUP BY g";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row* g1 = FindRow(rows.Value(), 0, Value(int64_t{1}));
   ASSERT_NE(g1, nullptr);
@@ -2072,14 +2261,25 @@ TEST_F(AggBigCov, GroupedFilteredAggregatesAccumulateGenerically) {
   const double mean = sx / n;
   const double var_pop = (sxx / n) - (mean * mean);
   EXPECT_NEAR((*g1)[4].value.double_value, var_pop, (var_pop * 1e-9) + 1e-9);
+  // The grouped aggregation consumed all 10003 input rows into 4 groups and
+  // applied each member's row filter during accumulation: 30002 updates is
+  // exactly the per-(row,aggregate) pairs whose predicate held.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("aggregate_input_rows=10003"), std::string::npos)
+      << *dump;
+  EXPECT_NE(dump->find("aggregate_groups=4"), std::string::npos) << *dump;
+  EXPECT_NE(dump->find("aggregate_updates=30002"), std::string::npos) << *dump;
 }
 
-TEST_F(AggBigCov, GenericStatisticalAggregatesOnExpressions) {
-  // Non-column children keep the per-row generic statistical path; adding a
-  // per-group constant never changes variance or correlation.
-  const auto rows = TryRunSql(
-      engine_.get(), context_.get(),
-      "SELECT g, VAR_POP(a - g), CORR(a - g, f - g) FROM big GROUP BY g");
+// Statistical aggregates over expression children ((a - g), (f - g)) keep the
+// per-row generic accumulation path; adding a per-group constant never
+// changes variance or correlation.  The counters show every one of the 10003
+// input rows fed both aggregates (20006 updates).
+TEST_F(AggBigCov, StatisticalAggregatesOnExpressionChildren) {
+  const std::string sql =
+      "SELECT g, VAR_POP(a - g), CORR(a - g, f - g) FROM big GROUP BY g";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row* g2 = FindRow(rows.Value(), 0, Value(int64_t{2}));
   ASSERT_NE(g2, nullptr);
@@ -2094,40 +2294,68 @@ TEST_F(AggBigCov, GenericStatisticalAggregatesOnExpressions) {
   const double var_pop = (sxx / n) - (mean * mean);
   EXPECT_NEAR((*g2)[1].value.double_value, var_pop, (var_pop * 1e-9) + 1e-9);
   EXPECT_NEAR((*g2)[2].value.double_value, 1.0, 1e-9);
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("aggregate_input_rows=10003"), std::string::npos)
+      << *dump;
+  EXPECT_NE(dump->find("aggregate_updates=20006"), std::string::npos) << *dump;
 }
 
 TEST_F(AggBigCov, ParallelSumOverflowRaises) {
   // Multi-aggregate: the parallel typed int64 path must raise instead of
   // wrapping.
-  EXPECT_FALSE(TryRunSql(engine_.get(), context_.get(),
-                         "SELECT SUM(huge), COUNT(*) FROM big")
-                   .HasValue());
-  // Single SUM: the checked JIT fallback path raises too.
-  EXPECT_FALSE(
-      TryRunSql(engine_.get(), context_.get(), "SELECT SUM(huge) FROM big")
-          .HasValue());
+  const auto multi = TryRunSql(engine_.get(), context_.get(),
+                               "SELECT SUM(huge), COUNT(*) FROM big");
+  ASSERT_FALSE(multi.HasValue());
+  EXPECT_NE(multi.GetStatus().GetMessage().find("integer overflow in SUM"),
+            std::string::npos)
+      << multi.GetStatus().GetMessage();
+  // Single SUM: the checked typed fold raises too.
+  const auto single =
+      TryRunSql(engine_.get(), context_.get(), "SELECT SUM(huge) FROM big");
+  ASSERT_FALSE(single.HasValue());
+  EXPECT_NE(single.GetStatus().GetMessage().find("integer overflow in SUM"),
+            std::string::npos)
+      << single.GetStatus().GetMessage();
 }
 
 TEST_F(AggBigCov, ParallelScanAppliesSimpleAndResidualFilters) {
-  // 10002 rows have a non-NULL g (10000 generated + two g=0 extras);
-  // two of them carry s = 'zz'.
-  const auto rows = TryRunSql(
-      engine_.get(), context_.get(),
-      "SELECT COUNT(*) FROM big WHERE g >= 0 AND a / 2 >= 0 AND s != 'zz'");
+  // Statistics let the planner pick the parallel scan; the mixed predicate
+  // (g >= 0 simple, a / 2 >= 0 residual, s != 'zz' simple) must be applied by
+  // the worker-filter on the scan side.
+  ASSERT_TRUE(
+      TryRunSql(engine_.get(), context_.get(), "ANALYZE big;").HasValue());
+  const std::string sql =
+      "SELECT COUNT(*) FROM big WHERE g >= 0 AND a / 2 >= 0 AND s != 'zz'";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   EXPECT_EQ(rows.Value()[0][0], Value(int64_t{10000}));
+  // 10002 rows have a non-NULL g (10000 generated + two g=0 extras);
+  // two of them carry s = 'zz'.  The dump proves the parallel worker-filter
+  // scan ran rather than a serial full scan.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("ParallelScan: big ("), std::string::npos) << *dump;
+  EXPECT_NE(dump->find("worker-filter"), std::string::npos) << *dump;
 }
 
 TEST_F(AggBigCov, JoinInstallsIntegerKeyFilterOnProbeSide) {
-  // med.a (1..64 plus two zeros) joins big.a; the runtime key filter must not
-  // change the answer (69 matching pairs).
-  const auto rows = TryRunSql(
-      engine_.get(), context_.get(),
-      "SELECT COUNT(*) FROM med JOIN big ON med.a = big.a WHERE big.a >= 0");
-  EXPECT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
-  if (rows.HasValue()) {
-    EXPECT_EQ(rows.Value()[0][0], Value(int64_t{69}));
-  }
+  // Statistics drive the join to build a runtime exact-set filter over big.a
+  // and probe med with it; the filter must not change the answer (69
+  // matching pairs).
+  ASSERT_TRUE(
+      TryRunSql(engine_.get(), context_.get(), "ANALYZE big;").HasValue());
+  const std::string sql =
+      "SELECT COUNT(*) FROM med JOIN big ON med.a = big.a WHERE big.a >= 0";
+  const auto rows = TryRunSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  EXPECT_EQ(rows.Value()[0][0], Value(int64_t{69}));
+  // The dump proves a runtime join filter was installed and consulted at
+  // least one scan.
+  const auto dump = DumpSql(engine_.get(), context_.get(), sql);
+  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  EXPECT_NE(dump->find("RuntimeFilter type="), std::string::npos) << *dump;
+  EXPECT_NE(dump->find("scans="), std::string::npos) << *dump;
 }
 
 // ---------------------------------------------------------------------------
@@ -2210,6 +2438,8 @@ TEST_F(ScanFilterDirectTest, SimpleCompareEveryOpBothOperandOrders) {
                                      ColumnValueExp("v"))},
                 schema);
     EXPECT_EQ(flipped.simple.size(), 1U) << static_cast<int>(op);
+    EXPECT_EQ(Match(flipped, Row({Value(int64_t{3})}), schema), cmp(op, 3, 3))
+        << static_cast<int>(op);
     EXPECT_EQ(Match(flipped, Row({Value(int64_t{2})}), schema), cmp(op, 3, 2))
         << static_cast<int>(op);
     EXPECT_EQ(Match(flipped, Row({Value(int64_t{4})}), schema), cmp(op, 3, 4))
@@ -2475,7 +2705,10 @@ TEST_F(ScanFilterDirectTest, ResidualOnlyFiltersUseBytecode) {
                               ConstantValueExp(Value(int64_t{2}))),
           BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0})))},
       schema);
+  // v % 2 is not a simple compare, so the whole predicate is residual and is
+  // carried as compiled bytecode rather than a per-row AST residual.
   EXPECT_TRUE(f.simple.empty());
+  EXPECT_TRUE(f.residual_bytecode.has_value());
   EXPECT_TRUE(Match(f, Row({Value(int64_t{4})}), schema));
   EXPECT_FALSE(Match(f, Row({Value(int64_t{5})}), schema));
   EXPECT_FALSE(Match(f, Row({Value()}), schema));
@@ -2544,7 +2777,7 @@ TEST_F(ScanFilterDirectTest, SplitAndCombineDisjuncts) {
   std::vector<Expression> parts = relational_detail::SplitDisjuncts(or3);
   ASSERT_EQ(parts.size(), 3U);
   Expression combined = relational_detail::CombineDisjuncts(parts);
-  EXPECT_TRUE(relational_detail::SplitDisjuncts(combined).size() == 3U);
+  EXPECT_EQ(relational_detail::SplitDisjuncts(combined).size(), 3U);
   EXPECT_FALSE(relational_detail::CombineDisjuncts({}));
 }
 

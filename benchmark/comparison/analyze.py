@@ -130,9 +130,10 @@ def draw(records, output, micro, tpch, oltp):
         save(fig, filename)
         plt.close(fig)
 
-    largest = max(r["rows"] for r in records if r["kind"] == "olap" and r["suite"] == "micro")
-    horizontal(micro, "micro_1m.svg" if largest == 1000000 else f"micro_{largest}.svg",
-               f"Portable OLAP microbenchmarks: {largest:,} sales rows")
+    if micro:
+        largest = max(r["rows"] for r in records if r["kind"] == "olap" and r["suite"] == "micro")
+        horizontal(micro, "micro_1m.svg" if largest == 1000000 else f"micro_{largest}.svg",
+                   f"Portable OLAP microbenchmarks: {largest:,} sales rows")
     if tpch:
         scale = max(r["rows"] for r in records if r["kind"] == "olap" and r["suite"] == "tpch")
         horizontal(tpch, "tpch.svg", f"TPC-H-derived queries, SF {scale}, binary64 (not an audited TPC score)")

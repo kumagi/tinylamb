@@ -19,7 +19,7 @@
 namespace tinylamb {
 
 TEST(MemoryBudgetTest,
-     DefaultColumnarBudgetRetainsLargeProjectionAndOtherFloors) {
+     UncappedColumnarBudgetRetainsLargeProjectionAndOtherFloors) {
   auto& budget = ProcessMemoryBudget::Global();
   for (const size_t limit : {size_t{1} << 30, size_t{16} << 30}) {
     budget.ResetForTest(limit, limit / 4, 0, false);

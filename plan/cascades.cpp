@@ -80,6 +80,22 @@ bool SameColumnReference(const ColumnName& left, const ColumnName& right) {
          IdentifierEquals(left.name, right.name);
 }
 
+// LogicalProperties matchers (IsUniqueOn / IsNotNull / AreEqual) and the
+// exact `unordered_set<std::string>::contains` probes in the join rules
+// accept BOTH spellings of a column -- the qualified "schema.name" and
+// the bare "name" -- so rule-side sets keep both forms. A schema-less
+// ColumnName has ToString() == name; the second insert would be a
+// duplicate lookup, so only the bare name goes in.
+inline void InsertColumnMatcherNames(std::unordered_set<std::string>& out,
+                                     const ColumnName& col) {
+  if (col.schema.empty()) {
+    out.insert(col.name);
+    return;
+  }
+  out.insert(col.ToString());
+  out.insert(col.name);
+}
+
 std::vector<std::string> Normalize(std::vector<std::string> relations) {
   std::ranges::sort(relations);
   const auto [first, last] = std::ranges::unique(relations);
@@ -100,7 +116,7 @@ std::string ChildGroupIdsFingerprint(const std::vector<GroupId>& children) {
   std::string out;
   out.reserve(children.size() * 21);
   for (GroupId child : children) {
-    out += std::to_string(child);
+    AppendInteger(out, child);
     out.push_back(',');
   }
   out.push_back('|');
@@ -116,18 +132,10 @@ std::string TargetListFingerprint(const std::vector<NamedExpression>& targets) {
   for (const NamedExpression& target : targets) {
     const std::string expression =
         target.expression ? target.expression->ToString() : "<null>";
-    out += std::to_string(target.name.size());
+    AppendInteger(out, target.name.size());
     out.push_back(':');
     out += target.name;
-    {
-      char __tbuf[32];
-      const auto [__tend, __tec] = std::to_chars(__tbuf, __tbuf + sizeof(__tbuf), expression.size());
-      if (__tec == std::errc{}) {
-        out.append(__tbuf, __tend);
-      } else {
-        out += std::to_string(expression.size());
-      }
-    }
+    AppendInteger(out, expression.size());
     out.push_back(':');
     out += expression;
   }
@@ -145,7 +153,7 @@ std::string GroupIdsTag(std::initializer_list<GroupId> ids) {
   std::string out = "@";
   out.reserve(1 + ids.size() * 21);
   for (const GroupId id : ids) {
-    out += std::to_string(id);
+    AppendInteger(out, id);
     out.push_back(',');
   }
   return out;
@@ -155,7 +163,7 @@ std::string GroupIdsTag(const std::vector<GroupId>& ids) {
   std::string out = "@";
   out.reserve(1 + ids.size() * 21);
   for (const GroupId id : ids) {
-    out += std::to_string(id);
+    AppendInteger(out, id);
     out.push_back(',');
   }
   return out;
@@ -1618,7 +1626,7 @@ std::string Memo::GroupKey(const std::vector<std::string>& relations) {
   std::string key;
   key.reserve(relations.size() * 32);
   for (const std::string& relation : relations) {
-    key.append(std::to_string(relation.size()));
+    AppendInteger(key, relation.size());
     key.push_back(':');
     key.append(relation);
     key.push_back(';');
@@ -5677,8 +5685,10 @@ const RuleSet& RuleSet::Default() {
             const std::string predicate_key =
                 expression.predicate ? (*expression.predicate)->ToString()
                                      : std::string("<null>");
-            const std::string child_key =
-                std::to_string(left_id) + ":" + std::to_string(right_id);
+            std::string child_key;
+            AppendInteger(child_key, left_id);
+            child_key.push_back(':');
+            AppendInteger(child_key, right_id);
             const std::vector<std::string> cur_relations =
                 memo.Get(group).relations;
             const GroupId left_outer_group = memo.EnsureDerivedGroup(
@@ -6100,10 +6110,11 @@ const RuleSet& RuleSet::Default() {
             }
 
             const GroupId win_child = win_expr.children[0];
+            const Expression combined = CombineConjuncts(pushable);
             const GroupId win_child_filtered = memo.EnsureDerivedGroup(
                 memo.Get(win_child).relations,
                 "win_part_push:" + GroupIdsTag({win_child}) +
-                    CombineConjuncts(pushable)->ToString());
+                    combined->ToString());
             InheritBranchLocal(memo, win_child_filtered, group);
             if (win_child_filtered == win_child ||
                 win_child_filtered == group) {
@@ -6113,7 +6124,7 @@ const RuleSet& RuleSet::Default() {
                 win_child_filtered,
                 LogicalExpression{.operation = LogicalOperator::kSelection,
                                   .children = {win_child},
-                                  .predicate = CombineConjuncts(pushable)});
+                                  .predicate = combined});
 
             if (remaining.empty()) {
               LogicalExpression new_win = win_expr;
@@ -6259,8 +6270,9 @@ const RuleSet& RuleSet::Default() {
                                             op, *const_expr)
                       : BinaryExpressionExp(*const_expr, op,
                                             ColumnValueExp(ColumnName(member)));
-              if (known_texts.insert(inferred_bin->ToString()).second &&
-                  inferred_texts.insert(inferred_bin->ToString()).second) {
+              std::string text = inferred_bin->ToString();
+              if (known_texts.insert(text).second &&
+                  inferred_texts.insert(std::move(text)).second) {
                 new_inferred.push_back(std::move(inferred_bin));
               }
             }
@@ -6431,7 +6443,10 @@ const RuleSet& RuleSet::Default() {
 
             std::unordered_set<std::string> right_join_cols;
             const auto& right_rels = memo.Get(right_id).relations;
-            for (const auto& conjunct : SplitConjuncts(*ojoin.predicate)) {
+            const std::vector<Expression> conjuncts =
+                SplitConjuncts(*ojoin.predicate);
+            right_join_cols.reserve(conjuncts.size() * 2);
+            for (const auto& conjunct : conjuncts) {
               if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
                 continue;
               }
@@ -6443,16 +6458,14 @@ const RuleSet& RuleSet::Default() {
                 const auto& col = bin.Left()->AsColumnValue().GetColumnName();
                 if (std::ranges::find(right_rels, col.schema) !=
                     right_rels.end()) {
-                  right_join_cols.insert(col.ToString());
-                  right_join_cols.insert(col.name);
+                  InsertColumnMatcherNames(right_join_cols, col);
                 }
               }
               if (bin.Right()->Type() == TypeTag::kColumnValue) {
                 const auto& col = bin.Right()->AsColumnValue().GetColumnName();
                 if (std::ranges::find(right_rels, col.schema) !=
                     right_rels.end()) {
-                  right_join_cols.insert(col.ToString());
-                  right_join_cols.insert(col.name);
+                  InsertColumnMatcherNames(right_join_cols, col);
                 }
               }
             }
@@ -6466,8 +6479,7 @@ const RuleSet& RuleSet::Default() {
               continue;
             }
             bool exact_key_conjunction = true;
-            for (const Expression& conjunct :
-                 SplitConjuncts(*ojoin.predicate)) {
+            for (const Expression& conjunct : conjuncts) {
               if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
                 exact_key_conjunction = false;
                 break;
@@ -6500,10 +6512,14 @@ const RuleSet& RuleSet::Default() {
               continue;
             }
 
-            const std::string limit_tag =
-                "ojoin_limit_left:" + std::to_string(total_limit) + ":" +
-                std::to_string(left_id) + ":" + std::to_string(right_id) + ":" +
-                (*ojoin.predicate)->ToString();
+            std::string limit_tag = "ojoin_limit_left:";
+            AppendInteger(limit_tag, total_limit);
+            limit_tag.push_back(':');
+            AppendInteger(limit_tag, left_id);
+            limit_tag.push_back(':');
+            AppendInteger(limit_tag, right_id);
+            limit_tag.push_back(':');
+            limit_tag += (*ojoin.predicate)->ToString();
             const GroupId limit_left_group =
                 memo.EnsureDerivedGroup(memo.Get(left_id).relations, limit_tag);
             if (limit_left_group == left_id || limit_left_group == group) {
@@ -7412,7 +7428,7 @@ const RuleSet& RuleSet::Default() {
           if (!evaluated.HasValue() || !evaluated.Value().IsArray()) {
             return;
           }
-          const std::vector<Value> elements = evaluated.Value().ArrayElements();
+          const auto& elements = evaluated.Value().ArrayElements();
           if (elements.size() > kConstantUnnestValuesThreshold) {
             return;
           }
@@ -7735,9 +7751,9 @@ const RuleSet& RuleSet::Default() {
           std::string value_fingerprint = target_col->ToString() + ":";
           for (const Value& v : in_values) {
             const std::string text = v.AsString();
-            value_fingerprint += std::to_string(static_cast<int>(v.type));
+            AppendInteger(value_fingerprint, static_cast<int>(v.type));
             value_fingerprint.push_back(':');
-            value_fingerprint += std::to_string(text.size());
+            AppendInteger(value_fingerprint, text.size());
             value_fingerprint.push_back(':');
             value_fingerprint += text;
             value_fingerprint.push_back(';');
@@ -8071,6 +8087,8 @@ const RuleSet& RuleSet::Default() {
 
             std::vector<GroupId> pushed_aggs;
             pushed_aggs.reserve(union_expr.children.size());
+            const std::string target_fingerprint =
+                TargetListFingerprint(expression.target_list);
             for (size_t i = 0; i < union_expr.children.size(); ++i) {
               const GroupId branch_id = union_expr.children[i];
               // Keyed by the branch group itself (D1): two unions over the
@@ -8080,8 +8098,7 @@ const RuleSet& RuleSet::Default() {
               const GroupId branch_agg = memo.EnsureDerivedGroup(
                   memo.Get(branch_id).relations,
                   "agg_union_branch_" + std::to_string(i) + ":" +
-                      std::to_string(branch_id) + ":" +
-                      TargetListFingerprint(expression.target_list));
+                      std::to_string(branch_id) + ":" + target_fingerprint);
               InheritBranchLocal(memo, branch_agg, group);
               if (branch_agg != branch_id && branch_agg != group) {
                 memo.AddExpression(
@@ -8185,6 +8202,7 @@ const RuleSet& RuleSet::Default() {
             if (child.operation == LogicalOperator::kProjection &&
                 child.children.size() == 1 && child.children[0] != group) {
               properties = &memo.Get(child.children[0]).logical_properties;
+              columns.reserve(child.target_list.size());
               for (const auto& target : child.target_list) {
                 if (target.expression &&
                     target.expression->Type() == TypeTag::kColumnValue) {
@@ -8202,6 +8220,7 @@ const RuleSet& RuleSet::Default() {
                   schema = &found->second;
                 }
               }
+              columns.reserve(schema->ColumnCount());
               for (size_t i = 0; i < schema->ColumnCount(); ++i) {
                 columns.insert(schema->GetColumn(i).Name().ToString());
               }
@@ -8507,6 +8526,8 @@ const RuleSet& RuleSet::Default() {
               size_t equi_join_count = 0;
               const std::vector<Expression> join_conjuncts =
                   SplitConjuncts(join_predicate);
+              pushed_join_cols.reserve(join_conjuncts.size() * 2);
+              other_join_cols.reserve(join_conjuncts.size() * 2);
               for (const Expression& conjunct : join_conjuncts) {
                 if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
                   continue;
@@ -8534,10 +8555,8 @@ const RuleSet& RuleSet::Default() {
                 } else {
                   continue;
                 }
-                pushed_join_cols.insert(pushed_col->ToString());
-                pushed_join_cols.insert(pushed_col->name);
-                other_join_cols.insert(other_col->ToString());
-                other_join_cols.insert(other_col->name);
+                InsertColumnMatcherNames(pushed_join_cols, *pushed_col);
+                InsertColumnMatcherNames(other_join_cols, *other_col);
                 ++equi_join_count;
               }
               if (pushed_join_cols.empty() || other_join_cols.empty() ||
@@ -8639,7 +8658,7 @@ const RuleSet& RuleSet::Default() {
               // one group, one meaning).
               std::string keys_sig;
               for (const NamedExpression& key : topn_keys) {
-                keys_sig.append(std::to_string(key.name.size()));
+                AppendInteger(keys_sig, key.name.size());
                 keys_sig.push_back(':');
                 keys_sig.append(key.name);
                 keys_sig.push_back('=');
@@ -8647,13 +8666,13 @@ const RuleSet& RuleSet::Default() {
                                                : std::string("<null>"));
                 keys_sig.push_back('|');
               }
-              keys_sig.append(std::to_string(topn_ascending.size()));
+              AppendInteger(keys_sig, topn_ascending.size());
               keys_sig.push_back(':');
               for (const bool ascending : topn_ascending) {
                 keys_sig.push_back(ascending ? '1' : '0');
               }
               keys_sig.push_back('/');
-              keys_sig.append(std::to_string(topn_nulls_first.size()));
+              AppendInteger(keys_sig, topn_nulls_first.size());
               keys_sig.push_back(':');
               for (const std::optional<bool>& nulls_first : topn_nulls_first) {
                 keys_sig.push_back(nulls_first.has_value()
@@ -8663,15 +8682,7 @@ const RuleSet& RuleSet::Default() {
               const std::vector<std::string> pushed_relations =
                   memo.Get(pushed_id).relations;
               std::string tag = "topn_proven_one_to_one:";
-              {
-                char __tbuf[32];
-                const auto [__tend, __tec] = std::to_chars(__tbuf, __tbuf + sizeof(__tbuf), total_limit);
-                if (__tec == std::errc{}) {
-                  tag.append(__tbuf, __tend);
-                } else {
-                  tag += std::to_string(total_limit);
-                }
-              }
+              AppendInteger(tag, total_limit);
               tag += ":";
               tag += pushed_rel;
               tag += ":";
@@ -8699,7 +8710,7 @@ const RuleSet& RuleSet::Default() {
                             : std::vector<GroupId>{other_id, pushed_topn_group};
               std::string pushed_join_tag;
               pushed_join_tag += "topn_proven_join:";
-              pushed_join_tag += std::to_string(total_limit);
+              AppendInteger(pushed_join_tag, total_limit);
               pushed_join_tag += ':';
               pushed_join_tag += pushed_rel;
               pushed_join_tag += ':';
@@ -8939,6 +8950,8 @@ const RuleSet& RuleSet::Default() {
             }
             const Expression join_predicate = *join_expr.predicate;
             const int side_limit = is_inner ? 2 : 1;
+            const std::vector<Expression> join_conjuncts =
+                SplitConjuncts(join_predicate);
             for (int side = 0; side < side_limit; ++side) {
               const GroupId pushed_id = side == 0 ? left_id : right_id;
               const GroupId other_id = side == 0 ? right_id : left_id;
@@ -8947,8 +8960,8 @@ const RuleSet& RuleSet::Default() {
               const std::string other_rel =
                   side == 0 ? right_relations.front() : left_relations.front();
               std::unordered_set<std::string> other_join_cols;
-              for (const Expression& conjunct :
-                   SplitConjuncts(join_predicate)) {
+              other_join_cols.reserve(join_conjuncts.size() * 2);
+              for (const Expression& conjunct : join_conjuncts) {
                 if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
                   continue;
                 }
@@ -8964,12 +8977,10 @@ const RuleSet& RuleSet::Default() {
                     binary.Right()->AsColumnValue().GetColumnName();
                 if (lhs_col.schema == pushed_rel &&
                     rhs_col.schema == other_rel) {
-                  other_join_cols.insert(rhs_col.ToString());
-                  other_join_cols.insert(rhs_col.name);
+                  InsertColumnMatcherNames(other_join_cols, rhs_col);
                 } else if (lhs_col.schema == other_rel &&
                            rhs_col.schema == pushed_rel) {
-                  other_join_cols.insert(lhs_col.ToString());
-                  other_join_cols.insert(lhs_col.name);
+                  InsertColumnMatcherNames(other_join_cols, lhs_col);
                 }
               }
               if (other_join_cols.empty() ||
@@ -8983,9 +8994,12 @@ const RuleSet& RuleSet::Default() {
               // never share a join group (D1).
               const std::vector<std::string> pushed_relations =
                   memo.Get(pushed_id).relations;
-              const GroupId pushed_distinct = memo.EnsureDerivedGroup(
-                  pushed_relations, "distinct_eager:" + pushed_rel + ":" +
-                                        std::to_string(pushed_id));
+              std::string distinct_tag = "distinct_eager:";
+              distinct_tag += pushed_rel;
+              distinct_tag.push_back(':');
+              AppendInteger(distinct_tag, pushed_id);
+              const GroupId pushed_distinct =
+                  memo.EnsureDerivedGroup(pushed_relations, distinct_tag);
               if (pushed_distinct == pushed_id || pushed_distinct == group) {
                 continue;
               }
@@ -9149,10 +9163,14 @@ const RuleSet& RuleSet::Default() {
             }
             LogicalExpression capped_union = union_expr;
             capped_union.children = std::move(capped_children);
-            const GroupId capped_union_group = memo.EnsureDerivedGroup(
-                input_relations,
-                "topn_union_pushed:" + std::to_string(total_limit) + ":" +
-                    topn_key_signature + ":" + union_expr.Fingerprint());
+            std::string pushed_tag = "topn_union_pushed:";
+            AppendInteger(pushed_tag, total_limit);
+            pushed_tag.push_back(':');
+            pushed_tag += topn_key_signature;
+            pushed_tag.push_back(':');
+            pushed_tag += union_expr.Fingerprint();
+            const GroupId capped_union_group =
+                memo.EnsureDerivedGroup(input_relations, pushed_tag);
             if (capped_union_group == group || capped_union_group == input_id) {
               continue;
             }
@@ -10175,6 +10193,7 @@ const RuleSet& RuleSet::Default() {
                 memo.Get(join_group_id).expressions;
             const std::vector<std::string> join_relations =
                 memo.Get(join_group_id).relations;
+            std::optional<std::string> target_fingerprint;
             for (const LogicalExpression& join_expr : join_candidates) {
               if (join_expr.operation != LogicalOperator::kOuterJoin ||
                   join_expr.children.size() != 2 ||
@@ -10244,10 +10263,14 @@ const RuleSet& RuleSet::Default() {
                       .children = {left_id, right_id},
                       .predicate =
                           has_pred ? join_expr.predicate : std::nullopt});
+              if (!target_fingerprint) {
+                target_fingerprint =
+                    TargetListFingerprint(aggregation.target_list);
+              }
               const GroupId new_agg = memo.EnsureDerivedGroup(
                   group_relations,
                   "agg-over-demoted-outer:" + GroupIdsTag({inner_join_group}) +
-                      TargetListFingerprint(aggregation.target_list));
+                      *target_fingerprint);
               InheritBranchLocal(memo, new_agg, group);
               if (new_agg == group || new_agg == inner_join_group) {
                 continue;
@@ -10470,6 +10493,8 @@ const RuleSet& RuleSet::Default() {
               // no-op).
               std::unordered_set<std::string> seen_unqualified_names;
               std::unordered_set<std::string> pre_key_strs;
+              seen_unqualified_names.reserve(pre_key_cols.size());
+              pre_key_strs.reserve(pre_key_cols.size());
               bool name_collision = false;
               for (const ColumnName& c : pre_key_cols) {
                 if (!seen_unqualified_names.insert(c.name).second) {

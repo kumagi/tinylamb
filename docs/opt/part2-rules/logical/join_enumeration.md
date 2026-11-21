@@ -82,7 +82,7 @@ graph TD
 
 `mask` の各ビットは、対応する関係を左側の子 Group に含めるかどうかを示します。0（左側が空）および全ビット点灯（右側が空）を除く範囲を走査します。
 
-`Memo::CutConnected` は、登録済みの連接詞マスク集合（`conjunct_masks_`）のうち、左側と右側の双方にまたがる述語が1 つ以上存在するかを検査します。
+`Memo::CutConnected` は、登録済みの連接詞マスク集合（`conjunct_masks_`）のうち、root-only の述語を除いて左側と右側の双方にまたがる述語が1 つ以上存在するかを検査します。
 
 ```cpp
 bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
@@ -90,10 +90,16 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
   if (left_mask == 0 || right_mask == 0) {
     return false;
   }
-  return std::ranges::any_of(
-      conjunct_masks_, [left_mask, right_mask](uint64_t mask) {
-        return (mask & left_mask) != 0 && (mask & right_mask) != 0;
-      });
+  for (size_t i = 0; i < conjunct_masks_.size(); ++i) {
+    if (conjunct_root_only_[i] != 0U) {
+      continue;
+    }
+    const uint64_t mask = conjunct_masks_[i];
+    if ((mask & left_mask) != 0 && (mask & right_mask) != 0) {
+      return true;
+    }
+  }
+  return false;
 }
 ```
 

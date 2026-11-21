@@ -226,6 +226,38 @@ TEST(SpillableStoreTest, InMemoryFastPathAvoidsDiskIo) {
   }
 }
 
+TEST(SpillableStoreTest, FailedTransitionPreservesBufferedChunks) {
+  TempDirGuard dir("ooc_spillable_failed_transition");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  SpillableStore sstore(SpillableStore::Options{
+      .spill_store = &store, .memory_budget_bytes = 4096, .io_buffer_bytes = 0});
+  for (int value : {1, 2}) {
+    DataChunk chunk;
+    chunk.Append(Row({Value(value)}), RowPosition());
+    ASSERT_EQ(sstore.AppendChunk(std::move(chunk)), Status::kSuccess);
+  }
+  DataChunk large;
+  large.Append(Row({Value(std::string(8192, 'x'))}), RowPosition());
+  auto& mem = ProcessMemoryBudget::Global();
+  mem.SetTestSpillIoFailCountdown(2);
+  const Status failure = sstore.AppendChunk(std::move(large));
+  mem.SetTestSpillIoFailCountdown(0);
+  EXPECT_EQ(failure.GetCode(), StatusCode::kIOError);
+  ASSERT_FALSE(sstore.Spilled());
+  EXPECT_EQ(store.Stats().live_segments, 0U);
+  ASSERT_EQ(sstore.Seal(), Status::kSuccess);
+  Row row;
+  for (int value : {1, 2}) {
+    const auto found = sstore.NextRow(&row);
+    ASSERT_TRUE(found.HasValue());
+    ASSERT_TRUE(found.Value());
+    EXPECT_EQ(row, Row({Value(value)}));
+  }
+  const auto found = sstore.NextRow(&row);
+  ASSERT_TRUE(found.HasValue());
+  EXPECT_FALSE(found.Value());
+}
+
 TEST(SpillableStoreTest, SpillsOverBudgetAndCleansUpOnReset) {
   TempDirGuard dir("ooc_spillable_spill");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});

@@ -65,8 +65,9 @@ TEST(ExpressionTest, ConstantValue_WhenConstructed_OutputsToString) {
   Expression cv_varchar = ConstantValueExp(Value("hello"));
   Expression cv_double = ConstantValueExp(Value(1.1));
 
-  LOG(INFO) << "cv_int: " << cv_int << "\ncv_varchar: " << cv_varchar
-            << "\ncv_double: " << cv_double;
+  EXPECT_EQ(cv_int->ToString(), "1");
+  EXPECT_EQ(cv_varchar->ToString(), "\"hello\"");
+  EXPECT_EQ(cv_double->ToString(), "1.1");
 }
 
 TEST(ExpressionTest, ConstantValue_Evaluate_ReturnsConstantValue) {

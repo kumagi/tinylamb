@@ -27,7 +27,8 @@ namespace tinylamb {
 // Appends a self-describing, length-safe binary representation of `val` onto
 // `dst` (supports arbitrary string lengths > 64 KiB,
 // unsigned/interval/collation tags, NULLs, dates, doubles, and arrays).
-[[nodiscard]] Status EncodeSpillValue(const Value& val, std::string* dst);
+[[nodiscard]] Status EncodeSpillValue(const Value& val, std::string* dst,
+                                      int max_depth = 64);
 
 // Decodes one Value from `src`, advancing `src` past the consumed bytes.
 [[nodiscard]] StatusOr<Value> DecodeSpillValue(std::string_view* src,
@@ -50,8 +51,9 @@ namespace tinylamb {
 [[nodiscard]] Status DecodeRowBlock(std::string_view* src,
                                     std::vector<Row>* rows_out);
 
-// Streams a framed Row block into `SpillSegmentWriter` using at most one block
-// buffer.
+// Streams a framed Row block into `SpillSegmentWriter`. If supplied, the
+// scratch buffer is cleared and reused for the encoded block. Otherwise the
+// function uses a local buffer.
 [[nodiscard]] Status WriteRowBlock(SpillSegmentWriter* writer,
                                    std::span<const Row> rows,
                                    std::string* scratch_buffer = nullptr);

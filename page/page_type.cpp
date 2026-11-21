@@ -18,7 +18,6 @@
 
 #include <cstdint>
 #include <ostream>
-#include <string>
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"

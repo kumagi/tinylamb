@@ -100,6 +100,9 @@ std::optional<int64_t> HashEstimateKeyTuple(
 template <typename Fn>
 void ForEachStridedColumnarPos(const ColumnarTable& tbl, size_t stride,
                                Fn&& fn) {
+  if (stride == 0) {
+    return;
+  }
   size_t base = 0;
   size_t next = 0;
   for (const ColumnarChunk& chunk : tbl.chunks) {

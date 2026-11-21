@@ -32,6 +32,11 @@ from workloads import (ROOT, OLTP, accounts, adapt_sql, equivalent, insert_sql,
 ENGINES = ("tinylamb", "postgresql", "mysql")
 
 
+def file_sha256(path):
+    with open(path, "rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
 class Client:
     def __init__(self, engine, ports, timeout=30):
         self.engine = engine
@@ -195,8 +200,8 @@ class Stack:
                 "git_head": command(["git", "rev-parse", "HEAD"], cwd=ROOT),
                 "git_status": command(["git", "status", "--short"], cwd=ROOT),
                 "tracked_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT)).hexdigest(),
-                "server_sha256": hashlib.file_digest(open(self.args.server, "rb"), "sha256").hexdigest(),
-                "harness_sha256": {p.name: hashlib.file_digest(p.open("rb"), "sha256").hexdigest()
+                "server_sha256": file_sha256(self.args.server),
+                "harness_sha256": {p.name: file_sha256(p)
                                    for p in Path(__file__).parent.glob("*.py")},
                 "platform": platform.platform(), "python": sys.version,
                 "cpu": command(["lscpu"]), "memory": command(["free", "-b"]),
@@ -283,7 +288,9 @@ class Stack:
         if self.log:
             self.log.close()
         for name in self.names:
-            subprocess.run(["docker", "logs", name], stdout=(self.output / f"{name}.log").open("w"), stderr=subprocess.STDOUT)
+            with (self.output / f"{name}.log").open("w") as log:
+                subprocess.run(["docker", "logs", name], stdout=log,
+                               stderr=subprocess.STDOUT)
             subprocess.run(["docker", "rm", "-fv", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.temporary.cleanup()
 
@@ -642,7 +649,7 @@ def load_tpch(stack, args, output):
         client.close()
         print(f"TPC-H loaded {engine} {counts} seconds={loading:.2f}", flush=True)
     (output / "tpch-manifest.txt").write_text((data / "tinylamb-tpch.manifest").read_text())
-    (output / "tpch-data-sha256.json").write_text(json.dumps({p.name: hashlib.file_digest(p.open("rb"), "sha256").hexdigest() for p in data.glob("*.tbl")}, indent=2))
+    (output / "tpch-data-sha256.json").write_text(json.dumps({p.name: file_sha256(p) for p in data.glob("*.tbl")}, indent=2))
 
 
 def summarize(output):

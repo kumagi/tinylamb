@@ -82,8 +82,8 @@ bool CheckSubq(Database& db, TransactionContext& ctx,
                const std::vector<std::string>& subq, std::string* report,
                bool verbose);
 
-// Returns whether at least one recorded NoREC pair executed (true when the
-// arm recorded nothing, so it cannot count as skipped).
+// Returns true if a recorded NoREC pair executed or if the arm recorded
+// nothing. False means recorded checks were skipped.
 bool CheckNoRec(Database& db, TransactionContext& ctx, const OracleTrace& t,
                 const char* phase, std::string* report, bool verbose);
 

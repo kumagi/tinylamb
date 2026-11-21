@@ -45,13 +45,16 @@ class DuckDBSupportTest(unittest.TestCase):
             probe.bind(('127.0.0.1', 0))
             port = probe.getsockname()[1]
         cpus = sorted(os.sched_getaffinity(0))[:2]
-        cls.args = SimpleNamespace(duckdb_extensions=str(Path(__file__).resolve().parents[2] / 'build/benchmarks/duckdb-extensions-2.0.0'),
+        extension_dir = os.environ.get(
+            'TINYLAMB_BENCH_DUCKDB_EXTENSIONS', str(cls.work / 'extensions'))
+        cls.args = SimpleNamespace(duckdb_extensions=extension_dir,
                                    server_cpus=','.join(map(str, cpus)), duckdb_port=port,
                                    duckdb_threads=len(cpus), duckdb_memory_mib=128)
         cls.ports = {'duckdb': port}
         cls.server = Server(cls.args, cls.work, cls.work, lambda _: None)
         cls.server.start()
-        deadline = time.monotonic() + 20
+        timeout = float(os.environ.get('TINYLAMB_BENCH_DUCKDB_STARTUP_TIMEOUT', '60'))
+        deadline = time.monotonic() + timeout
         while True:
             try:
                 client = Client(cls.ports)
@@ -142,6 +145,8 @@ class DuckDBSupportTest(unittest.TestCase):
         self.assertTrue(any(row[0] == 'duckdb' for row in size))
 
     def test_server_preparation_keeps_mysql_c_driver_loadable(self):
+        if importlib.util.find_spec('mysql') is None or importlib.util.find_spec('mysql.connector') is None:
+            self.skipTest('mysql-connector-python is required for the TLS test')
         # A fresh process reproduces the static-TLS import ordering failure.
         code = '''
 import os, socket, tempfile

@@ -76,7 +76,14 @@ class IndexTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
-TEST_F(IndexTest, Construct_Default_Succeeds) {}
+TEST_F(IndexTest, FixtureCreatesBothIndexes) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  ASSERT_EQ(tbl->IndexCount(), 2U);
+  EXPECT_EQ(tbl->GetIndex(0).sc_.key_, (std::vector<slot_t>{0, 1}));
+  EXPECT_EQ(tbl->GetIndex(1).sc_.key_, (std::vector<slot_t>{2}));
+}
 
 TEST_F(IndexTest, Insert_DuplicateRowsOnNonUniqueIndex_Succeeds) {
   TransactionContext ctx = rs_->BeginContext();
@@ -133,6 +140,8 @@ TEST_F(IndexTest, Update_MultipleRowsRepeatedly_UpdatesSuccessfully) {
     ASSIGN_OR_ASSERT_FAIL(RowPosition, new_pos,
                           tbl->Update(ctx.txn_, pos, new_row));
     rps[static_cast<size_t>(i) % rps.size()] = new_pos;
+    ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, new_pos));
+    EXPECT_EQ(read, new_row);
   }
 }
 
@@ -153,14 +162,30 @@ TEST_F(IndexTest, Insert_MultipleRowsWithIndex_Succeeds) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                               ctx.GetTable(kTableName));
-
-  ASSERT_SUCCESS(
-      tbl->Insert(ctx.txn_, Row({Value(1), Value("string"), Value(3.3)}))
-          .GetStatus());
-  ASSERT_SUCCESS(tbl->Insert(ctx.txn_, Row({Value(2), Value("hoge"), Value(8)}))
-                     .GetStatus());
-  ASSERT_SUCCESS(tbl->Insert(ctx.txn_, Row({Value(3), Value("foo"), Value(5)}))
-                     .GetStatus());
+  const std::vector<Row> expected{
+      Row({Value(1), Value("string"), Value(3)}),
+      Row({Value(2), Value("hoge"), Value(8)}),
+      Row({Value(3), Value("foo"), Value(5)})};
+  for (const Row& row : expected) {
+    ASSIGN_OR_ASSERT_FAIL_CONST(RowPosition, pos, tbl->Insert(ctx.txn_, row));
+    ASSIGN_OR_ASSERT_FAIL_CONST(Row, restored, tbl->Read(ctx.txn_, pos));
+    EXPECT_EQ(restored, row);
+  }
+  ASSERT_EQ(tbl->IndexCount(), 2U);
+  for (const Row& row : expected) {
+    auto first = tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(0), row[0], row[0]);
+    ASSERT_TRUE(first.IsValid());
+    EXPECT_EQ(*first, row);
+    ++first;
+    EXPECT_FALSE(first.IsValid());
+    EXPECT_EQ(first.GetStatus(), Status::kSuccess);
+    auto second = tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(1), row[2], row[2]);
+    ASSERT_TRUE(second.IsValid());
+    EXPECT_EQ(*second, row);
+    ++second;
+    EXPECT_FALSE(second.IsValid());
+    EXPECT_EQ(second.GetStatus(), Status::kSuccess);
+  }
 }
 
 TEST_F(IndexTest, Update_RowWithIndex_PreservesRowPosition) {
@@ -202,6 +227,11 @@ TEST_F(IndexTest, Delete_RowWithIndex_PreservesRemainingRowPositions) {
   ASSERT_SUCCESS(tbl->Delete(ctx.txn_, rp1));
 
   ASSERT_NE(rp2, rp3);
+  ASSERT_FAIL(tbl->Read(ctx.txn_, rp1).GetStatus());
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, row2, tbl->Read(ctx.txn_, rp2));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, row3, tbl->Read(ctx.txn_, rp3));
+  EXPECT_EQ(row2, Row({Value(2), Value("hoge"), Value(4)}));
+  EXPECT_EQ(row3, Row({Value(3), Value("foo"), Value(5)}));
 }
 
 namespace {
@@ -241,7 +271,8 @@ TEST_F(IndexTest, Update_ManyRowsUnderHeavyLoad_UpdatesSuccessfully) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                               ctx.GetTable(kTableName));
-  std::unordered_set<Row> rows;
+  std::vector<Row> expected;
+  expected.reserve(kCount);
   std::vector<RowPosition> rps;
   rps.reserve(kCount);
 
@@ -251,16 +282,22 @@ TEST_F(IndexTest, Update_ManyRowsUnderHeavyLoad_UpdatesSuccessfully) {
     Row new_row({Value(i), Value(std::move(key)), Value(i % 10)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Insert(ctx.txn_, new_row));
     rps.push_back(rp);
+    expected.push_back(std::move(new_row));
   }
-  Row read;
   for (int i = 0; i < kCount * 4; ++i) {
-    RowPosition& pos = rps[(static_cast<size_t>(i) * 63) % rps.size()];
+    const size_t index = (static_cast<size_t>(i) * 63) % rps.size();
+    const RowPosition pos = rps[index];
     std::string key = RandomString(
         ((static_cast<size_t>(19937) * static_cast<size_t>(i)) % 3200) + 500,
         false);
     Row new_row({Value(i), Value(std::move(key)), Value(i % 20)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Update(ctx.txn_, pos, new_row));
-    rps[(static_cast<size_t>(i) * 63) % rps.size()] = rp;
+    rps[index] = rp;
+    expected[index] = std::move(new_row);
+  }
+  for (size_t i = 0; i < rps.size(); ++i) {
+    ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rps[i]));
+    EXPECT_EQ(read, expected[i]);
   }
 }
 }  // namespace tinylamb

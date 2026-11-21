@@ -198,7 +198,7 @@ python3 -m venv /var/tmp/tinylamb-comparison-venv
 /var/tmp/tinylamb-comparison-venv/bin/python benchmark/comparison/run.py \
   --output /var/tmp/tinylamb-comparison-smoke-new --sizes 100 \
   --clients 1 4 --seconds 0.5 --warmup 0.1 --trials 1 --repeats 1 --tpch-scale 0
-python3 -m unittest discover -s benchmark/comparison -p '*_test.py' -v
+/var/tmp/tinylamb-comparison-venv/bin/python -m unittest discover -s benchmark/comparison -p '*_test.py' -v
 python3 scripts/check_layering.py
 ```
 

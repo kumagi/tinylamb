@@ -54,6 +54,12 @@ class SortDistinctPlan final : public PlanBase {
     return child_->OrderIsMeasured();
   }
   [[nodiscard]] bool EnforcesDistinct() const override { return true; }
+  // DISTINCT only removes duplicate rows, so a limit the child already
+  // enforces still bounds this node's output exactly.
+  [[nodiscard]] bool EnforcesLimit(size_t limit_count,
+                                   size_t limit_offset) const override {
+    return child_->EnforcesLimit(limit_count, limit_offset);
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

@@ -98,6 +98,8 @@ struct IntervalValue {
   [[nodiscard]] StatusOr<IntervalValue> TryJustifyInterval() const;
 
   [[nodiscard]] StatusOr<std::string> TryToString() const;
+  [[nodiscard]] static StatusOr<IntervalValue> TryFromInteger(
+      int64_t amount, std::string_view unit);
   [[nodiscard]] static StatusOr<IntervalValue> TryParse(
       std::string_view text, std::string_view unit = "");
 

@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -307,6 +308,37 @@ TEST(PaxStorageFuzzerTest, PostingsCountFoldRejectsUndecodableParam) {
   EXPECT_EQ(bad.GetStatus().GetCode(), StatusCode::kCorrupt);
 }
 
+TEST(PaxStorageFuzzerTest, ForcedDoubleCasesReachTheRequestedEncoding) {
+  const Schema schema = MakeStorageSchema();
+  auto check = [&schema](const auto& cases) {
+    for (const auto& item : cases) {
+      if (item.expected != PaxChunk::Scheme::kSfor &&
+          item.expected != PaxChunk::Scheme::kExpFor) {
+        continue;
+      }
+      ASSERT_EQ(schema.GetColumn(item.col).Type(), ValueType::kDouble);
+      bool reached = false;
+      for (size_t i = 0; i < item.nshapes; ++i) {
+        setenv("TINYLAMB_FORCE_SCHEME", item.name, 1);
+        auto chunk = PaxChunk::BuildFromSortedRun(
+            MakeRun(MakeStorageRowsForScheme(item.shapes[i], item.expected),
+                    schema), schema);
+        unsetenv("TINYLAMB_FORCE_SCHEME");
+        ASSERT_TRUE(chunk.HasValue());
+        const auto& encodings = chunk.Value().GetFooter().encodings;
+        if (item.col < encodings.size() &&
+            encodings[item.col] == static_cast<uint8_t>(item.expected)) {
+          reached = true;
+          break;
+        }
+      }
+      EXPECT_TRUE(reached) << item.name;
+    }
+  };
+  check(kSchemeCases);
+  check(kStrCases);
+}
+
 TEST(PaxStorageFuzzerTest, RegionSchemeSeeds) {
   Rng rng(0xC0FFEE01U);
   for (uint8_t kase = 0; kase < kSchemeCaseCount; ++kase) {
@@ -362,13 +394,15 @@ TEST(PaxStorageFuzzerTest, NullmapVarcharSeeds) {
 }
 
 TEST(PaxStorageFuzzerTest, FooterSectionsSeeds) {
-  constexpr int kMaxSections = 32;
   constexpr int kModes = 4;
-  for (int sec = 0; sec < kMaxSections; ++sec) {
-    for (int mode = 0; mode < kModes; ++mode) {
-      for (const int shape : {0, 8, 15}) {
+  for (const uint8_t shape : {0, 8, 15, 16, 32, 48}) {
+    const size_t section_count = FooterSectionCountForSeed(shape);
+    ASSERT_GT(section_count, 0U);
+    ASSERT_LE(section_count, 256U);
+    for (size_t sec = 0; sec < section_count; ++sec) {
+      for (int mode = 0; mode < kModes; ++mode) {
         std::vector<uint8_t> seed(32, 0);
-        seed[0] = static_cast<uint8_t>(shape);
+        seed[0] = shape;
         seed[1] = static_cast<uint8_t>(sec);
         seed[2] = static_cast<uint8_t>(1 + (sec % 7));
         seed[3] = static_cast<uint8_t>((sec * 3) % 64);

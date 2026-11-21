@@ -42,7 +42,7 @@ std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
 }
 
 std::string CellText(const Row& row, size_t column) {
-  return row.values_[column].AsString();
+  return row.values_.at(column).AsString();
 }
 
 }  // namespace
@@ -331,7 +331,7 @@ TEST_F(MergeTest, SelfReferencingForeignKeyAcceptsInStatementForwardKey) {
       RunSql(engine_.get(), context_.get(), "SELECT id FROM emp2;").size(), 3);
 }
 
-TEST_F(MergeTest, SelfReferencingForeignKeyFollowsUpdateReweys) {
+TEST_F(MergeTest, SelfReferencingForeignKeyFollowsUpdateRekeys) {
   // The parent multiset must be re-seeded after the UPDATE phase: an UPDATE
   // that rekeys this very table removes the old key and publishes the new
   // one, so a later INSERT of the same statement may reference the new key
@@ -464,10 +464,8 @@ TEST_F(MergeTest, UpdateFromTableSourceAndWhereResidual) {
             (std::vector<std::string>{"1:\"old1\"", "2:\"x\"", "3:\"old3\""}));
 }
 
-TEST_F(MergeTest, UpdateFromWithoutWhereMatchesEveryJoinedPair) {
-  // No WHERE: every (target, source) pair with ON=TRUE matches, so each
-  // target row is updated (multi-match = one unconditional action per pair
-  // is fine; only multiple ACTIONS on one target row are rejected).
+TEST_F(MergeTest, UpdateFromWhereMatchesOnlyJoinedTarget) {
+  // The WHERE equality matches only target key 1 to the single source row.
   RunSql(engine_.get(), context_.get(),
          "UPDATE tgt SET v = 'all' FROM (SELECT 1 AS k) AS one "
          "WHERE tgt.k = one.k;");

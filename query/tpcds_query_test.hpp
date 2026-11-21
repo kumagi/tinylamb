@@ -161,10 +161,13 @@ inline std::vector<Q68Expected> ComputeQ68Expected(
 class TpcdsQueryTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    db_name_ = "tpcds_" + RandomString();
-    database_ = Database::Create(db_name_).MoveValue();
+    const std::filesystem::path workspace = "tpcds_" + RandomString();
+    std::error_code error;
+    ASSERT_TRUE(std::filesystem::create_directory(workspace, error))
+        << workspace << ": " << error.message();
+    workspace_ = workspace;
+    database_ = Database::Create((workspace_ / "fixture").string()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
-    engine_ = std::make_unique<SqlEngine>(*database_);
     for (const std::string_view ddl : tpcds::Ddl()) {
       RunDdl(ddl);
     }
@@ -196,12 +199,13 @@ class TpcdsQueryTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    engine_.reset();
     context_.reset();
     database_.reset();
-    std::filesystem::remove(db_name_ + ".db");
-    tinylamb::RemoveLogAndSegments(db_name_ + ".log");
-    std::filesystem::remove(db_name_ + ".last_checkpoint");
+    if (!workspace_.empty()) {
+      std::error_code error;
+      std::filesystem::remove_all(workspace_, error);
+      EXPECT_FALSE(error) << workspace_ << ": " << error.message();
+    }
   }
 
   void RunDdl(std::string_view sql) {
@@ -257,7 +261,7 @@ class TpcdsQueryTest : public ::testing::Test {
       row = Row();
     }
     EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
-    context.PreCommit();
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess) << sql;
     return rows;
   }
 
@@ -275,7 +279,7 @@ class TpcdsQueryTest : public ::testing::Test {
     EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
     std::ostringstream dump;
     prepared.Value()->Dump(dump, 0);
-    context.PreCommit();
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess) << sql;
     return dump.str();
   }
 
@@ -290,11 +294,16 @@ class TpcdsQueryTest : public ::testing::Test {
     std::string plan;
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
-      plan += row[0].AsString();
-      plan += '\n';
+      if (row.values_.size() != 1 || row[0].IsNull() ||
+          row[0].type != ValueType::kVarChar) {
+        ADD_FAILURE() << "EXPLAIN returned a non-text row for " << sql;
+        break;
+      }
+      plan.append(row[0].AsStringView());
+      plan.push_back('\n');
     }
     EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
-    context.PreCommit();
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess) << sql;
     return plan;
   }
 
@@ -313,14 +322,13 @@ class TpcdsQueryTest : public ::testing::Test {
       row = Row();
     }
     EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
-    context.PreCommit();
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess) << sql;
     return rows;
   }
 
-  std::string db_name_;
+  std::filesystem::path workspace_;
   std::unique_ptr<Database> database_;
   std::unique_ptr<TransactionContext> context_;
-  std::unique_ptr<SqlEngine> engine_;
   tpcds::GeneratedData fixture_;
 };
 

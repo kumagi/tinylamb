@@ -2,10 +2,11 @@
 #include "common/string_util.hpp"
 
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <functional>
+#include <limits>
 #include <new>
 #include <string>
 #include <thread>
@@ -48,6 +49,10 @@ void* operator new(std::size_t n, std::align_val_t a) {
   CountAllocationIfActive();
   const auto align = static_cast<std::size_t>(a);
   std::size_t size = n == 0 ? 1 : n;
+  if (!std::has_single_bit(align) ||
+      size > std::numeric_limits<std::size_t>::max() - (align - 1)) {
+    throw std::bad_alloc();
+  }
   size = (size + align - 1) & ~(align - 1);
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)  // raw-buffer codec test
   void* p = std::aligned_alloc(align, size);
@@ -207,25 +212,31 @@ TEST(StringUtilTest, TrimCodePointsDoesNotAllocateForTypicalCutsets) {
   const std::string text = "  hello world, this string has some padding   ";
   const std::string_view ascii_cutset = " \t\n\r\f\v";
   // Warm up any lazy static init outside the window.
-  EXPECT_EQ(TrimCodePoints(text, ascii_cutset, true, true),
-            "hello world, this string has some padding");
+  constexpr std::string_view trimmed = "hello world, this string has some padding";
+  EXPECT_EQ(TrimCodePoints(text, ascii_cutset, true, true), trimmed);
   std::atomic<uint64_t> sink{0};
   const auto measure = [&](std::string_view cutset) {
     g_alloc_count.store(0, std::memory_order_relaxed);
     g_measuring_thread.store(std::this_thread::get_id(),
                                   std::memory_order_relaxed);
+    struct StopCountingOnExit {
+      ~StopCountingOnExit() {
+        g_counting.store(false, std::memory_order_seq_cst);
+      }
+    };
     g_counting.store(true, std::memory_order_seq_cst);
+    const StopCountingOnExit counting;
     for (int i = 0; i < 100; ++i) {
       sink.fetch_add(TrimCodePoints(text, cutset, true, true).size(),
                      std::memory_order_relaxed);
     }
-    g_counting.store(false, std::memory_order_seq_cst);
     return g_alloc_count.load(std::memory_order_relaxed);
   };
   // The old body allocated the per-call vector<string_view> on every row.
   EXPECT_EQ(measure(ascii_cutset), 0U);
   const std::string multi = "\xC3\x81\xC3\x82\xC3\x83";  // 3 inline points
   EXPECT_EQ(measure(multi), 0U);
+  EXPECT_EQ(sink.load(), 100U * (text.size() + trimmed.size()));
 }
 
 // T1542: overlong leads (0xC0/0xC1) and above-U+10FFFF leads (0xF5..0xF7)

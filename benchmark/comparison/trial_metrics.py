@@ -14,13 +14,20 @@ def window_metrics(points, start, duration):
     def delta(name): return last[name] - first[name]
     def per(name, count):
         return delta(name) / delta(count) / 1e6 if delta(count) else None
+    durability_fields = ("durability_commands", "durability_batches")
+    batch_count = (
+        delta("durability_batches")
+        if all(snapshot.get(field) is not None
+               for snapshot in (first, last) for field in durability_fields)
+        else 0
+    )
     return dict(interior_seconds=elapsed,
                 commands_per_second=delta('tasks') / elapsed,
                 queue_ms_per_command=per('queue_ns', 'tasks'),
                 execution_ms_per_command=per('execution_ns', 'tasks'),
                 completion_ms_per_command=per('completion_ns', 'tasks') if 'completion_ns' in first else None,
                 deferred_wait_ms_per_command=per('durability_wait_ns', 'durability_commands') if 'durability_commands' in first else None,
-                commands_per_durability_batch=delta('durability_commands') / delta('durability_batches') if first.get('durability_batches') is not None and delta('durability_batches') else None,
+                commands_per_durability_batch=delta('durability_commands') / batch_count if batch_count else None,
                 own_wal_wait_ms_per_commit=per('wal_wait_ns', 'wal_wait_count'),
                 sync_ms_per_call=per('wal_sync_ns', 'wal_sync_count'),
                 commits_per_sync=delta('wal_wait_count') / delta('wal_sync_count') if delta('wal_sync_count') else None,

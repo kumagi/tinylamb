@@ -168,12 +168,13 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
       if (include_offsets_.empty()) {
         dst = iter_.GetKey();
       } else {
-        Row inc;
-        inc.values_.reserve(include_offsets_.size());
+        const Row& key = iter_.GetKey();
+        dst.values_.clear();
+        dst.values_.reserve(key.values_.size() + include_offsets_.size());
+        dst.values_.insert(dst.values_.end(), key.values_.begin(), key.values_.end());
         for (slot_t offset : include_offsets_) {
-          inc.values_.push_back(heap_row[offset]);
+          dst.values_.push_back(heap_row[offset]);
         }
-        dst = iter_.GetKey() + inc;
       }
     }
     if (distinct_keys_ && dst.IsValid()) {

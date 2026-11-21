@@ -51,6 +51,22 @@ TEST(SpillFileTest, Append_MultipleRows_ReadsAllRowsCorrectly) {
   EXPECT_EQ(rows[1], Row({Value(2), Value("b")}));
 }
 
+TEST(SpillFileTest, RowReaderRejectsMissingOutputsWithoutConsumingRow) {
+  SpillFile spill;
+  const Row expected({Value(42)});
+  ASSERT_EQ(spill.Append(expected), Status::kSuccess);
+  auto opened = spill.OpenRowReader();
+  ASSERT_TRUE(opened.HasValue());
+  auto reader = opened.MoveValue();
+  Row row;
+  bool found = false;
+  EXPECT_EQ(reader.Next(nullptr, &found).GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(reader.Next(&row, nullptr).GetCode(), StatusCode::kInvalidArgument);
+  ASSERT_EQ(reader.Next(&row, &found), Status::kSuccess);
+  EXPECT_TRUE(found);
+  EXPECT_EQ(row, expected);
+}
+
 TEST(SpillFileTest, FinishWriting_OnEmptySpill_HasZeroRows) {
   SpillFile spill;
   ASSERT_SUCCESS(spill.FinishWriting());
@@ -83,6 +99,21 @@ TEST(SpillFileTest, ForEachRow_ManyRows_StreamsAllRowsCorrectly) {
   }));
   EXPECT_EQ(count, 100);
   EXPECT_EQ(sum, 4950);
+}
+
+TEST(SpillFileTest, ForEachRowStopsAtCallbackFailure) {
+  SpillFile spill;
+  ASSERT_SUCCESS(spill.Append(Row({Value(7)})));
+  ASSERT_SUCCESS(spill.Append(Row({Value(8)})));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  int calls = 0;
+  const Status status = spill.ForEachRow([&](const Row&) {
+    ++calls;
+    return StatusError(StatusCode::kInvalidArgument, "callback error");
+  });
+  EXPECT_EQ(status.GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(status.GetMessage(), "callback error");
+  EXPECT_EQ(calls, 1);
 }
 
 TEST(SpillFileTest, ReadAllRows_WithoutFinishWriting_AutoFinishesAndReads) {

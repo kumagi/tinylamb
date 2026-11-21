@@ -55,9 +55,7 @@ WindowExecutor::WindowExecutor(TransactionContext& context, Executor child,
 Schema WindowExecutor::InputSchema() const {
   // The output schema appends one column per call; strip those suffix columns
   // to recover the schema the calls resolve against.
-  const size_t input_width = schema_.ColumnCount() >= outputs_.size()
-                                 ? schema_.ColumnCount() - outputs_.size()
-                                 : 0;
+  const size_t input_width = schema_.ColumnCount() - outputs_.size();
   std::vector<Column> input_columns;
   input_columns.reserve(input_width);
   for (size_t i = 0; i < input_width; ++i) {
@@ -240,6 +238,11 @@ bool WindowExecutor::NextChunk() {
   // read_offset_ here would replay the chunk that is still in rows_ forever.
   if (exhausted_) {
     return false;
+  }
+  if (schema_.ColumnCount() < outputs_.size()) {
+    exhausted_ = true;
+    return FailWith(StatusError(StatusCode::kInvalidArgument,
+                                "window output schema is narrower than its calls"));
   }
   if (!spill_enabled_) {
     if (buffered_done_) {

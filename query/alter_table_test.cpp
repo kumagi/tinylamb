@@ -13,6 +13,7 @@
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "table/table.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "query/googlesql_frontend.hpp"
@@ -93,19 +94,32 @@ TEST_F(AlterTableTest, RenameTableMovesRowsAndDropsOldName) {
   database_.reset();
   auto reopened = Database::Create(database_name_);
   ASSERT_TRUE(reopened.HasValue()) << reopened.GetStatus();
-  TransactionContext ctx(reopened.Value()->BeginContext());
-  SqlEngine engine(*reopened.Value());
+  database_ = reopened.MoveValue();
+  TransactionContext ctx(database_->BeginContext());
+  SqlEngine engine(*database_);
   EXPECT_EQ(RunSql(&engine, &ctx, "SELECT COUNT(*) FROM moved;")[0][0],
             (Value(int64_t{2})));
 }
 
 TEST_F(AlterTableTest, RenameColumnKeepsDataAndIndexPositions) {
+  RunSql(engine_.get(), context_.get(), "CREATE INDEX base_v_idx ON base(v)");
+  auto before = database_->GetTable(*context_, "base");
+  ASSERT_TRUE(before.HasValue()) << before.GetStatus();
+  ASSERT_EQ(before.Value().IndexCount(), 1U);
+  const auto original_index = before.Value().GetIndex(0).sc_;
   RunSql(engine_.get(), context_.get(),
          "ALTER TABLE base RENAME COLUMN v TO label;");
   const auto rows = RunSql(engine_.get(), context_.get(),
                            "SELECT k, label FROM base ORDER BY k;");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[1][1], (Value("two")));
+  auto renamed = database_->GetTable(*context_, "base");
+  ASSERT_TRUE(renamed.HasValue()) << renamed.GetStatus();
+  ASSERT_EQ(renamed.Value().IndexCount(), 1U);
+  EXPECT_EQ(renamed.Value().GetIndex(0).sc_, original_index);
+  EXPECT_EQ(RunSql(engine_.get(), context_.get(),
+                   "SELECT k FROM base WHERE label = 'two'"),
+            (std::vector<Row>{Row({Value(2)})}));
   // The old column name no longer resolves.
   StatusOr<Executor> stale = engine_->Prepare(*context_, "SELECT v FROM base;");
   EXPECT_FALSE(stale.HasValue());

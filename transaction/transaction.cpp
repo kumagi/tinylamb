@@ -884,6 +884,8 @@ void Transaction::ReleaseWriteIntent(const RowPosition& rp) {
 }
 
 Transaction::VersionCacheShard& Transaction::ThreadShard() {
+  // Readers must finish before the owner moves or destroys the transaction,
+  // including its shard map, lock, and the references returned here.
   // Thread-local shortcut so the shard-map lock is taken once per thread
   // instead of once per row.  The process-wide epoch guards against stale
   // entries when a destroyed transaction's address or id is reused.

@@ -8907,8 +8907,8 @@ bool BypassDisjointUnionGroupBy(SelectStatement* select) {
 
   std::vector<std::shared_ptr<SelectStatement>> flat_branches;
   flat_branches.reserve(branches.size());
-  for (auto & branche : branches) {
-    auto aligned_b = std::make_shared<SelectStatement>(*branche);
+  for (const auto& branch : branches) {
+    auto aligned_b = std::make_shared<SelectStatement>(*branch);
     std::vector<NamedExpression> b_sel = aligned_b->SelectList();
     for (size_t c = 0; c < arity; ++c) {
       b_sel[c].name = branch0_names[c];

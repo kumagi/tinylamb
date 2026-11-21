@@ -356,7 +356,7 @@ Expression QualifyDown(
     const Expression& expression,  // NOLINT(misc-no-recursion) // AST rewrite
                                    // recursion mirrors expression tree depth;
                                    // bounded by parser depth guard.
-    const std::string& relation, const std::string& physical) {
+    const std::string& relation, std::string_view physical) {
   ImplementationRuleDepthGuard depth_guard;
   if (!expression || relation == physical || !depth_guard.entered) {
     return expression;
@@ -428,14 +428,14 @@ bool SameFilterIgnoringQualifier(const Expression& left,
 // through unchanged while downstream operators resolve `alias.column`
 // references against the renamed schema.
 Plan RenameToRelation(Plan candidate, const std::string& relation,
-                      const std::string& physical) {
+                      std::string_view physical) {
   if (relation == physical) {
     return candidate;
   }
   // Positional pass-through rename; IsOrderedBy translates requests back to
   // physical names so index-provided order stays visible above the rename.
   return std::make_shared<RelationRenamePlan>(std::move(candidate), relation,
-                                              physical);
+                                              std::string(physical));
 }
 
 bool SameColumnLayout(const Schema& left, const Schema& right) {
@@ -793,8 +793,8 @@ std::vector<PlanAlternative> ScanAlternatives(
   const Table& table = *table_it->second;
   const TableStatistics& statistics = *statistics_it->second;
   const Schema& schema = table.GetSchema();
-  const std::string relation = logical.table;
-  const std::string physical = std::string(schema.Name());
+  const std::string& relation = logical.table;
+  const std::string_view physical = schema.Name();
   // The group filter carries the single-relation conjuncts of the WHERE
   // clause; it must be applied in full because the root
   // SelectionPlan wrap no longer exists. Conjuncts speak relation identities

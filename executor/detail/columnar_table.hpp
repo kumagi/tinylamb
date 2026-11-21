@@ -1260,7 +1260,7 @@ inline bool ColumnarColumn::ResolveLeaf(size_t row_idx,
   while (cur->encoding == Encoding::kGathered) {
     const ChunkGatherIndex* gi = cur->gather_index.get();
     if (gi == nullptr || r >= gi->src_rows.size() ||
-        gi->source_table == nullptr) [[unlikely]] {
+        r >= gi->src_chunks.size() || gi->source_table == nullptr) [[unlikely]] {
       return false;
     }
     const uint32_t sr = gi->src_rows[r];
@@ -1269,6 +1269,7 @@ inline bool ColumnarColumn::ResolveLeaf(size_t row_idx,
     }
     const uint32_t sc = gi->src_chunks[r];
     if (sc >= gi->source_table->chunks.size() ||
+        sr >= gi->source_table->chunks[sc].rows ||
         cur->gather_col >= gi->source_table->chunks[sc].columns.size())
         [[unlikely]] {
       return false;

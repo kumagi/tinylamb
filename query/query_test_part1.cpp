@@ -103,6 +103,7 @@ TEST_F(QueryTest, NotNullColumnEnforcesInsertAndUpdateAndRewritesCount) {
     StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
     EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
     std::string text;
+    text.reserve(8192);
     Row row;
     while (prepared.HasValue() && prepared.Value()->Next(&row, nullptr)) {
       text += row[0].AsString();
@@ -433,6 +434,7 @@ TEST_F(QueryTest, SiblingDerivedAggregatesFuseIntoSingleScan) {
     EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
                                                       << engine.LastError();
     std::vector<Row> rows;
+    rows.reserve(1024);
     if (!prepared.HasValue()) {
       return rows;
     }
@@ -521,6 +523,7 @@ TEST_F(QueryTest, TableValuedFunctionInvokesStoredBody) {
     EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
                                                       << engine.LastError();
     std::vector<Row> rows;
+    rows.reserve(1024);
     if (!prepared.HasValue()) {
       return rows;
     }
@@ -567,6 +570,7 @@ TEST_F(QueryTest, TableSampleExecutorSemantics) {
     EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
                                                       << engine.LastError();
     std::vector<Row> rows;
+    rows.reserve(1024);
     if (!prepared.HasValue()) {
       return rows;
     }
@@ -632,6 +636,7 @@ TEST_F(QueryTest, SqlEngineForUpdateLocksScannedRows) {
   SqlEngine engine(*db_);
   const auto drain_for_update = [&](std::string_view sql) {
     std::vector<Row> rows;
+    rows.reserve(1024);
     StatusOr<Executor> prepared = engine.Prepare(locker, sql);
     EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
     if (!prepared.HasValue()) {
@@ -765,6 +770,7 @@ TEST_F(QueryTest, SqlEngineCalcMergesDuplicateScanFilters) {
          "INSERT INTO calc_t VALUES (1, 10), (2, 20), (3, 30), (4, NULL);");
   const auto explain = [&](std::string_view sql) {
     std::string text;
+    text.reserve(8192);
     StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
     EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
     Row row;
@@ -1492,6 +1498,7 @@ TEST_F(QueryTest, SqlEngineExplainAnalyzeSelect) {
   EXPECT_EQ(explain_type, std::optional(StatementType::kSelect));
   Row row;
   std::string text;
+  text.reserve(8192);
   while (prepared.Value()->Next(&row, nullptr)) {
     text += row[0].AsString();
   }
@@ -2127,6 +2134,7 @@ TEST_F(QueryTest, WindowFrameExclusionHandlesPeerGroupsAndTies) {
                         ctx, statement, std::move(input), nullptr, {})
                         .MoveValue();
     std::vector<Row> rows;
+    rows.reserve(1024);
     windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
     ASSERT_EQ(rows.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {

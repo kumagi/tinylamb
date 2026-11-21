@@ -43,6 +43,7 @@ Usage:
 
 import argparse
 import fnmatch
+from itertools import chain
 import re
 import sys
 from pathlib import Path
@@ -319,7 +320,7 @@ def resolve_include(src, include, root, index):
 
 
 def allowed(edge, extra):
-    return any(fnmatch.fnmatchcase(edge, pattern) for pattern in tuple(DEFAULT_ALLOWLIST) + tuple(extra))
+    return any(fnmatch.fnmatchcase(edge, pattern) for pattern in chain(DEFAULT_ALLOWLIST, extra))
 
 
 def is_violation(src, src_layer, include, dst_layer):

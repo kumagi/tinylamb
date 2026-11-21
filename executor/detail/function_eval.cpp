@@ -2041,15 +2041,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(FormatCivilTime(ct));
     }
     if (arguments.size() == 3) {
-      std::string d = raw_str(arguments[0]);
-      std::string t = raw_str(arguments[1]);
-      if (d.size() > 10) {
-        d = d.substr(0, 10);
-      }
+      std::string components = raw_str(arguments[0]);
+      components.resize(std::min<size_t>(components.size(), 10));
+      components.push_back(' ');
+      components.append(raw_str(arguments[1]));
       CivilTime ct;
-      if (!ParseCivilTime(d + " " + t, &ct)) {
+      if (!ParseCivilTime(components, &ct)) {
         return StatusError(StatusCode::kInvalidArgument,
-                           "invalid DATETIME components: " + d + " " + t);
+                           "invalid DATETIME components: " + components);
       }
       return Value(FormatCivilTime(ct));
     }
@@ -2204,11 +2203,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         space = s.find('T');
       }
       if (space != std::string::npos) {
-        s = s.substr(space + 1);
+        s.erase(0, space + 1);
       }
-      size_t tz_pos = s.find_first_of("+-Zz");
+      const size_t tz_pos = s.find_first_of("+-Zz");
       if (tz_pos != std::string::npos) {
-        s = s.substr(0, tz_pos);
+        s.resize(tz_pos);
       }
       return Value(std::move(s));
     }
@@ -3682,15 +3681,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             StatusCode::kInvalidArgument,
             "Failed to parse input string " + Value(std::move(val)).AsString());
       }
-      int w = 0, y = 0;
-      if (val.size() == 3) {
-        w = std::stoi(val.substr(0, 2));
-        y = std::stoi(val.substr(2, 1));
-      } else {
-        w = std::stoi(val.substr(0, 2));
-        y = std::stoi(val.substr(2, 2));
-      }
-      if (w < 0 || w > 53) {
+      const int w = 10 * (val[0] - '0') + (val[1] - '0');
+      const int y = val.size() == 3
+                        ? val[2] - '0'
+                        : 10 * (val[2] - '0') + (val[3] - '0');
+      if (w > 53) {
         return StatusError(StatusCode::kIsInfinity,
                            "week out of range in PARSE_DATE: " + val);
       }
@@ -4727,6 +4722,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const size_t needed = static_cast<size_t>(target_len) - total_cps;
     std::string pad_str;
+    pad_str.reserve((needed / pad_cps + 1) * pad.size());
     for (size_t i = 0; i < needed / pad_cps; ++i) {
       pad_str += pad;
     }
@@ -5263,6 +5259,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const int64_t occ = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
 
     std::vector<std::string> parts;
+    parts.reserve(delim.empty() ? 1U : str.size() / delim.size() + 1U);
     if (delim.empty()) {
       parts.push_back(str);
     } else {
@@ -5302,7 +5299,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     int64_t end_idx =
         std::min(start_idx + len, static_cast<int64_t>(parts.size()));
     std::string res = parts[static_cast<size_t>(start_idx)];
-    res.reserve(static_cast<size_t>(end_idx - start_idx));
+    size_t res_bytes = res.size();
+    for (int64_t i = start_idx + 1; i < end_idx; ++i) {
+      res_bytes += delim.size() + parts[static_cast<size_t>(i)].size();
+    }
+    res.reserve(res_bytes);
     for (int64_t i = start_idx + 1; i < end_idx; ++i) {
       res += delim + parts[static_cast<size_t>(i)];
     }

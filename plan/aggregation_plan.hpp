@@ -179,7 +179,7 @@ class AggregationPlan : public PlanBase {
   [[nodiscard]] const AggregateMemoryPolicy& Memory() const { return memory_; }
   [[nodiscard]] const Plan& Child() const { return child_; }
   // Groups the shape may hold before it spills.
-  [[nodiscard]] size_t RowCapacity() const {
+  [[nodiscard]] virtual size_t RowCapacity() const {
     return AggregateGroupCapacity(memory_);
   }
   [[nodiscard]] std::string ToString() const override;
@@ -284,7 +284,7 @@ class StreamAggregatePlan final : public AggregationPlan {
   [[nodiscard]] std::string MemorySuffix() const override;
   // One group is resident at a time, so the shape holds no group table: the
   // budget is the input's, not the aggregation's.
-  [[nodiscard]] static size_t RowCapacity() { return 1; }
+  [[nodiscard]] size_t RowCapacity() const override { return 1; }
   // The output keeps the input's group-key order, which the input contract
   // fixes to ascending / NULLs first.
   [[nodiscard]] bool IsOrderedBy(

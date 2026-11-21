@@ -64,6 +64,7 @@ int FuzzMemtableModelOneInput(const uint8_t* data, size_t size);
 int FuzzChunkFooterOneInput(const uint8_t* data, size_t size);
 int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size);
 int FuzzNullmapVarcharOneInput(const uint8_t* data, size_t size);
+size_t FooterSectionCountForSeed(uint8_t shape);
 int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size);
 int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size);
 

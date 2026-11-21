@@ -87,14 +87,14 @@ TEST(Crc32CTest, Crc32C_MatchesSoftwareLoop_AcrossSizesAndSeeds) {
 TEST(Crc32CTest, Crc32CExtend_ComposesAcrossSlices) {
   // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp)
   std::mt19937_64 rng(777);  // deterministic vectors
-  std::vector<uint8_t> buf(1000);
+  std::vector<uint8_t> buf(32U << 10);
   for (auto& byte : buf) {
     byte = static_cast<uint8_t>(rng());
   }
-  constexpr std::array<size_t, 10> cuts = {0,   1,   7,   63,  255,
-                                           256, 257, 511, 999, 1000};
+  constexpr std::array<size_t, 12> cuts = {
+      0, 1, 7, 63, 255, 256, 257, 2047, 2048, 2049, 16384, 32768};
+  const uint32_t one_shot = detail::Crc32CRawHardware(0xffffffffU, buf);
   for (const size_t cut : cuts) {
-    const uint32_t one_shot = detail::Crc32CRawHardware(0xffffffffU, buf);
     uint32_t piecewise = 0xffffffffU;
     if (cut > 0) {
       piecewise =

@@ -1106,9 +1106,9 @@ TEST_F(AggregateShapeTest, EveryAlternativeIsExactlyOneStrategy) {
       ASSERT_NE(plan, nullptr) << alternative.plan->ToString();
       const std::string name = plan->StrategyName();
       names.push_back(name);
-      EXPECT_EQ(plan->ToString().substr(0, plan->ToString().find(':')), name);
-      EXPECT_EQ(alternative.plan->ToString().find(name), 0U)
-          << alternative.plan->ToString();
+      const std::string description = plan->ToString();
+      EXPECT_EQ(description.substr(0, description.find(':')), name);
+      EXPECT_TRUE(description.starts_with(name)) << description;
       if (name == "HashAggregate") {
         EXPECT_NE(
             std::dynamic_pointer_cast<HashAggregatePlan>(alternative.plan),
@@ -1567,7 +1567,7 @@ TEST_F(AggregateShapeTest, PlanDumpTruncatesDeepChildren) {
        pos = text.find("Limit: 10 offset 0", pos + 1)) {
     ++limit_lines;
   }
-  EXPECT_EQ(limit_lines, 256U)  // one per level up to kMaxPlanDumpDepth (512)
+  EXPECT_EQ(limit_lines, 256U)  // one per two indentation units up to kMaxPlanDumpDepth (512)
       << "exactly the levels up to the cap render";
   EXPECT_EQ(text.find("Leaf"), std::string::npos) << "deep child truncated";
 

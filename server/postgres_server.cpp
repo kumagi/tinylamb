@@ -1330,7 +1330,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     if (client.input.size() < length) {
       return false;
     }
-    const std::string packet = client.input.substr(0, length);
+    const std::string_view packet(client.input.data(), length);
     const StatusOr<uint32_t> code_field = pgwire::ReadUint32(packet, 4);
     if (!code_field.HasValue()) {
       Queue(client,
@@ -1339,8 +1339,8 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       return false;
     }
     const uint32_t code = code_field.Value();
-    client.input.erase(0, length);
     if (code == pgwire::kCancelRequestCode) {
+      client.input.erase(0, length);
       client.close_after_write = true;
       return false;
     }
@@ -1348,6 +1348,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     std::string parse_error;
     std::optional<pgwire::StartupPacket> startup =
         pgwire::ParseStartupPacket(packet, &parse_error);
+    client.input.erase(0, length);
     if (!startup) {
       Queue(client, pgwire::ErrorResponse(parse_error, "08P01", "FATAL"));
       client.close_after_write = true;

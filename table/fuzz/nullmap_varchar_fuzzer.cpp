@@ -39,7 +39,7 @@ bool TryShape(const Schema& sc, const StrCase& c, uint8_t shape,
               PaxChunk* out) {
   setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
   PaxChunk chunk =
-      PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc)
+      PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRowsForScheme(shape, c.expected), sc), sc)
           .MoveValue();
   unsetenv("TINYLAMB_FORCE_SCHEME");
   const auto& enc = chunk.GetFooter().encodings;

@@ -462,6 +462,25 @@ inline std::vector<Row> MakeStorageRows(uint8_t shape) {
   return rows;
 }
 
+// These codecs require finite values, and SFOR also requires monotone
+// nonnegative values. The default fixture exercises NaNs and infinities.
+inline std::vector<Row> MakeStorageRowsForScheme(uint8_t shape,
+                                                 PaxChunk::Scheme scheme) {
+  auto rows = MakeStorageRows(shape);
+  if (scheme == PaxChunk::Scheme::kSfor) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+      rows[i][3] = Value(1.0 + shape + static_cast<double>(i) * 0.25);
+    }
+  } else if (scheme == PaxChunk::Scheme::kExpFor) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const double magnitude =
+          12.0 + static_cast<double>((i * (size_t{3} + shape)) % 97) / 32.0;
+      rows[i][3] = Value((i / 120) % 2 == 0 ? magnitude : -magnitude);
+    }
+  }
+  return rows;
+}
+
 inline PaxChunk BuildStorageChunk(uint8_t shape = 0) {
   const Schema sc = MakeStorageSchema();
   return PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc)

@@ -80,8 +80,8 @@ bool Column::IntegerValueFits(const Value& value) const {
 }
 
 Encoder& operator<<(Encoder& a, const Column& c) {
-  // Bits 0..2 encode ValueType, bits 4..5 the declared integer width,
-  // and bit 7 unsignedness. Existing 64-bit column encodings stay unchanged.
+  // Bits 0..2 encode ValueType, bit 3 marks INTERVAL, bits 4..5 encode
+  // integer width, and bit 7 marks unsignedness.
   auto encoded_type = static_cast<uint8_t>(c.type_);
   if (c.unsigned_) {
     encoded_type |= 0x80;
@@ -125,10 +125,12 @@ Decoder& operator>>(Decoder& e, Column& c) {
 uint64_t std::hash<tinylamb::Column>::operator()(
     const tinylamb::Column& c) const noexcept {
   uint64_t result = std::hash<tinylamb::ColumnName>()(c.Name());
-  result += std::hash<tinylamb::ValueType>()(c.Type());
-  result += std::hash<bool>()(c.IsUnsigned());
-  result += std::hash<bool>()(c.IsInterval());
-  result += std::hash<uint8_t>()(c.IntegerBits());
-  result += std::hash<tinylamb::Constraint>()(c.GetConstraint());
+  const auto combine = [&](uint64_t hash) {
+    result ^= hash + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+  };
+  combine(std::hash<tinylamb::ValueType>()(c.Type()));
+  combine((c.IsUnsigned() ? 1U : 0U) | (c.IsInterval() ? 2U : 0U));
+  combine(std::hash<uint8_t>()(c.IntegerBits()));
+  combine(std::hash<tinylamb::Constraint>()(c.GetConstraint()));
   return result;
 }

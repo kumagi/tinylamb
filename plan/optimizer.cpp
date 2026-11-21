@@ -3852,10 +3852,13 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       std::string signature;
       // Length-prefixed elements: raw '|' concatenation collides when a key
       // text itself contains the separator ("a|b" as one key vs "a","b").
-      signature += std::to_string(call.partition_by.size()) + ":";
+      AppendInteger(signature, call.partition_by.size());
+      signature.push_back(':');
       for (const Expression& key : call.partition_by) {
         const std::string text = key ? key->ToString() : std::string("<null>");
-        signature += std::to_string(text.size()) + "/" + text;
+        AppendInteger(signature, text.size());
+        signature.push_back('/');
+        signature += text;
       }
       if (!grouped_targets.contains(signature)) {
         partition_order.push_back(signature);

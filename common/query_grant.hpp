@@ -51,9 +51,9 @@ class QueryMemoryGrant {
     std::weak_ptr<const bool> alive_;
   };
 
-  // Worker-local chunk reservation cache.  Callers size the refill between
-  // a 64 KiB floor and kDefaultRefillBytes (256 KiB) below, so hot loops
-  // avoid per-row atomic traffic against QueryMemoryGrant (ADR 0003).
+  // Worker-local chunk reservation cache. Typical refills range from 64 KiB
+  // to kDefaultRefillBytes (256 KiB) to avoid per-row atomic traffic. Callers
+  // can request a smaller refill for a tight budget.
   class LocalBatchCache {
    public:
     static constexpr size_t kDefaultRefillBytes = size_t{256} << 10;
@@ -187,7 +187,9 @@ class QueryMemoryCoordinator {
   [[nodiscard]] size_t MaxGrantFromEnv() const noexcept;
   [[nodiscard]] static uint64_t WaitTimeoutMsFromEnv() noexcept;
 
-  // Admits a query requesting between [min_bytes, preferred_bytes].
+  // Admits a query requesting between [min_bytes, preferred_bytes]. A zero
+  // minimum allows any positive grant; pass an explicit minimum to require
+  // enough space to run without immediate spill.
   // `preferred_bytes == 0 && min_bytes == 0` admits immediately without consuming pool quota.
   [[nodiscard]] StatusOr<QueryMemoryGrant> AcquireGrant(
       size_t preferred_bytes, size_t min_bytes = 0,

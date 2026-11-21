@@ -54,3 +54,7 @@ jobs:
           ctest --test-dir build \
             -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|PageManager|ParallelWork|SpillStore|Logger|TableTest)' \
             -j"$(nproc)" --output-on-failure
+
+      - name: Clean test database artifacts
+        if: always()
+        run: python3 scripts/clean_root_artifacts.py

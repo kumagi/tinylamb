@@ -85,7 +85,7 @@ TEST(JoinReductionTest, AndWithNullAcceptingConjunctStillRejectsPadding) {
   const std::unique_ptr<SelectStatement> statement = ParseSelect(
       "SELECT c.customer_id, o.order_id FROM customers c LEFT JOIN orders o "
       "ON c.customer_id = o.customer_id "
-      "WHERE o.amount >= 60 AND o.amount IS NULL");
+      "WHERE o.amount >= 60 AND o.order_id IS NULL");
   ASSERT_NE(statement, nullptr);
   EXPECT_TRUE(ReduceOuterJoins(statement.get()));
   EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kInner);
@@ -100,15 +100,14 @@ TEST(JoinReductionTest, NotWrappingRejectingPredicateReduces) {
   EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kInner);
 }
 
-// NOT over an AND is NOT rejecting: on a NULL-padded row the padded
-// comparison is NULL, the other conjunct can be FALSE, `NULL AND FALSE` is
-// FALSE, and `NOT FALSE` is TRUE — the padded row must survive, so the
-// outer join must stay.
+// For a customer with id 8 and no matching order, the comparison on amount
+// is NULL and the comparison with id -1 is false. NOT turns the resulting
+// false conjunction into true, so the padded customer row must survive.
 TEST(JoinReductionTest, NotOverAndKeepsLeftJoin) {
   const std::unique_ptr<SelectStatement> statement = ParseSelect(
       "SELECT c.customer_id, o.order_id FROM customers c LEFT JOIN orders o "
       "ON c.customer_id = o.customer_id "
-      "WHERE NOT (o.amount >= 60 AND c.customer_id >= 0)");
+      "WHERE NOT (o.amount >= 60 AND c.customer_id = -1)");
   ASSERT_NE(statement, nullptr);
   EXPECT_FALSE(ReduceOuterJoins(statement.get()));
   EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kLeft);

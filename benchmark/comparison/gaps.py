@@ -56,6 +56,9 @@ def collect(records, profile, threshold=10, reference_engine="postgresql"):
         if set(engines)!= {'tinylamb',reference_engine}:
             raise ValueError('missing OLAP counterpart')
         t,p=(engines[e] for e in ('tinylamb',reference_engine))
+        for engine, record in zip(('tinylamb', reference_engine), (t, p)):
+            if not record.get('samples_ms') or record.get('median_ms') is None:
+                raise ValueError(f'{suite}/{name}: {engine} result lacks latency samples or median')
         if not math.isclose(statistics.median(t['samples_ms']),t['median_ms'],rel_tol=1e-12):
             raise ValueError('stored tinylamb median differs from samples')
         if not math.isclose(statistics.median(p['samples_ms']),p['median_ms'],rel_tol=1e-12):

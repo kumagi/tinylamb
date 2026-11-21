@@ -1150,7 +1150,6 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
   // Bind every column reference first: a batch whose runtime storage does
   // not match the declared numeric type must fall back wholesale, before any
   // accumulator state has moved.
-  std::vector<const ColumnVector*> columns(inputs_.size(), nullptr);
   for (size_t i = 0; i < inputs_.size(); ++i) {
     const AggregateInput& input = inputs_[i];
     if (input.kind != AggregateInputKind::kTypedColumn) {
@@ -1163,7 +1162,6 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
     if (actual != input.type && actual != ValueType::kNull) {
       return false;
     }
-    columns[i] = &column;
   }
   for (size_t i = 0; i < inputs_.size(); ++i) {
     const AggregateInput& input = inputs_[i];
@@ -1263,7 +1261,7 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
       }
       continue;
     }
-    const ColumnVector& column = *columns[i];
+    const ColumnVector& column = chunk.ColumnAt(input.column);
     if (column.Type() == ValueType::kNull) {
       continue;  // all-null batch
     }

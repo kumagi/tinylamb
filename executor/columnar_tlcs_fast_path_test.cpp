@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -1844,6 +1845,109 @@ TEST(ColumnarTlcsFastPathTest, TpchShapesMatchRowStoreAfterCompaction) {
           << "tlcs round " << round << ": " << cases[i].sql;
     }
   }
+
+  db->DeleteAll();
+}
+
+// The block-monotonic run aggregation now also folds COUNT(DISTINCT int)
+// (TPC-H Q21's `GROUP BY l_orderkey HAVING COUNT(DISTINCT l_suppkey)`).
+// Groups of 1..5 rows on a key sorted across >= 4 TLCS blocks put some groups
+// across block boundaries, where per-block partial sets must merge; run-to-run
+// reuse of the distinct set must not leak values between groups.
+TEST(ColumnarTlcsFastPathTest, MonotonicRunCountDistinctMatchesRowStore) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
+  BudgetResetGuard budget_guard;
+  auto& budget = ProcessMemoryBudget::Global();
+  // Small columnar pool: paged TLCS mode, where the run aggregation lives.
+  budget.ResetForTest(size_t{512} << 20, size_t{128} << 20, size_t{2} << 20,
+                      /*check_rss_pressure=*/false);
+
+  const std::string prefix = "tlcs_mono_distinct_" + RandomString();
+  Schema schema("li", {Column("k", ValueType::kInt64),
+                       Column("s", ValueType::kInt64),
+                       Column("late", ValueType::kInt64)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  constexpr int64_t kOrders = 60000;  // ~180k rows: >= 4 TLCS blocks
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_EQ(db->CreateTable(ctx, schema).GetStatus(), Status::kSuccess);
+    Table tbl = db->GetTable(ctx, "li").MoveValue();
+    for (int64_t k = 0; k < kOrders; ++k) {
+      const int64_t lines = 1 + (k % 5);
+      for (int64_t line = 0; line < lines; ++line) {
+        // k % 3 == 0: one supplier repeated; otherwise one per line, with a
+        // repeat on the last line of every 4th order.
+        int64_t s = (k % 3 == 0) ? (k % 7) : (k * 10) + line;
+        if (k % 4 == 1 && line == lines - 1 && line > 0) {
+          s = (k * 10);
+        }
+        const Value late = (line == 0 && k % 2 == 0) ? Value(int64_t{1})
+                           : (k % 11 == 0)            ? Value()
+                                                      : Value(int64_t{0});
+        ASSERT_TRUE(
+            tbl.Insert(ctx.txn_, Row({Value(k), Value(s), late})).HasValue());
+      }
+    }
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  const std::vector<std::string> queries = {
+      "SELECT COUNT(*) FROM (SELECT k FROM li GROUP BY k "
+      "HAVING COUNT(DISTINCT s) > 1) m",
+      "SELECT COUNT(*) FROM (SELECT k FROM li WHERE late = 1 GROUP BY k "
+      "HAVING COUNT(DISTINCT s) = 1) m",
+      "SELECT SUM(d), COUNT(*) FROM (SELECT k, COUNT(DISTINCT s) AS d FROM li "
+      "GROUP BY k HAVING COUNT(*) >= 1) m",
+      "SELECT SUM(d * k) FROM (SELECT k, COUNT(DISTINCT s) AS d FROM li "
+      "WHERE late IS NOT NULL GROUP BY k HAVING COUNT(DISTINCT s) >= 2) m",
+  };
+  auto run_all = [&]() {
+    std::vector<std::vector<std::string>> out;
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    SqlEngine eng(*db);
+    for (const std::string& q : queries) {
+      std::vector<std::string> rows;
+      for (const Row& r : RunSql(&eng, &ctx, q)) {
+        rows.push_back(r.ToString());
+      }
+      out.push_back(std::move(rows));
+    }
+    return out;
+  };
+  const auto row_store = run_all();
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_EQ(db->CompactTableToTlcs(ctx, "li"), Status::kSuccess);
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  for (int round = 0; round < 2; ++round) {
+    const auto tlcs = run_all();
+    for (size_t i = 0; i < queries.size(); ++i) {
+      ASSERT_EQ(row_store[i].size(), 1U) << queries[i];
+      EXPECT_EQ(tlcs[i], row_store[i])
+          << "round " << round << ": " << queries[i];
+    }
+  }
+  // Brute-force expectation for the first query, mirroring the generator.
+  int64_t multi = 0;
+  for (int64_t k = 0; k < kOrders; ++k) {
+    const int64_t lines = 1 + (k % 5);
+    std::vector<int64_t> seen;
+    for (int64_t line = 0; line < lines; ++line) {
+      int64_t s = (k % 3 == 0) ? (k % 7) : (k * 10) + line;
+      if (k % 4 == 1 && line == lines - 1 && line > 0) {
+        s = (k * 10);
+      }
+      if (std::find(seen.begin(), seen.end(), s) == seen.end()) {
+        seen.push_back(s);
+      }
+    }
+    if (seen.size() > 1) {
+      ++multi;
+    }
+  }
+  EXPECT_EQ(row_store[0][0], Row({Value(multi)}).ToString());
 
   db->DeleteAll();
 }

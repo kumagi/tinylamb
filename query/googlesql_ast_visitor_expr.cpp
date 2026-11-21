@@ -335,7 +335,12 @@ StatusOr<std::vector<std::string>> PathParts(const GoogleSqlAstNode& path) {
 StatusOr<std::string> Path(const GoogleSqlAstNode& path) {
   ASSIGN_OR_RETURN(std::vector<std::string>, hv12514_0, (PathParts(path)));
   const std::vector<std::string> parts = std::move(hv12514_0);
+  size_t joined_size = parts.size() - 1;
+  for (const std::string& part : parts) {
+    joined_size += part.size();
+  }
   std::string result;
+  result.reserve(joined_size);
   for (const std::string& part : parts) {
     if (!result.empty()) {
       result += '.';
@@ -550,22 +555,21 @@ StatusOr<std::string> DecodeStringEscapesImpl(std::string_view value_view,
 }
 
 }  // namespace
-StatusOr<std::string> DecodeSingleComponent(std::string_view value_view) {
-  std::string value = std::string(value_view);
+StatusOr<std::string> DecodeSingleComponent(std::string_view value) {
   bool is_raw = false;
   bool is_bytes = false;
   if (!value.empty() && (value.front() == 'r' || value.front() == 'R')) {
     is_raw = true;
-    value = value.substr(1);
+    value.remove_prefix(1);
   }
   if (!value.empty() && (value.front() == 'b' || value.front() == 'B')) {
     is_bytes = true;
-    value = value.substr(1);
+    value.remove_prefix(1);
   }
   if (!is_raw && !value.empty() &&
       (value.front() == 'r' || value.front() == 'R')) {
     is_raw = true;
-    value = value.substr(1);
+    value.remove_prefix(1);
   }
 
   bool is_triple = false;
@@ -582,28 +586,40 @@ StatusOr<std::string> DecodeSingleComponent(std::string_view value_view) {
     quote = value.front();
     value = value.substr(1, value.size() - 2);
   } else {
-    return value;
+    return std::string(value);
   }
 
   if (is_raw) {
-    return value;
+    return std::string(value);
   }
 
   return DecodeStringEscapesImpl(value, is_bytes, is_triple, quote);
 }
 
 StatusOr<std::string> DecodeString(const GoogleSqlAstNode& node) {
+  size_t component_bytes = 0;
+  size_t components = 0;
+  for (const auto& child : node.children) {
+    if (child->kind == "StringLiteralComponent") {
+      component_bytes += child->detail.size();
+      ++components;
+    }
+  }
   std::string result;
-  bool found_component = false;
+  if (components > 1) {
+    result.reserve(component_bytes);
+  }
   for (const auto& child : node.children) {
     if (child->kind == "StringLiteralComponent") {
       ASSIGN_OR_RETURN(std::string, hv30550_0,
                        (DecodeSingleComponent(child->detail)));
+      if (components == 1) {
+        return hv30550_0;
+      }
       result += hv30550_0;
-      found_component = true;
     }
   }
-  if (found_component) {
+  if (components != 0) {
     return result;
   }
   return DecodeSingleComponent(node.detail);
@@ -3031,6 +3047,7 @@ std::optional<std::vector<std::string>> StructProjectionFields(
     if (!object || object->type != json_doc::JVal::kObj) {
       return std::nullopt;
     }
+    names.reserve(object->obj.size());
     for (const auto& field : object->obj) {
       names.push_back(field.first);
     }
@@ -3042,6 +3059,7 @@ std::optional<std::vector<std::string>> StructProjectionFields(
       return std::nullopt;
     }
     const auto& arguments = call.Args();
+    names.reserve(arguments.size() / 3);
     for (size_t i = 0; i + 2 < arguments.size(); i += 3) {
       if (arguments[i]->Type() != TypeTag::kConstantValue) {
         return std::nullopt;
@@ -3060,6 +3078,7 @@ std::optional<std::vector<std::string>> StructProjectionFields(
       return std::nullopt;
     }
     if (query->AsStruct()) {
+      names.reserve(query->SelectList().size());
       for (const NamedExpression& field : query->SelectList()) {
         if (!field.name.empty()) {
           names.push_back(field.name);
@@ -3970,7 +3989,9 @@ StatusOr<Expression> VisitExpression(
         // wrapper THROWS on unparsable text (fuzz-found: INTERVAL '<empty>'
         // with no unit aborted the process).  Reject through Status instead.
         if (!IntervalValue::TryParse(
-                 str_val.empty() ? std::to_string(amount) : str_val, unit)
+                 str_val.empty() ? std::string_view("0")
+                                 : std::string_view(str_val),
+                 unit)
                  .HasValue()) {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -3984,7 +4005,7 @@ StatusOr<Expression> VisitExpression(
       if (expr->Type() == TypeTag::kConstantValue) {
         const Value& v = expr->AsConstantValue().GetValue();
         if (v.type == ValueType::kInt64) {
-          if (!IntervalValue::TryParse(std::to_string(v.value.int_value), unit)
+          if (!IntervalValue::TryFromInteger(v.value.int_value, unit)
                    .HasValue()) {
             return StatusError(
                 StatusCode::kInvalidArgument,
@@ -3996,7 +4017,9 @@ StatusOr<Expression> VisitExpression(
           std::string str_val = std::string(v.value.varchar_value);
           const int64_t amount = ParseIntervalAmount(str_val);
           if (!IntervalValue::TryParse(
-                   (str_val.empty() ? std::to_string(amount) : str_val), unit)
+                   str_val.empty() ? std::string_view("0")
+                                   : std::string_view(str_val),
+                   unit)
                    .HasValue()) {
             return StatusError(
                 StatusCode::kInvalidArgument,
@@ -4028,8 +4051,7 @@ StatusOr<Expression> VisitExpression(
       if (StatusOr<Value> v = expr->TryEvaluate(dummy_row, dummy_schema);
           v.HasValue()) {
         if (v.Value().type == ValueType::kInt64) {
-          if (!IntervalValue::TryParse(
-                   std::to_string(v.Value().value.int_value), unit)
+          if (!IntervalValue::TryFromInteger(v.Value().value.int_value, unit)
                    .HasValue()) {
             return StatusError(StatusCode::kInvalidArgument,
                                "unsupported INTERVAL literal: folded interval");
@@ -4041,7 +4063,9 @@ StatusOr<Expression> VisitExpression(
           std::string str_val = std::string(v.Value().value.varchar_value);
           const int64_t amount = ParseIntervalAmount(str_val);
           if (!IntervalValue::TryParse(
-                   (str_val.empty() ? std::to_string(amount) : str_val), unit)
+                   str_val.empty() ? std::string_view("0")
+                                   : std::string_view(str_val),
+                   unit)
                    .HasValue()) {
             return StatusError(
                 StatusCode::kInvalidArgument,

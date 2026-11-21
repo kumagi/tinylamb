@@ -109,6 +109,25 @@ TEST(RegexGuardCompileTest, CachedPatternsKeepIndependentPrograms) {
   EXPECT_FALSE(CompileCheckedRegex("(a+)+").HasValue());
 }
 
+TEST(RegexGuardCompileTest, OneCacheMissPreservesOtherPrograms) {
+  static thread_local int compiles = 0;
+  constexpr auto transform = [](const std::string& pattern) {
+    ++compiles;
+    return pattern;
+  };
+  const int before = compiles;
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_TRUE(regex_guard_detail::CompileCheckedPattern<transform>(
+                    "cache-capacity-" + std::to_string(i))
+                    .HasValue());
+  }
+  ASSERT_EQ(compiles, before + 9);
+  ASSERT_TRUE(regex_guard_detail::CompileCheckedPattern<transform>(
+                  "cache-capacity-1")
+                  .HasValue());
+  EXPECT_EQ(compiles, before + 9);
+}
+
 TEST(RegexGuardCompileTest, ReplacementUsesGoogleSqlCaptures) {
   auto captured =
       ReplaceCheckedRegex("abc123def", "([a-z]+)([0-9]+)", R"(\2-\1-\0)");

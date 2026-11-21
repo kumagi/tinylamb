@@ -54,8 +54,7 @@ std::vector<Row> Drain(
   std::vector<Row> rows;
   Row row;
   while (executor->Next(&row, nullptr)) {
-    rows.push_back(row);
-    row = Row();
+    rows.push_back(std::move(row));
   }
   return rows;
 }
@@ -89,8 +88,8 @@ class LateMaterializationPlanTest : public ::testing::Test {
         IndexSchema("lmp_right_k", {0}, {}, IndexMode::kNonUnique)));
     ASSERT_SUCCESS(setup.txn_.PreCommit());
     TransactionContext statistics = database_->BeginContext();
-    database_->RefreshStatistics(statistics, "LMPLeft");
-    database_->RefreshStatistics(statistics, "LMPRight");
+    ASSERT_SUCCESS(database_->RefreshStatistics(statistics, "LMPLeft"));
+    ASSERT_SUCCESS(database_->RefreshStatistics(statistics, "LMPRight"));
     ASSERT_SUCCESS(statistics.txn_.PreCommit());
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
     left_table_ = context_->GetTable("LMPLeft").MoveValue();
@@ -127,6 +126,8 @@ TEST_F(LateMaterializationPlanTest, RulePublishesLogicalPlanForWideSmallBuild) {
   ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, *context_));
   std::ostringstream dump;
   dump << *plan;
+  EXPECT_NE(dump.str().find("LMPLeft"), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("LMPRight"), std::string::npos) << dump.str();
   Executor executor = plan->EmitExecutor(*context_);
   const std::vector<Row> rows = Drain(executor);
   EXPECT_EQ(executor->GetStatus(), Status::kSuccess);

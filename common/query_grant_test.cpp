@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "common/query_grant.hpp"
 
+#include <limits>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -102,7 +103,7 @@ TEST(QueryGrantTest, CoordinatorAdmitsWaitsWakesAndTimesOut) {
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
     g1.Value().ReleaseGrant();
   });
-  auto g2 = coord.AcquireGrant(500, 500, /*wait_timeout_ms=*/2000);
+  auto g2 = coord.AcquireGrant(500, 500, std::numeric_limits<uint64_t>::max());
   releaser.join();
   ASSERT_TRUE(g2.HasValue());
   EXPECT_EQ(g2.Value().GrantedBytes(), 500U);

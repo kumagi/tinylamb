@@ -2,14 +2,14 @@ import TinylambOpt.TpcdsDiscovery
 import TinylambOpt.ClickBenchDiscovery
 
 /-
-# Step 13: TPC-H SF=10 対 DuckDB 敗北クエリ群に向けた証明付きオプティマイザ拡充探索
+# Step 14: TPC-H SF=10 対 DuckDB 敗北クエリ群に向けた証明付きオプティマイザ拡充探索
 
 過去のベンチマーク記録（`benchmark/comparison/README-tpch.md`, `build/quality/tpch-scaling-20261117/verification.json`,
 `build/quality/tpch-sf10-performance-20261117/gate47`）および SF=10（約 8,658 万行）全 22 問プロファイルを精査し、
 DuckDB 2.0 に対して劣後またはスピル超過しているクエリ群
 （**Q19, Q13, Q18, Q9, Q15, Q10, Q8, Q20, Q11, Q16, Q12, Q17**）
 の根本原因を解消する **6 系統のアグレッシブな書き換えルール（TPCH-1〜TPCH-6）** と、
-実装時に踏み抜くとサイレント誤答を引き起こす **8 つの SQL 三値論理・NULL・空集合・多重度トラップ反例** を
+実装時に踏み抜くとサイレント誤答を引き起こす **9 つの SQL 三値論理・NULL・空集合・多重度トラップ反例** を
 Lean 4 で `sorry` ゼロで形式化・機械証明します。
 
 ## 収録する 6 大 TPC-H SF=10 最適化ファミリー（すべて `sorry` ゼロ）

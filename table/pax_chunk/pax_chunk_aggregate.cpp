@@ -2145,7 +2145,7 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
     }
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kChimp128) {
-      std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
+      std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
       chunk.DecodeInt64ColumnRg(col, group, decoded.data());
       for (uint32_t row = 0; row < rows; ++row) {
         if (CellIsNull(f, group, col, row)) {
@@ -2319,7 +2319,7 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
     }
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kAlpRdTans) {
-      std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
+      std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
       chunk.DecodeInt64ColumnRg(col, group, decoded.data());
       for (uint32_t row = 0; row < rows; ++row) {
         if (CellIsNull(f, group, col, row)) {
@@ -2490,7 +2490,7 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
     }
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kPatas) {
-      std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
+      std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
       chunk.DecodeInt64ColumnRg(col, group, decoded.data());
       for (uint32_t row = 0; row < rows; ++row) {
         if (CellIsNull(f, group, col, row)) {
@@ -2781,7 +2781,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       // Gated to a single predicate on the aggregate column, and only when
       // TryFastPredicateMask DECLINES: if a compressed kernel can answer the
       // mask without decoding, decoding it here would throw that win away.
-      std::array<int64_t, PaxChunk::kRowGroupSize> fused_stack{};
+      std::array<int64_t, PaxChunk::kRowGroupSize> fused_stack;
       const int64_t* fused_vals = nullptr;
       // A compressed-domain mask already computed for THIS cell by THIS
       // predicate. TryFastPredicateMask used to run here purely as a probe and
@@ -4114,7 +4114,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       //
       // `vals_stack` must outlive this block: `vals` is read by the fold loop
       // below, so scoping the array to the `else` arm leaves it dangling.
-      std::array<int64_t, PaxChunk::kRowGroupSize> vals_stack{};
+      std::array<int64_t, PaxChunk::kRowGroupSize> vals_stack;
       std::vector<int64_t> vals_heap;
       const int64_t* vals = nullptr;
       if (fused_vals != nullptr) {
@@ -4840,7 +4840,7 @@ StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
       }
     }
 #endif
-    alignas(64) std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf{};
+    alignas(64) std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf;
     std::vector<int64_t> heap_buf;
     int64_t* buf = stack_buf.data();
     if (rc > PaxChunk::kRowGroupSize) {
@@ -5368,8 +5368,14 @@ StatusOr<ScanResult> VectorizedScanColumnInList(
     }
     // Generic: decode the group once, binary-search the literal set per
     // row. Null cells decode as raw 0, matching every other path.
-    std::vector<int64_t> buf(rc);
-    chunk.DecodeInt64ColumnRg(col, g, buf.data());
+    std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf;
+    std::vector<int64_t> heap_buf;
+    int64_t* buf = stack_buf.data();
+    if (rc > PaxChunk::kRowGroupSize) {
+      heap_buf.resize(rc);
+      buf = heap_buf.data();
+    }
+    chunk.DecodeInt64ColumnRg(col, g, buf);
     uint64_t cnt = 0;
     uint64_t sm = 0;
     for (uint32_t i = 0; i < rc; ++i) {
@@ -9226,7 +9232,9 @@ std::vector<TopKEntry> TopKColumn(const PaxChunk& chunk, slot_t col, size_t k,
                           : (f.all_zone_mins[zi] >= thresh);
     }
     if (!pruned) {
-      buf.assign(rc, 0);
+      if (buf.size() < rc) {
+        buf.resize(rc);
+      }
       chunk.DecodeInt64ColumnRg(col, g, buf.data());
       for (uint16_t i = 0; i < rc; ++i) {
         const TopKEntry e{.value = buf[i], .row = base_row + i};

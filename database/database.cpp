@@ -523,9 +523,10 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     const Column& col = schema.GetColumn(i);
     if (col.GetConstraint().IsUnique()) {
-      std::stringstream idx_name_stream;
-      idx_name_stream << schema.Name() << "|" << col.Name();
-      IndexSchema new_idx(idx_name_stream.str(), {i}, {});
+      std::string index_name(schema.Name());
+      index_name.push_back('|');
+      index_name += col.Name().ToString();
+      IndexSchema new_idx(index_name, {i}, {});
       // A failed unique-index build (oversized key, conflicts) must fail the
       // CREATE TABLE instead of silently registering an unconstrained table.
       const Status index_status = new_table.CreateIndex(ctx.txn_, new_idx);
@@ -1303,7 +1304,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
   uint64_t rows = 0;
   uint64_t layout_generation = 0;
   {
-    std::stringstream stream(meta);
+    std::istringstream stream(std::move(meta));
     Decoder decoder(stream);
     decoder >> magic >> rows;
     if (stream.fail()) {

@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -154,10 +155,27 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     const GoogleSqlAstNode& query);
 
 struct GroupingSetBranchContext {
-  // Fingerprints (ToString) of every grouping key of the statement.
-  std::vector<std::string> all_key_texts;
-  // Fingerprints of the active keys for the branch being rewritten.
-  std::unordered_set<std::string> active_key_texts;
+  const std::unordered_set<std::string_view>& all_key_texts;
+  std::unordered_set<std::string_view> active_key_texts;
+};
+
+// Branch contexts borrow these fingerprints for one synchronous expansion.
+class GroupingSetKeyTexts {
+ public:
+  explicit GroupingSetKeyTexts(
+      const std::vector<std::vector<Expression>>& grouping_sets);
+  GroupingSetKeyTexts(const GroupingSetKeyTexts&) = delete;
+  GroupingSetKeyTexts& operator=(const GroupingSetKeyTexts&) = delete;
+
+  [[nodiscard]] GroupingSetBranchContext ForBranch(
+      const std::vector<Expression>& active) const;
+  [[nodiscard]] const std::string& TextOf(const Expression& key) const {
+    return by_expression_.at(key.get());
+  }
+
+ private:
+  std::unordered_map<const ExpressionBase*, std::string> by_expression_;
+  std::unordered_set<std::string_view> all_;
 };
 
 bool ContainsAggregate(const Expression& expression);

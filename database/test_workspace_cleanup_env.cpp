@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <string_view>
 
 #include "database/database.hpp"
 #include "gtest/gtest.h"
@@ -24,7 +25,9 @@ class TestDatabaseCleanup : public ::testing::Environment {
  public:
   void SetUp() override {
     const char* keep = std::getenv("TINYLAMB_KEEP_TEST_DATABASES");
-    keep_artifacts_ = keep != nullptr && keep[0] != '\0' && keep[0] != '0';
+    const std::string_view value = keep == nullptr ? "" : keep;
+    keep_artifacts_ = value == "1" || value == "true" || value == "yes" ||
+                      value == "on";
   }
 
   // gtest's Environment::TearDown is a non-const virtual, so the const

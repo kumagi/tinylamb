@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_COMMON_PLATFORM_HASH_HPP
 #define TINYLAMB_COMMON_PLATFORM_HASH_HPP
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -41,7 +42,14 @@ inline uint64_t StableHashBytes(std::string_view bytes) {
   uint64_t hash = kSeed ^ (len * kMul);
   for (size_t i = 0; i < len_aligned; i += 8) {
     uint64_t word = 0;
-    std::memcpy(&word, buf + i, sizeof(word));
+    if constexpr (std::endian::native == std::endian::little) {
+      std::memcpy(&word, buf + i, sizeof(word));
+    } else {
+      for (size_t byte = 0; byte < sizeof(word); ++byte) {
+        word |= static_cast<uint64_t>(
+                    static_cast<unsigned char>(buf[i + byte])) << (byte * 8);
+      }
+    }
     hash ^= shift_mix(word * kMul) * kMul;
     hash *= kMul;
   }

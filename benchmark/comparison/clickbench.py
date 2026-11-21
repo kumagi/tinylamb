@@ -591,7 +591,7 @@ def run(args):
         shutil.copy2(path, frozen)
     binary = out / 'tinylamb_tpcds_compare'
     dump(out / 'run.json', manifest)
-    (out / 'queries').mkdir()
+    (out / 'queries').mkdir(exist_ok=True)
     records = []
     with (out / 'native.log').open('w') as log, (out / 'results.jsonl').open('w') as output:
         native = Worker([str(binary), str(args.native_db.resolve()), '--serve',

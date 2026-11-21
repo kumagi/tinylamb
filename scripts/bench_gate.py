@@ -114,6 +114,8 @@ def parse_results(path: Path) -> dict:
             raise SystemExit("error: JSON results must be a flat object")
         parsed = {}
         for key, value in data.items():
+            if isinstance(value, bool):
+                continue
             num = value if isinstance(value, (int, float)) else parse_number(str(value))
             if isinstance(num, (int, float)):
                 parsed[normalize_key(key)] = float(num)
@@ -128,7 +130,7 @@ def parse_results(path: Path) -> dict:
             continue
         value = parse_number(fields[1])
         if value is not None:
-            parsed.setdefault(normalize_key(fields[0]), value)
+            parsed[normalize_key(fields[0])] = value
     return parsed
 
 

@@ -407,5 +407,4 @@ unique、error、batch、rowid、row position、stale index）、
 
 ## 集約との融合経路
 
-`executor/detail/fused_grouped_join.cpp` の `TryFusedGroupedJoin` と
-（削除済みの `stream_grouped_join.cpp` の `TryStreamGroupedBaseJoin` は、対応する結合と集約を融合して中間行の生成を減らす。関数の戻り値は成功・エラーと適用可否を区別し、適用条件を満たさなければ通常の関係実行へ戻る。NULL の集約対象、符号付き整数の範囲、HAVING、残余条件を省略してよいという意味ではない。各関数の型・式・結合形状ゲートが契約となる。
+`executor/detail/fused_grouped_join.cpp` の `TryFusedGroupedJoin` は、対応する結合と集約を融合して中間行の生成を減らす。関数の戻り値は成功・エラーと適用可否を区別し、適用条件を満たさなければ通常の関係実行へ戻る。NULL の集約対象、符号付き整数の範囲、HAVING、残余条件を省略してよいという意味ではない。各関数の型・式・結合形状ゲートが契約となる。

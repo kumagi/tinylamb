@@ -2386,13 +2386,16 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
           statement, Schema("", output_columns), ctx);
       Plan explain_target =
           opt_rel.HasValue() && opt_rel.Value() ? opt_rel.Value() : core_plan;
-      std::ostringstream explain_oss;
-      if (explain_target != nullptr) {
-        explain_target->Dump(explain_oss, 0);
-      }
       ASSIGN_OR_RETURN(std::optional<PipelineGraph>, grouped_graph,
                        TryLowerGroupedStatementToPipeline(
-                           *statement, core_plan, ctx, explain_oss.str(),
+                           *statement, core_plan, ctx,
+                           [explain_target]() {
+                             std::ostringstream oss;
+                             if (explain_target != nullptr) {
+                               explain_target->Dump(oss, 0);
+                             }
+                             return oss.str();
+                           },
                            substitute_aliases));
       if (grouped_graph.has_value()) {
         Executor exec =
@@ -2458,12 +2461,15 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
   finish->SetExplainInfo(core_plan->ExplainInfo());
   if (PipelineEngineEnabled()) {
     const auto* gb = dynamic_cast<const GroupByPlan*>(finish.get());
-    std::ostringstream explain_oss;
-    finish->Dump(explain_oss, 0);
     if (gb != nullptr && gb->Statement() != nullptr) {
       ASSIGN_OR_RETURN(std::optional<PipelineGraph>, grouped_graph,
                        TryLowerGroupedStatementToPipeline(
-                           *gb->Statement(), core_plan, ctx, explain_oss.str(),
+                           *gb->Statement(), core_plan, ctx,
+                           [finish]() {
+                             std::ostringstream oss;
+                             finish->Dump(oss, 0);
+                             return oss.str();
+                           },
                            substitute_aliases));
       if (grouped_graph.has_value()) {
         Executor exec =

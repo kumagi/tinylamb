@@ -29,7 +29,7 @@ inductive DoubleSqlVal where
   | null : DoubleSqlVal
   deriving DecidableEq, Repr
 
-/-- GoogleSQL / `tinylamb` の `SetOperationExecutor` (`relational.cpp:8793`) の同値判定:
+/-- GoogleSQL / `tinylamb` の `SetOperationExecutor` (`executor/set_operation.hpp`) の同値判定:
     `NULL` 同士も `NaN` 同士も同一要素として扱う。 -/
 def setOpSame : DoubleSqlVal → DoubleSqlVal → Bool
   | .null,  .null  => true
@@ -725,11 +725,11 @@ theorem not_null_and_trivial_selection_sound {Row α : Type}
 /-!
 ## 4. 等価クラス・推移律・冗長結合述語消去と `IN` リスト準結合化
 対象 C++ ルール:
-- `redundant_join_predicate_elimination` (`plan/cascades.cpp:6789`)
-- `join_predicate_transitivity` (`plan/cascades.cpp:6696`)
-- `infer_filter_from_equivalence_class` (`plan/cascades.cpp:5825`)
-- `functional_dependency_filter_reduction` (`plan/cascades.cpp:7314`)
-- `in_list_to_semi_join` (`plan/cascades.cpp:7200`)
+- `redundant_join_predicate_elimination` (`plan/cascades.cpp`)
+- `join_predicate_transitivity` (`plan/cascades.cpp`)
+- `infer_filter_from_equivalence_class` (`plan/cascades.cpp`)
+- `functional_dependency_filter_reduction` (`plan/cascades.cpp`)
+- `in_list_to_semi_join` (`plan/cascades.cpp`)
 -/
 
 def ufFind (fuel : Nat) (parent : List (String × String)) (x : String) : String :=
@@ -856,9 +856,9 @@ theorem in_list_to_semi_join_sound {Row α : Type} [DecidableEq α]
 /-!
 ## 5. Sort・Limit 合成と順序非依存集約の下の Sort 消去
 対象 C++ ルール:
-- `eliminate_sort_under_unordered_consumer` (`plan/cascades.cpp:4649`)
-- `push_filter_through_sort` (`plan/cascades.cpp:4600`)
-- `merge_limits` (`plan/cascades.cpp:3523`)
+- `eliminate_sort_under_unordered_consumer` (`plan/cascades.cpp`)
+- `push_filter_through_sort` (`plan/cascades.cpp`)
+- `merge_limits` (`plan/cascades.cpp`)
 -/
 
 /-- 🚨 **実在バグ証明 H3 (`eliminate_sort_under_unordered_consumer` の `HAVING` 消失バグ)**:

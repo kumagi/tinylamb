@@ -113,7 +113,13 @@ inline std::string ExplainAnalyze(Database& database, std::string_view sql,
   }
   Row row;
   while (prepared.Value()->Next(&row, nullptr)) {
-    profile += std::string(row[0].value.varchar_value) + "\n";
+    if (row.values_.size() != 1 || row[0].IsNull() ||
+        row[0].type != ValueType::kVarChar) {
+      ADD_FAILURE() << "EXPLAIN ANALYZE returned a non-text row for " << sql;
+      break;
+    }
+    profile.append(row[0].AsStringView());
+    profile.push_back('\n');
   }
   EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);

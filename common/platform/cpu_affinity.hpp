@@ -46,7 +46,8 @@ class CpuSet {
   // relies on being cheap.
   static std::optional<CpuSet> CurrentThread();
 
-  // A set containing only `cpu`.
+  // A set containing only `cpu` when affinity is supported and the id is
+  // valid for the platform. Returns an empty set otherwise.
   static CpuSet Single(int cpu);
 
   // Restricts the calling thread to this set. Returns false on failure (and

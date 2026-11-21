@@ -30,12 +30,16 @@ if (fn.Args().empty() || !fn.Args()[0] ||
     fn.Args()[0]->Type() != TypeTag::kConstantValue) {
   return Expression{};
 }
+if (fn.Args().size() > 2) {
+  return Expression{};
+}
 const Value json_val = fn.Args()[0]->AsConstantValue().GetValue();
 if (json_val.IsNull() || json_val.type != ValueType::kVarChar) {
   return Expression{};
 }
 ```
 
+- **引数個数**: 1 個または 2 個。3 個以上の呼び出しは実行時の引数個数エラーを保持します。
 - **JSON 本体の定数性**: 第 1 引数が非 NULL の VARCHAR 定数であること。
 - **JSON パスの定数性**: 第 2 引数が省略されている場合はデフォルトパス `"$"` を適用し、指定されている場合は非 NULL の VARCHAR 定数であること。
 - パス解析ルーチン `EvaluateJsonFunction` を呼び出し、結果を `ConstantValueExp` として返却します。

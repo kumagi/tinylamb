@@ -1571,8 +1571,9 @@ TEST_F(RelationalRegressionTest, RelativeDimensionPreloadKeepsDeferredFact) {
   RelationalRun(*rs_, "CREATE TABLE PreloadFact (dk INT64,dt INT64,v INT64)");
   constexpr int64_t kDim = 40000;
   constexpr int64_t kFact = kDim * 4;
-  std::map<std::pair<int64_t, std::string>, int64_t> counts;
-  std::map<std::tuple<int64_t, std::string, int64_t>, int64_t> wide_counts;
+  constexpr std::array<std::string_view, 3> kLabels{"0", "1", "2"};
+  std::map<std::pair<int64_t, std::string_view>, int64_t> counts;
+  std::map<std::tuple<int64_t, std::string_view, int64_t>, int64_t> wide_counts;
   {
     auto context = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, dim,
@@ -1600,8 +1601,9 @@ TEST_F(RelationalRegressionTest, RelativeDimensionPreloadKeepsDeferredFact) {
                                           Value(i % 100), Value(1)}))
               .HasValue());
       if (!null_key && (i % 100) / 10 == 1) {
-        ++counts[{key % 7, std::to_string(key % 3)}];
-        ++wide_counts[{key % 7, std::to_string(key % 3),
+        const auto label = kLabels[static_cast<size_t>(key % 3)];
+        ++counts[{key % 7, label}];
+        ++wide_counts[{key % 7, label,
                        ((i % 100) % 3 == 0 ? -1 : (i % 100) % 3)}];
       }
     }

@@ -131,7 +131,7 @@ requests are declined and
 clients continue over plain TCP. The default bind address is therefore
 `127.0.0.1`; binding to a non-loopback address should only be done on a trusted
 network. PostgreSQL extended-query messages, `COPY`, catalog compatibility for
-psql backslash commands such as `\\dt`, and PostgreSQL user/password management
+psql backslash commands such as `\dt`, and PostgreSQL user/password management
 are not implemented yet.
 
 Read scaling can be measured with the bundled PostgreSQL-protocol benchmark

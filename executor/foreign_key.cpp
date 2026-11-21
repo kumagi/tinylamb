@@ -243,6 +243,10 @@ Status ForeignKeyCounts::BuildSortedSegment(
     framed.reserve(sizeof(uint32_t) + block_buf.size());
     AppendUint32(&framed, block_entries);
     framed.append(block_buf);
+    if (!std::in_range<uint32_t>(framed.size())) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "foreign key spill leaf exceeds the file format limit");
+    }
     Status st = store_->Append(new_seg, framed.data(), framed.size());
     if (st != Status::kSuccess) {
       return st;
@@ -339,6 +343,11 @@ Status ForeignKeyCounts::BuildSortedSegment(
         dir_buf.append(lm.first_key);
         AppendUint64(&dir_buf, lm.offset);
         AppendUint32(&dir_buf, lm.length);
+      }
+      if (!std::in_range<uint32_t>(dir_buf.size())) {
+        store_->DropSegment(new_seg);
+        return StatusError(StatusCode::kInvalidArgument,
+                           "foreign key spill directory exceeds the file format limit");
       }
       const Status dst =
           store_->Append(new_seg, dir_buf.data(), dir_buf.size());

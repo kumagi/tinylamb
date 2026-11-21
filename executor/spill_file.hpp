@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -69,7 +70,8 @@ class SpillFile {
   StatusOr<std::vector<Row>> ReadAllRows();
   StatusOr<std::vector<std::pair<Row, RowPosition>>> ReadAllPositioned();
 
-  // Stream rows without buffering the full file in memory.
+  // Stream rows without buffering the full file. A callback returning Status
+  // can stop iteration by returning a failure.
   template <typename Fn>
   Status ForEachRow(Fn&& fn) {
     if (count_ == 0) {
@@ -90,7 +92,13 @@ class SpillFile {
             StatusCode::kCorrupt,
             "truncated spill file: " + path_.string());  // NOLINT(readability)
       }
-      fn(row);
+      if constexpr (std::is_same_v<
+                        std::remove_cvref_t<std::invoke_result_t<Fn&, Row&>>,
+                        Status>) {
+        RETURN_IF_FAIL(fn(row));
+      } else {
+        fn(row);
+      }
     }
     return Status::kSuccess;
   }

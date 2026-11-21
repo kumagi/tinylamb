@@ -94,9 +94,11 @@ TEST_F(FragmentAuditTest, NullComparisonsAgreeAcrossArtifacts) {
            .bytes_literal = {},
            .in_literals = {0},
            .bytes_literal_hi = {}});
+      fragment.projection = {0};
       auto result = Execute(Runtime::kNative, {artifact}, fragment, schema_);
       ASSERT_TRUE(result.HasValue());
       EXPECT_EQ(result.Value().rows_proved_pass, 1U);
+      EXPECT_EQ(result.Value().projected_values, (std::vector<int64_t>{2}));
     }
   }
 }
@@ -161,8 +163,8 @@ TEST_F(FragmentAuditTest, TopKPreservesRowIdentity) {
   Fragment fragment;
   fragment.top_k = TopKSpec{.col = 0, .k = 3, .descending = true};
   auto artifacts = Artifacts();
-  for (size_t i : {size_t{1}, size_t{2}}) {
-    auto result = Execute(Runtime::kNative, {artifacts[i]}, fragment, schema_);
+  for (const auto& artifact : artifacts) {
+    auto result = Execute(Runtime::kNative, {artifact}, fragment, schema_);
     ASSERT_TRUE(result.HasValue());
     ASSERT_EQ(result.Value().top_k.size(), 3U);
     EXPECT_EQ(result.Value().top_k[0].row, 3U);
@@ -180,16 +182,28 @@ TEST_F(FragmentAuditTest, SumRejectsSignedOverflow) {
   std::vector<Row> rows{Row({Value(1), Value(INT64_MAX)}),
                         Row({Value(2), Value(INT64_MAX)})};
   SortedRun run = fuzz::MakeRun(rows, schema);
-  const ArtifactRef artifact{
-      .kind = ArtifactRef::Kind::kRun, .run = &run, .schema = &schema};
-  Fragment fragment;
-  fragment.aggregate =
-      Aggregate{.kind = AggregateKind::kSum, .col = 1, .coeff = 2, .terms = {}};
-  auto result = Execute(Runtime::kNative, {artifact}, fragment, schema);
-  EXPECT_EQ(result.GetStatus(), Status::kIsInfinity);
-  fragment.aggregate->terms = {{.coeff = 2, .cols = {1, 1, 1, 1}}};
-  result = Execute(Runtime::kNative, {artifact}, fragment, schema);
-  EXPECT_EQ(result.GetStatus(), Status::kIsInfinity);
+  auto chunk = PaxChunk::BuildFromSortedRun(run, schema);
+  ASSERT_TRUE(chunk.HasValue());
+  MemTable table(schema);
+  for (const auto& row : rows) {
+    ASSERT_EQ(table.Put(row), Status::kSuccess);
+  }
+  const auto snapshot = table.Snapshot();
+  const std::vector<ArtifactRef> artifacts{
+      {.kind = ArtifactRef::Kind::kChunk, .chunk = &chunk.Value(), .schema = &schema},
+      {.kind = ArtifactRef::Kind::kRun, .run = &run, .schema = &schema},
+      {.kind = ArtifactRef::Kind::kMemSnapshot, .mem_rows = &snapshot,
+       .schema = &schema}};
+  for (const auto& artifact : artifacts) {
+    Fragment fragment;
+    fragment.aggregate =
+        Aggregate{.kind = AggregateKind::kSum, .col = 1, .coeff = 2, .terms = {}};
+    EXPECT_EQ(Execute(Runtime::kNative, {artifact}, fragment, schema).GetStatus(),
+              Status::kIsInfinity);
+    fragment.aggregate->terms = {{.coeff = 2, .cols = {1, 1, 1, 1}}};
+    EXPECT_EQ(Execute(Runtime::kNative, {artifact}, fragment, schema).GetStatus(),
+              Status::kIsInfinity);
+  }
 }
 
 TEST_F(FragmentAuditTest, GroupAggregateHonorsAccessMultiplierAndGeneration) {

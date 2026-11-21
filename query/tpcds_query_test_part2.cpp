@@ -34,8 +34,7 @@ TEST_F(TpcdsQueryTest, ExplainSeparatesHeuristicAndSelectedCore) {
   EXPECT_EQ(plan.find("Reoptimization"), std::string::npos) << plan;
 }
 
-// q18 executes and agrees with itself. The deterministic sweep above also
-// runs it twice; this case keeps a direct hook on the ROLLUP query.
+// q18 executes twice and returns the same rows, pinning its ROLLUP path.
 TEST_F(TpcdsQueryTest, RollupQueryExecutes) {
   const tpcds::TpcdsQuery* query = nullptr;
   for (const tpcds::TpcdsQuery& candidate : tpcds::kQueries) {
@@ -329,7 +328,7 @@ TEST_F(TpcdsQueryTest, LeanProvenTpcdsRewritesMatchRelationalFallback) {
       row = Row();
     }
     EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
-    context.PreCommit();
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess) << sql;
     return rows;
   };
 
@@ -366,6 +365,44 @@ TEST_F(TpcdsQueryTest, LeanProvenTpcdsRewritesMatchRelationalFallback) {
             EXPECT_EQ(a, b) << target << " (" << r << "," << c << ")";
           }
         }
+      }
+    } else {
+      // No total order: match rows as a multiset under the same per-cell
+      // tolerance the ordered path uses (NULL equality, NEAR for doubles).
+      auto cells_match = [](const Value& a, const Value& b) {
+        if (a.IsNull() || b.IsNull()) {
+          return a.IsNull() == b.IsNull();
+        }
+        if (a.type == ValueType::kDouble && b.type == ValueType::kDouble) {
+          const double scale =
+              std::max({1.0, std::abs(a.value.double_value),
+                        std::abs(b.value.double_value)});
+          return std::abs(a.value.double_value - b.value.double_value) <=
+                 1e-6 * scale;
+        }
+        return a == b;
+      };
+      std::vector<char> ref_used(ref_rows.size(), 0);
+      for (const Row& opt : opt_rows) {
+        bool matched = false;
+        for (size_t j = 0; j < ref_rows.size(); ++j) {
+          if (ref_used[j] || opt.values_.size() != ref_rows[j].values_.size()) {
+            continue;
+          }
+          bool same = true;
+          for (size_t c = 0; c < opt.values_.size(); ++c) {
+            if (!cells_match(opt[c], ref_rows[j][c])) {
+              same = false;
+              break;
+            }
+          }
+          if (same) {
+            ref_used[j] = 1;
+            matched = true;
+            break;
+          }
+        }
+        EXPECT_TRUE(matched) << target << ": unmatched optimized row";
       }
     }
   }

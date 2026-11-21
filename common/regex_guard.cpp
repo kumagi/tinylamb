@@ -814,7 +814,8 @@ StatusOr<const ReplacementProgram*> LookupOrCompileReplacement(
   // template.  Cache any program whose conservative size estimate fits the
   // per-thread budget, evicting round-robin-oldest entries as needed.
   static thread_local std::array<std::optional<Entry>, 8> cache;
-  static thread_local size_t next = 0;
+  static thread_local size_t head = 0;
+  static thread_local size_t count = 0;
   static thread_local size_t used = 0;
   for (const auto& entry : cache) {
     if (entry && entry->pattern == pattern &&
@@ -839,25 +840,21 @@ StatusOr<const ReplacementProgram*> LookupOrCompileReplacement(
   // wedge.
   constexpr size_t kProgramCacheBudget = size_t{8} << 20;
   if (bytes <= kProgramCacheBudget) {
-    // `next` is the FIFO head; free entries until this one fits.
-    for (;;) {
-      auto& slot = cache[next];
-      if (!slot && used + bytes <= kProgramCacheBudget) {
-        break;
-      }
-      if (slot) {
-        used -= slot->bytes;
-        slot.reset();
-      }
-      next = (next + 1) % cache.size();
+    // Evict the oldest entries only while a slot or bytes are needed.
+    while (count == cache.size() || used + bytes > kProgramCacheBudget) {
+      auto& slot = cache[head];
+      used -= slot->bytes;
+      slot.reset();
+      head = (head + 1) % cache.size();
+      --count;
     }
-    auto& entry = cache[next].emplace(
+    auto& entry = cache[(head + count) % cache.size()].emplace(
         Entry{.pattern = std::string(pattern),
               .replacement = std::string(replacement),
               .program = std::move(compiled),
               .bytes = bytes});
     used += bytes;
-    next = (next + 1) % cache.size();
+    ++count;
     return &entry.program;
   }
   return &temporary->emplace(std::move(compiled));

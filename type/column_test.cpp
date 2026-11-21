@@ -132,5 +132,15 @@ TEST(ColumnTest,
   ASSERT_NE(h1, h3);
   ASSERT_NE(h1, h4);
   ASSERT_EQ(h1, h5);
+  Column unsigned_column = c1;
+  unsigned_column.SetUnsigned(true);
+  Column interval_column = c1;
+  interval_column.SetInterval(true);
+  Column narrower_column = c1;
+  narrower_column.SetIntegerBits(32);
+  EXPECT_NE(hasher(unsigned_column), h1);
+  EXPECT_NE(hasher(interval_column), h1);
+  EXPECT_NE(hasher(narrower_column), h1);
+  EXPECT_NE(hasher(unsigned_column), hasher(interval_column));
 }
 }  // namespace tinylamb

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -293,14 +294,19 @@ struct PipelineGraph {
   std::vector<PipelineStage> stages;
   Schema output_schema;
   // Optional optimizer/plan dump text rendered in Dump() before Pipeline lines.
-  std::string plan_explain_text;
+  mutable std::string plan_explain_text;
+  // Lazy producer for plan_explain_text: materialized on first Dump/Explain so
+  // Prepare does not serialize the plan for every grouped query.
+  std::function<std::string()> plan_explain_producer;
   size_t estimated_grant_bytes{0};
   size_t min_grant_bytes{0};
   size_t requested_dop{1};
 };
 
 // Preferred grant a lowering may request for one pipeline, clamped to
-// [256 KiB, per-query grant ceiling].  The ceiling is the coordinator's
+// [256 KiB, max(256 KiB, per-query grant ceiling)]. The 256 KiB floor applies
+// to the request, and the coordinator enforces the configured ceiling. The
+// ceiling is the coordinator's
 // documented per-query bound (`TINYLAMB_QUERY_MEMORY_BYTES`, default 8 GiB,
 // never above the effective query-pool max); the coordinator still caps the
 // request to the pool and shrinks it toward min_grant_bytes under

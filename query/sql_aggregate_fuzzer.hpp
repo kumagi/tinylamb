@@ -12,17 +12,17 @@
 
 namespace tinylamb {
 
-// Aggregation / GROUP BY / window-function oracle.  Mirrors a single table
-// in C++, then runs random aggregate queries — GROUP BY over 1-2 key
+// Aggregation / GROUP BY / window-function oracle. Mirrors the generated
+// input in C++ and checks a separate primary-key fixture. It runs aggregate queries — GROUP BY over 1-2 key
 // columns, optional WHERE and HAVING (3VL on the aggregate result), global
 // aggregates over possibly-empty input (COUNT(*)=0 / SUM=NULL contract),
 // COUNTIF and DISTINCT aggregates (COUNT(DISTINCT)/SUM(DISTINCT)) — and
 // window queries (ROW_NUMBER / RANK / COUNT(*) / running SUM plus
-// ROWS BETWEEN k PRECEDING AND CURRENT ROW frames for SUM/COUNT(b)) over
-// PARTITION BY with a unique ORDER BY.  ~12% of iterations use ~8.4k rows
-// (multi-row VALUES batches) to cross the morsel/parallel-aggregation
-// threshold.  Whole result multisets are compared against the mirror's
-// SQL-semantics computation (NULL groups, NULL-skipping aggregates,
+// ROWS BETWEEN k PRECEDING AND CURRENT ROW frames for SUM/COUNT(b)).
+// Window cases cover both unique ordering and peer groups. About 12% of
+// iterations use large inputs in multi-row VALUES batches, with about
+// 8,300–8,409 or 33,000–33,040 rows to cross parallel execution thresholds. The C++
+// mirror checks whole result multisets (NULL groups, NULL-skipping aggregates,
 // NULLS-FIRST ranking).
 
 struct AggQueryExpect {
