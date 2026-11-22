@@ -31,6 +31,7 @@
 #include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
+#include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
@@ -105,7 +106,7 @@ TEST(IndexReservationTest, ForeignOwnerSummaryTracksRepeatedAndSharedPages) {
     EXPECT_TRUE(owner.txn_.HasForeignIndexReservations());
     EXPECT_TRUE(other.txn_.HasForeignIndexReservations());
     EXPECT_EQ(owner.txn_.IndexUndoReservedBytes(1), 384U);
-    other.Abort();
+    EXPECT_EQ(other.Abort(), Status::kSuccess);
     EXPECT_FALSE(owner.txn_.HasForeignIndexReservations());
     EXPECT_TRUE(observer.txn_.HasForeignIndexReservations());
     EXPECT_EQ(owner.txn_.IndexUndoReservedBytes(1), 0U);
@@ -115,14 +116,14 @@ TEST(IndexReservationTest, ForeignOwnerSummaryTracksRepeatedAndSharedPages) {
     again.txn_.ReserveIndexUndoBytes(1, 16);
     EXPECT_FALSE(again.txn_.HasForeignIndexReservations());
     EXPECT_TRUE(observer.txn_.HasForeignIndexReservations());
-    again.Abort();
+    EXPECT_EQ(again.Abort(), Status::kSuccess);
     EXPECT_FALSE(observer.txn_.HasForeignIndexReservations());
   }
   database->DeleteAll();
 }
 
 // ---------------------------------------------------------------------------
-// Commit-path publication (Phase 1-3): timestamps come from an atomic
+// Commit-path publication: timestamps come from an atomic
 // fetch_add and versions publish under shard locks; snapshots come from the
 // stable watermark.  These tests pin the invariant that makes that safe:
 // a reader can observe commits out of thin air only in timestamp order --
@@ -324,6 +325,7 @@ TEST(WriteIntentWaitTest, WaiterGivesUpAfterWaitLimit) {
   });
   waiter.join();
   EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
+  RemoveLogAndSegments(log_name);
 }
 
 // A stalled WAL durability barrier (a checkpoint's data-file sync stretching
@@ -366,6 +368,7 @@ TEST(WriteIntentWaitTest, DurabilityBarrierExtendsTheEscapeHatch) {
     waiter.join();
   }
   EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
+  RemoveLogAndSegments(log_name);
 }
 
 // A contended hot row legitimately queues waiters (TPC-C delivery: every
@@ -414,6 +417,7 @@ TEST(WriteIntentWaitTest, HandoverProgressResetsTheWaitDeadline) {
   }
   waiter.join();
   EXPECT_EQ(tm.Abort(holder1), Status::kSuccess);
+  RemoveLogAndSegments(log_name);
 }
 
 // The latch cycle's fast lane: once the holder STARTS aborting, its undo
@@ -460,6 +464,7 @@ TEST(WriteIntentWaitTest, WaiterGivesUpWhenHolderStartsAbort) {
             giveups_before + 1);
   EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
   EXPECT_TRUE(holder.IsAbortStarted());
+  RemoveLogAndSegments(log_name);
 }
 
 // Abort() itself arms the flag before the undo walk, on every non-read-only
@@ -481,10 +486,11 @@ TEST(WriteIntentWaitTest, AbortArmsHolderAbortFlag) {
 
   Transaction read_only = tm.Begin(true);
   EXPECT_EQ(tm.Abort(read_only), Status::kSuccess);
+  RemoveLogAndSegments(log_name);
 }
 
 // ---------------------------------------------------------------------------
-// Delivery DELETE visibility contract (Phase 0-1).
+// Delivery DELETE visibility contract.
 //
 // Contract under test: Table::Delete deletes exactly the rows the caller
 // selected through its own snapshot, and TransactionManager::ReadVersion
@@ -567,15 +573,20 @@ TEST_F(QueueTableTest, DeleteAffectsExactlyTheSnapshotSelectedRows) {
 
   // The surviving rows are untouched.
   int remaining = 0;
-  bool deleted_gone = true;
+  int surviving_deleted = 0;
   for (Iterator it = table.Value()->BeginFullScan(ctx.txn_); it.IsValid();
        ++it) {
     ++remaining;
-    if (it.Position() == selected.front()) {
-      deleted_gone = false;
+    // Check every deleted position, not just selected.front(): a swap that
+    // removes the first row but leaves another selected one must be caught.
+    for (const RowPosition& pos : selected) {
+      if (it.Position() == pos) {
+        ++surviving_deleted;
+        break;
+      }
     }
   }
-  EXPECT_TRUE(deleted_gone);
+  EXPECT_EQ(surviving_deleted, 0);
   EXPECT_EQ(remaining, (256 * 8) - kExpectedGone);
   ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
 
@@ -668,8 +679,9 @@ TEST_F(QueueTableTest, PointRangeOnKeyPrefixResolvesHeapRows) {
            "root cause.";
   }
 
-  // Once the index-layer descent is fixed, every prefix probe must agree
-  // with the heap exactly.
+  // Reached only when every prefix probe agreed with the heap; the GTEST_SKIP
+  // above intentionally returns on the known index-descent bug, so this
+  // assertion documents the post-fix contract rather than a reachable failure.
   EXPECT_TRUE(mismatches.empty());
   ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
 }

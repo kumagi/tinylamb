@@ -6,6 +6,7 @@
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -45,45 +46,162 @@ bool DeleteExecutor::Execute(Row* dst, RowPosition* rp) {
   uint64_t check_steps = 0;
   if (!ref_checks_.empty() && !pending.Empty()) {
     for (const ReferencedByCheck& check : ref_checks_) {
-      StatusOr<std::optional<std::string>> referenced = FindReferencedParentKey(
-          *check.child, *txn_, check.child_offset,
-          [&](const std::function<Status(const Value&)>& emit) -> Status {
-            return pending.ForEach([&](const RowPosition& pos) -> Status {
-              if ((++check_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
-                const Status ts = txn_->CheckStatementTimeout();
-                if (ts != Status::kSuccess) {
-                  return ts;
-                }
+      // Emits the parent key of every pending row whose encoded key is in
+      // |vacated| (empty map = every pending key).
+      const auto emit_candidate_keys =
+          [&](const std::function<Status(const Value&)>& emit,
+              const std::unordered_map<std::string, int64_t>* vacated)
+          -> Status {
+        return pending.ForEach([&](const RowPosition& pos) -> Status {
+          if ((++check_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
+            const Status ts = txn_->CheckStatementTimeout();
+            if (ts != Status::kSuccess) {
+              return ts;
+            }
+          }
+          StatusOr<Row> old = target_->Read(*txn_, pos);
+          if (!old.HasValue()) {
+            return old.GetStatus();
+          }
+          const Row& old_row = old.Value();
+          if (check.parent_offset < old_row.values_.size()) {
+            const Value& parent_key = old_row[check.parent_offset];
+            if (!parent_key.IsNull()) {
+              if (vacated != nullptr &&
+                  !vacated->contains(ForeignKeyString(parent_key))) {
+                return Status::kSuccess;
               }
-              StatusOr<Row> old = target_->Read(*txn_, pos);
-              if (!old.HasValue()) {
-                return old.GetStatus();
-              }
-              const Row& old_row = old.Value();
-              if (check.parent_offset < old_row.values_.size()) {
-                const Value& parent_key = old_row[check.parent_offset];
-                if (!parent_key.IsNull()) {
-                  return emit(parent_key);
-                }
-              }
-              return Status::kSuccess;
-            });
-          },
+              return emit(parent_key);
+            }
+          }
+          return Status::kSuccess;
+        });
+      };
+      const auto emit_ignore_positions =
           [&](const std::function<Status(const RowPosition&)>& emit) -> Status {
-            return pending.ForEach([&](const RowPosition& pos) -> Status {
-              if ((++check_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
-                const Status ts = txn_->CheckStatementTimeout();
-                if (ts != Status::kSuccess) {
-                  return ts;
-                }
-              }
-              return emit(pos);
-            });
-          });
+        // Self-referencing edge only: the ignore positions are
+        // target-row positions, meaningless against another child
+        // table's row space.
+        if (check.child != target_) {
+          return Status::kSuccess;
+        }
+        return pending.ForEach([&](const RowPosition& pos) -> Status {
+          if ((++check_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
+            const Status ts = txn_->CheckStatementTimeout();
+            if (ts != Status::kSuccess) {
+              return ts;
+            }
+          }
+          return emit(pos);
+        });
+      };
+      const auto probe_children =
+          [&](const std::unordered_map<std::string, int64_t>* vacated)
+          -> StatusOr<std::optional<std::string>> {
+        return FindReferencedParentKey(
+            *check.child, *txn_, check.child_offset,
+            [&](const std::function<Status(const Value&)>& emit) -> Status {
+              return emit_candidate_keys(emit, vacated);
+            },
+            emit_ignore_positions);
+      };
+
+      // Fast path: probe every pending key against the child tables.
+      StatusOr<std::optional<std::string>> referenced = probe_children(nullptr);
       if (!referenced.HasValue()) {
         return FailWith(referenced.GetStatus());
       }
-      if (referenced.Value().has_value()) {
+      if (!referenced.Value().has_value()) {
+        continue;
+      }
+
+      // The referenced column need not be unique, so a matched key may
+      // still be supplied by a parent row the statement keeps
+      // (p=(1,10),(1,20); DELETE WHERE tag=10 leaves a=1). On a unique
+      // column no survivor can share the key and the match is final.
+      if (target_->GetSchema()
+              .GetColumn(check.parent_offset)
+              .GetConstraint()
+              .IsUnique()) {
+        return FailWith(StatusError(
+            StatusCode::kConflicts,
+            "delete on table " + std::string(target_->GetSchema().Name()) +
+                " violates foreign key constraint (referenced by " +
+                std::string(check.child->GetSchema().Name()) + ")"));
+      }
+
+      // Multiset of the pending rows' keys, then a parent scan cancels
+      // each key against its surviving occurrences — the DELETE-side
+      // analog of UPDATE's supplied_keys/vacated_keys correction. A key
+      // erased here still exists after the statement; one left in the map
+      // (count may reach zero) is truly vacated.
+      std::unordered_map<std::string, int64_t> vacated;
+      const Status vac_st =
+          pending.ForEach([&](const RowPosition& pos) -> Status {
+            if ((++check_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
+              const Status ts = txn_->CheckStatementTimeout();
+              if (ts != Status::kSuccess) {
+                return ts;
+              }
+            }
+            StatusOr<Row> old = target_->Read(*txn_, pos);
+            if (!old.HasValue()) {
+              return old.GetStatus();
+            }
+            const Row& old_row = old.Value();
+            if (check.parent_offset < old_row.values_.size() &&
+                !old_row[check.parent_offset].IsNull()) {
+              ++vacated[ForeignKeyString(old_row[check.parent_offset])];
+            }
+            return Status::kSuccess;
+          });
+      if (vac_st != Status::kSuccess) {
+        return FailWith(vac_st);
+      }
+      if (!vacated.empty()) {
+        const std::vector<slot_t> projection{
+            static_cast<slot_t>(check.parent_offset)};
+        auto current = target_->BeginFullScan(*txn_, projection);
+        size_t steps = 0;
+        for (; current.IsValid(); ++current) {
+          if ((++steps & 255U) == 0 && txn_->HasStatementTimeout()) {
+            const Status timeout = txn_->CheckStatementTimeout();
+            if (timeout != Status::kSuccess) {
+              return FailWith(timeout);
+            }
+          }
+          const Row& parent = *current;
+          if (parent.values_.empty() || parent[0].IsNull()) {
+            continue;
+          }
+          auto found = vacated.find(ForeignKeyString(parent[0]));
+          if (found == vacated.end()) {
+            continue;
+          }
+          if (found->second > 0) {
+            --found->second;
+            continue;
+          }
+          vacated.erase(found);
+          if (vacated.empty()) {
+            break;
+          }
+        }
+        if (current.GetStatus() != Status::kSuccess) {
+          return FailWith(current.GetStatus());
+        }
+      }
+      if (vacated.empty()) {
+        continue;
+      }
+
+      // Re-probe with only the truly vacated keys.
+      StatusOr<std::optional<std::string>> still_referenced =
+          probe_children(&vacated);
+      if (!still_referenced.HasValue()) {
+        return FailWith(still_referenced.GetStatus());
+      }
+      if (still_referenced.Value().has_value()) {
         return FailWith(StatusError(
             StatusCode::kConflicts,
             "delete on table " + std::string(target_->GetSchema().Name()) +

@@ -53,6 +53,7 @@
 
 #include "common/constants.hpp"
 #include "common/digest.hpp"
+#include "common/literal_like_pattern.hpp"
 #include "common/math_utils.hpp"
 #include "common/regex_guard.hpp"
 #include "common/string_util.hpp"
@@ -884,6 +885,9 @@ bool JsonObjectFieldTexts(std::string_view json,
       }
       ++i;
     }
+    if (i == value_begin) {
+      return false;
+    }
     values->emplace_back(json.substr(value_begin, i - value_begin));
     if (i < end && json[i] == ',') {
       ++i;
@@ -909,6 +913,9 @@ int CompareEncodedField(std::string_view raw_left, std::string_view raw_right) {
   };
   const std::string_view l = trim(raw_left);
   const std::string_view r = trim(raw_right);
+  if (l.empty() || r.empty()) {
+    return l == r ? 1 : 0;
+  }
   // Deferred STRUCT construction represents a literal NULL as the quoted
   // text token `"null"` in its VARCHAR argument.
   if (l == "null" || r == "null" || l == "\"null\"") {
@@ -1502,6 +1509,9 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
 }
 
 bool Like(std::string_view value, std::string_view pattern) {
+  if (pattern.find('\\') != std::string_view::npos) {
+    return EscapedLikeMatch(value, pattern);
+  }
   // Fast paths for the common TPC-H shapes: 'foo%', '%foo', '%foo%'.
   if (pattern == "%") {
     return true;
@@ -1610,27 +1620,6 @@ StatusOr<Value> Aggregate(const AggregateExpression& aggregate,
 
 // Recursive descent over the expression tree is the intended evaluation
 // strategy.
-namespace {
-
-bool IsDatePartKeyword(std::string_view name) {
-  std::string upper_name(name);
-  for (char& c : upper_name) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  }
-  return upper_name == "DAY" || upper_name == "WEEK" || upper_name == "MONTH" ||
-         upper_name == "QUARTER" || upper_name == "YEAR" ||
-         upper_name == "HOUR" || upper_name == "MINUTE" ||
-         upper_name == "SECOND" || upper_name == "MILLISECOND" ||
-         upper_name == "MICROSECOND" || upper_name == "NANOSECOND" ||
-         upper_name == "MONDAY" || upper_name == "TUESDAY" ||
-         upper_name == "WEDNESDAY" || upper_name == "THURSDAY" ||
-         upper_name == "FRIDAY" || upper_name == "SATURDAY" ||
-         upper_name == "SUNDAY" || upper_name == "ISOYEAR" ||
-         upper_name == "ISOWEEK" || upper_name == "DATE";
-}
-
-}  // namespace
-
 Status ValidateExpressionColumnsInScope(const Expression& expression,
                                         const Schema& schema,
                                         const Scope* outer) {
@@ -1650,9 +1639,9 @@ Status ValidateExpressionColumnsInScope(const Expression& expression,
     if (lookup.HasValue()) {
       continue;
     }
-    if (IsDatePartKeyword(name.name)) {
-      continue;
-    }
+    // Date-part units of DATE_TRUNC/EXTRACT are turned into string literals by
+    // TryEvaluateFunction before evaluation, so no name needs a special pass
+    // here; an unresolved column is an error, exactly as in the AST evaluator.
     return lookup.GetStatus();
   }
   return Status::kSuccess;
@@ -1681,18 +1670,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       if (name.name == "*" && name.schema.empty()) {
         return Value(1);
       }
-      StatusOr<Value> lookup = TryLookup(name, scope);
-      if (lookup.HasValue()) {
-        return lookup;
-      }
-      if (IsDatePartKeyword(name.name)) {
-        std::string upper_name = name.name;
-        for (char& c : upper_name) {
-          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        }
-        return Value(std::move(upper_name));
-      }
-      return lookup.GetStatus();
+      return TryLookup(name, scope);
     }
     case TypeTag::kConstantValue:
       return expression->AsConstantValue().GetValue();
@@ -1887,8 +1865,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       // projected value is invariant across those probes, so a node-keyed
       // memo answers repeats with one map hit. Same liveness contract as
       // the membership cache: retained_statements pins the node address.
-      if (context.execution_runtime() != nullptr && !value.Exists() &&
-          value.Test() == nullptr && !value.ArrayResult()) {
+      if (ctes.empty() && context.execution_runtime() != nullptr &&
+          !value.Exists() && value.Test() == nullptr && !value.ArrayResult()) {
         auto& scalar_memo =
             context.execution_runtime()->uncorrelated_scalar_by_node;
         if (const auto memo_hit = scalar_memo.find(expression.get());
@@ -1931,7 +1909,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       }
       if (relation == nullptr) {
         const bool apply_cacheable =
-            scope.row != nullptr && context.execution_runtime() != nullptr &&
+            ctes.empty() && scope.row != nullptr &&
+            context.execution_runtime() != nullptr &&
             !StatementContainsVolatileFunctionCached(
                 context.execution_runtime(), *value.Query());
         if (apply_cacheable) {
@@ -2055,7 +2034,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           // exists that could turn UNKNOWN).
           saw_null = false;
           found = false;
-        } else if (uncorrelated && context.execution_runtime() != nullptr &&
+        } else if (ctes.empty() && uncorrelated &&
+                   context.execution_runtime() != nullptr &&
                    !structural_members) {
           // Probe-side fast path: the membership build is keyed on the
           // kQueryExp node pointer, so a repeat probe skips the fingerprint
@@ -2217,7 +2197,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
               : ProjectSubqueryRow(*first, as_struct, &subquery_schema);
       // Memoize only uncorrelated results: the correlated-index path yields
       // row-dependent values. See the node-keyed memo lookup above.
-      if (uncorrelated && context.execution_runtime() != nullptr) {
+      if (ctes.empty() && uncorrelated &&
+          context.execution_runtime() != nullptr) {
         context.execution_runtime()->uncorrelated_scalar_by_node.emplace(
             expression.get(), scalar);
       }

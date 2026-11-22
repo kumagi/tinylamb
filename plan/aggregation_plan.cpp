@@ -70,6 +70,29 @@ ValueType KeyValueType(const Expression& expression, const Schema& input) {
   }
 }
 
+// Order-key identity for the ordered aggregate shapes. Besides pointer
+// identity and the rendered spelling, two ColumnValues naming the same column
+// through different spellings (`t.x` vs `x`) describe the same order. This is
+// the same qualifier-tolerant normalization LogicalProperties::AreEqual uses
+// in cascades_search.cpp; without it a redundant Sort survives the memo.
+bool SameOrderKey(const ExpressionBase& lhs, const ExpressionBase& rhs) {
+  if (&lhs == &rhs) {
+    return true;
+  }
+  if (lhs.ToString() == rhs.ToString()) {
+    return true;
+  }
+  if (lhs.Type() != TypeTag::kColumnValue ||
+      rhs.Type() != TypeTag::kColumnValue) {
+    return false;
+  }
+  const ColumnName& left = lhs.AsColumnValue().GetColumnName();
+  const ColumnName& right = rhs.AsColumnValue().GetColumnName();
+  return left.name == right.name &&
+         (left.schema.empty() || right.schema.empty() ||
+          left.schema == right.schema);
+}
+
 // The group-key order both ordered shapes deliver: ascending with NULLs first,
 // which is the engine default for an ascending key. A requirement is answered
 // only when it asks for exactly that, and only for a prefix of the key list —
@@ -84,9 +107,8 @@ bool DeliversAscendingNullsFirst(
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (!ascending[i] || !keys[i].expression ||
-        (keys[i].expression != expressions[i] &&
-         keys[i].expression->ToString() != expressions[i]->ToString())) {
+    if (!ascending[i] || !keys[i].expression || !expressions[i] ||
+        !SameOrderKey(*keys[i].expression, *expressions[i])) {
       return false;
     }
     if (nulls_first != nullptr && i < nulls_first->size() &&

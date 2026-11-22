@@ -28,6 +28,7 @@
 
 #include "common/constants.hpp"
 #include "common/exception_status.hpp"
+#include "common/literal_like_pattern.hpp"
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
@@ -41,6 +42,7 @@
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/bytecode.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -149,6 +151,9 @@ bool IsIntLike(const Value& value) {
 }  // namespace
 
 bool FastLikeMatch(std::string_view value, std::string_view pattern) {
+  if (pattern.find('\\') != std::string_view::npos) {
+    return EscapedLikeMatch(value, pattern);
+  }
   if (pattern.find('_') == std::string_view::npos) {
     const size_t first_wild = pattern.find('%');
     if (first_wild == std::string_view::npos) {
@@ -217,7 +222,14 @@ bool FastLikeMatch(std::string_view value, std::string_view pattern) {
       ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
       pattern_pos = wildcard + 1;
-      value_pos = ++retry;
+      // '%' retries at the next UTF-8 character boundary, not the next byte
+      // (same rule as the AST and expression_eval Like evaluators): a
+      // byte-wise retry could restart a literal comparison inside a
+      // multi-byte sequence.
+      retry +=
+          std::min(Utf8SequenceLength(static_cast<unsigned char>(value[retry])),
+                   value.size() - retry);
+      value_pos = retry;
     } else {
       return false;
     }
@@ -259,20 +271,22 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred,
                                right.value.int_value);
     }
     if (left.type == ValueType::kDouble && right.type == ValueType::kDouble) {
-      // The canonical Value comparison folds all NaNs equal (matching group
-      // keys / hashing); a raw IEEE `==` would reject NaN=NaN rows when this
-      // predicate is pushed into the scan.
+      // Delegate to the canonical evaluator: SQL comparisons treat NaN as IEEE
+      // unordered (NaN = NaN is false), unlike group-key equality/hashing which
+      // folds all NaNs into one peer. A raw IEEE `==` here would agree for
+      // equality but disagree for the other comparison operators.
       StatusOr<Value> cmp = TryBinary(pred.op, left, right);
       return exact(std::move(cmp));
     }
     if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
-      if (left.IsCaseInsensitive() || right.IsCaseInsensitive()) {
+      const std::string_view lhs = left.value.varchar_value;
+      const std::string_view rhs = right.value.varchar_value;
+      if (left.IsCaseInsensitive() || right.IsCaseInsensitive() ||
+          (LooksLikeTimestampText(lhs) && LooksLikeTimestampText(rhs))) {
         StatusOr<Value> cmp = TryBinary(pred.op, left, right);
         return exact(std::move(cmp));
       }
-      return ComparePositional(
-          pred.op, static_cast<std::string_view>(left.value.varchar_value),
-          static_cast<std::string_view>(right.value.varchar_value));
+      return ComparePositional(pred.op, lhs, rhs);
     }
     // Compile time only admits like-kind pairs, but a stored value can still
     // surprise (e.g. mixed-layout rows shared with a differently-typed
@@ -722,6 +736,12 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
         compiled.constant.IsCaseInsensitive()) {
       return std::nullopt;
     }
+    // A runtime column value can carry case-insensitive collation even when
+    // its schema only says VARCHAR. LIKE with '_' can then raise an error.
+    const std::string_view pattern = compiled.constant.value.varchar_value;
+    if (pattern.find('_') != std::string_view::npos) {
+      return std::nullopt;
+    }
     return compiled;
   }
   if ((compiled.constant.type == ValueType::kInt64 ||
@@ -862,9 +882,7 @@ bool MatchPrefixIn(const Row& row, const PrefixInPredicate& pred) {
     return false;
   }
   const std::string_view text = cell.value.varchar_value;
-  return std::ranges::any_of(pred.prefixes, [text](const std::string& prefix) {
-    return text.starts_with(prefix);
-  });
+  return pred.Matches(text);
 }
 
 std::optional<PrefixInPredicate> TryCompilePrefixIn(const Expression& predicate,
@@ -929,6 +947,7 @@ std::optional<PrefixInPredicate> TryCompilePrefixIn(const Expression& predicate,
     }
     compiled.prefixes.emplace_back(prefix);
   }
+  compiled.Finalize();
   return compiled;
 }
 
@@ -1206,8 +1225,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                   if (nworkers >= 2) {
                     const bool flat_ready =
                         std::ranges::all_of(needed, [&](slot_t col) {
-                          return col < store->integer_columns.size() &&
-                                 store->integer_columns[col].size() ==
+                          return store->IntegerColumn(col).size() ==
                                      store->total_rows &&
                                  col < store->column_has_null.size() &&
                                  !store->column_has_null[col];
@@ -1220,7 +1238,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                         threads.emplace_back([&, w] {
                           if (flat_ready) {
                             const auto* keys =
-                                store->integer_columns[col_idx].data();
+                                store->IntegerColumn(col_idx).data();
                             const size_t begin =
                                 store->total_rows * w / nworkers;
                             const size_t end =
@@ -1247,14 +1265,48 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                                 }
                                 return;
                               }
-                              // T1231: unordered keys used to pay one
-                              // InsertDenseAtomic RMW per row — the
-                              // DenseWriter's word buffer cannot amortize a
-                              // random word sequence.  Buffer this worker's
-                              // slice instead, sort+unique it, then stream it
-                              // through the writer: atomic traffic drops from
-                              // one per row to one per 64 distinct keys that
-                              // share a word.
+                              // Lean proof:
+                              // lean/TinylambOpt/TpchSf10VectorizedExec.lean
+                              //   (parallel_bitset_or_eq_union)
+                              // When the dense bitset fits comfortably per
+                              // worker (<= 4 MiB), set bits in a thread-local
+                              // bitset and OR words once at the end instead of
+                              // sorting millions of random keys per worker.
+                              if (values->DenseWordCount() <= 524288) {
+                                const int64_t dmin = values->DenseMin();
+                                const int64_t dmax = values->DenseMax();
+                                std::vector<uint64_t> local_bits(
+                                    values->DenseWordCount(), 0ULL);
+                                uint64_t* lbits = local_bits.data();
+                                bool overflowed = false;
+                                for (size_t r = begin; r < end; ++r) {
+                                  const int64_t key = keys[r];
+                                  if (have_last && key == last) {
+                                    continue;
+                                  }
+                                  if (!matches(r)) {
+                                    continue;
+                                  }
+                                  if (key < dmin || key > dmax) {
+                                    overflowed = true;
+                                  } else {
+                                    const uint64_t off =
+                                        static_cast<uint64_t>(key) -
+                                        static_cast<uint64_t>(dmin);
+                                    lbits[off >> 6] |= uint64_t{1}
+                                                       << (off & 63);
+                                  }
+                                  have_last = true;
+                                  last = key;
+                                }
+                                if (overflowed) {
+                                  values->InsertDenseAtomic(dmin - 1);
+                                }
+                                values->MergeDenseWordsAtomic(
+                                    local_bits.data(), local_bits.size());
+                                return;
+                              }
+                              // T1231: fallback for huge dense spans.
                               std::vector<int64_t> keys_buf;
                               keys_buf.reserve(end - begin > (1U << 16)
                                                    ? (1U << 16)
@@ -1286,9 +1338,9 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                                 local_simple[0].column_payload) {
                               const auto& compare = local_simple[0];
                               const auto* a =
-                                  store->integer_columns[compare.column].data();
+                                  store->IntegerColumn(compare.column).data();
                               const auto* b =
-                                  store->integer_columns[compare.right_column]
+                                  store->IntegerColumn(compare.right_column)
                                       .data();
                               switch (compare.op) {
                                 case BinaryOperation::kEquals:
@@ -1317,12 +1369,11 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                               return std::ranges::all_of(
                                   local_simple, [&](const auto& compare) {
                                     const int64_t a =
-                                        store->integer_columns[compare.column]
-                                                              [r];
+                                        store->IntegerColumn(compare.column)[r];
                                     const int64_t b =
                                         compare.column_payload
-                                            ? store->integer_columns
-                                                  [compare.right_column][r]
+                                            ? store->IntegerColumn(
+                                                  compare.right_column)[r]
                                             : compare.int_constant;
                                     return ComparePositional(compare.op, a, b);
                                   });
@@ -1574,66 +1625,164 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
     }
   }
   const Relation* members = nullptr;
+  bool columnar_filled = false;
   if (!direct_filled) {
     RetainSubqueryStatement(runtime, query.Query());
     members = ExecuteCachedUncorrelated(context, statement, ctes, false);
     if (members == nullptr || members->schema.ColumnCount() != 1) {
       return mbail("exec");
     }
-    bool reserved_dense = false;
-    if (!members->HasSpill() && !members->rows.empty()) {
+    // Fast columnar-only path: scan the single int64/date column directly
+    // without boxing every member into a Row, and reserve dense mode when the
+    // observed [min, max] fits within kMaxDenseSpan.
+    if (!members->HasSpill() && members->HasColumnarOnly() &&
+        members->columnar != nullptr && !members->columnar->chunks.empty()) {
+      bool all_flat_int = true;
       int64_t min_k = std::numeric_limits<int64_t>::max();
       int64_t max_k = std::numeric_limits<int64_t>::min();
       bool any_k = false;
-      for (const Row& row : members->rows) {
-        if (!row.values_.empty() && !row.values_[0].IsNull() &&
-            (row.values_[0].type == ValueType::kInt64 ||
-             row.values_[0].type == ValueType::kDate)) {
-          const int64_t v = row.values_[0].value.int_value;
-          min_k = std::min(min_k, v);
-          max_k = std::max(max_k, v);
+      ValueType col_type = ValueType::kNull;
+      bool col_unsigned = false;
+      for (const ColumnarChunk& chunk : members->columnar->chunks) {
+        if (chunk.rows == 0) {
+          continue;
+        }
+        if (chunk.columns.empty()) {
+          all_flat_int = false;
+          break;
+        }
+        const ColumnarColumn& c0 = chunk.columns[0];
+        if (c0.encoding != ColumnarColumn::Encoding::kFlat || !c0.is_uniform ||
+            c0.is_interval ||
+            (c0.type != ValueType::kInt64 && c0.type != ValueType::kDate) ||
+            c0.ints.size() < chunk.rows) {
+          all_flat_int = false;
+          break;
+        }
+        if (!has_domain) {
+          has_domain = true;
+          col_type = c0.type;
+          col_unsigned = c0.is_unsigned;
+        } else if (c0.type != col_type || c0.is_unsigned != col_unsigned) {
+          all_flat_int = false;
+          break;
+        }
+        const int64_t* vals = c0.ints.data();
+        const bool has_nulls = c0.has_null && c0.nulls.size() >= chunk.rows;
+        if (!has_nulls) {
+          for (size_t r = 0; r < chunk.rows; ++r) {
+            const int64_t v = vals[r];
+            min_k = std::min(min_k, v);
+            max_k = std::max(max_k, v);
+          }
           any_k = true;
+        } else {
+          const uint8_t* nulls = c0.nulls.data();
+          for (size_t r = 0; r < chunk.rows; ++r) {
+            if (nulls[r] != 0) {
+              contains_null = true;
+            } else {
+              const int64_t v = vals[r];
+              min_k = std::min(min_k, v);
+              max_k = std::max(max_k, v);
+              any_k = true;
+            }
+          }
         }
       }
-      if (any_k && values->TryReserveDense(min_k, max_k)) {
-        reserved_dense = true;
+      if (all_flat_int) {
+        domain_type = col_type;
+        domain_unsigned = col_unsigned;
+        if (any_k) {
+          if (!values->TryReserveDense(min_k, max_k)) {
+            values->Reserve(members->TotalRows());
+          }
+          for (const ColumnarChunk& chunk : members->columnar->chunks) {
+            if (chunk.rows == 0) {
+              continue;
+            }
+            const ColumnarColumn& c0 = chunk.columns[0];
+            const int64_t* vals = c0.ints.data();
+            const bool has_nulls = c0.has_null && c0.nulls.size() >= chunk.rows;
+            if (!has_nulls) {
+              for (size_t r = 0; r < chunk.rows; ++r) {
+                values->Insert(vals[r]);
+              }
+            } else {
+              const uint8_t* nulls = c0.nulls.data();
+              for (size_t r = 0; r < chunk.rows; ++r) {
+                if (nulls[r] == 0) {
+                  values->Insert(vals[r]);
+                }
+              }
+            }
+          }
+        } else {
+          values->Reserve(0);
+        }
+        columnar_filled = true;
+      } else {
+        has_domain = false;
+        contains_null = false;
       }
     }
-    if (!reserved_dense) {
-      values->Reserve(members->TotalRows());
+    if (!columnar_filled) {
+      bool reserved_dense = false;
+      if (!members->HasSpill() && !members->rows.empty()) {
+        int64_t min_k = std::numeric_limits<int64_t>::max();
+        int64_t max_k = std::numeric_limits<int64_t>::min();
+        bool any_k = false;
+        for (const Row& row : members->rows) {
+          if (!row.values_.empty() && !row.values_[0].IsNull() &&
+              (row.values_[0].type == ValueType::kInt64 ||
+               row.values_[0].type == ValueType::kDate)) {
+            const int64_t v = row.values_[0].value.int_value;
+            min_k = std::min(min_k, v);
+            max_k = std::max(max_k, v);
+            any_k = true;
+          }
+        }
+        if (any_k && values->TryReserveDense(min_k, max_k)) {
+          reserved_dense = true;
+        }
+      }
+      if (!reserved_dense) {
+        values->Reserve(members->TotalRows());
+      }
     }
   }
   const Status iteration =
-      direct_filled ? Status::kSuccess
-                    : members->ForEachRow([&](const Row& row) {
-                        if (bail) {
-                          return;
-                        }
-                        const Value member = ProjectSubqueryRow(row, false);
-                        if (member.IsNull()) {
-                          contains_null = true;
-                          return;
-                        }
-                        if (!has_domain) {
-                          has_domain = true;
-                          domain_type = member.type;
-                          domain_unsigned = member.IsUnsigned();
-                        } else if (member.type != domain_type ||
-                                   member.IsUnsigned() != domain_unsigned) {
-                          // Mixed numeric domains promote under `=`; the
-                          // type-strict set would wrongly decide those probes.
-                          // Keep the AST path.
-                          bail = true;
-                          return;
-                        }
-                        if (member.Collation() != 0) {
-                          // A collated domain compares under folding rules the
-                          // set cannot reproduce; keep the AST path.
-                          bail = true;
-                          return;
-                        }
-                        values->Insert(member.value.int_value);
-                      });
+      (direct_filled || columnar_filled)
+          ? Status::kSuccess
+          : members->ForEachRow([&](const Row& row) {
+              if (bail) {
+                return;
+              }
+              const Value member = ProjectSubqueryRow(row, false);
+              if (member.IsNull()) {
+                contains_null = true;
+                return;
+              }
+              if (!has_domain) {
+                has_domain = true;
+                domain_type = member.type;
+                domain_unsigned = member.IsUnsigned();
+              } else if (member.type != domain_type ||
+                         member.IsUnsigned() != domain_unsigned) {
+                // Mixed numeric domains promote under `=`; the
+                // type-strict set would wrongly decide those probes.
+                // Keep the AST path.
+                bail = true;
+                return;
+              }
+              if (member.Collation() != 0) {
+                // A collated domain compares under folding rules the
+                // set cannot reproduce; keep the AST path.
+                bail = true;
+                return;
+              }
+              values->Insert(member.value.int_value);
+            });
   if (bail || iteration != Status::kSuccess || values->DenseOverflowed()) {
     return mbail("build");
   }
@@ -1641,6 +1790,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                      domain_unsigned != probe_column.IsUnsigned())) {
     return mbail("domain");
   }
+  values->TryCompactToDense();
   PrebuiltMembershipPredicate compiled;
   compiled.column = static_cast<slot_t>(*offset);
   compiled.negated = query.Negated();
@@ -3104,11 +3254,17 @@ std::optional<PrebuiltMembershipPredicate> TryCompileConstantInMembership(
   compiled.negated = negated;
   compiled.domain_type = probe_type;
   compiled.existence = false;
+  auto extract_const_item = [](const Expression& item) -> std::optional<Value> {
+    if (item && item->Type() == TypeTag::kConstantValue) {
+      return item->AsConstantValue().GetValue();
+    }
+    return TryDecideConstantConjunct(item);
+  };
   if (probe_type == ValueType::kVarChar) {
     auto strings = std::make_shared<MembershipStringSet>();
     strings->reserve(in.list_.size());
     for (const Expression& item : in.list_) {
-      std::optional<Value> val = TryDecideConstantConjunct(item);
+      std::optional<Value> val = extract_const_item(item);
       if (!val.has_value()) {
         return std::nullopt;
       }
@@ -3128,8 +3284,10 @@ std::optional<PrebuiltMembershipPredicate> TryCompileConstantInMembership(
   auto values = std::make_shared<FlatIntSet>();
   std::vector<int64_t> int_vals;
   int_vals.reserve(in.list_.size());
+  int64_t min_v = std::numeric_limits<int64_t>::max();
+  int64_t max_v = std::numeric_limits<int64_t>::min();
   for (const Expression& item : in.list_) {
-    std::optional<Value> val = TryDecideConstantConjunct(item);
+    std::optional<Value> val = extract_const_item(item);
     if (!val.has_value()) {
       return std::nullopt;
     }
@@ -3140,10 +3298,15 @@ std::optional<PrebuiltMembershipPredicate> TryCompileConstantInMembership(
     if (val->type != probe_type || val->IsUnsigned()) {
       return std::nullopt;
     }
-    int_vals.push_back(val->value.int_value);
+    const int64_t iv = val->value.int_value;
+    int_vals.push_back(iv);
+    min_v = std::min(min_v, iv);
+    max_v = std::max(max_v, iv);
   }
   if (!int_vals.empty()) {
-    values->Reserve(int_vals.size());
+    if (!values->TryReserveDense(min_v, max_v)) {
+      values->Reserve(int_vals.size());
+    }
     for (int64_t v : int_vals) {
       values->Insert(v);
     }
@@ -3384,6 +3547,150 @@ CompiledScanFilter CompileScanFilterUncached(
             break;
           }
           new_branches.push_back(std::move(branch));
+        }
+        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        //   (contiguous_interval_union_eq)
+        // Collapse a contiguous union of closed intervals on a single numeric
+        // column `(col >= lo_1 AND col <= hi_1) OR ...` (e.g. TPC-DS Q48/Q13/
+        // Q85 `ss_sales_price` / `ss_net_profit`) into two simple bounds
+        // `col >= min(lo_i) AND col <= max(hi_i)`, avoiding disjunctive-branch
+        // cross-product explosion and unlocking the columnar scan fast path.
+        if (all_branches_usable && new_branches.size() >= 2) {
+          bool can_collapse_intervals = true;
+          slot_t common_col = 0;
+          bool is_dbl = false;
+          bool is_int = false;
+          struct IntervalItem {
+            double d_lo{0.0};
+            double d_hi{0.0};
+            int64_t i_lo{0};
+            int64_t i_hi{0};
+            const SimpleComparePredicate* lo_pred{nullptr};
+            const SimpleComparePredicate* hi_pred{nullptr};
+          };
+          std::vector<IntervalItem> ivals;
+          ivals.reserve(new_branches.size());
+          for (size_t bi = 0; bi < new_branches.size(); ++bi) {
+            const auto& br = new_branches[bi];
+            if (!br.prefix_in.empty() || !br.prebuilt_membership.empty() ||
+                !br.residual.empty() || br.simple.size() != 2) {
+              can_collapse_intervals = false;
+              break;
+            }
+            const SimpleComparePredicate& p0 = br.simple[0];
+            const SimpleComparePredicate& p1 = br.simple[1];
+            if (p0.column_payload || p1.column_payload ||
+                p0.column != p1.column || p0.column >= schema.ColumnCount()) {
+              can_collapse_intervals = false;
+              break;
+            }
+            if (bi == 0) {
+              common_col = p0.column;
+              const Column& cmeta = schema.GetColumn(common_col);
+              if (cmeta.IsUnsigned() || cmeta.IsInterval()) {
+                can_collapse_intervals = false;
+                break;
+              }
+              if (cmeta.Type() == ValueType::kDouble) {
+                is_dbl = true;
+              } else if (cmeta.Type() == ValueType::kInt64 ||
+                         cmeta.Type() == ValueType::kDate) {
+                is_int = true;
+              } else {
+                can_collapse_intervals = false;
+                break;
+              }
+            } else if (p0.column != common_col) {
+              can_collapse_intervals = false;
+              break;
+            }
+            const SimpleComparePredicate* ge = nullptr;
+            const SimpleComparePredicate* le = nullptr;
+            if (p0.op == BinaryOperation::kGreaterThanEquals &&
+                p1.op == BinaryOperation::kLessThanEquals) {
+              ge = &p0;
+              le = &p1;
+            } else if (p1.op == BinaryOperation::kGreaterThanEquals &&
+                       p0.op == BinaryOperation::kLessThanEquals) {
+              ge = &p1;
+              le = &p0;
+            } else {
+              can_collapse_intervals = false;
+              break;
+            }
+            IntervalItem item;
+            item.lo_pred = ge;
+            item.hi_pred = le;
+            if (is_dbl) {
+              if (!ge->double_payload || !le->double_payload ||
+                  std::isnan(ge->double_constant) ||
+                  std::isnan(le->double_constant) ||
+                  ge->double_constant > le->double_constant) {
+                can_collapse_intervals = false;
+                break;
+              }
+              item.d_lo = ge->double_constant;
+              item.d_hi = le->double_constant;
+            } else {
+              if (!ge->int_payload || !le->int_payload ||
+                  ge->int_constant > le->int_constant) {
+                can_collapse_intervals = false;
+                break;
+              }
+              item.i_lo = ge->int_constant;
+              item.i_hi = le->int_constant;
+            }
+            ivals.push_back(item);
+          }
+          if (can_collapse_intervals && ivals.size() >= 2) {
+            if (is_dbl) {
+              std::ranges::sort(ivals, [](const IntervalItem& a,
+                                          const IntervalItem& b) {
+                return a.d_lo < b.d_lo || (a.d_lo == b.d_lo && a.d_hi < b.d_hi);
+              });
+              double cur_hi = ivals[0].d_hi;
+              const SimpleComparePredicate* best_hi = ivals[0].hi_pred;
+              bool contiguous = true;
+              for (size_t k = 1; k < ivals.size(); ++k) {
+                if (ivals[k].d_lo > cur_hi) {
+                  contiguous = false;
+                  break;
+                }
+                if (ivals[k].d_hi > cur_hi) {
+                  cur_hi = ivals[k].d_hi;
+                  best_hi = ivals[k].hi_pred;
+                }
+              }
+              if (contiguous) {
+                compiled.simple.push_back(*ivals[0].lo_pred);
+                compiled.simple.push_back(*best_hi);
+                continue;
+              }
+            } else if (is_int) {
+              std::ranges::sort(ivals, [](const IntervalItem& a,
+                                          const IntervalItem& b) {
+                return a.i_lo < b.i_lo || (a.i_lo == b.i_lo && a.i_hi < b.i_hi);
+              });
+              int64_t cur_hi = ivals[0].i_hi;
+              const SimpleComparePredicate* best_hi = ivals[0].hi_pred;
+              bool contiguous = true;
+              for (size_t k = 1; k < ivals.size(); ++k) {
+                if (ivals[k].i_lo > cur_hi) {
+                  contiguous = false;
+                  break;
+                }
+                if (ivals[k].i_hi > cur_hi) {
+                  cur_hi = ivals[k].i_hi;
+                  best_hi = ivals[k].hi_pred;
+                }
+              }
+              if (contiguous) {
+                compiled.simple.push_back(*ivals[0].lo_pred);
+                compiled.simple.push_back(*best_hi);
+                continue;
+              }
+            }
+          }
         }
         // Cross-product size guard: keep the branch list bounded and push
         // the predicate into the ordinary residual when it would explode.
@@ -4232,6 +4539,17 @@ const Row& TagUnsignedRow(const Row& row, const CompiledScanFilter& filter,
 WorkerScanFilterPrograms CompileWorkerFilter(const CompiledScanFilter& filter,
                                              const Schema& schema) {
   WorkerScanFilterPrograms programs;
+  const bool has_branch_residual =
+      std::ranges::any_of(filter.disjunctive_branches,
+                          [](const auto& b) { return !b.residual.empty(); });
+  // Positional predicates (simple, prefix_in, prebuilt_membership,
+  // prebuilt_scalar_compare) are already bound to exact slot_t indices and do
+  // not invoke bytecode, so duplicate column names in multi-self-join schemas
+  // (e.g. TPC-DS Q72 date_dim d1/d2/d3) do not require bytecode compilation.
+  if (filter.residual.empty() && !has_branch_residual) {
+    programs.complete = true;
+    return programs;
+  }
   if (!BytecodeEnabled() || SchemaHasDuplicateNames(schema)) {
     return programs;
   }
@@ -4374,14 +4692,12 @@ bool BytecodeColumnTruthy(const ColumnarColumn& col, size_t r) {
   }
   switch (col.type) {
     case ValueType::kInt64:
-    case ValueType::kDate:
       return col.IntAt(r) != 0;
     case ValueType::kDouble:
       return col.DoubleAt(r) != 0.0;
-    case ValueType::kVarChar:
-      return !col.StringAt(r).empty();
     default:
-      return false;
+      // Value::Truthy treats every other non-null type as true.
+      return true;
   }
 }
 
@@ -4489,10 +4805,276 @@ bool TryFilterColumnarTable(TransactionContext& context,
     result->SetColumnarTable(std::move(input_table), uniform);
     return true;
   }
-  const WorkerScanFilterPrograms programs =
-      CompileWorkerFilter(filter, match_schema);
+  struct FastScaledDoubleCmp {
+    bool active{false};
+    slot_t lhs_col{0};
+    slot_t rhs_col{0};
+    double scale{1.0};
+    BinaryOperation op{BinaryOperation::kLessThanEquals};
+  } fast_scaled_cmp;
+  if (filter.residual.size() == 1 && filter.residual[0] != nullptr &&
+      filter.residual[0]->Type() == TypeTag::kBinaryExp) {
+    const auto& bin = filter.residual[0]->AsBinaryExpression();
+    const BinaryOperation bop = bin.Op();
+    if (bop == BinaryOperation::kLessThan ||
+        bop == BinaryOperation::kLessThanEquals ||
+        bop == BinaryOperation::kGreaterThan ||
+        bop == BinaryOperation::kGreaterThanEquals) {
+      auto unwrap_double_cast = [](const Expression& e) -> const Expression& {
+        if (e && e->Type() == TypeTag::kCastExp &&
+            e->AsCastExpression().TargetValueType() == ValueType::kDouble &&
+            e->AsCastExpression().Child() != nullptr) {
+          return e->AsCastExpression().Child();
+        }
+        return e;
+      };
+      auto extract_col = [&](const Expression& raw_e, slot_t* out) -> bool {
+        const Expression& e = unwrap_double_cast(raw_e);
+        if (!e || e->Type() != TypeTag::kColumnValue) return false;
+        const auto off =
+            LocalColumnOffset(match_schema, e->AsColumnValue().GetColumnName());
+        if (!off.has_value() ||
+            static_cast<size_t>(*off) >= match_schema.ColumnCount() ||
+            match_schema.GetColumn(static_cast<size_t>(*off)).Type() !=
+                ValueType::kDouble) {
+          return false;
+        }
+        *out = *off;
+        return true;
+      };
+      auto extract_const = [&](const Expression& raw_e, double* out) -> bool {
+        const Expression& e = unwrap_double_cast(raw_e);
+        if (!e || e->Type() != TypeTag::kConstantValue) return false;
+        const Value& v = e->AsConstantValue().GetValue();
+        if (v.IsNull()) return false;
+        if (v.type == ValueType::kDouble) {
+          if (!std::isfinite(v.value.double_value)) return false;
+          *out = v.value.double_value;
+          return true;
+        }
+        if (v.type == ValueType::kInt64 && !v.IsUnsigned()) {
+          *out = static_cast<double>(v.value.int_value);
+          return true;
+        }
+        return false;
+      };
+      auto extract_scaled = [&](const Expression& raw_e, slot_t* col_out,
+                                double* scale_out) -> bool {
+        const Expression& e = unwrap_double_cast(raw_e);
+        if (!e || e->Type() != TypeTag::kBinaryExp ||
+            e->AsBinaryExpression().Op() != BinaryOperation::kMultiply) {
+          return false;
+        }
+        const auto& mb = e->AsBinaryExpression();
+        if (extract_const(mb.Left(), scale_out) &&
+            extract_col(mb.Right(), col_out)) {
+          return true;
+        }
+        if (extract_col(mb.Left(), col_out) &&
+            extract_const(mb.Right(), scale_out)) {
+          return true;
+        }
+        return false;
+      };
+      auto flip_op = [](BinaryOperation o) -> BinaryOperation {
+        switch (o) {
+          case BinaryOperation::kLessThan:
+            return BinaryOperation::kGreaterThan;
+          case BinaryOperation::kLessThanEquals:
+            return BinaryOperation::kGreaterThanEquals;
+          case BinaryOperation::kGreaterThan:
+            return BinaryOperation::kLessThan;
+          case BinaryOperation::kGreaterThanEquals:
+            return BinaryOperation::kLessThanEquals;
+          default:
+            return o;
+        }
+      };
+      slot_t lcol = 0;
+      slot_t rcol = 0;
+      double sc = 1.0;
+      if (extract_col(bin.Left(), &lcol) &&
+          extract_scaled(bin.Right(), &rcol, &sc)) {
+        fast_scaled_cmp = {.active = true,
+                           .lhs_col = lcol,
+                           .rhs_col = rcol,
+                           .scale = sc,
+                           .op = bop};
+      } else if (extract_scaled(bin.Left(), &rcol, &sc) &&
+                 extract_col(bin.Right(), &lcol)) {
+        fast_scaled_cmp = {.active = true,
+                           .lhs_col = lcol,
+                           .rhs_col = rcol,
+                           .scale = sc,
+                           .op = flip_op(bop)};
+      }
+    }
+  }
+
+  // Fast path for `col_a op (col_b +/- const_int)` over DATE or signed INT64
+  // columns (e.g. TPC-DS Q72 `d3.d_date > d1.d_date + 5`).
+  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  //   (date_offset_cmp_filter_sound)
+  struct FastDateOffsetCmp {
+    bool active{false};
+    bool is_date{false};
+    slot_t lhs_col{0};
+    slot_t rhs_col{0};
+    int64_t delta{0};
+    BinaryOperation op{BinaryOperation::kGreaterThan};
+  } fast_date_cmp;
+  if (!fast_scaled_cmp.active && filter.residual.size() == 1 &&
+      filter.residual[0] != nullptr &&
+      filter.residual[0]->Type() == TypeTag::kBinaryExp) {
+    const auto& bin = filter.residual[0]->AsBinaryExpression();
+    const BinaryOperation bop = bin.Op();
+    if (bop == BinaryOperation::kLessThan ||
+        bop == BinaryOperation::kLessThanEquals ||
+        bop == BinaryOperation::kGreaterThan ||
+        bop == BinaryOperation::kGreaterThanEquals ||
+        bop == BinaryOperation::kEquals || bop == BinaryOperation::kNotEquals) {
+      auto extract_id_col = [&](const Expression& e, slot_t* out,
+                                ValueType* vt_out) -> bool {
+        if (!e || e->Type() != TypeTag::kColumnValue) return false;
+        const auto off =
+            LocalColumnOffset(match_schema, e->AsColumnValue().GetColumnName());
+        if (!off.has_value() ||
+            static_cast<size_t>(*off) >= match_schema.ColumnCount()) {
+          return false;
+        }
+        const Column& c = match_schema.GetColumn(static_cast<size_t>(*off));
+        if (c.IsUnsigned() ||
+            (c.Type() != ValueType::kDate && c.Type() != ValueType::kInt64)) {
+          return false;
+        }
+        *out = *off;
+        *vt_out = c.Type();
+        return true;
+      };
+      auto extract_i64_const = [](const Expression& e, int64_t* out) -> bool {
+        if (!e || e->Type() != TypeTag::kConstantValue) return false;
+        const Value& v = e->AsConstantValue().GetValue();
+        if (v.IsNull() || v.type != ValueType::kInt64 || v.IsUnsigned()) {
+          return false;
+        }
+        *out = v.value.int_value;
+        return true;
+      };
+      auto extract_shifted = [&](const Expression& e, slot_t* col_out,
+                                 ValueType* vt_out,
+                                 int64_t* delta_out) -> bool {
+        if (!e || e->Type() != TypeTag::kBinaryExp) return false;
+        const auto& ab = e->AsBinaryExpression();
+        if (ab.Op() != BinaryOperation::kAdd &&
+            ab.Op() != BinaryOperation::kSubtract) {
+          return false;
+        }
+        int64_t k = 0;
+        if (extract_id_col(ab.Left(), col_out, vt_out) &&
+            extract_i64_const(ab.Right(), &k)) {
+          if (ab.Op() == BinaryOperation::kSubtract) {
+            if (k == std::numeric_limits<int64_t>::min()) return false;
+            k = -k;
+          }
+          *delta_out = k;
+          return true;
+        }
+        if (ab.Op() == BinaryOperation::kAdd &&
+            extract_i64_const(ab.Left(), &k) &&
+            extract_id_col(ab.Right(), col_out, vt_out)) {
+          *delta_out = k;
+          return true;
+        }
+        return false;
+      };
+      auto flip_op = [](BinaryOperation o) -> BinaryOperation {
+        switch (o) {
+          case BinaryOperation::kLessThan:
+            return BinaryOperation::kGreaterThan;
+          case BinaryOperation::kLessThanEquals:
+            return BinaryOperation::kGreaterThanEquals;
+          case BinaryOperation::kGreaterThan:
+            return BinaryOperation::kLessThan;
+          case BinaryOperation::kGreaterThanEquals:
+            return BinaryOperation::kLessThanEquals;
+          default:
+            return o;
+        }
+      };
+      slot_t lcol = 0;
+      slot_t rcol = 0;
+      ValueType lvt = ValueType::kNull;
+      ValueType rvt = ValueType::kNull;
+      int64_t delta = 0;
+      if (extract_id_col(bin.Left(), &lcol, &lvt) &&
+          extract_shifted(bin.Right(), &rcol, &rvt, &delta) && lvt == rvt) {
+        fast_date_cmp = {.active = true,
+                         .is_date = (lvt == ValueType::kDate),
+                         .lhs_col = lcol,
+                         .rhs_col = rcol,
+                         .delta = delta,
+                         .op = bop};
+      } else if (extract_shifted(bin.Left(), &rcol, &rvt, &delta) &&
+                 extract_id_col(bin.Right(), &lcol, &lvt) && lvt == rvt) {
+        fast_date_cmp = {.active = true,
+                         .is_date = (lvt == ValueType::kDate),
+                         .lhs_col = lcol,
+                         .rhs_col = rcol,
+                         .delta = delta,
+                         .op = flip_op(bop)};
+      }
+    }
+  }
+
+  bool fast_residual_covers_all_chunks = false;
+  if (fast_scaled_cmp.active) {
+    fast_residual_covers_all_chunks = true;
+    for (const ColumnarChunk& ch : input.chunks) {
+      if (ch.rows == 0) continue;
+      if (fast_scaled_cmp.lhs_col >= ch.columns.size() ||
+          fast_scaled_cmp.rhs_col >= ch.columns.size()) {
+        fast_residual_covers_all_chunks = false;
+        break;
+      }
+      const auto& ca = ch.columns[fast_scaled_cmp.lhs_col];
+      const auto& cb = ch.columns[fast_scaled_cmp.rhs_col];
+      if (!ca.is_uniform || ca.type != ValueType::kDouble || !cb.is_uniform ||
+          cb.type != ValueType::kDouble) {
+        fast_residual_covers_all_chunks = false;
+        break;
+      }
+    }
+  } else if (fast_date_cmp.active) {
+    fast_residual_covers_all_chunks = true;
+    const ValueType want_vt =
+        fast_date_cmp.is_date ? ValueType::kDate : ValueType::kInt64;
+    for (const ColumnarChunk& ch : input.chunks) {
+      if (ch.rows == 0) continue;
+      if (fast_date_cmp.lhs_col >= ch.columns.size() ||
+          fast_date_cmp.rhs_col >= ch.columns.size()) {
+        fast_residual_covers_all_chunks = false;
+        break;
+      }
+      const auto& ca = ch.columns[fast_date_cmp.lhs_col];
+      const auto& cb = ch.columns[fast_date_cmp.rhs_col];
+      if (!ca.is_uniform || ca.is_unsigned || ca.type != want_vt ||
+          !cb.is_uniform || cb.is_unsigned || cb.type != want_vt) {
+        fast_residual_covers_all_chunks = false;
+        break;
+      }
+    }
+  }
+
+  WorkerScanFilterPrograms programs = CompileWorkerFilter(filter, match_schema);
   if (!programs.complete) {
-    return false;
+    const bool has_branch_residual =
+        std::ranges::any_of(filter.disjunctive_branches,
+                            [](const auto& b) { return !b.residual.empty(); });
+    if (fast_residual_covers_all_chunks && !has_branch_residual) {
+      programs.complete = true;
+    } else {
+      return false;
+    }
   }
 
   const size_t nchunks = input.chunks.size();
@@ -4618,6 +5200,83 @@ bool TryFilterColumnarTable(TransactionContext& context,
                                      bool* has_sel) {
     const size_t nrows = chunk.rows;
     if (pred.column_payload || pred.column >= chunk.columns.size()) {
+      if (pred.column_payload && pred.column < chunk.columns.size() &&
+          pred.right_column < chunk.columns.size()) {
+        const ColumnarColumn& lc = chunk.columns[pred.column];
+        const ColumnarColumn& rc = chunk.columns[pred.right_column];
+        if (lc.is_uniform && rc.is_uniform && !lc.is_unsigned &&
+            !rc.is_unsigned && lc.type == rc.type && lc.IsFlat() &&
+            rc.IsFlat()) {
+          if ((lc.type == ValueType::kInt64 || lc.type == ValueType::kDate) &&
+              lc.ints.size() == nrows && rc.ints.size() == nrows) {
+            const int64_t* __restrict lv = lc.ints.data();
+            const int64_t* __restrict rv = rc.ints.data();
+            const bool any_null = lc.has_null || rc.has_null;
+            const BinaryOperation op = pred.op;
+            auto cmp_i = [&](int64_t a, int64_t b) noexcept -> bool {
+              switch (op) {
+                case BinaryOperation::kEquals:
+                  return a == b;
+                case BinaryOperation::kNotEquals:
+                  return a != b;
+                case BinaryOperation::kLessThan:
+                  return a < b;
+                case BinaryOperation::kLessThanEquals:
+                  return a <= b;
+                case BinaryOperation::kGreaterThan:
+                  return a > b;
+                case BinaryOperation::kGreaterThanEquals:
+                  return a >= b;
+                default:
+                  return false;
+              }
+            };
+            if (!any_null) {
+              NarrowSelection(nrows, sel, has_sel,
+                              [&](uint32_t r) { return cmp_i(lv[r], rv[r]); });
+            } else {
+              NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+                return !lc.IsNull(r) && !rc.IsNull(r) && cmp_i(lv[r], rv[r]);
+              });
+            }
+            return;
+          }
+          if (lc.type == ValueType::kDouble && lc.doubles.size() == nrows &&
+              rc.doubles.size() == nrows) {
+            const double* __restrict lv = lc.doubles.data();
+            const double* __restrict rv = rc.doubles.data();
+            const bool any_null = lc.has_null || rc.has_null;
+            const BinaryOperation op = pred.op;
+            auto cmp_d = [&](double a, double b) noexcept -> bool {
+              switch (op) {
+                case BinaryOperation::kEquals:
+                  return a == b;
+                case BinaryOperation::kNotEquals:
+                  return a != b;
+                case BinaryOperation::kLessThan:
+                  return a < b;
+                case BinaryOperation::kLessThanEquals:
+                  return a <= b;
+                case BinaryOperation::kGreaterThan:
+                  return a > b;
+                case BinaryOperation::kGreaterThanEquals:
+                  return a >= b;
+                default:
+                  return false;
+              }
+            };
+            if (!any_null) {
+              NarrowSelection(nrows, sel, has_sel,
+                              [&](uint32_t r) { return cmp_d(lv[r], rv[r]); });
+            } else {
+              NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+                return !lc.IsNull(r) && !rc.IsNull(r) && cmp_d(lv[r], rv[r]);
+              });
+            }
+            return;
+          }
+        }
+      }
       const size_t need = std::max<size_t>(pred.column, pred.right_column) + 1;
       if (scratch_row->values_.size() < need) {
         scratch_row->values_.resize(need);
@@ -4813,9 +5472,7 @@ bool TryFilterColumnarTable(TransactionContext& context,
     const ColumnarColumn& col = chunk.columns[pred.column];
     if (col.encoding == ColumnarColumn::Encoding::kConstant && col.is_uniform) {
       if (col.const_is_null || col.type != ValueType::kVarChar ||
-          !std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
-            return col.const_string.starts_with(p);
-          })) {
+          !pred.Matches(col.const_string)) {
         sel->clear();
         *has_sel = true;
       }
@@ -4841,12 +5498,7 @@ bool TryFilterColumnarTable(TransactionContext& context,
         fresh.pass.reserve(ec);
         for (size_t code = 0; code < ec; ++code) {
           const std::string_view sv = col.dict->StringEntryAt(code);
-          fresh.pass.push_back(std::ranges::any_of(pred.prefixes,
-                                                   [&](const std::string& p) {
-                                                     return sv.starts_with(p);
-                                                   })
-                                   ? 1
-                                   : 0);
+          fresh.pass.push_back(pred.Matches(sv) ? 1 : 0);
         }
         if (cache.size() >= kMaxDictFilterCacheEntries) {
           cache.clear();
@@ -4871,20 +5523,14 @@ bool TryFilterColumnarTable(TransactionContext& context,
           if (has_null && nulls[r] != 0) {
             return false;
           }
-          const std::string_view sv = strs[r];
-          return std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
-            return sv.starts_with(p);
-          });
+          return pred.Matches(strs[r]);
         });
       } else {
         NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
           if (col.IsNull(r)) {
             return false;
           }
-          const std::string_view sv = col.StringAt(r);
-          return std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
-            return sv.starts_with(p);
-          });
+          return pred.Matches(col.StringAt(r));
         });
       }
       return;
@@ -4900,9 +5546,7 @@ bool TryFilterColumnarTable(TransactionContext& context,
       if (v.IsNull() || v.type != ValueType::kVarChar) {
         return false;
       }
-      return std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
-        return v.value.varchar_value.starts_with(p);
-      });
+      return pred.Matches(v.value.varchar_value);
     });
   };
 
@@ -5457,54 +6101,208 @@ bool TryFilterColumnarTable(TransactionContext& context,
       }
 
       if (!filter.residual.empty() && !empty_now()) {
-        const size_t active_count = has_sel ? sel.size() : nrows;
-        for (size_t c = 0; c < chunk.columns.size(); ++c) {
-          if (c < residual_needed_cols.size() && residual_needed_cols[c] != 0) {
-            if (flat_view_ready[c] == 0) {
-              views[c] = chunk.columns[c].ToBytecodeView(
-                  chunk.rows, &view_scratches[c], nullptr);
-              flat_view_ready[c] = 1;
+        bool handled_fast_scaled = false;
+        if (fast_scaled_cmp.active &&
+            fast_scaled_cmp.lhs_col < chunk.columns.size() &&
+            fast_scaled_cmp.rhs_col < chunk.columns.size()) {
+          const ColumnarColumn& ca = chunk.columns[fast_scaled_cmp.lhs_col];
+          const ColumnarColumn& cb = chunk.columns[fast_scaled_cmp.rhs_col];
+          if (ca.encoding == ColumnarColumn::Encoding::kFlat && ca.is_uniform &&
+              ca.type == ValueType::kDouble && ca.doubles.size() == nrows &&
+              cb.encoding == ColumnarColumn::Encoding::kFlat && cb.is_uniform &&
+              cb.type == ValueType::kDouble && cb.doubles.size() == nrows) {
+            const double* __restrict av = ca.doubles.data();
+            const double* __restrict bv = cb.doubles.data();
+            const double sc = fast_scaled_cmp.scale;
+            const bool no_null = !ca.has_null && !cb.has_null;
+            auto cmp_val = [&](double a, double b) noexcept -> bool {
+              const double rhs = sc * b;
+              switch (fast_scaled_cmp.op) {
+                case BinaryOperation::kLessThan:
+                  return a < rhs;
+                case BinaryOperation::kLessThanEquals:
+                  return a <= rhs;
+                case BinaryOperation::kGreaterThan:
+                  return a > rhs;
+                case BinaryOperation::kGreaterThanEquals:
+                  return a >= rhs;
+                default:
+                  return false;
+              }
+            };
+            if (!has_sel) {
+              sel.clear();
+              if (no_null) {
+                for (uint32_t r = 0; r < static_cast<uint32_t>(nrows); ++r) {
+                  if (cmp_val(av[r], bv[r])) {
+                    sel.push_back(r);
+                  }
+                }
+              } else {
+                for (uint32_t r = 0; r < static_cast<uint32_t>(nrows); ++r) {
+                  if (!ca.IsNull(r) && !cb.IsNull(r) && cmp_val(av[r], bv[r])) {
+                    sel.push_back(r);
+                  }
+                }
+              }
+              has_sel = true;
+            } else {
+              size_t out_n = 0;
+              if (no_null) {
+                for (size_t i = 0; i < sel.size(); ++i) {
+                  const uint32_t r = sel[i];
+                  if (cmp_val(av[r], bv[r])) {
+                    sel[out_n++] = r;
+                  }
+                }
+              } else {
+                for (size_t i = 0; i < sel.size(); ++i) {
+                  const uint32_t r = sel[i];
+                  if (!ca.IsNull(r) && !cb.IsNull(r) && cmp_val(av[r], bv[r])) {
+                    sel[out_n++] = r;
+                  }
+                }
+              }
+              sel.resize(out_n);
             }
-          } else {
-            views[c] = BytecodeColumnView{};
+            handled_fast_scaled = true;
           }
         }
-        truthy_col.Init(ValueType::kNull, false, false, active_count);
-        BytecodeColumnSink sink = truthy_col.AsBytecodeSink(0);
-        Status eval_err{Status::kSuccess};
-        const auto st = programs.residual->TryEvaluateColumnarBatch(
-            views, has_sel ? sel.data() : nullptr, active_count, &sink,
-            &eval_err);
-        if (st == BytecodeProgram::FastEval::kDone) {
-          truthy_col.SyncFromBytecodeSink(sink, nullptr, active_count);
-          if (!has_sel) {
-            sel.clear();
-            for (size_t i = 0; i < active_count; ++i) {
-              if (BytecodeColumnTruthy(truthy_col, i)) {
-                sel.push_back(static_cast<uint32_t>(i));
+        if (!handled_fast_scaled && fast_date_cmp.active &&
+            fast_date_cmp.lhs_col < chunk.columns.size() &&
+            fast_date_cmp.rhs_col < chunk.columns.size()) {
+          const ColumnarColumn& ca = chunk.columns[fast_date_cmp.lhs_col];
+          const ColumnarColumn& cb = chunk.columns[fast_date_cmp.rhs_col];
+          const ValueType want_vt =
+              fast_date_cmp.is_date ? ValueType::kDate : ValueType::kInt64;
+          if (ca.is_uniform && !ca.is_unsigned && ca.type == want_vt &&
+              cb.is_uniform && !cb.is_unsigned && cb.type == want_vt) {
+            const bool a_flat = ca.IsFlat() && ca.ints.size() == nrows;
+            const bool b_flat = cb.IsFlat() && cb.ints.size() == nrows;
+            const int64_t* __restrict av = a_flat ? ca.ints.data() : nullptr;
+            const int64_t* __restrict bv = b_flat ? cb.ints.data() : nullptr;
+            const int64_t delta = fast_date_cmp.delta;
+            const bool is_date = fast_date_cmp.is_date;
+            const bool no_null = !ca.has_null && !cb.has_null;
+            const BinaryOperation op = fast_date_cmp.op;
+            const bool has_bc_fallback = programs.residual.has_value();
+            bool out_of_range = false;
+            auto cmp_row = [&](uint32_t r) -> bool {
+              if (!no_null && (ca.IsNull(r) || cb.IsNull(r))) {
+                return false;
               }
-            }
-            has_sel = true;
-          } else {
-            size_t out = 0;
-            for (size_t i = 0; i < active_count; ++i) {
-              if (BytecodeColumnTruthy(truthy_col, i)) {
-                sel[out++] = sel[i];
+              const int64_t a = a_flat ? av[r] : ca.IntAt(r);
+              const int64_t b = b_flat ? bv[r] : cb.IntAt(r);
+              int64_t rhs = 0;
+              if (__builtin_add_overflow(b, delta, &rhs) ||
+                  (is_date && (rhs < kDateMinDays || rhs > kDateMaxDays)))
+                  [[unlikely]] {
+                if (has_bc_fallback) {
+                  out_of_range = true;
+                } else {
+                  chunk_deferred_rows.push_back(r);
+                }
+                return false;
               }
+              switch (op) {
+                case BinaryOperation::kLessThan:
+                  return a < rhs;
+                case BinaryOperation::kLessThanEquals:
+                  return a <= rhs;
+                case BinaryOperation::kGreaterThan:
+                  return a > rhs;
+                case BinaryOperation::kGreaterThanEquals:
+                  return a >= rhs;
+                case BinaryOperation::kEquals:
+                  return a == rhs;
+                case BinaryOperation::kNotEquals:
+                  return a != rhs;
+                default:
+                  return false;
+              }
+            };
+            std::vector<uint32_t> saved_sel;
+            const bool saved_has_sel = has_sel;
+            if (has_bc_fallback && has_sel) {
+              saved_sel = sel;
             }
-            sel.resize(out);
+            if (!has_sel) {
+              sel.clear();
+              for (uint32_t r = 0; r < static_cast<uint32_t>(nrows); ++r) {
+                if (cmp_row(r)) {
+                  sel.push_back(r);
+                }
+              }
+              has_sel = true;
+            } else {
+              size_t out_n = 0;
+              for (size_t i = 0; i < sel.size(); ++i) {
+                const uint32_t r = sel[i];
+                if (cmp_row(r)) {
+                  sel[out_n++] = r;
+                }
+              }
+              sel.resize(out_n);
+            }
+            if (out_of_range) {
+              sel = std::move(saved_sel);
+              has_sel = saved_has_sel;
+            } else {
+              handled_fast_scaled = true;
+            }
           }
-        } else {
-          NarrowSelection(nrows, &sel, &has_sel, [&](uint32_t r) {
-            chunk.MaterializeRowInto(r, &full_row);
-            StatusOr<Value> decided =
-                TryEvaluateRowAuto(*programs.residual, full_row);
-            if (!decided.HasValue()) {
-              chunk_deferred_rows.push_back(r);
-              return false;
+        }
+        if (!handled_fast_scaled) {
+          const size_t active_count = has_sel ? sel.size() : nrows;
+          for (size_t c = 0; c < chunk.columns.size(); ++c) {
+            if (c < residual_needed_cols.size() &&
+                residual_needed_cols[c] != 0) {
+              if (flat_view_ready[c] == 0) {
+                views[c] = chunk.columns[c].ToBytecodeView(
+                    chunk.rows, &view_scratches[c], nullptr);
+                flat_view_ready[c] = 1;
+              }
+            } else {
+              views[c] = BytecodeColumnView{};
             }
-            return Truthy(decided.Value());
-          });
+          }
+          truthy_col.Init(ValueType::kNull, false, false, active_count);
+          BytecodeColumnSink sink = truthy_col.AsBytecodeSink(0);
+          Status eval_err{Status::kSuccess};
+          const auto st = programs.residual->TryEvaluateColumnarBatch(
+              views, has_sel ? sel.data() : nullptr, active_count, &sink,
+              &eval_err);
+          if (st == BytecodeProgram::FastEval::kDone) {
+            truthy_col.SyncFromBytecodeSink(sink, nullptr, active_count);
+            if (!has_sel) {
+              sel.clear();
+              for (size_t i = 0; i < active_count; ++i) {
+                if (BytecodeColumnTruthy(truthy_col, i)) {
+                  sel.push_back(static_cast<uint32_t>(i));
+                }
+              }
+              has_sel = true;
+            } else {
+              size_t out = 0;
+              for (size_t i = 0; i < active_count; ++i) {
+                if (BytecodeColumnTruthy(truthy_col, i)) {
+                  sel[out++] = sel[i];
+                }
+              }
+              sel.resize(out);
+            }
+          } else {
+            NarrowSelection(nrows, &sel, &has_sel, [&](uint32_t r) {
+              chunk.MaterializeRowInto(r, &full_row);
+              StatusOr<Value> decided =
+                  TryEvaluateRowAuto(*programs.residual, full_row);
+              if (!decided.HasValue()) {
+                chunk_deferred_rows.push_back(r);
+                return false;
+              }
+              return Truthy(decided.Value());
+            });
+          }
         }
       }
 
@@ -6119,7 +6917,7 @@ Relation UnnestValueToRelation(const SelectSource& source,
     // AND the encoded members carry those names, each member is placed at
     // its declared position (a JSON document may serialize members in any
     // order). Anonymous fN encodings and positional members keep the
-    // serialized-order behaviour.
+    // serialized-order behavior.
     const bool declared_named =
         declared_struct && !declared_fields.empty() &&
         std::ranges::none_of(declared_fields,
@@ -6722,8 +7520,12 @@ std::optional<bool> TryMatchSimpleCompareArena(
           std::bit_cast<double>(row_cells[pred.right_column]));
     }
     if (lt == ValueType::kVarChar && rt == ValueType::kVarChar) {
-      return ComparePositional(pred.op, arena.Varchar(row, pred.column),
-                               arena.Varchar(row, pred.right_column));
+      const std::string_view lhs = arena.Varchar(row, pred.column);
+      const std::string_view rhs = arena.Varchar(row, pred.right_column);
+      if (LooksLikeTimestampText(lhs) && LooksLikeTimestampText(rhs)) {
+        return std::nullopt;  // Let the boxed comparator compare instants.
+      }
+      return ComparePositional(pred.op, lhs, rhs);
     }
     return std::nullopt;
   }

@@ -135,6 +135,35 @@ TEST(RuntimeFilterTest, ExactKeyEnclosureKeepsConjunctiveMembership) {
   EXPECT_EQ(empty.ExactKeys(), nullptr);
 }
 
+TEST(RuntimeFilterTest, DenseBitsNeverClaimKeysThePartsReject) {
+  // The dense bitmap replaces the parts scan in Reject()/RejectRange(), so a
+  // candidate key a part rejects must keep a clear bit even when the caller's
+  // sorted key list contains it. MinMax accepts [0,10]; the all-zero Bloom
+  // rejects every key, so the conjunction accepts nothing.
+  std::vector<std::unique_ptr<RuntimeFilter>> parts;
+  parts.push_back(std::make_unique<MinMaxRuntimeFilter>(0, 10, 3));
+  parts.push_back(std::make_unique<BloomRuntimeFilter>(
+      std::vector<uint64_t>(8, 0), 512, 3));
+  const std::vector<int64_t> keys = {3, 5, 7};
+  const RuntimeFilterGroup group(std::move(parts), &keys);
+  ASSERT_TRUE(group.has_dense_bits());
+  for (const int64_t key : keys) {
+    EXPECT_TRUE(group.Reject(key)) << "key " << key;
+  }
+  EXPECT_TRUE(group.RejectRange(3, 7));
+  EXPECT_TRUE(group.RejectRange(0, 10));
+
+  // Control: a single MinMax part accepts every in-range candidate, so the
+  // same key list still populates the bitmap.
+  std::vector<std::unique_ptr<RuntimeFilter>> wide;
+  wide.push_back(std::make_unique<MinMaxRuntimeFilter>(0, 10, 3));
+  const RuntimeFilterGroup accepted(std::move(wide), &keys);
+  ASSERT_TRUE(accepted.has_dense_bits());
+  for (const int64_t key : keys) {
+    EXPECT_FALSE(accepted.Reject(key)) << "key " << key;
+  }
+}
+
 TEST(RuntimeFilterTest, EmptyBuildPublishesNothingUnlessRejectAllAllowed) {
   RuntimeFilterBuilder builder;
   EXPECT_TRUE(builder.empty());
@@ -576,8 +605,9 @@ TEST(RuntimeFilterTest, BatchedObservationsPreserveMembershipAndOverflow) {
   EXPECT_TRUE(batch.empty());
   scalar.ObserveNull();
   batch.ObserveNull();
-  for (int64_t key : keys) { scalar.Observe(key);
-}
+  for (int64_t key : keys) {
+    scalar.Observe(key);
+  }
   batch.Observe(std::span<const int64_t>(keys).first(3));
   batch.Observe(keys[3]);
   batch.Observe(std::span<const int64_t>(keys).subspan(4));
@@ -587,11 +617,12 @@ TEST(RuntimeFilterTest, BatchedObservationsPreserveMembershipAndOverflow) {
   const auto actual = batch.Build();
   ASSERT_NE(actual, nullptr);
   EXPECT_EQ(actual->DistinctKeys(), expected->DistinctKeys());
-  for (int64_t key : keys) { EXPECT_FALSE(actual->Reject(key));
-}
+  for (int64_t key : keys) {
+    EXPECT_FALSE(actual->Reject(key));
+  }
   for (int64_t key : {-18, -7, 1, 40, 42}) {
     EXPECT_EQ(actual->Reject(key), expected->Reject(key));
-}
+  }
 
   RuntimeFilterBuilder capped;
   std::vector<int64_t> repeated(RuntimeFilterBuilder::kMaxTrackedKeys, -9);
@@ -607,8 +638,9 @@ TEST(RuntimeFilterTest, BatchedObservationsPreserveMembershipAndOverflow) {
   const auto enclosure = capped.Build();
   ASSERT_NE(enclosure, nullptr);
   EXPECT_FALSE(enclosure->Reject(-9));
-  for (int64_t key : keys) { EXPECT_FALSE(enclosure->Reject(key));
-}
+  for (int64_t key : keys) {
+    EXPECT_FALSE(enclosure->Reject(key));
+  }
 }
 
 }  // namespace

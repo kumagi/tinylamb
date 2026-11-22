@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <limits>
 #include <string>
 
 #include "common/memory_budget.hpp"
@@ -93,7 +94,8 @@ class QueryMemoryCharge {
   struct kAlreadyReserved {};
   QueryMemoryCharge() = default;
   explicit QueryMemoryCharge(size_t bytes);
-  QueryMemoryCharge(kAlreadyReserved, size_t bytes) noexcept : bytes_(bytes) {}  // NOLINT(readability-named-parameter)
+  QueryMemoryCharge(kAlreadyReserved, size_t bytes) noexcept
+      : bytes_(bytes) {}  // NOLINT(readability-named-parameter)
   QueryMemoryCharge(const QueryMemoryCharge&) = delete;
   QueryMemoryCharge& operator=(const QueryMemoryCharge&) = delete;
   QueryMemoryCharge(QueryMemoryCharge&& other) noexcept;
@@ -103,7 +105,15 @@ class QueryMemoryCharge {
   void Add(size_t bytes);
   [[nodiscard]] bool TryAdd(size_t bytes);
   void Release(size_t bytes);
-  void Adopt(size_t bytes) noexcept { bytes_ += bytes; }
+  void Adopt(size_t bytes) noexcept {
+    // Adopt is used with bytes that were already reserved through
+    // QueryMemoryBudget::TryReserve. Saturate instead of wrapping: a wrapped
+    // bytes_ would make ReleaseAll hand back far too little to the process
+    // budget and leak the reservation permanently (QueryMemoryBudget::Release
+    // already clamps an over-release to the current usage).
+    constexpr size_t kMax = std::numeric_limits<size_t>::max();
+    bytes_ = bytes > kMax - bytes_ ? kMax : bytes_ + bytes;
+  }
   [[nodiscard]] size_t DetachBytes() noexcept {
     const size_t detached = bytes_;
     bytes_ = 0;

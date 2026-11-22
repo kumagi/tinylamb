@@ -396,7 +396,7 @@ theorem int64_reassoc_opposite_sign_overflow_bug :
 
 /-- ✅ **完全正当性 (`reassociate_add_constants` & `reassociate_subtract_constants` &
     `reassociate_subtract_add_constants` & `reassociate_add_subtract_constants`)**:
-    C++ 実装 (`rewrite.cpp:1530-1609, 1764-1863`) の符号一致ゲート＋定数事前畳み込み成功条件のもとで、
+    C++ 実装 (`expression/rewrite.cpp` の上記 4 ルール) の符号一致ゲート＋定数事前畳み込み成功条件のもとで、
     全 $2^{64}$ 値＋`NULL`＋先行例外のすべての入力に対して、値だけでなく **オーバーフロー例外の発生有無まで 100% 一致** する！ -/
 theorem int64_reassociate_all_four_rules_sound
     (x : EvalRes Int)

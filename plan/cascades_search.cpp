@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -275,6 +276,29 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
   const auto push_ec = [&](std::unordered_set<std::string> ec) {
     PushEquivalenceClass(props, &seen_ec_keys, std::move(ec));
   };
+  // Cross-type numeric equality (INT64 vs DOUBLE around 2^53) is not
+  // transitive; merging mismatched catalog types into one equivalence class
+  // can make inferred inequalities wrong (Lean:
+  // `cpp_cross_type_int64_double_nontransitive_bug`). Only proven-same or
+  // unknown types may be merged, for both selection and join equalities.
+  const auto columns_proven_mismatched_type = [&](const ColumnName& c1,
+                                                  const ColumnName& c2) {
+    if (c1.schema.empty() || c2.schema.empty()) {
+      return false;
+    }
+    const auto f1 = table_schemas_.find(c1.schema);
+    const auto f2 = table_schemas_.find(c2.schema);
+    if (f1 == table_schemas_.end() || f2 == table_schemas_.end()) {
+      return false;
+    }
+    const int o1 = f1->second.Offset(ColumnName("", c1.name));
+    const int o2 = f2->second.Offset(ColumnName("", c2.name));
+    if (o1 < 0 || o2 < 0) {
+      return false;
+    }
+    return f1->second.GetColumn(static_cast<size_t>(o1)).Type() !=
+           f2->second.GetColumn(static_cast<size_t>(o2)).Type();
+  };
 
   if (group.expressions.empty()) {
     group.logical_properties_expression_count = 0;
@@ -439,9 +463,11 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
               if (bin.Op() == BinaryOperation::kEquals &&
                   bin.Left()->Type() == TypeTag::kColumnValue &&
                   bin.Right()->Type() == TypeTag::kColumnValue) {
-                push_ec(
-                    {bin.Left()->AsColumnValue().GetColumnName().ToString(),
-                     bin.Right()->AsColumnValue().GetColumnName().ToString()});
+                const auto& c1 = bin.Left()->AsColumnValue().GetColumnName();
+                const auto& c2 = bin.Right()->AsColumnValue().GetColumnName();
+                if (!columns_proven_mismatched_type(c1, c2)) {
+                  push_ec({c1.ToString(), c2.ToString()});
+                }
               }
             } else if (c->Type() == TypeTag::kUnaryExp) {
               const auto& unary = c->AsUnaryExpression();
@@ -493,27 +519,11 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
                   bin.Right()->Type() == TypeTag::kColumnValue) {
                 const auto& c1 = bin.Left()->AsColumnValue().GetColumnName();
                 const auto& c2 = bin.Right()->AsColumnValue().GetColumnName();
-                // Cross-type numeric equality (INT64 vs DOUBLE around 2^53) is
-                // not transitive; do not merge mismatched catalog types into
-                // one equivalence class (Lean:
+                // Cross-type numeric equality (INT64 vs DOUBLE around 2^53)
+                // is not transitive; do not merge mismatched catalog types
+                // into one equivalence class (Lean:
                 // `cpp_cross_type_int64_double_nontransitive_bug`).
-                bool proven_mismatched_type = false;
-                if (!c1.schema.empty() && !c2.schema.empty()) {
-                  const auto f1 = table_schemas_.find(c1.schema);
-                  const auto f2 = table_schemas_.find(c2.schema);
-                  if (f1 != table_schemas_.end() &&
-                      f2 != table_schemas_.end()) {
-                    const int o1 = f1->second.Offset(ColumnName("", c1.name));
-                    const int o2 = f2->second.Offset(ColumnName("", c2.name));
-                    if (o1 >= 0 && o2 >= 0) {
-                      proven_mismatched_type =
-                          f1->second.GetColumn(static_cast<size_t>(o1))
-                              .Type() !=
-                          f2->second.GetColumn(static_cast<size_t>(o2)).Type();
-                    }
-                  }
-                }
-                if (!proven_mismatched_type) {
+                if (!columns_proven_mismatched_type(c1, c2)) {
                   push_ec({c1.ToString(), c2.ToString()});
                 }
                 if (std::ranges::find(left_rels, c1.schema) !=
@@ -695,7 +705,8 @@ namespace {
 // Pattern/Match recursion instead of trusting a "finite query" comment.
 constexpr size_t kMaxPatternMatchDepth = 512;
 thread_local size_t tls_pattern_match_depth = 0;
-struct PatternMatchDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+struct
+    PatternMatchDepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
   bool entered{false};
   PatternMatchDepthGuard() {
     if (tls_pattern_match_depth < kMaxPatternMatchDepth) {
@@ -711,7 +722,8 @@ struct PatternMatchDepthGuard {  // NOLINT(cppcoreguidelines-special-member-func
 };
 }  // namespace
 
-bool Pattern::Capture(GroupId group, Bindings* bindings, CaptureLog* inserted) const {
+bool Pattern::Capture(GroupId group, Bindings* bindings,
+                      CaptureLog* inserted) const {
   if (capture_.empty()) {
     return true;
   }
@@ -731,10 +743,10 @@ bool Pattern::MatchGroup(const Memo& memo, GroupId group, Bindings* bindings,
   if (!operation_) {
     return Capture(group, bindings, inserted);
   }
-  return std::ranges::any_of(memo.Get(group).expressions,
-                             [&](const LogicalExpression& expression) {
-    return MatchExpression(memo, group, expression, bindings, inserted);
-  });
+  return std::ranges::any_of(
+      memo.Get(group).expressions, [&](const LogicalExpression& expression) {
+        return MatchExpression(memo, group, expression, bindings, inserted);
+      });
 }
 
 bool Pattern::MatchPayload(const Memo& memo,
@@ -771,9 +783,8 @@ bool Pattern::MatchPayload(const Memo& memo,
 
 bool Pattern::Match(
     const Memo& memo,
-    GroupId group,  // NOLINT(misc-no-recursion) // Cascades pattern matching
-                    // recurses over the expression tree by design; depth is
-                    // bounded by the memo built from a finite query.
+    GroupId group,  // NOLINT(misc-no-recursion) // Pattern matching recurses
+                    // through memo groups; MatchGroup guards its depth.
     const LogicalExpression& expression, Bindings* bindings) const {
   CaptureLog inserted;
   return MatchExpression(memo, group, expression, bindings, &inserted);
@@ -794,7 +805,8 @@ bool Pattern::MatchExpression(const Memo& memo, GroupId group,
   }
   bool matched = true;
   for (size_t i = 0; matched && i < children_.size(); ++i) {
-    matched = children_[i].MatchGroup(memo, expression.children[i], bindings, inserted);
+    matched = children_[i].MatchGroup(memo, expression.children[i], bindings,
+                                      inserted);
   }
   if (matched && MatchPayload(memo, expression, *bindings)) {
     return true;
@@ -852,7 +864,12 @@ std::vector<std::string> RuleSet::Names() const {
 
 std::string PhysicalProperties::Key() const {
   std::string key = require_row_position ? "rowpos:1" : "rowpos:0";
-  key.reserve(ordering.size());
+  // A key holds the rowpos/wait prefix, every ordering field and all the
+  // trailing properties, not just one character per ordering column. Reserve
+  // enough for the common case so the hot group x property path does not
+  // reallocate on each append.
+  key.reserve(64 + ordering.size() * 32 + partition_by.size() * 32 +
+              bloom_filter_keys.size() * 32 + collation.size());
   key.append(wait_for_write_intent ? "|wait:1" : "|wait:0");
   for (size_t i = 0; i < ordering.size(); ++i) {
     key.push_back('|');
@@ -890,12 +907,17 @@ std::string PhysicalProperties::Key() const {
       key.append(bloom_filter_keys[i].ToString());
     }
   }
+  // NOTE: this key order is NOT the FormatPhysicalProperties (EXPLAIN) order:
+  // Key() puts the column list first and emits uniq before mult/lim/am/dist,
+  // while EXPLAIN puts limit/access_method/distribution/distinct before
+  // unique and collation before join_multiplicity. Keep each format stable on
+  // its own; do not assume a key and its EXPLAIN rendering are interchangeable.
+  if (is_unique) {
+    key.append("|uniq:1");
+  }
   if (join_multiplicity != JoinMultiplicity::kUnknown) {
     key.append("|mult:");
     AppendInteger(key, static_cast<int>(join_multiplicity));
-  }
-  if (is_unique) {
-    key.append("|uniq:1");
   }
   key.append("|lim:");
   AppendInteger(key, limit_hint);
@@ -934,7 +956,10 @@ double EstimateMemorySpillCost(OperatorCostKind kind, double input_rows,
   const double excess_ratio = data_bytes / budget.max_memory_bytes;
   double multiplier = budget.io_spill_cost_multiplier;
   if (kind == OperatorCostKind::kSort) {
-    multiplier *= std::log2(std::max(2.0, excess_ratio));
+    // The excess ratio is >1 here, so anchoring at 1.0 makes the spill cost
+    // grow continuously from zero with the amount spilled. Floor 2.0 charged
+    // every sub-2x spill the same 1.0 multiplier as an exactly 2x spill.
+    multiplier *= std::log2(std::max(1.0, excess_ratio));
   } else if (kind == OperatorCostKind::kHashJoin) {
     multiplier *= 1.5;
   }
@@ -942,6 +967,11 @@ double EstimateMemorySpillCost(OperatorCostKind kind, double input_rows,
 }
 
 const RuleContext& RuleContext::Empty() {
+  // Function-local statics are initialized on first use, so this singleton is
+  // never read before it is constructed regardless of translation-unit order.
+  // Keep it that way: a namespace-scope default RuleContext (or a RuleSet
+  // built from one) would reintroduce a static initialization order dependency
+  // for SearchEngine::Explore/ImplementationRule::Apply.
   static const RuleContext empty;
   return empty;
 }
@@ -1088,7 +1118,10 @@ bool SatisfiesOrderingCollation(const Plan& plan,
   // they fold: byte order against byte order, or case-insensitive against
   // case-insensitive. A case-insensitive order is a *different* order and may
   // not stand in for a byte order (or the other way round), whatever produced
-  // it.
+  // it. PhysicalProperties::Key deliberately keeps the collation *string*
+  // ("" vs "binary" included) so distinct requirements get distinct cache
+  // entries and EXPLAIN shows what was asked; only this satisfaction test
+  // folds the two equivalent spellings into one comparison class.
   const bool plan_folds = plan->OrderCollation() == Collation::kCaseInsensitive;
   const bool required_folds =
       CollationFromName(required.collation) == Collation::kCaseInsensitive;
@@ -1097,24 +1130,9 @@ bool SatisfiesOrderingCollation(const Plan& plan,
 
 namespace {
 
-// The query's own ORDER BY contract (expressions, direction, NULL placement)
-// must be delivered verbatim before a plan may keep the required ordering.
-bool IsOrderedByQueryContract(const Plan& plan, const QueryData& query) {
-  if (plan == nullptr) {
-    return false;
-  }
-  const bool order_contract_complete =
-      query.order_expressions_.size() == query.order_ascending_.size() &&
-      (query.order_nulls_first_.empty() ||
-       query.order_nulls_first_.size() == query.order_expressions_.size());
-  return order_contract_complete &&
-         plan->IsOrderedBy(query.order_expressions_, query.order_ascending_,
-                           query.order_nulls_first_);
-}
-
-PhysicalProperties InferProvidedProperties(const Plan& plan,
-                                           const PhysicalProperties& required,
-                                           const RuleContext& context) {
+PhysicalProperties InferProvidedProperties(
+    const Plan& plan, const PhysicalProperties& required,
+    [[maybe_unused]] const RuleContext& context) {
   PhysicalProperties provided;
   provided.require_row_position = required.require_row_position;
   provided.wait_for_write_intent = required.wait_for_write_intent;
@@ -1130,16 +1148,23 @@ PhysicalProperties InferProvidedProperties(const Plan& plan,
   // the claim entirely (the property key must not advertise an order the
   // consumer cannot use).
   provided.collation = required.collation;
-  if (!provided.ordering.empty()) {
-    if (!SatisfiesOrderingCollation(plan, required) ||
-        (context.query != nullptr &&
-         !IsOrderedByQueryContract(plan, *context.query))) {
-      provided.ordering.clear();
-      provided.sort_ascending.clear();
-      provided.sort_nulls_first.clear();
-      provided.collation.clear();
-    }
+  if (!provided.ordering.empty() &&
+      !SatisfiesOrderingCollation(plan, required)) {
+    // Only the collation decides whether a delivered order can stand in for
+    // the required one. A required order need not be the query's ORDER BY
+    // (GROUP BY keys, a merge join's probe order, ...), so also demanding
+    // IsOrderedBy(query.order_expressions_) erased perfectly valid provided
+    // orderings and made EXPLAIN disagree with the plan OptimizeGroup chose;
+    // actual delivery is priced there with the required ordering directly.
+    provided.ordering.clear();
+    provided.sort_ascending.clear();
+    provided.sort_nulls_first.clear();
+    provided.collation.clear();
   }
+  // `distinct` (and any partition/filter keys) is independent of ordering: a
+  // plan that enforces one row per group still does so when its ORDER BY is
+  // produced under a different collation. Only the order-specific fields above
+  // are retracted on a collation/order mismatch.
   return provided;
 }
 
@@ -1278,16 +1303,21 @@ void SearchEngine::ExploreGroup(GroupId group,
                                   : std::chrono::steady_clock::time_point{};
       // Transformation rules may legitimately decline; the return value is
       // only advisory for callers that track memo growth.
-      // PRODUCTION FIX: a buggy rule used to throw std::invalid_argument
-      // straight out of Explore, failing the whole query instead of just
-      // skipping one bad alternative. Contain the failure per rule.
+      // PRODUCTION FIX: a buggy rule used to throw straight out of Explore,
+      // failing the whole query instead of just skipping one bad alternative.
+      // Contain every rule failure here: .at()/out_of_range, allocation
+      // failures and even non-standard exceptions are all rule-local.
       try {
         if (rule.Apply(memo_, group, expression)) {
           applied_rules_.insert(rule.Name());
         }
-      } catch (const std::invalid_argument&) {
-        // Memo invariant violation from a transformation rule: keep the
-        // alternative absent and continue exploring the remaining rules.
+      } catch (const std::exception& e) {
+        LOG(WARN) << "Cascades rule '" << rule.Name()
+                  << "' threw: " << e.what();
+        continue;
+      } catch (...) {
+        LOG(WARN) << "Cascades rule '" << rule.Name()
+                  << "' threw a non-standard exception";
         continue;
       }
       if (rule_stats_) {

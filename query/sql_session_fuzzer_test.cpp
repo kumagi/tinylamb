@@ -414,20 +414,14 @@ TEST(SqlSessionFuzzer,
 
 // Any committed sql_session_fuzz-*.test file replays as a permanent
 // regression guard: the recorded dumps must hold now.
-TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard0) {
-  ReplayCommittedRegressionShard(0, 4);
+class SqlSessionRegressionTest : public ::testing::TestWithParam<size_t> {};
+constexpr size_t kRegressionShards = 16;
+
+TEST_P(SqlSessionRegressionTest, ReplayCommittedRegressionFiles) {
+  ReplayCommittedRegressionShard(GetParam(), kRegressionShards);
 }
 
-TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard1) {
-  ReplayCommittedRegressionShard(1, 4);
-}
-
-TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard2) {
-  ReplayCommittedRegressionShard(2, 4);
-}
-
-TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard3) {
-  ReplayCommittedRegressionShard(3, 4);
-}
+INSTANTIATE_TEST_SUITE_P(RegressionShards, SqlSessionRegressionTest,
+                         ::testing::Range(size_t{0}, kRegressionShards));
 
 }  // namespace tinylamb

@@ -130,7 +130,7 @@ std::string AppendProtoTypeMarker(const std::string& payload,
 std::string ExtractProtoTypeMarker(std::string_view text);
 
 // Best-effort proto type resolution for payloads stored without a marker:
-// scores the modelled compliance protos by their signature fields, counting
+// scores the modeled compliance protos by their signature fields, counting
 // both payload entries and the caller's SET-target path segments.  Returns
 // the display-form type name, or empty when nothing matches confidently.
 std::string InferProtoTypeName(std::string_view payload,

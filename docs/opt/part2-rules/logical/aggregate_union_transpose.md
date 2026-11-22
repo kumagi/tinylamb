@@ -31,12 +31,26 @@ graph TD
 
 パターンは `Aggregation(Any("input"))`、ターゲットヒントは `LogicalOperator::kAggregation` です。以下の条件をすべて満たす場合にのみ発火します。
 
-1. 集約ノードが子を 1 つ持ち、ターゲットリストが非空であり、入力 Group が自分自身でないこと。
-2. 入力 Group 内の対象式が空でない子リストを持つ `kUnionAll` であること。
-3. **集約関数の分配可能性検証**:
-   ターゲットリスト内のすべての集約関数が、`DISTINCT` 修飾子、`HAVING` 修飾子、および `FILTER` 述語を持たず、関数の種類が `SUM`, `COUNT`, `MIN`, `MAX` のいずれかであること。
+1. 集約ノードが子を 1 つ持ち、入力 Group が自分自身でなく、さらに入力 Group のタグが `union_all_pushed_aggs:` で始まらないこと。最後の条件が fixpoint 防止で、既に分配済みの Group に再適用して無限に派生 Group を増やすのを止めます。
 
    ```cpp
+   if (memo.Get(input_id).tag.starts_with("union_all_pushed_aggs:")) {
+     return;
+   }
+   ```
+
+2. 入力 Group 内の対象式が空でない子リストを持つ `kUnionAll` であること。
+3. `grouping_sets` の各要素が null でなく `kColumnValue` であること。部分集約のグループキーとしてそのまま使うためです。
+4. **ターゲット項目の検証**（現行のガードは集約種別だけではありません）:
+
+   ```cpp
+   if (target.name.empty() ||
+       !seen_agg_names.insert(target.name).second ||
+       agg.Distinct() || agg.NeedsGroupContext() ||
+       agg.HasWhereFilter() || !agg.InnerGroupBy().empty()) {
+     distributable = false;
+     break;
+   }
    if (agg.GetType() != AggregationType::kSum &&
        agg.GetType() != AggregationType::kCount &&
        agg.GetType() != AggregationType::kMin &&
@@ -46,9 +60,14 @@ graph TD
    }
    ```
 
-4. **全枝への適用完全性**:
+   - expression が null の項目は拒否します。
+   - 集約ターゲットは、名前が非空かつ `seen_agg_names` で重複していないこと（同名ターゲットの衝突拒否）、`Distinct()` / `NeedsGroupContext()` / `HasWhereFilter()` が偽で `InnerGroupBy()` が空であること、さらに種別が `SUM`, `COUNT`, `MIN`, `MAX` のいずれかであること。
+   - 非集約ターゲットは `ContainsAggregate(target.expression)` が偽（複合集約 `SUM(x) + 1` は UNION ALL 上で分配律が成り立たないため拒否）で、参照列が grouping_sets のキーだけであること。
+   - 集約ターゲットが 1 つ以上あること（`has_agg`）。
+
+5. **全枝への適用完全性**:
    各枝に対する部分集約 Group の生成を試み、すべての枝に対して部分集約 Group が正常に作成できた場合（`pushed_aggs.size() == union_expr.children.size()`）に限り処理を続行します。
-5. 生成される派生 Group が既存の Group と衝突しないこと（循環抑止）。
+6. 生成される派生 Group が既存の Group と衝突しないこと（循環抑止）。
 
 ## 意味論的根拠と多重度・代数的再集約
 
@@ -95,7 +114,6 @@ if (agg.GetType() == AggregationType::kCount) {
 
 ## 関連 Rule との相互作用
 
-- `aggregate_union_transpose`: 同様に集約を `UnionAll` の下位へ押し込む Rule ですが、再集約の target_list 読み替えを行わない設計であるため `COUNT` を除外する等の差異があります。
 
 ## 検証テスト
 

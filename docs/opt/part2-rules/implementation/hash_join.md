@@ -59,13 +59,17 @@ NULL安全等値比較（`IS NOT DISTINCT FROM`）への対応は、SQL標準に
 
 ```cpp
   const double cross = left.estimated_rows * right.estimated_rows;
-  if (max_ndv < 1) {
-    return cross;
+  double estimate = cross;
+  if (!key_selectivities.empty()) {
+    const double backoff =
+        cascades::EstimateEquijoinSelectivity(key_selectivities);
+    const double min_key = *std::ranges::min_element(key_selectivities);
+    estimate = std::min(cross, cross * std::max(backoff, min_key));
   }
-  return std::min(cross, cross / max_ndv);
+  // ...(省略: キー別選択率のデバッグ出力と残差述語の選択率反映)
 ```
 
-交差サイズ（直積サイズ）を結合キー列の最大異なり数（NDV: Number of Distinct Values）で除算して出力行数を推定します。統計情報が欠落している場合（`max_ndv < 1`）は直積サイズを採用する保守的なフォールバックを行い、過小見積もりによる不適切な計画選択を防止します。
+直積サイズに、各等値キーの選択率から求めた `EstimateEquijoinSelectivity` のバックオフを掛けて出力行数を推定します（単一キーの場合、これは従来の $|L| \times |R| / \max(\mathrm{NDV})$ モデルに相当します）。複合キー에서는キー間の独立性仮定による過小見積もりを避けるため、最も選択的な単一キー `min_key` を下限とし、直積サイズ `cross` を上限とします。統計情報が欠落してキー選択率が得られない場合は直積サイズをそのまま採用する保守的なフォールバックとなり、過小見積もりによる不適切な計画選択を防止します。
 
 ## 実装の詳細
 

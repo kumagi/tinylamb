@@ -41,7 +41,7 @@ CREATE TEMP AGGREGATE FUNCTION CountTimesTwoN(n INT64 NOT AGGREGATE) AS (
 )
 ==
 [prepare_database]
-CREATE TEMP AGGREGATE FUNCTION SumSqaures(a INT64) AS (SUM(a * a))
+CREATE TEMP AGGREGATE FUNCTION SumSquares(a INT64) AS (SUM(a * a))
 ==
 [prepare_database]
 CREATE TEMP AGGREGATE FUNCTION BunchOfAggs(a INT64) AS (
@@ -179,14 +179,14 @@ ARRAY<STRUCT<INT64>>[{7}]
 ==
 
 [name=call_sum_squares_gba]
-SELECT SumSqaures(a)
+SELECT SumSquares(a)
 FROM UNNEST([1, 2, 3, 4, 5]) AS a
 --
 ARRAY<STRUCT<INT64>>[{55}]
 ==
 
 [name=call_sum_squares_gbk]
-SELECT offset < 2, offset < 4, SumSqaures(a)
+SELECT offset < 2, offset < 4, SumSquares(a)
 FROM UNNEST([1, 2, 3, 4, 5]) AS a WITH OFFSET
 GROUP BY 1, 2
 --
@@ -426,7 +426,7 @@ SELECT * FROM
 MATCH_RECOGNIZE(
   ORDER BY x
   MEASURES
-    SumSqaures(x) AS sum_x
+    SumSquares(x) AS sum_x
   PATTERN ( t* )
   DEFINE
     t AS TRUE

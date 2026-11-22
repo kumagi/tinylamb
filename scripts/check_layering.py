@@ -266,7 +266,10 @@ def layer_of(rel_path):
         for prefix in prefixes:
             if rel_path.startswith(prefix) and len(prefix) > best_len:
                 best, best_len = name, len(prefix)
-    return best  # None => outside the DAG (e.g. cli_main_test.cpp)
+    # None => outside the DAG (e.g. a root-level non-test "foo.hpp").
+    # NOTE: *_test.cpp/_fuzzer.cpp files are "top", not None: the TEST_PATTERN
+    # check above returns early for them (cli_main_test.cpp included).
+    return best
 
 
 def source_files(root):
@@ -309,11 +312,17 @@ def resolve_include(src, include, root, index):
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
+        # With src_dir == "" the old `src_dir + "/"` was "/" and matched
+        # nothing, so a bare include from a root-level source could silently
+        # pick candidates[0] from the wrong layer.
+        def in_src_dir(c):
+            return c.startswith(src_dir + "/") if src_dir else ("/" not in c)
+
         layers = {layer_of(c) for c in candidates}
         if len(layers) == 1:
-            same = [c for c in candidates if c.startswith(src_dir + "/")]
+            same = [c for c in candidates if in_src_dir(c)]
             return same[0] if len(same) == 1 else candidates[0]
-        same = [c for c in candidates if c.startswith(src_dir + "/")]
+        same = [c for c in candidates if in_src_dir(c)]
         if len(same) == 1:
             return same[0]
     return None

@@ -303,9 +303,9 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
   char trailing = 0;
   in.read(&trailing, 1);
   if (in.gcount() > 0) {
-    return StatusError(StatusCode::kCorrupt,
-                       "WAL segment metadata has trailing bytes: " +
-                           path.string());
+    return StatusError(
+        StatusCode::kCorrupt,
+        "WAL segment metadata has trailing bytes: " + path.string());
   }
   in.clear();
   uint32_t magic = 0;
@@ -330,9 +330,9 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
   // it by a segment index; reject implausibly large values even on 64-bit.
   constexpr uint64_t kMaxSegmentSize = uint64_t{1} << 40;  // 1 TiB
   if (segment_size > kMaxSegmentSize) {
-    return StatusError(StatusCode::kCorrupt,
-                       "WAL segment size is implausibly large: " +
-                           path.string());
+    return StatusError(
+        StatusCode::kCorrupt,
+        "WAL segment size is implausibly large: " + path.string());
   }
   if (fixed_size != nullptr) {
     *fixed_size = version == 2U;
@@ -527,14 +527,15 @@ StatusOr<uint64_t> Logger::FindHighestSegment(const std::filesystem::path& base,
   ec.clear();
   for (const std::filesystem::directory_entry& entry : it) {
     if (ec) {
-      return StatusError(StatusCode::kIOError,
-                         "Failed to scan " + dir.string() + ": " + ec.message());
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to scan " + dir.string() + ": " + ec.message());
     }
     const bool regular = entry.is_regular_file(ec);
     if (ec) {
-      return StatusError(StatusCode::kIOError,
-                         "Failed to inspect " + entry.path().string() + ": " +
-                             ec.message());
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to inspect " + entry.path().string() + ": " + ec.message());
     }
     if (!regular) {
       continue;
@@ -573,14 +574,15 @@ StatusOr<uint64_t> Logger::FindLowestSegment(const std::filesystem::path& base,
   ec.clear();
   for (const std::filesystem::directory_entry& entry : it) {
     if (ec) {
-      return StatusError(StatusCode::kIOError,
-                         "Failed to scan " + dir.string() + ": " + ec.message());
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to scan " + dir.string() + ": " + ec.message());
     }
     const bool regular = entry.is_regular_file(ec);
     if (ec) {
-      return StatusError(StatusCode::kIOError,
-                         "Failed to inspect " + entry.path().string() + ": " +
-                             ec.message());
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to inspect " + entry.path().string() + ": " + ec.message());
     }
     if (!regular) {
       continue;
@@ -720,20 +722,11 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
                        "WAL segment size must be > 0");
   }
   // A crash between WriteSegmentMetadata's temp write and its rename leaves
-  // the temp behind; the next write overwrites it, so removal is pure
-  // hygiene a long-lived deployment should not skip.
-  {
-    std::error_code remove_ec;
-    const std::filesystem::path stale_meta_tmp =
-        SegmentMetadataPath(logfile).string() + ".tmp";
-    if (std::filesystem::exists(stale_meta_tmp, remove_ec) && !remove_ec) {
-      std::filesystem::remove(stale_meta_tmp, remove_ec);
-      LOG(INFO) << "Removed stale WAL segment metadata temp "
-                << stale_meta_tmp.string()
-                << (remove_ec ? (" (failed: " + remove_ec.message() + ")")
-                              : "");
-    }
-  }
+  // the temp behind. Do not unlink it here: the db-file lock does not cover
+  // the metadata temp, so another process may still be writing that same temp
+  // after a crash. WriteSegmentMetadata opens it with std::ios::trunc and
+  // removes it on every error path, so a stale temp is harmless while an
+  // eager remove can break the other writer's publish rename.
   bool any_segment = false;
   ASSIGN_OR_RETURN(uint64_t, initial_highest,
                    FindHighestSegment(logfile, &any_segment));
@@ -776,7 +769,15 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
     return StatusError(
         StatusCode::kIOError,
         "Segmented WAL has no geometry metadata: " + logfile.string());
-  } else if (!metadata_exists || persisted_segment_size != segment_size) {
+  } else {
+    // Without a numbered series the persisted size is only a migration
+    // parameter, so the requested size is applied. Warn on a mismatch just as
+    // the authoritative branch above does, otherwise a mistyped
+    // TINYLAMB_LOG_SEGMENT_BYTES is silently accepted.
+    if (metadata_exists && persisted_segment_size != segment_size) {
+      LOG(WARN) << "Applying WAL segment size override " << segment_size
+                << " over legacy persisted geometry " << persisted_segment_size;
+    }
     RETURN_IF_FAIL(WriteSegmentMetadata(logfile, segment_size, fixed_size));
   }
   bool legacy_base_oversized = false;
@@ -993,8 +994,11 @@ void Logger::NotifyWorker() {
 }
 
 void Logger::SetFailed(int err) {
-  error_number_.store(err, std::memory_order_relaxed);
-  failed_.store(true, std::memory_order_release);
+  {
+    std::scoped_lock lock(durable_mu_);
+    error_number_.store(err, std::memory_order_relaxed);
+    failed_.store(true, std::memory_order_release);
+  }
   // Name the volume state for the two failure classes an operator can act
   // on without touching the engine: ENOSPC (free space, or the inode/tmpfs
   // quota that shows up as ENOSPC on shared volumes) and EIO (device
@@ -1010,17 +1014,15 @@ void Logger::SetFailed(int err) {
     const auto free_bytes = std::filesystem::space(
         std::filesystem::path(base_path_).parent_path(), ec);
     if (!ec) {
-      LOG(ERROR) << std::string(std::strerror(err)) << " on WAL volume of " << base_path_
-                 << ": " << (free_bytes.available >> 20) << " MiB free of "
-                 << (free_bytes.capacity >> 20) << " MiB";
+      LOG(ERROR) << std::string(std::strerror(err)) << " on WAL volume of "
+                 << base_path_ << ": " << (free_bytes.available >> 20)
+                 << " MiB free of " << (free_bytes.capacity >> 20) << " MiB";
     } else {
       LOG(ERROR) << std::string(std::strerror(err)) << " on WAL " << base_path_;
     }
   } else {
-    LOG(ERROR) << std::string(std::strerror(err)) << " (WAL " << base_path_ << ")";
-  }
-  {
-    std::scoped_lock lock(durable_mu_);
+    LOG(ERROR) << std::string(std::strerror(err)) << " (WAL " << base_path_
+               << ")";
   }
   durable_cv_.notify_all();
   {
@@ -1042,7 +1044,8 @@ Status Logger::CheckFailed() const {
 void Logger::AdvanceDurable(lsn_t to) {
   {
     std::scoped_lock lock(durable_mu_);
-    if (to > durable_lsn_.load(std::memory_order_relaxed)) {
+    if (!failed_.load(std::memory_order_acquire) &&
+        to > durable_lsn_.load(std::memory_order_relaxed)) {
       durable_lsn_.store(to, std::memory_order_release);
     }
   }
@@ -1114,6 +1117,13 @@ int Logger::SyncSegment(size_t logical_end) {
 
 Status Logger::WaitForDurable(lsn_t lsn) {
   pending_durable_waiters_.fetch_add(1, std::memory_order_acq_rel);
+  // condition_variable::wait may throw std::system_error. Without this guard
+  // the waiter count would stay elevated forever, making the worker's
+  // "waiters present" branch fsync on every tick and killing idle backoff.
+  struct WaiterGuard {
+    std::atomic<int>& count;
+    ~WaiterGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
+  } waiter_guard{pending_durable_waiters_};
   const bool already_satisfied =
       failed_.load(std::memory_order_acquire) ||
       finish_.load(std::memory_order_acquire) ||
@@ -1122,14 +1132,20 @@ Status Logger::WaitForDurable(lsn_t lsn) {
     // Nudge the worker: it will fsync promptly when it sees the non-zero
     // waiter count even if the timer has not elapsed.
     NotifyWorker();
-    std::unique_lock lock(durable_mu_);
-    durable_cv_.wait(lock, [&] {
-      return failed_.load(std::memory_order_acquire) ||
-             finish_.load(std::memory_order_acquire) ||
-             durable_lsn_.load(std::memory_order_acquire) >= lsn;
-    });
+    try {
+      std::unique_lock lock(durable_mu_);
+      durable_cv_.wait(lock, [&] {
+        return failed_.load(std::memory_order_acquire) ||
+               finish_.load(std::memory_order_acquire) ||
+               durable_lsn_.load(std::memory_order_acquire) >= lsn;
+      });
+    } catch (...) {
+      // Status boundary: translate the wait failure instead of letting an
+      // exception escape (the guard above already released the waiter count).
+      return StatusError(StatusCode::kRuntimeError,
+                         "WAL durability wait failed");
+    }
   }
-  pending_durable_waiters_.fetch_sub(1, std::memory_order_acq_rel);
   Status failed = CheckFailed();
   if (failed != Status::kSuccess) {
     return failed;
@@ -1256,6 +1272,12 @@ Status Logger::TruncateTo(lsn_t valid_end) {
     if (flushed >= buffered) {
       break;
     }
+    // D1 (docs/lock_order.md): keep the enqueue latch across this wait, just
+    // as AddLog does for a full ring. The flush worker never takes the
+    // enqueue latch, so this cannot form a lock cycle. Producers are parked,
+    // which freezes buffered_lsn_ at a finite target -- the drain is bounded
+    // by one flush pass rather than chasing a moving target. On wake we
+    // re-check failed_/finish_ and the LSNs from scratch below.
     NotifyWorker();
     std::unique_lock work_lk(work_mu_);
     work_cv_.wait(work_lk, [&] {
@@ -1439,13 +1461,22 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
   if (start_index > highest_segment) {
     return;
   }
-  std::error_code ec;
   for (uint64_t index = start_index;; ++index) {
     if (index > highest_segment) {
       break;
     }
     const std::filesystem::path path = SegmentPath(base_path_, index);
-    if (!std::filesystem::exists(path, ec) || ec) {
+    std::error_code stat_ec;
+    const bool segment_exists = std::filesystem::exists(path, stat_ec);
+    if (stat_ec) {
+      // A failed stat is not proof the segment is gone. Breaking here would
+      // silently skip every newer segment and permanently disable the
+      // fadvise optimisation after one transient error.
+      LOG(WARN) << "Cannot stat WAL segment " << path.string() << ": "
+                << stat_ec.message();
+      continue;
+    }
+    if (!segment_exists) {
       break;
     }
     const lsn_t segment_start =
@@ -1453,7 +1484,8 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
     const int fd =
         platform::OpenFile(path, {.mode = platform::OpenMode::kReadOnly});
     if (fd < 0) {
-      break;
+      LOG(WARN) << "Cannot open WAL segment " << path.string() << " for advise";
+      continue;
     }
     const lsn_t advise_from = std::max(segment_start, lsn_t{0});
     const lsn_t advise_to =
@@ -1505,7 +1537,17 @@ lsn_t Logger::RecycleUpTo(lsn_t floor) {
       break;
     }
     const std::filesystem::path path = SegmentPath(base_path_, index);
-    if (!std::filesystem::exists(path, ec) || ec) {
+    std::error_code stat_ec;
+    const bool segment_exists = std::filesystem::exists(path, stat_ec);
+    if (stat_ec) {
+      // A stat failure (permissions, I/O error, ...) does NOT mean the
+      // segment is gone. Advancing lowest_segment_ here would hide live WAL
+      // from every later checkpoint and leak the file forever.
+      LOG(WARN) << "Cannot stat WAL segment " << path.string() << ": "
+                << stat_ec.message();
+      break;
+    }
+    if (!segment_exists) {
       // Already gone (earlier recycle or external cleanup): keep the cursor
       // honest so this index is never re-scanned.
       lowest_segment_ = index + 1;
@@ -1899,8 +1941,14 @@ void Logger::LoggerWork() {
       AdvanceDurable(flushed_lsn_.load(std::memory_order_relaxed));
     }
   }
+  if (failed_.load(std::memory_order_acquire)) {
+    return;
+  }
   {
     std::scoped_lock segment_guard(segment_mu_);
+    if (failed_.load(std::memory_order_acquire)) {
+      return;
+    }
     if (dst_ < 0 ||
         (fixed_size_segments_ &&
          WriteFixedTail(static_cast<size_t>(

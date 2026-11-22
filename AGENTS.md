@@ -115,8 +115,10 @@ tests (added via `add_replay_test`) instead link `tinylamb::sql` /
 - Unit test per bugfix/feature in the same layer dir (`*_test.cpp`).
 - Benchmarks: TPC-H (`tinylamb_tpch_benchmark`) and
   `tinylamb_expression_jit_benchmark` are `EXCLUDE_FROM_ALL` — build by
-  explicit target. TPC-H pulls an external `dbgen` build dependency
-  (pinned commit; not fetched for normal builds).
+  explicit target, e.g. `cmake --build build -j --target
+  tinylamb_tpch_benchmark` (as in `README.md`); the plain `cmake --build build -j`
+  shown first in the README does not produce them. TPC-H pulls an external
+  `dbgen` build dependency (pinned commit; not fetched for normal builds).
 - Bug hunting with SQL oracle fuzzers: `sql_oracle_fuzzer_libfuzzer`
   (TLP/NoREC/PQS/DQE/index-independence/txn-splitting oracles over the whole
   engine), `expr_oracle_fuzzer_libfuzzer` (scalar rewrite + engine + Python

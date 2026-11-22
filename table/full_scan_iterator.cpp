@@ -130,6 +130,8 @@ bool PhysicalReadEligible(const Transaction& txn, const Page& page) {
 
 struct FullScanIterator::StubBlockCache {
   TlcsFile::DecodedBlock block;
+  TlcsFile::DecodedBlock delta;
+  std::vector<TlcsFile::DecodedColumnChunk> free_chunks;
   std::vector<slot_t> col_chunk_idx;
   std::vector<uint8_t> io_scratch;
 };
@@ -296,8 +298,14 @@ FullScanIterator::PeekOutcome FullScanIterator::PeekIntegerPlanned(
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
   if (count != peek.stored_count) {
-    return {.kind = PeekOutcome::Kind::kNull,
-            .value = 0};  // corrupt count: reject the row
+    // A column-count mismatch is a corrupt row image, not a NULL key. Report
+    // it through the error channel so a filtered scan fails with kCorrupt
+    // exactly like the unfiltered decode path, instead of silently dropping
+    // the row (which used to look like an ordinary filter mismatch).
+    return {.kind = PeekOutcome::Kind::kError,
+            .value = 0,
+            .status = StatusError(StatusCode::kCorrupt,
+                                  "row image column count mismatch")};
   }
   if (has_null) {
     // A bitmap row may NULL out prefix columns, whose payload then shifts
@@ -664,13 +672,19 @@ void FullScanIterator::SeekVisibleRow() {
       stub_row_materialized_ = true;
       return;
     }
-    while (pos_.slot < stub_block_row_count_ && !StubRowMatches(pos_.slot)) {
-      ++pos_.slot;
+    if (!stub_matches_computed_) {
+      ComputeStubBlockMatches();
     }
-    if (pos_.slot < stub_block_row_count_) {
+    while (stub_match_cursor_ < stub_match_rows_.size() &&
+           stub_match_rows_[stub_match_cursor_] < pos_.slot) {
+      ++stub_match_cursor_;
+    }
+    if (stub_match_cursor_ < stub_match_rows_.size()) {
+      pos_.slot = static_cast<slot_t>(stub_match_rows_[stub_match_cursor_]);
       stub_row_materialized_ = false;
       return;
     }
+    pos_.slot = static_cast<slot_t>(stub_block_row_count_);
     if (!AdvanceFromStubPage()) {
       pos_.page_id = ~0ULL;
       current_row_.Clear();
@@ -832,9 +846,8 @@ const RowDecodePlan* FullScanIterator::RowPlan() {
             ? uint8_t{1}
             : uint8_t{0};
     has_unsigned = has_unsigned || plan.slot_unsigned[k] != 0;
-    plan.slot_interval[k] = schema.GetColumn(kept[k]).IsInterval()
-                                ? uint8_t{1}
-                                : uint8_t{0};
+    plan.slot_interval[k] =
+        schema.GetColumn(kept[k]).IsInterval() ? uint8_t{1} : uint8_t{0};
     has_interval = has_interval || plan.slot_interval[k] != 0;
   }
   plan.has_unsigned = has_unsigned;
@@ -847,20 +860,27 @@ void FullScanIterator::DeserializeCurrent(std::string_view row) {
   // Length-prefixed page images: decoded by offsets, never as C strings.
   const std::vector<slot_t>* const kept =
       projection_.has_value() ? &*projection_ : nullptr;
+  StatusOr<size_t> decoded = Status::kCorrupt;
   if (kept != nullptr) {
     if (const RowDecodePlan* plan = RowPlan()) {
-      current_row_.DeserializePlanned(
+      decoded = current_row_.TryDeserializePlanned(
           row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
           *plan);
     } else {
-      current_row_.DeserializeProjected(
+      decoded = current_row_.TryDeserializeProjected(
           row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
           table_->schema_, *kept);
     }
   } else {
-    current_row_.Deserialize(
+    decoded = current_row_.TryDeserialize(
         row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
         table_->schema_);
+  }
+  if (!decoded.HasValue()) {
+    status_ = decoded.GetStatus();
+    pos_.page_id = ~0ULL;
+    current_row_.Clear();
+    page_.reset();
   }
 }
 
@@ -874,6 +894,19 @@ void FullScanIterator::BuildTypedDecodePlan() {
   const Schema& schema = table_->schema_;
   const std::vector<slot_t>* kept =
       projection_.has_value() ? &*projection_ : nullptr;
+  // Mirror RowPlan's contract: every kept slot must be in range and strictly
+  // ascending. Without this check a malformed projection silently drops
+  // columns (e.g. {2,1} on a 3-column schema keeps only slot 2), diverging
+  // from the Row path which rejects it and falls back.
+  if (kept != nullptr) {
+    for (size_t k = 0; k < kept->size(); ++k) {
+      if ((*kept)[k] >= schema.ColumnCount() ||
+          (k > 0 && (*kept)[k - 1] >= (*kept)[k])) {
+        typed_keep_slots_.clear();
+        return;
+      }
+    }
+  }
   size_t kept_cursor = 0;
   size_t varchar_ordinal = 0;
   bool variable_seen = false;
@@ -978,6 +1011,20 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
     if (!pos_.IsValid()) {
       break;
     }
+    // The typed-batch path advances pos_ itself and never calls operator++,
+    // so it must check the statement budget on its own cadence (same 256-step
+    // rule) instead of letting a large batch run without a timeout check.
+    if ((++advance_steps_ & 255U) == 0 && txn_ != nullptr &&
+        txn_->HasStatementTimeout()) {
+      const Status ts = txn_->CheckStatementTimeout();
+      if (ts != Status::kSuccess) {
+        status_ = ts;
+        pos_.page_id = ~0ULL;
+        current_row_.Clear();
+        batch->rows = count;
+        return count;
+      }
+    }
     if (!lock_rows_ && stub_block_idx_ != LSTableStore::kInvalidBlockIndex) {
       count += DecodeStubBlockBatch(batch, count, max_rows - count);
       continue;
@@ -993,6 +1040,137 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
     }
     if (!pos_.IsValid()) {
       break;
+    }
+    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    //   (fast_readonly_row_page_filter_eq)
+    // Tight in-page batch loop for clean read-only all-fixed-width RowPages
+    // (e.g. uncompacted 133M-row `inventory` in TPC-DS Q21/Q22/Q72): avoids
+    // per-row NextVisibleImage() dispatch, PeekIntegerPlanned switches, and
+    // per-row null-flag memset. Falls through to NextVisibleImage() on page
+    // exhaustion, NULL-bitmap rows, or corrupt headers.
+    if (!lock_rows_ && page_ != nullptr &&
+        !(*page_)->body.row_page.IsColumnarStub() &&
+        typed_const_prefix_ == schema.ColumnCount() &&
+        !batch->capture_positions &&
+        (peek_compares_ == nullptr || peek_compares_->empty()) &&
+        key_filter_ == nullptr) {
+      if (!physical_read_eligible_.has_value()) {
+        physical_read_eligible_ = PhysicalReadEligible(*txn_, **page_);
+      }
+      if (*physical_read_eligible_) {
+        const RowPage& body = (*page_)->body.row_page;
+        const slot_t row_max = body.RowMax();
+        const slot_t ncols = schema.ColumnCount();
+        const size_t stride = batch->stride;
+        const bool has_rf = (runtime_filter_ != nullptr &&
+                             key_column_.has_value() && *key_column_ < ncols);
+        const bool rf_dense = has_rf && runtime_filter_->has_dense_bits();
+        const uint64_t rf_lo_u =
+            rf_dense ? static_cast<uint64_t>(runtime_filter_->Lo()) : 0ULL;
+        const uint64_t rf_span_u =
+            rf_dense ? (static_cast<uint64_t>(runtime_filter_->Hi()) - rf_lo_u)
+                     : 0ULL;
+        const uint64_t* const rf_bits =
+            rf_dense ? runtime_filter_->dense_bits_data() : nullptr;
+        const size_t rf_byte_off =
+            has_rf ? (sizeof(slot_t) +
+                      (sizeof(uint64_t) * static_cast<size_t>(*key_column_)))
+                   : 0;
+        constexpr slot_t kNullBitmapFlagFast = slot_t{1} << 15;
+        const size_t min_nonnull_bytes =
+            sizeof(slot_t) + (sizeof(uint64_t) * static_cast<size_t>(ncols));
+        const size_t start_count = count;
+        int64_t* const cells_data = batch->cells.data();
+        while (pos_.slot < row_max && count < max_rows) {
+          if (!body.IsSlotOccupied(pos_.slot)) {
+            ++pos_.slot;
+            continue;
+          }
+          const std::string_view sv = body.GetRow(pos_.slot);
+          if (sv.size() < min_nonnull_bytes) [[unlikely]] {
+            break;
+          }
+          const char* const row_base = sv.data();
+          slot_t encoded_count = 0;
+          const size_t hdr_bytes = DeserializeSlot(row_base, &encoded_count);
+          const bool has_null = (encoded_count & kNullBitmapFlagFast) != 0;
+          const auto stored_count =
+              static_cast<slot_t>(encoded_count & ~kNullBitmapFlagFast);
+          if (has_null || stored_count != ncols) [[unlikely]] {
+            break;
+          }
+          if (has_rf) {
+            uint64_t kbits = 0;
+            std::memcpy(&kbits, row_base + rf_byte_off, sizeof(uint64_t));
+            const int64_t key = static_cast<int64_t>(TINYLAMB_BSWAP64(kbits));
+            if (rf_dense) {
+              const uint64_t off = static_cast<uint64_t>(key) - rf_lo_u;
+              if (off > rf_span_u ||
+                  ((rf_bits[off >> 6] >> (off & 63)) & uint64_t{1}) == 0) {
+                ++pos_.slot;
+                continue;
+              }
+            } else if (runtime_filter_->Reject(key)) {
+              ++pos_.slot;
+              continue;
+            }
+          }
+          if (!extra_runtime_filters_.empty()) {
+            bool extra_rejected = false;
+            for (const ExtraRuntimeFilter& erf : extra_runtime_filters_) {
+              const size_t e_off =
+                  sizeof(slot_t) +
+                  (sizeof(uint64_t) * static_cast<size_t>(erf.column));
+              uint64_t ebits = 0;
+              std::memcpy(&ebits, row_base + e_off, sizeof(uint64_t));
+              const int64_t ekey =
+                  static_cast<int64_t>(TINYLAMB_BSWAP64(ebits));
+              if (erf.group->has_dense_bits()) {
+                const uint64_t lo_u = static_cast<uint64_t>(erf.group->Lo());
+                const uint64_t span_u =
+                    static_cast<uint64_t>(erf.group->Hi()) - lo_u;
+                const uint64_t off = static_cast<uint64_t>(ekey) - lo_u;
+                if (off > span_u ||
+                    ((erf.group->dense_bits_data()[off >> 6] >> (off & 63)) &
+                     uint64_t{1}) == 0) {
+                  extra_rejected = true;
+                  break;
+                }
+              } else if (erf.group->Reject(ekey)) {
+                extra_rejected = true;
+                break;
+              }
+            }
+            if (extra_rejected) {
+              ++pos_.slot;
+              continue;
+            }
+          }
+          const char* const payload = row_base + hdr_bytes;
+          const size_t base = count * stride;
+          if (typed_prefix_identity_) {
+            DecodePrefixCells(payload, cells_data + base, typed_prefix_kept_);
+          } else {
+            for (size_t k = 0; k < typed_prefix_kept_; ++k) {
+              uint64_t bits = 0;
+              std::memcpy(&bits,
+                          payload + (sizeof(uint64_t) * typed_keep_slots_[k]),
+                          sizeof(uint64_t));
+              cells_data[base + k] =
+                  static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
+            }
+          }
+          ++count;
+          ++pos_.slot;
+        }
+        if (count > start_count) {
+          std::memset(batch->nulls.data() + (start_count * stride), 0,
+                      (count - start_count) * stride);
+        }
+        if (count >= max_rows) {
+          break;
+        }
+      }
     }
     std::optional<std::string_view> row = NextVisibleImage();
     if (!row.has_value()) {
@@ -1168,16 +1346,27 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
 }
 
 IteratorBase& FullScanIterator::operator--() {
-  // Backward iteration is not implemented; the interface keeps operator--
-  // because IndexScanIterator supports it.  Fail loudly instead of silently
-  // breaking the iteration contract in NDEBUG builds.
-  CHECK_MSG(false, "FullScanIterator does not support operator--");
+  // Backward iteration is not implemented for a physical row-page scan; the
+  // interface keeps operator-- because IndexScanIterator supports it. Surface
+  // the unsupported operation as a sticky Status (IteratorBase::GetStatus)
+  // instead of aborting the process, and invalidate the cursor so a generic
+  // caller's loop terminates and can tell "unsupported" from "exhausted".
+  status_ = StatusError(StatusCode::kInvalidArgument,
+                        "FullScanIterator does not support operator--");
+  pos_.page_id = ~0ULL;
+  current_row_.Clear();
   return *this;
 }
 
 void FullScanIterator::DropPageLatch() {
   page_.reset();
   physical_read_eligible_.reset();
+  // status_ is deliberately NOT cleared here: IteratorBase defines it as a
+  // sticky first-failure record, and callers (e.g. parallel morsel workers)
+  // check GetStatus() immediately after dropping the latch. A worker that
+  // wants a fresh scan over a different page uses a fresh iterator; a single
+  // iterator is never handed to another thread/page while a sticky failure
+  // from this one is still pending.
 }
 
 const RuntimeFilterGroup* FullScanIterator::AcceptsColumn(
@@ -1205,6 +1394,17 @@ const RuntimeFilterGroup* FullScanIterator::AcceptsColumn(
   return group;
 }
 
+void FullScanIterator::AddExtraRuntimeFilter(const RuntimeFilterGroup* group,
+                                             slot_t column, ValueType type) {
+  const RuntimeFilterGroup* accepted =
+      AcceptsColumn(group, std::optional<slot_t>(column), type);
+  if (accepted == nullptr || extra_runtime_filters_.size() >= 4) {
+    return;
+  }
+  extra_runtime_filters_.push_back(
+      ExtraRuntimeFilter{.group = accepted, .column = column});
+}
+
 void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
                                         slot_t column, ValueType type) {
   const RuntimeFilterGroup* accepted =
@@ -1229,6 +1429,10 @@ void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
     return;
   }
   if (!lock_rows_ && stub_block_idx_ != LSTableStore::kInvalidBlockIndex) {
+    stub_zone_maps_pass_ = false;
+    stub_all_rows_match_ = -1;
+    stub_matches_computed_ = false;
+    stub_match_cursor_ = 0;
     SeekVisibleRow();
     return;
   }
@@ -1546,7 +1750,8 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
               dst[r * stride] = col.IntAt(r0 + r);
             }
           }
-        } else if (col.all_single_byte_varchar) {
+        } else if (col.all_single_byte_varchar &&
+                   col.VarcharBytes().size() >= blk->row_count) {
           auto& dst_bytes = batch->varchar_bytes[vslot];
           auto& dst_ends = batch->varchar_ends[vslot];
           const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
@@ -1565,7 +1770,9 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
           auto& dst_ends = batch->varchar_ends[vslot];
           for (size_t r = 0; r < take; ++r) {
             const std::string_view sv = col.VarcharAt(r0 + r);
-            dst_bytes.insert(dst_bytes.end(), sv.data(), sv.data() + sv.size());
+            if (!sv.empty()) {
+              dst_bytes.insert(dst_bytes.end(), sv.begin(), sv.end());
+            }
             dst_ends.push_back(static_cast<uint32_t>(dst_bytes.size()));
           }
         } else {
@@ -1573,11 +1780,24 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
           auto& dst_ends = batch->varchar_ends[vslot];
           const std::span<const uint8_t> src_bytes = col.VarcharBytes();
           const std::span<const uint32_t> src_ends_all = col.VarcharEnds();
+          if (src_ends_all.size() < r0 + take) {
+            status_ = StatusError(StatusCode::kCorrupt,
+                                  "LSTable VARCHAR ends are incomplete");
+            return 0;
+          }
           const uint32_t src_byte_begin = r0 == 0 ? 0U : src_ends_all[r0 - 1];
           const uint32_t src_byte_end = src_ends_all[r0 + take - 1];
+          if (src_byte_end < src_byte_begin ||
+              src_byte_end > src_bytes.size()) {
+            status_ = StatusError(StatusCode::kCorrupt,
+                                  "LSTable VARCHAR offsets are out of range");
+            return 0;
+          }
           const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
-          dst_bytes.insert(dst_bytes.end(), src_bytes.data() + src_byte_begin,
-                           src_bytes.data() + src_byte_end);
+          if (src_byte_end > src_byte_begin) {
+            dst_bytes.insert(dst_bytes.end(), src_bytes.data() + src_byte_begin,
+                             src_bytes.data() + src_byte_end);
+          }
           const uint32_t offset_delta = dst_base - src_byte_begin;
           const uint32_t* __restrict src_ends = src_ends_all.data() + r0;
           const size_t old_ends = dst_ends.size();
@@ -1627,7 +1847,8 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
                 dst[i * stride] = col.IntAt(match_rows[i]);
               }
             }
-          } else if (col.all_single_byte_varchar) {
+          } else if (col.all_single_byte_varchar &&
+                     col.VarcharBytes().size() >= blk->row_count) {
             auto& dst_bytes = batch->varchar_bytes[vslot];
             auto& dst_ends = batch->varchar_ends[vslot];
             const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
@@ -1646,8 +1867,9 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
             auto& dst_ends = batch->varchar_ends[vslot];
             for (size_t i = 0; i < n_match; ++i) {
               const std::string_view sv = col.VarcharAt(match_rows[i]);
-              dst_bytes.insert(dst_bytes.end(), sv.data(),
-                               sv.data() + sv.size());
+              if (!sv.empty()) {
+                dst_bytes.insert(dst_bytes.end(), sv.begin(), sv.end());
+              }
               dst_ends.push_back(static_cast<uint32_t>(dst_bytes.size()));
             }
           }
@@ -1724,6 +1946,9 @@ void FullScanIterator::ClearStubBlockState() {
   stub_current_pid_ = 0;
   stub_next_page_id_ = 0;
   stub_block_row_count_ = 0;
+  stub_matches_computed_ = false;
+  stub_match_cursor_ = 0;
+  stub_match_rows_.clear();
   stub_row_materialized_ = true;
 }
 
@@ -1886,6 +2111,9 @@ bool FullScanIterator::EnsureStubBlockColumns(
     stub_cache_->block.pid = pid;
     stub_cache_->block.row_count = rc.Value();
     stub_cache_->block.column_ids.clear();
+    for (auto& ch : stub_cache_->block.columns) {
+      stub_cache_->free_chunks.push_back(std::move(ch));
+    }
     stub_cache_->block.columns.clear();
     std::fill(stub_cache_->col_chunk_idx.begin(),
               stub_cache_->col_chunk_idx.end(), kNoChunk);
@@ -1902,7 +2130,15 @@ bool FullScanIterator::EnsureStubBlockColumns(
   }
   std::sort(missing.begin(), missing.end());
   missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
-  TlcsFile::DecodedBlock delta;
+  TlcsFile::DecodedBlock& delta = stub_cache_->delta;
+  delta.column_ids.clear();
+  delta.columns.clear();
+  delta.columns.reserve(missing.size());
+  for (size_t i = 0; i < missing.size() && !stub_cache_->free_chunks.empty();
+       ++i) {
+    delta.columns.push_back(std::move(stub_cache_->free_chunks.back()));
+    stub_cache_->free_chunks.pop_back();
+  }
   const Status ds = tlcs->DecodeBlockColumns(
       block_idx, missing, table_->GetSchema(), &delta,
       /*materialize_dict_ints=*/true, &stub_cache_->io_scratch);
@@ -1913,7 +2149,8 @@ bool FullScanIterator::EnsureStubBlockColumns(
   stub_cache_->block.row_count = delta.row_count;
   for (size_t i = 0; i < delta.column_ids.size(); ++i) {
     const slot_t cid = delta.column_ids[i];
-    if (stub_cache_->block.columns.size() >= std::numeric_limits<slot_t>::max()) {
+    if (stub_cache_->block.columns.size() >=
+        std::numeric_limits<slot_t>::max()) {
       status_ = StatusError(StatusCode::kCorrupt,
                             "columnar stub has too many columns");
       return false;
@@ -1926,6 +2163,212 @@ bool FullScanIterator::EnsureStubBlockColumns(
     }
   }
   return true;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (filterColumnAtATime_eq_row_at_a_time)
+void FullScanIterator::ComputeStubBlockMatches() noexcept {
+  stub_match_rows_.clear();
+  stub_match_cursor_ = 0;
+  stub_matches_computed_ = true;
+  if (stub_cache_ == nullptr || stub_block_row_count_ == 0) {
+    return;
+  }
+  const uint32_t rc = stub_block_row_count_;
+  bool initialized = false;
+
+  auto apply_pred = [&](auto&& fn) {
+    if (!initialized) {
+      stub_match_rows_.resize(rc);
+      uint32_t* out = stub_match_rows_.data();
+      size_t k = 0;
+      for (uint32_t r = 0; r < rc; ++r) {
+        out[k] = r;
+        k += static_cast<size_t>(fn(r));
+      }
+      stub_match_rows_.resize(k);
+      initialized = true;
+    } else {
+      uint32_t* out = stub_match_rows_.data();
+      const size_t n = stub_match_rows_.size();
+      size_t k = 0;
+      for (size_t i = 0; i < n; ++i) {
+        const uint32_t r = out[i];
+        out[k] = r;
+        k += static_cast<size_t>(fn(r));
+      }
+      stub_match_rows_.resize(k);
+    }
+  };
+
+  auto run_runtime_filter = [&]() -> bool {
+    if ((runtime_filter_ == nullptr && key_filter_ == nullptr) ||
+        !key_column_.has_value()) {
+      return true;
+    }
+    const slot_t col_idx = *key_column_;
+    if (col_idx >= stub_cache_->col_chunk_idx.size()) {
+      stub_match_rows_.clear();
+      return false;
+    }
+    const slot_t chunk_idx = stub_cache_->col_chunk_idx[col_idx];
+    if (chunk_idx >= stub_cache_->block.columns.size()) {
+      stub_match_rows_.clear();
+      return false;
+    }
+    const TlcsFile::DecodedColumnChunk& col =
+        stub_cache_->block.columns[chunk_idx];
+    if (col.type != ValueType::kInt64 && col.type != ValueType::kDate) {
+      stub_match_rows_.clear();
+      return false;
+    }
+    const int64_t* cells = col.int_cells.data();
+    const bool no_null = !col.has_null;
+    if (runtime_filter_ != nullptr && runtime_filter_->has_dense_bits()) {
+      const auto lo_u = static_cast<uint64_t>(runtime_filter_->Lo());
+      const auto span_u = static_cast<uint64_t>(runtime_filter_->Hi()) - lo_u;
+      const uint64_t* bits = runtime_filter_->dense_bits_data();
+      if (no_null) {
+        apply_pred([cells, lo_u, span_u, bits](uint32_t r) noexcept {
+          const uint64_t off = static_cast<uint64_t>(cells[r]) - lo_u;
+          return off <= span_u &&
+                 ((bits[off >> 6] >> (off & 63)) & uint64_t{1}) != 0;
+        });
+      } else {
+        apply_pred([&col, cells, lo_u, span_u, bits](uint32_t r) noexcept {
+          if (col.IsNull(r)) {
+            return false;
+          }
+          const uint64_t off = static_cast<uint64_t>(cells[r]) - lo_u;
+          return off <= span_u &&
+                 ((bits[off >> 6] >> (off & 63)) & uint64_t{1}) != 0;
+        });
+      }
+    } else if (runtime_filter_ != nullptr) {
+      const RuntimeFilterGroup* rf = runtime_filter_;
+      if (no_null) {
+        apply_pred(
+            [cells, rf](uint32_t r) noexcept { return !rf->Reject(cells[r]); });
+      } else {
+        apply_pred([&col, cells, rf](uint32_t r) noexcept {
+          return !col.IsNull(r) && !rf->Reject(cells[r]);
+        });
+      }
+    } else {
+      const auto* kf = key_filter_;
+      if (no_null) {
+        apply_pred([cells, kf](uint32_t r) noexcept {
+          return kf->contains(cells[r]);
+        });
+      } else {
+        apply_pred([&col, cells, kf](uint32_t r) noexcept {
+          return !col.IsNull(r) && kf->contains(cells[r]);
+        });
+      }
+    }
+    return !stub_match_rows_.empty();
+  };
+
+  auto run_peek_compares = [&]() -> bool {
+    if (peek_compares_ == nullptr || peek_compares_->empty()) {
+      return true;
+    }
+    for (const IntegerPeekCompare& pred : *peek_compares_) {
+      if (pred.column >= stub_cache_->col_chunk_idx.size()) {
+        stub_match_rows_.clear();
+        return false;
+      }
+      const slot_t chunk_idx = stub_cache_->col_chunk_idx[pred.column];
+      if (chunk_idx >= stub_cache_->block.columns.size()) {
+        stub_match_rows_.clear();
+        return false;
+      }
+      const TlcsFile::DecodedColumnChunk& col =
+          stub_cache_->block.columns[chunk_idx];
+      if (col.type != ValueType::kInt64 && col.type != ValueType::kDate) {
+        stub_match_rows_.clear();
+        return false;
+      }
+      const bool no_null = !col.has_null;
+      const int64_t c = pred.constant;
+      // Lean proof: filter_skip_always_true.
+      if (no_null && col.has_min_max && !col.is_unsigned) {
+        const int64_t lo = col.min_int;
+        const int64_t hi = col.max_int;
+        const bool always_true =
+            (pred.op == BinaryOperation::kEquals && lo == c && hi == c) ||
+            (pred.op == BinaryOperation::kNotEquals && (hi < c || c < lo)) ||
+            (pred.op == BinaryOperation::kLessThan && hi < c) ||
+            (pred.op == BinaryOperation::kLessThanEquals && hi <= c) ||
+            (pred.op == BinaryOperation::kGreaterThan && lo > c) ||
+            (pred.op == BinaryOperation::kGreaterThanEquals && lo >= c);
+        if (always_true) {
+          continue;
+        }
+      }
+      const int64_t* cells = col.int_cells.data();
+      auto run_op = [&](auto&& cmp_fn) {
+        if (no_null) {
+          apply_pred([cells, cmp_fn](uint32_t r) noexcept {
+            return cmp_fn(cells[r]);
+          });
+        } else {
+          apply_pred([&col, cells, cmp_fn](uint32_t r) noexcept {
+            return !col.IsNull(r) && cmp_fn(cells[r]);
+          });
+        }
+      };
+      switch (pred.op) {
+        case BinaryOperation::kEquals:
+          run_op([c](int64_t v) noexcept { return v == c; });
+          break;
+        case BinaryOperation::kNotEquals:
+          run_op([c](int64_t v) noexcept { return v != c; });
+          break;
+        case BinaryOperation::kLessThan:
+          run_op([c](int64_t v) noexcept { return v < c; });
+          break;
+        case BinaryOperation::kLessThanEquals:
+          run_op([c](int64_t v) noexcept { return v <= c; });
+          break;
+        case BinaryOperation::kGreaterThan:
+          run_op([c](int64_t v) noexcept { return v > c; });
+          break;
+        case BinaryOperation::kGreaterThanEquals:
+          run_op([c](int64_t v) noexcept { return v >= c; });
+          break;
+        default:
+          run_op([op = pred.op, c](int64_t v) noexcept {
+            return MatchIntegerCompare(v, op, c);
+          });
+          break;
+      }
+      if (stub_match_rows_.empty()) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // Run dense runtime_filter_ FIRST when available (typically 0.5%–10%
+  // selective on fact->dim joins) before peek_compares_.
+  if (runtime_filter_ != nullptr && runtime_filter_->has_dense_bits() &&
+      key_column_.has_value()) {
+    if (!run_runtime_filter() || !run_peek_compares()) {
+      return;
+    }
+  } else {
+    if (!run_peek_compares() || !run_runtime_filter()) {
+      return;
+    }
+  }
+
+  if (!initialized) {
+    stub_match_rows_.resize(rc);
+    for (uint32_t r = 0; r < rc; ++r) {
+      stub_match_rows_[r] = r;
+    }
+  }
 }
 
 bool FullScanIterator::StubRowMatches(uint32_t row) const noexcept {
@@ -2065,16 +2508,42 @@ size_t FullScanIterator::DecodeStubBlockBatch(TypedCellBatch* batch,
     return 0;
   }
   const bool all_match = StubBlockAllRowsMatch(*tlcs, stub_block_idx_);
-  std::vector<slot_t> needed;
-  if (all_match) {
-    needed = typed_keep_slots_;
+  if (!all_match) {
+    // Two-stage lazy decode: decode ONLY filter columns first and evaluate
+    // column-at-a-time; skip decoding payload columns on 0-match blocks.
+    if (!stub_matches_computed_) {
+      std::vector<slot_t> filter_cols;
+      GatherStubFilterCols(/*include_keep_cols=*/false, &filter_cols);
+      if (!EnsureStubBlockColumns(stub_block_idx_, pos_.page_id, filter_cols)) {
+        pos_.page_id = ~0ULL;
+        ClearStubBlockState();
+        return 0;
+      }
+      ComputeStubBlockMatches();
+    }
+    while (stub_match_cursor_ < stub_match_rows_.size() &&
+           stub_match_rows_[stub_match_cursor_] < pos_.slot) {
+      ++stub_match_cursor_;
+    }
+    if (stub_match_cursor_ >= stub_match_rows_.size()) {
+      if (!AdvanceFromStubPage()) {
+        pos_.page_id = ~0ULL;
+      }
+      return 0;
+    }
+    if (!EnsureStubBlockColumns(stub_block_idx_, pos_.page_id,
+                                typed_keep_slots_)) {
+      pos_.page_id = ~0ULL;
+      ClearStubBlockState();
+      return 0;
+    }
   } else {
-    GatherStubFilterCols(/*include_keep_cols=*/true, &needed);
-  }
-  if (!EnsureStubBlockColumns(stub_block_idx_, pos_.page_id, needed)) {
-    pos_.page_id = ~0ULL;
-    ClearStubBlockState();
-    return 0;
+    if (!EnsureStubBlockColumns(stub_block_idx_, pos_.page_id,
+                                typed_keep_slots_)) {
+      pos_.page_id = ~0ULL;
+      ClearStubBlockState();
+      return 0;
+    }
   }
   const size_t stride = batch->stride;
   const size_t kept_count = typed_keep_slots_.size();
@@ -2143,16 +2612,13 @@ size_t FullScanIterator::DecodeStubBlockBatch(TypedCellBatch* batch,
     emitted = take;
     pos_.slot = static_cast<slot_t>(r0 + take);
   } else if (!kept_has_null && !batch->capture_positions) {
-    std::array<uint32_t, 2048> match_rows{};
-    const size_t max_take = std::min<size_t>(max_rows, 2048);
-    size_t n_match = 0;
-    uint32_t cur = pos_.slot;
-    for (; cur < stub_block_row_count_ && n_match < max_take; ++cur) {
-      if (StubRowMatches(cur)) {
-        match_rows[n_match++] = cur;
-      }
-    }
-    pos_.slot = static_cast<slot_t>(cur);
+    const size_t avail = stub_match_rows_.size() - stub_match_cursor_;
+    const size_t n_match = std::min<size_t>(max_rows, avail);
+    const uint32_t* match_rows = stub_match_rows_.data() + stub_match_cursor_;
+    stub_match_cursor_ += n_match;
+    pos_.slot = stub_match_cursor_ < stub_match_rows_.size()
+                    ? static_cast<slot_t>(stub_match_rows_[stub_match_cursor_])
+                    : static_cast<slot_t>(stub_block_row_count_);
     if (n_match > 0) {
       std::memset(batch->nulls.data() + (count_offset * stride), 0,
                   n_match * stride);

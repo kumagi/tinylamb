@@ -23,6 +23,13 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def git_dirty(root):
+    status = subprocess.check_output(
+        ['git', 'status', '--porcelain', '--untracked-files=normal'],
+        cwd=root, text=True)
+    return bool(status)
+
+
 def cases(q67):
     result = []
     def add(name, args, threads=(2, 8, 16), reverse=False, cpus=None):
@@ -126,10 +133,11 @@ def main():
         manifest = dict(started=datetime.now(timezone.utc).isoformat(), binary=str(opts.binary.resolve()),
                         binary_sha256=digest(opts.binary), source_sha256=digest(ROOT / 'benchmark/spsc_aggregation_benchmark.cpp'),
                         git_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+                        git_dirty=git_dirty(ROOT),
                         cases=run_cases, repeats=5,
                         # Ring/batch/local-group sizes vary per case; the
                         # authoritative values are in each case's command.
-                        note='Dirty tree; excluded setup and validation; no SQL execution; per-case settings in cases[].command')
+                        note='Excluded setup and validation; no SQL execution; per-case settings in cases[].command')
         if opts.q67_input:
             manifest['q67_sha256'] = digest(opts.q67_input)
         (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

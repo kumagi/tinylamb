@@ -43,6 +43,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
@@ -237,6 +238,58 @@ TEST_F(DynamicFilterJoinTest, InnerJoinKeepsDuplicateAndNullKeySemantics) {
   // equals anything, not even another NULL.
   EXPECT_EQ(Text(rows),
             (std::vector<std::string>{"1|100|10", "1|101|10", "2|200|20"}));
+}
+
+TEST_F(DynamicFilterJoinTest, DensePrimaryKeyPayloadKeepsZeroAndNullMatches) {
+  TransactionContext setup = database_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, dense_dimension,
+      database_->CreateTable(
+          setup, Schema("dense_dimension",
+                        {Column("k", ValueType::kInt64,
+                                Constraint(Constraint::kPrimaryKey)),
+                         Column("payload", ValueType::kInt64)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, dense_probe,
+      database_->CreateTable(
+          setup, Schema("dense_probe", {Column("k", ValueType::kInt64)})));
+  // Nonmonotonic primary keys prevent the sorted-store lookup shortcut.
+  ASSERT_SUCCESS(
+      dense_dimension.Insert(setup.txn_, Row({Value(2), Value()})).GetStatus());
+  ASSERT_SUCCESS(dense_dimension.Insert(setup.txn_, Row({Value(0), Value(0)}))
+                     .GetStatus());
+  for (int64_t i = 0; i < 30000; ++i) {
+    ASSERT_SUCCESS(
+        dense_probe.Insert(setup.txn_, Row({Value(i % 3)})).GetStatus());
+  }
+  ASSERT_SUCCESS(setup.PreCommit());
+
+  SelectStatement statement(
+      {NamedExpression("payload", ColumnValueExp("dense_dimension.payload"))},
+      {"dense_probe", "dense_dimension"},
+      BinaryExpressionExp(ColumnValueExp("dense_probe.k"),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp("dense_dimension.k")));
+  TransactionContext probe = database_->BeginReadOnlyContext();
+  bool applied = false;
+  ASSIGN_OR_ASSERT_FAIL(
+      relational_detail::Relation, result,
+      relational_detail::BuildInput(probe, statement, nullptr, {}, &applied));
+  EXPECT_TRUE(applied);
+  ASSERT_EQ(result.schema.ColumnCount(), 1U);
+  EXPECT_EQ(result.TotalRows(), 20000U);
+  size_t zeros = 0;
+  size_t nulls = 0;
+  ASSERT_SUCCESS(result.ForEachRow([&](const Row& row) {
+    if (row[0].IsNull()) {
+      ++nulls;
+    } else {
+      EXPECT_EQ(row[0], Value(0));
+      ++zeros;
+    }
+  }));
+  EXPECT_EQ(zeros, 10000U);
+  EXPECT_EQ(nulls, 10000U);
 }
 
 TEST_F(DynamicFilterJoinTest, EmptyBuildSideMakesTheInnerJoinEmpty) {

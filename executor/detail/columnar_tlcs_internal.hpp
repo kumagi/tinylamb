@@ -58,7 +58,7 @@ class PagedStringArena {
 
   StatusOr<std::string_view> Intern(std::string_view sv) {
     if (sv.empty()) {
-      return std::string_view{};
+      return std::string_view("");
     }
     const size_t need = sv.size();
     if (current_pos_ + need > current_cap_) {
@@ -139,7 +139,7 @@ struct ColAggSpec {
   slot_t full_col{0};
   bool needs_bytes{false};
   bool needs_lengths_only{false};
-  std::shared_ptr<const ColDoubleArithExpr> double_arith;
+  std::shared_ptr<const ColDoubleArithExpr> double_arith{};
 };
 
 enum class ColKeyKind : uint8_t {
@@ -231,6 +231,16 @@ class ChunkedCharge {
   size_t slack_{0};
 };
 
+struct DistinctIntegerValues {
+  QueryMemoryCharge charge;
+  FlatIntKeyMap<uint8_t> values;
+};
+
+struct DistinctStringValues {
+  QueryMemoryCharge charge;
+  std::unordered_set<std::string_view> values;
+};
+
 struct RuntimeAggState {
   int64_t int_val{0};
   double double_val{0.0};
@@ -258,11 +268,11 @@ struct RuntimeAggState {
   // the pair-sharded partitioned COUNT(DISTINCT)): `count` then holds the
   // final distinct count and FinishAggState must report it.
   bool distinct_count_final{false};
-  std::unique_ptr<FlatIntKeyMap<uint8_t>> distinct_ints;
+  std::unique_ptr<DistinctIntegerValues> distinct_ints;
   // Keys are string_views into PagedStringArena storage (interned once per
   // distinct value), so counting distinct VARCHARs does not allocate a
   // std::string for every input row.
-  std::unique_ptr<std::unordered_set<std::string_view>> distinct_strs;
+  std::unique_ptr<DistinctStringValues> distinct_strs;
 };
 
 struct GroupKeySliceHasher {
@@ -377,7 +387,8 @@ class WorkerGroupTable {
   StatusOr<uint32_t> FindOrInsert(const RuntimeKeyCell* probe_keys,
                                   uint64_t hash, bool borrow_strings = false);
   Status MergeFromGroup(const RuntimeKeyCell* src_keys, uint64_t hash,
-                        RuntimeAggState* src_aggs, bool borrow_strings = false);
+                        std::span<RuntimeAggState> src_aggs,
+                        bool borrow_strings = false);
 
   [[nodiscard]] size_t NumGroups() const noexcept { return num_groups_; }
   [[nodiscard]] uint64_t HashAt(size_t gid) const noexcept {
@@ -401,6 +412,7 @@ class WorkerGroupTable {
   };
 
   Status Rehash(size_t new_cap);
+  Status ReserveGroupStorage(size_t groups);
 
   const std::vector<ColGroupKeySpec>* key_specs_;
   const std::vector<ColAggSpec>* agg_specs_;

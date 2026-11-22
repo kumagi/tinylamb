@@ -18,12 +18,12 @@
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
-#include "transaction/transaction.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
+#include "transaction/transaction.hpp"
 #include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -127,9 +127,7 @@ int ParallelMergeJoin::CompareKeys(const Row& left,
     if (!lv.IsNull() && !rv.IsNull() && lv.type != rv.type) {
       return static_cast<int>(lv.type) < static_cast<int>(rv.type) ? -1 : 1;
     }
-    return CompareUnderCollation(lv, rv, ResolveCollation(lv, rv)) < 0
-               ? -1
-               : 1;
+    return CompareUnderCollation(lv, rv, ResolveCollation(lv, rv)) < 0 ? -1 : 1;
   }
   return 0;
 }
@@ -379,7 +377,16 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
   };
 
   if (partitions_.size() <= 1) {
-    worker_func(0);
+    // The synchronous single-partition path must honor the same no-exception
+    // boundary as the worker threads below: a throwing allocation/comparison
+    // would otherwise escape ExecuteParallelMerge -> EnsureMaterialized ->
+    // NextBatch and cross the executor's Status boundary.
+    try {
+      worker_func(0);
+    } catch (...) {
+      FailWith(StatusFromCurrentException("parallel merge worker failed"));
+      return;
+    }
   } else {
     Status worker_failure{Status::kSuccess};
     std::mutex failure_mutex;
@@ -532,6 +539,12 @@ size_t ParallelMergeJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   }
   destination->Reset();
   EnsureMaterialized();
+  // A failed worker/child is latched as a sticky Status by
+  // EnsureMaterialized; stop before serving the empty output_ as a clean EOF
+  // (mirrors MergeJoin::NextBatch).
+  if (GetStatus() != Status::kSuccess) {
+    return 0;
+  }
   // PairPasses latches a failed residual as "no match", so the materialized
   // output can hold rows that only LOOK like inner-join drops or anti-join
   // matches. Next() surfaces the sticky error; the batched path must not

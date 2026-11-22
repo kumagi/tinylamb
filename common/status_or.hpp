@@ -32,6 +32,13 @@
 
 #define UNLIKELY(x) __builtin_expect((x), 0)
 
+// NOTE: Unlike COERCE/ASSERT_SUCCESS_AND_EQ, the ASSIGN_OR_* family is
+// deliberately *not* `do { ... } while (0)`: each macro declares `value` in
+// the caller's scope so it can be used by the following statements, and a
+// do-while would scope it away. As multi-statement macros they are not single
+// statements -- always brace them when used as an if/else/for/while body
+// (`if (c) { ASSIGN_OR_RETURN(...); }`), otherwise the caller's `else` no
+// longer matches its `if` and compilation fails instead of silently rebinding.
 #define ASSIGN_OR_RETURN(type, value, expr)          \
   StatusOr<type> value##_tmp = expr;                 \
   if (value##_tmp.GetStatus() != Status::kSuccess) { \
@@ -123,30 +130,37 @@ class StatusOr {
       : status_(Status::kSuccess), value_(std::in_place, std::forward<U>(v)) {}
 
   [[nodiscard]] bool HasValue() const {
-    // A success Status with no payload (e.g. `StatusOr<T> x = Status::kSuccess`)
-    // must not claim a value: Value()/MoveValue() would abort.
-    return status_ == Status::kSuccess && value_.has_value();
+    // A success Status with no payload (e.g. `StatusOr<T> x =
+    // Status::kSuccess`) must not claim a value: Value()/MoveValue() would
+    // abort.
+    return !consumed_ && status_ == Status::kSuccess && value_.has_value();
   }
   // Callers must check HasValue() first: accessing the value of a failed
   // StatusOr is a contract violation and aborts (no exceptions).
   T& Value() {
-    if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
-      detail::StatusOrNoValue(status_);
+    if (UNLIKELY(consumed_ || status_ != Status::kSuccess ||
+                 !value_.has_value())) {
+      detail::StatusOrNoValue(ConsumedStatus());
     }
     return *value_;
   }
   // Moves the value out and consumes the StatusOr: a second MoveValue() (or
-  // Value()) on the same object aborts.
+  // Value()) on the same object aborts. Track consumption separately from
+  // status_ so GetStatus() keeps the original error (e.g. kCorrupt) instead
+  // of overwriting it with kUnknown, which is indistinguishable from a
+  // genuine failure.
   T&& MoveValue() {
-    if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
-      detail::StatusOrNoValue(status_);
+    if (UNLIKELY(consumed_ || status_ != Status::kSuccess ||
+                 !value_.has_value())) {
+      detail::StatusOrNoValue(ConsumedStatus());
     }
-    status_ = Status::kUnknown;
+    consumed_ = true;
     return std::move(*value_);
   }
   [[nodiscard]] const T& Value() const {
-    if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
-      detail::StatusOrNoValue(status_);
+    if (UNLIKELY(consumed_ || status_ != Status::kSuccess ||
+                 !value_.has_value())) {
+      detail::StatusOrNoValue(ConsumedStatus());
     }
     return *value_;
   }
@@ -163,8 +177,13 @@ class StatusOr {
   }
 
  private:
+  [[nodiscard]] Status ConsumedStatus() const {
+    return consumed_ ? Status(StatusCode::kUnknown) : status_;
+  }
+
   Status status_;
   std::optional<T> value_;
+  bool consumed_{false};
 };
 
 }  // namespace tinylamb

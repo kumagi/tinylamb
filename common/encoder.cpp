@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <ios>
 #include <limits>
 #include <string_view>
@@ -38,6 +39,19 @@ Encoder& Encoder::operator<<(std::string_view sv) {
   // oversize string here is an invariant violation, not a runtime error.
   if (sv.size() > std::numeric_limits<bin_size_t>::max()) {
     LOG(FATAL) << "string too long to encode: " << sv.size();
+  }
+  // The length prefix can reallocate the destination before we read sv.
+  // Snapshot aliased input first; std::less gives a total pointer order even
+  // when the source belongs to an unrelated allocation.
+  std::string snapshot;
+  if (bytes_ != nullptr && !sv.empty()) {
+    const char* begin = bytes_->data();
+    const char* end = begin + bytes_->size();
+    const std::less<> less;
+    if (!less(sv.data(), begin) && less(sv.data(), end)) {
+      snapshot.assign(sv);
+      sv = snapshot;
+    }
   }
   const auto sz = static_cast<bin_size_t>(sv.size());
   std::array<char, sizeof(bin_size_t)> prefix{};

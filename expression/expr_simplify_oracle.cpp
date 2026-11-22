@@ -131,7 +131,8 @@ std::string MakeStringLeaf(Gen& g, bool extended) {
   static constexpr std::string_view kAlphabet = "ab%_ '\\\t\n";
   const int len = g.Pick(0, 3);
   std::string s;
-  const int max_char_idx = extended ? 9 : 6;
+  const int max_char_idx =
+      extended ? static_cast<int>(kAlphabet.size()) - 1 : 6;
   for (int i = 0; i < len; ++i) {
     s.push_back(kAlphabet[static_cast<size_t>(g.Pick(0, max_char_idx))]);
   }
@@ -1140,7 +1141,12 @@ std::string ConstantSql(const Value& v, GenType type) {
     // a plain INT64 literal while the AST reference evaluated the tagged
     // value — a serializer artifact, not an engine divergence.
     if (v.IsUnsigned()) {
-      return "CAST(" + std::to_string(v.value.int_value) + " AS UINT64)";
+      // int_value holds the UINT64 bit pattern; rendering it as int64 turns
+      // UINT64_MAX into "-1" (and 2^63 into a negative), so the SQL text would
+      // evaluate a different value than the AST reference.
+      return "CAST(" +
+             std::to_string(static_cast<uint64_t>(v.value.int_value)) +
+             " AS UINT64)";
     }
     if (v.value.int_value == kInt64Min) {
       return "(-9223372036854775807 - 1)";

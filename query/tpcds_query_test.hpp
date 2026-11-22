@@ -160,7 +160,9 @@ inline std::vector<Q68Expected> ComputeQ68Expected(
 
 class TpcdsQueryTest : public ::testing::Test {
  protected:
-  void SetUp() override {
+  void SetUp() override { SetUpWithFixture(tpcds::Generate(1)); }
+
+  void SetUpWithFixture(tpcds::GeneratedData fixture) {
     const std::filesystem::path workspace = "tpcds_" + RandomString();
     std::error_code error;
     ASSERT_TRUE(std::filesystem::create_directory(workspace, error))
@@ -171,7 +173,7 @@ class TpcdsQueryTest : public ::testing::Test {
     for (const std::string_view ddl : tpcds::Ddl()) {
       RunDdl(ddl);
     }
-    fixture_ = tpcds::Generate(1);
+    fixture_ = std::move(fixture);
     for (const std::string_view ddl : tpcds::Ddl()) {
       static constexpr std::string_view kCreate = "CREATE TABLE ";
       const size_t begin = ddl.find(kCreate) + kCreate.size();

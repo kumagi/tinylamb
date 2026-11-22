@@ -66,6 +66,15 @@ TEST(SqlJoinFuzzer, SeededJoinsMatchMirror) {
   EXPECT_GT(left_joins, 0) << "LEFT JOIN never exercised";
 }
 
+TEST(SqlJoinFuzzer, ReplayReportsSetupErrors) {
+  JoinTrace trace;
+  trace.setup = {"CREATE TABLE fact (x INT64)",
+                 "INSERT INTO missing_table VALUES (1)"};
+  const std::string report = ReplayJoinTrace(trace);
+  EXPECT_NE(report.find("[JOIN FUZZ SETUP ERROR]"), std::string::npos);
+  EXPECT_NE(report.find("missing_table"), std::string::npos);
+}
+
 TEST(SqlJoinFuzzer, TestFileRoundTripDetectsMismatch) {
   JoinTrace trace;
   trace.setup = {

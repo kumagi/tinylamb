@@ -13,16 +13,17 @@
 namespace tinylamb {
 
 // Aggregation / GROUP BY / window-function oracle. Mirrors the generated
-// input in C++ and checks a separate primary-key fixture. It runs aggregate queries — GROUP BY over 1-2 key
-// columns, optional WHERE and HAVING (3VL on the aggregate result), global
-// aggregates over possibly-empty input (COUNT(*)=0 / SUM=NULL contract),
-// COUNTIF and DISTINCT aggregates (COUNT(DISTINCT)/SUM(DISTINCT)) — and
-// window queries (ROW_NUMBER / RANK / COUNT(*) / running SUM plus
-// ROWS BETWEEN k PRECEDING AND CURRENT ROW frames for SUM/COUNT(b)).
-// Window cases cover both unique ordering and peer groups. About 12% of
-// iterations use large inputs in multi-row VALUES batches, with about
-// 8,300–8,409 or 33,000–33,040 rows to cross parallel execution thresholds. The C++
-// mirror checks whole result multisets (NULL groups, NULL-skipping aggregates,
+// input in C++ and checks a separate primary-key fixture. It runs aggregate
+// queries — GROUP BY over 1-2 key columns, optional WHERE and HAVING (3VL on
+// the aggregate result), global aggregates over possibly-empty input
+// (COUNT(*)=0 / SUM=NULL contract), COUNTIF and DISTINCT aggregates
+// (COUNT(DISTINCT)/SUM(DISTINCT)) — and window queries (ROW_NUMBER / RANK /
+// COUNT(*) / running SUM plus ROWS BETWEEN k PRECEDING AND CURRENT ROW frames
+// for SUM/COUNT(b)). Window cases cover both unique ordering and peer groups.
+// About 12% of iterations use large inputs loaded by a single-statement INSERT
+// ... SELECT ... FROM UNNEST(GENERATE_SERIES(...)), with about 8,300–8,409 or
+// 33,000–33,040 rows to cross parallel execution thresholds. The C++ mirror
+// checks whole result multisets (NULL groups, NULL-skipping aggregates,
 // NULLS-FIRST ranking).
 
 struct AggQueryExpect {

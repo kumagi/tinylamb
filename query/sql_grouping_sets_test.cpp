@@ -104,6 +104,23 @@ TEST_F(SqlGroupingSetsTest, RollupSingleKeyProducesSubtotalAndGrandTotal) {
   EXPECT_EQ(rows[3][1], Value(int64_t{100}));
 }
 
+// An immutable INT64-valued expression as the aggregate child must take the
+// exact-partial ROLLUP path too (TPC-DS Q67 uses COALESCE(a*b, 0)), not just a
+// bare column reference.
+// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+//   (rollup_two_level_state_combine_sound,
+//   rollup_three_level_state_combine_sound)
+TEST_F(SqlGroupingSetsTest, RollupWithExpressionAggregateChildKeepsTotals) {
+  const auto rows =
+      Run("SELECT a, SUM(COALESCE(x * 2, 0)) AS s FROM g "
+          "GROUP BY ROLLUP(a) ORDER BY a NULLS LAST");
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0][1], Value(int64_t{60}));   // a = 1
+  EXPECT_EQ(rows[1][1], Value(int64_t{60}));   // a = 2
+  EXPECT_EQ(rows[2][1], Value(int64_t{80}));   // a = NULL
+  EXPECT_EQ(rows[3][1], Value(int64_t{200}));  // grand total
+}
+
 // ROLLUP(a, b) hierarchy: (a,b), (a) subtotals and the () grand total.
 TEST_F(SqlGroupingSetsTest, RollupTwoKeysProducesHierarchy) {
   const auto rows =

@@ -127,6 +127,7 @@ TEST_F(IndexKeyHistoryTest, DisabledHistoryAdvancesEvictionWatermark) {
   // possible commit (strictly greater than every snapshot that could miss
   // the discarded keys), i.e. >= 1.  Before the fix it stayed at 0.
   EXPECT_GE(state.first, 1ULL);
+  tinylamb::RemoveLogAndSegments(log_name);
 }
 
 TEST_F(IndexKeyHistoryTest, OversizedPendingSetRevokesRatherThanLosesKeys) {

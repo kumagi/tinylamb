@@ -26,8 +26,9 @@
 namespace tinylamb::platform {
 
 // A set of CPUs a thread may run on. Thread pinning exists only on Linux
-// (sched_{get,set}affinity); macOS offers affinity *hints* at best, so there
-// CurrentThread() returns nullopt and callers skip pinning entirely.
+// (sched_{get,set}affinity); macOS offers affinity *hints* at best. On
+// unsupported platforms, CurrentThread() returns nullopt and callers skip
+// pinning entirely.
 class CpuSet {
  public:
   // Whether this platform can pin threads to CPUs at all.

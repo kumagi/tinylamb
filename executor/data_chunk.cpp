@@ -149,9 +149,8 @@ void ColumnVector::Append(const Value& value) {
     MaterializeInferredStorage();
   } else if (!is_null &&
              (type_ != value.type ||
-              (type_ == ValueType::kInt64 &&
-               value.IsUnsigned() != unsigned_ && size_ > 0 &&
-               allow_heterogeneous_))) {
+              (type_ == ValueType::kInt64 && value.IsUnsigned() != unsigned_ &&
+               size_ > 0 && allow_heterogeneous_))) {
     // A different type -- or an INT64 cell whose signedness differs from the
     // column's -- cannot share the typed integer storage: the column keeps a
     // single unsigned flag, so -1 appended after a UINT64 would read back as
@@ -210,9 +209,8 @@ void ColumnVector::Append(Value&& value) {
     MaterializeInferredStorage();
   } else if (!is_null &&
              (type_ != value.type ||
-              (type_ == ValueType::kInt64 &&
-               value.IsUnsigned() != unsigned_ && size_ > 0 &&
-               allow_heterogeneous_))) {
+              (type_ == ValueType::kInt64 && value.IsUnsigned() != unsigned_ &&
+               size_ > 0 && allow_heterogeneous_))) {
     // See Append(const Value&): mixed INT64 signedness keeps per-value cells.
     if (allow_heterogeneous_) {
       PromoteToHeterogeneous();
@@ -285,13 +283,13 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
     }
     CHECK_MSG(false, "column vector type mismatch");
   }
+  if (type_ == ValueType::kVarChar && source.type_ == ValueType::kVarChar) {
+    ObserveSourceCollation(source);
+  }
   EnsureNullBit(size_, is_null);
   if (is_null) {
     AppendDefault();
   } else {
-    if (source.type_ == ValueType::kVarChar) {
-      ObserveSourceCollation(source);
-    }
     switch (type_) {
       case ValueType::kInt64:
       case ValueType::kDate:
@@ -1176,7 +1174,7 @@ void DataChunk::CommitBatchAppend(size_t appended_rows) {
   // out-of-band and only advances size_/positions_. Over-reporting used to
   // silently leave size_ ahead of ColumnVector::Size(), so RowAt/ValueAt read
   // out-of-bounds cells and zone maps drifted. Clamp to the rows every column
-  // actually holds (a column-less chunk keeps the historical behaviour) so
+  // actually holds (a column-less chunk keeps the historical behavior) so
   // the size invariant Append/AppendGather maintain cannot be broken by a
   // miscounted caller.
   for (const ColumnVector& column : columns_) {

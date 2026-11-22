@@ -33,8 +33,11 @@ serializes through here; depends only on `common/`.
 - `constraint.{hpp,cpp}` (`kNotNull/kUnique/kPrimaryKey`), `function.hpp`
   (catalog function signatures), `date.*`, `interval.*`.
 - `row_block_codec.{hpp,cpp}` — `RowBlockCodec`: self-describing arbitrary-length
-  `Row` and `RowPosition` serialization used by `SpillStore` and transaction
-  write-set / version spills.
+  `Row` / `RowPosition` serialization used by the executor OOC sinks
+  (`external_sorter`, `spillable_store`, `ooc_*_sink`, `chunk_codec`,
+  `recursive_partitioner`) and by `update.cpp` / `foreign_key.cpp`. `SpillStore`
+  itself stores raw byte blocks (no codec), and transaction write-set / MVCC
+  version spills write raw bytes through `SpillStore` without this codec.
 
 ## Before reading code here
 

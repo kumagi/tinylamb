@@ -7,6 +7,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -509,6 +511,124 @@ TEST(PipelineP3bTest, OocGroupAggNonDecomposableSkewReturnsTooBigData) {
   EXPECT_EQ(st.GetCode(), StatusCode::kTooBigData);
 }
 
+TEST(PipelineP3bTest, OocGroupAggMixedDistinctSkewReturnsTooBigData) {
+  // COUNT(DISTINCT) combined with other aggregates cannot take the sorted
+  // single-distinct path, so its per-group distinct-value set must obey the
+  // operator memory budget instead of growing without bound.
+  TestKnobsGuard guard(64ULL << 10);
+  Schema schema(
+      "gdm", {Column("grp", ValueType::kInt64), Column("k", ValueType::kInt64),
+              Column("v", ValueType::kVarChar)});
+  std::vector<Row> input;
+  input.reserve(1200);
+  const std::string pad(256, 'M');
+  for (int i = 0; i < 1200; ++i) {
+    input.push_back(Row({Value(int64_t{1}), Value(int64_t{i}),
+                         Value(std::to_string(i) + "_" + pad)}));
+  }
+  auto cnt_distinct = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, ColumnValueExp("v"), true);
+  auto sum_k = std::make_shared<AggregateExpression>(
+      AggregationType::kSum, ColumnValueExp("k"), false);
+  Schema out_schema("gdm_out", {Column("grp", ValueType::kInt64),
+                                Column("cd", ValueType::kInt64),
+                                Column("s", ValueType::kInt64)});
+  auto sink = std::make_shared<OocGroupAggSink>(
+      schema, std::vector<Expression>{ColumnValueExp("grp")},
+      std::vector<const AggregateExpression*>{cnt_distinct.get(), sum_k.get()},
+      out_schema);
+  Status st;
+  std::vector<Row> out = ExecuteSink(out_schema, std::move(input), sink, &st);
+  EXPECT_TRUE(out.empty());
+  EXPECT_EQ(st.GetCode(), StatusCode::kTooBigData);
+}
+
+TEST(PipelineP3bTest, OocGroupAggSingleDistinctSkewStripsAndStaysExact) {
+  // A lone plain COUNT/SUM/AVG(DISTINCT col) takes the sorted skew path
+  // with a DISTINCT-stripped accumulator: adjacent dedup feeds each
+  // distinct value once, keeping per-group state O(1) while preserving
+  // exact DISTINCT semantics (duplicates and NULLs handled).
+  TestKnobsGuard guard(64ULL << 10);
+  Schema schema("gds",
+                {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64),
+                 Column("pad", ValueType::kVarChar)});
+  constexpr int kRows = 2500;
+  std::vector<Row> input;
+  input.reserve(kRows);
+  const std::string pad(120, 'T');
+  std::unordered_map<int64_t, std::unordered_set<int64_t>> expected_distinct;
+  for (int i = 0; i < kRows; ++i) {
+    // 80% heavy key 7 (skew), 20% light keys; v cycles i % 37 with
+    // periodic NULLs so dedup and NULL-skipping are both exercised.
+    const int64_t k = (i % 5 != 0) ? 7 : i;
+    const bool is_null = (i % 11 == 0);
+    const int64_t v = i % 37;
+    input.push_back(
+        Row({Value(k), is_null ? Value() : Value(v), Value(std::string(pad))}));
+    auto& distinct_vals = expected_distinct[k];
+    if (!is_null) {
+      distinct_vals.insert(v);
+    }
+  }
+  ASSERT_GT(expected_distinct.size(), 1U);
+
+  const struct {
+    AggregationType type;
+    ValueType out_type;
+  } cases[] = {
+      {AggregationType::kCount, ValueType::kInt64},
+      {AggregationType::kSum, ValueType::kInt64},
+      {AggregationType::kAvg, ValueType::kDouble},
+  };
+  for (const auto& tc : cases) {
+    auto agg =
+        std::make_shared<AggregateExpression>(tc.type, ColumnValueExp("v"),
+                                              /*distinct=*/true);
+    Schema out_schema("gds_out", {Column("k", ValueType::kInt64),
+                                  Column("agg", tc.out_type)});
+    auto sink = std::make_shared<OocGroupAggSink>(
+        schema, std::vector<Expression>{ColumnValueExp("k")},
+        std::vector<const AggregateExpression*>{agg.get()}, out_schema);
+    Status st;
+    const std::vector<Row> out =
+        ExecuteSink(out_schema, input, sink, &st, nullptr, nullptr);
+    ASSERT_EQ(st, Status::kSuccess);
+    ASSERT_EQ(out.size(), expected_distinct.size());
+    for (const Row& r : out) {
+      const auto it = expected_distinct.find(r[0].AsInt64());
+      ASSERT_NE(it, expected_distinct.end());
+      if (it->second.empty()) {
+        // A group whose every input was NULL: COUNT is 0, SUM/AVG NULL.
+        if (tc.type == AggregationType::kCount) {
+          EXPECT_EQ(r[1].AsInt64(), 0);
+        } else {
+          EXPECT_TRUE(r[1].IsNull());
+        }
+        continue;
+      }
+      int64_t sum = 0;
+      for (const int64_t d : it->second) {
+        sum += d;
+      }
+      const double avg =
+          static_cast<double>(sum) / static_cast<double>(it->second.size());
+      switch (tc.type) {
+        case AggregationType::kCount:
+          EXPECT_EQ(r[1].AsInt64(), static_cast<int64_t>(it->second.size()));
+          break;
+        case AggregationType::kSum:
+          EXPECT_EQ(r[1].AsInt64(), sum);
+          break;
+        case AggregationType::kAvg:
+          EXPECT_NEAR(r[1].AsDouble(), avg, 1e-9);
+          break;
+        default:
+          FAIL() << "unexpected aggregate type";
+      }
+    }
+  }
+}
+
 TEST(PipelineP3bTest, SqlEngineP3bOperatorsZeroLegacyAndBudgetInvariant) {
   const std::string prefix = "p3b_sql_" + RandomString();
   auto db_or = Database::Create(prefix);
@@ -627,6 +747,77 @@ TEST(PipelineP3bTest, SqlEngineP3bOperatorsZeroLegacyAndBudgetInvariant) {
     EXPECT_EQ(spilled[i], oracle[i])
         << "G2 always-spill mismatch for: " << queries[i];
   }
+}
+
+TEST(PipelineP3bTest, OocRecursiveCteUnionDistinctSpillBoundaryKeepsRow) {
+  // Regression: the UNION DISTINCT reached-set spills once `work_index`
+  // outgrows `seen_budget`. The row that crosses the budget must be spilled
+  // *before* it enters `reached_seg`; inserting it first wrote it into both
+  // the spilled reached set and the candidate sorter, and the merge
+  // anti-join then dropped it from the output and the next delta.
+  const std::string prefix = "p3b_rcte_" + RandomString();
+  auto db_or = Database::Create(prefix);
+  ASSERT_EQ(db_or.GetStatus(), Status::kSuccess);
+  auto db = db_or.MoveValue();
+
+  const std::string sql =
+      "WITH RECURSIVE r AS (SELECT 1 AS n UNION DISTINCT "
+      "SELECT n + 1 FROM r WHERE n < 900) SELECT n FROM r ORDER BY n;";
+
+  auto run = [&](size_t op_budget) -> std::vector<Row> {
+    TestKnobsGuard guard(op_budget);
+    TransactionContext ctx = db->BeginContext();
+    SqlEngine eng(*db);
+    StatusOr<Executor> exec_or = eng.Prepare(ctx, sql);
+    EXPECT_TRUE(exec_or.HasValue()) << eng.LastError();
+    if (!exec_or.HasValue()) {
+      ctx.txn_.Abort();
+      return {};
+    }
+    Executor exec = exec_or.MoveValue();
+    std::vector<Row> rows = DrainExecutor(exec.get());
+    EXPECT_EQ(exec->GetStatus().GetCode(), StatusCode::kSuccess);
+    ctx.txn_.Abort();
+    return rows;
+  };
+
+  const auto oracle = run(size_t{64} << 20);
+  ASSERT_EQ(oracle.size(), 900U);
+  const auto tight = run(64ULL << 10);
+  EXPECT_EQ(tight, oracle);
+}
+
+TEST(PipelineP3bTest, MergeJoinUsesSortOrderForMixedTypes) {
+  Schema input("input", {Column("k", ValueType::kVarChar)});
+  Schema output("output", {Column("lk", ValueType::kVarChar),
+                           Column("rk", ValueType::kVarChar)});
+  OocSetOpInputStream left{
+      .source = std::make_shared<RowVectorSource>(
+          std::vector<Row>{Row({Value("a")}), Row({Value("b")})}),
+      .operators = {},
+      .schema = input};
+  OocSetOpInputStream right{
+      .source = std::make_shared<RowVectorSource>(
+          std::vector<Row>{Row({Value(1.0)}), Row({Value("b")})}),
+      .operators = {},
+      .schema = input};
+  auto join = std::make_shared<OocMergeJoinSource>(
+      std::move(left), std::move(right), std::vector<slot_t>{0},
+      std::vector<slot_t>{0}, JoinKind::kInner, 1, 1, Expression(),
+      input + input, output);
+  PipelineGraph graph;
+  graph.output_schema = output;
+  graph.stages.push_back(PipelineStage{.id = 0,
+                                       .name = "join",
+                                       .source = join,
+                                       .operators = {},
+                                       .sink = nullptr,
+                                       .output_binding = nullptr});
+  PipelineExecutor exec(nullptr, std::move(graph));
+  const auto rows = DrainExecutor(&exec);
+  ASSERT_EQ(exec.GetStatus().GetCode(), StatusCode::kSuccess);
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0], Row({Value("b"), Value("b")}));
 }
 
 TEST(PipelineP3bTest, OocMergeBandCrossJoinHandleOverflowRunsAndOuterModes) {

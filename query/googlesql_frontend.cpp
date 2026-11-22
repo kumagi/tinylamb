@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -60,14 +61,31 @@ namespace {
 
 // Child stdout and stderr share one pipe; a stderr warning can precede the
 // parser's "ERROR:" line, so a leading-only check would misclassify an error
-// as a successful AST. Look for an ERROR: at the start of any line.
+// as a successful AST. A successful dump, however, echoes literal contents
+// verbatim: a multi-line literal can hold a line starting with "ERROR:".
+// Treat only diagnostics before the AST dump begins as parse errors.
 bool ContainsParserError(std::string_view output) {
-  size_t pos = 0;
-  while ((pos = output.find("ERROR:", pos)) != std::string_view::npos) {
-    if (pos == 0 || output[pos - 1] == '\n') {
-      return true;
+  bool in_ast_dump = false;
+  size_t line_start = 0;
+  while (line_start < output.size()) {
+    const size_t newline = output.find('\n', line_start);
+    const size_t line_end =
+        newline == std::string_view::npos ? output.size() : newline;
+    const std::string_view line =
+        output.substr(line_start, line_end - line_start);
+    if (line.starts_with("ERROR:")) {
+      if (!in_ast_dump) {
+        return true;
+      }
+    } else if (!line.empty() && !line.starts_with("WARNING:") &&
+               !line.starts_with("INFO:")) {
+      // The first non-diagnostic line is the root node of the AST dump.
+      in_ast_dump = true;
     }
-    pos += 6;
+    if (newline == std::string_view::npos) {
+      break;
+    }
+    line_start = newline + 1;
   }
   return false;
 }
@@ -117,7 +135,8 @@ std::chrono::seconds NegativeCacheTtlSeconds() {
       char* end = nullptr;
       errno = 0;
       const long val = std::strtol(env, &end, 10);
-      if (errno == 0 && val > 0 && end != nullptr && end != env && *end == '\0') {
+      if (errno == 0 && val > 0 && end != nullptr && end != env &&
+          *end == '\0') {
         return std::chrono::seconds(val);
       }
     }
@@ -156,6 +175,11 @@ struct ParseShard {
 
 std::array<ParseShard, kParseCacheShards> parse_shards;
 
+// A zygote that accepts a connection but never returns the exit-status byte
+// would otherwise wedge every later parse until the timeout. Retire the
+// fast path process-wide on the first such failure and spawn the parser.
+std::atomic<bool> zygote_unresponsive{false};
+
 ParseShard& ShardFor(std::string_view sql) {
   return parse_shards[std::hash<std::string_view>{}(sql) % kParseCacheShards];
 }
@@ -183,9 +207,16 @@ std::filesystem::path ResolveGoogleSqlExecutable() {
     }
   }
 #ifndef TINYLAMB_OS_WINDOWS
-  std::filesystem::path tmp_shim("/tmp/tinylamb-execute-query");
-  if (std::filesystem::exists(tmp_shim, ec)) {
-    return tmp_shim;
+  // /tmp is writable by other users on multi-user hosts: silently executing
+  // whatever happens to live at a fixed path there would run arbitrary code
+  // with this process's privileges and leak every SQL statement on stdin.
+  // Keep the dev shim, but require an explicit opt-in instead of trusting it.
+  if (const char* allow = std::getenv("TINYLAMB_ALLOW_TMP_PARSER_SHIM");
+      allow != nullptr && std::strcmp(allow, "1") == 0) {
+    std::filesystem::path tmp_shim("/tmp/tinylamb-execute-query");
+    if (std::filesystem::exists(tmp_shim, ec)) {
+      return tmp_shim;
+    }
   }
 #endif
   return configured;
@@ -242,36 +273,37 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   std::thread reader;
   try {
     writer = std::thread([stdin_write, sql]() {
-    size_t written = 0;
-    while (written < sql.size()) {
-      const DWORD chunk = static_cast<DWORD>(
-          std::min<size_t>(sql.size() - written, 64U * 1024U));
-      DWORD n = 0;
-      if (!::WriteFile(stdin_write, sql.data() + written, chunk, &n, nullptr)) {
-        break;
+      size_t written = 0;
+      while (written < sql.size()) {
+        const DWORD chunk = static_cast<DWORD>(
+            std::min<size_t>(sql.size() - written, 64U * 1024U));
+        DWORD n = 0;
+        if (!::WriteFile(stdin_write, sql.data() + written, chunk, &n,
+                         nullptr)) {
+          break;
+        }
+        written += n;
       }
-      written += n;
-    }
-    ::CloseHandle(stdin_write);
-  });
+      ::CloseHandle(stdin_write);
+    });
 
     reader = std::thread([stdout_read, &output, &output_truncated]() {
-    std::array<char, 4096> buffer{};
-    for (;;) {
-      DWORD n = 0;
-      if (!::ReadFile(stdout_read, buffer.data(),
-                      static_cast<DWORD>(buffer.size()), &n, nullptr) ||
-          n == 0) {
-        break;
+      std::array<char, 4096> buffer{};
+      for (;;) {
+        DWORD n = 0;
+        if (!::ReadFile(stdout_read, buffer.data(),
+                        static_cast<DWORD>(buffer.size()), &n, nullptr) ||
+            n == 0) {
+          break;
+        }
+        output.append(buffer.data(), n);
+        if (output.size() > kMaxChildOutputBytes) {
+          output_truncated = true;
+          break;
+        }
       }
-      output.append(buffer.data(), n);
-      if (output.size() > kMaxChildOutputBytes) {
-        output_truncated = true;
-        break;
-      }
-    }
-    ::CloseHandle(stdout_read);
-  });
+      ::CloseHandle(stdout_read);
+    });
 
   } catch (...) {
     (void)::TerminateProcess(pi.hProcess, 1);
@@ -284,7 +316,8 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     ::CloseHandle(stdout_read);
     ::CloseHandle(pi.hThread);
     ::CloseHandle(pi.hProcess);
-    return {.ok = false, .ast = {}, .error = "cannot start parser pipe workers"};
+    return {
+        .ok = false, .ast = {}, .error = "cannot start parser pipe workers"};
   }
 
   const auto timeout_ms =
@@ -371,6 +404,9 @@ class BlockedSigPipe {
 // SCM_RIGHTS and returns the connected socket fd (which will yield a 1-byte
 // exit status when the parse finishes), or -1 to fall back to posix_spawn.
 int TryConnectZygote(int stdin_fd, int stdout_fd) {
+  if (zygote_unresponsive.load(std::memory_order_relaxed)) {
+    return -1;
+  }
   const char* sock_path = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   if (sock_path == nullptr || *sock_path == '\0') {
     return -1;
@@ -419,7 +455,8 @@ int TryConnectZygote(int stdin_fd, int stdout_fd) {
   return sock;
 }
 
-GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
+GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
+                                        bool allow_zygote = true) {
   std::array<int, 2> input_pipe{};
   std::array<int, 2> output_pipe{};
   // Close-on-exec (plus POSIX_SPAWN_CLOEXEC_DEFAULT where the platform cannot
@@ -442,7 +479,8 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   }
 
   BlockedSigPipe blocked_sigpipe;
-  const int zygote_sock = TryConnectZygote(input_pipe[0], output_pipe[1]);
+  const int zygote_sock =
+      allow_zygote ? TryConnectZygote(input_pipe[0], output_pipe[1]) : -1;
   pid_t child = -1;
   if (zygote_sock < 0) {
     if (input_pipe[0] > STDERR_FILENO && output_pipe[1] > STDERR_FILENO) {
@@ -659,10 +697,11 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     }
     ::close(zygote_sock);
     if (!got_status) {
-      GoogleSqlParseResult timed_out;
-      timed_out.ok = false;
-      timed_out.error = "GoogleSQL parser timed out";
-      return timed_out;
+      // The zygote accepted the descriptors but never answered; keep serving
+      // parses by retiring it and retrying this one via a fresh spawn. The
+      // recursive call skips the zygote, so it cannot recurse again.
+      zygote_unresponsive.store(true, std::memory_order_relaxed);
+      return ParseRawSubprocess(sql, /*allow_zygote=*/false);
     }
     if (output_truncated) {
       GoogleSqlParseResult truncated;
@@ -672,6 +711,14 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     }
     if (exit_code != 0 || ContainsParserError(output)) {
       return {.ok = false, .ast = {}, .error = std::move(output)};
+    }
+    if (output.empty() &&
+        std::any_of(sql.begin(), sql.end(),
+                    [](unsigned char c) { return std::isspace(c) == 0; })) {
+      return {.ok = false,
+              .ast = {},
+              .error =
+                  "GoogleSQL parser exited 0 without output for non-empty SQL"};
     }
     return {.ok = true, .ast = std::move(output), .error = {}};
   }
@@ -869,9 +916,12 @@ bool ExtractDistinctOn(std::string_view sql, size_t* out_start, size_t* out_end,
     if (found == std::string::npos) {
       break;
     }
+    // The boundary check must read the masked copy: a literal that ends just
+    // before "distinct" is blanked there, while the raw text still has an
+    // alphanumeric quote-adjacent byte and would reject a valid rewrite.
     if (found > 0 &&
-        ((std::isalnum(static_cast<unsigned char>(lower[found - 1])) != 0) ||
-         lower[found - 1] == '_')) {
+        ((std::isalnum(static_cast<unsigned char>(mask[found - 1])) != 0) ||
+         mask[found - 1] == '_')) {
       pos = found + 8;
       continue;
     }
@@ -999,25 +1049,53 @@ bool ExtractFetchWithTies(std::string_view sql, std::string* out_rewritten,
   *out_with_ties = with_ties;
 
   if (fetch_pos != std::string::npos) {
+    // LIMIT/OFFSET operands are constant expressions and the engine folds
+    // them (OFFSET 5-1 == 4, FETCH FIRST 2+1 == 3). Keeping only leading
+    // digits silently dropped the tail and returned the wrong rows.
+    const auto is_ident = [](char c) {
+      return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+             c == '$';
+    };
+    // ROW/ROWS terminates the argument. Search the masked text so a keyword
+    // inside a literal or comment cannot end the expression early.
+    const auto argument_end = [&](size_t from, size_t end) {
+      size_t cur = from;
+      while (cur < end && lower[cur] != ';') {
+        const bool word_start = cur == 0 || !is_ident(mask[cur - 1]);
+        if (word_start &&
+            ((mask.compare(cur, 4, "rows") == 0 &&
+              (cur + 4 >= mask.size() || !is_ident(mask[cur + 4]))) ||
+             (mask.compare(cur, 3, "row") == 0 &&
+              (cur + 3 >= mask.size() || !is_ident(mask[cur + 3]))))) {
+          break;
+        }
+        ++cur;
+      }
+      return cur;
+    };
+    const auto argument = [&](size_t from, size_t end) {
+      while (from < end &&
+             std::isspace(static_cast<unsigned char>(lower[from])) != 0) {
+        ++from;
+      }
+      while (end > from &&
+             std::isspace(static_cast<unsigned char>(lower[end - 1])) != 0) {
+        --end;
+      }
+      return std::string(sql.substr(from, end - from));
+    };
+
     size_t offset_pos = FindOuterKeyword(mask, "offset");
     std::string offset_val;
     if (offset_pos != std::string::npos && offset_pos < fetch_pos) {
-      size_t cur = skip_space_and_comments(offset_pos + 6, fetch_pos);
-      while (cur < fetch_pos &&
-             (std::isdigit(static_cast<unsigned char>(lower[cur])) != 0)) {
-        offset_val.push_back(lower[cur]);
-        ++cur;
-      }
+      const size_t cur = skip_space_and_comments(offset_pos + 6, fetch_pos);
+      offset_val = argument(cur, argument_end(cur, fetch_pos));
     }
 
-    size_t count_start = skip_space_and_comments(fetch_pos + 11, lower.size());
-    std::string count_val;
-    size_t count_cur = count_start;
-    while (count_cur < lower.size() &&
-           (std::isdigit(static_cast<unsigned char>(lower[count_cur])) != 0)) {
-      count_val.push_back(lower[count_cur]);
-      ++count_cur;
-    }
+    const size_t count_start =
+        skip_space_and_comments(fetch_pos + 11, lower.size());
+    std::string count_val =
+        argument(count_start, argument_end(count_start, lower.size()));
     if (count_val.empty()) {
       count_val = "1";
     }
@@ -1211,20 +1289,29 @@ size_t LikeOperandEnd(std::string_view sql, std::string_view mask, size_t pos) {
   }
   const char c = sql[j];
   if (c == '\'' || c == '"' || c == '`') {
-    // Literal: run to the end of the blanked mask region; the loop stops on
-    // the first char after the closing quote (the quote itself is blanked).
-    ++j;
-    while (j < size && mask[j] != sql[j]) {
+    // Scan the literal itself with its quoting rules. Comparing against the
+    // mask (mask[j] != sql[j]) stopped at the first space *inside* a literal
+    // such as 'a b%': MaskLiteralsAndComments blanks those bytes too, so the
+    // right operand was truncated and LOWER(...) was left unbalanced. Match
+    // the quote handling used by MaskLiteralsAndComments instead.
+    const char quote = c;
+    const bool triple = quote != '`' && j + 2 < size && sql[j + 1] == quote &&
+                        sql[j + 2] == quote;
+    j += triple ? 3 : 1;
+    while (j < size) {
+      if (triple && sql[j] == quote && j + 2 < size && sql[j + 1] == quote &&
+          sql[j + 2] == quote) {
+        return j + 3;
+      }
+      if (!triple && sql[j] == quote) {
+        return j + 1;
+      }
+      if (sql[j] == '\\' && j + 1 < size) {
+        ++j;
+      }
       ++j;
     }
-    if (j >= size) {
-      // The literal may legitimately close on the statement's last char.
-      if (j == size && sql[size - 1] == c) {
-        return size;
-      }
-      return std::string::npos;
-    }
-    return j;
+    return std::string::npos;
   }
   if (c == '(') {
     size_t depth = 0;
@@ -1697,9 +1784,9 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
 
 }  // namespace
 
-bool frontend_detail::InjectDistinctOnKeys(std::string& ast,
-                                           const std::string& keys_ast,
-                                           std::optional<size_t> select_offset) {
+bool frontend_detail::InjectDistinctOnKeys(
+    std::string& ast, const std::string& keys_ast,
+    std::optional<size_t> select_offset) {
   size_t select_pos = std::string::npos;
   if (select_offset.has_value()) {
     // Nested DISTINCT ON (derived table, CTE body, UNION branch): attach the
@@ -1847,8 +1934,7 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
       cached_bytes += key.size();
     }
     while (shard.cache.size() >= max_per_shard ||
-           cached_bytes + cache_key.size() >
-               kMaxParseCacheKeyBytesPerShard) {
+           cached_bytes + cache_key.size() > kMaxParseCacheKeyBytesPerShard) {
       if (shard.cache.empty()) {
         break;
       }
@@ -1870,8 +1956,8 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
       if (shard.negative_cache.size() >= max_per_shard) {
         shard.negative_cache.erase(shard.negative_cache.begin());
       }
-      shard.negative_cache.insert_or_assign(
-          cache_key, std::chrono::steady_clock::now());
+      shard.negative_cache.insert_or_assign(cache_key,
+                                            std::chrono::steady_clock::now());
     }
   }
   return parsed;

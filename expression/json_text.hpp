@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/json_string.hpp"
 #include "type/value.hpp"
@@ -319,7 +320,12 @@ inline std::string ToJsonText(const Value& value) {
   switch (value.type) {
     case ValueType::kVarChar: {
       const std::string_view text = value.value.varchar_value;
-      if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
+      // Only treat the value as a pre-encoded STRUCT payload when it really
+      // is valid JSON. A plain STRING like "{not json}" or "{\"a\":}" starts
+      // and ends with braces too; passing it through verbatim would emit
+      // malformed JSON. Fall back to a quoted JSON string in that case.
+      if (text.size() >= 2 && text.front() == '{' && text.back() == '}' &&
+          IsValid(text)) {
         return std::string(text);
       }
       return EncodeJsonString(text);
@@ -346,17 +352,31 @@ inline std::string ToJsonText(const Value& value) {
     case ValueType::kNull:
       return "null";
     case ValueType::kArray: {
-      std::string out = "[";
-      out.reserve(value.ArrayElements().size() + 2);
-      bool first = true;
-      for (const Value& element : value.ArrayElements()) {
-        if (!first) {
-          out += ",";
-        }
-        first = false;
-        out += ToJsonText(element);
+      // Render each element once and size the buffer from the rendered bytes:
+      // quoted VARCHARs and exponent-form DOUBLEs are many bytes wider than
+      // one byte per element, so reserving `elements.size() + 2` reallocates
+      // on virtually every non-trivial ARRAY (repeatedly as it grows).
+      const auto& elements = value.ArrayElements();
+      std::vector<std::string> rendered;
+      rendered.reserve(elements.size());
+      size_t estimated = 2;  // '[' and ']'
+      for (const Value& element : elements) {
+        rendered.push_back(ToJsonText(element));
+        estimated += rendered.back().size();
       }
-      out += "]";
+      if (!elements.empty()) {
+        estimated += elements.size() - 1;  // separating commas
+      }
+      std::string out;
+      out.reserve(estimated);
+      out += '[';
+      for (size_t i = 0; i < rendered.size(); ++i) {
+        if (i != 0U) {
+          out += ',';
+        }
+        out += rendered[i];
+      }
+      out += ']';
       return out;
     }
     default:

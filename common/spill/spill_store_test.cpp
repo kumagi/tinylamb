@@ -16,6 +16,7 @@
 
 #include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 
 namespace tinylamb {
@@ -164,15 +165,21 @@ TEST(SpillStoreTest, TempLimitEnforcesNoSpaceAndRecoversAfterDrop) {
                                      .use_global_temp_limit = false});
 
   std::vector<uint8_t> two_blocks(2ULL * SpillStore::kBlockSize, 0x33);
-  auto seg1 = store.AllocateSegment().MoveValue();
-  auto seg2 = store.AllocateSegment().MoveValue();
+  auto seg1_or = store.AllocateSegment();
+  ASSERT_EQ(seg1_or.GetStatus().GetCode(), StatusCode::kSuccess);
+  const SpillSegmentId seg1 = seg1_or.Value();
+  auto seg2_or = store.AllocateSegment();
+  ASSERT_EQ(seg2_or.GetStatus().GetCode(), StatusCode::kSuccess);
+  const SpillSegmentId seg2 = seg2_or.Value();
   ASSERT_EQ(store.Append(seg1, two_blocks.data(), two_blocks.size()),
             Status::kSuccess);
   ASSERT_EQ(store.Append(seg2, two_blocks.data(), two_blocks.size()),
             Status::kSuccess);
 
   // Any further block allocation must fail cleanly with kNoSpace.
-  auto seg3 = store.AllocateSegment().MoveValue();
+  auto seg3_or = store.AllocateSegment();
+  ASSERT_EQ(seg3_or.GetStatus().GetCode(), StatusCode::kSuccess);
+  const SpillSegmentId seg3 = seg3_or.Value();
   const Status over = store.Append(seg3, two_blocks.data(), 16);
   EXPECT_EQ(over.GetCode(), StatusCode::kNoSpace);
   EXPECT_EQ(store.Stats().current_active_bytes, kLimit);
@@ -297,7 +304,7 @@ TEST(SpillStoreTest, ConcurrentDropAndClearDeferWhileAppendInFlight) {
   TempDirGuard dir("spill_store_concurrent_drop");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
 
-  constexpr size_t kLargeAppend = size_t{4} << 20;  // 4 MiB = 1024 blocks
+  constexpr size_t kLargeAppend = size_t{4} << 20;  // 4 MiB = 64 blocks
   std::vector<uint8_t> payload(kLargeAppend, 0x5A);
 
   for (int iter = 0; iter < 8; ++iter) {
@@ -310,18 +317,16 @@ TEST(SpillStoreTest, ConcurrentDropAndClearDeferWhileAppendInFlight) {
     std::vector<uint8_t> head(SpillStore::kBlockSize, 0x11);
     ASSERT_EQ(store.Append(seg, head.data(), head.size()), Status::kSuccess);
 
-    std::atomic<bool> writer_done{false};
     Status append_status = Status::kSuccess;
     std::thread writer([&]() {
       append_status = store.Append(seg, payload.data(), payload.size());
-      writer_done.store(true, std::memory_order_release);
     });
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     // Wait for the writer to reach the contending state, not for it to finish:
-    // including writer_done here lets a fast writer make the test pass
-    // vacuously before Drop/Clear ever overlaps with the append.
+    // waiting on a completion flag instead would let a fast writer make the
+    // test pass vacuously before Drop/Clear ever overlaps with the append.
     while (store.Stats().current_active_bytes <= SpillStore::kBlockSize &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::yield();
@@ -469,7 +474,7 @@ TEST(SpillStoreTest, WritePathAdvisoriesAreCounted) {
 // T2066: an explicitly supplied (empty) temp_dir means the current working
 // directory; only an option the caller never set falls through to
 // TINYLAMB_TEMP_DIR.  The env var is pointed at a missing directory so the
-// two paths are distinguishable: honoured cwd succeeds, fallback fails.
+// two paths are distinguishable: honored cwd succeeds, fallback fails.
 TEST(SpillStoreTest, ExplicitlyEmptyTempDirBeatsEnvironmentFallback) {
   const char* saved = std::getenv("TINYLAMB_TEMP_DIR");
   const std::string saved_copy = saved != nullptr ? saved : "";
@@ -478,13 +483,15 @@ TEST(SpillStoreTest, ExplicitlyEmptyTempDirBeatsEnvironmentFallback) {
     std::string value;
     ~EnvRestore() {
       if (had) {
-        (void)setenv("TINYLAMB_TEMP_DIR", value.c_str(), 1);
+        (void)platform::SetEnv("TINYLAMB_TEMP_DIR", value.c_str(), 1);
       } else {
-        (void)unsetenv("TINYLAMB_TEMP_DIR");
+        (void)platform::UnsetEnv("TINYLAMB_TEMP_DIR");
       }
     }
-  } restore{saved != nullptr, saved_copy};  // NOLINT(modernize-use-designated-initializers)
-  ASSERT_EQ(setenv("TINYLAMB_TEMP_DIR", "/nonexistent_t2066_dir", 1), 0);
+  } restore{saved != nullptr,
+            saved_copy};  // NOLINT(modernize-use-designated-initializers)
+  ASSERT_EQ(platform::SetEnv("TINYLAMB_TEMP_DIR", "/nonexistent_t2066_dir", 1),
+            0);
 
   std::vector<uint8_t> data(4096, 0x77);
   {

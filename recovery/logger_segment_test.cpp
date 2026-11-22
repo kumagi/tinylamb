@@ -18,6 +18,7 @@
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
@@ -413,8 +414,14 @@ TEST_F(LoggerSegmentTest, AuditLegacyRollCrashBeforeSuccessorIsZeroTail) {
   {
     RecoveryManager recovery(base_, nullptr, kSegmentSize);
     EXPECT_EQ(recovery.ValidLogEnd(0), record.size());
-    EXPECT_SUCCESS(recovery.RecoverFrom(0, nullptr));
+    EXPECT_EQ(recovery.RecoverFrom(0, nullptr), Status::kCorrupt);
+    auto logger = Logger::Create(base_, 4096, 1, kSegmentSize);
+    ASSERT_TRUE(logger.HasValue()) << logger.GetStatus();
+    TransactionManager transactions(nullptr, logger.Value().get(), &recovery);
+    ASSERT_SUCCESS(recovery.RecoverFrom(0, &transactions));
+    EXPECT_TRUE(recovery.RecoveryTornTailTruncated());
   }
+  WriteFile(base_, padded);
   // A later segment proves this is an actual missing middle segment.
   WriteFile(Logger::SegmentPath(base_, 2), record);
   {
@@ -452,7 +459,6 @@ TEST_F(LoggerSegmentTest, DeleteAllRemovesSegmentSeries) {
   db->DeleteAll();
   EXPECT_FALSE(std::filesystem::exists(segment));
   EXPECT_FALSE(std::filesystem::exists(name + ".log.meta"));
-  Database::RemoveCreatedDatabaseFiles();
 }
 
 }  // namespace tinylamb

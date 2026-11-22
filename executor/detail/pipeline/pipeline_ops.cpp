@@ -9,6 +9,10 @@ namespace tinylamb {
 StatusOr<bool> ChunkVectorSource::NextBatch(PipelineContext* /*ctx*/,
                                             DataChunk* out, size_t max_rows) {
   out->Reset();
+  // A zero-row request produces no batch; false here means "no rows emitted
+  // by this call", not that the input is exhausted. State is deliberately left
+  // untouched so a later call with a positive limit still drains the remaining
+  // chunks, matching the other pipeline sources' contract.
   if (max_rows == 0) {
     return false;
   }
@@ -31,9 +35,12 @@ StatusOr<bool> ChunkVectorSource::NextBatch(PipelineContext* /*ctx*/,
     return true;
   }
   const size_t end = std::min(cur.Size(), row_in_chunk_ + max_rows);
-  out->Reserve(end - row_in_chunk_);
+  // Append column-wise from the source so ColumnVector metadata (collation,
+  // unsigned flag, heterogeneous layout) is carried over through
+  // ObserveSourceCollation; RowAt()+Append() would infer it from the row's
+  // per-value tags only and lose a column-level collation.
   for (size_t r = row_in_chunk_; r < end; ++r) {
-    out->Append(cur.RowAt(r), cur.PositionAt(r));
+    out->AppendFrom(cur, r);
   }
   row_in_chunk_ = end;
   if (row_in_chunk_ >= cur.Size()) {
@@ -51,7 +58,13 @@ StatusOr<bool> SpillableStoreSource::NextBatch(PipelineContext* /*ctx*/,
                                                DataChunk* out,
                                                size_t max_rows) {
   out->Reset();
-  if (!store_ || max_rows == 0) {
+  if (!store_) {
+    return false;
+  }
+  // As with ChunkVectorSource, a zero-row request is "no rows this call", not
+  // end of input: do not consume or clear the store, so a later positive-limit
+  // call can still read from where this one stopped.
+  if (max_rows == 0) {
     return false;
   }
   while (active_row_ >= active_chunk_.Size()) {

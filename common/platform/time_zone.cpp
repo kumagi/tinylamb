@@ -213,7 +213,7 @@ std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
 namespace {
 // T2093: mirror the macOS branch's name cache.  std::chrono::tzdb is a
 // process-wide singleton, so resolved zone pointers stay valid; unknown
-// names cache as nullptr so repeated lookups of a bad name cost a hash  // NOLINT(modernize-use-scoped-lock)
+// names cache as nullptr so repeated lookups of a bad name cost a hash
 // probe instead of another locate_zone search.
 //
 // T2096: only std::runtime_error from locate_zone means "unknown zone".
@@ -255,11 +255,11 @@ std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
   if (name.empty()) {
     return std::nullopt;
   }
-  const std::chrono::time_zone* zone = FindZoneCached(name);
-  if (zone == nullptr) {
-    return std::nullopt;
-  }
   try {
+    const std::chrono::time_zone* zone = FindZoneCached(name);
+    if (zone == nullptr) {
+      return std::nullopt;
+    }
     const std::optional<int64_t> local_epoch =
         LocalSeconds(year, month, day, hour, minute, second);
     if (!local_epoch.has_value()) {
@@ -272,8 +272,9 @@ std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
     }
     const std::chrono::local_seconds local{seconds};
     return static_cast<int>(zone->get_info(local).first.offset.count());
-  } catch (const std::runtime_error&) {
-    // get_info out_of_range on unrepresentable civil times: no offset.
+  } catch (...) {
+    // This optional-returning API promises not to let lookup or allocation
+    // failures escape, matching the other platform implementation.
     return std::nullopt;
   }
 }

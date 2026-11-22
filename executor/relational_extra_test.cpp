@@ -134,19 +134,57 @@ TEST(RelationSpillOrderExtraTest, RepeatedSpillKeepsGenerationOrder) {
     return file;
   };
   relational_detail::Relation relation;
-  relation.spill = spill_of(1);                       // oldest generation
-  relation.extra_spills.push_back(spill_of(2));        // next generation
-  relation.rows.push_back(Row({Value(int64_t{3})}));   // new in-memory generation
+  relation.spill = spill_of(1);                  // oldest generation
+  relation.extra_spills.push_back(spill_of(2));  // next generation
+  relation.rows.push_back(
+      Row({Value(int64_t{3})}));  // new in-memory generation
 
+  relation.EnsureSpill();
+  relation.AddRow(Row({Value(4)}));  // active spill tail
+  relation.rows.push_back(Row({Value(5)}));
   relation.EnsureSpill();
 
   std::vector<int64_t> actual;
   EXPECT_EQ(relation.ForEachRow([&](const Row& row) {
-              actual.push_back(row[0].value.int_value);
-              return Status::kSuccess;
-            }),
+    actual.push_back(row[0].value.int_value);
+    return Status::kSuccess;
+  }),
             Status::kSuccess);
-  EXPECT_EQ(actual, std::vector<int64_t>({1, 2, 3}));
+  EXPECT_EQ(actual, std::vector<int64_t>({1, 2, 3, 4, 5}));
+}
+
+TEST(RelationSpillOrderExtraTest, SpilledShardFollowsDestinationPrefix) {
+  relational_detail::Relation result;
+  result.AddRow(Row({Value(1)}));
+  relational_detail::Relation shard;
+  shard.AddRow(Row({Value(2)}));
+  shard.EnsureSpill();
+  shard.AddRow(Row({Value(3)}));
+  // Model the in-memory suffix coexisting with the shard's earlier files.
+  shard.rows.push_back(Row({Value(4)}));
+
+  ASSERT_EQ(result.AdoptSpilledShard(std::move(shard)), Status::kSuccess);
+  result.AddRow(Row({Value(5)}));
+  std::vector<int64_t> actual;
+  const auto visit = [&](const Row& row) {
+    actual.push_back(row[0].AsInt64());
+  };
+  const auto& view = result;
+  EXPECT_EQ(view.ForEachRowBounded(4, visit), Status::kSuccess);
+  EXPECT_EQ(actual, (std::vector<int64_t>{1, 2, 3, 4}));
+  actual.clear();
+  EXPECT_EQ(result.ForEachRow(visit), Status::kSuccess);
+  EXPECT_EQ(actual, (std::vector<int64_t>{1, 2, 3, 4, 5}));
+
+  std::vector<Row> rows;
+  std::vector<std::shared_ptr<SpillFile>> files;
+  ASSERT_EQ(result.TakeRowAndSpillBacking(&rows, &files), Status::kSuccess);
+  EXPECT_TRUE(rows.empty());
+  actual.clear();
+  for (const auto& file : files) {
+    EXPECT_EQ(file->ForEachRow(visit), Status::kSuccess);
+  }
+  EXPECT_EQ(actual, (std::vector<int64_t>{1, 2, 3, 4, 5}));
 }
 
 }  // namespace

@@ -42,6 +42,40 @@ namespace tinylamb {
 
 namespace {
 
+class BoolSource final : public ExecutorBase {
+ public:
+  explicit BoolSource(size_t n) : n_(n) {}
+  size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+    dst->Reset();
+    size_t emitted = 0;
+    while (offset_ < n_ && emitted < max_rows) {
+      dst->Append(Row({Value(int64_t{static_cast<int64_t>(offset_ % 2)})}));
+      ++offset_;
+      ++emitted;
+    }
+    return emitted;
+  }
+  void Dump(std::ostream& o, int /*indent*/) const override {
+    o << "BoolSource";
+  }
+
+ private:
+  size_t n_;
+  size_t offset_{0};
+};
+
+// A bare column predicate compiles to a single kLoadColumn instruction. The
+// JIT promotion gate used to read instructions[1] unconditionally, which was
+// an out-of-bounds vector read once the threshold fired.
+TEST(ExecutorCoverageTest, BareColumnPredicateJITGateDoesNotReadPastBytecode) {
+  const Schema schema("t", {Column("flag", ValueType::kInt64)});
+  Selection sel(ColumnValueExp("flag"), schema, std::make_shared<BoolSource>(4),
+                /*jit_threshold_rows=*/1);
+  DataChunk batch;
+  EXPECT_GT(sel.NextBatch(&batch, 4), 0U);
+  EXPECT_EQ(sel.GetStatus(), Status::kSuccess);
+}
+
 std::vector<Value> ReadAll(ExecutorBase* exec) {
   std::vector<Value> out;
   Row row;
@@ -469,6 +503,40 @@ TEST(LimitCoverageTest, BoundedDemandCrossesProjectionAndFilterWithOffset) {
   EXPECT_FALSE(limit.Next(&row, &position));
   EXPECT_EQ(source->consumed, 408U);
   EXPECT_EQ(limit.GetStatus(), Status::kSuccess);
+}
+
+TEST(ExecutorBaseCoverageTest,
+     NextBatchDrainingResetsDestinationBetweenSmallPulls) {
+  class SeqSource final : public ExecutorBase {
+   public:
+    size_t NextBatch(DataChunk* chunk, size_t max_rows) override {
+      chunk->Reset();
+      while (next_ < 16 && chunk->Size() < max_rows) {
+        chunk->Append(Row({Value(static_cast<int64_t>(next_))}));
+        ++next_;
+      }
+      return chunk->Size();
+    }
+    void Dump(std::ostream& out, int /*indent*/) const override {
+      out << "SeqSource";
+    }
+
+   private:
+    size_t next_ = 0;
+  };
+
+  SeqSource source;
+  Row row;
+  for (int64_t i = 0; i < 4; ++i) {
+    ASSERT_TRUE(source.Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(i)}));
+  }
+  DataChunk chunk;
+  for (int64_t i = 4; i < 8; ++i) {
+    ASSERT_EQ(source.NextBatchDraining(&chunk, 1), 1U);
+    ASSERT_EQ(chunk.Size(), 1U);
+    EXPECT_EQ(chunk.RowAt(0), Row({Value(i)}));
+  }
 }
 
 }  // namespace tinylamb

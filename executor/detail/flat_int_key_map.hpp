@@ -23,11 +23,12 @@ namespace tinylamb::relational_detail {
 //
 // Two slot layouts, chosen by T:
 //  - unsigned integral T (the group-index shape): a 16-byte {key, value}
-//    slot whose occupancy is value == std::numeric_limits<uint64_t>::max() (uint64 max).  At the
-//    shared capacity a 2.9M-group fold holds ~64 MiB of 16-byte slots vs
-//    ~96 MiB of 24-byte slots (4 vs 2.67 per cache line), which shrinks both
-//    the probe traffic and the Grow() rehash pass by a third. Callers must never store
-//    std::numeric_limits<uint64_t>::max() itself (group indices never do).
+//    slot whose occupancy is value == std::numeric_limits<uint64_t>::max()
+//    (uint64 max).  At the shared capacity a 2.9M-group fold holds ~64 MiB of
+//    16-byte slots vs ~96 MiB of 24-byte slots (4 vs 2.67 per cache line),
+//    which shrinks both the probe traffic and the Grow() rehash pass by a
+//    third. Callers must never store std::numeric_limits<uint64_t>::max()
+//    itself (group indices never do).
 //  - any other T (including signed integers): the historical 24-byte
 //    {key, value, used} slot.
 //
@@ -61,6 +62,27 @@ class FlatIntKeyMap {
       *inserted = true;
     }
     return &slots_[slot].value;
+  }
+
+  // Distinct aggregation owns the reservation alongside this map, including
+  // when an aggregate is moved to another worker during merge.
+  template <typename Charge>
+  [[nodiscard]] bool TryInsertCharged(int64_t key, Charge& charge) {
+    if ((size_ + 1) * 10 > Capacity() * 7) {
+      if (Find(key) != nullptr) {
+        return true;
+      }
+      const size_t next = NextCapacity();
+      if (next <= Capacity() || next > slots_.max_size() ||
+          !charge.TryAdd(next * sizeof(Slot))) {
+        return false;
+      }
+      const size_t old_bytes = slots_.capacity() * sizeof(Slot);
+      GrowTo(next);
+      charge.Release(old_bytes);
+    }
+    TryEmplace(key);
+    return true;
   }
 
   [[nodiscard]] size_t Size() const noexcept { return size_; }
@@ -119,6 +141,9 @@ class FlatIntKeyMap {
   void Clear() {
     if constexpr (kCompact) {
       if (!slots_.empty()) {
+        // EmptySlot() value-initializes the whole Slot (key included) before
+        // setting the "empty" value, so this resets keys as well — no stale
+        // key from a previous occupancy survives Clear().
         std::fill(slots_.begin(), slots_.end(), EmptySlot());
       }
     } else {
@@ -172,14 +197,14 @@ class FlatIntKeyMap {
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
     return static_cast<size_t>(x ^ (x >> 31)) & mask_;
   }
-  void Grow() {
+  [[nodiscard]] size_t NextCapacity() const {
     // Quadruple instead of double: total rehash work across a build is
     // final_size * factor/(factor-1), so x4 pays ~1.33x the final table
     // instead of ~2x — callgrind put the rehash passes at a visible slice of
     // the multi-million-group folds' TryEmplace cost.
-    const size_t next = Capacity() < 16 ? 16 : Capacity() * 4;
-    GrowTo(next);
+    return Capacity() < 16 ? 16 : Capacity() * 4;
   }
+  void Grow() { GrowTo(NextCapacity()); }
   void GrowTo(size_t next) {
     std::vector<Slot> old_slots = std::move(slots_);
     mask_ = next - 1;
@@ -237,8 +262,8 @@ class FlatIntSet {
     dense_bits_.clear();
     slots_.assign(CapacityFor(members), Slot{});
     mask_ = slots_.size() - 1;
-    size_ = 0;
-    has_bounds_ = false;
+    size_.store(0, std::memory_order_relaxed);
+    ResetBounds();
   }
 
   bool TryReserveDense(int64_t min_key, int64_t max_key) {
@@ -257,12 +282,76 @@ class FlatIntSet {
     dense_mode_ = true;
     dense_min_ = min_key;
     dense_max_ = max_key;
-    size_ = 0;
-    has_bounds_ = false;
+    size_.store(0, std::memory_order_relaxed);
+    ResetBounds();
+    return true;
+  }
+
+  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  //   (dense_compact_membership_eq)
+  // After all keys are inserted into hash mode, compact to a dense bitmap when
+  // the observed [min_key, max_key] span fits within kMaxDenseSpan and the
+  // bitmap is no larger than the hash table (or <= 2 MiB). This shrinks
+  // dense integer sets (e.g. 600K order numbers: 16 MiB hash -> 75 KiB bitmap)
+  // into L2 cache and makes ContainsAnyInRange O((hi - lo) / 64).
+  bool TryCompactToDense() {
+    if (dense_mode_ || !has_bounds_.load(std::memory_order_relaxed)) {
+      return dense_mode_;
+    }
+    const int64_t min_k = min_key_.load(std::memory_order_relaxed);
+    const int64_t max_k = max_key_.load(std::memory_order_relaxed);
+    if (min_k > max_k) {
+      return false;
+    }
+    const uint64_t span =
+        static_cast<uint64_t>(max_k) - static_cast<uint64_t>(min_k);
+    if (span > kMaxDenseSpan) {
+      return false;
+    }
+    const size_t words = static_cast<size_t>((span >> 6) + 1);
+    const size_t dense_bytes = words * sizeof(uint64_t);
+    const size_t hash_bytes = slots_.size() * sizeof(Slot);
+    if (dense_bytes > std::max<size_t>(hash_bytes, size_t{2} << 20)) {
+      return false;
+    }
+    std::vector<uint64_t> bits(words, 0ULL);
+    for (const Slot& slot : slots_) {
+      if (slot.used != 0) {
+        const uint64_t off =
+            static_cast<uint64_t>(slot.key) - static_cast<uint64_t>(min_k);
+        bits[off >> 6] |= uint64_t{1} << (off & 63);
+      }
+    }
+    slots_.clear();
+    slots_.shrink_to_fit();
+    mask_ = 0;
+    dense_bits_ = std::move(bits);
+    dense_min_ = min_k;
+    dense_max_ = max_k;
+    dense_mode_ = true;
+    dense_overflow_.store(false, std::memory_order_relaxed);
     return true;
   }
 
   [[nodiscard]] bool IsDenseMode() const noexcept { return dense_mode_; }
+  [[nodiscard]] int64_t DenseMin() const noexcept { return dense_min_; }
+  [[nodiscard]] int64_t DenseMax() const noexcept { return dense_max_; }
+  [[nodiscard]] size_t DenseWordCount() const noexcept {
+    return dense_bits_.size();
+  }
+
+  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  //   (parallel_bitset_or_eq_union)
+  void MergeDenseWordsAtomic(const uint64_t* local_words,
+                             size_t count) noexcept {
+    const size_t n = std::min(count, dense_bits_.size());
+    for (size_t i = 0; i < n; ++i) {
+      if (local_words[i] != 0) {
+        std::atomic_ref<uint64_t>(dense_bits_[i])
+            .fetch_or(local_words[i], std::memory_order_relaxed);
+      }
+    }
+  }
 
   // A failed dense build must be discarded before publishing a predicate.
   [[nodiscard]] bool DenseOverflowed() const noexcept {
@@ -298,8 +387,9 @@ class FlatIntSet {
 
    private:
     void Flush() noexcept {
-      if (bits_ == 0) { return;
-}
+      if (bits_ == 0) {
+        return;
+      }
       std::atomic_ref<uint64_t>(set_.dense_bits_[word_])
           .fetch_or(bits_, std::memory_order_relaxed);
       bits_ = 0;
@@ -326,14 +416,16 @@ class FlatIntSet {
   }
 
   void FinalizeDenseBounds() noexcept {
-    size_ = 0;
-    has_bounds_ = false;
+    size_t count = 0;
+    bool have_bounds = false;
+    int64_t lo = 0;
+    int64_t hi = 0;
     for (size_t w = 0; w < dense_bits_.size(); ++w) {
       const uint64_t word = dense_bits_[w];
       if (word == 0) {
         continue;
       }
-      size_ += static_cast<size_t>(__builtin_popcountll(word));
+      count += static_cast<size_t>(__builtin_popcountll(word));
       const int64_t lo_k =
           dense_min_ +
           static_cast<int64_t>((static_cast<uint64_t>(w) << 6) +
@@ -342,14 +434,20 @@ class FlatIntSet {
           dense_min_ + static_cast<int64_t>(
                            (static_cast<uint64_t>(w) << 6) +
                            static_cast<uint64_t>(63 - __builtin_clzll(word)));
-      if (!has_bounds_) {
-        has_bounds_ = true;
-        min_key_ = lo_k;
-        max_key_ = hi_k;
+      if (!have_bounds) {
+        have_bounds = true;
+        lo = lo_k;
+        hi = hi_k;
       } else {
-        max_key_ = hi_k;
+        hi = hi_k;
       }
     }
+    size_.store(count, std::memory_order_relaxed);
+    if (have_bounds) {
+      min_key_.store(lo, std::memory_order_relaxed);
+      max_key_.store(hi, std::memory_order_relaxed);
+    }
+    has_bounds_.store(have_bounds, std::memory_order_relaxed);
   }
 
   void Insert(int64_t key) {
@@ -357,22 +455,22 @@ class FlatIntSet {
       dense_overflow_.store(true, std::memory_order_relaxed);
       return;
     }
-    if (!has_bounds_) {
-      has_bounds_ = true;
-      min_key_ = key;
-      max_key_ = key;
-    } else {
-      min_key_ = std::min(key, min_key_);
-      max_key_ = std::max(key, max_key_);
-    }
+    // Writers may overlap (the dense build uses several workers).  Publish the
+    // range with atomic RMWs so concurrent inserts converge on the true
+    // [min, max] instead of losing one another's extreme key: Contains uses
+    // this range as its first gate, so a stale bound hides real members.
+    AtomicFetchMin(min_key_, key);
+    AtomicFetchMax(max_key_, key);
+    has_bounds_.store(true, std::memory_order_relaxed);
     if (dense_mode_) {
       const uint64_t off =
           static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_min_);
       const uint64_t bit_mask = uint64_t{1} << (off & 63);
       uint64_t& word = dense_bits_[off >> 6];
-      if ((word & bit_mask) == 0) {
-        word |= bit_mask;
-        ++size_;
+      if ((std::atomic_ref<uint64_t>(word).fetch_or(bit_mask,
+                                                    std::memory_order_relaxed) &
+           bit_mask) == 0) {
+        size_.fetch_add(1, std::memory_order_relaxed);
       }
       return;
     }
@@ -385,11 +483,13 @@ class FlatIntSet {
     }
     slots_[slot].key = key;
     slots_[slot].used = 1;
-    ++size_;
+    size_.fetch_add(1, std::memory_order_relaxed);
   }
 
   [[nodiscard]] bool Contains(int64_t key) const noexcept {
-    if (!has_bounds_ || key < min_key_ || key > max_key_) {
+    if (!has_bounds_.load(std::memory_order_relaxed) ||
+        key < min_key_.load(std::memory_order_relaxed) ||
+        key > max_key_.load(std::memory_order_relaxed)) {
       return false;
     }
     if (dense_mode_) {
@@ -408,12 +508,15 @@ class FlatIntSet {
   }
 
   [[nodiscard]] bool ContainsAnyInRange(int64_t lo, int64_t hi) const noexcept {
-    if (!has_bounds_ || lo > hi || hi < min_key_ || lo > max_key_) {
+    const int64_t min_k = min_key_.load(std::memory_order_relaxed);
+    const int64_t max_k = max_key_.load(std::memory_order_relaxed);
+    if (!has_bounds_.load(std::memory_order_relaxed) || lo > hi || hi < min_k ||
+        lo > max_k) {
       return false;
     }
     if (dense_mode_) {
-      const int64_t clamped_lo = lo > min_key_ ? lo : min_key_;
-      const int64_t clamped_hi = hi < max_key_ ? hi : max_key_;
+      const int64_t clamped_lo = lo > min_k ? lo : min_k;
+      const int64_t clamped_hi = hi < max_k ? hi : max_k;
       if (clamped_lo > clamped_hi) {
         return false;
       }
@@ -443,25 +546,59 @@ class FlatIntSet {
       }
       return (dense_bits_[word_hi] & high_mask) != 0;
     }
-    // Hash mode: scan the slots rather than answering "yes" on any
-    // overlapping range. Cap the work via slots_.size() so a wide range
-    // over a large set stays conservative (true).
-    if (slots_.size() <= 2048) {
-      for (const Slot& slot : slots_) {  // NOLINT(readability-use-anyofallof)
-        if (slot.used != 0 && slot.key >= lo && slot.key <= hi) {
+    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    //   (range_check_conservative_sound)
+    // Hash mode: when the query range covers the whole member domain every key
+    // is in range (O(1)). For narrow ranges (<= 64 distinct integers), probe
+    // Contains() directly in O(hi - lo). For large hash tables with wide block
+    // ranges, return true (sound conservative over-approximation) instead of
+    // linearly scanning millions of hash slots on every page block.
+    if (lo <= min_k && hi >= max_k) {
+      return true;
+    }
+    const int64_t clamped_lo = lo > min_k ? lo : min_k;
+    const int64_t clamped_hi = hi < max_k ? hi : max_k;
+    if (clamped_lo > clamped_hi) {
+      return false;
+    }
+    const uint64_t width =
+        static_cast<uint64_t>(clamped_hi) - static_cast<uint64_t>(clamped_lo);
+    if (width <= 64ULL) {
+      for (uint64_t off = 0; off <= width; ++off) {
+        const int64_t k =
+            static_cast<int64_t>(static_cast<uint64_t>(clamped_lo) + off);
+        if (Contains(k)) {
           return true;
         }
       }
       return false;
     }
-    return true;
+    if (slots_.size() > 1024) {
+      return true;
+    }
+    for (const Slot& slot : slots_) {  // NOLINT(readability-use-anyofallof)
+      if (slot.used != 0 && slot.key >= clamped_lo && slot.key <= clamped_hi) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  [[nodiscard]] bool Empty() const noexcept { return size_ == 0; }
-  [[nodiscard]] size_t Size() const noexcept { return size_; }
-  [[nodiscard]] bool HasBounds() const noexcept { return has_bounds_; }
-  [[nodiscard]] int64_t MinKey() const noexcept { return min_key_; }
-  [[nodiscard]] int64_t MaxKey() const noexcept { return max_key_; }
+  [[nodiscard]] bool Empty() const noexcept {
+    return size_.load(std::memory_order_relaxed) == 0;
+  }
+  [[nodiscard]] size_t Size() const noexcept {
+    return size_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] bool HasBounds() const noexcept {
+    return has_bounds_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] int64_t MinKey() const noexcept {
+    return min_key_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] int64_t MaxKey() const noexcept {
+    return max_key_.load(std::memory_order_relaxed);
+  }
 
   // Visits every distinct member.  Build-once contract: the set is frozen
   // while this runs.
@@ -510,17 +647,44 @@ class FlatIntSet {
     return static_cast<size_t>(x ^ (x >> 31)) & mask_;
   }
 
+  // The bounds start at sentinels so every Insert can use an atomic RMW (C++20
+  // has no atomic fetch_min/fetch_max).  ResetBounds is a single-threaded
+  // lifecycle step; Insert and the readers below are the concurrent part.
+  void ResetBounds() noexcept {
+    min_key_.store(std::numeric_limits<int64_t>::max(),
+                   std::memory_order_relaxed);
+    max_key_.store(std::numeric_limits<int64_t>::min(),
+                   std::memory_order_relaxed);
+    has_bounds_.store(false, std::memory_order_relaxed);
+  }
+  static void AtomicFetchMin(std::atomic<int64_t>& target,
+                             int64_t key) noexcept {
+    int64_t cur = target.load(std::memory_order_relaxed);
+    while (key < cur &&
+           !target.compare_exchange_weak(cur, key, std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+    }
+  }
+  static void AtomicFetchMax(std::atomic<int64_t>& target,
+                             int64_t key) noexcept {
+    int64_t cur = target.load(std::memory_order_relaxed);
+    while (key > cur &&
+           !target.compare_exchange_weak(cur, key, std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+    }
+  }
+
   std::vector<Slot> slots_;
   std::vector<uint64_t> dense_bits_;
-  int64_t min_key_ = 0;
-  int64_t max_key_ = 0;
+  std::atomic<int64_t> min_key_{std::numeric_limits<int64_t>::max()};
+  std::atomic<int64_t> max_key_{std::numeric_limits<int64_t>::min()};
   int64_t dense_min_ = 0;
   int64_t dense_max_ = 0;
-  size_t size_ = 0;
+  std::atomic<size_t> size_{0};
   size_t mask_ = 0;
   std::atomic<bool> dense_overflow_{false};
   bool dense_mode_ = false;
-  bool has_bounds_ = false;
+  std::atomic<bool> has_bounds_{false};
 };
 
 }  // namespace tinylamb::relational_detail

@@ -147,12 +147,16 @@ StatusOr<std::vector<NamedExpression>> ExpandSelect(
         expanded.emplace_back(
             ColumnName(relation, table->GetSchema().GetColumn(i).Name().name));
       }
-      if (requested.schema.empty()) {
-        const auto sample = query.samples_.find(relation);
-        if (sample != query.samples_.end() && sample->second.with_weight) {
-          expanded.emplace_back(sample->second.weight_alias,
-                                ColumnValueExp(sample->second.weight_alias));
-        }
+      // The weight pseudo-column belongs to this relation's input schema
+      // (BuildInputSchema appends it unconditionally), so a qualified star
+      // must expand it exactly like the bare star does.
+      const auto sample = query.samples_.find(relation);
+      if (sample != query.samples_.end() && sample->second.with_weight) {
+        // BuildInputSchema names this column with the relation qualifier;
+        // referencing it bare would not resolve against the input schema.
+        expanded.emplace_back(
+            sample->second.weight_alias,
+            ColumnValueExp(ColumnName(relation, sample->second.weight_alias)));
       }
     }
     if (!matched_relation) {
@@ -755,9 +759,7 @@ std::optional<QueryData> TryEliminateUnusedJoins(
     // Proof holds: drop the dimension and its equality conjunct.
     rewritten.from_.erase(std::ranges::find(rewritten.from_, plan.dim));
     rewritten.aliases_.erase(plan.dim);
-    kept_conjuncts.erase(std::remove(kept_conjuncts.begin(),
-                                     kept_conjuncts.end(), plan.conjunct),
-                         kept_conjuncts.end());
+    std::erase(kept_conjuncts, plan.conjunct);
     tables.erase(plan.dim);
     changed = true;
   }
@@ -771,7 +773,7 @@ std::optional<QueryData> TryEliminateUnusedJoins(
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot referential-integrity proofs for TopN pushdown .
+// Snapshot referential-integrity proofs for TopN pushdown.
 //
 // `topn_push_through_proven_one_to_one_join` (plan/cascades.cpp) pushes a
 // TopN below an inner join only with a 1:1 proof the memo cannot derive
@@ -1423,7 +1425,7 @@ Expression RewritePrefixLike(const Expression& expression) {
   }
   // The rewrite evaluates the left operand twice (>= lower AND < upper). A
   // volatile, throwing or subquery-bearing operand must stay as a single LIKE
-  // evaluation: duplicating it changes results and error behaviour.
+  // evaluation: duplicating it changes results and error behavior.
   if (!SafeToReduceEvaluationCount(binary.Left())) {
     return expression;
   }
@@ -2231,11 +2233,11 @@ bool SupportsOuterJoinSlice(const QueryData& query, bool has_aggregate,
 }
 
 // ---------------------------------------------------------------------------
-// Subquery decorrelation (tpch Phase2-4 / P1-5): the canonical correlated
-// shapes `x IN (SELECT c ...)`, `EXISTS (SELECT ... WHERE outer = inner)` and
-// their negations become semi/anti hash joins. The tuned relational path keeps
-// every other subquery shape via subquery_runtime; only conjuncts that reach
-// this optimizer AND match a pattern exactly are rewritten.
+// Subquery decorrelation (TPC-H subquery decorrelation): the canonical
+// correlated shapes `x IN (SELECT c ...)`, `EXISTS (SELECT ... WHERE outer =
+// inner)` and their negations become semi/anti hash joins. The tuned relational
+// path keeps every other subquery shape via subquery_runtime; only conjuncts
+// that reach this optimizer AND match a pattern exactly are rewritten.
 // ---------------------------------------------------------------------------
 
 constexpr size_t kMaxDecorrelationDepth = 8;
@@ -2339,7 +2341,7 @@ std::optional<Expression> QualifyExpression(  // NOLINT(misc-no-recursion)
     }
     qualified.push_back(std::move(*rewritten));
   }
-  return WithExpressionChildren(expression, qualified);
+  return WithExpressionChildren(expression, std::move(qualified));
 }
 
 bool ContainsAggregateExp(
@@ -3113,10 +3115,15 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         for (size_t i = 0; i < cell_schema.ColumnCount(); ++i) {
           columns.push_back(cell_schema.GetColumn(i));
         }
-        const std::string qualifier =
-            cell_schema.ColumnCount() == 0
-                ? relation
-                : cell_schema.GetColumn(0).Name().schema;
+        // Use the first real relation qualifier, not just column 0: a lifted
+        // CTE can mix qualified and derived columns.
+        std::string qualifier = relation;
+        for (size_t i = 0; i < cell_schema.ColumnCount(); ++i) {
+          if (!cell_schema.GetColumn(i).Name().schema.empty()) {
+            qualifier = cell_schema.GetColumn(i).Name().schema;
+            break;
+          }
+        }
         columns.emplace_back(ColumnName(qualifier, sample->second.weight_alias),
                              ValueType::kDouble);
         cell_schema = Schema("", std::move(columns));
@@ -3135,10 +3142,15 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         for (size_t i = 0; i < recursive_schema.ColumnCount(); ++i) {
           columns.push_back(recursive_schema.GetColumn(i));
         }
-        const std::string qualifier =
-            recursive_schema.ColumnCount() == 0
-                ? relation
-                : recursive_schema.GetColumn(0).Name().schema;
+        // Match the lifted-CTE case above: find a real relation qualifier
+        // instead of trusting the first column.
+        std::string qualifier = relation;
+        for (size_t i = 0; i < recursive_schema.ColumnCount(); ++i) {
+          if (!recursive_schema.GetColumn(i).Name().schema.empty()) {
+            qualifier = recursive_schema.GetColumn(i).Name().schema;
+            break;
+          }
+        }
         columns.emplace_back(ColumnName(qualifier, sample->second.weight_alias),
                              ValueType::kDouble);
         recursive_schema = Schema("", std::move(columns));
@@ -3242,9 +3254,9 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     }
   }
 
-  // Subquery decorrelation (tpch Phase2-4 / P1-5): canonical IN / EXISTS /
-  // NOT EXISTS conjuncts become semi/anti hash joins wrapped around the
-  // optimized core. Skipped when a LIMIT/OFFSET folds into the plan: the
+  // Subquery decorrelation (TPC-H subquery decorrelation): canonical IN /
+  // EXISTS / NOT EXISTS conjuncts become semi/anti hash joins wrapped around
+  // the optimized core. Skipped when a LIMIT/OFFSET folds into the plan: the
   // semi join must sit below any truncation to preserve SQL evaluation
   // order, and the memo has no operator between the two.
   std::vector<DecorrelationSpec> decorrelations;
@@ -3819,7 +3831,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       search_root = outer;
     }
   }
-  // Snapshot 1:1 proofs for TopN pushdown . Inner joins
+  // Snapshot 1:1 proofs for TopN pushdown. Inner joins
   // only: outer-join memos carry kOuterJoin (never matched by the TopN push
   // rule), so marking there would be dead data.
   if (!is_outer) {

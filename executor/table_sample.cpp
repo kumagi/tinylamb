@@ -36,10 +36,9 @@ StatusOr<double> NumericValue(const Value& value) {
                        "TABLESAMPLE requires non-null size");
   }
   if (value.type == ValueType::kInt64) {
-    return value.IsUnsigned()
-                    ? static_cast<double>(
-                          static_cast<uint64_t>(value.value.int_value))
-                    : static_cast<double>(value.value.int_value);
+    return value.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                    value.value.int_value))
+                              : static_cast<double>(value.value.int_value);
   }
   if (value.type == ValueType::kDouble) {
     return value.value.double_value;
@@ -78,9 +77,14 @@ TableSampleExecutor::TableSampleExecutor(TransactionContext& context,
     for (size_t i = 0; i < child_schema_.ColumnCount(); ++i) {
       columns.push_back(child_schema_.GetColumn(i));
     }
+    // Match SamplePlan::BuildSchema: a mixed-qualifier child must still give
+    // the weight column a real relation qualifier.
     std::string qualifier;
-    if (child_schema_.ColumnCount() != 0) {
-      qualifier = child_schema_.GetColumn(0).Name().schema;
+    for (size_t i = 0; i < child_schema_.ColumnCount(); ++i) {
+      if (!child_schema_.GetColumn(i).Name().schema.empty()) {
+        qualifier = child_schema_.GetColumn(i).Name().schema;
+        break;
+      }
     }
     columns.emplace_back(ColumnName(qualifier, spec_.weight_alias),
                          ValueType::kDouble);
@@ -308,16 +312,22 @@ size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
     while (output_offset_ < output_rows_.size() &&
            destination->Size() < max_rows) {
       Candidate& candidate = output_rows_[output_offset_++];
+      // Snapshot the fields that describe the row before moving `row` out of
+      // `candidate`: today partition/position are independent members, but if
+      // Candidate ever gains a field derived from `row` this would become a
+      // use-after-move.
+      const size_t partition = candidate.partition;
+      const RowPosition position = candidate.position;
       Row row = std::move(candidate.row);
       if (spec_.with_weight) {
-        const PartitionState& state = partition_states_[candidate.partition];
+        const PartitionState& state = partition_states_[partition];
         const size_t selected = state.selected;
         const double weight = selected == 0 ? 1.0
                                             : static_cast<double>(state.seen) /
                                                   static_cast<double>(selected);
         row.values_.emplace_back(weight);
       }
-      destination->Append(std::move(row), candidate.position);
+      destination->Append(std::move(row), position);
     }
     return destination->Size();
   }

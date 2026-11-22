@@ -4,7 +4,7 @@
 
 論理 Rule は、`Pattern` で候補を絞り込み、`Bindings` で変換処理に必要な
 Group を受け取ります。この章では `plan/cascades.hpp` の `Pattern`、
-`PayloadConstraint`、`Bindings` と、`plan/cascades.cpp` の照合処理を
+`PayloadConstraint`、`Bindings` と、`plan/cascades_search.cpp` の照合処理を
 説明します。
 
 ## 30-1. 規則における適用条件と変換処理の分離
@@ -37,8 +37,13 @@ class Pattern {
                            Bindings* bindings) const;
 
  private:
-  [[nodiscard]] bool MatchGroup(const Memo& memo, GroupId group,
-                                Bindings* bindings) const;
+  using CaptureLog = std::vector<const std::string*>;
+  bool MatchExpression(const Memo& memo, GroupId group,
+                       const LogicalExpression& expression, Bindings* bindings,
+                       CaptureLog* inserted) const;
+  bool Capture(GroupId group, Bindings* bindings, CaptureLog* inserted) const;
+  bool MatchGroup(const Memo& memo, GroupId group, Bindings* bindings,
+                  CaptureLog* inserted) const;
   [[nodiscard]] bool MatchPayload(const Memo& memo,
                                   const LogicalExpression& expression,
                                   const Bindings& bindings) const;
@@ -103,35 +108,42 @@ inline Pattern SelectionWithin(size_t predicate_within_child,
 
 ## 30-3. パターン照合の評価手順
 
-照合処理は `Match`、`MatchGroup`、`MatchPayload` の 3 段階で再帰的に進みます。最上位のエントリポイントは `Pattern::Match` です（`plan/cascades.cpp`）。
+照合処理は `Match`、`MatchExpression`、`MatchGroup`、`MatchPayload` を通じて再帰的に進みます。最上位のエントリポイントは `Pattern::Match` です（`plan/cascades_search.cpp`）。
 
 ```cpp
 bool Pattern::Match(
     const Memo& memo, GroupId group,
     const LogicalExpression& expression, Bindings* bindings) const {
+  CaptureLog inserted;
+  return MatchExpression(memo, group, expression, bindings, &inserted);
+}
+
+bool Pattern::MatchExpression(const Memo& memo, GroupId group,
+                              const LogicalExpression& expression,
+                              Bindings* bindings, CaptureLog* inserted) const {
   if (operation_ && expression.operation != *operation_) {
     return false;
   }
   if (!children_.empty() && children_.size() != expression.children.size()) {
     return false;
   }
-  Bindings local = *bindings;
-  if (!capture_.empty()) {
-    auto [iter, inserted] = local.emplace(capture_, group);
-    if (!inserted && iter->second != group) {
-      return false;
-    }
-  }
-  for (size_t i = 0; i < children_.size(); ++i) {
-    if (!children_[i].MatchGroup(memo, expression.children[i], &local)) {
-      return false;
-    }
-  }
-  if (!MatchPayload(memo, expression, local)) {
+  const size_t checkpoint = inserted->size();
+  if (!Capture(group, bindings, inserted)) {
     return false;
   }
-  *bindings = std::move(local);
-  return true;
+  bool matched = true;
+  for (size_t i = 0; matched && i < children_.size(); ++i) {
+    matched = children_[i].MatchGroup(memo, expression.children[i], bindings,
+                                      inserted);
+  }
+  if (matched && MatchPayload(memo, expression, *bindings)) {
+    return true;
+  }
+  while (inserted->size() > checkpoint) {
+    bindings->erase(*inserted->back());
+    inserted->pop_back();
+  }
+  return false;
 }
 ```
 
@@ -143,39 +155,32 @@ bool Pattern::Match(
 4. **子グループへの再帰判定**: 各子ノードに対して `MatchGroup` を呼び出す。
 5. **ペイロード制約の検証**: `MatchPayload` を評価します。
 
-照合途中で失敗した際に呼び出し元の束縛情報を汚染しないよう、ローカルコピー `local` に対して操作を行い、すべての条件を満たした場合にのみ元の `bindings` を上書きします。
+`Capture` は新たに追加した名前を `CaptureLog` に記録します。失敗した場合はチェックポイント以降に追加された束縛だけを消し、もともとの束縛を保持します。束縛表全体のコピーは行いません。
 
-子 Group を照合する `MatchGroup` は以下のとおりです（`plan/cascades.cpp`）。
+子 Group を照合する `MatchGroup` は以下のとおりです（`plan/cascades_search.cpp`）。
 
 ```cpp
 bool Pattern::MatchGroup(
     const Memo& memo, GroupId group,
-    Bindings* bindings) const {
-  if (!capture_.empty()) {
-    auto [iter, inserted] = bindings->emplace(capture_, group);
-    if (!inserted && iter->second != group) {
-      return false;
-    }
+    Bindings* bindings, CaptureLog* inserted) const {
+  PatternMatchDepthGuard depth_guard;
+  if (!depth_guard.entered) {
+    return false;
   }
   if (!operation_) {
-    return true;
+    return Capture(group, bindings, inserted);
   }
   return std::ranges::any_of(
       memo.Get(group).expressions,
       [&](const LogicalExpression& expression) {
-        Bindings local = *bindings;
-        if (Match(memo, group, expression, &local)) {
-          *bindings = std::move(local);
-          return true;
-        }
-        return false;
+        return MatchExpression(memo, group, expression, bindings, inserted);
       });
 }
 ```
 
-この処理では、子 Group 内にある**いずれか 1 つの等価式**がパターンに合えば、Group 全体がマッチしたと判定します（`std::ranges::any_of`）。Group は等価な式の集合なので、対象の形を持つ代替案が一つでもあれば、探索エンジンはその候補を選んで Rule を適用できます。
+この処理では、子 Group 内にある**いずれか 1 つの等価式**がパターンに合えば、Group 全体がマッチしたと判定します（`std::ranges::any_of`）。各候補の失敗時には `MatchExpression` が追加分を巻き戻します。`PatternMatchDepthGuard` は Memo 内の循環による再帰を 512 段に制限します。
 
-ペイロード制約の構造体と判定処理は以下のとおりです（`plan/cascades.hpp`, `plan/cascades.cpp`）。
+ペイロード制約の構造体と判定処理は以下のとおりです（`plan/cascades.hpp`, `plan/cascades_search.cpp`）。
 
 ```cpp
 struct PayloadConstraint {

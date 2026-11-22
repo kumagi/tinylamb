@@ -102,6 +102,35 @@ TEST_F(MemTableSyncTest, SyncFailurePropagatesInsteadOfFalseSuccess) {
   EXPECT_NE(st, Status::kSuccess);
 }
 
+TEST_F(MemTableSyncTest, FailedDurabilityHookKeepsDataForRetry) {
+  // If the durability hook throws, the sealed entry must survive so the next
+  // Sync can hand it to the hook again. Releasing the arenas first made the
+  // failed run unrecoverable (the bytes existed only in the discarded blob).
+  struct Thrower {
+    static void Boom(const char*, size_t, void*) {
+      throw std::runtime_error("disk on fire");
+    }
+  };
+  Schema sc = MakeSyncSchema();
+  MemTable mt(sc);
+  ASSERT_SUCCESS(mt.Put(Row{Value(int64_t{5}), Value(int64_t{55})}));
+
+  mt.SetDurabilityCallback(&Thrower::Boom, nullptr);
+  std::vector<char> blob;
+  std::vector<uint32_t> key_run, row_run;
+  size_t generation = 0;
+  EXPECT_EQ(mt.Sync(&blob, &key_run, &row_run, &generation), Status::kIOError);
+
+  mt.SetDurabilityCallback(&CaptureDurability, &capture_);
+  blob.clear();
+  key_run.clear();
+  row_run.clear();
+  ASSERT_SUCCESS(mt.Sync(&blob, &key_run, &row_run, &generation));
+  EXPECT_EQ(capture_.calls, 1);
+  EXPECT_FALSE(capture_.blob.empty());
+  EXPECT_FALSE(blob.empty());
+}
+
 // Issue 2525: Snapshot(V) must resolve the version that was current at the
 // pinned read version even when the key was rewritten several times within
 // one pending generation.  Before the fix the second Put overwrote the first

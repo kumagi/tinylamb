@@ -9,9 +9,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The tree is formatted with clang-format 22 (matching the dev
-      # toolchain). Distro clang-format (< 19) disagrees on requires-clause
-      # indentation, which made this job fail even on empty patches.
+      # CI pins clang-format 22 explicitly rather than using the distro
+      # default: clang-format (< 19) disagrees on requires-clause indentation,
+      # which made this job fail even on empty patches. Local dev toolchain is
+      # clang/llvm 21.1.8 (AGENTS.local.md); run the pinned version to match CI.
       - name: Install clang-format 22
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
@@ -25,6 +26,6 @@ jobs:
         run: |
           # Quote the pathspecs: an unquoted *.{...} glob expands against the
           # repo root only, so nested files silently dropped out of the check.
-          git ls-files '*.c' '*.h' '*.cc' '*.cpp' '*.hpp' | \
+          git ls-files '*.c' '*.h' '*.cc' '*.cpp' '*.hpp' '*.tcc' '*.inc' '*.ipp' '*.inl' | \
             xargs -r clang-format-22 -style=file -i
           git diff --exit-code

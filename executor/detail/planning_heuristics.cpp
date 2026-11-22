@@ -61,6 +61,7 @@
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/jit.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
@@ -544,6 +545,76 @@ bool MapsToExactEqualityKey(const Schema& left, const Schema& right,
 }
 
 }  // namespace
+
+namespace {
+
+// A VARCHAR's collation can live on the value without being declared by the
+// schema. A raw-byte hash key is unsafe if either input carries a collation.
+StatusOr<bool> HasCollatedJoinColumn(const Relation& relation, size_t column) {
+  // `uniform_cell_types` only promises the declared ValueType for non-NULL
+  // cells; inspect the actual cells so a COLLATE tag can never be missed.
+  if (relation.schema.GetColumn(column).Type() != ValueType::kVarChar) {
+    return false;
+  }
+  if (relation.HasColumnarOnly()) {
+    Value cell;
+    for (const auto& chunk : relation.columnar->chunks) {
+      if (chunk.rows == 0) {
+        continue;
+      }
+      // T4593: a projected chunk can be narrower than the schema; it simply
+      // carries no evidence for this column. Do not fail the whole query.
+      if (column >= chunk.columns.size()) {
+        continue;
+      }
+      const auto& values = chunk.columns[column];
+      for (size_t row = 0; row < chunk.rows; ++row) {
+        values.WriteValueInto(row, &cell);
+        if (!cell.IsNull() && cell.IsCaseInsensitive()) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  const auto collated = [column](const Row& row) {
+    return column < row.Count() && !row[column].IsNull() &&
+           row[column].IsCaseInsensitive();
+  };
+  if (!relation.HasSpill()) {
+    return std::ranges::any_of(relation.rows, collated);
+  }
+  bool found = false;
+  RETURN_IF_FAIL(relation.ForEachRow(
+      [&](const Row& row) { found = found || collated(row); }));
+  return found;
+}
+
+StatusOr<bool> RequiresCollatedJoinComparison(const Relation& left,
+                                              const Relation& right,
+                                              const EqualityKey& key) {
+  ASSIGN_OR_RETURN(bool, left_collated, HasCollatedJoinColumn(left, key.left));
+  if (left_collated) {
+    return true;
+  }
+  return HasCollatedJoinColumn(right, key.right);
+}
+
+}  // namespace
+
+Status DisableRawCollatedKeys(const Relation& left, const Relation& right,
+                              std::vector<EqualityKey>* keys) {
+  size_t keep = 0;
+  for (const auto& key : *keys) {
+    ASSIGN_OR_RETURN(bool, collated,
+                     RequiresCollatedJoinComparison(left, right, key));
+    if (!collated) {
+      (*keys)[keep++] = key;
+    }
+  }
+  keys->resize(keep);
+  return Status::kSuccess;
+}
 
 bool HasMixedKeySignednessOrType(const Relation& left, const Relation& right,
                                  const std::vector<EqualityKey>& keys) {
@@ -1082,11 +1153,12 @@ size_t EstimateJoinRows(const Relation& left, const Relation& right,
   // estimate shape as before biased keys existed).
   std::vector<EqualityKey> keys =
       EqualityKeys(left.schema, right.schema, predicates);
-  const bool only_biased_keys = !keys.empty();
+  // Remember whether any key existed before biased ones are filtered out.
+  const bool had_any_keys = !keys.empty();
   std::erase_if(keys, [](const EqualityKey& key) {
     return key.left_offset != 0 || key.right_offset != 0;
   });
-  if (only_biased_keys && keys.empty()) {
+  if (had_any_keys && keys.empty()) {
     // A biased equality (k = k + c) is still an equality at execution time;
     // estimate it as a selective join instead of falling through to a cross
     // product just because the raw-frequency maps cannot fold the constant.
@@ -1128,11 +1200,12 @@ size_t EstimateJoinRowsCached(
         cache) {
   std::vector<EqualityKey> keys =
       EqualityKeys(left.schema, candidate.schema, predicates);
-  const bool only_biased_keys = !keys.empty();
+  // Remember whether any key existed before biased ones are filtered out.
+  const bool had_any_keys = !keys.empty();
   std::erase_if(keys, [](const EqualityKey& key) {
     return key.left_offset != 0 || key.right_offset != 0;
   });
-  if (only_biased_keys && keys.empty()) {
+  if (had_any_keys && keys.empty()) {
     return std::max(left.TotalRows(), candidate.TotalRows());
   }
   if (keys.empty()) {
@@ -3498,6 +3571,149 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
   const size_t res_probe_off = flip ? left_width : 0;
   const size_t res_build_off = flip ? 0 : left_width;
 
+  struct FastResidualScaledDoubleCmp {
+    bool active{false};
+    bool probe_is_lhs{true};
+    slot_t probe_col{0};
+    slot_t build_col{0};
+    double scale{1.0};
+    BinaryOperation op{BinaryOperation::kLessThanEquals};
+  } fast_res_scaled_cmp;
+  if (active_residuals.size() == 1 && compiled_residuals.has_value() &&
+      compiled_residuals->size() == residual.size()) {
+    size_t active_pi = 0;
+    for (size_t pi = 0; pi < residual.size(); ++pi) {
+      if (&(*compiled_residuals)[pi] == active_residuals[0]) {
+        active_pi = pi;
+        break;
+      }
+    }
+    const Expression& r_expr = residual[active_pi];
+    if (r_expr && r_expr->Type() == TypeTag::kBinaryExp) {
+      const auto& bin = r_expr->AsBinaryExpression();
+      const BinaryOperation bop = bin.Op();
+      if (bop == BinaryOperation::kLessThan ||
+          bop == BinaryOperation::kLessThanEquals ||
+          bop == BinaryOperation::kGreaterThan ||
+          bop == BinaryOperation::kGreaterThanEquals) {
+        auto unwrap_double_cast = [](const Expression& e) -> const Expression& {
+          if (e && e->Type() == TypeTag::kCastExp &&
+              e->AsCastExpression().TargetValueType() == ValueType::kDouble &&
+              e->AsCastExpression().Child() != nullptr) {
+            return e->AsCastExpression().Child();
+          }
+          return e;
+        };
+        struct ColSideRef {
+          bool on_probe{false};
+          slot_t col{0};
+        };
+        auto extract_col = [&](const Expression& raw_e,
+                               ColSideRef* out) -> bool {
+          const Expression& e = unwrap_double_cast(raw_e);
+          if (!e || e->Type() != TypeTag::kColumnValue) return false;
+          const auto off = LocalColumnOffset(
+              result_schema, e->AsColumnValue().GetColumnName());
+          if (!off.has_value() || *off >= result_schema.ColumnCount()) {
+            return false;
+          }
+          const Column& c = result_schema.GetColumn(*off);
+          if (c.IsUnsigned() || c.Type() != ValueType::kDouble) {
+            return false;
+          }
+          if (*off < left_width) {
+            out->on_probe = !flip;
+            out->col = *off;
+          } else {
+            out->on_probe = flip;
+            out->col = *off - left_width;
+          }
+          return true;
+        };
+        auto extract_const = [&](const Expression& raw_e, double* out) -> bool {
+          const Expression& e = unwrap_double_cast(raw_e);
+          if (!e || e->Type() != TypeTag::kConstantValue) return false;
+          const Value& v = e->AsConstantValue().GetValue();
+          if (v.IsNull()) return false;
+          if (v.type == ValueType::kDouble) {
+            if (!std::isfinite(v.value.double_value)) return false;
+            *out = v.value.double_value;
+            return true;
+          }
+          if (v.type == ValueType::kInt64 && !v.IsUnsigned()) {
+            *out = static_cast<double>(v.value.int_value);
+            return true;
+          }
+          return false;
+        };
+        auto extract_scaled = [&](const Expression& raw_e, ColSideRef* col_out,
+                                  double* scale_out) -> bool {
+          const Expression& e = unwrap_double_cast(raw_e);
+          if (!e || e->Type() != TypeTag::kBinaryExp ||
+              e->AsBinaryExpression().Op() != BinaryOperation::kMultiply) {
+            return false;
+          }
+          const auto& mb = e->AsBinaryExpression();
+          if (extract_const(mb.Left(), scale_out) &&
+              extract_col(mb.Right(), col_out)) {
+            return true;
+          }
+          if (extract_col(mb.Left(), col_out) &&
+              extract_const(mb.Right(), scale_out)) {
+            return true;
+          }
+          return false;
+        };
+        auto flip_op = [](BinaryOperation o) -> BinaryOperation {
+          switch (o) {
+            case BinaryOperation::kLessThan:
+              return BinaryOperation::kGreaterThan;
+            case BinaryOperation::kLessThanEquals:
+              return BinaryOperation::kGreaterThanEquals;
+            case BinaryOperation::kGreaterThan:
+              return BinaryOperation::kLessThan;
+            case BinaryOperation::kGreaterThanEquals:
+              return BinaryOperation::kLessThanEquals;
+            default:
+              return o;
+          }
+        };
+        ColSideRef ca;
+        ColSideRef cb;
+        double sc = 1.0;
+        bool matched = false;
+        BinaryOperation cmp_op = bop;
+        if (extract_col(bin.Left(), &ca) &&
+            extract_scaled(bin.Right(), &cb, &sc) &&
+            ca.on_probe != cb.on_probe) {
+          matched = true;
+          cmp_op = bop;
+        } else if (extract_scaled(bin.Left(), &cb, &sc) &&
+                   extract_col(bin.Right(), &ca) &&
+                   ca.on_probe != cb.on_probe) {
+          matched = true;
+          cmp_op = flip_op(bop);
+        }
+        if (matched) {
+          const slot_t pcol = ca.on_probe ? ca.col : cb.col;
+          const slot_t bcol = ca.on_probe ? cb.col : ca.col;
+          if (probe_plan[pcol].all_uniform && build_plan[bcol].all_uniform &&
+              (probe_plan[pcol].all_null ||
+               probe_plan[pcol].common_type == ValueType::kDouble) &&
+              (build_plan[bcol].all_null ||
+               build_plan[bcol].common_type == ValueType::kDouble)) {
+            fast_res_scaled_cmp = {.active = true,
+                                   .probe_is_lhs = ca.on_probe,
+                                   .probe_col = pcol,
+                                   .build_col = bcol,
+                                   .scale = sc,
+                                   .op = cmp_op};
+          }
+        }
+      }
+    }
+  }
+
   std::vector<uint32_t> build_chunk_of(n_build);
   std::vector<uint32_t> build_row_of(n_build);
   std::vector<uint32_t> chunk_base_bid(build_tbl->chunks.size(), 0);
@@ -3513,6 +3729,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
   enum class KeyMode {
     kEmptyNull,
     kSingleInt64,
+    kPacked2x32,
     kMultiInt64,
     kSingleVarChar,
     kEncoded
@@ -3522,6 +3739,11 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
     mode = KeyMode::kEmptyNull;
   } else if (all_int_keys && build_cols.size() == 1) {
     mode = KeyMode::kSingleInt64;
+  } else if (all_int_keys && build_cols.size() == 2 &&
+             std::getenv("TINYLAMB_DISABLE_PACKED2X32_HJ") == nullptr &&
+             JitPacked2x32HashProbe::Compile(false, false, false, false)
+                 .has_value()) {
+    mode = KeyMode::kPacked2x32;
   } else if (all_int_keys && build_cols.size() <= CompositeIntKey::kMaxParts) {
     mode = KeyMode::kMultiInt64;
   } else if (single_str_key) {
@@ -3561,7 +3783,267 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
   ChunkStringArena encoded_build_arena;
   std::vector<ChunkStringArena> encoded_worker_arenas;
 
-  if (!sharded) {
+  static_assert(kColumnarEmptyBucket == std::numeric_limits<uint32_t>::max());
+  std::vector<uint64_t> packed_ht_keys;
+  std::vector<uint32_t> packed_ht_heads;
+  std::vector<uint64_t> packed_bloom_words;
+  uint64_t packed_ht_mask = 0;
+  uint64_t packed_bloom_word_mask = 0;
+  bool packed_has_bloom = false;
+  bool packed_built_chunk_map = false;
+
+  if (mode == KeyMode::kPacked2x32) {
+    struct PackedBuildItem {
+      uint64_t key;
+      uint32_t bid;
+    };
+    const slot_t bcol0 = build_cols[0];
+    const slot_t bcol1 = build_cols[1];
+    const int64_t b0 = build_biases[0];
+    const int64_t b1 = build_biases[1];
+    std::atomic<bool> packed_overflow{false};
+    auto extract_slice = [&](const ColumnarChunk& ch, uint32_t bc, uint32_t r0,
+                             uint32_t r1, SrcIntLeafCache* lc,
+                             std::vector<PackedBuildItem>* out) {
+      const uint32_t base = chunk_base_bid[bc];
+      for (uint32_t r = r0; r < r1; ++r) {
+        build_chunk_of[base + r] = bc;
+        build_row_of[base + r] = r;
+      }
+      if (packed_overflow.load(std::memory_order_relaxed)) {
+        return;
+      }
+      const ColumnarColumn& c0 = ch.columns[bcol0];
+      const ColumnarColumn& c1 = ch.columns[bcol1];
+      if (c0.encoding == ColumnarColumn::Encoding::kFlat && c0.is_uniform &&
+          (!c0.has_null || c0.nulls.empty()) && c0.type != ValueType::kNull &&
+          c1.encoding == ColumnarColumn::Encoding::kFlat && c1.is_uniform &&
+          (!c1.has_null || c1.nulls.empty()) && c1.type != ValueType::kNull) {
+        const int64_t* p0 = c0.ints.data();
+        const int64_t* p1 = c1.ints.data();
+        for (uint32_t r = r0; r < r1; ++r) {
+          const int64_t v0 = b0 != 0 ? AddJoinKeyBias(p0[r], b0) : p0[r];
+          const int64_t v1 = b1 != 0 ? AddJoinKeyBias(p1[r], b1) : p1[r];
+          if (static_cast<int64_t>(static_cast<int32_t>(v0)) != v0 ||
+              static_cast<int64_t>(static_cast<int32_t>(v1)) != v1) {
+            packed_overflow.store(true, std::memory_order_relaxed);
+            return;
+          }
+          const uint64_t packed =
+              (static_cast<uint64_t>(
+                   static_cast<uint32_t>(static_cast<int32_t>(v0)))
+               << 32) |
+              static_cast<uint64_t>(
+                  static_cast<uint32_t>(static_cast<int32_t>(v1)));
+          out->push_back({packed, base + r});
+        }
+        return;
+      }
+      std::array<int64_t, 64> t0{};
+      std::array<int64_t, 64> t1{};
+      for (uint32_t p = r0; p < r1; p += 64) {
+        const uint32_t sub = std::min<uint32_t>(64, r1 - p);
+        uint64_t valid = DecodeIntTile64(c0, p, sub, lc, t0.data());
+        valid &= DecodeIntTile64(c1, p, sub, lc, t1.data());
+        while (valid != 0) {
+          const auto i = static_cast<uint32_t>(std::countr_zero(valid));
+          valid &= (valid - 1);
+          const int64_t v0 = b0 != 0 ? AddJoinKeyBias(t0[i], b0) : t0[i];
+          const int64_t v1 = b1 != 0 ? AddJoinKeyBias(t1[i], b1) : t1[i];
+          if (static_cast<int64_t>(static_cast<int32_t>(v0)) != v0 ||
+              static_cast<int64_t>(static_cast<int32_t>(v1)) != v1) {
+            packed_overflow.store(true, std::memory_order_relaxed);
+            return;
+          }
+          const uint64_t packed =
+              (static_cast<uint64_t>(
+                   static_cast<uint32_t>(static_cast<int32_t>(v0)))
+               << 32) |
+              static_cast<uint64_t>(
+                  static_cast<uint32_t>(static_cast<int32_t>(v1)));
+          out->push_back({packed, base + p + i});
+        }
+      }
+    };
+    const size_t extract_workers = sharded ? build_workers : 1;
+    std::vector<std::vector<PackedBuildItem>> worker_items(extract_workers);
+    if (!sharded) {
+      SrcIntLeafCache lc;
+      worker_items[0].reserve(n_build);
+      for (uint32_t bc = 0; bc < build_tbl->chunks.size(); ++bc) {
+        const ColumnarChunk& ch = build_tbl->chunks[bc];
+        extract_slice(ch, bc, 0, static_cast<uint32_t>(ch.rows), &lc,
+                      &worker_items[0]);
+        if (packed_overflow.load(std::memory_order_relaxed)) {
+          break;
+        }
+      }
+    } else {
+      std::vector<ChunkSliceTask> ext_tasks;
+      constexpr uint32_t kExtSliceRows = 4096;
+      for (uint32_t bc = 0; bc < build_tbl->chunks.size(); ++bc) {
+        const auto nrows = static_cast<uint32_t>(build_tbl->chunks[bc].rows);
+        for (uint32_t r0 = 0; r0 < nrows; r0 += kExtSliceRows) {
+          ext_tasks.push_back(
+              {.chunk_idx = bc,
+               .row_begin = r0,
+               .row_end = std::min<uint32_t>(nrows, r0 + kExtSliceRows)});
+        }
+      }
+      std::atomic<size_t> next_ext{0};
+      RETURN_IF_FAIL(RunParallelTasks(extract_workers, [&](size_t w) {
+        SrcIntLeafCache lc;
+        auto& out = worker_items[w];
+        out.reserve((n_build / extract_workers) + 64);
+        while (true) {
+          const size_t tid = next_ext.fetch_add(1, std::memory_order_relaxed);
+          if (tid >= ext_tasks.size()) {
+            break;
+          }
+          const ChunkSliceTask& t = ext_tasks[tid];
+          extract_slice(build_tbl->chunks[t.chunk_idx], t.chunk_idx,
+                        t.row_begin, t.row_end, &lc, &out);
+        }
+      }));
+    }
+    if (packed_overflow.load(std::memory_order_relaxed)) {
+      mode = KeyMode::kMultiInt64;
+    } else {
+      size_t valid_build_count = 0;
+      for (const auto& wi : worker_items) {
+        valid_build_count += wi.size();
+      }
+      if (valid_build_count == 0) {
+        mode = KeyMode::kEmptyNull;
+        packed_built_chunk_map = true;
+      } else {
+        const size_t ht_cap =
+            std::bit_ceil(std::max<size_t>(16, valid_build_count * 2));
+        packed_ht_mask = ht_cap - 1;
+        packed_ht_keys.assign(ht_cap, 0ULL);
+        packed_ht_heads.assign(ht_cap, kColumnarEmptyBucket);
+        packed_has_bloom = (valid_build_count >= 16384);
+        if (packed_has_bloom) {
+          const size_t bloom_bits = std::clamp<size_t>(
+              std::bit_ceil(valid_build_count * 8), 4096, size_t{1} << 25);
+          packed_bloom_words.assign(bloom_bits >> 6, 0ULL);
+          packed_bloom_word_mask = (bloom_bits >> 6) - 1;
+        }
+        if (!sharded || ht_cap < 1024 || extract_workers <= 1) {
+          for (auto& wi : worker_items) {
+            for (const PackedBuildItem& it : wi) {
+              const uint64_t h = HashPacked2x32Key(it.key);
+              if (packed_has_bloom) {
+                InsertPacked2x32Bloom(h, packed_bloom_words.data(),
+                                      packed_bloom_word_mask);
+              }
+              auto slot = static_cast<size_t>(h & packed_ht_mask);
+              while (packed_ht_heads[slot] != kColumnarEmptyBucket &&
+                     packed_ht_keys[slot] != it.key) {
+                slot = (slot + 1) & packed_ht_mask;
+              }
+              if (packed_ht_heads[slot] == kColumnarEmptyBucket) {
+                packed_ht_keys[slot] = it.key;
+                next_in_bucket[it.bid] = kColumnarEmptyBucket;
+              } else {
+                next_in_bucket[it.bid] = packed_ht_heads[slot];
+              }
+              packed_ht_heads[slot] = it.bid;
+            }
+            std::vector<PackedBuildItem>().swap(wi);
+          }
+        } else {
+          constexpr size_t kBuildParts = 64;
+          const size_t range_len = ht_cap >> 6;
+          const uint32_t range_shift =
+              static_cast<uint32_t>(std::bit_width(packed_ht_mask)) - 6U;
+          struct PartItem {
+            uint64_t key;
+            uint64_t h;
+            uint32_t bid;
+          };
+          std::vector<std::array<std::vector<PartItem>, kBuildParts>>
+              part_items(extract_workers);
+          RETURN_IF_FAIL(RunParallelTasks(extract_workers, [&](size_t w) {
+            auto& parts = part_items[w];
+            for (const PackedBuildItem& it : worker_items[w]) {
+              const uint64_t h = HashPacked2x32Key(it.key);
+              const auto p =
+                  static_cast<size_t>((h & packed_ht_mask) >> range_shift);
+              parts[p].push_back({it.key, h, it.bid});
+            }
+            std::vector<PackedBuildItem>().swap(worker_items[w]);
+          }));
+          std::array<std::vector<PartItem>, kBuildParts> overflow_items{};
+          std::atomic<size_t> next_p{0};
+          RETURN_IF_FAIL(RunParallelTasks(extract_workers, [&](size_t) {
+            while (true) {
+              const size_t p = next_p.fetch_add(1, std::memory_order_relaxed);
+              if (p >= kBuildParts) {
+                break;
+              }
+              const size_t r_begin = p * range_len;
+              const size_t r_end = r_begin + range_len;
+              for (size_t w = 0; w < extract_workers; ++w) {
+                auto& bucket = part_items[w][p];
+                for (const PartItem& it : bucket) {
+                  if (packed_has_bloom) {
+                    const auto w0 = static_cast<size_t>((it.h >> 6U) &
+                                                        packed_bloom_word_mask);
+                    const auto w1 = static_cast<size_t>((it.h >> 30U) &
+                                                        packed_bloom_word_mask);
+                    const uint64_t m0 = uint64_t{1} << (it.h & 63U);
+                    const uint64_t m1 = uint64_t{1} << ((it.h >> 24U) & 63U);
+                    __atomic_fetch_or(&packed_bloom_words[w0], m0,
+                                      __ATOMIC_RELAXED);
+                    __atomic_fetch_or(&packed_bloom_words[w1], m1,
+                                      __ATOMIC_RELAXED);
+                  }
+                  size_t slot = static_cast<size_t>(it.h & packed_ht_mask);
+                  while (slot < r_end &&
+                         packed_ht_heads[slot] != kColumnarEmptyBucket &&
+                         packed_ht_keys[slot] != it.key) {
+                    ++slot;
+                  }
+                  if (slot == r_end) {
+                    overflow_items[p].push_back(it);
+                  } else if (packed_ht_heads[slot] == kColumnarEmptyBucket) {
+                    packed_ht_keys[slot] = it.key;
+                    next_in_bucket[it.bid] = kColumnarEmptyBucket;
+                    packed_ht_heads[slot] = it.bid;
+                  } else {
+                    next_in_bucket[it.bid] = packed_ht_heads[slot];
+                    packed_ht_heads[slot] = it.bid;
+                  }
+                }
+                std::vector<PartItem>().swap(bucket);
+              }
+            }
+          }));
+          for (size_t p = 0; p < kBuildParts; ++p) {
+            for (const PartItem& it : overflow_items[p]) {
+              auto slot = static_cast<size_t>(it.h & packed_ht_mask);
+              while (packed_ht_heads[slot] != kColumnarEmptyBucket &&
+                     packed_ht_keys[slot] != it.key) {
+                slot = (slot + 1) & packed_ht_mask;
+              }
+              if (packed_ht_heads[slot] == kColumnarEmptyBucket) {
+                packed_ht_keys[slot] = it.key;
+                next_in_bucket[it.bid] = kColumnarEmptyBucket;
+              } else {
+                next_in_bucket[it.bid] = packed_ht_heads[slot];
+              }
+              packed_ht_heads[slot] = it.bid;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (mode == KeyMode::kPacked2x32 ||
+      (mode == KeyMode::kEmptyNull && packed_built_chunk_map)) {
+  } else if (!sharded) {
     for (uint32_t bc = 0; bc < build_tbl->chunks.size(); ++bc) {
       const uint32_t base = chunk_base_bid[bc];
       const auto rows = static_cast<uint32_t>(build_tbl->chunks[bc].rows);
@@ -4081,6 +4563,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
   };
   std::vector<WorkerOutput> worker_outputs(workers);
   std::atomic<size_t> next_task{0};
+  std::atomic<bool> probe_failed{false};
   std::mutex error_mutex;
   Status first_error{Status::kSuccess};
 
@@ -4273,7 +4756,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
     WorkerOutput& wout = worker_outputs[wid];
     SrcIntLeafCache probe_leaf_cache;
     Row scratch_row;
-    if (has_active_residuals) {
+    if (has_active_residuals && !fast_res_scaled_cmp.active) {
       scratch_row.values_.resize(result_schema.ColumnCount());
     }
     Value key_scratch;
@@ -4283,9 +4766,23 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
     std::vector<uint32_t> match_b_ids;
     match_p_rows.reserve(4096);
     match_b_ids.reserve(4096);
+    std::array<std::optional<JitPacked2x32HashProbe>, 16> packed_probe_cache;
+    std::vector<int64_t> packed_tile_k0;
+    std::vector<int64_t> packed_tile_k1;
+    std::vector<uint8_t> packed_tile_n0;
+    std::vector<uint8_t> packed_tile_n1;
+    std::vector<uint32_t> packed_tile_heads;
+    if (mode == KeyMode::kPacked2x32) {
+      packed_tile_k0.resize(4096);
+      packed_tile_k1.resize(4096);
+      packed_tile_n0.resize(4096);
+      packed_tile_n1.resize(4096);
+      packed_tile_heads.resize(4096);
+    }
 
     while (true) {
-      if (!first_error.ok()) {
+      // Only the cancellation flag is shared without the error lock.
+      if (probe_failed.load(std::memory_order_relaxed)) {
         return;
       }
       const size_t tid = next_task.fetch_add(1, std::memory_order_relaxed);
@@ -4324,54 +4821,117 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
       auto handle_candidates = [&](uint32_t pr, uint32_t head) {
         bool matched = false;
         if (head != kColumnarEmptyBucket) {
-          bool loaded_probe_res = false;
-          for (uint32_t bid = head; bid != kColumnarEmptyBucket;
-               bid = next_in_bucket[bid]) {
-            ++wout.comparisons;
-            if (has_active_residuals) {
-              if (!loaded_probe_res) {
-                for (slot_t ps : res_probe_slots) {
-                  pchunk.columns[ps].WriteValueInto(
-                      pr, &scratch_row.values_[res_probe_off + ps]);
+          if (fast_res_scaled_cmp.active) {
+            double pd = 0.0;
+            if (pchunk.columns[fast_res_scaled_cmp.probe_col]
+                    .TryReadNonNullDouble(pr, &pd)) {
+              const slot_t rbcol = fast_res_scaled_cmp.build_col;
+              const double sc = fast_res_scaled_cmp.scale;
+              const bool p_lhs = fast_res_scaled_cmp.probe_is_lhs;
+              const BinaryOperation rop = fast_res_scaled_cmp.op;
+              for (uint32_t bid = head; bid != kColumnarEmptyBucket;
+                   bid = next_in_bucket[bid]) {
+                ++wout.comparisons;
+                const uint32_t bc = build_chunk_of[bid];
+                const uint32_t br = build_row_of[bid];
+                double bd = 0.0;
+                if (!build_tbl->chunks[bc].columns[rbcol].TryReadNonNullDouble(
+                        br, &bd)) {
+                  continue;
                 }
-                loaded_probe_res = true;
+                const double lhs_v = p_lhs ? pd : bd;
+                const double rhs_v = sc * (p_lhs ? bd : pd);
+                bool accepted = false;
+                switch (rop) {
+                  case BinaryOperation::kLessThan:
+                    accepted = (lhs_v < rhs_v);
+                    break;
+                  case BinaryOperation::kLessThanEquals:
+                    accepted = (lhs_v <= rhs_v);
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    accepted = (lhs_v > rhs_v);
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    accepted = (lhs_v >= rhs_v);
+                    break;
+                  default:
+                    break;
+                }
+                if (!accepted) {
+                  continue;
+                }
+                matched = true;
+                if (want_build_nulls &&
+                    __atomic_load_n(&shared_build_matched[bid],
+                                    __ATOMIC_RELAXED) == 0) {
+                  __atomic_store_n(&shared_build_matched[bid], uint8_t{1},
+                                   __ATOMIC_RELAXED);
+                }
+                match_p_rows.push_back(pr);
+                match_b_ids.push_back(bid);
+                if (match_p_rows.size() >= kColumnarChunkRows) {
+                  flush_matches();
+                }
               }
-              const uint32_t bc = build_chunk_of[bid];
-              const uint32_t br = build_row_of[bid];
-              const ColumnarChunk& bchunk = build_tbl->chunks[bc];
-              for (slot_t bs : res_build_slots) {
-                bchunk.columns[bs].WriteValueInto(
-                    br, &scratch_row.values_[res_build_off + bs]);
+            } else {
+              for (uint32_t bid = head; bid != kColumnarEmptyBucket;
+                   bid = next_in_bucket[bid]) {
+                ++wout.comparisons;
               }
-              bool accepted = true;
-              for (const BytecodeProgram* program : active_residuals) {
-                auto val = TryEvaluateRowAuto(*program, scratch_row);
-                if (!val.HasValue()) {
-                  std::scoped_lock lock(error_mutex);
-                  if (first_error.ok()) {
-                    first_error = val.GetStatus();
+            }
+          } else {
+            bool loaded_probe_res = false;
+            for (uint32_t bid = head; bid != kColumnarEmptyBucket;
+                 bid = next_in_bucket[bid]) {
+              ++wout.comparisons;
+              if (has_active_residuals) {
+                if (!loaded_probe_res) {
+                  for (slot_t ps : res_probe_slots) {
+                    pchunk.columns[ps].WriteValueInto(
+                        pr, &scratch_row.values_[res_probe_off + ps]);
                   }
-                  return false;
+                  loaded_probe_res = true;
                 }
-                if (!Truthy(val.Value())) {
-                  accepted = false;
-                  break;
+                const uint32_t bc = build_chunk_of[bid];
+                const uint32_t br = build_row_of[bid];
+                const ColumnarChunk& bchunk = build_tbl->chunks[bc];
+                for (slot_t bs : res_build_slots) {
+                  bchunk.columns[bs].WriteValueInto(
+                      br, &scratch_row.values_[res_build_off + bs]);
+                }
+                bool accepted = true;
+                for (const BytecodeProgram* program : active_residuals) {
+                  auto val = TryEvaluateRowAuto(*program, scratch_row);
+                  if (!val.HasValue()) {
+                    std::scoped_lock lock(error_mutex);
+                    if (first_error.ok()) {
+                      first_error = val.GetStatus();
+                      probe_failed.store(true, std::memory_order_relaxed);
+                    }
+                    return false;
+                  }
+                  if (!Truthy(val.Value())) {
+                    accepted = false;
+                    break;
+                  }
+                }
+                if (!accepted) {
+                  continue;
                 }
               }
-              if (!accepted) {
-                continue;
+              matched = true;
+              if (want_build_nulls &&
+                  __atomic_load_n(&shared_build_matched[bid],
+                                  __ATOMIC_RELAXED) == 0) {
+                __atomic_store_n(&shared_build_matched[bid], uint8_t{1},
+                                 __ATOMIC_RELAXED);
               }
-            }
-            matched = true;
-            if (want_build_nulls && __atomic_load_n(&shared_build_matched[bid],
-                                                    __ATOMIC_RELAXED) == 0) {
-              __atomic_store_n(&shared_build_matched[bid], uint8_t{1},
-                               __ATOMIC_RELAXED);
-            }
-            match_p_rows.push_back(pr);
-            match_b_ids.push_back(bid);
-            if (match_p_rows.size() >= kColumnarChunkRows) {
-              flush_matches();
+              match_p_rows.push_back(pr);
+              match_b_ids.push_back(bid);
+              if (match_p_rows.size() >= kColumnarChunkRows) {
+                flush_matches();
+              }
             }
           }
         }
@@ -4481,6 +5041,135 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
                 if (!handle_candidates(r0 + i, head)) {
                   return;
                 }
+              }
+            }
+          }
+        }
+      } else if (mode == KeyMode::kPacked2x32) {
+        const ColumnarColumn& pcol0 = pchunk.columns[probe_cols[0]];
+        const ColumnarColumn& pcol1 = pchunk.columns[probe_cols[1]];
+        const int64_t pb0 = probe_biases[0];
+        const int64_t pb1 = probe_biases[1];
+        const bool has_bias = (pb0 != 0 || pb1 != 0);
+        auto prep_key_col = [&](const ColumnarColumn& col, uint32_t r0,
+                                uint32_t cnt, int64_t* dst_k, uint8_t* dst_n,
+                                const int64_t** out_k,
+                                const uint8_t** out_n) -> bool {
+          if (col.encoding == ColumnarColumn::Encoding::kFlat &&
+              col.is_uniform && col.type != ValueType::kNull &&
+              col.ints.size() >= r0 + cnt) {
+            *out_k = col.ints.data() + r0;
+            if (col.has_null && col.nulls.size() >= r0 + cnt) {
+              *out_n = col.nulls.data() + r0;
+              return true;
+            }
+            *out_n = nullptr;
+            return false;
+          }
+          bool any_null = false;
+          for (uint32_t off = 0; off < cnt; off += 64) {
+            const uint32_t sub = std::min<uint32_t>(64, cnt - off);
+            const uint64_t valid = DecodeIntTile64(
+                col, r0 + off, sub, &probe_leaf_cache, dst_k + off);
+            const uint64_t full =
+                sub == 64 ? ~uint64_t{0} : ((uint64_t{1} << sub) - 1);
+            if (valid == full) {
+              std::memset(dst_n + off, 0, sub);
+            } else {
+              any_null = true;
+              for (uint32_t b = 0; b < sub; ++b) {
+                dst_n[off + b] =
+                    static_cast<uint8_t>((valid & (uint64_t{1} << b)) == 0);
+              }
+            }
+          }
+          *out_k = dst_k;
+          *out_n = any_null ? dst_n : nullptr;
+          return any_null;
+        };
+        for (uint32_t r0 = task.row_begin; r0 < task.row_end; r0 += 4096) {
+          const uint32_t cnt = std::min<uint32_t>(4096, task.row_end - r0);
+          const int64_t* in_k0 = nullptr;
+          const uint8_t* in_n0 = nullptr;
+          const int64_t* in_k1 = nullptr;
+          const uint8_t* in_n1 = nullptr;
+          const bool has_n0 =
+              prep_key_col(pcol0, r0, cnt, packed_tile_k0.data(),
+                           packed_tile_n0.data(), &in_k0, &in_n0);
+          const bool has_n1 =
+              prep_key_col(pcol1, r0, cnt, packed_tile_k1.data(),
+                           packed_tile_n1.data(), &in_k1, &in_n1);
+          const size_t cache_idx = static_cast<size_t>(
+              (has_n0 ? 1U : 0U) | (has_n1 ? 2U : 0U) |
+              (packed_has_bloom ? 4U : 0U) | (has_bias ? 8U : 0U));
+          if (!packed_probe_cache[cache_idx].has_value()) {
+            packed_probe_cache[cache_idx] = JitPacked2x32HashProbe::Compile(
+                has_n0, has_n1, packed_has_bloom, has_bias);
+          }
+          if (packed_probe_cache[cache_idx].has_value()) {
+            packed_probe_cache[cache_idx]->Probe(
+                cnt, in_k0, in_n0, in_k1, in_n1, pb0, pb1,
+                packed_has_bloom ? packed_bloom_words.data() : nullptr,
+                packed_bloom_word_mask, packed_ht_keys.data(),
+                packed_ht_heads.data(), packed_ht_mask,
+                packed_tile_heads.data());
+          } else {
+            for (uint32_t i = 0; i < cnt; ++i) {
+              uint32_t head = kColumnarEmptyBucket;
+              if ((!has_n0 || in_n0[i] == 0) && (!has_n1 || in_n1[i] == 0)) {
+                const int64_t v0 = has_bias && pb0 != 0
+                                       ? AddJoinKeyBias(in_k0[i], pb0)
+                                       : in_k0[i];
+                const int64_t v1 = has_bias && pb1 != 0
+                                       ? AddJoinKeyBias(in_k1[i], pb1)
+                                       : in_k1[i];
+                if (static_cast<int64_t>(static_cast<int32_t>(v0)) == v0 &&
+                    static_cast<int64_t>(static_cast<int32_t>(v1)) == v1) {
+                  const uint64_t packed =
+                      (static_cast<uint64_t>(
+                           static_cast<uint32_t>(static_cast<int32_t>(v0)))
+                       << 32) |
+                      static_cast<uint64_t>(
+                          static_cast<uint32_t>(static_cast<int32_t>(v1)));
+                  const uint64_t h = HashPacked2x32Key(packed);
+                  size_t slot = static_cast<size_t>(h & packed_ht_mask);
+                  while (packed_ht_heads[slot] != kColumnarEmptyBucket) {
+                    if (packed_ht_keys[slot] == packed) {
+                      head = packed_ht_heads[slot];
+                      break;
+                    }
+                    slot = (slot + 1) & packed_ht_mask;
+                  }
+                }
+              }
+              packed_tile_heads[i] = head;
+            }
+          }
+          if (!has_active_residuals && !want_build_nulls) {
+            for (uint32_t i = 0; i < cnt; ++i) {
+              const uint32_t head = packed_tile_heads[i];
+              if (head != kColumnarEmptyBucket) {
+                for (uint32_t bid = head; bid != kColumnarEmptyBucket;
+                     bid = next_in_bucket[bid]) {
+                  ++wout.comparisons;
+                  match_p_rows.push_back(r0 + i);
+                  match_b_ids.push_back(bid);
+                  if (match_p_rows.size() >= kColumnarChunkRows) {
+                    flush_matches();
+                  }
+                }
+              } else if (probe_outer_emit) {
+                match_p_rows.push_back(r0 + i);
+                match_b_ids.push_back(kColumnarEmptyBucket);
+                if (match_p_rows.size() >= kColumnarChunkRows) {
+                  flush_matches();
+                }
+              }
+            }
+          } else {
+            for (uint32_t i = 0; i < cnt; ++i) {
+              if (!handle_candidates(r0 + i, packed_tile_heads[i])) {
+                return;
               }
             }
           }
@@ -4893,6 +5582,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
   }
   std::vector<EqualityKey> equality_keys =
       EqualityKeys(left.schema, right.schema, ordinary_predicates);
+  RETURN_IF_FAIL(DisableRawCollatedKeys(left, right, &equality_keys));
   struct UsingJoinKey {
     std::vector<size_t> left_columns;
     std::vector<size_t> right_columns;
@@ -4929,12 +5619,16 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
         left.schema.GetColumn(left_columns.front()).IsUnsigned() ==
             right.schema.GetColumn(right_columns.front()).IsUnsigned();
     if (same_single_type) {
-      equality_keys.push_back(
-          {left_columns.front(), right_columns.front(), false});
-    } else {
-      using_residuals.push_back(
-          {std::move(left_columns), std::move(right_columns)});
+      const EqualityKey key{left_columns.front(), right_columns.front(), false};
+      ASSIGN_OR_RETURN(bool, collated,
+                       RequiresCollatedJoinComparison(left, right, key));
+      if (!collated) {
+        equality_keys.push_back(key);
+        continue;
+      }
     }
+    using_residuals.push_back(
+        {std::move(left_columns), std::move(right_columns)});
   }
   const std::vector<Expression> residual =
       HasMixedKeySignednessOrType(left, right, equality_keys)
@@ -5640,6 +6334,7 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
       std::max(left.peak_intermediate_rows, right.peak_intermediate_rows);
   std::vector<EqualityKey> equality_keys =
       EqualityKeys(left.schema, right.schema, predicates);
+  RETURN_IF_FAIL(DisableRawCollatedKeys(left, right, &equality_keys));
   const std::vector<Expression> residual =
       HasMixedKeySignednessOrType(left, right, equality_keys)
           ? predicates

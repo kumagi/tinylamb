@@ -5,15 +5,17 @@ Current implementation, verified against `recovery/log_record.cpp`,
 
 ## Segments and checkpoints
 
-`Logger` writes `<db>.log.<index>` with a zero-padded 20-digit index. The
-ordinary segment size is 16 MiB; `TINYLAMB_LOG_SEGMENT_BYTES` can request another
-size. Persisted `<db>.log.meta` geometry is authoritative once a numbered series
-exists. Absolute LSNs map to `index = lsn / segment_size` and
-`offset = lsn % segment_size`; recycling never renumbers them. Metadata uses
+`Logger` writes segment 0 to `<db>.log` itself (the unsuffixed legacy base
+file) and segment `index >= 1` to `<db>.log.<index>` with a zero-padded
+20-digit index. The ordinary segment size is 16 MiB;
+`TINYLAMB_LOG_SEGMENT_BYTES` can request another size. Persisted
+`<db>.log.meta` geometry is authoritative once a numbered series exists (a
+different requested size is warned about and ignored); a numbered series
+without metadata fails closed. Absolute LSNs map to `index = lsn / segment_size`
+and `offset = lsn % segment_size`; recycling never renumbers them. Metadata uses
 big-endian fields and CRC32C and is published through a synced temporary file
-and rename. A numbered series without metadata fails closed. Base-file legacy
-migration concerns segment layout; it does not add support for old record
-versions.
+and rename. Base-file legacy migration concerns segment layout; it does not add
+support for old record versions.
 
 New records never straddle segment boundaries. If a record does not fit, the
 writer waits for pending data, pre-rolls to the next segment and places the

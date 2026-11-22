@@ -36,6 +36,12 @@ int main(int argc, char** argv) {
   std::vector<char> content((std::istreambuf_iterator<char>(case_data)),
                             std::istreambuf_iterator<char>());
   LOG(INFO) << "test file: " << file << " (" << content.size() << " bytes)";
+  if (content.empty()) {
+    // A missing/empty replay file must not masquerade as a successful run:
+    // Try() would create and delete a DB without exercising any input.
+    std::cerr << "empty or missing replay input: " << file << "\n";
+    return 1;
+  }
   tinylamb::Try(reinterpret_cast<const uint8_t*>(content.data()),
                 content.size(), true);
   LOG(INFO) << "successfully finished.";

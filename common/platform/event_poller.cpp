@@ -59,6 +59,9 @@ void EventPoller::Close() {
   }
   interest_changed_.notify_all();
 #else
+  // Precondition: the Wait-er has stopped (see the header). Closing the epoll
+  // or kqueue fd is not a portable way to interrupt a blocking Wait, so a
+  // caller that needs a cross-thread stop must wake a registered Waker first.
   if (poll_fd_ >= 0) {
     ::close(poll_fd_);
     poll_fd_ = -1;
@@ -119,7 +122,7 @@ bool EventPoller::Open() {
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
-bool EventPoller::Add(int fd, uint32_t interest) {
+bool EventPoller::Add(SocketFd fd, uint32_t interest) {
   epoll_event event{};
   event.events = ToEpoll(interest);
   event.data.fd = fd;
@@ -127,7 +130,7 @@ bool EventPoller::Add(int fd, uint32_t interest) {
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
-bool EventPoller::Modify(int fd, uint32_t interest) {
+bool EventPoller::Modify(SocketFd fd, uint32_t interest) {
   epoll_event event{};
   event.events = ToEpoll(interest);
   event.data.fd = fd;
@@ -135,7 +138,7 @@ bool EventPoller::Modify(int fd, uint32_t interest) {
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
-bool EventPoller::Remove(int fd) {
+bool EventPoller::Remove(SocketFd fd) {
   epoll_event ignored{};
   return ::epoll_ctl(poll_fd_, EPOLL_CTL_DEL, fd, &ignored) == 0;
 }
@@ -180,7 +183,7 @@ void Waker::Close() {
 }
 
 void Waker::Wake() const {
-  const int fd = write_fd_.load(std::memory_order_relaxed);
+  const SocketFd fd = write_fd_.load(std::memory_order_relaxed);
   if (fd < 0) {
     return;
   }
@@ -211,7 +214,7 @@ bool EventPoller::Open() {
   return true;
 }
 
-bool EventPoller::Add(int fd, uint32_t interest) {
+bool EventPoller::Add(SocketFd fd, uint32_t interest) {
   std::scoped_lock lock(mu_);
   if (poll_fd_ < 0 || fd < 0) {
     errno = EBADF;
@@ -222,7 +225,7 @@ bool EventPoller::Add(int fd, uint32_t interest) {
   return true;
 }
 
-bool EventPoller::Modify(int fd, uint32_t interest) {
+bool EventPoller::Modify(SocketFd fd, uint32_t interest) {
   std::scoped_lock lock(mu_);
   if (poll_fd_ < 0) {
     errno = EBADF;
@@ -234,10 +237,11 @@ bool EventPoller::Modify(int fd, uint32_t interest) {
     return false;
   }
   found->second = interest;
+  interest_changed_.notify_all();
   return true;
 }
 
-bool EventPoller::Remove(int fd) {
+bool EventPoller::Remove(SocketFd fd) {
   std::scoped_lock lock(mu_);
   if (poll_fd_ < 0) {
     errno = EBADF;
@@ -259,102 +263,124 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
   }
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(std::max(0, timeout_ms));
-  std::vector<WSAPOLLFD> poll_fds;
-  std::vector<uint32_t> interests;
-  {
-    std::unique_lock lock(mu_);
-    const auto ready = [&] { return poll_fd_ < 0 || !interest_.empty(); };
-    if (timeout_ms < 0) {
-      interest_changed_.wait(lock, ready);
-    } else if (!interest_changed_.wait_until(lock, deadline, ready)) {
+  // WSAPoll blocks inside the kernel, so a condition_variable notification
+  // from Add/Modify/Remove cannot wake a thread already polling. For an
+  // infinite wait, wake periodically and rebuild the cached WSAPOLLFD array
+  // so interest changes become visible instead of hanging forever.
+  const bool infinite_wait = timeout_ms < 0;
+  for (;;) {
+    {
+      std::unique_lock lock(mu_);
+      const auto ready = [&] { return poll_fd_ < 0 || !interest_.empty(); };
+      if (infinite_wait) {
+        interest_changed_.wait_for(lock, std::chrono::milliseconds(250), ready);
+        if (!ready()) {
+          continue;
+        }
+      } else if (!interest_changed_.wait_until(lock, deadline, ready)) {
+        return 0;
+      }
+      if (poll_fd_ < 0) {
+        errno = EBADF;
+        return -1;
+      }
+      std::vector<std::pair<SocketFd, uint32_t> > snapshot;
+      snapshot.reserve(interest_.size());
+      for (const auto& [fd, interest] : interest_) {
+        snapshot.emplace_back(fd, interest);
+      }
+      if (snapshot != poll_cache_snapshot_) {
+        poll_cache_snapshot_ = std::move(snapshot);
+        poll_cache_fds_.clear();
+        poll_cache_interests_.clear();
+        poll_cache_fds_.reserve(poll_cache_snapshot_.size());
+        poll_cache_interests_.reserve(poll_cache_snapshot_.size());
+        for (const auto& [fd, interest] : poll_cache_snapshot_) {
+          SHORT ev = 0;
+          if ((interest & (kPollReadable | kPollPeerClosed)) != 0U) {
+            ev |= POLLRDNORM;
+          }
+          if ((interest & kPollWritable) != 0U) {
+            ev |= POLLWRNORM;
+          }
+          poll_cache_fds_.push_back(WSAPOLLFD{
+              .fd = static_cast<SOCKET>(fd), .events = ev, .revents = 0});
+          poll_cache_interests_.push_back(interest);
+        }
+      }
+    }
+    if (timeout_ms >= 0) {
+      timeout_ms = static_cast<int>(
+          std::max<int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now())
+                                   .count()));
+    }
+    // Wait is single-threaded and only Wait updates the cached snapshot.
+    // Registration and close can therefore proceed without holding mu_ here.
+    for (auto& fd : poll_cache_fds_) {
+      fd.revents = 0;
+    }
+    const int count =
+        PollSockets(poll_cache_fds_.data(), poll_cache_fds_.size(),
+                    infinite_wait ? 250 : timeout_ms);
+    if (count < 0) return -1;
+    if (count == 0) {
+      if (infinite_wait) {
+        continue;  // rebuild the interest snapshot and poll again
+      }
       return 0;
     }
-    if (poll_fd_ < 0) {
-      errno = EBADF;
-      return -1;
-    }
-    std::vector<std::pair<int, uint32_t>> snapshot;
-    snapshot.reserve(interest_.size());
-    for (const auto& [fd, interest] : interest_) {
-      snapshot.emplace_back(fd, interest);
-    }
-    if (snapshot != poll_cache_snapshot_) {
-      poll_cache_snapshot_ = std::move(snapshot);
-      poll_cache_fds_.clear();
-      poll_cache_interests_.clear();
-      poll_cache_fds_.reserve(poll_cache_snapshot_.size());
-      poll_cache_interests_.reserve(poll_cache_snapshot_.size());
-      for (const auto& [fd, interest] : poll_cache_snapshot_) {
-        SHORT ev = 0;
-        if ((interest & (kPollReadable | kPollPeerClosed)) != 0U) {
-          ev |= POLLRDNORM;
-        }
-        if ((interest & kPollWritable) != 0U) {
-          ev |= POLLWRNORM;
-        }
-        poll_cache_fds_.push_back(WSAPOLLFD{
-            .fd = static_cast<SOCKET>(fd), .events = ev, .revents = 0});
-        poll_cache_interests_.push_back(interest);
-      }
-    }
-  }
-  if (timeout_ms >= 0) {
-    timeout_ms = static_cast<int>(
-        std::max<int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
-                                 deadline - std::chrono::steady_clock::now())
-                                 .count()));
-  }
-  const int count = PollSockets(poll_fds.data(), poll_fds.size(), timeout_ms);
-  if (count < 0) return -1;
-  if (count == 0) return 0;
 
-  const size_t capacity = std::min(out.size(), kMaxBatch);
-  int written = 0;
-  for (size_t i = 0;
-       i < poll_fds.size() && static_cast<size_t>(written) < capacity; ++i) {
-    const SHORT rev = poll_fds[i].revents;
-    if (rev == 0) continue;
-    const int fd = static_cast<int>(poll_fds[i].fd);
-    const uint32_t req = interests[i];
-    uint32_t bits = 0;
-    if ((rev & (POLLERR | POLLNVAL)) != 0) {
-      bits |= kPollError;
-    }
-    if ((rev & POLLHUP) != 0) {
-      if ((req & (kPollReadable | kPollPeerClosed)) != 0U) {
-        bits |= kPollReadable | kPollPeerClosed;
-      } else {
-        bits |= kPollHangup;
+    const size_t capacity = std::min(out.size(), kMaxBatch);
+    int written = 0;
+    for (size_t i = 0;
+         i < poll_cache_fds_.size() && static_cast<size_t>(written) < capacity;
+         ++i) {
+      const SHORT rev = poll_cache_fds_[i].revents;
+      if (rev == 0) continue;
+      const SocketFd fd = static_cast<SocketFd>(poll_cache_fds_[i].fd);
+      const uint32_t req = poll_cache_interests_[i];
+      uint32_t bits = 0;
+      if ((rev & (POLLERR | POLLNVAL)) != 0) {
+        bits |= kPollError;
       }
-    }
-    if ((rev & POLLIN) != 0) {
-      bits |= kPollReadable;
-      if ((req & kPollPeerClosed) != 0U) {
-        char peek = 0;
-        const int peeked = ::recv(static_cast<SOCKET>(fd), &peek, 1, MSG_PEEK);
-        if (peeked == 0) {
-          bits |= kPollPeerClosed;
-        } else if (peeked == SOCKET_ERROR &&
-                   ::WSAGetLastError() != WSAEWOULDBLOCK) {
-          bits |= kPollError;
+      if ((rev & POLLHUP) != 0) {
+        if ((req & (kPollReadable | kPollPeerClosed)) != 0U) {
+          bits |= kPollReadable | kPollPeerClosed;
+        } else {
+          bits |= kPollHangup;
         }
       }
+      if ((rev & POLLIN) != 0) {
+        bits |= kPollReadable;
+        if ((req & kPollPeerClosed) != 0U) {
+          char peek = 0;
+          const int peeked =
+              ::recv(static_cast<SOCKET>(fd), &peek, 1, MSG_PEEK);
+          if (peeked == 0) {
+            bits |= kPollPeerClosed;
+          } else if (peeked == SOCKET_ERROR &&
+                     ::WSAGetLastError() != WSAEWOULDBLOCK) {
+            bits |= kPollError;
+          }
+        }
+      }
+      if ((rev & POLLOUT) != 0) {
+        bits |= kPollWritable;
+      }
+      if (bits != 0U) {
+        out[static_cast<size_t>(written++)] = {.fd = fd, .events = bits};
+      }
     }
-    if ((rev & POLLOUT) != 0) {
-      bits |= kPollWritable;
-    }
-    if (bits != 0U) {
-      out[static_cast<size_t>(written++)] = {.fd = fd, .events = bits};
-    }
-  }
-  return written;
+    return written;
+  }  // infinite-wait refresh loop
 }
 
 Waker::~Waker() { Close(); }
 
 bool Waker::Open() {
   if (read_fd_ >= 0) return true;
-  std::array<int, 2> fds{-1, -1};
+  std::array<SocketFd, 2> fds{-1, -1};
   if (OpenPipe(fds, {.nonblocking = true, .close_on_exec = true}) != 0) {
     return false;
   }
@@ -366,14 +392,14 @@ bool Waker::Open() {
 void Waker::Close() {
   // Exchange first so a concurrent Wake() never reads a torn fd; see the
   // Linux implementation for the full ordering rationale.
-  const int write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
+  const SocketFd write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
   if (read_fd_ >= 0) CloseSocket(read_fd_);
   if (write_fd >= 0) CloseSocket(write_fd);
   read_fd_ = -1;
 }
 
 void Waker::Wake() const {
-  const int fd = write_fd_.load(std::memory_order_relaxed);
+  const SocketFd fd = write_fd_.load(std::memory_order_relaxed);
   if (fd < 0) return;
   const char one = 1;
   ssize_t written = 0;
@@ -439,7 +465,7 @@ bool EventPoller::Open() {
   return true;
 }
 
-bool EventPoller::Add(int fd, uint32_t interest) {
+bool EventPoller::Add(SocketFd fd, uint32_t interest) {
   std::scoped_lock lock(mu_);
   // A stale entry means the descriptor number was closed and reused without
   // Remove; the kernel already dropped its filters, so start fresh.
@@ -448,7 +474,7 @@ bool EventPoller::Add(int fd, uint32_t interest) {
   return true;
 }
 
-bool EventPoller::Modify(int fd, uint32_t interest) {
+bool EventPoller::Modify(SocketFd fd, uint32_t interest) {
   std::scoped_lock lock(mu_);
   const auto found = interest_.find(fd);
   if (found == interest_.end()) {
@@ -462,7 +488,7 @@ bool EventPoller::Modify(int fd, uint32_t interest) {
   return true;
 }
 
-bool EventPoller::Remove(int fd) {
+bool EventPoller::Remove(SocketFd fd) {
   std::scoped_lock lock(mu_);
   const auto found = interest_.find(fd);
   if (found == interest_.end()) {
@@ -528,7 +554,7 @@ Waker::~Waker() { Close(); }
 
 bool Waker::Open() {
   if (read_fd_ >= 0) return true;
-  std::array<int, 2> fds{-1, -1};
+  std::array<SocketFd, 2> fds{-1, -1};
   if (OpenPipe(fds, {.nonblocking = true, .close_on_exec = true}) != 0) {
     return false;
   }
@@ -540,14 +566,14 @@ bool Waker::Open() {
 void Waker::Close() {
   // Exchange first so a concurrent Wake() never reads a torn fd; see the
   // Linux implementation for the full ordering rationale.
-  const int write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
+  const SocketFd write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
   if (read_fd_ >= 0) ::close(read_fd_);
   if (write_fd >= 0) ::close(write_fd);
   read_fd_ = -1;
 }
 
 void Waker::Wake() const {
-  const int fd = write_fd_.load(std::memory_order_relaxed);
+  const SocketFd fd = write_fd_.load(std::memory_order_relaxed);
   if (fd < 0) return;
   const char one = 1;
   ssize_t written = 0;

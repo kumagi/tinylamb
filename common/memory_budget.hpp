@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -127,7 +128,8 @@ class ProcessMemoryBudget {
     // (0.875 * limit). Available()/CanReserve()/TryReserveNoFault() and
     // UnderMemoryPressure() all read it instead of re-deriving the formula.
     const size_t l = limit_.load(std::memory_order_acquire);
-    return l == 0 ? static_cast<size_t>(-1) : l - l / 8;  // NOLINT(readability-math-missing-parentheses)
+    return l == 0 ? static_cast<size_t>(-1)
+                  : l - l / 8;  // NOLINT(readability-math-missing-parentheses)
   }
 
   [[nodiscard]] size_t StorageUsed() const noexcept {
@@ -185,7 +187,16 @@ class ProcessMemoryBudget {
   // Registers fixed outbound socket-buffer reserve (`max_connections *
   // per_connection_buffer_bytes`) into the D1 `kTx` floor (ooca-v2.md §5.6).
   void AddServerBufferFloorBytes(size_t bytes) noexcept {
-    server_tx_floor_.fetch_add(bytes, std::memory_order_release);
+    size_t cur = server_tx_floor_.load(std::memory_order_acquire);
+    do {
+      const size_t max = std::numeric_limits<size_t>::max();
+      const size_t next = bytes > max - cur ? max : cur + bytes;
+      if (server_tx_floor_.compare_exchange_weak(cur, next,
+                                                 std::memory_order_release,
+                                                 std::memory_order_acquire)) {
+        break;
+      }
+    } while (true);
   }
   void SubServerBufferFloorBytes(size_t bytes) noexcept {
     size_t cur = server_tx_floor_.load(std::memory_order_acquire);
@@ -441,6 +452,10 @@ class ScopedReclaimHook {
   }
   ScopedReclaimHook& operator=(ScopedReclaimHook&& other) noexcept {
     if (this != &other) {
+      // Reset() only unregisters the hook *this* currently owns. `other`'s
+      // registration stays live in the budget while its id moves here, so
+      // there is no unregister/re-register window in which a reclaim Publish
+      // could miss the columnar-cache hook.
       Reset();
       id_ = other.id_;
       other.id_ = 0;
@@ -475,10 +490,20 @@ class ProcessMemoryCharge {
   void AddForced(size_t bytes) noexcept;
   void Release(size_t bytes) noexcept;
   void ReleaseAll() noexcept;
+  size_t TransferTo(ProcessMemoryCharge& dst, size_t bytes) noexcept {
+    if (this == &dst || pool_ != dst.pool_) {
+      return 0;
+    }
+    const size_t xfer = bytes < bytes_ ? bytes : bytes_;
+    bytes_ -= xfer;
+    dst.bytes_ += xfer;
+    return xfer;
+  }
   [[nodiscard]] size_t Bytes() const noexcept { return bytes_; }
-  // True while every reservation made through this handle succeeded (ctor,
-  // TryAdd, TryAddWithReclaim). A failed reservation leaves the charge not
-  // holding those bytes and flips this flag (T1838).
+  // True when the most recent reservation through this handle succeeded
+  // (ctor, TryAdd, TryAddWithReclaim). A failed reservation leaves the charge
+  // not holding those bytes and flips this flag (T1838); a later successful
+  // TryAdd/TryAddWithReclaim flips it back so a recovered charge reports Ok().
   [[nodiscard]] bool Ok() const noexcept { return valid_; }
 
  private:

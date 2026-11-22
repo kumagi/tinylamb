@@ -3,6 +3,7 @@
 #define TINYLAMB_COMMON_SPILL_SPILL_STORE_HPP
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -52,15 +53,22 @@ struct SpillStoreStats {
 
 // Block-multiplexed temporary storage manager (ADR 0005).
 //
-// Maintains constant open file descriptors (at most one unlinked temp file)
-// regardless of how many logical spill segments (partitions, sorted runs,
-// hash buckets) exist simultaneously. Space from dropped segments is recycled
+// Uses at most one open file descriptor for an unlinked temp file regardless
+// of how many logical spill segments (partitions, sorted runs, hash buckets)
+// exist simultaneously. The descriptor is opened lazily by the first Append
+// and closed again once the store is empty, so the *maximum* is constant but
+// no descriptor is held while idle. Space from dropped segments is recycled
 // at 64 KiB block granularity via an internal free list.
 class SpillStore {
  public:
   static constexpr size_t kBlockSize = 64ULL * 1024ULL;
 
   explicit SpillStore(SpillStoreOptions options = {});
+  // Waits for in-flight Read() calls to finish before tearing down the mutex,
+  // segment map and backing fd, so a read released from mu_ for PreadAll can
+  // always complete its bookkeeping. Starting a *new* read on a store whose
+  // destruction has begun is still the caller's bug; guard that with
+  // LifetimeToken()/DropSegmentIfAlive.
   ~SpillStore();
 
   SpillStore(const SpillStore&) = delete;
@@ -118,8 +126,9 @@ class SpillStore {
       // A live token from a *different* store must not authorize dropping a
       // segment in this one with a coincidentally equal id.
       const auto live = token.lock();
+      if (!live) return;
       const auto& own = store->alive_token_;
-      if (live && own && live == own) {
+      if (own && live == own) {
         store->DropSegment(id);
       }
     }
@@ -153,6 +162,10 @@ class SpillStore {
   SpillStoreOptions options_;
 
   mutable std::mutex mu_;
+  // Read() calls that have released mu_ for PreadAll but have not yet finished
+  // their under-mu_ bookkeeping. The destructor waits for this to reach zero.
+  mutable size_t active_reads_total_{0};
+  mutable std::condition_variable reads_done_cv_;
   int fd_{-1};
   SpillSegmentId next_segment_id_{1};
   uint32_t next_block_index_{0};
@@ -216,8 +229,12 @@ class SpillSegmentWriter {
   void Abort() noexcept;
 
   [[nodiscard]] SpillSegmentId SegmentId() const noexcept { return id_; }
+  // Logical (persisted + still-buffered) byte offset in the segment. Used by
+  // callers as the seek offset for a chunk just handed to Write(), so it must
+  // remain stable while a flush is retried; `bytes_written_` itself counts
+  // only bytes a successful Append persisted.
   [[nodiscard]] uint64_t BytesWritten() const noexcept {
-    return bytes_written_;
+    return bytes_written_ + buffer_.size();
   }
 
  private:

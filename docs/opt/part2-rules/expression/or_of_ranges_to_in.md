@@ -37,10 +37,9 @@ graph TD
 // Safety rules:
 // 1. Target expression must be safe to reduce evaluation count
 //    (volatiles like RAND() must not collapse evaluations).
-// 2. An intervening disjunct that can throw (!ExpressionCannotThrow)
-//    is a barrier: moving a later disjunct before it could evaluate
-//    to TRUE and short-circuit the throw away. All active groups
-//    must be sealed at the barrier.
+// 2. Merge only consecutive alternatives of the same target.
+//    Their comparisons retain order even when a type error is
+//    possible; never move one across another target or predicate.
 // 3. Only mark `changed = true` when multiple disjuncts actually
 //    merge into a single slot.
 // 4. Empty IN lists (x IN ()) are not equality ranges and must
@@ -52,7 +51,7 @@ graph TD
 - `t = c` または `c = t`（片側が定数リテラル）であり、ターゲット式 `t` が `SafeToReduceEvaluationCount` を満たすこと。
 - `t IN (c1, ...)` であり、`t` が非定数かつ `SafeToReduceEvaluationCount` を満たし、リストの全要素が定数リテラルであること。
 
-同一のターゲット式（`Same` で判定）を持つ選言が 2 つ以上存在し、それらが単一スロットに集約された場合にのみ変換が成立します。
+同一のターゲット式（`Same` で判定）を持つ選言が 2 つ以上**連続して**存在し、それらが単一スロットに集約された場合にのみ変換が成立します。間に別のターゲットや非グループ化の選言が挟まると、そこでグループが封印されます。
 
 ## 意味論的根拠と三値論理・例外保護
 
@@ -61,7 +60,15 @@ graph TD
 本変換における例外保護と短絡評価の維持には細心の注意が払われています。
 
 1. **評価回数の安全性**: ターゲット式が `rand()` 等の揮発性関数である場合、集約によって式の評価回数が減少し、結果が変動します。そのため `SafeToReduceEvaluationCount` が必須となります。
-2. **例外発生式を跨ぐ再配置の禁止**: 論理和は左から右へ短絡評価されます。もし例外を送出し得る選言（例: `CAST('invalid' AS INT64) = 0`）が存在する場合、その後ろにある `x = 3` を前方に移動して集約してしまうと、`x = 3` が真となった場合に本来送出されるべき例外が短絡によって消去されてしまいます。このため、`!ExpressionCannotThrow` である選言に遭遇した時点でアクティブなグループをすべて封印（seal）し、障壁を跨いだ項の移動を禁止します。
+2. **評価順序を跨ぐ再配置の禁止**: 論理和は左から右へ短絡評価されます。もし例外を送出し得る選言（例: `CAST('invalid' AS INT64) = 0`）が存在する場合、その後ろにある `x = 3` を前方に移動して集約してしまうと、`x = 3` が真となった場合に本来送出されるべき例外が短絡によって消去されてしまいます。現行実装では、グループ化できない選言（別ターゲットへの等値比較、`SafeToReduceEvaluationCount` を満たさない式、その他の式など）に遭遇した時点でアクティブなグループをすべて封印（seal）し、障壁を跨いだ項の移動を禁止します。障壁の判定は「例外を送りうるか」ではなく「同一ターゲットの連続した選択肢かどうか」です。
+
+   ```cpp
+   // Non-grouped disjunct is an evaluation-order barrier.
+   seal_groups();
+   kept.push_back(d);
+   ```
+
+   `seal_groups()` は新しいターゲットのグループを開くときにも呼ばれ、異なるターゲットの選択肢が混ざってマージされることを防ぎます。例外を送出しない無関係な述語も同様に障壁として扱われる点に注意してください。
 3. **空リストの除外**: `x IN ()` は常に FALSE を表す特殊式であり、等値範囲のグルーピング対象からは完全に除外されます。
 
 ## 実装の詳細

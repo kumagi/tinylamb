@@ -56,10 +56,17 @@ TEST(ExprExtraTest, Int64ModuloStaysIntegralAndNullPropagates) {
   EXPECT_EQ(result.type, ValueType::kInt64);
   EXPECT_EQ(result.value.int_value, 1);
 
-  // NULL on either side yields NULL, never zero.
-  Expression null_side = BinaryExpressionExp(
+  // NULL on either side (or both) yields NULL, never zero.
+  Expression null_left = BinaryExpressionExp(
       ConstantValueExp(Value()), BinaryOperation::kModulo, ColumnValueExp("j"));
-  EXPECT_TRUE(Eval(null_side).IsNull());
+  EXPECT_TRUE(Eval(null_left).IsNull());
+  Expression null_right = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kModulo, ConstantValueExp(Value()));
+  EXPECT_TRUE(Eval(null_right).IsNull());
+  Expression both_null =
+      BinaryExpressionExp(ConstantValueExp(Value()), BinaryOperation::kModulo,
+                          ConstantValueExp(Value()));
+  EXPECT_TRUE(Eval(both_null).IsNull());
 }
 
 TEST(ExprExtraTest, ModuloByZeroFailsWithoutCrashing) {
@@ -75,8 +82,9 @@ TEST(ExprExtraTest, ThreeValuedComparisonKeepsNullUnknown) {
       BinaryExpressionExp(ConstantValueExp(Value()), BinaryOperation::kEquals,
                           ConstantValueExp(Value()));
   EXPECT_TRUE(Eval(null_equals_null).IsNull());
-  EXPECT_TRUE(Eval(UnaryExpressionExp(ConstantValueExp(Value()),
-                                     UnaryOperation::kNot)).IsNull());
+  EXPECT_TRUE(
+      Eval(UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kNot))
+          .IsNull());
 
   const Value compared = Eval(
       BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,

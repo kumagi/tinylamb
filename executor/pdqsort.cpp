@@ -2,6 +2,7 @@
 #include "executor/pdqsort.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -17,31 +18,59 @@ namespace tinylamb {
 
 namespace {
 
-int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
-                   const std::vector<SortExecutor::Key>& keys, Status* error) {
-  for (const SortExecutor::Key& key : keys) {
-    StatusOr<Value> lv_or = key.expression->TryEvaluate(lhs, schema);
-    StatusOr<Value> rv_or = key.expression->TryEvaluate(rhs, schema);
-    if (!lv_or.HasValue() || !rv_or.HasValue()) {
-      // Comparators cannot abort mid-sort: record the first failure and
-      // treat the pair as equal.
-      if (error != nullptr && *error == Status::kSuccess) {
-        *error = lv_or.HasValue() ? rv_or.GetStatus() : lv_or.GetStatus();
+// One row's sort-key tuple, evaluated once up front. Sorting these instead of
+// re-evaluating the key expressions on every comparison turns a K-key sort
+// from O(K n log n) expression evaluations into O(K n).
+struct MaterializedKeys {
+  std::vector<Value> values;
+  Status error{Status::kSuccess};
+};
+
+template <typename Rows, typename Project>
+std::vector<MaterializedKeys> MaterializeSortKeys(
+    const Rows& rows, const Schema& schema,
+    const std::vector<SortExecutor::Key>& keys, Project&& project) {
+  std::vector<MaterializedKeys> images;
+  images.reserve(rows.size());
+  for (const auto& entry : rows) {
+    MaterializedKeys image;
+    image.values.reserve(keys.size());
+    for (const SortExecutor::Key& key : keys) {
+      StatusOr<Value> evaluated =
+          key.expression->TryEvaluate(project(entry), schema);
+      if (!evaluated.HasValue()) {
+        image.error = evaluated.GetStatus();
+        break;
       }
-      return 0;
+      image.values.push_back(evaluated.MoveValue());
     }
-    Value lv = lv_or.MoveValue();
-    Value rv = rv_or.MoveValue();
+    images.push_back(std::move(image));
+  }
+  return images;
+}
+
+int CompareMaterializedKeys(const MaterializedKeys& lhs,
+                            const MaterializedKeys& rhs,
+                            const std::vector<SortKeyOrder>& orders,
+                            Status* error) {
+  if (lhs.error != Status::kSuccess || rhs.error != Status::kSuccess) {
+    // Comparators cannot abort mid-sort: record the first failure and treat
+    // the pair as equal, exactly like the evaluating comparator did.
+    if (error != nullptr && *error == Status::kSuccess) {
+      *error = lhs.error != Status::kSuccess ? lhs.error : rhs.error;
+    }
+    return 0;
+  }
+  for (size_t i = 0; i < orders.size(); ++i) {
+    const Value& lv = lhs.values[i];
+    const Value& rv = rhs.values[i];
     if (lv.IsNull() && rv.IsNull()) {
       continue;
     }
-    // CompareForOrderBy canonicalizes NaN (equal to itself, above +inf)
-    // like SortExecutor/TopN.  Raw `lv < rv` / `rv < lv` makes NaN compare
-    // "equal" to every value while 5 < 7 -- not a strict weak ordering, so
-    // std::sort below is UB (unguarded partitioning can read out of
-    // bounds) and NaN rows land in inconsistent positions.  SortKeyOrder adds
-    // the NULL placement, the direction and the key's collation on top.
-    const int cmp = MakeSortKeyOrder(key).Compare(lv, rv);
+    // MakeSortKeyOrder (precomputed below) canonicalizes NaN, adds NULL
+    // placement, the direction and the key's collation -- the same total
+    // order the evaluating comparator used.
+    const int cmp = orders[i].Compare(lv, rv);
     if (cmp != 0) {
       return cmp;
     }
@@ -49,26 +78,43 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
   return 0;
 }
 
-// Validates that every row's sort keys evaluate cleanly BEFORE sorting.
-// The comparator cannot abort mid-sort and std::sort requires a strict
-// weak ordering: a data-dependent "equal" answer for a failing row breaks
-// transitivity (Y~X and X~Z while Y<Z), which is the same UB class the
-// NaN comment below calls out.  Detecting failures up front keeps the
-// comparator total; the rows are left untouched when this returns an error.
+// `validate` preserves the two public overloads' existing gate: the pair
+// overload always validates before sorting, the plain-Row overload only does
+// so when the caller supplies an error status.
 template <typename Rows, typename Project>
-Status ValidateSortKeys(const Rows& rows, const Schema& schema,
-                        const std::vector<SortExecutor::Key>& keys,
-                        Project&& project) {
-  for (const auto& entry : rows) {
-    const Row& row = project(entry);
-    for (const SortExecutor::Key& key : keys) {
-      StatusOr<Value> evaluated = key.expression->TryEvaluate(row, schema);
-      if (!evaluated.HasValue()) {
-        return evaluated.GetStatus();
+void SortByMaterializedKeys(Rows& rows, const Schema& schema,
+                            const std::vector<SortExecutor::Key>& keys,
+                            Status* error, bool validate, Project&& project) {
+  const std::vector<MaterializedKeys> images =
+      MaterializeSortKeys(rows, schema, keys, project);
+  Status local_error = Status::kSuccess;
+  Status* validation_error = error != nullptr ? error : &local_error;
+  if (validate) {
+    for (const MaterializedKeys& image : images) {
+      if (image.error != Status::kSuccess) {
+        *validation_error = image.error;
+        return;
       }
     }
   }
-  return Status::kSuccess;
+  std::vector<SortKeyOrder> orders;
+  orders.reserve(keys.size());
+  for (const SortExecutor::Key& key : keys) {
+    orders.push_back(MakeSortKeyOrder(key));
+  }
+  // Sort indices, not rows in place: the keys are bound to a row's original
+  // position, which std::sort would move around during the permutation.
+  std::vector<size_t> order(rows.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return CompareMaterializedKeys(images[a], images[b], orders, error) < 0;
+  });
+  Rows sorted;
+  sorted.reserve(rows.size());
+  for (size_t index : order) {
+    sorted.push_back(std::move(rows[index]));
+  }
+  rows = std::move(sorted);
 }
 
 }  // namespace
@@ -78,41 +124,20 @@ void PdqSort::Sort(std::vector<std::pair<Row, RowPosition>>& rows,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
   // Validation must always run: a failed key evaluation would otherwise
   // make the comparator non-transitive and std::sort undefined.
-  Status local_error = Status::kSuccess;
-  Status* validation_error = error != nullptr ? error : &local_error;
-  const Status validation = ValidateSortKeys(
-      rows, schema, keys,
+  SortByMaterializedKeys(
+      rows, schema, keys, error, true,
       [](const std::pair<Row, RowPosition>& entry) -> const Row& {
         return entry.first;
       });
-  if (validation != Status::kSuccess) {
-    *validation_error = validation;
-    return;
-  }
-  std::sort(rows.begin(), rows.end(),
-            [&](const std::pair<Row, RowPosition>& a,
-                const std::pair<Row, RowPosition>& b) {
-              return CompareRowKeys(a.first, b.first, schema, keys, error) < 0;
-            });
 }
 
 void PdqSort::Sort(std::vector<Row>& rows, const Schema& schema,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
-  if (error != nullptr) {
-    const Status validation =
-        ValidateSortKeys(rows, schema, keys, [](const Row& row) -> const Row& {
-          return row;  // NOLINT(bugprone-return-const-ref-from-parameter)
-        });
-    if (validation != Status::kSuccess) {
-      if (*error == Status::kSuccess) {
-        *error = validation;
-      }
-      return;
-    }
-  }
-  std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
-    return CompareRowKeys(a, b, schema, keys, error) < 0;
-  });
+  SortByMaterializedKeys(
+      rows, schema, keys, error, error != nullptr,
+      [](const Row& row) -> const Row& {
+        return row;  // NOLINT(bugprone-return-const-ref-from-parameter)
+      });
 }
 
 }  // namespace tinylamb

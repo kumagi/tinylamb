@@ -580,6 +580,203 @@ size_t EstimateSecondaryStoreBytes(const LSTableStore& store,
   return bytes;
 }
 
+bool CanonicalizeProjection(const std::vector<slot_t>& projection,
+                            slot_t col_count, std::vector<uint32_t>* out) {
+  out->clear();
+  out->reserve(projection.size());
+  for (const slot_t c : projection) {
+    if (c >= col_count) {
+      return false;
+    }
+    out->push_back(static_cast<uint32_t>(c));
+  }
+  std::ranges::sort(*out);
+  const auto dup = std::ranges::unique(*out);
+  out->erase(dup.begin(), dup.end());
+  return true;
+}
+
+LSTableColumnDictionary MakeDictionaryView(const LSTableColumnDictionary& src) {
+  LSTableColumnDictionary out;
+  out.active = src.active;
+  out.wide_code_bytes = src.wide_code_bytes;
+  out.packed_code_bits = src.packed_code_bits;
+  out.bytewise_equality = src.bytewise_equality;
+  out.codes_follow_string_order = src.codes_follow_string_order;
+  out.all_single_byte = src.all_single_byte;
+  out.value_type = src.value_type;
+  out.all_canonical_utc_timestamps = src.all_canonical_utc_timestamps;
+  out.packed_code_count = src.packed_code_count;
+  out.single_byte_chars = src.single_byte_chars;
+
+  out.narrow_codes_view = src.NarrowCodes();
+  out.wide_codes_view = src.WideCodes();
+  out.int_entries_view = src.IntEntries();
+  out.double_entries_view = src.DoubleEntries();
+  out.flat_str_offsets = src.flat_str_offsets;
+  out.flat_str_bytes = src.flat_str_bytes;
+  out.utc_minute_of_hour_view = src.utc_minute_of_hour_view;
+  out.utc_minute_bucket_view = src.utc_minute_bucket_view;
+  out.utc_minute_exemplar_code_view = src.utc_minute_exemplar_code_view;
+
+  out.entries = src.entries;
+  out.code_counts = src.code_counts;
+  out.code_first_row = src.code_first_row;
+  out.encounter_codes = src.encounter_codes;
+  out.one_minus_double_entries = src.one_minus_double_entries;
+  out.one_plus_double_entries = src.one_plus_double_entries;
+  return out;
+}
+
+size_t TransferColumnarCharge(const std::shared_ptr<ProcessMemoryCharge>& from,
+                              const std::shared_ptr<ProcessMemoryCharge>& to,
+                              size_t requested_bytes) {
+  if (requested_bytes == 0 || !from || !to) {
+    return 0;
+  }
+  return from->TransferTo(*to, requested_bytes);
+}
+
+void ExtractColumnsFromStore(
+    LSTableStore& src, const Table& table, uint64_t generation,
+    const std::vector<slot_t>& cols,
+    std::shared_ptr<const LSTableBlockLayout>* layout_io,
+    std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>* cols_io) {
+  const Schema& schema = table.GetSchema();
+  const size_t nblocks = src.blocks.size();
+  if (!*layout_io || (*layout_io)->first_pid != src.first_pid ||
+      (*layout_io)->uncommitted_owner_txn != src.uncommitted_owner_txn) {
+    auto layout = std::make_shared<LSTableBlockLayout>();
+    layout->generation = generation;
+    layout->first_pid = src.first_pid;
+    layout->uncommitted_owner_txn = src.uncommitted_owner_txn;
+    layout->total_rows = src.total_rows;
+    layout->lstable_schema = src.lstable_schema;
+    layout->has_unsigned_column = src.has_unsigned_column;
+    layout->is_persistent_tlcs = src.is_persistent_tlcs;
+    layout->pax_chunk = std::move(src.pax_chunk);
+    layout->page_ids = std::move(src.page_ids);
+    layout->flat_page_to_block = std::move(src.flat_page_to_block);
+    layout->page_to_block = std::move(src.page_to_block);
+    layout->block_row_counts.reserve(nblocks);
+    layout->block_page_lsns.reserve(nblocks);
+    layout->block_identity_slots.reserve(nblocks);
+    bool any_non_identity = false;
+    for (const LSTablePageBlock& blk : src.blocks) {
+      if (!blk.identity_slots) {
+        any_non_identity = true;
+        break;
+      }
+    }
+    if (any_non_identity) {
+      layout->block_slots.resize(nblocks);
+    }
+    size_t layout_bytes =
+        sizeof(LSTableBlockLayout) +
+        (layout->page_ids.size() * sizeof(page_id_t)) +
+        (layout->flat_page_to_block.size() * sizeof(uint32_t)) +
+        (layout->page_to_block.size() * 32ULL) +
+        (nblocks * (sizeof(uint32_t) + sizeof(lsn_t) + sizeof(uint8_t)));
+    for (size_t bi = 0; bi < nblocks; ++bi) {
+      LSTablePageBlock& blk = src.blocks[bi];
+      layout->block_row_counts.push_back(blk.row_count);
+      layout->block_page_lsns.push_back(blk.page_lsn);
+      layout->block_identity_slots.push_back(blk.identity_slots ? 1 : 0);
+      if (any_non_identity && !blk.identity_slots) {
+        layout_bytes += blk.slots.size() * sizeof(slot_t);
+        layout->block_slots[bi] = std::move(blk.slots);
+      }
+    }
+    layout->memory_charge =
+        std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+    TransferColumnarCharge(src.memory_charge, layout->memory_charge,
+                           layout_bytes);
+    *layout_io = std::move(layout);
+    table.RefillLSTableBlockLayout(generation, *layout_io);
+  }
+
+  for (const slot_t c : cols) {
+    if (c >= schema.ColumnCount() || !src.HasColumn(c)) {
+      continue;
+    }
+    auto entry = std::make_shared<LSTableColumnCacheEntry>();
+    entry->generation = generation;
+    entry->col_index = c;
+    entry->type = schema.GetColumn(c).Type();
+    entry->is_unsigned = schema.GetColumn(c).IsUnsigned();
+    entry->has_null =
+        c < src.column_has_null.size() && src.column_has_null[c] != 0;
+    entry->is_monotonic =
+        c < src.column_is_monotonic.size() && src.column_is_monotonic[c] != 0;
+    entry->is_unique_nonnull = c < src.column_is_unique_nonnull.size() &&
+                               src.column_is_unique_nonnull[c] != 0;
+    entry->is_identity_1_to_n = c < src.column_is_identity_1_to_n.size() &&
+                                src.column_is_identity_1_to_n[c] != 0;
+    if (c < src.column_min_int.size()) {
+      entry->min_int = src.column_min_int[c];
+    }
+    if (c < src.column_max_int.size()) {
+      entry->max_int = src.column_max_int[c];
+    }
+    if (c < src.integer_columns.size()) {
+      entry->integer_column = std::move(src.integer_columns[c]);
+    }
+    if (c < src.dictionaries.size()) {
+      entry->dictionary = std::move(src.dictionaries[c]);
+    }
+    if (c < src.integer_membership.size()) {
+      entry->integer_membership = std::move(src.integer_membership[c]);
+    }
+
+    entry->blocks.resize(nblocks);
+    size_t col_bytes =
+        sizeof(LSTableColumnCacheEntry) +
+        (nblocks * sizeof(LSTableColumnBlock)) +
+        (entry->integer_column.size() * sizeof(int64_t)) +
+        EstimateDictionaryBytes(entry->dictionary) +
+        (entry->integer_membership
+             ? entry->integer_membership->Words().size() * sizeof(uint64_t)
+             : 0);
+    size_t row_base = 0;
+    const auto narrow_span = entry->dictionary.NarrowCodes();
+    for (size_t bi = 0; bi < nblocks; ++bi) {
+      const uint32_t rc = src.blocks[bi].row_count;
+      LSTableColumnBlock& col = entry->blocks[bi];
+      col = std::move(src.blocks[bi].columns[c]);
+      if (col.dict != nullptr) {
+        col.dict = &entry->dictionary;
+      }
+      if (entry->dictionary.active && !col.dict_codes.empty() &&
+          row_base + rc <= narrow_span.size()) {
+        col.dict_codes = narrow_span.subspan(row_base, rc);
+      }
+      if (!entry->integer_column.empty() &&
+          row_base + rc <= entry->integer_column.size()) {
+        col.int_cells = std::span<const int64_t>(entry->integer_column)
+                            .subspan(row_base, rc);
+      }
+      if (!col.for16_codes.empty()) {
+        col.for_bytes = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(col.for16_codes.data()),
+            col.for16_codes.size() * sizeof(uint16_t));
+      }
+      col_bytes += col.nulls.size() + col.varchar_bytes.size() +
+                   (col.varchar_ends.size() * sizeof(uint32_t)) +
+                   (col.for16_codes.size() * sizeof(uint16_t));
+      row_base += rc;
+    }
+
+    entry->estimated_bytes = col_bytes;
+    entry->memory_charge =
+        std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+    TransferColumnarCharge(src.memory_charge, entry->memory_charge, col_bytes);
+    table.RefillCachedLSTableColumn(c, generation, col_bytes, entry);
+    if (c < cols_io->size()) {
+      (*cols_io)[c] = std::move(entry);
+    }
+  }
+}
+
 }  // namespace
 
 bool LSTablePageBlock::MatchesZoneMaps(
@@ -665,15 +862,14 @@ std::shared_ptr<const LSTableIntegerRuns> LSTableStore::IntegerRuns(
     if (integer_runs_ && integer_runs_->column == column) {
       return integer_runs_;
     }
+    const auto keys = IntegerColumn(column);
     if (total_rows == 0 || total_rows > UINT32_MAX ||
-        column >= integer_columns.size() ||
         column >= column_is_monotonic.size() ||
         (column_is_monotonic[column] == 0U) ||
         column >= column_has_null.size() || (column_has_null[column] != 0U) ||
-        integer_columns[column].size() != total_rows) {
+        keys.size() != total_rows) {
       return nullptr;
     }
-    const auto& keys = integer_columns[column];
     const uint64_t span = static_cast<uint64_t>(keys.back()) -
                           static_cast<uint64_t>(keys.front()) + 1;
     constexpr size_t max_bytes = size_t{256} << 20;
@@ -732,8 +928,8 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
     slot_t key_column, slot_t value_column) const {
   try {
     const auto runs = IntegerRuns(key_column);
-    if (!runs || value_column >= integer_columns.size() ||
-        integer_columns[value_column].size() != total_rows ||
+    const auto cells = IntegerColumn(value_column);
+    if (!runs || cells.size() != total_rows ||
         value_column >= column_has_null.size() ||
         (column_has_null[value_column] != 0U)) {
       return nullptr;
@@ -743,7 +939,6 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
         integer_run_bounds_->value_column == value_column) {
       return integer_run_bounds_;
     }
-    const auto& cells = integer_columns[value_column];
     int64_t low = 0, high = 0;
     if (value_column < column_min_int.size() &&
         value_column < column_max_int.size() &&
@@ -877,9 +1072,10 @@ StatusOr<ExecResult> LSTableStore::ExecuteFragment(const Fragment& fragment,
   return Execute(runtime, artifacts, fragment, *lstable_schema);
 }
 
-std::shared_ptr<const LSTableStore> BuildLSTableStore(
+std::shared_ptr<const LSTableStore> BuildLSTableStoreImpl(
     Transaction& txn, const Table& table, const std::vector<slot_t>* projection,
-    uint64_t max_bytes) {
+    uint64_t max_bytes, bool cache_in_table,
+    std::shared_ptr<LSTableStore>* mutable_out) {
   if (txn.IsFailed() || table.RowsRewrittenInPlace()) {
     return nullptr;
   }
@@ -897,17 +1093,21 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
   if (projection != nullptr && incarnation != nullptr) {
     projection_mask.resize(schema.ColumnCount());
     for (slot_t col : *projection) {
-      if (col >= projection_mask.size()) { return nullptr; }
+      if (col >= projection_mask.size()) {
+        return nullptr;
+      }
       projection_mask[col] = 1;
     }
-    if (incarnation->ProjectionRejected(generation, effective_max_bytes, projection_mask)) {
+    if (incarnation->ProjectionRejected(generation, effective_max_bytes,
+                                        projection_mask)) {
       return nullptr;
     }
   }
   const auto remember_projection_limit = [&] {
     if (!projection_mask.empty() && txn.WriteSetEmpty() &&
         table.LayoutGeneration() == generation) {
-      incarnation->RejectProjection(generation, effective_max_bytes, projection_mask);
+      incarnation->RejectProjection(generation, effective_max_bytes,
+                                    projection_mask);
     }
   };
   const std::shared_ptr<const TlcsFile> backing_tlcs =
@@ -935,7 +1135,9 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
         return projected;
       }
       if (backing_tlcs->IsPaged()) {
-        if (capacity_rejected) { remember_projection_limit(); }
+        if (capacity_rejected) {
+          remember_projection_limit();
+        }
         return nullptr;
       }
     }
@@ -1240,7 +1442,9 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
         estimated_bytes += restored_raw_bytes;
         if (estimated_bytes > effective_max_bytes ||
             !mem_charge->TryAddWithReclaim(restored_raw_bytes)) {
-          if (estimated_bytes > effective_max_bytes) { remember_projection_limit(); }
+          if (estimated_bytes > effective_max_bytes) {
+            remember_projection_limit();
+          }
           if (projection == nullptr &&
               max_bytes == LSTableStore::kBuildByteLimit &&
               table.LayoutGeneration() == generation) {
@@ -1270,7 +1474,9 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
     if (store->total_rows > static_cast<uint64_t>(INT64_MAX) ||
         estimated_bytes > effective_max_bytes ||
         !mem_charge->TryAddWithReclaim(block_bytes)) {
-      if (estimated_bytes > effective_max_bytes) { remember_projection_limit(); }
+      if (estimated_bytes > effective_max_bytes) {
+        remember_projection_limit();
+      }
       // Only an unchanged full-store capacity failure suppresses later full
       // builds. Snapshot/IO failures must never become a capacity verdict.
       if (projection == nullptr && max_bytes == LSTableStore::kBuildByteLimit &&
@@ -1974,13 +2180,184 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
     LOG(WARN) << "PaxChunk sample construction skipped: unknown exception";
   }
 
-  if (projection != nullptr) {
-    // Replacing the one cached projection bounds cache growth across queries.
-    // Existing readers keep their immutable shared store until completion.
-    table.RefillProjectedLSTableStore(store);
-  } else if (store->uncommitted_owner_txn == 0 ||
-             table.GetLSTableStore() == nullptr) {
-    table.RefillLSTableStore(store);
+  if (cache_in_table) {
+    if (projection != nullptr) {
+      // Replacing the one cached projection bounds cache growth across
+      // queries. Existing readers keep their immutable shared store until
+      // completion.
+      table.RefillProjectedLSTableStore(store);
+    } else if (store->uncommitted_owner_txn == 0 ||
+               table.GetLSTableStore() == nullptr) {
+      table.RefillLSTableStore(store);
+    }
+  }
+  if (mutable_out != nullptr) {
+    *mutable_out = store;
+  }
+  return store;
+}
+
+std::shared_ptr<const LSTableStore> BuildLSTableStore(
+    Transaction& txn, const Table& table, const std::vector<slot_t>* projection,
+    uint64_t max_bytes) {
+  return BuildLSTableStoreImpl(txn, table, projection, max_bytes,
+                               /*cache_in_table=*/true,
+                               /*mutable_out=*/nullptr);
+}
+
+std::shared_ptr<const LSTableStore> AssembleLSTableStoreView(
+    uint64_t generation, size_t col_count,
+    const std::shared_ptr<const LSTableBlockLayout>& layout,
+    const std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>& columns,
+    const std::vector<slot_t>* projection) {
+  (void)projection;
+  if (!layout || columns.size() != col_count) {
+    return nullptr;
+  }
+  auto store = std::make_shared<LSTableStore>();
+  store->layout_generation = generation;
+  store->first_pid = layout->first_pid;
+  store->uncommitted_owner_txn = layout->uncommitted_owner_txn;
+  store->total_rows = layout->total_rows;
+  store->lstable_schema = layout->lstable_schema;
+  store->has_unsigned_column = layout->has_unsigned_column;
+  store->is_persistent_tlcs = layout->is_persistent_tlcs;
+  store->pax_chunk = layout->pax_chunk;
+  store->serialized_column_stats = layout->serialized_column_stats;
+  store->backing_mmap = layout->backing_mmap;
+  if (!store->backing_mmap) {
+    for (const auto& entry : columns) {
+      if (entry && entry->backing_mmap) {
+        store->backing_mmap = entry->backing_mmap;
+        break;
+      }
+    }
+  }
+  store->memory_charge =
+      std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+  store->page_ids = layout->page_ids;
+  store->flat_page_to_block = layout->flat_page_to_block;
+  store->page_to_block = layout->page_to_block;
+  store->layout_owner = layout;
+  store->column_owners = columns;
+
+  size_t kept = 0;
+  for (size_t c = 0; c < col_count; ++c) {
+    if (columns[c] != nullptr) {
+      ++kept;
+    }
+  }
+  if (kept < col_count) {
+    store->loaded_columns.assign(col_count, 0);
+    store->column_offsets.assign(col_count, SIZE_MAX);
+    size_t off = 0;
+    for (size_t c = 0; c < col_count; ++c) {
+      if (columns[c] != nullptr) {
+        store->loaded_columns[c] = 1;
+        store->column_offsets[c] = off++;
+      }
+    }
+  }
+
+  store->dictionaries.resize(col_count);
+  store->integer_columns.resize(col_count);
+  store->integer_columns_view.resize(col_count);
+  store->integer_membership.resize(col_count);
+  store->column_has_null.assign(col_count, 0);
+  store->column_is_monotonic.assign(col_count, 0);
+  store->column_is_unique_nonnull.assign(col_count, 0);
+  store->column_is_identity_1_to_n.assign(col_count, 0);
+  store->column_min_int.assign(col_count, std::numeric_limits<int64_t>::max());
+  store->column_max_int.assign(col_count, std::numeric_limits<int64_t>::min());
+
+  const size_t nblocks = layout->block_row_counts.size();
+  for (size_t c = 0; c < col_count; ++c) {
+    const auto& entry = columns[c];
+    if (!entry) {
+      continue;
+    }
+    if (entry->blocks.size() != nblocks) {
+      return nullptr;
+    }
+    store->column_has_null[c] = entry->has_null ? 1 : 0;
+    store->column_is_monotonic[c] = entry->is_monotonic ? 1 : 0;
+    store->column_is_unique_nonnull[c] = entry->is_unique_nonnull ? 1 : 0;
+    store->column_is_identity_1_to_n[c] = entry->is_identity_1_to_n ? 1 : 0;
+    store->column_min_int[c] = entry->min_int;
+    store->column_max_int[c] = entry->max_int;
+    store->dictionaries[c] = MakeDictionaryView(entry->dictionary);
+    store->integer_columns_view[c] = entry->integer_column;
+    store->integer_membership[c] = entry->integer_membership;
+  }
+
+  store->blocks.resize(nblocks);
+  for (size_t bi = 0; bi < nblocks; ++bi) {
+    LSTablePageBlock& dst_b = store->blocks[bi];
+    if (bi < layout->page_ids.size()) {
+      dst_b.page_id = layout->page_ids[bi];
+    }
+    if (bi < layout->block_page_lsns.size()) {
+      dst_b.page_lsn = layout->block_page_lsns[bi];
+    }
+    dst_b.row_count = layout->block_row_counts[bi];
+    dst_b.identity_slots = bi < layout->block_identity_slots.size()
+                               ? (layout->block_identity_slots[bi] != 0)
+                               : true;
+    if (!dst_b.identity_slots && bi < layout->block_slots.size()) {
+      dst_b.slots = layout->block_slots[bi];
+    }
+    if (kept == col_count) {
+      dst_b.columns.resize(col_count);
+    } else {
+      dst_b.columns.Project(store->column_offsets, kept);
+    }
+    for (size_t c = 0; c < col_count; ++c) {
+      const auto& entry = columns[c];
+      if (!entry) {
+        continue;
+      }
+      const LSTableColumnBlock& src = entry->blocks[bi];
+      LSTableColumnBlock& dst = dst_b.columns[c];
+      dst.type = src.type;
+      dst.is_unsigned = src.is_unsigned;
+      dst.has_null = src.has_null;
+      dst.has_min_max = src.has_min_max;
+      dst.has_double_min_max = src.has_double_min_max;
+      dst.has_nan = src.has_nan;
+      dst.all_single_byte_varchar = src.all_single_byte_varchar;
+      dst.for_width = src.for_width;
+      dst.for_base = src.for_base;
+      dst.min_int = src.min_int;
+      dst.max_int = src.max_int;
+      dst.min_double = src.min_double;
+      dst.max_double = src.max_double;
+      dst.dict = (src.dict != nullptr) ? &store->dictionaries[c] : nullptr;
+      dst.wide_code_begin = src.wide_code_begin;
+      dst.wide_code_count = src.wide_code_count;
+      dst.dict_mask = src.dict_mask;
+      dst.dict_codes = src.dict_codes;
+      dst.int_cells = src.int_cells;
+      dst.is_const_code = src.is_const_code;
+      dst.has_code_min_max = src.has_code_min_max;
+      dst.const_code = src.const_code;
+      dst.min_code = src.min_code;
+      dst.max_code = src.max_code;
+      dst.min_nonzero_code = src.min_nonzero_code;
+      if (!src.for_bytes.empty()) {
+        dst.for_bytes = src.for_bytes;
+      } else if (!src.for16_codes.empty()) {
+        dst.for_bytes = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(src.for16_codes.data()),
+            src.for16_codes.size() * sizeof(uint16_t));
+      }
+      dst.nulls_view = src.Nulls();
+      dst.varchar_bytes_view = src.VarcharBytes();
+      dst.varchar_ends_view = src.VarcharEnds();
+      dst.block_bloom = src.block_bloom;
+      if (dst.has_null) {
+        dst_b.has_any_null = true;
+      }
+    }
   }
   return store;
 }
@@ -2009,20 +2386,29 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
     }
     return nullptr;
   }
-  if (table.LSTableCapacityRejected(generation)) {
-    if (projection == nullptr) {
+  const Schema& schema = table.GetSchema();
+  const slot_t col_count = schema.ColumnCount();
+  std::vector<uint32_t> req_cols;
+  if (projection != nullptr) {
+    if (!CanonicalizeProjection(*projection, col_count, &req_cols)) {
       return nullptr;
+    }
+    if (auto cached_view = table.GetCachedLSTableView(generation, req_cols);
+        cached_view != nullptr &&
+        cached_view->layout_generation == generation &&
+        cached_view->first_pid == table.FirstPageId() &&
+        (cached_view->uncommitted_owner_txn == 0 ||
+         cached_view->uncommitted_owner_txn == txn.ID())) {
+      return cached_view;
     }
     const auto partial = table.GetProjectedLSTableStore();
     if (partial != nullptr && partial->layout_generation == generation &&
         partial->first_pid == table.FirstPageId() &&
         (partial->uncommitted_owner_txn == 0 ||
          partial->uncommitted_owner_txn == txn.ID()) &&
-        std::ranges::all_of(*projection, [&](slot_t c) {
-          return c < table.GetSchema().ColumnCount() && partial->HasColumn(c);
+        std::ranges::all_of(req_cols, [&](uint32_t c) {
+          return c < col_count && partial->HasColumn(static_cast<slot_t>(c));
         })) {
-      // Match the full-cache contract: callers still validate MVCC visibility.
-      // A cache hit must not repeatedly sweep the transaction version maps.
       return partial;
     }
   }
@@ -2041,83 +2427,192 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
   if (txn.HasAnyPageVersionChains()) {
     return nullptr;
   }
+
+  const std::shared_ptr<const TlcsFile> backing_tlcs =
+      table.GetBackingTlcsStore();
+  const bool valid_tlcs = backing_tlcs != nullptr &&
+                          backing_tlcs->LayoutGeneration() == generation &&
+                          backing_tlcs->FirstPageId() == table.FirstPageId();
+  if (valid_tlcs && projection != nullptr) {
+    if (auto resident = backing_tlcs->ResidentStore();
+        resident != nullptr && resident->layout_generation == generation &&
+        resident->first_pid == table.FirstPageId()) {
+      table.RefillLSTableStore(resident);
+      return resident;
+    }
+    if (!LSTableStore::SupportsSchema(schema)) {
+      return nullptr;
+    }
+    std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> col_entries(
+        col_count);
+    std::vector<slot_t> missing_cols;
+    for (const uint32_t c32 : req_cols) {
+      const auto c = static_cast<slot_t>(c32);
+      if (auto cached = table.GetCachedLSTableColumn(c, generation)) {
+        col_entries[c] = std::move(cached);
+      } else {
+        if (table.LSTableColumnRejected(c, generation)) {
+          return nullptr;
+        }
+        missing_cols.push_back(c);
+      }
+    }
+    auto layout = table.GetLSTableBlockLayout(generation);
+    if (!layout || layout->first_pid != table.FirstPageId()) {
+      layout = backing_tlcs->BuildBlockLayout(schema, generation);
+      if (!layout) {
+        return nullptr;
+      }
+      table.RefillLSTableBlockLayout(generation, layout);
+    }
+    if (!missing_cols.empty()) {
+      const size_t est_missing =
+          backing_tlcs->EstimateColumnsCacheBytes(schema, missing_cols);
+      const auto& budget = ProcessMemoryBudget::Global();
+      const size_t col_limit =
+          std::min(budget.ColumnarPoolLimit(),
+                   budget.EffectivePoolMaxBytes(MemoryPoolKind::kColumnar));
+      if (col_limit > 0 && budget.ColumnarUsed() + est_missing > col_limit) {
+        table.EvictIdleColumnarHeadroom((budget.ColumnarUsed() + est_missing) -
+                                        col_limit);
+      }
+      const uint64_t eff_limit =
+          EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit);
+      std::vector<slot_t> rejected_cols;
+      auto built = backing_tlcs->BuildColumnCacheEntries(
+          schema, generation, missing_cols, eff_limit, &rejected_cols);
+      for (const slot_t rc : rejected_cols) {
+        table.NoteLSTableColumnRejected(rc, generation);
+      }
+      bool all_built = built.size() == missing_cols.size();
+      for (size_t i = 0; i < missing_cols.size(); ++i) {
+        if (i < built.size() && built[i] != nullptr) {
+          const slot_t c = missing_cols[i];
+          table.RefillCachedLSTableColumn(c, generation,
+                                          built[i]->estimated_bytes, built[i]);
+          col_entries[c] = std::move(built[i]);
+        } else {
+          all_built = false;
+        }
+      }
+      if (!all_built) {
+        return nullptr;
+      }
+    }
+    auto view = AssembleLSTableStoreView(generation, col_count, layout,
+                                         col_entries, projection);
+    if (!view) {
+      return nullptr;
+    }
+    table.RefillCachedLSTableView(generation, std::move(req_cols), view);
+    return view;
+  }
+
   if (!table.LSTableCapacityRejected(generation)) {
-    if (auto full = BuildLSTableStore(txn, table)) {
+    uint64_t full_limit = LSTableStore::kBuildByteLimit;
+    if (!valid_tlcs && projection != nullptr && !projection->empty() &&
+        projection->size() * 2 < col_count && col_count >= 16) {
+      const uint64_t eff =
+          EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit);
+      full_limit =
+          std::min(eff, std::max<uint64_t>(uint64_t{64} << 20, eff / 4));
+    }
+    if (auto full = BuildLSTableStore(txn, table, nullptr, full_limit)) {
       return full;
+    }
+    if (full_limit != LSTableStore::kBuildByteLimit &&
+        table.LayoutGeneration() == generation) {
+      table.NoteLSTableCapacityRejected(generation);
     }
   }
   if (projection == nullptr || !table.LSTableCapacityRejected(generation)) {
     return nullptr;
   }
-  const slot_t col_count = table.GetSchema().ColumnCount();
+  if (!LSTableStore::SupportsSchema(schema)) {
+    return nullptr;
+  }
   std::vector<uint8_t> req_mask(col_count, 0);
-  size_t req_unique = 0;
-  for (const slot_t c : *projection) {
-    if (c >= col_count) {
-      return nullptr;
-    }
-    if (req_mask[c] == 0) {
-      req_mask[c] = 1;
-      ++req_unique;
-    }
+  for (const uint32_t c : req_cols) {
+    req_mask[c] = 1;
   }
   if (const auto& incarnation = table.IncarnationState();
-      incarnation && incarnation->ProjectionRejected(generation,
-          EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit), req_mask)) {
+      incarnation &&
+      incarnation->ProjectionRejected(
+          generation, EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit),
+          req_mask)) {
     return nullptr;
   }
-  if (req_unique >= col_count) {
-    // All columns were already rejected by the full-table capacity check; do
-    // not evict a valid proper-subset projection for a guaranteed failure.
+  if (req_cols.size() >= col_count) {
     return nullptr;
   }
-  std::vector<slot_t> union_proj;
-  {
-    auto old_partial = table.GetProjectedLSTableStore();
-    if (table.GetBackingTlcsStore() == nullptr && old_partial != nullptr &&
-        old_partial->layout_generation == generation &&
-        old_partial->first_pid == table.FirstPageId() &&
-        (old_partial->uncommitted_owner_txn == 0 ||
-         old_partial->uncommitted_owner_txn == txn.ID()) &&
-        old_partial->total_rows >= 1'000'000 &&
-        old_partial->memory_charge != nullptr) {
-      std::vector<uint8_t> merged_mask = req_mask;
-      uint64_t added_est_bytes = 0;
-      for (slot_t c = 0; c < col_count; ++c) {
-        if (old_partial->HasColumn(c)) {
-          merged_mask[c] = 1;
-        } else if (req_mask[c] != 0) {
-          const ValueType vt = table.GetSchema().GetColumn(c).Type();
-          added_est_bytes += old_partial->total_rows *
-                             (vt == ValueType::kVarChar ? 16ULL : 8ULL);
-        }
+
+  std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> col_entries(
+      col_count);
+  std::vector<slot_t> missing_cols;
+  for (const uint32_t c32 : req_cols) {
+    const auto c = static_cast<slot_t>(c32);
+    if (auto cached = table.GetCachedLSTableColumn(c, generation)) {
+      col_entries[c] = std::move(cached);
+    } else {
+      if (table.LSTableColumnRejected(c, generation)) {
+        return nullptr;
       }
-      const uint64_t total_est =
-          static_cast<uint64_t>(old_partial->memory_charge->Bytes()) +
-          added_est_bytes + (uint64_t{256} << 20);
-      if (total_est <= EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit)) {
-        union_proj.reserve(col_count);
-        for (slot_t c = 0; c < col_count; ++c) {
-          if (merged_mask[c] != 0) {
-            union_proj.push_back(c);
-          }
-        }
-        if (union_proj.size() >= col_count || union_proj.size() == req_unique) {
-          union_proj.clear();
-        }
-      }
+      missing_cols.push_back(c);
     }
   }
-  // The single cached projection cannot serve this request. Release its
-  // cache ownership before allocating a replacement so peak memory need not
-  // contain both images. Active readers retain their own shared snapshots.
-  table.RefillProjectedLSTableStore(nullptr);
-  if (!union_proj.empty()) {
-    if (auto merged = BuildLSTableStore(txn, table, &union_proj)) {
-      return merged;
+  auto layout = table.GetLSTableBlockLayout(generation);
+  const bool need_layout = !layout || layout->first_pid != table.FirstPageId();
+  if (!missing_cols.empty() || need_layout) {
+    if (!missing_cols.empty() && layout != nullptr) {
+      uint64_t est_missing =
+          sizeof(LSTablePageBlock) * layout->block_row_counts.size();
+      for (const slot_t mc : missing_cols) {
+        const ValueType vt = schema.GetColumn(mc).Type();
+        est_missing +=
+            layout->total_rows * (vt == ValueType::kVarChar ? 16ULL : 12ULL);
+      }
+      const auto& budget = ProcessMemoryBudget::Global();
+      const size_t col_limit =
+          std::min(budget.ColumnarPoolLimit(),
+                   budget.EffectivePoolMaxBytes(MemoryPoolKind::kColumnar));
+      if (col_limit > 0 && budget.ColumnarUsed() + est_missing > col_limit) {
+        table.EvictIdleColumnarHeadroom((budget.ColumnarUsed() + est_missing) -
+                                        col_limit);
+      }
     }
+    std::shared_ptr<LSTableStore> mutable_built;
+    auto built = BuildLSTableStoreImpl(
+        txn, table, &missing_cols, LSTableStore::kBuildByteLimit,
+        /*cache_in_table=*/false, &mutable_built);
+    if (built != nullptr && !mutable_built) {
+      // A concurrent reader may have attached/returned a resident store.
+      return built;
+    }
+    if (!mutable_built && req_cols.size() > missing_cols.size()) {
+      table.EvictIdleColumnarHeadroom(size_t{256} << 20);
+      built = BuildLSTableStoreImpl(txn, table, &missing_cols,
+                                    LSTableStore::kBuildByteLimit,
+                                    /*cache_in_table=*/false, &mutable_built);
+      if (built != nullptr && !mutable_built) {
+        return built;
+      }
+    }
+    if (!mutable_built) {
+      if (missing_cols.size() == 1 && table.LayoutGeneration() == generation) {
+        table.NoteLSTableColumnRejected(missing_cols[0], generation);
+      }
+      return nullptr;
+    }
+    ExtractColumnsFromStore(*mutable_built, table, generation, missing_cols,
+                            &layout, &col_entries);
   }
-  return BuildLSTableStore(txn, table, projection);
+  auto view = AssembleLSTableStoreView(generation, col_count, layout,
+                                       col_entries, projection);
+  if (!view) {
+    return nullptr;
+  }
+  table.RefillCachedLSTableView(generation, std::move(req_cols), view);
+  return view;
 }
 
 }  // namespace tinylamb

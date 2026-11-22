@@ -34,8 +34,7 @@ TEST(IntervalTest, IntegerUnitsAreScaledExactly) {
             Iv(0, 0, min));
   EXPECT_EQ(IntervalValue::TryFromInteger(-2, "quarters").MoveValue(),
             Iv(-6, 0, 0));
-  EXPECT_EQ(IntervalValue::TryFromInteger(3, "week").MoveValue(),
-            Iv(0, 21, 0));
+  EXPECT_EQ(IntervalValue::TryFromInteger(3, "week").MoveValue(), Iv(0, 21, 0));
   EXPECT_FALSE(IntervalValue::TryFromInteger(max, "second").HasValue());
   EXPECT_FALSE(IntervalValue::TryFromInteger(1, "invalid").HasValue());
 }
@@ -94,21 +93,25 @@ TEST(IntervalTest, PlusMinusNegateMultiply) {
 TEST(IntervalTest, JustifyHours) {
   // GoogleSQL normalizes hours to [-23,23] and carries whole days (the
   // canonical interval.test pins JUSTIFY_HOURS(1-2 35 49:5) -> 1-2 37 1:5).
-  EXPECT_EQ(Iv(0, 1, 49LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
-            Iv(0, 3, 1LL * 3600LL * 1000000000LL));
-  EXPECT_EQ(Iv(0, 1, -49LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
-            Iv(0, -1, -1LL * 3600LL * 1000000000LL));
+  EXPECT_EQ(
+      Iv(0, 1, 49LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
+      Iv(0, 3, 1LL * 3600LL * 1000000000LL));
+  EXPECT_EQ(
+      Iv(0, 1, -49LL * 3600LL * 1000000000LL).TryJustifyHours().MoveValue(),
+      Iv(0, -1, -1LL * 3600LL * 1000000000LL));
   EXPECT_EQ(Iv(0, 0, 7).TryJustifyHours().MoveValue(), Iv(0, 0, 7));
   EXPECT_EQ(Iv(1, 2, 7).TryJustifyHours().MoveValue(), Iv(1, 2, 7));
   // The compliance golden's months + carry case: 1-2 35 49:5:6.789 ->
   // 1-2 37 1:5:6.789 (months ride along while the time overflow lands in
   // days; folding months into the nanos total would erase them).
   EXPECT_EQ(
-      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
+      // unambiguous
       Iv(14, 35, (49LL * 3600 + 5LL * 60 + 6) * 1000000000LL + 789000000LL)
           .TryJustifyHours()
           .MoveValue(),
-      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
+      // unambiguous
       Iv(14, 37, (1LL * 3600 + 5LL * 60 + 6) * 1000000000LL + 789000000LL));
 }
 
@@ -223,10 +226,16 @@ TEST(IntervalTest, ParseSingleUnitsIntegral) {
             5000);
   EXPECT_EQ(IntervalValue::TryParse("6", "nanosecond").MoveValue().nanos, 6);
   EXPECT_EQ(IntervalValue::TryParse("6", "nanoseconds").MoveValue().nanos, 6);
-  // Large integral values parse exactly without double rounding.
+  // Large integral values parse exactly without double rounding. A leading
+  // '+' must take the same exact path (from_chars rejects '+', so it used to
+  // fall into the lossy strtod path and report out_of_range).
   EXPECT_EQ(
       IntervalValue::TryParse("9223372036854775806", "DAY").MoveValue().days,
       9223372036854775806LL);
+  EXPECT_EQ(
+      IntervalValue::TryParse("+9223372036854775806", "DAY").MoveValue().days,
+      9223372036854775806LL);
+  EXPECT_EQ(IntervalValue::TryParse("+6", "NANOSECOND").MoveValue().nanos, 6);
   // DAY / MONTH / NANOSECOND return the raw fields without a final
   // range re-check, so an exactly-int64-max day count parses successfully
   // (using it later in arithmetic is what reports out-of-range).
@@ -310,8 +319,7 @@ TEST(IntervalTest, ParseUnitRanges) {
   // A part count outside the unit range is a parse error: the extra field
   // must not be dropped silently and reinterpreted (audit: "unexpected
   // component").
-  EXPECT_FALSE(
-      IntervalValue::TryParse("1 2 3", "year to month").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("1 2 3", "year to month").HasValue());
   // The range spelling with a mismatched part count defers to the generic
   // accumulation, which stores raw fields without a final re-check.
   EXPECT_EQ(
@@ -348,11 +356,17 @@ TEST(IntervalTest, ParseRejectsTrailingGarbage) {
   // ending at minutes, but not when seconds are still owed.
   EXPECT_EQ(IntervalValue::TryParse("1:2").MoveValue().nanos,
             3720LL * 1000000000LL);
-  EXPECT_EQ(IntervalValue::TryParse("3:4", "hour to minute").MoveValue()
-                .nanos,
+  EXPECT_EQ(IntervalValue::TryParse("3:4", "hour to minute").MoveValue().nanos,
             11040LL * 1000000000LL);
-  EXPECT_FALSE(
-      IntervalValue::TryParse("1:2", "hour to second").HasValue());
+  // GoogleSQL's MINUTE TO SECOND literal uses the two-field M:S spelling:
+  // INTERVAL '1:2' MINUTE TO SECOND is one minute and two seconds (62s).
+  EXPECT_EQ(
+      IntervalValue::TryParse("1:2", "minute to second").MoveValue().nanos,
+      62LL * 1000000000LL);
+  EXPECT_EQ(
+      IntervalValue::TryParse("15:14", "MINUTE TO SECOND").MoveValue().nanos,
+      (15LL * 60 + 14) * 1000000000LL);
+  EXPECT_FALSE(IntervalValue::TryParse("1:2", "hour to second").HasValue());
   EXPECT_FALSE(IntervalValue::TryParse("1:2:").HasValue());
   EXPECT_FALSE(IntervalValue::TryParse("1:2:3junk").HasValue());
   EXPECT_FALSE(IntervalValue::TryParse("1:2:3:4").HasValue());
@@ -373,8 +387,8 @@ TEST(IntervalTest, ParseUnitNamesMatchExactly) {
   EXPECT_FALSE(IntervalValue::TryParse("1", "daylight").HasValue());
   EXPECT_FALSE(IntervalValue::TryParse("1 2", "yearxyz to month").HasValue());
   EXPECT_FALSE(IntervalValue::TryParse("1 2", "daylight to second").HasValue());
-  EXPECT_FALSE(IntervalValue::TryParse("1 2 3 4", "seconds to minutes")
-                   .HasValue());
+  EXPECT_FALSE(
+      IntervalValue::TryParse("1 2 3 4", "seconds to minutes").HasValue());
   // Canonical spellings, plurals and ranges are unaffected.
   EXPECT_EQ(IntervalValue::TryParse("1 2", "YEARS TO MONTHS").MoveValue(),
             Iv(14, 0, 0));
@@ -396,16 +410,15 @@ TEST(IntervalTest, ParseEmptyAmountValidatesUnit) {
 TEST(IntervalTest, ParseAcceptsInt64MinBoundary) {
   // -2^63 is exactly representable and used to be rejected by an off-by-one
   // <= comparison against the double boundary.
-  EXPECT_EQ(IntervalValue::TryParse("P-9223372036854775808M").MoveValue()
-                .months,
-            INT64_MIN);
+  EXPECT_EQ(
+      IntervalValue::TryParse("P-9223372036854775808M").MoveValue().months,
+      INT64_MIN);
   EXPECT_EQ(IntervalValue::TryParse("-9223372036854775808", "NANOSECOND")
                 .MoveValue()
                 .nanos,
             INT64_MIN);
   // One past the boundary in either direction is still an error.
-  EXPECT_FALSE(
-      IntervalValue::TryParse("P9223372036854775808M").HasValue());
+  EXPECT_FALSE(IntervalValue::TryParse("P9223372036854775808M").HasValue());
   EXPECT_FALSE(
       IntervalValue::TryParse("9223372036854775808", "NANOSECOND").HasValue());
 }

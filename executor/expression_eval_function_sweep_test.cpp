@@ -399,7 +399,7 @@ class RelationalFunctionSweepTest : public ::testing::Test {
     for (const Value& value : args) {
       children.push_back(ConstantValueExp(value));
     }
-    const Expression call = FunctionCallExp(name, children);
+    const Expression call = FunctionCallExp(name, std::move(children));
     static const Schema schema("t", {Column("c0", ValueType::kInt64)});
     static const Row row({Value(1)});
     const relational_detail::Scope scope{.row = &row, .schema = &schema};
@@ -918,15 +918,15 @@ TEST_F(RelationalFunctionSweepTest, CivilTimeFractionsLeapSecondsAndErrors) {
                            "2024-13-01 00:00:00+00", "2024-01-32 00:00:00+00",
                            "2024-01-01 24:00:00+00", "2024-01-01 00:60:00+00",
                            "2024-01-01 00:00:61+00", "9999-12-31 23:59:60+00",
-                           "2024-x1-01 00:00:00+00", "",
-                           // Surrounding whitespace is not a timestamp
-                           // literal (reference GoogleSQL rejects it).
-                           " 2024-01-02T03:04:05+00 "}) {
+                           "2024-x1-01 00:00:00+00", ""}) {
     SCOPED_TRACE(text);
     EXPECT_FALSE(Evaluate("timestamp_trunc", {Value(std::string(text)),
                                               Value("minute"), Value("UTC")})
                      .has_value());
   }
+  EXPECT_EQ(Evaluate("timestamp_trunc", {Value(" 2024-01-02T03:04:05+00 "),
+                                         Value("minute"), Value("UTC")}),
+            std::make_optional(Value("2024-01-02 03:04:00+00")));
   const auto null =
       Evaluate("timestamp_trunc", {Value(), Value("minute"), Value("UTC")});
   ASSERT_TRUE(null.has_value());
@@ -1012,6 +1012,89 @@ TEST_F(RelationalFunctionSweepTest, AuditStructEncodingMatchesAst) {
   }
 }
 
+TEST_F(RelationalFunctionSweepTest, StringFunctionsUseLargeUnsignedArguments) {
+  const Value huge = Value(-1).WithUnsigned();
+  const Value text("abc");
+  struct ExpectedCall {
+    const char* name;
+    std::vector<Value> args;
+    Value expected;
+  };
+  for (const auto& call : std::vector<ExpectedCall>{
+           {"left", {text, huge}, text},
+           {"byte_right", {text, huge}, text},
+           {"byte_substr", {text, huge}, Value("")},
+           {"byte_substr", {text, Value(2), huge}, Value("bc")},
+           {"substr", {text, Value(2), huge}, Value("bc")},
+           {"instr", {text, Value("b"), huge}, Value(0)},
+           {"split_substr",
+            {Value("a,b,c"), Value(","), Value(2), huge},
+            Value("b,c")},
+           {"regexp_instr", {text, Value("b"), huge}, Value(0)},
+           {"regexp_extract", {text, Value("b"), Value(1), huge}, Value()},
+           {"repeat", {Value(""), huge}, Value("")}}) {
+    SCOPED_TRACE(call.name);
+    const auto ast = ExecuteFunction(call.name, call.args);
+    ASSERT_TRUE(ast.HasValue()) << ast.GetStatus();
+    EXPECT_EQ(ast.Value(), call.expected);
+    EXPECT_EQ(Evaluate(call.name, call.args),
+              std::make_optional(call.expected));
+  }
+  for (const char* name : {"repeat", "lpad", "rpad"}) {
+    SCOPED_TRACE(name);
+    const auto ast = ExecuteFunction(name, {text, huge});
+    ASSERT_FALSE(ast.HasValue());
+    EXPECT_NE(
+        ast.GetStatus().GetMessage().find("exceeds max allowed output size"),
+        std::string::npos);
+    EXPECT_FALSE(Evaluate(name, {text, huge}).has_value());
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, CivilFunctionsEvaluateOperandsOnce) {
+  // Interval nodes in this evaluator delegate to their virtual TryEvaluate.
+  // Use that hook to observe evaluation of arguments without clock or RNG
+  // dependencies.
+  struct CountedDate final : IntervalExpression {
+    CountedDate(Value value, int& evaluations)
+        : IntervalExpression(1, "DAY"),
+          date(std::move(value)),
+          calls(evaluations) {}
+    StatusOr<Value> TryEvaluate(const Row&, const Schema&) const override {
+      ++calls;
+      return date;
+    }
+    Value date;
+    int& calls;
+  };
+  const Row row;
+  const Schema schema;
+  const relational_detail::Scope scope{.row = &row, .schema = &schema};
+  int left_calls = 0;
+  int right_calls = 0;
+  auto left =
+      std::make_shared<CountedDate>(Value::Date("2026-01-10"), left_calls);
+  auto right =
+      std::make_shared<CountedDate>(Value::Date("2026-01-01"), right_calls);
+  const auto difference = relational_detail::TryEvaluate(
+      FunctionCallExp("date_diff", {left, right, ColumnValueExp("DAY")}), scope,
+      nullptr, *context_, {});
+  ASSERT_TRUE(difference.HasValue()) << difference.GetStatus();
+  EXPECT_EQ(difference.Value(), Value(9));
+  EXPECT_EQ(left_calls, 1);
+  EXPECT_EQ(right_calls, 1);
+
+  const auto bucket = relational_detail::TryEvaluate(
+      FunctionCallExp(
+          "date_bucket",
+          {left, std::make_shared<IntervalExpression>(7, "DAY"), right}),
+      scope, nullptr, *context_, {});
+  ASSERT_TRUE(bucket.HasValue()) << bucket.GetStatus();
+  EXPECT_EQ(bucket.Value(), Value::Date("2026-01-08"));
+  EXPECT_EQ(left_calls, 2);
+  EXPECT_EQ(right_calls, 2);
+}
+
 TEST_F(RelationalFunctionSweepTest, AuditArrayIndexesRejectNonIntegers) {
   const Value array = Arr({Value(10), Value(20)});
   for (const Value& index : {Value(1.0), Value("1"), Value::DateFromDays(1)}) {
@@ -1023,6 +1106,57 @@ TEST_F(RelationalFunctionSweepTest, AuditArrayIndexesRejectNonIntegers) {
     EXPECT_FALSE(Evaluate("array_slice", {array, index, Value(1)}).has_value());
     EXPECT_FALSE(Evaluate("array_slice", {array, Value(1), index}).has_value());
   }
+}
+
+TEST_F(RelationalFunctionSweepTest, BucketRejectsOverflowingWidth) {
+  const relational_detail::Scope scope{};
+  for (const auto& [amount, unit] :
+       std::vector<std::pair<int64_t, std::string>>{
+           {106752, "day"}, {15300, "week"}, {-106752, "day"}}) {
+    const auto expression =
+        FunctionCallExp("timestamp_bucket",
+                        {ConstantValueExp(Value("2020-01-01 00:00:00+00")),
+                         std::make_shared<IntervalExpression>(amount, unit)});
+    const auto result = relational_detail::TryEvaluate(expression, scope,
+                                                       nullptr, *context_, {});
+    EXPECT_FALSE(result.HasValue()) << unit;
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, ExplicitTemporalZonesAreAppliedOnce) {
+  struct Restore {
+    std::string zone = GetDefaultTimeZone();
+    ~Restore() { SetDefaultTimeZone(zone); }
+  } restore{};
+  SetDefaultTimeZone("-08:00");
+  const auto evaluate = [&](const char* name, std::vector<Expression> args,
+                            const char* expected) {
+    SCOPED_TRACE(name);
+    const relational_detail::Scope scope{};
+    const auto expr = FunctionCallExp(name, std::move(args));
+    ASSIGN_OR_ASSERT_FAIL(
+        Value, result,
+        relational_detail::TryEvaluate(expr, scope, nullptr, *context_, {}));
+    EXPECT_EQ(result, Value(expected));
+  };
+  for (const std::string marker : {"Z", " UTC", " GMT", " gmt", "+00"}) {
+    SCOPED_TRACE(marker);
+    const auto input = ConstantValueExp(Value("2021-01-01 03:30:45" + marker));
+    evaluate("timestamp", {input}, "2021-01-01 03:30:45+00");
+    evaluate("datetime", {input}, "2020-12-31 19:30:45");
+    evaluate("time", {input}, "19:30:45");
+    evaluate("timestamp_trunc", {input, ColumnValueExp("DAY")},
+             "2020-12-31 08:00:00+00");
+    evaluate("timestamp_bucket",
+             {input, std::make_shared<IntervalExpression>(1, "day"),
+              ConstantValueExp(Value("2021-01-01 00:00:00" + marker))},
+             "2021-01-01 00:00:00+00");
+  }
+  evaluate("time", {ConstantValueExp(Value("12:30:45+05:00"))}, "23:30:45");
+  evaluate("time", {ConstantValueExp(Value("12:30:45-05:00"))}, "09:30:45");
+  const auto offset = ConstantValueExp(Value("2021-01-01 12:30:45+05:00"));
+  evaluate("timestamp", {offset}, "2021-01-01 07:30:45+00");
+  evaluate("datetime", {offset}, "2020-12-31 23:30:45");
 }
 
 TEST_F(RelationalFunctionSweepTest, AuditTimestampArithmeticUsesAbsoluteTime) {
@@ -1076,15 +1210,14 @@ TEST_F(RelationalFunctionSweepTest, NamedZoneOffsetUsesHistoricalYear) {
   // year; clamping it to 1970 would wrongly answer PST (UTC-8) and shift the
   // rendered local time an hour earlier.
   const std::optional<Value> as_string =
-      Evaluate("string", {Value("1945-03-15 12:00:00+00"),
-                          Value("America/Los_Angeles")});
+      Evaluate("string",
+               {Value("1945-03-15 12:00:00+00"), Value("America/Los_Angeles")});
   ASSERT_TRUE(as_string.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
   EXPECT_EQ(*as_string, Value("1945-03-15 05:00:00-07"));
   const std::optional<Value> formatted =
       Evaluate("format_timestamp",
-               {Value("%Y-%m-%d %H:%M:%S"),
-                Value("1945-03-15 12:00:00+00"),
+               {Value("%Y-%m-%d %H:%M:%S"), Value("1945-03-15 12:00:00+00"),
                 Value("America/Los_Angeles")});
   ASSERT_TRUE(formatted.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
@@ -1113,7 +1246,8 @@ TEST_F(RelationalFunctionSweepTest, AuditJsonExtractionMatchesAst) {
       const auto actual = Evaluate(name, args);
       ASSERT_TRUE(expected.HasValue()) << name;
       ASSERT_TRUE(actual.has_value()) << name;
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+      // success
       EXPECT_EQ(*actual, expected.Value()) << name;
     }
   }

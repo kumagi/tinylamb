@@ -116,6 +116,12 @@ class CheckpointManager {
   size_t interval_seconds_;
   std::mutex checkpoint_mu_;
   std::mutex worker_wait_mu_;
+  // Serializes Start()/Stop() as a whole. Callback registration must happen
+  // outside worker_wait_mu_ (the compaction thread holds compaction_cb_mu_
+  // while calling into RequestCompaction), so a separate lock is needed to
+  // stop a concurrent Stop() from clearing a callback Start() just installed
+  // -- or Start() re-installing one Stop() just cleared.
+  std::mutex lifecycle_mu_;
   std::condition_variable worker_wait_cv_;
   // WAL retention warning support (`TINYLAMB_WAL_RETENTION_WARN_BYTES`).
   static uint64_t DefaultWalRetentionWarnBytes() noexcept;

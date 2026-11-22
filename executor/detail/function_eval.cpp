@@ -187,10 +187,15 @@ namespace {
 // across the string-function arms; give each distinct contract one home so
 // a fix lands everywhere at once.
 //
-// Strict variant: only INT64 converts; every other input yields `def`
-// (the historical SUBSTR/byte_substr position & length contract).
+// The strict variant accepts integer arguments. Unsigned indices exceeding
+// INT64_MAX saturate so they still behave as large positive lengths/positions.
 [[nodiscard]] int64_t ToInt64Exact(const Value& v, int64_t def) {
-  return v.type == ValueType::kInt64 ? v.value.int_value : def;
+  if (v.type != ValueType::kInt64) {
+    return def;
+  }
+  return v.IsUnsigned() ? SaturatingUnsignedToInt64(
+                              static_cast<uint64_t>(v.value.int_value))
+                        : v.value.int_value;
 }
 
 // Lenient variant: INT64 passes through, DOUBLE saturates, and canonical
@@ -198,7 +203,7 @@ namespace {
 // read as 2).
 [[nodiscard]] int64_t ToInt64WithText(const Value& v, int64_t def) {
   if (v.type == ValueType::kInt64) {
-    return v.value.int_value;
+    return ToInt64Exact(v, def);
   }
   if (v.type == ValueType::kDouble) {
     return SaturatingDoubleToInt64(v.value.double_value);
@@ -492,6 +497,30 @@ std::string FormatTimeZoneOffset(int tz_offset_sec) {
   return {buf.data()};
 }
 
+void ExpandNumericTimeZone(std::string& format, int offset_seconds) {
+  const int magnitude = std::abs(offset_seconds);
+  const char sign = offset_seconds < 0 ? '-' : '+';
+  for (size_t i = format.find('%');
+       i != std::string::npos && i + 1 < format.size();
+       i = format.find('%', i + 1)) {
+    const char spec = format[i + 1];
+    if (spec == '%') {
+      ++i;
+      continue;
+    }
+    const bool modified = (spec == 'E' || spec == 'O') &&
+                          i + 2 < format.size() && format[i + 2] == 'z';
+    if (spec != 'z' && !modified) {
+      continue;
+    }
+    std::array<char, 16> offset{};
+    (void)snprintf(offset.data(), offset.size(), "%c%02d%s%02d", sign,
+                   magnitude / 3600, spec == 'E' ? ":" : "",
+                   (magnitude / 60) % 60);
+    format.replace(i, modified ? 3 : 2, offset.data());
+  }
+}
+
 // True when `fmt` can only produce empty output through platform::FormatTime:
 // the format is empty or consists solely of zone-name directives
 // (%Z/%EZ/%OZ), which expand to nothing for the zone-less struct tm these
@@ -521,28 +550,50 @@ bool FormatTimeYieldsEmpty(std::string_view fmt) {
   return true;
 }
 
-// An explicit zone suffix on TIMESTAMP text fixes one instant. Render that
-// instant in UTC, mirroring the AST evaluator's TryValueToCivilTime:
-// ParseCivilTime stops at the suffix and leaves `ct` as the zoned wall time,
-// so the offset must be removed here. Zone-less text is already civil time.
+// Skip the two date separators before looking for a numeric UTC offset.
+std::string_view ExplicitZoneSuffix(std::string_view text) {
+  while (!text.empty() &&
+         (std::isspace(static_cast<unsigned char>(text.front())) != 0)) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() &&
+         (std::isspace(static_cast<unsigned char>(text.back())) != 0)) {
+    text.remove_suffix(1);
+  }
+  const size_t first_delimiter = text.find_first_of("-:");
+  if (first_delimiter == std::string_view::npos) {
+    return {};
+  }
+  size_t search_from = first_delimiter + 1;
+  if (text[first_delimiter] == '-') {
+    const size_t month_end = text.find('-', search_from);
+    if (month_end == std::string_view::npos) {
+      return {};
+    }
+    search_from = month_end + 1;
+  }
+  const size_t offset = text.find_first_of("+-", search_from);
+  if (offset != std::string_view::npos) {
+    return text.substr(offset);
+  }
+  for (std::string_view suffix : {" UTC", " utc", " GMT", " gmt", "Z", "z"}) {
+    if (text.ends_with(suffix)) {
+      return text.substr(text.size() - suffix.size() +
+                         (suffix.front() == ' ' ? 1 : 0));
+    }
+  }
+  return {};
+}
+
+// ParseCivilTime reads the wall time. Removing its explicit offset yields UTC.
 StatusOr<CivilTime> ExplicitZoneTextToUtcCivil(std::string_view text,
                                                CivilTime ct) {
-  // Time-only spellings place the zone marker at index 8, not 10.
-  if (text.size() <= 8) {
+  const std::string_view zone = ExplicitZoneSuffix(text);
+  if (zone.empty()) {
     return ct;
   }
-  for (size_t i = 8; i < text.size(); ++i) {
-    if ((text[i] != '+' && text[i] != '-') || i + 1 >= text.size() ||
-        std::isdigit(static_cast<unsigned char>(text[i + 1])) == 0) {
-      continue;
-    }
-    ASSIGN_OR_RETURN(int, offset, (ParseTimeZoneOffset(text.substr(i), &ct)));
-    // Whole-second shift: historical LMT offsets carry seconds that an
-    // hour/minute decomposition would silently drop. Same reading the AST
-    // evaluator applies (ShiftCivilTimeSeconds(ct, -offset)).
-    return ShiftCivilTimeSeconds(ct, -int64_t{offset});
-  }
-  return ct;
+  ASSIGN_OR_RETURN(int, offset, (ParseTimeZoneOffset(zone, &ct)));
+  return ShiftCivilTimeSeconds(ct, -int64_t{offset});
 }
 
 StatusOr<CivilTime> TryValueToCivilTime(const Value& val) {
@@ -609,36 +660,16 @@ CivilTime NanosToCivilTime(platform::Int128 nanos) {
   return ct;
 }
 
-// Timestamp text that carries an explicit zone ("+HH[:MM]", "-HH", "Z", the
-// canonical "+00" suffix) names one instant; re-express that instant as
-// civil time in the session default zone (UTC unless overridden). Zone-less
-// text is already civil time and is returned unchanged. `ct` is the civil
-// time ParseCivilTime read from `text` (it ignores the zone suffix).
+// TryValueToCivilTime has already converted explicitly zoned text to UTC.
 StatusOr<CivilTime> ExplicitZoneTextToDefaultCivil(std::string_view text,
-                                                   CivilTime ct) {
-  if (text.size() <= 10) {
-    return ct;
+                                                   CivilTime utc_ct) {
+  if (ExplicitZoneSuffix(text).empty()) {
+    return utc_ct;
   }
-  const size_t tz_pos = text.find_first_of("+-", 11);
-  const bool zulu = text.back() == 'Z' || text.back() == 'z' ||
-                    text.ends_with(" UTC") || text.ends_with(" utc");
-  if (tz_pos == std::string_view::npos && !zulu) {
-    return ct;
-  }
-  int explicit_sec = 0;
-  if (tz_pos != std::string_view::npos) {
-    ASSIGN_OR_RETURN(int, parsed,
-                     (ParseTimeZoneOffset(text.substr(tz_pos), &ct)));
-    explicit_sec = parsed;
-  }
-  const platform::Int128 utc_ns =
-      CivilTimeToNanos(ct) -
-      (static_cast<platform::Int128>(explicit_sec) * 1000000000);
-  const CivilTime utc_ct = NanosToCivilTime(utc_ns);
   ASSIGN_OR_RETURN(int, default_sec,
-                   (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct)));
-  return NanosToCivilTime(
-      utc_ns + (static_cast<platform::Int128>(default_sec) * 1000000000));
+                   (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct,
+                                        /*at_utc=*/true)));
+  return ShiftCivilTimeSeconds(utc_ct, default_sec);
 }
 
 std::string FormatCivilTime(const CivilTime& ct, bool include_subsecond = true,
@@ -1317,11 +1348,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   const bool truncates_civil_time =
       name_view == "date_trunc" || name_view == "datetime_trunc" ||
       name_view == "timestamp_trunc" || name_view == "last_day";
+  const bool diffs_civil_time = name_view == "date_diff" ||
+                                name_view == "datetime_diff" ||
+                                name_view == "timestamp_diff";
   for (const Expression& argument : call.Args()) {
-    // The second operand is a date-part token, not a row reference. Looking
-    // up MINUTE in a wide row can otherwise synthesize a whole-row STRUCT
-    // which the truncation branch immediately discards in favor of its name.
-    if (truncates_civil_time && arguments.size() == 1 &&
+    // Convert date-part identifiers to their literal names before evaluation.
+    if (((truncates_civil_time && arguments.size() == 1) ||
+         (diffs_civil_time && arguments.size() == 2)) &&
         argument->Type() == TypeTag::kColumnValue) {
       arguments.emplace_back(
           std::string(argument->AsColumnValue().GetColumnName().name));
@@ -1925,27 +1958,19 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                            // checked.
                       s.c_str(), "%d-%d-%d", &Y, &M, &D);
         if (fields >= (s.size() > 10 ? 5 : 3)) {
-          int tz_offset_sec = 0;
-          bool has_tz = false;
           const CivilTime ct_parsed{.year = Y,
                                     .month = M,
                                     .day = D,
                                     .hour = h,
                                     .minute = m,
                                     .second = static_cast<int>(sec)};
-          size_t tz_pos = s.find_first_of("+-", 10);
-          if (tz_pos != std::string::npos) {
-            // The canonical parser validates digits and ranges; the old
-            // sscanf fallback turned malformed offsets ('+abc', '+99:99')
-            // into a silent +00:00.
-            ASSIGN_OR_RETURN(
-                int, parsed_tz,
-                (ParseTimeZoneOffset(std::string_view(s).substr(tz_pos),
-                                     &ct_parsed)));
+          const std::string_view zone = ExplicitZoneSuffix(s);
+          const bool has_tz = !zone.empty();
+          int tz_offset_sec = 0;
+          if (has_tz) {
+            ASSIGN_OR_RETURN(int, parsed_tz,
+                             (ParseTimeZoneOffset(zone, &ct_parsed)));
             tz_offset_sec = parsed_tz;
-            has_tz = true;
-          } else if (s.ends_with('Z') || s.ends_with('z')) {
-            has_tz = true;
           }
           if (arguments.size() == 2) {
             std::string tz2 = raw_str(arguments[1]);
@@ -2093,49 +2118,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
-    std::string tz_str =
-        (arguments.size() == 2) ? raw_str(arguments[1]) : GetDefaultTimeZone();
-    ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
-    // An explicit zone inside the timestamp text (" UTC", "Z", "+HH:MM")
-    // fixes the instant; the session default must not shift it again.
-    if (arguments[0].type == ValueType::kVarChar) {
-      const std::string_view text = arguments[0].value.varchar_value;
-      if (text.size() > 10) {
-        bool has_explicit_zone = false;
-        int explicit_sec = 0;
-        for (size_t i = 10; i < text.size(); ++i) {
-          if ((text[i] == '+' || text[i] == '-') &&
-              std::isdigit(static_cast<unsigned char>(
-                  i + 1 < text.size() ? text[i + 1] : '0')) != 0) {
-            has_explicit_zone = true;
-            {
-              ASSIGN_OR_RETURN(int, parsed_offset,
-                               (ParseTimeZoneOffset(text.substr(i), &ct)));
-              explicit_sec = parsed_offset;
-            }
-            break;
-          }
-        }
-        if (!has_explicit_zone) {
-          for (const std::string_view marker :
-               {" UTC", " utc", " GMT", " gmt", "Z", "z"}) {
-            if (text.size() > marker.size() &&
-                text.substr(text.size() - marker.size()) == marker) {
-              has_explicit_zone = true;
-              explicit_sec = 0;
-              break;
-            }
-          }
-        }
-        if (has_explicit_zone) {
-          tz_offset_sec = explicit_sec;
-        }
+    const bool has_explicit_zone =
+        arguments[0].type == ValueType::kVarChar &&
+        !ExplicitZoneSuffix(arguments[0].value.varchar_value).empty();
+    CivilTime utc_ct = ct;
+    if (!has_explicit_zone || arguments.size() == 2) {
+      const std::string tz_str = (arguments.size() == 2) ? raw_str(arguments[1])
+                                                         : GetDefaultTimeZone();
+      ASSIGN_OR_RETURN(int, offset, (ParseTimeZoneOffset(tz_str, &ct)));
+      if (!has_explicit_zone) {
+        utc_ct = ShiftCivilTimeSeconds(ct, -int64_t{offset});
       }
     }
-    platform::Int128 ns =
-        CivilTimeToNanos(ct) -
-        (static_cast<platform::Int128>(tz_offset_sec) * 1000000000);
-    CivilTime utc_ct = NanosToCivilTime(ns);
     if (utc_ct.year < 1 || utc_ct.year > 9999) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TIMESTAMP result is outside the valid year range");
@@ -2154,29 +2148,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       std::string s = raw_str(arguments[0]);
       CivilTime ct;
       if (ParseCivilTime(s, &ct)) {
-        size_t tz_pos = s.find_first_of("+-", 11);
-        if (tz_pos != std::string::npos || s.find('Z') != std::string::npos ||
-            s.find('z') != std::string::npos) {
-          int tz_offset_sec = 0;
-          if (tz_pos != std::string::npos) {
-            {
-              ASSIGN_OR_RETURN(int, parsed_offset,
-                               (ParseTimeZoneOffset(s.substr(tz_pos), &ct)));
-              tz_offset_sec = parsed_offset;
-            }
-          }
-          // TIME(timestamp) == TIME(timestamp, <session default zone>).
-          const platform::Int128 utc_ns =
-              CivilTimeToNanos(ct) -
-              (static_cast<platform::Int128>(tz_offset_sec) * 1000000000);
-          const CivilTime utc_ct = NanosToCivilTime(utc_ns);
-          ASSIGN_OR_RETURN(
-              int, default_sec,
-              (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct)));
-          ct = NanosToCivilTime(
-              utc_ns +
-              (static_cast<platform::Int128>(default_sec) * 1000000000));
-        }
+        ASSIGN_OR_RETURN(CivilTime, utc_ct,
+                         (ExplicitZoneTextToUtcCivil(s, ct)));
+        ASSIGN_OR_RETURN(CivilTime, local_ct,
+                         (ExplicitZoneTextToDefaultCivil(s, utc_ct)));
+        ct = local_ct;
         std::array<char, 64> buf{};
         if (ct.subsecond_nanos != 0) {
           if (ct.subsecond_nanos % 1000000 == 0) {
@@ -2887,33 +2863,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        "get_field requires a STRUCT");
   }
-  if (name_view == "date_diff" || name_view == "datetime_diff" ||
-      name_view == "timestamp_diff") {
-    if (call.Args().size() != 3) {
+  if (diffs_civil_time) {
+    if (arguments.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 3 arguments");
     }
-    ASSIGN_OR_RETURN(
-        Value, d1,
-        (TryEvaluate(call.Args()[0], scope, aggregates, context, ctes)));
-    ASSIGN_OR_RETURN(
-        Value, d2,
-        (TryEvaluate(call.Args()[1], scope, aggregates, context, ctes)));
+    const Value& d1 = arguments[0];
+    const Value& d2 = arguments[1];
     if (d1.IsNull() || d2.IsNull()) {
       return Value();
     }
-    std::string unit = "day";
-    if (call.Args()[2]->Type() == TypeTag::kColumnValue) {
-      unit = to_lower(call.Args()[2]->AsColumnValue().GetColumnName().name);
-    } else {
-      ASSIGN_OR_RETURN(
-          Value, uval,
-          (TryEvaluate(call.Args()[2], scope, aggregates, context, ctes)));
-
-      if (!uval.IsNull()) {
-        unit = to_lower(raw_str(uval));
-      }
-    }
+    const std::string unit =
+        arguments[2].IsNull() ? "day" : to_lower(raw_str(arguments[2]));
     ASSIGN_OR_RETURN(CivilTime, parsed1, (TryValueToCivilTime(d1)));
     ASSIGN_OR_RETURN(CivilTime, parsed2, (TryValueToCivilTime(d2)));
     // Zoned (TIMESTAMP) operands are compared as civil time in the session
@@ -3094,18 +3055,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         unit = to_lower(raw_str(uval));
       }
     }
-    std::string s_orig = raw_str(d);
-    bool has_explicit_tz = (s_orig.find('+') != std::string::npos ||
-                            s_orig.find('Z') != std::string::npos ||
-                            s_orig.find('z') != std::string::npos);
-    if (!has_explicit_tz) {
-      for (size_t i = 10; i < s_orig.size(); ++i) {
-        if (s_orig[i] == '+' || s_orig[i] == '-') {
-          has_explicit_tz = true;
-          break;
-        }
-      }
-    }
+    const bool has_explicit_tz = !ExplicitZoneSuffix(raw_str(d)).empty();
     bool is_timestamp = (name_view == "timestamp_trunc" || has_explicit_tz);
     std::string trunc_tz = GetDefaultTimeZone();
     if (call.Args().size() == 3) {
@@ -3344,7 +3294,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     tm.tm_sec = ct.second;
     platform::TimeGm(&tm);
     std::array<char, 128> buf{};
-    // %z/%Z render from the struct (UTC here), never the host's zone.
+    // The civil fields are already shifted into the requested zone. Supply
+    // its numeric offset explicitly because TimeGm calibrated the tm in UTC.
+    ExpandNumericTimeZone(fmt, tz_offset_sec);
     const size_t formatted =
         platform::FormatTime(buf.data(), buf.size(), fmt.c_str(), &tm);
     // strftime's 0 means both "expansion failed" and "legitimately empty
@@ -3447,29 +3399,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   }
   if (name_view == "date_bucket" || name_view == "timestamp_bucket" ||
       name_view == "datetime_bucket") {
-    if (call.Args().size() < 2 || call.Args().size() > 3) {
+    if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " takes 2 or 3 arguments");
     }
-    ASSIGN_OR_RETURN(
-        Value, d,
-        (TryEvaluate(call.Args()[0], scope, aggregates, context, ctes)));
+    const Value& d = arguments[0];
     if (d.IsNull()) {
       return Value();
     }
     ASSIGN_OR_RETURN(CivilTime, d_ct, (TryValueToCivilTime(d)));
-    std::string d_s = raw_str(d);
-    bool d_has_tz = (d_s.find('+') != std::string::npos ||
-                     d_s.find('Z') != std::string::npos ||
-                     d_s.find('z') != std::string::npos);
-    if (!d_has_tz) {
-      for (size_t i = 10; i < d_s.size(); ++i) {
-        if (d_s[i] == '+' || d_s[i] == '-') {
-          d_has_tz = true;
-          break;
-        }
-      }
-    }
+    const bool d_has_tz = !ExplicitZoneSuffix(raw_str(d)).empty();
     bool is_ts = (name_view == "timestamp_bucket" || d_has_tz);
 
     CivilTime orig_ct{.year = 1970,
@@ -3481,28 +3420,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                       .subsecond_nanos = 0};
     bool has_origin = false;
     bool orig_has_tz = false;
-    if (call.Args().size() == 3) {
-      ASSIGN_OR_RETURN(
-          Value, orig,
-          (TryEvaluate(call.Args()[2], scope, aggregates, context, ctes)));
-
+    if (arguments.size() == 3) {
+      const Value& orig = arguments[2];
       if (orig.IsNull()) {
         return Value();
       }
       ASSIGN_OR_RETURN(CivilTime, orig_ct_next, (TryValueToCivilTime(orig)));
       orig_ct = orig_ct_next;
-      std::string orig_s = raw_str(orig);
-      orig_has_tz = (orig_s.find('+') != std::string::npos ||
-                     orig_s.find('Z') != std::string::npos ||
-                     orig_s.find('z') != std::string::npos);
-      if (!orig_has_tz) {
-        for (size_t i = 10; i < orig_s.size(); ++i) {
-          if (orig_s[i] == '+' || orig_s[i] == '-') {
-            orig_has_tz = true;
-            break;
-          }
-        }
-      }
+      orig_has_tz = !ExplicitZoneSuffix(raw_str(orig)).empty();
       if (orig_has_tz) {
         is_ts = true;
       }
@@ -3577,28 +3502,55 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
       int64_t step_ns = 0;
       if (is_fractional_second) {
-        step_ns = static_cast<int64_t>(std::round(sec_amount * 1000000000.0));
+        const double rounded = std::round(sec_amount * 1000000000.0);
+        // The upper bound is exclusive: double(INT64_MAX) rounds to 2^63.
+        if (!std::isfinite(rounded) || rounded < -0x1p63 || rounded >= 0x1p63) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
+        step_ns = static_cast<int64_t>(rounded);
       } else if (unit == "nanosecond" || unit == "nanoseconds") {
         step_ns = amount;
       } else if (unit == "microsecond" || unit == "microseconds") {
-        step_ns = amount * 1000LL;
+        if (__builtin_mul_overflow(amount, 1000LL, &step_ns)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
       } else if (unit == "millisecond" || unit == "milliseconds") {
-        step_ns = amount * 1000000LL;
+        if (__builtin_mul_overflow(amount, 1000000LL, &step_ns)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
       } else if (unit == "second" || unit == "seconds") {
-        step_ns = amount * 1000000000LL;
+        if (__builtin_mul_overflow(amount, 1000000000LL, &step_ns)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
       } else if (unit == "minute" || unit == "minutes") {
-        step_ns = amount * 60LL * 1000000000LL;
+        if (__builtin_mul_overflow(amount, 60000000000LL, &step_ns)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
       } else if (unit == "hour" || unit == "hours") {
-        step_ns = amount * 3600LL * 1000000000LL;
+        if (__builtin_mul_overflow(amount, 3600000000000LL, &step_ns)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
       } else if (unit == "day" || unit == "days") {
-        step_ns = amount * 86400LL * 1000000000LL;
+        if (__builtin_mul_overflow(amount, 86400000000000LL, &step_ns)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
         if (!has_origin && amount % 7 == 0) {
           orig_ct.year = 1970;
           orig_ct.month = 1;
           orig_ct.day = 4;  // Sunday
         }
       } else if (unit == "week" || unit == "weeks") {
-        step_ns = amount * 7LL * 86400LL * 1000000000LL;
+        if (__builtin_mul_overflow(amount, 604800000000000LL, &step_ns)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": interval width out of range");
+        }
         if (!has_origin) {
           orig_ct.year = 1970;
           orig_ct.month = 1;
@@ -3610,6 +3562,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             "unsupported interval unit in " + name + ": " + unit);
       }
 
+      if (step_ns == 0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           name + ": interval must not be zero");
+      }
       platform::Int128 d_ns = CivilTimeToNanos(d_ct);
       if (is_ts && !d_has_tz) {
         ASSIGN_OR_RETURN(int, tz_sec,
@@ -3682,9 +3638,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             "Failed to parse input string " + Value(std::move(val)).AsString());
       }
       const int w = 10 * (val[0] - '0') + (val[1] - '0');
-      const int y = val.size() == 3
-                        ? val[2] - '0'
-                        : 10 * (val[2] - '0') + (val[3] - '0');
+      const int y =
+          val.size() == 3 ? val[2] - '0' : 10 * (val[2] - '0') + (val[3] - '0');
       if (w > 53) {
         return StatusError(StatusCode::kIsInfinity,
                            "week out of range in PARSE_DATE: " + val);
@@ -4301,11 +4256,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string target = raw_str(arguments[1]);
     auto to_i64 = [](const Value& v) -> StatusOr<int64_t> {
       if (v.type != ValueType::kInt64) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "REGEXP_EXTRACT position and occurrence require "
-                           "INT64 arguments");
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "INSTR position and occurrence require INT64 arguments");
       }
-      return v.value.int_value;
+      return ToInt64Exact(v, 1);
     };
     int64_t position = 1;
     if (arguments.size() >= 3) {
@@ -4943,7 +4898,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const Value& arr = arguments[0];
     if (arr.type != ValueType::kArray) {
-      return Value();
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CODE_POINTS_TO_STRING requires an ARRAY<INT64>");
     }
     std::string res;
     res.reserve(arr.ArrayElements().size());
@@ -5001,7 +4957,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const Value& arr = arguments[0];
     if (arr.type != ValueType::kArray) {
-      return Value();
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CODE_POINTS_TO_BYTES requires an ARRAY<INT64>");
     }
     std::string res;
     res.reserve(arr.ArrayElements().size());
@@ -5296,8 +5253,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       start_idx = 0;
     }
 
-    int64_t end_idx =
-        std::min(start_idx + len, static_cast<int64_t>(parts.size()));
+    const int64_t remaining = static_cast<int64_t>(parts.size()) - start_idx;
+    const int64_t end_idx = start_idx + std::min(len, remaining);
     std::string res = parts[static_cast<size_t>(start_idx)];
     size_t res_bytes = res.size();
     for (int64_t i = start_idx + 1; i < end_idx; ++i) {
@@ -5660,7 +5617,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return StatusError(StatusCode::kInvalidArgument,
                            name + " digits must be an integer");
       }
-      digits = arguments[1].value.int_value;
+      digits = arguments[1].IsUnsigned() && arguments[1].value.int_value < 0
+                   ? std::numeric_limits<int64_t>::max()
+                   : arguments[1].value.int_value;
     }
     // INT64 input: truncation never needs a double round-trip (see ROUND).
     if (arguments[0].type == ValueType::kInt64) {
@@ -6756,7 +6715,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       const auto& elements = arr.ArrayElements();
       merged.insert(merged.end(), elements.begin(), elements.end());
     }
-    return Value::Array(std::move(merged), element_type);
+    return Value::Array(std::move(merged), std::move(element_type));
   }
 
   if (name_view == "array_first" || name_view == "array_last") {
@@ -7547,16 +7506,6 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(static_cast<int64_t>(bits)).WithUnsigned();
   }
 
-  if (name_view == "error") {
-    if (arguments.size() != 1) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "ERROR requires 1 argument");
-    }
-    return StatusError(
-        StatusCode::kInvalidArgument,
-        arguments[0].IsNull() ? "ERROR()" : raw_str(arguments[0]));
-  }
-
   if (name_view == "array_reverse") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -7573,128 +7522,6 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     std::vector<Value> reversed(array.ArrayElements().rbegin(),
                                 array.ArrayElements().rend());
     return Value::Array(std::move(reversed), array.ArrayElementSqlType());
-  }
-
-  if (name_view == "array_is_distinct") {
-    if (arguments.size() != 1) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "ARRAY_IS_DISTINCT requires 1 argument");
-    }
-    const Value& array = arguments[0];
-    if (array.IsNull()) {
-      return Value();
-    }
-    if (!array.IsArray()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "ARRAY_IS_DISTINCT requires an array");
-    }
-    const auto& elements = array.ArrayElements();
-    bool saw_null = false;
-    for (size_t i = 0; i < elements.size(); ++i) {
-      if (elements[i].IsNull()) {
-        if (saw_null) {
-          return Value(int64_t{0});
-        }
-        saw_null = true;
-        continue;
-      }
-      for (size_t j = 0; j < i; ++j) {
-        if (elements[j].IsNull()) {
-          continue;
-        }
-        // ARRAY equality (Value::EqualsSlow) folds every NaN into one peer
-        // while TryBinary's IEEE '=' does not; match it so a NaN pair is
-        // not reported distinct.
-        if (elements[j].type == ValueType::kDouble &&
-            elements[i].type == ValueType::kDouble &&
-            std::isnan(elements[j].value.double_value) &&
-            std::isnan(elements[i].value.double_value)) {
-          return Value(int64_t{0});
-        }
-        StatusOr<Value> eq =
-            TryBinary(BinaryOperation::kEquals, elements[j], elements[i]);
-        if (eq.HasValue() && eq.Value().Truthy()) {
-          return Value(int64_t{0});
-        }
-      }
-    }
-    return Value(int64_t{1});
-  }
-
-  if (name_view == "array_first" || name_view == "array_last") {
-    if (arguments.size() != 1) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         name + " requires 1 argument");
-    }
-    const Value& array = arguments[0];
-    if (array.IsNull()) {
-      return Value();
-    }
-    if (!array.IsArray()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         name + " requires an ARRAY argument");
-    }
-    if (array.ArrayElements().empty()) {
-      return StatusError(
-          StatusCode::kInvalidArgument,
-          name_view == "array_first"
-              ? "ARRAY_FIRST cannot get the first element of an empty array"
-              : "ARRAY_LAST cannot get the last element of an empty array");
-    }
-    if (name_view == "array_first") {
-      return array.ArrayElements().front();
-    }
-    return array.ArrayElements().back();
-  }
-
-  if (name_view == "array_slice") {
-    if (arguments.size() < 2 || arguments.size() > 3) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "ARRAY_SLICE requires 2 or 3 arguments");
-    }
-    const Value& array = arguments[0];
-    if (array.IsNull()) {
-      return Value();
-    }
-    if (!array.IsArray()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "ARRAY_SLICE requires an array");
-    }
-    auto as_index = [&](const Value& v) -> StatusOr<int64_t> {
-      if (v.IsNull() ||
-          (v.type != ValueType::kInt64 && v.type != ValueType::kDouble)) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "ARRAY_SLICE offsets must be integers");
-      }
-      return v.type == ValueType::kInt64
-                 ? v.value.int_value
-                 : static_cast<int64_t>(v.value.double_value);
-    };
-    const auto& elements = array.ArrayElements();
-    const auto n = static_cast<int64_t>(elements.size());
-    ASSIGN_OR_RETURN(int64_t, start_raw, (as_index(arguments[1])));
-    ASSIGN_OR_RETURN(int64_t, end_raw,
-                     (arguments.size() == 3 ? as_index(arguments[2])
-                                            : StatusOr<int64_t>(n)));
-    const auto slice_normalize = [n](int64_t offset) -> int64_t {
-      if (offset < 0) {
-        offset += n;
-      }
-      if (offset < 0) {
-        return 0;
-      }
-      if (offset > n) {
-        return n;
-      }
-      return offset;
-    };
-    int64_t start = slice_normalize(start_raw);
-    int64_t end = slice_normalize(end_raw);
-    start = std::min(start, end);
-    std::vector<Value> sliced(
-        elements.begin() + static_cast<std::ptrdiff_t>(start),
-        elements.begin() + static_cast<std::ptrdiff_t>(end));
-    return Value::Array(std::move(sliced), array.ArrayElementSqlType());
   }
 
   if (name_view == "euclidean_distance") {

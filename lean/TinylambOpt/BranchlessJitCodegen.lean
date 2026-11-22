@@ -683,7 +683,7 @@ def runPredicated {Row : Type} (prog : Array (DagInst Row)) (depths : Nat → Na
   let mergedEnd         := mergeIncoming prog.size (depths prog.size) finalEdges
   (err, mergedEnd.stk)
 
-/-- ✅ **主定理 3 (`if_conversion_sound_and_complete`)**:
+/-- ✅ **主定理 3-A (`if_conversion_sound_and_complete`)**:
     静的スタック深さ検査を通過した **任意の前方分岐 Bytecode プログラム `prog`**（`AND / OR / CASE / COALESCE / IN` の
     あらゆる入れ子を含む！）に対して、ループ内分岐ゼロの `runPredicated` は逐次短絡 VM `runSeqFrom` と：
     1. エラー発生時は **必ず `err = true` を返す（エラー見逃しゼロ）**

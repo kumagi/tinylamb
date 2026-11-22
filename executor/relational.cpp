@@ -33,6 +33,7 @@
 #include "common/parallel_work.hpp"
 #include "common/platform/int128_conversion.hpp"
 #include "common/query_parallelism.hpp"
+#include "common/runtime_filter.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
@@ -549,10 +550,10 @@ inline uint64_t MixSetHash(uint64_t h) noexcept {
   return h == 0 ? 1 : h;
 }
 
-void DistinctResidentRows(Relation& relation) {
+Status DistinctResidentRows(Relation& relation) {
   const size_t n = relation.rows.size();
   if (n <= 1) {
-    return;
+    return Status::kSuccess;
   }
   const size_t workers = n >= 16384 ? ParallelWorkerCount(n / 16384) : 1;
   if (workers <= 1) {
@@ -581,11 +582,11 @@ void DistinctResidentRows(Relation& relation) {
       ++output;
     }
     relation.rows.resize(output);
-    return;
+    return Status::kSuccess;
   }
 
   struct HashedRowRef {
-    uint32_t row;
+    size_t row;
     uint64_t hash;
   };
   const size_t partitions =
@@ -603,12 +604,10 @@ void DistinctResidentRows(Relation& relation) {
     for (size_t i = begin; i < end; ++i) {
       const uint64_t h = MixSetHash(std::hash<Row>{}(relation.rows[i]));
       buckets[base + ((h >> 32) & p_mask)].push_back(
-          HashedRowRef{.row = static_cast<uint32_t>(i), .hash = h});
+          HashedRowRef{.row = i, .hash = h});
     }
   });
-  if (!part_st.ok()) {
-    return;
-  }
+  RETURN_IF_FAIL(part_st);
 
   std::vector<uint8_t> keep(n, 0);
   std::atomic<size_t> next_p{0};
@@ -626,18 +625,18 @@ void DistinctResidentRows(Relation& relation) {
       }
       const size_t cap = std::bit_ceil(std::max<size_t>(8, total * 2));
       const size_t s_mask = cap - 1;
-      slots.assign(cap, HashedRowRef{.row = UINT32_MAX, .hash = 0});
+      slots.assign(cap, HashedRowRef{.row = SIZE_MAX, .hash = 0});
       for (size_t w = 0; w < workers; ++w) {
         for (const HashedRowRef& item : buckets[(w * partitions) + p]) {
           size_t pos = item.hash & s_mask;
-          while (slots[pos].row != UINT32_MAX) {
+          while (slots[pos].row != SIZE_MAX) {
             if (slots[pos].hash == item.hash &&
                 eq(relation.rows[slots[pos].row], relation.rows[item.row])) {
               break;
             }
             pos = (pos + 1) & s_mask;
           }
-          if (slots[pos].row == UINT32_MAX) {
+          if (slots[pos].row == SIZE_MAX) {
             slots[pos] = item;
             keep[item.row] = 1;
           }
@@ -645,9 +644,7 @@ void DistinctResidentRows(Relation& relation) {
       }
     }
   });
-  if (!dedup_st.ok()) {
-    return;
-  }
+  RETURN_IF_FAIL(dedup_st);
   size_t output = 0;
   for (size_t i = 0; i < n; ++i) {
     if (keep[i] == 0) {
@@ -659,12 +656,13 @@ void DistinctResidentRows(Relation& relation) {
     ++output;
   }
   relation.rows.resize(output);
+  return Status::kSuccess;
 }
 
 // Keep hash keys in their original relations until all membership and
 // multiplicity decisions are complete; moving a row earlier invalidates keys.
-void ReduceResidentRows(Relation& left, const Relation& right,
-                        SetOperationKind operation) {
+Status ReduceResidentRows(Relation& left, const Relation& right,
+                          SetOperationKind operation) {
   const bool all = operation == SetOperationKind::kIntersectAll ||
                    operation == SetOperationKind::kExceptAll;
   const bool intersection = operation == SetOperationKind::kIntersect ||
@@ -672,15 +670,15 @@ void ReduceResidentRows(Relation& left, const Relation& right,
   const size_t nl = left.rows.size();
   const size_t nr = right.rows.size();
   if (nl == 0) {
-    return;
+    return Status::kSuccess;
   }
   if (nr == 0) {
     if (intersection) {
       left.rows.clear();
     } else if (!all) {
-      DistinctResidentRows(left);
+      RETURN_IF_FAIL(DistinctResidentRows(left));
     }
-    return;
+    return Status::kSuccess;
   }
   const size_t workers =
       (nl + nr) >= 16384 ? ParallelWorkerCount((nl + nr) / 16384) : 1;
@@ -726,15 +724,15 @@ void ReduceResidentRows(Relation& left, const Relation& right,
       }
     }
     left.rows.resize(output);
-    return;
+    return Status::kSuccess;
   }
 
   struct HashedRowRef {
-    uint32_t row;
+    size_t row;
     uint64_t hash;
   };
   struct RightSlot {
-    uint32_t row{UINT32_MAX};
+    size_t row{SIZE_MAX};
     uint64_t hash{0};
     size_t count{0};
     uint8_t emitted{0};
@@ -753,17 +751,15 @@ void ReduceResidentRows(Relation& left, const Relation& right,
     for (size_t i = r_begin; i < r_end; ++i) {
       const uint64_t h = MixSetHash(std::hash<Row>{}(right.rows[i]));
       right_buckets[base + ((h >> 32) & p_mask)].push_back(
-          HashedRowRef{.row = static_cast<uint32_t>(i), .hash = h});
+          HashedRowRef{.row = i, .hash = h});
     }
     for (size_t i = l_begin; i < l_end; ++i) {
       const uint64_t h = MixSetHash(std::hash<Row>{}(left.rows[i]));
       left_buckets[base + ((h >> 32) & p_mask)].push_back(
-          HashedRowRef{.row = static_cast<uint32_t>(i), .hash = h});
+          HashedRowRef{.row = i, .hash = h});
     }
   });
-  if (!part_st.ok()) {
-    return;
-  }
+  RETURN_IF_FAIL(part_st);
 
   std::vector<uint8_t> keep(nl, 0);
   std::atomic<size_t> next_p{0};
@@ -800,14 +796,14 @@ void ReduceResidentRows(Relation& left, const Relation& right,
         for (size_t w = 0; w < workers; ++w) {
           for (const HashedRowRef& item : left_buckets[(w * partitions) + p]) {
             size_t pos = item.hash & s_mask;
-            while (slots[pos].row != UINT32_MAX) {
+            while (slots[pos].row != SIZE_MAX) {
               if (slots[pos].hash == item.hash &&
                   eq(left.rows[slots[pos].row], left.rows[item.row])) {
                 break;
               }
               pos = (pos + 1) & s_mask;
             }
-            if (slots[pos].row == UINT32_MAX) {
+            if (slots[pos].row == SIZE_MAX) {
               slots[pos] = RightSlot{
                   .row = item.row, .hash = item.hash, .count = 0, .emitted = 1};
               keep[item.row] = 1;
@@ -824,7 +820,7 @@ void ReduceResidentRows(Relation& left, const Relation& right,
       for (size_t w = 0; w < workers; ++w) {
         for (const HashedRowRef& item : right_buckets[(w * partitions) + p]) {
           size_t pos = item.hash & s_mask;
-          while (slots[pos].row != UINT32_MAX) {
+          while (slots[pos].row != SIZE_MAX) {
             if (slots[pos].hash == item.hash &&
                 eq(right.rows[slots[pos].row], right.rows[item.row])) {
               ++slots[pos].count;
@@ -832,7 +828,7 @@ void ReduceResidentRows(Relation& left, const Relation& right,
             }
             pos = (pos + 1) & s_mask;
           }
-          if (slots[pos].row == UINT32_MAX) {
+          if (slots[pos].row == SIZE_MAX) {
             slots[pos] = RightSlot{
                 .row = item.row, .hash = item.hash, .count = 1, .emitted = 0};
           }
@@ -841,7 +837,7 @@ void ReduceResidentRows(Relation& left, const Relation& right,
       for (size_t w = 0; w < workers; ++w) {
         for (const HashedRowRef& item : left_buckets[(w * partitions) + p]) {
           size_t pos = item.hash & s_mask;
-          while (slots[pos].row != UINT32_MAX) {
+          while (slots[pos].row != SIZE_MAX) {
             const Row& existing =
                 slots[pos].emitted != 0 && slots[pos].count == 0
                     ? left.rows[slots[pos].row]
@@ -853,7 +849,7 @@ void ReduceResidentRows(Relation& left, const Relation& right,
             pos = (pos + 1) & s_mask;
           }
           if (intersection) {
-            if (slots[pos].row != UINT32_MAX && slots[pos].count != 0) {
+            if (slots[pos].row != SIZE_MAX && slots[pos].count != 0) {
               if (all) {
                 --slots[pos].count;
                 keep[item.row] = 1;
@@ -863,7 +859,7 @@ void ReduceResidentRows(Relation& left, const Relation& right,
               }
             }
           } else {
-            if (slots[pos].row == UINT32_MAX) {
+            if (slots[pos].row == SIZE_MAX) {
               if (!all) {
                 slots[pos] = RightSlot{.row = item.row,
                                        .hash = item.hash,
@@ -881,9 +877,7 @@ void ReduceResidentRows(Relation& left, const Relation& right,
       }
     }
   });
-  if (!reduce_st.ok()) {
-    return;
-  }
+  RETURN_IF_FAIL(reduce_st);
   size_t output = 0;
   for (size_t i = 0; i < nl; ++i) {
     if (keep[i] != 0) {
@@ -894,6 +888,7 @@ void ReduceResidentRows(Relation& left, const Relation& right,
     }
   }
   left.rows.resize(output);
+  return Status::kSuccess;
 }
 
 // HAVING may reference select-list aliases (`HAVING double_avg > 0.7`).
@@ -1518,8 +1513,12 @@ StatusOr<Relation> Project(TransactionContext& context,
   group_shapes.reserve(aggregate_expressions.size());
   for (const auto* aggregate : aggregate_expressions) {
     group_value_columns.push_back(bind_group_column(aggregate->Child()));
+    const Schema* type_schema =
+        aggregate->GetType() == AggregationType::kApproxQuantiles
+            ? &input.schema
+            : nullptr;
     group_shapes.push_back(
-        AggregateAccumulator::AnalyzeShape(aggregate, nullptr));
+        AggregateAccumulator::AnalyzeShape(aggregate, type_schema));
   }
   std::vector<Value> group_key_scratch;
   group_key_scratch.reserve(statement.GroupBy().size());
@@ -1885,12 +1884,7 @@ StatusOr<Relation> Project(TransactionContext& context,
           std::vector<WorkerLocal> locals(workers);
           // Classification shared by every per-group accumulator construction
           // in the workers below; identical for all groups of one aggregate.
-          std::vector<AggregateAccumulator::Shape> parallel_shapes;
-          parallel_shapes.reserve(aggregate_expressions.size());
-          for (const AggregateExpression* aggregate : aggregate_expressions) {
-            parallel_shapes.push_back(
-                AggregateAccumulator::AnalyzeShape(aggregate, nullptr));
-          }
+          const auto& parallel_shapes = group_shapes;
           {
             std::vector<std::jthread> threads;
             threads.reserve(workers);
@@ -2583,7 +2577,11 @@ StatusOr<Relation> Project(TransactionContext& context,
     bounded_sort = true;
     topn_capacity = statement.Offset() + statement.Limit();
   }
-  ExternalKeyedSorter sorter(order_specs, bounded_sort, topn_capacity);
+  const bool top1_with_ties = !statement.Distinct() && statement.HasLimit() &&
+                              statement.WithTies() && statement.Limit() == 1 &&
+                              statement.Offset() == 0;
+  ExternalKeyedSorter sorter(order_specs, bounded_sort, topn_capacity,
+                             top1_with_ties);
   Schema initial_output_schema("", output_columns);
 
   std::vector<std::optional<size_t>> order_positions(
@@ -2598,12 +2596,17 @@ StatusOr<Relation> Project(TransactionContext& context,
     // identically for every row and the sort would silently do nothing.
     if (const std::optional<CollatedOrdinal> collated =
             AsCollatedOrdinal(expression);
-        collated.has_value() && collated->ordinal >= 1 &&
-        static_cast<size_t>(collated->ordinal) <= output_columns.size() &&
-        !output_columns[static_cast<size_t>(collated->ordinal) - 1]
-             .Name()
-             .name.empty()) {
-      order_positions[order_index] = static_cast<size_t>(collated->ordinal) - 1;
+        collated.has_value()) {
+      // A COLLATE-qualified ordinal is still an ordinal: it binds to the
+      // output column position like the bare-integer form below, and an
+      // out-of-range value gets the same error.  Letting it fall through
+      // would leave a constant key that sorts identically for every row.
+      if (collated->ordinal < 1 ||
+          std::cmp_greater(collated->ordinal, output_columns.size())) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ORDER BY ordinal out of range");
+      }
+      order_positions[order_index] = static_cast<size_t>(collated->ordinal - 1);
       continue;
     }
     if (!expression || expression->Type() != TypeTag::kConstantValue ||
@@ -2741,9 +2744,10 @@ StatusOr<Relation> Project(TransactionContext& context,
   std::vector<TopNOutputSlot> stage_a_slots;
   std::vector<ColumnarTopNKey> stage_a_keys;
   bool stage_a_eligible = !grouped && !having_expr && has_order_by &&
-                          bounded_sort && !statement.Distinct() &&
-                          hidden_columns == 0 && outer == nullptr &&
-                          lowered_using.empty() && !input.HasSpill();
+                          (bounded_sort || top1_with_ties) &&
+                          !statement.Distinct() && hidden_columns == 0 &&
+                          outer == nullptr && lowered_using.empty() &&
+                          !input.HasSpill();
   if (stage_a_eligible) {
     stage_a_slots.reserve(output_columns.size());
     for (size_t item = 0; item < statement.SelectList().size(); ++item) {
@@ -2763,6 +2767,13 @@ StatusOr<Relation> Project(TransactionContext& context,
             TopNOutputSlot{.col = null_coalesces[item]->first,
                            .is_coalesce = true,
                            .fallback_col = null_coalesces[item]->second});
+      } else if (projection_programs[item] &&
+                 SafeToReduceEvaluationCountWithSchema(
+                     statement.SelectList()[item].expression, input.schema)) {
+        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        //   (topn_deferred_safe_projection_sound)
+        stage_a_slots.push_back(
+            TopNOutputSlot{.program = &*projection_programs[item]});
       } else {
         stage_a_eligible = false;
       }
@@ -2790,12 +2801,17 @@ StatusOr<Relation> Project(TransactionContext& context,
           break;
         }
         const TopNOutputSlot& slot = stage_a_slots[pos];
-        stage_a_keys.push_back(
-            slot.is_coalesce
-                ? ColumnarTopNKey::Coalesce(
-                      static_cast<slot_t>(slot.col),
-                      static_cast<slot_t>(slot.fallback_col))
-                : ColumnarTopNKey::Direct(static_cast<slot_t>(slot.col)));
+        if (slot.program != nullptr) {
+          stage_a_keys.push_back(ColumnarTopNKey::Computed(
+              *slot.program, initial_output_schema.GetColumn(pos)));
+        } else {
+          stage_a_keys.push_back(
+              slot.is_coalesce
+                  ? ColumnarTopNKey::Coalesce(
+                        static_cast<slot_t>(slot.col),
+                        static_cast<slot_t>(slot.fallback_col))
+                  : ColumnarTopNKey::Direct(static_cast<slot_t>(slot.col)));
+        }
         continue;
       }
       const Expression& expression = resolved_order_expressions[oi];
@@ -2820,12 +2836,17 @@ StatusOr<Relation> Project(TransactionContext& context,
                 initial_output_schema.GetColumn(*projected).Name().name,
                 name.name)) {
           const TopNOutputSlot& slot = stage_a_slots[*projected];
-          stage_a_keys.push_back(
-              slot.is_coalesce
-                  ? ColumnarTopNKey::Coalesce(
-                        static_cast<slot_t>(slot.col),
-                        static_cast<slot_t>(slot.fallback_col))
-                  : ColumnarTopNKey::Direct(static_cast<slot_t>(slot.col)));
+          if (slot.program != nullptr) {
+            stage_a_keys.push_back(ColumnarTopNKey::Computed(
+                *slot.program, initial_output_schema.GetColumn(*projected)));
+          } else {
+            stage_a_keys.push_back(
+                slot.is_coalesce
+                    ? ColumnarTopNKey::Coalesce(
+                          static_cast<slot_t>(slot.col),
+                          static_cast<slot_t>(slot.fallback_col))
+                    : ColumnarTopNKey::Direct(static_cast<slot_t>(slot.col)));
+          }
         } else {
           const auto base = LocalColumnOffset(input.schema, name);
           if (!base ||
@@ -2859,6 +2880,7 @@ StatusOr<Relation> Project(TransactionContext& context,
           } else {
             if (*proj >= stage_a_slots.size() ||
                 stage_a_slots[*proj].is_coalesce ||
+                stage_a_slots[*proj].program != nullptr ||
                 stage_a_slots[*proj].col != *base ||
                 !IdentifierEquals(
                     initial_output_schema.GetColumn(*proj).Name().name,
@@ -2896,7 +2918,7 @@ StatusOr<Relation> Project(TransactionContext& context,
     }
   }
 
-  if (stage_a_eligible && input.HasColumnarOnly()) {
+  if (stage_a_eligible && !top1_with_ties && input.HasColumnarOnly()) {
     RETURN_IF_FAIL(input.GetStatus());
     const auto sort_begin = std::chrono::steady_clock::now();
     ASSIGN_OR_RETURN(
@@ -3055,7 +3077,8 @@ StatusOr<Relation> Project(TransactionContext& context,
       ASSIGN_OR_RETURN(
           std::optional<std::shared_ptr<relational_detail::ColumnarTable>>,
           projected_col,
-          relational_detail::TryProjectColumnarTable(plan, *input.columnar));
+          relational_detail::TryProjectColumnarTable(plan, *input.columnar,
+                                                     &input.columnar));
       if (projected_col.has_value()) {
         bool all_uniform = (*projected_col)->total_rows > 0;
         for (const auto& chunk : (*projected_col)->chunks) {
@@ -3173,24 +3196,53 @@ StatusOr<Relation> Project(TransactionContext& context,
           return a < b;
         };
         std::vector<size_t> positions;
-        positions.reserve(capacity);
-        for (size_t r = 0; r < n_rows && capacity != 0; ++r) {
-          if (positions.size() < capacity) {
-            positions.push_back(r);
-            std::push_heap(positions.begin(), positions.end(), before);
-          } else if (before(r, positions.front())) {
-            std::pop_heap(positions.begin(), positions.end(), before);
-            positions.back() = r;
-            std::push_heap(positions.begin(), positions.end(), before);
+        if (top1_with_ties) {
+          // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+          //   (single_pass_argmax_eq_filterMaxRows)
+          for (size_t r = 0; r < n_rows; ++r) {
+            if (positions.empty()) {
+              positions.push_back(r);
+              continue;
+            }
+            int cmp = 0;
+            for (size_t k = 0; k < stage_a_keys.size(); ++k) {
+              cmp = order_specs[k].Compare(read_row_key(r, k),
+                                           read_row_key(positions.front(), k));
+              if (cmp != 0) {
+                break;
+              }
+            }
+            if (cmp < 0) {
+              positions.clear();
+              positions.push_back(r);
+            } else if (cmp == 0) {
+              positions.push_back(r);
+            }
           }
+        } else {
+          positions.reserve(capacity);
+          for (size_t r = 0; r < n_rows && capacity != 0; ++r) {
+            if (positions.size() < capacity) {
+              positions.push_back(r);
+              std::push_heap(positions.begin(), positions.end(), before);
+            } else if (before(r, positions.front())) {
+              std::pop_heap(positions.begin(), positions.end(), before);
+              positions.back() = r;
+              std::push_heap(positions.begin(), positions.end(), before);
+            }
+          }
+          std::ranges::sort(positions, before);
         }
-        std::ranges::sort(positions, before);
         for (const size_t position : positions) {
           const Row& src_row = input.rows[position];
           std::vector<Value> values;
           values.reserve(stage_a_slots.size());
           for (const TopNOutputSlot& slot : stage_a_slots) {
-            if (!slot.is_coalesce) {
+            if (slot.program != nullptr) {
+              ASSIGN_OR_RETURN(Value, evaluated,
+                               TryEvaluateRowAuto(*slot.program, src_row));
+              values.push_back(std::move(evaluated));
+            } else if (!slot.is_coalesce) {
               values.push_back(src_row[slot.col]);
             } else {
               const Value& v = src_row[slot.col];
@@ -3618,7 +3670,7 @@ StatusOr<Relation> Project(TransactionContext& context,
     values.reserve(output_columns.size());
     for (size_t item = 0; item < statement.SelectList().size(); ++item) {
       const NamedExpression& projection = statement.SelectList()[item];
-      if (select_star(projection.expression)) {
+      if (star_proto[item] || !star_groups[item].empty()) {
         if (star_proto[item]) {
           const ColumnName base = input.schema.GetColumn(0).Name();
           for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
@@ -4114,7 +4166,7 @@ namespace {
 // Window functions in a grouped statement evaluate over the grouped rows
 // (SQL semantics), including calls whose arguments are aggregates themselves
 // (`avg(sum(x)) OVER (PARTITION BY key)` — TPC-DS q12/q89).  This runs the
-// statement in two passes:
+// statement in three passes:
 //   1. a grouped pass where every window call is pulled out of the select
 //      list, each distinct aggregate nested inside a window call becomes a
 //      hidden `$aggK` select item, and the ordinary grouping machinery runs;
@@ -4615,7 +4667,8 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
     const NamedExpression& projection = statement.SelectList()[i];
     Expression expression;
-    if (projection.expression->Type() == TypeTag::kWindowFunctionExp) {
+    if (projection.expression &&
+        projection.expression->Type() == TypeTag::kWindowFunctionExp) {
       expression = ColumnValueExp(ColumnName(
           "", aggregate_columns.at(projection.expression->ToString())));
     } else if (item_has_window[i]) {
@@ -4656,8 +4709,9 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
     if (node->Type() == TypeTag::kAggregateExp) {
       // ORDER BY <aggregate>: point at the matching select item's column.
       for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-        if (statement.SelectList()[i].expression->ToString() ==
-            node->ToString()) {
+        if (statement.SelectList()[i].expression &&
+            statement.SelectList()[i].expression->ToString() ==
+                node->ToString()) {
           return ColumnValueExp(
               ColumnName("", ProjectionName(statement.SelectList()[i], i)));
         }
@@ -4732,8 +4786,7 @@ bool OrderByResolvableOnSchema(
       const Value& value = expression->AsConstantValue().GetValue();
       if (value.type == ValueType::kInt64 && !value.IsNull()) {
         if (value.value.int_value < 1 ||
-            std::cmp_greater(value.value.int_value,
-                             schema.ColumnCount())) {
+            std::cmp_greater(value.value.int_value, schema.ColumnCount())) {
           return false;
         }
       }
@@ -4792,89 +4845,100 @@ StatusOr<Relation> FinishQuery(TransactionContext& context,
         !compiled.prebuilt_scalar_compare.empty() ||
         !compiled.disjunctive_branches.empty() ||
         compiled.residual_bytecode.has_value() || !compiled.residual.empty()) {
-      input.FinishSpill();
-      if (!compiled.residual_bytecode.has_value() &&
-          !compiled.residual.empty() &&
-          (!compiled.simple.empty() || !compiled.prefix_in.empty() ||
-           !compiled.prebuilt_membership.empty() ||
-           !compiled.prebuilt_scalar_compare.empty() ||
-           !compiled.disjunctive_branches.empty())) {
-        relational_detail::CompiledScanFilter non_residual = compiled;
-        non_residual.residual.clear();
-        Relation prefiltered(context.execution_runtime());
-        prefiltered.schema = input.schema;
-        CopyExecutionStats(&prefiltered, input);
-        Status pre_error{Status::kSuccess};
-        if (!relational_detail::TryParallelFilterRows(
-                context, input, non_residual, input.schema, outer, ctes,
-                nullptr, &prefiltered, &pre_error, &input)) {
-          relational_detail::ColumnLookupCache pre_lookup;
-          Status pre_iter = input.ForEachRow([&](const Row& row) {
-            if (!pre_error.ok()) {
-              return;
-            }
-            if (relational_detail::MatchScanFilter(
-                    row, input.schema, non_residual, outer, context, ctes,
-                    &pre_error, &pre_lookup)) {
-              prefiltered.AddRow(row);
-            }
-          });
-          RETURN_IF_FAIL(pre_iter);
-        }
-        RETURN_IF_FAIL(pre_error);
-        prefiltered.FinishSpill();
-        input = std::move(prefiltered);
-      }
-      Relation filtered(context.execution_runtime());
-      filtered.schema = input.schema;
-      CopyExecutionStats(&filtered, input);
-      Status eval_error{Status::kSuccess};
-      // A/B hatch: TINYLAMB_DISABLE_FINISH_PARALLEL_FILTER=1 keeps the serial
-      // per-row loop below.
+      RETURN_IF_FAIL(input.FinishSpill());
       static const bool finish_parallel_disabled =
           std::getenv("TINYLAMB_DISABLE_FINISH_PARALLEL_FILTER") != nullptr;
-      bool filtered_in_parallel = false;
-      if (!finish_parallel_disabled) {
-        // Worker threads decide rows with the positional compares and the
-        // compiled bytecode programs; rows whose program raised are parked
-        // and re-checked on this thread through the same contextual
-        // MatchScanFilter call the serial loop uses, so error semantics are
-        // unchanged.  Filters that need the evaluator (query expressions the
-        // bytecode cannot compile) make the parallel attempt decline and
-        // fall through to the serial loop.
-        filtered_in_parallel = relational_detail::TryParallelFilterRows(
-            context, input, compiled, input.schema, outer, ctes, nullptr,
-            &filtered, &eval_error, &input);
+      bool handled_direct_columnar = false;
+      if (!finish_parallel_disabled && input.HasColumnarOnly() &&
+          !compiled.residual_bytecode.has_value() &&
+          !compiled.residual.empty()) {
+        Relation direct_out(context.execution_runtime());
+        direct_out.schema = input.schema;
+        CopyExecutionStats(&direct_out, input);
+        Status direct_err{Status::kSuccess};
+        if (relational_detail::TryParallelFilterRows(
+                context, input, compiled, input.schema, outer, ctes, nullptr,
+                &direct_out, &direct_err, &input)) {
+          RETURN_IF_FAIL(direct_err);
+          RETURN_IF_FAIL(direct_out.FinishSpill());
+          input = std::move(direct_out);
+          handled_direct_columnar = true;
+        }
       }
-      if (filtered_in_parallel) {
-        RETURN_IF_FAIL(eval_error);
-      } else {
-        RETURN_IF_FAIL((([&]() -> Status {
-          // Register the filtered relation so a correlated-subquery build
-          // triggered by one of the predicates can prune its build scan to
-          // this pipeline's outer key domain.
-          relational_detail::ScopedCorrelatedOuter correlated_outer(context,
-                                                                    input);
-          return input.ForEachRow([&](const Row& row) {
-            if (!eval_error.ok()) {
-              return;
-            }
-            if (relational_detail::MatchScanFilter(row, input.schema, compiled,
-                                                   outer, context, ctes,
-                                                   &eval_error)) {
-              filtered.AddRow(row);
-            }
-          });
-        })()));
-        RETURN_IF_FAIL(eval_error);
+      if (!handled_direct_columnar) {
+        if (!compiled.residual_bytecode.has_value() &&
+            !compiled.residual.empty() &&
+            (!compiled.simple.empty() || !compiled.prefix_in.empty() ||
+             !compiled.prebuilt_membership.empty() ||
+             !compiled.prebuilt_scalar_compare.empty() ||
+             !compiled.disjunctive_branches.empty())) {
+          relational_detail::CompiledScanFilter non_residual = compiled;
+          non_residual.residual.clear();
+          Relation prefiltered(context.execution_runtime());
+          prefiltered.schema = input.schema;
+          CopyExecutionStats(&prefiltered, input);
+          Status pre_error{Status::kSuccess};
+          if (!relational_detail::TryParallelFilterRows(
+                  context, input, non_residual, input.schema, outer, ctes,
+                  nullptr, &prefiltered, &pre_error, &input)) {
+            relational_detail::ColumnLookupCache pre_lookup;
+            Status pre_iter = input.ForEachRow([&](const Row& row) {
+              if (!pre_error.ok()) {
+                return;
+              }
+              if (relational_detail::MatchScanFilter(
+                      row, input.schema, non_residual, outer, context, ctes,
+                      &pre_error, &pre_lookup)) {
+                prefiltered.AddRow(row);
+              }
+            });
+            RETURN_IF_FAIL(pre_iter);
+          }
+          RETURN_IF_FAIL(pre_error);
+          RETURN_IF_FAIL(prefiltered.FinishSpill());
+          input = std::move(prefiltered);
+        }
+        Relation filtered(context.execution_runtime());
+        filtered.schema = input.schema;
+        CopyExecutionStats(&filtered, input);
+        Status eval_error{Status::kSuccess};
+        bool filtered_in_parallel = false;
+        if (!finish_parallel_disabled) {
+          filtered_in_parallel = relational_detail::TryParallelFilterRows(
+              context, input, compiled, input.schema, outer, ctes, nullptr,
+              &filtered, &eval_error, &input);
+        }
+        if (filtered_in_parallel) {
+          RETURN_IF_FAIL(eval_error);
+        } else {
+          RETURN_IF_FAIL((([&]() -> Status {
+            // Register the filtered relation so a correlated-subquery build
+            // triggered by one of the predicates can prune its build scan to
+            // this pipeline's outer key domain.
+            relational_detail::ScopedCorrelatedOuter correlated_outer(context,
+                                                                      input);
+            relational_detail::ColumnLookupCache lookup_cache;
+            return input.ForEachRow([&](const Row& row) {
+              if (!eval_error.ok()) {
+                return;
+              }
+              if (relational_detail::MatchScanFilter(
+                      row, input.schema, compiled, outer, context, ctes,
+                      &eval_error, &lookup_cache)) {
+                filtered.AddRow(row);
+              }
+            });
+          })()));
+          RETURN_IF_FAIL(eval_error);
+        }
+        RETURN_IF_FAIL(filtered.FinishSpill());
+        input = std::move(filtered);
       }
-      filtered.FinishSpill();
-      input = std::move(filtered);
     } else {
       Relation filtered(context.execution_runtime());
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
-      input.FinishSpill();
+      RETURN_IF_FAIL(input.FinishSpill());
       // Use the non-throwing evaluation path: the per-row evaluation must not
       // use the throwing Evaluate wrapper. An
       // unresolvable qualified reference inside a subquery predicate
@@ -4899,7 +4963,7 @@ StatusOr<Relation> FinishQuery(TransactionContext& context,
         }
       }));
       RETURN_IF_FAIL(filter_error);
-      filtered.FinishSpill();
+      RETURN_IF_FAIL(filtered.FinishSpill());
       input = std::move(filtered);
     }
     if (context.execution_runtime() != nullptr) {
@@ -5836,16 +5900,20 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
   // expressions into the parent SELECT/WHERE/ORDER BY. The rewrite is
   // intentionally restricted to a single source with no grouping, ordering,
   // limit, window, or subquery expression.
-  if (std::shared_ptr<SelectStatement> flattened =
-          FlattenProjectionBoundary(statement, source, derived)) {
-    return flattened;
-  }
+  // WITH TIES compares ORDER BY keys after projection. Either flattener
+  // can substitute a sort expression that needs hidden input columns.
+  if (!statement.WithTies()) {
+    if (std::shared_ptr<SelectStatement> flattened =
+            FlattenProjectionBoundary(statement, source, derived)) {
+      return flattened;
+    }
 
-  // A grouping parent over a plain joined projection absorbs the projection
-  // so the grouping (and the grouped-join fusion) runs over the base sources.
-  if (std::shared_ptr<SelectStatement> flattened =
-          FlattenGroupedDerivedBoundary(statement, source, derived)) {
-    return flattened;
+    // A grouping parent over a plain joined projection can run the grouping
+    // (and the grouped-join fusion) directly over the base sources.
+    if (std::shared_ptr<SelectStatement> flattened =
+            FlattenGroupedDerivedBoundary(statement, source, derived)) {
+      return flattened;
+    }
   }
 
   // An outer filter observes completed window values. Move it to QUALIFY,
@@ -6715,6 +6783,7 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
       // round evaluates against the new working table.
       runtime->uncorrelated_results.clear();
       runtime->uncorrelated_results_by_fingerprint.clear();
+      runtime->cte_subquery_results.clear();
       runtime->uncorrelated_key_memo.clear();
       runtime->uncorrelated_membership_by_node.clear();
       runtime->uncorrelated_scalar_by_node.clear();
@@ -6813,7 +6882,7 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
 
 namespace {
 
-// Total over the numeric/NULL cells accepted below. In particular, an
+// Tolerate the numeric/NULL cells accepted below. In particular, an
 // independent rejecting conjunct must not hide overflow/division/cast errors
 // elsewhere in the WHERE expression when skipping all-unmatched tuples.
 bool NumericPushPredicate(const Expression& expression) {
@@ -12307,8 +12376,8 @@ StatusOr<std::optional<Relation>> TryExecuteRadixPacked2x32JoinCount(
         }
         std::atomic<bool> range_ok{true};
         const size_t used_w = std::min(workers, slices.size());
-        const size_t per_bucket_est =
-            (tbl.total_rows / (used_w * kPartitions)) + 16;
+        const size_t base_est = tbl.total_rows / (used_w * kPartitions);
+        const size_t per_bucket_est = base_est + (base_est / 8) + 64;
         auto run_w = [&](size_t w) {
           auto& bins = (*worker_bins)[w];
           for (auto& b : bins) {
@@ -12327,11 +12396,18 @@ StatusOr<std::optional<Relation>> TryExecuteRadixPacked2x32JoinCount(
             const ColumnarColumn& c1 = ch.columns[cols[1]];
             const uint32_t beg = slices[si].second.first;
             const uint32_t end = slices[si].second.second;
-            if (c0.IsFlat() && c0.is_uniform && !c0.has_null && c1.IsFlat() &&
-                c1.is_uniform && !c1.has_null) {
-              const int64_t* v0 = c0.ints.data();
-              const int64_t* v1 = c1.ints.data();
+            if (c0.IsFlat() && c0.is_uniform && c1.IsFlat() && c1.is_uniform) {
+              const int64_t* __restrict v0 = c0.ints.data();
+              const int64_t* __restrict v1 = c1.ints.data();
+              const uint8_t* __restrict n0 =
+                  c0.has_null ? c0.nulls.data() : nullptr;
+              const uint8_t* __restrict n1 =
+                  c1.has_null ? c1.nulls.data() : nullptr;
               for (uint32_t r = beg; r < end; ++r) {
+                if ((n0 != nullptr && n0[r] != 0) ||
+                    (n1 != nullptr && n1[r] != 0)) {
+                  continue;
+                }
                 const int64_t k0 = v0[r];
                 const int64_t k1 = v1[r];
                 if (k0 < INT32_MIN || k0 > INT32_MAX || k1 < INT32_MIN ||
@@ -12347,7 +12423,7 @@ StatusOr<std::optional<Relation>> TryExecuteRadixPacked2x32JoinCount(
                         static_cast<uint32_t>(static_cast<int32_t>(k1)));
                 const uint64_t h =
                     (packed ^ (packed >> 33U)) * 0xff51afd7ed558ccdULL;
-                bins[(h >> 58U) & (kPartitions - 1)].push_back(
+                bins[(h >> 56U) & (kPartitions - 1)].push_back(
                     static_cast<int64_t>(packed));
               }
             } else {
@@ -12370,7 +12446,7 @@ StatusOr<std::optional<Relation>> TryExecuteRadixPacked2x32JoinCount(
                         static_cast<uint32_t>(static_cast<int32_t>(k1)));
                 const uint64_t h =
                     (packed ^ (packed >> 33U)) * 0xff51afd7ed558ccdULL;
-                bins[(h >> 58U) & (kPartitions - 1)].push_back(
+                bins[(h >> 56U) & (kPartitions - 1)].push_back(
                     static_cast<int64_t>(packed));
               }
             }
@@ -12398,51 +12474,101 @@ StatusOr<std::optional<Relation>> TryExecuteRadixPacked2x32JoinCount(
     return std::optional<Relation>{};
   }
 
-  std::array<int64_t, kPartitions> part_counts{};
-  auto join_part = [&](size_t p) {
-    size_t l_n = 0;
-    size_t r_n = 0;
-    for (const auto& wb : l_bins) {
-      l_n += wb[p].size();
-    }
-    for (const auto& wb : r_bins) {
-      r_n += wb[p].size();
-    }
-    if (l_n == 0 || r_n == 0) {
-      part_counts[p] = 0;
-      return;
-    }
-    const bool build_r = (r_n <= l_n);
-    const auto& build_bins = build_r ? r_bins : l_bins;
-    const auto& probe_bins = build_r ? l_bins : r_bins;
-    FlatIntKeyMap<uint32_t> ht;
-    ht.Reserve(build_r ? r_n : l_n);
-    for (const auto& wb : build_bins) {
-      for (const int64_t k : wb[p]) {
-        bool emp = false;
-        uint32_t* cnt = ht.TryEmplace(k, &emp);
-        if (emp) {
-          *cnt = 1;
-        } else {
-          ++(*cnt);
+  std::vector<int64_t> worker_counts(workers, 0);
+  auto join_worker = [&](size_t w) {
+    struct GenSlot {
+      int64_t key{0};
+      uint32_t count{0};
+      uint32_t gen{0};
+    };
+    std::vector<GenSlot> table;
+    uint32_t cur_gen = 0;
+    int64_t w_acc = 0;
+    for (size_t p = w; p < kPartitions; p += workers) {
+      size_t l_n = 0;
+      size_t r_n = 0;
+      for (const auto& wb : l_bins) {
+        l_n += wb[p].size();
+      }
+      for (const auto& wb : r_bins) {
+        r_n += wb[p].size();
+      }
+      if (l_n == 0 || r_n == 0) {
+        continue;
+      }
+      const bool build_r = (r_n <= l_n);
+      const size_t build_n = build_r ? r_n : l_n;
+      const auto& build_bins = build_r ? r_bins : l_bins;
+      const auto& probe_bins = build_r ? l_bins : r_bins;
+      size_t cap = 64;
+      while (cap < build_n * 2) {
+        cap <<= 1U;
+      }
+      if (table.size() < cap) {
+        table.assign(cap, GenSlot{});
+        cur_gen = 0;
+      }
+      if (++cur_gen == 0) {
+        std::memset(table.data(), 0, table.size() * sizeof(GenSlot));
+        cur_gen = 1;
+      }
+      const size_t mask = cap - 1;
+      GenSlot* __restrict slots = table.data();
+      for (const auto& wb : build_bins) {
+        const int64_t* __restrict keys = wb[p].data();
+        const size_t kn = wb[p].size();
+        for (size_t i = 0; i < kn; ++i) {
+          const int64_t k = keys[i];
+          const uint64_t u = static_cast<uint64_t>(k);
+          size_t idx =
+              static_cast<size_t>((u ^ (u >> 33U)) * 0xff51afd7ed558ccdULL) &
+              mask;
+          while (true) {
+            GenSlot& s = slots[idx];
+            if (s.gen != cur_gen) {
+              s.key = k;
+              s.count = 1;
+              s.gen = cur_gen;
+              break;
+            }
+            if (s.key == k) {
+              ++s.count;
+              break;
+            }
+            idx = (idx + 1) & mask;
+          }
+        }
+      }
+      for (const auto& wb : probe_bins) {
+        const int64_t* __restrict keys = wb[p].data();
+        const size_t kn = wb[p].size();
+        for (size_t i = 0; i < kn; ++i) {
+          const int64_t k = keys[i];
+          const uint64_t u = static_cast<uint64_t>(k);
+          size_t idx =
+              static_cast<size_t>((u ^ (u >> 33U)) * 0xff51afd7ed558ccdULL) &
+              mask;
+          while (true) {
+            const GenSlot& s = slots[idx];
+            if (s.gen != cur_gen) {
+              break;
+            }
+            if (s.key == k) {
+              w_acc += static_cast<int64_t>(s.count);
+              break;
+            }
+            idx = (idx + 1) & mask;
+          }
         }
       }
     }
-    int64_t acc = 0;
-    for (const auto& wb : probe_bins) {
-      for (const int64_t k : wb[p]) {
-        if (const uint32_t* cnt = ht.Find(k); cnt != nullptr) {
-          acc += static_cast<int64_t>(*cnt);
-        }
-      }
-    }
-    part_counts[p] = acc;
+    worker_counts[w] = w_acc;
   };
-  if (RunParallelTasks(kPartitions, join_part) != Status::kSuccess) {
+  if (RunParallelTasks(workers, join_worker) != Status::kSuccess) {
     return std::optional<Relation>{};
   }
   int64_t total_matches = 0;
-  for (int64_t c : part_counts) {
+  for (int64_t c : worker_counts) {
     total_matches += c;
   }
 
@@ -12711,7 +12837,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
           left.MergeInMemoryShard(std::move(right));
           right = Relation(context.execution_runtime());
           if (operation == SetOperationKind::kUnion && !left.HasSpill()) {
-            DistinctResidentRows(left);
+            RETURN_IF_FAIL(DistinctResidentRows(left));
           }
           RETURN_IF_FAIL(left.FinishSpill());
           RETURN_IF_FAIL(left.GetStatus());
@@ -12729,7 +12855,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         if (auto charge = ResidentSetCharge(left, right)) {
           RETURN_IF_FAIL(left.GetStatus());
           RETURN_IF_FAIL(right.GetStatus());
-          ReduceResidentRows(left, right, operation);
+          RETURN_IF_FAIL(ReduceResidentRows(left, right, operation));
           return left;
         }
       }
@@ -12879,9 +13005,17 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       return std::string(shape.Fingerprint());
     };
     auto shareable = [&](const SelectStatement& part) {
-      return !part.GroupBy().empty() && !part.Distinct() &&
-             !part.HasDistinctOn() && !part.Having() && !part.Qualify() &&
-             !StatementContainsVolatileFunction(part) &&
+      // A ROLLUP / GROUPING SETS expansion includes a grand-total branch,
+      // which has no GROUP BY keys but is still produced from the same input.
+      // It is a legitimate coarsest level of the state-reuse chain
+      // (PlanExactIntegerGroupingSets handles IsGroupAll sets explicitly).
+      // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+      //   (rollup_two_level_state_combine_sound,
+      //    rollup_three_level_state_combine_sound,
+      //    rollup_grand_total_requires_coalesce)
+      return (!part.GroupBy().empty() || part.IsGroupAll()) &&
+             !part.Distinct() && !part.HasDistinctOn() && !part.Having() &&
+             !part.Qualify() && !StatementContainsVolatileFunction(part) &&
              ContainsOnlyUncorrelatedQueries(context, part.WhereClause(),
                                              ctes) &&
              std::ranges::none_of(part.SelectList(),
@@ -12930,6 +13064,9 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         partial_fusion = BuildGroupedJoinFusionSpec(partial->partial);
         partial_fusion.require_exact_integer_totals =
             !partial->allow_float_sums;
+        const auto* runtime = context.execution_runtime();
+        partial_fusion.columnar_output =
+            runtime != nullptr && runtime->grouping_rank_limit.has_value();
       }
       ASSIGN_OR_RETURN(Relation, input,
                        (BuildInput(context, partial ? partial->partial : scan,
@@ -13001,6 +13138,13 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         statement.SetOperationKinds().size() == statement.UnionAll().size() &&
         std::ranges::all_of(statement.SetOperationKinds(),
                             IsPresenceOnlySetOperation);
+    const bool all_intersect_distinct =
+        !shared_input && outer == nullptr && !statement.UnionAll().empty() &&
+        statement.SetOperationKinds().size() == statement.UnionAll().size() &&
+        std::ranges::all_of(statement.SetOperationKinds(),
+                            [](SetOperationKind k) {
+                              return k == SetOperationKind::kIntersect;
+                            });
     size_t shared_term_index = 0;
     std::deque<SelectStatement> union_grouped_owned;
     std::vector<const SelectStatement*> unshared_ptrs;
@@ -13022,10 +13166,13 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       for (const auto& union_stmt : statement.UnionAll()) {
         prepare_union_term(*union_stmt);
       }
-      ASSIGN_OR_RETURN(std::optional<std::vector<Relation>>, executed,
-                       (TryExecuteBranchesParallel(context, unshared_ptrs, ctes,
-                                                   branch_columnar_flat)));
-      union_parallel_terms = std::move(executed);
+      if (!all_intersect_distinct) {
+        ASSIGN_OR_RETURN(
+            std::optional<std::vector<Relation>>, executed,
+            (TryExecuteBranchesParallel(context, unshared_ptrs, ctes,
+                                        branch_columnar_flat)));
+        union_parallel_terms = std::move(executed);
+      }
     }
 
     size_t union_parallel_index = 0;
@@ -13077,7 +13224,6 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       return FinishQuery(context, effective, std::move(input), nullptr, ctes,
                          !shared_where_applied, 0);
     };
-    ASSIGN_OR_RETURN(Relation, combined, run_shared_term(head));
     // PRODUCTION FIX: apply per-pair kinds with operator precedence
     // (INTERSECT binds tighter than UNION/EXCEPT).  The previous flat left
     // fold computed `1 UNION ALL 2 INTERSECT 2` as `(1 UNION ALL 2)
@@ -13107,7 +13253,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
           left.MergeInMemoryShard(std::move(right));
           right = Relation(context.execution_runtime());
           if (operation == SetOperationKind::kUnion && !left.HasSpill()) {
-            DistinctResidentRows(left);
+            RETURN_IF_FAIL(DistinctResidentRows(left));
           }
           RETURN_IF_FAIL(left.FinishSpill());
           RETURN_IF_FAIL(left.GetStatus());
@@ -13125,7 +13271,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         if (auto charge = ResidentSetCharge(left, right)) {
           RETURN_IF_FAIL(left.GetStatus());
           RETURN_IF_FAIL(right.GetStatus());
-          ReduceResidentRows(left, right, operation);
+          RETURN_IF_FAIL(ReduceResidentRows(left, right, operation));
           return left;
         }
       }
@@ -13161,31 +13307,436 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       }
       return folded;
     };
-    std::vector<Relation> terms;
-    terms.push_back(std::move(combined));
-    std::vector<SetOperationKind> low_ops;
-    for (size_t i = 0; i < statement.UnionAll().size(); ++i) {
-      const auto& union_stmt = statement.UnionAll()[i];
-      ASSIGN_OR_RETURN(Relation, branch, run_shared_term(*union_stmt));
-      const SetOperationKind operation =
-          i < statement.SetOperationKinds().size()
-              ? statement.SetOperationKinds()[i]
-              : SetOperationKind::kUnionAll;
-      const bool intersects = operation == SetOperationKind::kIntersect ||
-                              operation == SetOperationKind::kIntersectAll;
-      if (intersects) {
-        ASSIGN_OR_RETURN(Relation, folded_pair,
-                         (apply_pair(std::move(terms.back()), std::move(branch),
-                                     operation)));
-        terms.back() = std::move(folded_pair);
-      } else {
-        low_ops.push_back(operation);
-        terms.push_back(std::move(branch));
+    Relation combined(context.execution_runtime());
+    bool handled_intersect_fast = false;
+    if (all_intersect_distinct && unshared_ptrs.size() >= 2 &&
+        context.execution_runtime() != nullptr) {
+      // INTERSECT DISTINCT is commutative & associative (Lean proof:
+      // lean/TinylambOpt/TpchSf10VectorizedExec.lean
+      // intersect_dim_key_semifilter_sound). Evaluate the smallest-fact branch
+      // first, then project its surviving dimension attribute tuples back to
+      // matching dimension PKs as an exact runtime filter for each subsequent
+      // branch's fact scan.
+      std::function<size_t(const SelectStatement&)> max_base_rows =
+          [&](const SelectStatement& s) -> size_t {
+        size_t best = 0;
+        for (const auto& src : s.Sources()) {
+          if (src.query) {
+            best = std::max(best, max_base_rows(*src.query));
+          } else if (!src.unnest && !src.sample && !ctes.contains(src.table)) {
+            if (auto st = context.GetStats(src.table); st.HasValue()) {
+              best = std::max(best, st.Value()->Rows());
+            }
+          }
+        }
+        return best;
+      };
+      std::vector<size_t> order(unshared_ptrs.size());
+      for (size_t idx = 0; idx < order.size(); ++idx) {
+        order[idx] = idx;
       }
+      std::vector<size_t> branch_sizes(unshared_ptrs.size(), 0);
+      for (size_t idx = 0; idx < unshared_ptrs.size(); ++idx) {
+        branch_sizes[idx] = max_base_rows(*unshared_ptrs[idx]);
+      }
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return branch_sizes[a] < branch_sizes[b];
+      });
+      auto try_build_semi_rf = [&](const Relation& seed,
+                                   const SelectStatement& next_stmt)
+          -> std::optional<ExecutionRuntime::ScopedExtraTableRf> {
+        if (!seed.HasColumnarOnly() || seed.columnar == nullptr ||
+            seed.TotalRows() == 0 || seed.TotalRows() > 250000 ||
+            next_stmt.Sources().size() < 2 || !next_stmt.WhereClause()) {
+          return std::nullopt;
+        }
+        // Locate a dimension base source D whose attributes appear in
+        // next_stmt.SelectList(), and a large fact table F joined to D.pk
+        // either directly or through a 1-level derived table (e.g.
+        // __tpcds_sk_pre).
+        const auto& sources = next_stmt.Sources();
+        for (size_t di = 0; di < sources.size(); ++di) {
+          const auto& dsrc = sources[di];
+          if (dsrc.query || dsrc.unnest || dsrc.sample ||
+              ctes.contains(dsrc.table)) {
+            continue;
+          }
+          auto dstats = context.GetStats(dsrc.table);
+          auto dtbl = context.GetTable(dsrc.table);
+          if (!dstats.HasValue() || !dtbl.HasValue() ||
+              dstats.Value()->Rows() == 0 || dstats.Value()->Rows() > 2000000) {
+            continue;
+          }
+          const Schema& dschema = dtbl.Value()->GetSchema();
+          const std::string dqual =
+              dsrc.alias.empty() ? dsrc.table : dsrc.alias;
+          const Schema qdschema = QualifySchema(dschema, dqual);
+
+          // Collect (out_idx, dim_col_slot) pairs projected from D.
+          std::vector<std::pair<size_t, slot_t>> dim_out_pairs;
+          for (size_t oi = 0; oi < next_stmt.SelectList().size(); ++oi) {
+            const Expression& ex = next_stmt.SelectList()[oi].expression;
+            if (!ex || ex->Type() != TypeTag::kColumnValue) continue;
+            const auto off = LocalColumnOffset(
+                qdschema, ex->AsColumnValue().GetColumnName());
+            if (!off.has_value()) continue;
+            const ValueType vt =
+                dschema.GetColumn(static_cast<size_t>(*off)).Type();
+            if (vt != ValueType::kVarChar && vt != ValueType::kInt64 &&
+                vt != ValueType::kDate) {
+              dim_out_pairs.clear();
+              break;
+            }
+            if (oi >= seed.schema.ColumnCount() ||
+                seed.schema.GetColumn(oi).Type() != vt) {
+              dim_out_pairs.clear();
+              break;
+            }
+            dim_out_pairs.emplace_back(oi, *off);
+          }
+          if (dim_out_pairs.empty()) {
+            continue;
+          }
+          // Find equality predicate D.pk = other.fk.
+          std::string fact_table;
+          std::string fact_fk_col;
+          slot_t dim_pk_slot = 0;
+          bool found_join = false;
+          for (const Expression& conj :
+               SplitConjuncts(next_stmt.WhereClause())) {
+            if (!conj || conj->Type() != TypeTag::kBinaryExp) continue;
+            const auto& bin = conj->AsBinaryExpression();
+            if (bin.Op() != BinaryOperation::kEquals || !bin.Left() ||
+                !bin.Right() || bin.Left()->Type() != TypeTag::kColumnValue ||
+                bin.Right()->Type() != TypeTag::kColumnValue) {
+              continue;
+            }
+            const ColumnName& ln = bin.Left()->AsColumnValue().GetColumnName();
+            const ColumnName& rn = bin.Right()->AsColumnValue().GetColumnName();
+            const auto loff = LocalColumnOffset(qdschema, ln);
+            const auto roff = LocalColumnOffset(qdschema, rn);
+            if (loff.has_value() == roff.has_value()) continue;
+            const slot_t dslot = loff.has_value() ? *loff : *roff;
+            const ColumnName& other_cn = loff.has_value() ? rn : ln;
+            const Column& pk_col =
+                dschema.GetColumn(static_cast<size_t>(dslot));
+            if (pk_col.IsUnsigned() || (pk_col.Type() != ValueType::kInt64 &&
+                                        pk_col.Type() != ValueType::kDate)) {
+              continue;
+            }
+            // Resolve other_cn against another source in next_stmt.
+            for (size_t fi = 0; fi < sources.size(); ++fi) {
+              if (fi == di) continue;
+              const auto& fsrc = sources[fi];
+              const std::string fqual =
+                  fsrc.alias.empty() ? fsrc.table : fsrc.alias;
+              if (!other_cn.schema.empty() && other_cn.schema != fqual) {
+                continue;
+              }
+              if (!fsrc.query && !fsrc.unnest && !fsrc.sample &&
+                  !ctes.contains(fsrc.table)) {
+                auto fstats = context.GetStats(fsrc.table);
+                auto ftbl = context.GetTable(fsrc.table);
+                if (fstats.HasValue() && ftbl.HasValue() &&
+                    fstats.Value()->Rows() >= 1000000) {
+                  if (LocalColumnOffset(ftbl.Value()->GetSchema(),
+                                        ColumnName("", other_cn.name))
+                          .has_value()) {
+                    fact_table = fsrc.table;
+                    fact_fk_col = other_cn.name;
+                    dim_pk_slot = dslot;
+                    found_join = true;
+                    break;
+                  }
+                }
+              } else if (fsrc.query) {
+                const SelectStatement& sub = *fsrc.query;
+                for (const auto& sitem : sub.SelectList()) {
+                  if (sitem.name == other_cn.name && sitem.expression &&
+                      sitem.expression->Type() == TypeTag::kColumnValue) {
+                    const ColumnName& inner_cn =
+                        sitem.expression->AsColumnValue().GetColumnName();
+                    for (const auto& isrc : sub.Sources()) {
+                      if (isrc.query || isrc.unnest || isrc.sample ||
+                          ctes.contains(isrc.table)) {
+                        continue;
+                      }
+                      const std::string iqual =
+                          isrc.alias.empty() ? isrc.table : isrc.alias;
+                      if (!inner_cn.schema.empty() &&
+                          inner_cn.schema != iqual) {
+                        continue;
+                      }
+                      auto istats = context.GetStats(isrc.table);
+                      auto itbl = context.GetTable(isrc.table);
+                      if (istats.HasValue() && itbl.HasValue() &&
+                          istats.Value()->Rows() >= 1000000 &&
+                          LocalColumnOffset(itbl.Value()->GetSchema(),
+                                            ColumnName("", inner_cn.name))
+                              .has_value()) {
+                        fact_table = isrc.table;
+                        fact_fk_col = inner_cn.name;
+                        dim_pk_slot = dslot;
+                        found_join = true;
+                        break;
+                      }
+                    }
+                    if (found_join) break;
+                  }
+                }
+                if (found_join) break;
+              }
+            }
+            if (found_join) break;
+          }
+          if (!found_join) {
+            continue;
+          }
+          // Build 64-bit hash set of seed's dim_out_pairs (IS NOT DISTINCT
+          // FROM: NULLs hash to a distinct tag). A 64-bit hash match is a sound
+          // superset for a runtime filter (false positives are harmlessly
+          // filtered by the exact INTERSECT; false negatives are impossible).
+          // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+          //   (intersect_dim_key_semifilter_sound)
+          auto hash_mix = [](uint64_t h, uint64_t v) noexcept -> uint64_t {
+            v += 0x9e3779b97f4a7c15ULL;
+            v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            v = (v ^ (v >> 27)) * 0x94d049bb133111ebULL;
+            v ^= (v >> 31);
+            return (h * 0x100000001b3ULL) ^ v;
+          };
+          auto hash_col_cell = [&](uint64_t h, const ColumnarColumn& col,
+                                   size_t r, bool* ok) noexcept -> uint64_t {
+            if (!col.is_uniform) {
+              *ok = false;
+              return h;
+            }
+            if (col.has_null && col.IsNull(r)) {
+              return hash_mix(h, 0x5555aaaa5555aaaaULL);
+            }
+            if (col.type == ValueType::kVarChar) {
+              const std::string_view sv = col.StringAt(r);
+              const uint64_t sh = std::hash<std::string_view>{}(sv);
+              return hash_mix(hash_mix(h, static_cast<uint64_t>(sv.size())),
+                              sh);
+            }
+            if (col.type == ValueType::kInt64 || col.type == ValueType::kDate) {
+              return hash_mix(h, static_cast<uint64_t>(col.IntAt(r)));
+            }
+            *ok = false;
+            return h;
+          };
+          FlatIntSet seed_hashes;
+          seed_hashes.Reserve(seed.TotalRows());
+          bool seed_ok = true;
+          for (const ColumnarChunk& ch : seed.columnar->chunks) {
+            for (size_t r = 0; r < ch.rows; ++r) {
+              uint64_t h = 0xcbf29ce484222325ULL;
+              for (const auto& [oi, _] : dim_out_pairs) {
+                if (oi >= ch.columns.size()) {
+                  seed_ok = false;
+                  break;
+                }
+                h = hash_col_cell(h, ch.columns[oi], r, &seed_ok);
+                if (!seed_ok) break;
+              }
+              if (!seed_ok) break;
+              seed_hashes.Insert(std::bit_cast<int64_t>(h));
+            }
+            if (!seed_ok) break;
+          }
+          if (!seed_ok || seed_hashes.Empty()) {
+            continue;
+          }
+          // Scan D (projected to pk + dim_out_pairs) in parallel and collect
+          // all D.pk whose hashed attribute tuple belongs to seed_hashes.
+          std::vector<slot_t> dproj;
+          dproj.push_back(dim_pk_slot);
+          for (const auto& [_, dcol] : dim_out_pairs) {
+            dproj.push_back(dcol);
+          }
+          std::ranges::sort(dproj);
+          dproj.erase(std::ranges::unique(dproj).begin(), dproj.end());
+          const auto pk_pos = static_cast<size_t>(std::distance(
+              dproj.begin(), std::ranges::lower_bound(dproj, dim_pk_slot)));
+          std::vector<size_t> attr_pos;
+          attr_pos.reserve(dim_out_pairs.size());
+          for (const auto& [_, dcol] : dim_out_pairs) {
+            attr_pos.push_back(static_cast<size_t>(std::distance(
+                dproj.begin(), std::ranges::lower_bound(dproj, dcol))));
+          }
+          StatusOr<Relation> drel_or = LoadSource(
+              context, dsrc, nullptr, ctes, &dproj, nullptr, nullptr, nullptr,
+              /*columnar_output=*/true);
+          if (!drel_or.HasValue() || !drel_or.Value().GetStatus().ok() ||
+              !drel_or.Value().HasColumnarOnly() ||
+              drel_or.Value().columnar == nullptr) {
+            continue;
+          }
+          const Relation& drel = drel_or.Value();
+          const size_t d_nchunks = drel.columnar->chunks.size();
+          const size_t d_workers =
+              drel.TotalRows() >= 32768
+                  ? std::min<size_t>(QueryParallelWorkerLimit(
+                                         std::thread::hardware_concurrency()),
+                                     std::max<size_t>(1, d_nchunks))
+                  : 1;
+          std::vector<std::vector<int64_t>> worker_pks(d_workers);
+          std::atomic<bool> scan_failed{false};
+          auto scan_worker = [&](size_t w) {
+            const size_t cbegin = (d_nchunks * w) / d_workers;
+            const size_t cend = (d_nchunks * (w + 1)) / d_workers;
+            auto& out_pks = worker_pks[w];
+            for (size_t ci = cbegin; ci < cend; ++ci) {
+              if (scan_failed.load(std::memory_order_relaxed)) return;
+              const ColumnarChunk& ch = drel.columnar->chunks[ci];
+              if (pk_pos >= ch.columns.size() ||
+                  !ch.columns[pk_pos].is_uniform) {
+                scan_failed.store(true, std::memory_order_relaxed);
+                return;
+              }
+              const ColumnarColumn& pkc = ch.columns[pk_pos];
+              for (size_t r = 0; r < ch.rows; ++r) {
+                if (pkc.has_null && pkc.IsNull(r)) continue;
+                uint64_t h = 0xcbf29ce484222325ULL;
+                bool ok = true;
+                for (size_t ap : attr_pos) {
+                  if (ap >= ch.columns.size()) {
+                    ok = false;
+                    break;
+                  }
+                  h = hash_col_cell(h, ch.columns[ap], r, &ok);
+                  if (!ok) break;
+                }
+                if (!ok) {
+                  scan_failed.store(true, std::memory_order_relaxed);
+                  return;
+                }
+                if (seed_hashes.Contains(std::bit_cast<int64_t>(h))) {
+                  out_pks.push_back(pkc.IntAt(r));
+                }
+              }
+            }
+          };
+          if (d_workers > 1) {
+            (void)RunParallelTasks(d_workers, scan_worker);
+          } else {
+            scan_worker(0);
+          }
+          if (scan_failed.load(std::memory_order_relaxed)) {
+            continue;
+          }
+          size_t matched_pks = 0;
+          for (const auto& vp : worker_pks) {
+            matched_pks += vp.size();
+          }
+          if (matched_pks == 0 || matched_pks * 10 > drel.TotalRows() * 7) {
+            continue;
+          }
+          RuntimeFilterBuilder rfb;
+          for (const auto& vp : worker_pks) {
+            for (int64_t pk : vp) {
+              rfb.Observe(pk);
+            }
+          }
+          auto grp = rfb.Build(false);
+          if (grp == nullptr) {
+            continue;
+          }
+          return ExecutionRuntime::ScopedExtraTableRf{
+              .table_name = std::move(fact_table),
+              .column_name = std::move(fact_fk_col),
+              .group = std::move(grp),
+          };
+        }
+        return std::nullopt;
+      };
+
+      ASSIGN_OR_RETURN(Relation, first_rel,
+                       (ExecuteQuery(context, *unshared_ptrs[order[0]], outer,
+                                     ctes, nullptr, branch_columnar_flat)));
+      combined = std::move(first_rel);
+      for (size_t oi = 1; oi < order.size(); ++oi) {
+        if (combined.TotalRows() == 0) {
+          break;
+        }
+        const SelectStatement& next_stmt = *unshared_ptrs[order[oi]];
+        auto semi_rf = try_build_semi_rf(combined, next_stmt);
+        auto* rt = context.execution_runtime();
+        struct ScopedRfPop {
+          ExecutionRuntime* r{nullptr};
+          ~ScopedRfPop() {
+            if (r != nullptr) r->scoped_extra_table_rfs.pop_back();
+          }
+        } pop_guard;
+        if (semi_rf.has_value() && rt != nullptr) {
+          rt->scoped_extra_table_rfs.push_back(std::move(*semi_rf));
+          pop_guard.r = rt;
+        }
+        ASSIGN_OR_RETURN(Relation, branch,
+                         (ExecuteQuery(context, next_stmt, outer, ctes, nullptr,
+                                       branch_columnar_flat)));
+        ASSIGN_OR_RETURN(Relation, folded_pair,
+                         (apply_pair(std::move(combined), std::move(branch),
+                                     SetOperationKind::kIntersect)));
+        combined = std::move(folded_pair);
+      }
+      // Restore original head column names if the first evaluated branch was
+      // reordered.
+      if (order[0] != 0 &&
+          combined.schema.ColumnCount() == head.SelectList().size()) {
+        std::vector<Column> renamed;
+        renamed.reserve(combined.schema.ColumnCount());
+        for (size_t ci = 0; ci < combined.schema.ColumnCount(); ++ci) {
+          Column col = combined.schema.GetColumn(ci);
+          const auto& item = head.SelectList()[ci];
+          std::string nm = item.name;
+          if (nm.empty() && item.expression &&
+              item.expression->Type() == TypeTag::kColumnValue) {
+            nm = item.expression->AsColumnValue().GetColumnName().name;
+          }
+          if (!nm.empty()) {
+            Column next_col(nm, col.Type());
+            next_col.SetUnsigned(col.IsUnsigned());
+            next_col.SetInterval(col.IsInterval());
+            renamed.push_back(std::move(next_col));
+          } else {
+            renamed.push_back(std::move(col));
+          }
+        }
+        combined.schema = Schema("", std::move(renamed));
+      }
+      handled_intersect_fast = true;
     }
-    ASSIGN_OR_RETURN(Relation, combined_folded,
-                     (FoldLowPrecedenceSetTerms(terms, low_ops, apply_pair)));
-    combined = std::move(combined_folded);
+    if (!handled_intersect_fast) {
+      ASSIGN_OR_RETURN(Relation, first_combined, run_shared_term(head));
+      combined = std::move(first_combined);
+      std::vector<Relation> terms;
+      terms.push_back(std::move(combined));
+      std::vector<SetOperationKind> low_ops;
+      for (size_t i = 0; i < statement.UnionAll().size(); ++i) {
+        const auto& union_stmt = statement.UnionAll()[i];
+        ASSIGN_OR_RETURN(Relation, branch, run_shared_term(*union_stmt));
+        const SetOperationKind operation =
+            i < statement.SetOperationKinds().size()
+                ? statement.SetOperationKinds()[i]
+                : SetOperationKind::kUnionAll;
+        const bool intersects = operation == SetOperationKind::kIntersect ||
+                                operation == SetOperationKind::kIntersectAll;
+        if (intersects) {
+          ASSIGN_OR_RETURN(Relation, folded_pair,
+                           (apply_pair(std::move(terms.back()),
+                                       std::move(branch), operation)));
+          terms.back() = std::move(folded_pair);
+        } else {
+          low_ops.push_back(operation);
+          terms.push_back(std::move(branch));
+        }
+      }
+      ASSIGN_OR_RETURN(Relation, combined_folded,
+                       (FoldLowPrecedenceSetTerms(terms, low_ops, apply_pair)));
+      combined = std::move(combined_folded);
+    }
     RETURN_IF_FAIL(combined.FinishSpill());
     RETURN_IF_FAIL(combined.GetStatus());
     if (!statement.OrderBy().empty()) {
@@ -13988,7 +14539,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         // evicted page whose spill read fails); never cache or aggregate a
         // silently truncated scan.
         RETURN_IF_FAIL(iterator.GetStatus());
-        cache_rel.FinishSpill();
+        // AddRow() is void: a spill-write failure is latched as a sticky
+        // first-error on the Relation. Never publish a truncated relation into
+        // the shared cache, or every later cache hit reports the partial rows
+        // as the complete answer.
+        RETURN_IF_FAIL(cache_rel.FinishSpill());
         cached = context.execution_runtime()
                      ->base_relations
                      .emplace(cache_key,
@@ -14009,7 +14564,10 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       // Aggregation always reads through the shared cache so the first user
       // and later users see exactly the same rows.
       Status scan_accumulate_error{Status::kSuccess};
-      cached->second->FinishSpill();
+      const Status cache_finish_status = cached->second->FinishSpill();
+      if (cache_finish_status != Status::kSuccess) {
+        scan_accumulate_error = cache_finish_status;
+      }
       Status scan_iterated = cached->second->ForEachRow([&](const Row& row) {
         if (!scan_accumulate_error.ok()) {
           return;
@@ -14113,7 +14671,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       bounded = true;
       topn_capacity = stmt.Offset() + stmt.Limit();
     }
-    ExternalKeyedSorter sorter(order_specs, bounded, topn_capacity);
+    const bool top1_with_ties = !stmt.Distinct() && stmt.HasLimit() &&
+                                stmt.WithTies() && stmt.Limit() == 1 &&
+                                stmt.Offset() == 0;
+    ExternalKeyedSorter sorter(order_specs, bounded, topn_capacity,
+                               top1_with_ties);
     // Aggregate expression identities are fixed across groups. Reuse their
     // map nodes, while still finishing every aggregate before testing HAVING
     // so errors in a discarded group remain observable.
@@ -14333,7 +14895,6 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
     const BinaryExpression& hbin = statement.Having()->AsBinaryExpression();
     if (IsComparison(hbin.Op()) && hbin.Left() &&
         hbin.Left()->Type() == TypeTag::kAggregateExp) {
-      const AggregateExpression& lhs_agg = hbin.Left()->AsAggregateExpression();
       std::optional<size_t> matched_col;
       for (size_t si = 0; si < statement.SelectList().size(); ++si) {
         if (same_expr(hbin.Left(), statement.SelectList()[si].expression)) {
@@ -14354,60 +14915,89 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
             post_having.op = hbin.Op();
             post_having.constant_or_factor = cv.value.double_value;
           }
-        } else if (lhs_agg.GetType() == AggregationType::kSum &&
-                   !lhs_agg.Distinct() && !lhs_agg.WhereFilter() &&
-                   hbin.Right()->Type() == TypeTag::kQueryExp) {
-          const QueryExpression& q = hbin.Right()->AsQueryExpression();
-          if (!q.Exists() && !q.Test() && !q.ArrayResult() &&
-              q.Query() != nullptr) {
-            const SelectStatement& sub = *q.Query();
-            bool same_sources =
-                sub.WithQueries().empty() && sub.UnionAll().empty() &&
-                !sub.GetSetOperationTree() && !sub.Qualify() &&
-                !sub.HasLimit() && sub.Offset() == 0 && sub.GroupBy().empty() &&
-                !sub.Having() && !sub.Distinct() && sub.OrderBy().empty() &&
-                sub.Sources().size() == statement.Sources().size() &&
-                same_expr(sub.WhereClause(), statement.WhereClause());
-            for (size_t s = 0; same_sources && s < statement.Sources().size();
-                 ++s) {
-              const SelectSource& a = statement.Sources()[s];
-              const SelectSource& b = sub.Sources()[s];
-              if (a.table != b.table || a.alias != b.alias ||
-                  a.join_type != b.join_type || a.query != nullptr ||
-                  b.query != nullptr || a.unnest != nullptr ||
-                  b.unnest != nullptr || a.sample.has_value() ||
-                  b.sample.has_value() ||
-                  !same_expr(a.join_condition, b.join_condition)) {
-                same_sources = false;
-              }
-            }
-            if (same_sources && sub.SelectList().size() == 1 &&
-                sub.SelectList()[0].expression &&
-                sub.SelectList()[0].expression->Type() == TypeTag::kBinaryExp) {
-              const BinaryExpression& sbin =
-                  sub.SelectList()[0].expression->AsBinaryExpression();
-              if (sbin.Op() == BinaryOperation::kMultiply) {
-                Expression const_side;
-                if (same_expr(sbin.Left(), hbin.Left())) {
-                  const_side = sbin.Right();
-                } else if (same_expr(sbin.Right(), hbin.Left())) {
-                  const_side = sbin.Left();
+        } else if (hbin.Right()->Type() == TypeTag::kQueryExp &&
+                   !statement.Distinct() && !statement.HasLimit() &&
+                   statement.Offset() == 0 && statement.WithQueries().empty() &&
+                   statement.UnionAll().empty() &&
+                   statement.GetSetOperationTree() == nullptr) {
+          // Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+          //   (grouped_having_global_sum_fubini_sound,
+          //    grouped_having_distinct_sum_fubini_bug)
+          // Match HAVING SUM(e) <cmp> (SELECT SUM(e) * factor FROM <same>
+          // WHERE <same>) so TryFusedGroupedJoin computes the grand total
+          // from group sums in a single pass without scanning the inputs twice
+          // or materializing a CTE.
+          const auto& left_agg = hbin.Left()->AsAggregateExpression();
+          const auto& right_qe = hbin.Right()->AsQueryExpression();
+          if (left_agg.GetType() == AggregationType::kSum &&
+              !left_agg.Distinct() && !left_agg.HasWhereFilter() &&
+              right_qe.Query() != nullptr && !right_qe.Test() &&
+              !right_qe.Exists() && !right_qe.Negated() &&
+              !right_qe.ArrayResult()) {
+            const auto& sub_stmt = *right_qe.Query();
+            if (sub_stmt.GroupBy().empty() && !sub_stmt.Having() &&
+                !sub_stmt.Distinct() && !sub_stmt.HasLimit() &&
+                sub_stmt.Offset() == 0 && sub_stmt.WithQueries().empty() &&
+                sub_stmt.UnionAll().empty() &&
+                sub_stmt.GetSetOperationTree() == nullptr &&
+                sub_stmt.SelectList().size() == 1 &&
+                sub_stmt.Sources().size() == statement.Sources().size() &&
+                same_expr(statement.WhereClause(), sub_stmt.WhereClause())) {
+              bool same_sources = true;
+              for (size_t si = 0; si < statement.Sources().size(); ++si) {
+                const auto& a = statement.Sources()[si];
+                const auto& b = sub_stmt.Sources()[si];
+                if (a.query != nullptr || b.query != nullptr ||
+                    a.join_type != b.join_type || a.table != b.table ||
+                    a.alias != b.alias ||
+                    !same_expr(a.join_condition, b.join_condition)) {
+                  same_sources = false;
+                  break;
                 }
-                if (const_side &&
-                    const_side->Type() == TypeTag::kConstantValue) {
-                  const Value& fv = const_side->AsConstantValue().GetValue();
-                  if (!fv.IsNull() &&
-                      (fv.type == ValueType::kDouble ||
-                       (fv.type == ValueType::kInt64 && !fv.IsUnsigned()))) {
-                    post_having.active = true;
-                    post_having.is_self_sum_factor = true;
-                    post_having.select_col = *matched_col;
-                    post_having.op = hbin.Op();
-                    post_having.constant_or_factor =
-                        fv.type == ValueType::kDouble
-                            ? fv.value.double_value
-                            : static_cast<double>(fv.value.int_value);
+              }
+              const Expression& sub_expr = sub_stmt.SelectList()[0].expression;
+              if (same_sources && sub_expr &&
+                  sub_expr->Type() == TypeTag::kBinaryExp &&
+                  sub_expr->AsBinaryExpression().Op() ==
+                      BinaryOperation::kMultiply) {
+                const auto& mbin = sub_expr->AsBinaryExpression();
+                auto extract_factor = [&](const Expression& a,
+                                          const Expression& b,
+                                          double* factor_out) -> bool {
+                  if (!a || !b || a->Type() != TypeTag::kAggregateExp ||
+                      b->Type() != TypeTag::kConstantValue ||
+                      !same_expr(a, hbin.Left())) {
+                    return false;
                   }
+                  const Value& fv = b->AsConstantValue().GetValue();
+                  if (fv.IsNull()) {
+                    return false;
+                  }
+                  double f = 0.0;
+                  if (fv.type == ValueType::kDouble) {
+                    f = fv.value.double_value;
+                  } else if (fv.type == ValueType::kInt64) {
+                    f = fv.IsUnsigned()
+                            ? static_cast<double>(
+                                  static_cast<uint64_t>(fv.value.int_value))
+                            : static_cast<double>(fv.value.int_value);
+                  } else {
+                    return false;
+                  }
+                  if (!std::isfinite(f)) {
+                    return false;
+                  }
+                  *factor_out = f;
+                  return true;
+                };
+                double factor = 0.0;
+                if (extract_factor(mbin.Left(), mbin.Right(), &factor) ||
+                    extract_factor(mbin.Right(), mbin.Left(), &factor)) {
+                  post_having.active = true;
+                  post_having.is_self_sum_factor = true;
+                  post_having.select_col = *matched_col;
+                  post_having.op = hbin.Op();
+                  post_having.constant_or_factor = factor;
                 }
               }
             }

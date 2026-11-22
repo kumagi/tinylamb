@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
@@ -122,6 +123,16 @@ TEST(DistinctExecutorTest, DistinctDoublesScenarioMatchesGoogleSql) {
 TEST(DistinctExecutorTest, TypeSensitiveIntVsDouble) {
   std::vector<Value> vals{Value(int64_t{1}), Value(1.0)};
   EXPECT_EQ(CountDistinct(Rows(std::move(vals))), 2);
+}
+
+// A positional key past the input width is a plan error. It used to become a
+// NULL key and silently collapse unrelated rows into one DISTINCT result.
+TEST(DistinctExecutorTest, OutOfRangePositionalKeyFails) {
+  DistinctExecutor ex(std::make_shared<FakeSource>(Rows({Value(1), Value(2)})),
+                      {}, {}, /*key_cols=*/{5});
+  DataChunk chunk;
+  EXPECT_EQ(ex.NextBatch(&chunk), 0U);
+  EXPECT_EQ(ex.GetStatus().GetCode(), StatusCode::kInvalidArgument);
 }
 
 TEST(SortDistinctExecutorTest, CollapsesAdjacentNans) {

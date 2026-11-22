@@ -146,7 +146,6 @@ class RecursivePartitioner {
   };
 
   [[nodiscard]] size_t EffectiveBudgetBytes() const noexcept;
-  [[nodiscard]] Status InitRootSpillWriters();
   [[nodiscard]] static Status WriteRowToBucket(BucketWriter* bucket, Row&& row,
                                                size_t est_bytes);
   [[nodiscard]] static Status FlushBucket(BucketWriter* bucket);
@@ -157,11 +156,11 @@ class RecursivePartitioner {
   void CleanupInternal() noexcept;
 
   Options options_;
+  std::weak_ptr<const bool> store_alive_;
   RowHashFn hash_fn_;
   std::optional<QueryMemoryGrant::LocalBatchCache> grant_cache_;
 
   uint32_t root_fanout_bits_{4};
-  size_t root_writer_buf_{16384};
 
   std::vector<Row> mem_rows_;
   size_t mem_bytes_{0};

@@ -203,11 +203,15 @@ TEST(FlatIntSetAuditTest, WideDenseMembershipKeepsHolesAndSignedEndpoints) {
     }
     set.FinalizeDenseBounds();
     EXPECT_FALSE(set.DenseOverflowed());
-    EXPECT_EQ(set.Size(), span / 1000 + 1);  // NOLINT(readability-math-missing-parentheses)
+    EXPECT_EQ(set.Size(),
+              span / 1000 + 1);  // NOLINT(readability-math-missing-parentheses)
     for (int64_t i = 0; i <= span / 1000; ++i) {
-      EXPECT_TRUE(set.Contains(base + i * 1000));  // NOLINT(readability-math-missing-parentheses)
+      EXPECT_TRUE(set.Contains(
+          base + i * 1000));  // NOLINT(readability-math-missing-parentheses)
       if (i != span / 1000) {
-        EXPECT_FALSE(set.Contains(base + i * 1000 + 1));  // NOLINT(readability-math-missing-parentheses)
+        EXPECT_FALSE(
+            set.Contains(base + i * 1000 +
+                         1));  // NOLINT(readability-math-missing-parentheses)
       }
     }
     if (base > INT64_MIN) {
@@ -297,6 +301,10 @@ TEST(ScanFilterTest, FastLikeMatchAsciiAndWildcards) {
   EXPECT_TRUE(FastLikeMatch("a\xC3\xA9z", "%_z"));
   // A truncated trailing multi-byte sequence still counts as one character.
   EXPECT_TRUE(FastLikeMatch("a\xC3", "a_"));
+  EXPECT_TRUE(FastLikeMatch("abc%", "abc\\%"));
+  EXPECT_FALSE(FastLikeMatch("abcd", "abc\\%"));
+  EXPECT_TRUE(FastLikeMatch("x_a", "%\\_a"));
+  EXPECT_FALSE(FastLikeMatch("xxa", "%\\_a"));
 }
 
 TEST(ScanFilterTest, TryDecideConstantConjunctFoldsCompileTimeConstants) {
@@ -740,11 +748,14 @@ TEST(ScanFilterTest,
                           ConstantValueExp(Value("2000-01-01")));
   const auto compiled = TryCompileSimpleCompare(expression, schema);
   ASSERT_TRUE(compiled.has_value());
-  ASSERT_TRUE(compiled->date_string_payload);  // NOLINT(bugprone-unchecked-optional-access)
+  ASSERT_TRUE(
+      compiled
+          ->date_string_payload);  // NOLINT(bugprone-unchecked-optional-access)
   // A parameter rebind can replace the parsed literal with an unparseable
   // string after compilation; the failed coercion must surface as an error,
   // not a clean per-row reject.
-  SimpleComparePredicate rebound = *compiled;  // NOLINT(bugprone-unchecked-optional-access)
+  SimpleComparePredicate rebound =
+      *compiled;  // NOLINT(bugprone-unchecked-optional-access)
   rebound.date_string_payload = false;
   rebound.constant = Value("invalid date");
   const Row row({Value::DateFromDays(11138)});
@@ -757,8 +768,8 @@ TEST(ScanFilterTest,
 TEST(ScanFilterTest, UnsignedTaggingLimitedToReferencedColumns) {
   Column unsigned_column(ColumnName("u"), ValueType::kInt64);
   unsigned_column.SetUnsigned(true);
-  const Schema schema("test", {Column(ColumnName("id"), ValueType::kInt64),
-                               unsigned_column});
+  const Schema schema(
+      "test", {Column(ColumnName("id"), ValueType::kInt64), unsigned_column});
   // A predicate over only the signed column must not disable the fast paths
   // because of an untouched unsigned column.
   const auto signed_filter = CompileScanFilter(

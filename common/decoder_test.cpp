@@ -39,7 +39,7 @@ std::atomic<std::thread::id> g_measuring_thread;
 inline void CountAllocationIfActive() {
   if (g_counting.load(std::memory_order_relaxed) &&
       std::this_thread::get_id() ==
-      g_measuring_thread.load(std::memory_order_relaxed)) {
+          g_measuring_thread.load(std::memory_order_relaxed)) {
     g_alloc_count.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -50,7 +50,8 @@ inline void CountAllocationIfActive() {
 // Replace the allocation and deallocation paths together to preserve pairing.
 void* operator new(std::size_t n) {
   CountAllocationIfActive();
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) raw-buffer codec test
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+  // raw-buffer codec test
   void* p = std::malloc(n == 0 ? 1 : n);
   // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
   if (p == nullptr) {
@@ -60,7 +61,8 @@ void* operator new(std::size_t n) {
 }
 void* operator new[](std::size_t n) {
   CountAllocationIfActive();
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) raw-buffer codec test
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+  // raw-buffer codec test
   void* p = std::malloc(n == 0 ? 1 : n);
   if (p == nullptr) {
     // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
@@ -87,30 +89,46 @@ void* operator new(std::size_t n, std::align_val_t a) {
 void* operator new[](std::size_t n, std::align_val_t a) {
   return operator new(n, a);
 }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
 void operator delete(void* p) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
 void operator delete[](void* p) noexcept { std::free(p); }
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
 void operator delete(void* p, std::size_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
-void operator delete[](void* p, std::size_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
-void operator delete(void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
-void operator delete[](void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
+void operator delete[](void* p, std::size_t /*unused*/) noexcept {
+  std::free(p);
+}
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
+void operator delete(void* p, std::align_val_t /*unused*/) noexcept {
   std::free(p);
 }
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-void operator delete[](void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
+void operator delete[](void* p, std::align_val_t /*unused*/) noexcept {
   std::free(p);
+}
+void operator delete(void* p, std::size_t /*unused*/,
+                     std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+  // intentional in this code
+  std::free(p);
+}
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+void operator delete[](void* p, std::size_t /*unused*/,
+                       std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+  // intentional in this code
+  std::free(p);
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 }
 
 namespace tinylamb {
@@ -157,6 +175,26 @@ struct TrailingField final {
 };
 
 }  // namespace
+
+TEST(DecoderTest, DecodeRejectsTrailingBytes) {
+  const std::string encoded = Encode(uint64_t{123});
+  ASSERT_TRUE(Decode<uint64_t>(encoded).HasValue());
+  const auto trailing = Decode<uint64_t>(encoded + "garbage");
+  EXPECT_EQ(trailing.GetStatus(), Status::kCorrupt);
+}
+
+TEST(DecoderTest, EncoderSnapshotsAliasedStringViewBeforeGrowth) {
+  std::string bytes = "abcdefghijklmnop";
+  bytes.shrink_to_fit();
+  const std::string original = bytes.substr(3, 9);
+  const size_t prefix = bytes.size();
+  Encoder encoder(bytes);
+  encoder << std::string_view(bytes).substr(3, 9);
+  const auto decoded =
+      Decode<std::string>(std::string_view(bytes).substr(prefix));
+  ASSERT_TRUE(decoded.HasValue());
+  EXPECT_EQ(decoded.Value(), original);
+}
 
 TEST(DecoderTest, DecodeRoundTripsOverStringViewStorage) {
   std::string payload;
@@ -208,7 +246,7 @@ TEST(DecoderTest, AtEndSeesTrueExactlyAtBufferEnd) {
   std::string both;
   {
     Encoder enc(both);
-    enc << TrailingField{.head=42, .tail=0.5};
+    enc << TrailingField{.head = 42, .tail = 0.5};
   }
   ASSIGN_OR_ASSERT_FAIL(TrailingField, missing,
                         Decode<TrailingField>(head_only));
@@ -223,7 +261,8 @@ TEST(DecoderTest, AtEndSeesTrueExactlyAtBufferEnd) {
 // heap at all.  The old body (std::string copy feeding a std::stringstream)
 // allocated at least twice per Decode; the in-place get area does neither.
 TEST(DecoderTest, AllocationMeasurementStopsOnException) {
-  EXPECT_THROW(MeasureAllocations([] { throw std::bad_alloc(); }), std::bad_alloc);
+  EXPECT_THROW(MeasureAllocations([] { throw std::bad_alloc(); }),
+               std::bad_alloc);
   EXPECT_FALSE(g_counting.load(std::memory_order_relaxed));
 }
 
@@ -231,7 +270,7 @@ TEST(DecoderTest, DecodeOfPlainPayloadPerformsNoHeapAllocation) {
   std::string payload;
   {
     Encoder enc(payload);
-    enc << TrailingField{.head=7, .tail=0.25};
+    enc << TrailingField{.head = 7, .tail = 0.25};
   }
   // Warm up: the first Decode may pull in lazy static init outside the
   // measurement window.
@@ -246,9 +285,9 @@ TEST(DecoderTest, DecodeOfPlainPayloadPerformsNoHeapAllocation) {
     }
   });
   EXPECT_EQ(sink.load(), 700U);
-  EXPECT_EQ(measured, 0U)
-      << "Decode of a 16-byte POD payload allocated " << measured
-      << " times (copy + stringstream regression?)";
+  EXPECT_EQ(measured, 0U) << "Decode of a 16-byte POD payload allocated "
+                          << measured
+                          << " times (copy + stringstream regression?)";
 }
 
 }  // namespace tinylamb

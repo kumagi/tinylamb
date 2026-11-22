@@ -58,7 +58,16 @@ class IndexScanIterator : public IteratorBase {
   IndexScanIterator& operator=(IndexScanIterator&&) = delete;
   ~IndexScanIterator() override = default;
   bool operator==(const IndexScanIterator& rhs) const {
-    return bpt_ == rhs.bpt_ && &txn_ == &rhs.txn_ &&
+    // Two cursors are interchangeable only when their whole positioning state
+    // matches. Comparing just the root page, txn, and (lazily resolved) row
+    // would call an exhausted or oppositely directed cursor "equal" at the
+    // same row.
+    return bpt_ == rhs.bpt_ && &table_ == &rhs.table_ &&
+           &index_ == &rhs.index_ && &txn_ == &rhs.txn_ &&
+           ascending_ == rhs.ascending_ && resolve_head_ == rhs.resolve_head_ &&
+           is_unique_ == rhs.is_unique_ && invalidated_ == rhs.invalidated_ &&
+           status_ == rhs.status_ && value_offset_ == rhs.value_offset_ &&
+           pos_ == rhs.pos_ && keys_ == rhs.keys_ &&
            current_row_ == rhs.current_row_;
   }
   [[nodiscard]] bool IsValid() const override;
@@ -176,6 +185,11 @@ class IndexScanIterator : public IteratorBase {
   mutable std::vector<std::pair<size_t, size_t>> heap_image_slots_;
   mutable size_t heap_page_images_copied_{0};
   mutable size_t rows_decoded_{0};
+  // Pre-decode integer filters. Not filled by this class' constructors or
+  // SetProjection(): the friend IndexScan compiles them from its residual
+  // predicate (IndexScan::CompileIntegerPeeks in executor/index_scan.cpp)
+  // after each (re)open. Plain iterator users therefore legitimately see an
+  // empty list here; the SQL scan path does not.
   std::vector<IntegerPeekCompare> integer_peeks_;
   std::optional<std::vector<slot_t>> projection_;
   // One-slot memo for the chain probe in TryReadIndexOnly: consecutive

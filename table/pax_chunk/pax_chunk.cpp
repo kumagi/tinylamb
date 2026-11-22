@@ -23,8 +23,9 @@
 namespace tinylamb {
 
 // ---------------------------------------------------------------------------
-// Varchar predicate pushdown (docs/12 roadmap: native eq + RANGE over
-// CONST/PLAIN/DICT/FSST). Comparison domain is the DECODED value: NULL cells
+// Varchar predicate pushdown over CONST/PLAIN/DICT/FSST supports equality,
+// inequality, ordered comparisons, prefix matching and half-open ranges.
+// Comparison domain is the DECODED value: NULL cells
 // are the empty string, exactly like ReadColumnValue/ReadRow report them.
 // ---------------------------------------------------------------------------
 namespace {
@@ -58,6 +59,12 @@ struct StrPredicate {
   }
   // Half-open [lo, hi) with either side unbounded.
   [[nodiscard]] bool MatchesRange(std::string_view v) const {
+    // Defensive self-check: internal callers that build StrPredicate directly
+    // (e.g. dictionary range windows) must not rely on the public API having
+    // rejected an empty interval first.
+    if (has_lo && has_hi && std::string_view(lo) >= std::string_view(hi)) {
+      return false;
+    }
     if (has_lo && !(v >= std::string_view(lo))) {
       return false;
     }
@@ -133,8 +140,8 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
     }
     case Scheme::kDict: {
       // The 2-byte code-count header must be inside the region BEFORE the
-      // read (the kConst arm above / kFsst arm below and every sibling kDict decoder
-      // gate the same way; a 1-byte cell at the data-area end would
+      // read (the kConst arm above / kFsst arm below and every sibling kDict
+      // decoder gate the same way; a 1-byte cell at the data-area end would
       // otherwise read its ncodes from the footer's first byte).
       if (r + 2 > region_end) {
         return std::nullopt;

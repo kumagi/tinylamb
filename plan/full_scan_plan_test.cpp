@@ -322,7 +322,7 @@ TEST_F(FullScanClusteredOrderTest, ParallelShapeKeepsAndDmlSourceWithholds) {
   const std::vector<ColumnStats> columns{stats->Column(0)};
   const uint64_t proof = stats->LayoutGeneration();
 
-  // D-9: at or above the parallel-scan threshold EmitExecutor picks the
+  // At or above the parallel-scan threshold EmitExecutor picks the
   // morsel-parallel scan, whose morsel-ordered handoff still delivers the
   // stored chain order -- the claim survives, and the ordered parallel scan
   // refuses row-filter pushdown (deferred-row parking would reorder).

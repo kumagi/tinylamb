@@ -503,11 +503,11 @@ struct SExpr {
   SPredPtr cond;                          // kCase only
   std::unique_ptr<SExpr> then_e, else_e;  // kCase only
 
-  [[nodiscard]] Value Eval(const Row& row) const {
+  [[nodiscard]] StatusOr<Value> Eval(const Row& row) const {
     switch (kind) {
       case Kind::kConst:
         if (const_null) {
-          return {};
+          return Value();
         }
         return is_str   ? Value(std::string(const_val == kStrA ? "a" : "bb"))
                : is_dbl ? Value(static_cast<double>(const_val) * 0.5)
@@ -515,36 +515,45 @@ struct SExpr {
       case Kind::kCol:
         return row[static_cast<size_t>(col)];
       case Kind::kArith: {
-        const Value l = lhs->Eval(row);
-        const Value r = rhs->Eval(row);
+        ASSIGN_OR_RETURN(Value, l, lhs->Eval(row));
+        ASSIGN_OR_RETURN(Value, r, rhs->Eval(row));
         if (l.IsNull() || r.IsNull()) {
-          return {};
+          return Value();
         }
         const int64_t lv = l.value.int_value;
         const int64_t rv = r.value.int_value;
+        int64_t result = 0;
+        bool overflow = false;
         if (op == "+") {
-          return Value(lv + rv);
+          overflow = __builtin_add_overflow(lv, rv, &result);
+        } else if (op == "-") {
+          overflow = __builtin_sub_overflow(lv, rv, &result);
+        } else {
+          overflow = __builtin_mul_overflow(lv, rv, &result);
         }
-        if (op == "-") {
-          return Value(lv - rv);
+        if (overflow) {
+          return Status::kIsInfinity;
         }
-        return Value(lv * rv);
+        return Value(result);
       }
       case Kind::kCoalesce: {
-        const Value l = lhs->Eval(row);
-        return l.IsNull() ? rhs->Eval(row) : l;
+        ASSIGN_OR_RETURN(Value, l, lhs->Eval(row));
+        if (l.IsNull()) {
+          return rhs->Eval(row);
+        }
+        return l;
       }
       case Kind::kConcat: {
-        const Value l = lhs->Eval(row);
+        ASSIGN_OR_RETURN(Value, l, lhs->Eval(row));
         if (l.IsNull()) {
-          return {};
+          return Value();
         }
         return Value(std::string(l.value.varchar_value) + "!");
       }
       case Kind::kCase:
         return (cond->Eval(row) == 'T' ? then_e : else_e)->Eval(row);
     }
-    return {};
+    return Value();
   }
 
   [[nodiscard]] std::string Render() const {
@@ -905,15 +914,31 @@ bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
     *error = "unknown ddl: " + ddl;
     return false;
   }
+  // Replay inputs are arbitrary text: every delimiter must be present before
+  // it is used as a substr length/offset (an npos value underflows into
+  // std::out_of_range).
   const size_t name_end = ddl.find(" ON ", name_pos);
+  const size_t key_pos = name_end == std::string::npos
+                             ? std::string::npos
+                             : ddl.find(" KEY(", name_end);
+  const size_t key_end =
+      key_pos == std::string::npos ? std::string::npos : ddl.find(')', key_pos);
+  if (name_end == std::string::npos || key_pos == std::string::npos ||
+      key_end == std::string::npos || name_end < name_pos + prefix.size() ||
+      key_end < key_pos) {
+    *error = "malformed ddl: " + ddl;
+    return false;
+  }
   const std::string name =
       ddl.substr(name_pos + prefix.size(), name_end - name_pos - prefix.size());
-  const size_t key_pos = ddl.find(" KEY(", name_end);
-  const size_t key_end = ddl.find(')', key_pos);
   const size_t inc_pos = ddl.find(" INCLUDE(", key_end);
   size_t inc_end = std::string::npos;
   if (inc_pos != std::string::npos) {
     inc_end = ddl.find(')', inc_pos);
+    if (inc_end == std::string::npos) {
+      *error = "malformed ddl (INCLUDE): " + ddl;
+      return false;
+    }
   }
   const std::string table = ddl.substr(name_end + strlen(" ON "),
                                        key_pos - name_end - strlen(" ON "));
@@ -925,7 +950,7 @@ bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
                                      inc_end - inc_pos - strlen(" INCLUDE(")));
   }
   const IndexSchema schema(
-      name, key, include,
+      name, std::move(key), std::move(include),
       is_unique ? IndexMode::kUnique : IndexMode::kNonUnique);
   const Status status = db.CreateIndex(ctx, table, schema);
   if (status != Status::kSuccess) {
@@ -1749,7 +1774,12 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       std::vector<std::pair<int, Value>> results;
       results.reserve(sets.size());
       for (const auto& [col, expr] : sets) {
-        results.emplace_back(col, expr->Eval(*head_row));
+        auto evaluated = expr->Eval(*head_row);
+        if (!evaluated.HasValue()) {
+          return "concurrent UPDATE accepted an overflowing expression: " +
+                 sql + "\n";
+        }
+        results.emplace_back(col, evaluated.MoveValue());
       }
       target->rows[row_idx] = *head_row;
       for (const auto& [col, v] : results) {
@@ -2081,6 +2111,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           const size_t existing = target->rows.size();
           std::vector<Row> added;
           added.reserve(existing);
+          bool expect_overflow = false;
           for (size_t i = 0; i < existing; ++i) {
             const Row& row = target->rows[i];
             if (pred->Eval(row) != 'T') {
@@ -2089,7 +2120,15 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             std::vector<Value> cells;
             cells.reserve(exprs.size());
             for (const SExprPtr& e : exprs) {
-              cells.push_back(e->Eval(row));
+              auto evaluated = e->Eval(row);
+              if (!evaluated.HasValue()) {
+                expect_overflow = true;
+                break;
+              }
+              cells.push_back(evaluated.MoveValue());
+            }
+            if (expect_overflow) {
+              break;
             }
             added.emplace_back(std::move(cells));
           }
@@ -2099,7 +2138,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
               has_active_key = true;
             }
           }
-          if (has_active_key && added.size() != 1) {
+          if (!expect_overflow && has_active_key && added.size() != 1) {
             // Multi-row (or vacuous) projections against an active unique
             // index have order-dependent intermediate states; only a
             // single-row insert has a deterministic verdict, and a
@@ -2122,6 +2161,15 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           std::string why;
           const bool ok =
               RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why);
+          if (expect_overflow) {
+            t.steps.push_back({.must_fail = true, .sql = sql});
+            if (ok || why.find("integer overflow") == std::string::npos) {
+              return "INSERT SELECT did not report the predicted integer "
+                     "overflow: " +
+                     sql + " :: " + why + "\n";
+            }
+            break;
+          }
           if (expect_dup) {
             if (ok) {
               t.steps.push_back({.must_fail = true, .sql = sql});
@@ -2359,27 +2407,31 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
                 sets[0].second->Render() + " WHERE " + pred->Render() + ";";
           touches_key = false;
         }
+        bool expect_overflow = false;
+        std::vector<std::pair<size_t, Row>> updated;
+        updated.reserve(match_idx.size());
+        for (const size_t index : match_idx) {
+          const Row& previous = target->rows[index];
+          Row row = previous;
+          for (const auto& [col, expr] : sets) {
+            auto evaluated = expr->Eval(previous);
+            if (!evaluated.HasValue()) {
+              expect_overflow = true;
+              break;
+            }
+            row[static_cast<size_t>(col)] = evaluated.MoveValue();
+          }
+          if (expect_overflow) {
+            break;
+          }
+          updated.emplace_back(index, std::move(row));
+        }
         bool expect_dup = false;
-        if (touches_key) {  // exactly one matching row here
-          std::vector<Row> post = target->rows;
-          for (size_t mi : match_idx) {
-            Row row = post[mi];
-            std::vector<std::pair<int, Value>> results;
-            results.reserve(sets.size());
-            for (const auto& [col, expr] : sets) {
-              results.emplace_back(col, expr->Eval(row));
-            }
-            for (const auto& [col, v] : results) {
-              row[static_cast<size_t>(col)] = v;
-            }
-            post[mi] = row;
-            for (const std::vector<int>& key : target->unique_keys) {
-              if (KeyCollides(post, row, key, mi)) {
-                expect_dup = true;
-                break;
-              }
-            }
-            if (expect_dup) {
+        if (!expect_overflow && touches_key && !updated.empty()) {
+          const auto& [index, row] = updated.front();
+          for (const auto& key : target->unique_keys) {
+            if (KeyCollides(target->rows, row, key, index)) {
+              expect_dup = true;
               break;
             }
           }
@@ -2390,18 +2442,20 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         std::string why;
         const bool ok =
             RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why);
+        if (expect_overflow) {
+          t.steps.push_back({.must_fail = true, .sql = sql});
+          if (ok || why.find("integer overflow") == std::string::npos) {
+            return "UPDATE did not report the predicted integer overflow: " +
+                   sql + " :: " + why + "\n";
+          }
+          break;
+        }
         if (expect_dup) {
           if (ok) {
             t.steps.push_back({.must_fail = true, .sql = sql});
             return "unique-violating UPDATE unexpectedly accepted at step " +
                    std::to_string(step) + ": " + sql + "\n";
           }
-          t.steps.push_back({.must_fail = true, .sql = sql});
-          break;
-        }
-        // The row mirror wraps int64 arithmetic on overflow while the engine
-        // rejects it; such a rejection is expected, not an oracle mismatch.
-        if (!ok && why.find("integer overflow on") != std::string::npos) {
           t.steps.push_back({.must_fail = true, .sql = sql});
           break;
         }
@@ -2415,20 +2469,8 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           return err;
         }
         t.steps.push_back({.sql = sql});
-        for (Row& row : target->rows) {
-          if (pred->Eval(row) != 'T') {
-            continue;
-          }
-          // Evaluate all SET expressions before assigning: every RHS reads
-          // the pre-update row.
-          std::vector<std::pair<int, Value>> results;
-          results.reserve(sets.size());
-          for (const auto& [col, expr] : sets) {
-            results.emplace_back(col, expr->Eval(row));
-          }
-          for (const auto& [col, v] : results) {
-            row[static_cast<size_t>(col)] = v;
-          }
+        for (auto& [index, row] : updated) {
+          target->rows[index] = std::move(row);
         }
         if (dbg_pred) {
           if (std::string mismatch = check_all_tables(); !mismatch.empty()) {
@@ -2784,6 +2826,14 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
   if (trace.steps.empty()) {
     return "malformed trace: no steps";
   }
+  // Replay consumes checks in step order. Out-of-order after_step values (a
+  // hand edit or a bad Cut) would leave every later check unexecuted and the
+  // partial trace would replay green. Require the recorded order to be sane.
+  for (size_t i = 1; i < trace.checks.size(); ++i) {
+    if (trace.checks[i].after_step < trace.checks[i - 1].after_step) {
+      return "malformed trace: checks are not ordered by after_step";
+    }
+  }
   ScopedDb sdb("sql_session_replay");
   if (!sdb) {
     return "failed to create replay database\n";
@@ -2908,6 +2958,14 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
       }
       ++check_index;
     }
+  }
+  if (check_index != trace.checks.size()) {
+    // A check with after_step >= steps.size() is never reached by the loop.
+    // Confirm every recorded check actually ran; otherwise a trace whose
+    // trailing steps were removed would still be reported as "fixed".
+    return "malformed trace: " +
+           std::to_string(trace.checks.size() - check_index) +
+           " recorded check(s) were never reached (after_step >= steps.size())";
   }
   return "";
 }

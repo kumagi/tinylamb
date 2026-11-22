@@ -31,7 +31,20 @@ size_t ConstantExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
     std::vector<Column> cols;
     cols.reserve(rows_.front().values_.size());
     for (const Value& v : rows_.front().values_) {
-      cols.emplace_back("", v.type);
+      Column col("", v.type);
+      // Keep the row-level type tags the values actually carry.
+      col.SetUnsigned(v.IsUnsigned());
+      col.SetInterval(v.IsInterval());
+      cols.push_back(std::move(col));
+    }
+    // Same contract as ValuesExecutor: a mismatched row width would break
+    // the DataChunk invariant checked by Append.
+    for (const Row& row : rows_) {
+      if (row.values_.size() != cols.size()) {
+        FailWith(StatusError(StatusCode::kInvalidArgument,
+                             "constant row width mismatch"));
+        return 0;
+      }
     }
     schema_ = Schema("", std::move(cols));
   }

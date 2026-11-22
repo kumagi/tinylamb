@@ -25,12 +25,13 @@ size_t PipelineContext::OperatorBudgetBytes(size_t b_min) const noexcept {
   if (!grant.Unlimited()) {
     return grant.OperatorBudgetBytes(b_min);
   }
+  // An explicitly unlimited grant (e.g. a pre-acquired one) must not be
+  // silently quartered. Cap it by the query pool when that is known, but let
+  // the operator use the whole pool rather than a 1/(4 * consumers) slice.
   const size_t pool_max = ProcessMemoryBudget::Global().EffectivePoolMaxBytes(
       MemoryPoolKind::kQuery);
   if (pool_max > 0) {
-    const size_t active = std::max<size_t>(1, grant.ActiveConsumerCount());
-    const size_t quarter = std::max<size_t>(b_min, pool_max / (4 * active));
-    return quarter;
+    return std::max(b_min, pool_max);
   }
   return std::max<size_t>(b_min, size_t{64} << 20);
 }
@@ -319,8 +320,8 @@ Status PipelineExecutor::Initialize() {
   if (initialized_) {
     return Status::kSuccess;
   }
-  initialized_ = true;
-
+  // Publish initialization only after all stages open successfully.
+  // NextBatch records any initialization failure as a sticky executor error.
   QueryMemoryGrant grant;
   if (pre_acquired_grant_.has_value()) {
     grant = std::move(*pre_acquired_grant_);
@@ -347,6 +348,7 @@ Status PipelineExecutor::Initialize() {
 
   if (graph_.stages.empty()) {
     root_exhausted_ = true;
+    initialized_ = true;
     return Status::kSuccess;
   }
 
@@ -381,6 +383,7 @@ Status PipelineExecutor::Initialize() {
     RETURN_IF_FAIL(op->Open(ctx_.get()));
   }
   completed_metrics_ = ctx_->Snapshot();
+  initialized_ = true;
   return Status::kSuccess;
 }
 

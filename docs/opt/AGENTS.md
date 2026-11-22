@@ -78,7 +78,7 @@ tinylamb の最適化は 3 層の独立した Rule セットで構成される
 
 | 層 | 定義場所 | 本数 | 役割 |
 |---|---|---|---|
-| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 71 | 定数畳み込み・比較の正規化・ブール恒等式などスカラー式の正規化 |
+| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 70 | 定数畳み込み・比較の正規化・ブール恒等式などスカラー式の正規化 |
 | 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 95 | Memo へ同値な論理式を追加(探索) |
 | 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 46 | 論理式を物理プランへ実装(コスト評価の対象) |
 
@@ -122,7 +122,7 @@ docs/opt/
     60-rule-governance.md          Rule 追加・無効化・事前条件ゲート(D5)
     70-expression-rewrite.md       式書き換え: フレームワークと自明な Rule の一括解説
   part2-rules/                     第2部 Rule リファレンス(辞書向け)
-    logical/<rule-name>.md         論理 Rule 91 本(1 ルール 1 ファイル)
+    logical/<rule-name>.md         論理 Rule 95 本(1 ルール 1 ファイル)
     implementation/<rule-name>.md  実装 Rule 46 本(1 ルール 1 ファイル)
     expression/<rule-name>.md      式書き換え Rule の非自明なもの(個別章)
 ```
@@ -241,7 +241,7 @@ docs/opt/
 
 `relational_ir`, `dummy_scan`, `values`, `unnest`, `apply`, `recursive_cte`, `index_scan`, `full_scan`, `selection`, `sample`, `projection`, `aggregation`, `sort_incremental`, `sort`, `sort_external_merge`, `window`, `topn`, `empty`, `distinct`, `sort_distinct`, `skip_scan_distinct`, `union`, `union_all`, `intersect`, `intersect_all`, `except`, `except_all`, `limit`, `hash_join`, `merge_join`, `band_join`, `zigzag_join`, `outer_hash_join`, `cross_join`, `semi_hash_join`, `anti_hash_join`, `semi_merge_join`, `anti_merge_join`, `index_join`, `late_materialization_join`, `nested_loop_join`, `outer_nested_loop`, `batch_nested_loop`, `batch_nested_loop_semi`, `batch_nested_loop_anti`, `batch_nested_loop_outer`
 
-### 式書き換え Rule(71 本)(決定: 2026-09-13 — 1 本も飛ばさない)
+### 式書き換え Rule(70 本)(決定: 2026-09-13 — 1 本も飛ばさない)
 
 `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` は全 Rule を解説
 する。定数畳み込み(`x + 0`、`x * 1` など)のように自明度の高いものは

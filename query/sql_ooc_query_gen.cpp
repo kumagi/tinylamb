@@ -107,10 +107,9 @@ class Builder {
   }
 
  private:
-  const OocGenTable& T() {
-    return tables_[static_cast<size_t>(
-        g_.Pick(0, static_cast<int64_t>(tables_.size()) - 1))];
-  }
+  // OneOf uses at(), so an empty table list is rejected explicitly instead
+  // of indexing tables_[0] out of bounds (UB).
+  const OocGenTable& T() { return g_.OneOf(tables_); }
   int64_t Key(const OocGenTable& t) { return g_.Pick(t.key_lo, t.key_hi); }
   const std::string& Tag() { return g_.OneOf(TagLits()); }
 
@@ -257,26 +256,28 @@ class Builder {
   OutCol PlainCol(const std::string& a, const OocGenTable& t, bool allow_wide) {
     switch (g_.Pick(0, allow_wide ? 8 : 7)) {
       case 0:
-        return {.expr=C(a, "v")};
+        return {.expr = C(a, "v")};
       case 1:
-        return {.expr=C(a, "t"), .is_string=true};
+        return {.expr = C(a, "t"), .is_string = true};
       case 2:
-        return {.expr=C(a, "g")};
+        return {.expr = C(a, "g")};
       case 3:
-        return {.expr="LENGTH(" + C(a, "pad") + ")"};
+        return {.expr = "LENGTH(" + C(a, "pad") + ")"};
       case 4:
-        return {.expr="SUBSTR(" + C(a, "pad") + ", 1, " + I(g_.Pick(1, 16)) + ")",
-                .is_string=true};
+        return {
+            .expr = "SUBSTR(" + C(a, "pad") + ", 1, " + I(g_.Pick(1, 16)) + ")",
+            .is_string = true};
       case 5:
-        return {.expr="IFNULL(" + C(a, "v") + ", -1) + " + C(a, "g")};
+        return {.expr = "IFNULL(" + C(a, "v") + ", -1) + " + C(a, "g")};
       case 6:
-        return {.expr="MOD(" + C(a, "k") + ", " + I(g_.Pick(2, 50)) + ")"};
+        return {.expr = "MOD(" + C(a, "k") + ", " + I(g_.Pick(2, 50)) + ")"};
       case 7:
-        return {.expr="CONCAT(IFNULL(" + C(a, "t") + ", '-'), CAST(" + C(a, "g") +
-                    " AS STRING))",
-                .is_string=true};
+        return {.expr = "CONCAT(IFNULL(" + C(a, "t") + ", '-'), CAST(" +
+                        C(a, "g") + " AS STRING))",
+                .is_string = true};
       default:
-        return {.expr=C(a, "pad"), .is_string=true, .wide=t.pad_max > 256};
+        return {
+            .expr = C(a, "pad"), .is_string = true, .wide = t.pad_max > 256};
     }
   }
 
@@ -410,36 +411,39 @@ class Builder {
   KeySet GroupKeys(const std::string& a, const OocGenTable& t) {
     switch (g_.Pick(0, 11)) {
       case 0:
-        return {.cols={{C(a, "g")}}, .est=t.groups};
+        return {.cols = {{C(a, "g")}}, .est = t.groups};
       case 1:
-        return {.cols={{C(a, "t"), true}}, .est=5};
+        return {.cols = {{C(a, "t"), true}}, .est = 5};
       case 2:
-        return {.cols={{C(a, "g")}, {C(a, "t"), true}}, .est=t.groups * 5};
+        return {.cols = {{C(a, "g")}, {C(a, "t"), true}}, .est = t.groups * 5};
       case 3: {
         const int64_t m = g_.Pick(2, 400);
-        return {.cols={{"MOD(" + C(a, "k") + ", " + I(m) + ")"}}, .est=m};
+        return {.cols = {{"MOD(" + C(a, "k") + ", " + I(m) + ")"}}, .est = m};
       }
       case 4: {
         const int64_t n = g_.Pick(1, 4);
-        return {.cols={{"SUBSTR(" + C(a, "pad") + ", 1, " + I(n) + ")", true}},
-                .est=std::min<int64_t>(t.rows, 300 * n)};
+        return {
+            .cols = {{"SUBSTR(" + C(a, "pad") + ", 1, " + I(n) + ")", true}},
+            .est = std::min<int64_t>(t.rows, 300 * n)};
       }
       case 5:
-        return {.cols={{C(a, "k")}}, .est=t.rows};
+        return {.cols = {{C(a, "k")}}, .est = t.rows};
       case 6:
-        return {.cols={{C(a, "pad"), true, t.pad_max > 256}}, .est=t.rows};
+        return {.cols = {{C(a, "pad"), true, t.pad_max > 256}}, .est = t.rows};
       case 7:
-        return {.cols={{"LENGTH(" + C(a, "pad") + ")"}},
-                .est=std::min<int64_t>(t.rows, 3000)};
+        return {.cols = {{"LENGTH(" + C(a, "pad") + ")"}},
+                .est = std::min<int64_t>(t.rows, 3000)};
       case 8:
-        return {.cols={{C(a, "v")}}, .est=std::min<int64_t>(t.rows, t.v_mod + 1)};
+        return {.cols = {{C(a, "v")}},
+                .est = std::min<int64_t>(t.rows, t.v_mod + 1)};
       case 9:
-        return {.cols={{C(a, "g")}, {"MOD(" + C(a, "v") + ", 3)"}}, .est=t.groups * 4};
+        return {.cols = {{C(a, "g")}, {"MOD(" + C(a, "v") + ", 3)"}},
+                .est = t.groups * 4};
       case 10:
-        return {.cols={{C(a, "v")}, {C(a, "t"), true}},
-                .est=std::min<int64_t>(t.rows, (t.v_mod + 1) * 5)};
+        return {.cols = {{C(a, "v")}, {C(a, "t"), true}},
+                .est = std::min<int64_t>(t.rows, (t.v_mod + 1) * 5)};
       default:
-        return {.cols={}, .est=1};
+        return {.cols = {}, .est = 1};
     }
   }
 
@@ -450,58 +454,64 @@ class Builder {
     const std::string pad = C(a, "pad");
     switch (g_.Pick(0, 22)) {
       case 0:
-        return {.expr="COUNT(*)"};
+        return {.expr = "COUNT(*)"};
       case 1:
-        return {.expr="COUNT(" + v + ")"};
+        return {.expr = "COUNT(" + v + ")"};
       case 2:
-        return {.expr="SUM(" + v + ")"};
+        return {.expr = "SUM(" + v + ")"};
       case 3:
-        return {.expr="MIN(" + k + ")"};
+        return {.expr = "MIN(" + k + ")"};
       case 4:
-        return {.expr="MAX(" + k + ")"};
+        return {.expr = "MAX(" + k + ")"};
       case 5:
-        return {.expr="MIN(" + tg + ")", .is_string=true};
+        return {.expr = "MIN(" + tg + ")", .is_string = true};
       case 6:
-        return {.expr="MAX(" + tg + ")", .is_string=true};
+        return {.expr = "MAX(" + tg + ")", .is_string = true};
       case 7:
-        return {.expr="AVG(" + v + ")"};
+        return {.expr = "AVG(" + v + ")"};
       case 8:
-        return {.expr="MIN(" + pad + ")", .is_string=true, .wide=t.pad_max > 256};
+        return {.expr = "MIN(" + pad + ")",
+                .is_string = true,
+                .wide = t.pad_max > 256};
       case 9:
-        return {.expr="MAX(" + pad + ")", .is_string=true, .wide=t.pad_max > 256};
+        return {.expr = "MAX(" + pad + ")",
+                .is_string = true,
+                .wide = t.pad_max > 256};
       case 10:
-        return {.expr="COUNT(DISTINCT " + v + ")"};
+        return {.expr = "COUNT(DISTINCT " + v + ")"};
       case 11:
-        return {.expr="COUNT(DISTINCT " + tg + ")"};
+        return {.expr = "COUNT(DISTINCT " + tg + ")"};
       case 12:
         *heavy = true;
-        return {.expr="COUNT(DISTINCT " + pad + ")"};
+        return {.expr = "COUNT(DISTINCT " + pad + ")"};
       case 13:
-        return {.expr="SUM(DISTINCT " + v + ")"};
+        return {.expr = "SUM(DISTINCT " + v + ")"};
       case 14:
         *heavy = true;
-        return {.expr="LENGTH(STRING_AGG(" + tg + ", ',' ORDER BY " + k + "))"};
+        return {.expr =
+                    "LENGTH(STRING_AGG(" + tg + ", ',' ORDER BY " + k + "))"};
       case 15:
         *heavy = true;
-        return {.expr="SUBSTR(STRING_AGG(SUBSTR(" + pad + ", 1, 6), '' ORDER BY " +
-                    k + " DESC), 1, 40)",
-                .is_string=true};
+        return {.expr = "SUBSTR(STRING_AGG(SUBSTR(" + pad +
+                        ", 1, 6), '' ORDER BY " + k + " DESC), 1, 40)",
+                .is_string = true};
       case 16:
         *heavy = true;
-        return {.expr="LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(" + k +
-                " AS STRING) ORDER BY " + k + "), ','))"};
+        return {.expr = "LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(" + k +
+                        " AS STRING) ORDER BY " + k + "), ','))"};
       case 17:
-        return {.expr="COUNTIF(" + v + " > " + I(g_.Pick(0, t.v_mod)) + ")"};
+        return {.expr = "COUNTIF(" + v + " > " + I(g_.Pick(0, t.v_mod)) + ")"};
       case 18:
-        return {.expr="BIT_XOR(" + k + ")"};
+        return {.expr = "BIT_XOR(" + k + ")"};
       case 19:
-        return {.expr="MAX(LENGTH(" + pad + "))"};
+        return {.expr = "MAX(LENGTH(" + pad + "))"};
       case 20:
-        return {.expr="SUM(LENGTH(" + pad + "))"};
+        return {.expr = "SUM(LENGTH(" + pad + "))"};
       case 21:
-        return {.expr="LOGICAL_OR(" + v + " > " + I(g_.Pick(0, t.v_mod)) + ")"};
+        return {.expr =
+                    "LOGICAL_OR(" + v + " > " + I(g_.Pick(0, t.v_mod)) + ")"};
       default:
-        return {.expr="SUM(" + k + " * " + C(a, "g") + ")"};
+        return {.expr = "SUM(" + k + " * " + C(a, "g") + ")"};
     }
   }
 
@@ -529,8 +539,8 @@ class Builder {
       in.cols.push_back(Agg(a, t, &in.heavy));
     }
     if (!a.empty() && g_.Chance(60)) {
-      in.cols.push_back(g_.Chance(50) ? OutCol{.expr="SUM(b.v)"}
-                                      : OutCol{.expr="MAX(LENGTH(b.pad))"});
+      in.cols.push_back(g_.Chance(50) ? OutCol{.expr = "SUM(b.v)"}
+                                      : OutCol{.expr = "MAX(LENGTH(b.pad))"});
     }
     in.sql = "SELECT " + SelectList(in.cols) + " FROM " + from;
     if (!keys.cols.empty()) {
@@ -637,6 +647,8 @@ class Builder {
         break;
       case 5:
         on = "a.pad = b.pad";
+        // Pad can be identical in every row, so assume one distinct key.
+        cap_a = cap_b = SideCap(cap_, 1);
         shape += "pad";
         break;
       case 6:
@@ -829,57 +841,63 @@ class Builder {
         "MAX(k)", "AVG(v)",   "MAX(t)",   "SUM(LENGTH(pad))"};
     switch (g_.Pick(0, 17)) {
       case 0:
-        return {.expr="ROW_NUMBER() OVER (" + part + total + ")"};
+        return {.expr = "ROW_NUMBER() OVER (" + part + total + ")"};
       case 1:
-        return {.expr="RANK() OVER (" + part + "ORDER BY " + SortKey("") + ")"};
+        return {.expr =
+                    "RANK() OVER (" + part + "ORDER BY " + SortKey("") + ")"};
       case 2:
-        return {.expr="DENSE_RANK() OVER (" + part + "ORDER BY " + SortKey("") + ")"};
+        return {.expr = "DENSE_RANK() OVER (" + part + "ORDER BY " +
+                        SortKey("") + ")"};
       case 3:
       case 4:
       case 5: {
         const std::string agg = g_.OneOf(kAggs);
-        return {.expr=agg + " OVER (" + part + total + RowsFrame() + ")",
-                .is_string=agg == "MAX(t)"};
+        return {.expr = agg + " OVER (" + part + total + RowsFrame() + ")",
+                .is_string = agg == "MAX(t)"};
       }
       case 6: {
         // RANGE frames are peer-based: a non-unique numeric key is fine.
         const std::string key = g_.Chance(50) ? "k" : "v";
-        return {.expr=g_.OneOf(kAggs) + " OVER (" + part + "ORDER BY " + key +
-                    " RANGE BETWEEN " + I(g_.Pick(0, 40)) + " PRECEDING AND " +
-                    I(g_.Pick(0, 40)) + " FOLLOWING)",
-                .is_string=false};
+        return {.expr = g_.OneOf(kAggs) + " OVER (" + part + "ORDER BY " + key +
+                        " RANGE BETWEEN " + I(g_.Pick(0, 40)) +
+                        " PRECEDING AND " + I(g_.Pick(0, 40)) + " FOLLOWING)",
+                .is_string = false};
       }
       case 7:
         // Default frame (RANGE UNBOUNDED PRECEDING .. CURRENT ROW peers).
-        return {.expr="SUM(v) OVER (" + part + "ORDER BY " + SortKey("") + ")"};
+        return {.expr =
+                    "SUM(v) OVER (" + part + "ORDER BY " + SortKey("") + ")"};
       case 8:
-        return {.expr="COUNT(*) OVER (" + part + ")"};
+        return {.expr = "COUNT(*) OVER (" + part + ")"};
       case 9:
-        return {.expr="LAG(v, " + I(g_.Pick(1, 40)) + ") OVER (" + part + total +
-                ")"};
+        return {.expr = "LAG(v, " + I(g_.Pick(1, 40)) + ") OVER (" + part +
+                        total + ")"};
       case 10:
-        return {.expr="LEAD(k, " + I(g_.Pick(1, 400)) + ") OVER (" + part + total +
-                ")"};
+        return {.expr = "LEAD(k, " + I(g_.Pick(1, 400)) + ") OVER (" + part +
+                        total + ")"};
       case 11:
-        return {.expr="FIRST_VALUE(v) OVER (" + part + total + ")"};
+        return {.expr = "FIRST_VALUE(v) OVER (" + part + total + ")"};
       case 12:
-        return {.expr="LAST_VALUE(k) OVER (" + part + total + RowsFrame() + ")"};
+        return {.expr =
+                    "LAST_VALUE(k) OVER (" + part + total + RowsFrame() + ")"};
       case 13:
-        return {.expr="NTH_VALUE(k, " + I(g_.Pick(1, 30)) + ") OVER (" + part +
-                total + RowsFrame() + ")"};
+        return {.expr = "NTH_VALUE(k, " + I(g_.Pick(1, 30)) + ") OVER (" +
+                        part + total + RowsFrame() + ")"};
       case 14:
-        return {.expr="NTILE(" + I(g_.Pick(1, 50)) + ") OVER (" + part + total + ")"};
+        return {.expr = "NTILE(" + I(g_.Pick(1, 50)) + ") OVER (" + part +
+                        total + ")"};
       case 15:
-        return {.expr=(g_.Chance(50) ? "PERCENT_RANK()" : "CUME_DIST()") +
-                std::string(" OVER (") + part + "ORDER BY " + SortKey("") +
-                ")"};
+        return {.expr = (g_.Chance(50) ? "PERCENT_RANK()" : "CUME_DIST()") +
+                        std::string(" OVER (") + part + "ORDER BY " +
+                        SortKey("") + ")"};
       case 16:
         *heavy = *heavy || t.pad_max > 256;
-        return {.expr="LENGTH(LAG(pad, " + I(g_.Pick(1, 9)) + ") OVER (" + part +
-                total + "))"};
+        return {.expr = "LENGTH(LAG(pad, " + I(g_.Pick(1, 9)) + ") OVER (" +
+                        part + total + "))"};
       default:
         *heavy = *heavy || t.pad_max > 256;
-        return {.expr="LENGTH(MAX(pad) OVER (" + part + total + RowsFrame() + "))"};
+        return {.expr = "LENGTH(MAX(pad) OVER (" + part + total + RowsFrame() +
+                        "))"};
     }
   }
 
@@ -1092,24 +1110,20 @@ class Builder {
   OocGenQuery Band() {
     const OocGenTable& ta = T();
     const OocGenTable& tb = T();
-    // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
-    int64_t cap_a = ta.rows + 1;
-    // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
-    int64_t cap_b = tb.rows + 1;
+    int64_t side_cap = NestedLoopSide();
     std::string on;
     std::string shape;
     switch (g_.Pick(0, 3)) {
       case 0:
         on = "b.k BETWEEN a.k - " + I(g_.Pick(0, 5)) + " AND a.k + " +
              I(g_.Pick(0, 5));
-        cap_a = cap_b = NestedLoopSide();
         shape = "band_k";
         break;
       case 1: {
         const int64_t w = g_.Pick(0, 4);
         on = "a.v BETWEEN b.v - " + I(w) + " AND b.v + " + I(w);
-        cap_a = cap_b = std::min(
-            NestedLoopSide(),
+        side_cap = std::min(
+            side_cap,
             SideCap(cap_, std::max<int64_t>(
                               1, std::min(ta.v_mod, tb.v_mod) / (2 * w + 1))));
         shape = "band_v";
@@ -1117,12 +1131,11 @@ class Builder {
       }
       case 2:
         on = "a.k < b.k AND a.g = b.g";
-        cap_a = cap_b = SideCap(cap_, std::min(ta.groups, tb.groups));
+        side_cap = SideCap(cap_, std::min(ta.groups, tb.groups));
         shape = "band_lt_eq";
         break;
       default:
         on = "a.k <= b.k AND b.k < a.k + " + I(g_.Pick(1, 8));
-        cap_a = cap_b = NestedLoopSide();
         shape = "band_half_open";
         break;
     }
@@ -1131,8 +1144,8 @@ class Builder {
     Inner in;
     in.cols = {{"a.k"}, {"b.k"}, {"a.v"}, {"b.t", true}};
     in.sql = "SELECT " + SelectList(in.cols) + " FROM " +
-             Src(ta, "a", cap_a, &ea) + (g_.Chance(25) ? " LEFT" : "") +
-             " JOIN " + Src(tb, "b", cap_b, &eb) + " ON " + on;
+             Src(ta, "a", side_cap, &ea) + (g_.Chance(25) ? " LEFT" : "") +
+             " JOIN " + Src(tb, "b", side_cap, &eb) + " ON " + on;
     in.est_rows = cap_;
     return Finish(shape, in);
   }

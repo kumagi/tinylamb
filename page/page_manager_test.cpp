@@ -26,6 +26,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -37,6 +38,7 @@
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
+#include "page/page.hpp"
 #include "page/page_lsm_store.hpp"
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
@@ -72,6 +74,7 @@ class PageManagerTest : public ::testing::Test {
     rm_.reset();
     logger_.reset();
     pm_.reset();
+    std::ignore = std::remove((prefix_ + ".db").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt.tmp").c_str());
     std::ignore = std::remove((prefix_ + ".db.blocks").c_str());
@@ -286,6 +289,41 @@ TEST_F(PageManagerTest, AuditLsmScanKeepsOwnWriteUnderForeignOverwrite) {
   ASSERT_SUCCESS(observer.Abort());
 }
 
+TEST_F(PageManagerTest, PendingLsmDestroyIsVisibleOnlyToItsOwner) {
+  constexpr page_id_t tree = 991387;
+  auto seed = tm_->Begin();
+  ASSERT_SUCCESS(pm_->LsmInsert(seed, tree, "key", "committed"));
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  auto destroyer = tm_->Begin();
+  auto observer = tm_->Begin();
+  ASSERT_SUCCESS(pm_->LsmDestroy(destroyer, tree));
+  EXPECT_EQ(pm_->LsmDestroy(observer, tree), Status::kConflicts);
+  EXPECT_EQ(pm_->LsmRead(tree, "key", &destroyer).GetStatus(),
+            Status::kNotExists);
+  EXPECT_TRUE(pm_->LsmScanRange(tree, "", "", true, &destroyer).empty());
+
+  auto visible = pm_->LsmRead(tree, "key", &observer);
+  ASSERT_TRUE(visible.HasValue()) << visible.GetStatus();
+  EXPECT_EQ(visible.Value(), "committed");
+  EXPECT_TRUE(pm_->LsmRead(tree, "key").HasValue());
+  const auto rows = pm_->LsmScanRange(tree, "", "", true, &observer);
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows.front().second, "committed");
+  ASSERT_SUCCESS(destroyer.Abort());
+  EXPECT_TRUE(pm_->LsmRead(tree, "key", &observer).HasValue());
+  ASSERT_SUCCESS(observer.Abort());
+
+  auto committed_destroyer = tm_->Begin();
+  ASSERT_SUCCESS(pm_->LsmDestroy(committed_destroyer, tree));
+  ASSERT_SUCCESS(committed_destroyer.PreCommit());
+  auto new_reader = tm_->Begin();
+  EXPECT_EQ(pm_->LsmRead(tree, "key", &new_reader).GetStatus(),
+            Status::kNotExists);
+  EXPECT_TRUE(pm_->LsmScanRange(tree, "", "", true, &new_reader).empty());
+  ASSERT_SUCCESS(new_reader.Abort());
+}
+
 // P3834/386: LsmInsert/LsmUpdate/LsmDelete probe under the SHARED tree latch
 // (cold LSM block preads must not serialize the whole tree) and revalidate
 // under the exclusive latch via the tree mutation epoch.  Pin the externally
@@ -408,16 +446,13 @@ TEST_F(PageManagerTest, CheckpointLsmRotationSerializesWithConcurrentFlushes) {
   ASSERT_SUCCESS(pm_->LoadFuzzyCheckpoint(nullptr));
   const auto reloaded =
       pm_->LsmScanRange(tree, keys.front(), keys.back(), true);
+  ASSERT_EQ(reloaded.size(), keys.size());
   for (size_t i = 0; i < reloaded.size(); ++i) {
     EXPECT_EQ(reloaded[i].first, keys[i]) << i;
     EXPECT_EQ(reloaded[i].second, values[i]) << i;
   }
 }
 
-// sql_ooc_fuzzer finding: a transaction that had grown one table could not
-// grow a second one ("transaction already holds a table tail reservation"),
-// so a single-transaction bulk load into two tables failed outright.  An
-// uncontended tail must be granted; only waiting while holding is refused.
 // P144: exercise the restructured wait/notify loop of ReserveTableTailImpl:
 // an uninvolved second transaction must block on a tail held by another and
 // proceed once the holder resolves.  (With the txn_id_t overload the watcher
@@ -445,6 +480,10 @@ TEST_F(PageManagerTest, TableTailWaiterProceedsAfterHolderRelease) {
   pm_->ResolveTableTailReservations(kA, TableTailResolution::kDiscard);
 }
 
+// sql_ooc_fuzzer finding: a transaction that had grown one table could not
+// grow a second one ("transaction already holds a table tail reservation"),
+// so a single-transaction bulk load into two tables failed outright.  An
+// uncontended tail must be granted; only waiting while holding is refused.
 TEST_F(PageManagerTest, OneTransactionMayHoldTailsOfSeveralTables) {
   constexpr txn_id_t kA = 101;
   constexpr txn_id_t kB = 202;
@@ -490,20 +529,35 @@ TEST_F(PageManagerTest, AuditCheckpointCountsAreBoundedBeforeAllocation) {
       append(std::numeric_limits<uint32_t>::max());
     }
     append(Crc32C(bytes.data(), bytes.size()));
+    // Give each shape its own file: writing both to the fixture's prefix_.db
+    // truncatingly overwrote the first case and clobbered a file owned by
+    // this test's PageManager. Remove it here instead of depending on the
+    // fixture TearDown to sweep malformed checkpoints.
+    const std::string bad_path =
+        prefix_ + ".db.audit." + (rows ? "rows" : "no_rows");
     {
-      std::ofstream output(prefix_ + ".db", std::ios::binary | std::ios::trunc);
+      std::ofstream output(bad_path, std::ios::binary | std::ios::trunc);
       output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
       ASSERT_TRUE(output.good());
     }
-    bool loaded = true;
-    Status status = Status::kSuccess;
-    EXPECT_NO_THROW(status = pm_->LoadFuzzyCheckpoint(nullptr, &loaded));
-    EXPECT_EQ(status, Status::kCorrupt);
-    EXPECT_FALSE(loaded);
+    {
+      StatusOr<std::unique_ptr<PageManager>> corrupt_pm =
+          PageManager::Create(bad_path, 64, false);
+      EXPECT_EQ(corrupt_pm.GetStatus(), Status::kSuccess);
+      if (corrupt_pm.HasValue()) {
+        bool loaded = true;
+        Status status = Status::kSuccess;
+        EXPECT_NO_THROW(
+            status = corrupt_pm.Value()->LoadFuzzyCheckpoint(nullptr, &loaded));
+        EXPECT_EQ(status, Status::kCorrupt);
+        EXPECT_FALSE(loaded);
+      }
+    }
+    std::ignore = std::remove(bad_path.c_str());
   }
 }
 
-TEST_F(PageManagerTest, AuditReallocationWaitsForContentLatchBeforeReset) {
+TEST_F(PageManagerTest, ReallocationReusesIdWithFreshPageWhileOldPageIsHeld) {
   Transaction setup = tm_->Begin();
   ASSIGN_OR_ASSERT_FAIL(PageRef, page,
                         pm_->AllocateNewPage(setup, PageType::kRowPage));
@@ -515,11 +569,12 @@ TEST_F(PageManagerTest, AuditReallocationWaitsForContentLatchBeforeReset) {
   ASSERT_SUCCESS(pm_->DestroyPage(remove, held.get()));
   ASSERT_SUCCESS(remove.PreCommit());
   const lsn_t before = held->PageLSN();
-  std::promise<void> entered;
-  auto started = entered.get_future();
+  EXPECT_EQ(pm_->GetPage(pid).GetStatus(), Status::kNotExists);
+
+  // The old reference owns the detached shell. Reuse its id in another
+  // transaction while that reference still owns the old page's latch.
   auto allocation = std::async(std::launch::async, [&] {
     Transaction create = tm_->Begin();
-    entered.set_value();
     auto result = pm_->AllocateNewPage(create, PageType::kRowPage);
     if (!result.HasValue()) {
       return page_id_t{0};
@@ -529,19 +584,12 @@ TEST_F(PageManagerTest, AuditReallocationWaitsForContentLatchBeforeReset) {
     fresh.PageUnlock();
     return create.PreCommit() == Status::kSuccess ? actual : page_id_t{0};
   });
-  started.wait();
-  // A page destroyed while a reference is still held is not recycled under
-  // that reference: the concurrent allocation does not wait for the latch,
-  // it gets a different page, and the held page keeps its destroyed image.
   const page_id_t allocated = allocation.get();
-  EXPECT_NE(allocated, page_id_t{0});
-  EXPECT_NE(allocated, pid);
+  ASSERT_EQ(allocated, pid);
   EXPECT_EQ(held->Type(), PageType::kUnknown);
   EXPECT_EQ(held->PageLSN(), before);
-  held.PageUnlock();
-  // The destroyed page id is not resurrected by the unrelated allocation.
-  EXPECT_FALSE(pm_->GetPage(pid).HasValue());
-  ASSIGN_OR_ASSERT_FAIL(PageRef, fresh, pm_->GetPage(allocated));
+  ASSIGN_OR_ASSERT_FAIL(PageRef, fresh, pm_->GetPage(pid));
+  EXPECT_NE(fresh.get(), held.get());
   EXPECT_EQ(fresh->Type(), PageType::kRowPage);
 }
 
@@ -694,6 +742,38 @@ TEST_F(PageManagerTest, AuditAbortRestoresRowsAfterFreedSpaceIsReused) {
   }
 }
 
+// Aborting an INSERT must restore the empty slot it came from. Using DeleteRow
+// instead leaves the inserted row's length in hole_sizes_ as a phantom undo
+// reservation; a later insert on a full page then subtracts it as a locked
+// hole and wrongly returns kNoSpace.
+TEST_F(PageManagerTest, AbortInsertClearsHoleReservation) {
+  auto setup = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                        pm_->AllocateNewPage(setup, PageType::kRowPage));
+  const page_id_t pid = page->PageID();
+  ASSIGN_OR_ASSERT_FAIL(slot_t, kept,
+                        page->Insert(setup, std::string(4096, 'a')));
+  page.PageUnlock();
+  ASSERT_SUCCESS(setup.PreCommit());
+
+  slot_t aborted_slot = 0;
+  {
+    auto undone = tm_->Begin();
+    ASSIGN_OR_ASSERT_FAIL(PageRef, ref, pm_->GetPage(pid));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, inserted,
+                          ref->Insert(undone, std::string(8192, 'b')));
+    aborted_slot = inserted;
+    ref.PageUnlock();
+    ASSERT_SUCCESS(undone.Abort());
+  }
+
+  ASSIGN_OR_ASSERT_FAIL(PageRef, after, pm_->GetPage(pid));
+  EXPECT_TRUE(after->body.row_page.GetRow(aborted_slot).empty());
+  EXPECT_EQ(after->body.row_page.HoleReservationForTest(aborted_slot), 0U);
+  EXPECT_EQ(after->body.row_page.GetRow(kept), std::string(4096, 'a'));
+  after.PageUnlock();
+}
+
 // P666: an UPDATE shrink frees bytes the abort-restore may need.  While the
 // shrinker is open, foreign Inserts must treat the delta like a locked delete
 // hole (available = free - reservations); RestoreLiveSlot itself stays
@@ -768,10 +848,15 @@ TEST_F(PageManagerTest,
     return Encode(entries);
   };
   const auto decode_positions = [](std::string_view bytes) {
-    auto decoded = Decode<std::vector<TestIndexEntry>>(bytes).MoveValue();
+    StatusOr<std::vector<TestIndexEntry>> decoded =
+        Decode<std::vector<TestIndexEntry>>(bytes);
+    EXPECT_EQ(decoded.GetStatus(), Status::kSuccess);
+    if (!decoded.HasValue()) {
+      return std::vector<RowPosition>{};
+    }
     std::vector<RowPosition> out;
-    out.reserve(decoded.size());
-    for (const TestIndexEntry& e : decoded) {
+    out.reserve(decoded.Value().size());
+    for (const TestIndexEntry& e : decoded.Value()) {
       out.push_back(e.pos);
     }
     return out;
@@ -1063,7 +1148,20 @@ TEST_F(PageManagerTest,
 
   const auto range_a =
       pm_->LsmScanRange(kTreeA, "k_00000", "k_99999", true, &verify);
-  EXPECT_FALSE(range_a.empty());
+  // Tree A inserts one key per (batch, slot) and tombstones kid-1 whenever
+  // b > 0 && kid % 17 == 0. Mirror that generation here so a lost key or a
+  // resurrected tombstone is caught, not just an empty scan.
+  std::set<int> deleted_a;
+  for (int b = 1; b < kBatches; ++b) {
+    for (int k = 0; k < kLsmKeysPerBatch; ++k) {
+      const int kid = (b * kLsmKeysPerBatch) + k;
+      if (kid % 17 == 0) {
+        deleted_a.insert(kid - 1);
+      }
+    }
+  }
+  EXPECT_EQ(range_a.size(), static_cast<size_t>(kBatches * kLsmKeysPerBatch) -
+                                deleted_a.size());
   const auto range_b =
       pm_->LsmScanRange(kTreeB, "k_00000", "k_99999", true, &verify);
   EXPECT_EQ(range_b.size(),
@@ -1307,10 +1405,15 @@ TEST_F(PageManagerTest,
     return Encode(entries);
   };
   const auto decode_positions = [](std::string_view bytes) {
-    auto decoded = Decode<std::vector<TestIndexEntry>>(bytes).MoveValue();
+    StatusOr<std::vector<TestIndexEntry>> decoded =
+        Decode<std::vector<TestIndexEntry>>(bytes);
+    EXPECT_EQ(decoded.GetStatus(), Status::kSuccess);
+    if (!decoded.HasValue()) {
+      return std::vector<RowPosition>{};
+    }
     std::vector<RowPosition> out;
-    out.reserve(decoded.size());
-    for (const TestIndexEntry& e : decoded) {
+    out.reserve(decoded.Value().size());
+    for (const TestIndexEntry& e : decoded.Value()) {
       out.push_back(e.pos);
     }
     return out;
@@ -1355,7 +1458,7 @@ TEST_F(PageManagerTest,
 
   ASSIGN_OR_ASSERT_FAIL(std::string, recovered, pm_->LsmRead(tree, "hot_key"));
   const std::vector<RowPosition> recovered_pos = decode_positions(recovered);
-  EXPECT_EQ(recovered_pos.size(), static_cast<size_t>(300 + 50 - 10));
+  EXPECT_EQ(recovered_pos, after_t2);
 }
 
 // #1110: Insert must not pay a write-intent acquire/release pair per hole.
@@ -1473,6 +1576,27 @@ TEST(EvictedPageTableTest, SetWithInvalidDescUndoesInsertBookkeeping) {
   EXPECT_EQ(table.Count(), 1U);
 }
 
+TEST(EvictedPageTableTest, InvalidDescNeverLeaksAnEmptyChunk) {
+  EvictedPageTable table;
+  const EvictedPageDesc valid{
+      .disk_offset = 4096, .disk_length = 1024, .file_gen = 1};
+
+  // Setting an invalid desc where no chunk exists must not allocate a chunk
+  // that Erase would then refuse to reclaim (it reports {false, 0}).
+  EXPECT_EQ(table.Set(7, EvictedPageDesc{}), 0);
+  EXPECT_EQ(table.Bytes(), 0U);
+  EXPECT_FALSE(table.Contains(7));
+  EXPECT_FALSE(table.Erase(7).first);
+  EXPECT_EQ(table.Bytes(), 0U);
+
+  // A chunk emptied by invalidation through Set is reclaimed on the spot.
+  EXPECT_GT(table.Set(7, valid), 0);
+  EXPECT_GT(table.Bytes(), 0U);
+  EXPECT_LT(table.Set(7, EvictedPageDesc{}), 0);
+  EXPECT_EQ(table.Bytes(), 0U);
+  EXPECT_FALSE(table.Contains(7));
+}
+
 // T1936: RowPage::InsertRowAt is the public low-level entry used by WAL
 // hole-fill; internal callers pre-gate capacity but a slot at/over
 // kMaxSlotsPerBlock must be rejected at the entry itself, not grow the
@@ -1494,6 +1618,54 @@ TEST(RowPageSlotCapTest, InsertRowAtRejectsSlotsAtOrPastCap) {
   const StatusOr<slot_t> in_range = page.InsertRowAt(0, "r");
   ASSERT_TRUE(in_range.HasValue());
   EXPECT_EQ(page.RowCount(), 1);
+}
+
+// T10851: PageInit is also called by recovery/abort paths that hold no
+// PageRef. A recycled Page carrying the previous generation's exclusive
+// owner would make IsExclusivelyOwnedByCurrentThread() spuriously true, so
+// lock_page_if_needed would skip the content latch and race. PageInit must
+// clear the owner so the next latch is always taken.
+TEST(PageInitTest, ClearsStaleExclusiveOwner) {
+  Page page(1, PageType::kRowPage);
+  page.SetExclusiveOwner(std::this_thread::get_id());
+  ASSERT_TRUE(page.IsExclusivelyOwnedByCurrentThread());
+
+  page.PageInit(2, PageType::kRowPage);
+
+  EXPECT_FALSE(page.IsExclusivelyOwnedByCurrentThread());
+  EXPECT_EQ(page.PageID(), 2);
+  EXPECT_EQ(page.Type(), PageType::kRowPage);
+  // A second generation must not inherit it either.
+  page.SetExclusiveOwner(std::this_thread::get_id());
+  page.PageInit(3, PageType::kRowPage);
+  EXPECT_FALSE(page.IsExclusivelyOwnedByCurrentThread());
+  EXPECT_EQ(page.PageID(), 3);
+}
+
+// T10856: a positive WAL LSN with no connected durability waiter must not be
+// silently reported durable. Otherwise EvictBatch / WriteFuzzyCheckpoint
+// persist committed page images before the WAL reaches the durable frontier,
+// breaking WAL-before-data (docs/recovery_invariants.md). A logger-less
+// embedded PageManager only ever passes LSN 0, which stays a no-op.
+TEST(PageManagerDurableWaiterTest,
+     CheckpointWithoutWaiterFailsForPositiveWalLsn) {
+  const std::string prefix = "pm_durable_waiter-" + RandomString();
+  {
+    // Deliberately no SetDurableWaiter: this is the embedded-with-logger
+    // misconfiguration the barrier must catch.
+    auto pm = PageManager::Create(prefix + ".db", 64, false).MoveValue();
+    ASSERT_TRUE(pm != nullptr);
+
+    // A committed alloc with a positive LSN stands in for committed WAL
+    // records that back a disk-dirty page image.
+    ASSERT_SUCCESS(pm->ReplayCommittedRecord(
+        12345,
+        LogRecord::AllocatePageLogRecord(0, 100, 1, PageType::kRowPage)));
+
+    // The snapshot must refuse to be written: durability cannot be proven.
+    EXPECT_EQ(pm->WriteFuzzyCheckpoint(0), Status::kRuntimeError);
+  }
+  std::ignore = std::remove((prefix + ".db").c_str());
 }
 
 }  // namespace

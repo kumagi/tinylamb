@@ -1,11 +1,12 @@
 # merge_limits
 
 - 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
+- 注: 合成条件とコード引用は 2026-11-21 時点の実装に更新。
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録名 `"merge_limits"`）
 
 ## 概要
 
-`merge_limits` は、入れ子になった2 段階の行数制限演算 `Limit(Limit(X))` を検知し、オフセットを加算合成した上で、行数上限をより厳しい制約値へ縮約した単一の `kLimit` 演算子へと統合する論理変換 Rule です。
+`merge_limits` は、入れ子になった2 段階の行数制限演算 `Limit(Limit(X))` を検知し、オフセットを加算合成した上で、行数上限をより厳しい制約値へ縮約した単一の `kLimit` 演算子（外側オフセットが内側の行数上限に達して空結果が確定する場合は `kEmpty`）へと統合する論理変換 Rule です。
 
 中間 Limit ノードをバイパスして入力 `X` に直接接続された1 段の Limit 代替式を生成することにより、実行時における二重のタプルカウントおよびスライシング処理を排除します。
 
@@ -50,38 +51,51 @@ graph TD
 多重度および順序集合のスライス操作において、外側 $L_o(count_o, offset_o)$ と内側 $L_i(count_i, offset_i)$ の合成結果 $(count, offset)$ は以下の代数演算によって厳密に一意決定されます。
 
 ```cpp
+            if (inner.limit_offset >
+                std::numeric_limits<size_t>::max() - expression.limit_offset) {
+              continue;
+            }
             const size_t offset = inner.limit_offset + expression.limit_offset;
+            const bool empty = inner.limit_count != 0 &&
+                               expression.limit_offset >= inner.limit_count;
             size_t count = 0;
-            if (inner.limit_count == 0) {
-              count = expression.limit_count;
-            } else if (expression.limit_offset >= inner.limit_count) {
-              count = 0;
-            } else if (expression.limit_count == 0) {
-              count = inner.limit_count - expression.limit_offset;
-            } else {
-              count = std::min(expression.limit_count,
-                               inner.limit_count - expression.limit_offset);
+            if (!empty) {
+              if (inner.limit_count == 0) {
+                count = expression.limit_count;
+              } else if (expression.limit_count == 0) {
+                count = inner.limit_count - expression.limit_offset;
+              } else {
+                count = std::min(expression.limit_count,
+                                 inner.limit_count - expression.limit_offset);
+              }
             }
 ```
 
 各分岐の必要性は以下の通りです。
 
 - **オフセットの加算**: 内側で読み飛ばした行数と外側で読み飛ばす行数は直列に累積するため、$offset = offset_i + offset_o$ となります。
-- **上限超過による空化**: 外側のオフセットが内側の行数上限に達している場合（$offset_o \ge count_i$）、外側ノードに到達するタプルは存在せず、$count = 0$ と確定します。ここで誤って単なる最小値（`min`）を取ると、空であるべき結果に行が不当に復活してしまいます。
+- **上限超過による空化**: 外側のオフセットが内側の行数上限に達している場合（$offset_o \ge count_i$）、外側ノードに到達するタプルは存在せず、空結果と確定し、`kEmpty` を生成します。ここで誤って単なる最小値（`min`）を取ると、空であるべき結果に行が不当に復活してしまいます。
+- **加算の安全性**: オフセットの合計が `size_t` を超える場合は合成せず、元の二段 Limit を残します。
 - **制約の包含**: 内側の残余行数（$count_i - offset_o$）と外側の上限 $count_o$ の小さい方を採用することで、双方が課した制約の積集合が保存されます（`count == 0` は上限なしを表現）。
 
 また、`inner.children[0] == group` による循環防止チェックは、メモ構造における閉路形成を防止するための必須のガードレールです。
 
 ## 実装の詳細
 
-合成された `count` および `offset` を保持する新しい `kLimit` 式を構築し、親グループに追加します。
+空結果なら `kEmpty` を、それ以外なら合成した `count` と `offset` を持つ `kLimit` を親グループへ追加します。`count == 0` は上限なしを意味するため、空結果には使えません。
 
 ```cpp
-            memo.AddExpression(
-                group, LogicalExpression{.operation = LogicalOperator::kLimit,
-                                         .children = inner.children,
-                                         .limit_count = count,
-                                         .limit_offset = offset});
+            if (empty) {
+              memo.AddExpression(
+                  group, LogicalExpression{.operation = LogicalOperator::kEmpty,
+                                           .children = inner.children});
+            } else {
+              memo.AddExpression(
+                  group, LogicalExpression{.operation = LogicalOperator::kLimit,
+                                           .children = inner.children,
+                                           .limit_count = count,
+                                           .limit_offset = offset});
+            }
 ```
 
 - **子ノードの直接接続**: `children = inner.children` を設定することにより、内側の Limit ノードを読み飛ばして孫ノードに直結します。
@@ -96,7 +110,7 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `union_all_push_limit` / `union_all_push_limit`: UNION ALL の各ブランチに Limit を押し込んだ後、ブランチ側で新設された Limit と上位 Limit が再び結合する局面で本 Rule が発火します。
+- `union_all_push_limit`: UNION ALL の各ブランチに Limit を押し込んだ後、ブランチ側で新設された Limit と上位 Limit が再び結合する局面で本 Rule が発火します。
 - `limit_push_through_sort`: 1 段に集約された Limit は、ソートノードと組み合わされることで TopN オペレータへの変換を促進します。
 
 ## 検証テスト

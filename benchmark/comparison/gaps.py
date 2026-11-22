@@ -94,14 +94,19 @@ def collect(records, profile, threshold=10, reference_engine="postgresql"):
                 emit('htap',name,role+'_tps',[r['role_tps'][role] for r in t],
                      [r['role_tps'][role] for r in p],clients=clients)
                 # Mixed-request latency can hide a slow reader behind many
-                # short writer requests. Older saved runs may lack this field.
-                if clients > 1 and any('role_latency' in r for r in t+p):
+                # short writer requests. Older saved runs may lack this field;
+                # only compare a metric when BOTH sides actually recorded it,
+                # otherwise emit() would complain about missing measurements.
+                if clients > 1 and all(any('role_latency' in r for r in trials)
+                                       for trials in (t, p)):
                     for metric in ('p50_ms','p95_ms','p99_ms'):
                         values=[]
                         for trials in (t,p):
                             values.append([r['role_latency'][role][metric]
                                            for r in trials
                                            if r.get('role_latency',{}).get(role,{}).get(metric) is not None])
+                        if not all(values):
+                            continue
                         emit('tail' if metric != 'p50_ms' else 'htap',name,
                              role+'_'+metric,*values,clients=clients)
     return comparisons

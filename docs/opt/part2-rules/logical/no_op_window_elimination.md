@@ -49,8 +49,9 @@ graph TD
 
 1. 内側 Window の子ノードが親グループ自身でないこと。
 2. 外側のターゲットリストが内側 Window の出力を利用していないこと。具体的には、
+   - 外側のターゲットリストが空でないこと（空なら「ウィンドウを使用する」として不発）。
    - 外側式木が生のウィンドウ関数呼び出しを含まないこと。
-   - 外側のターゲットリストに含まれる未修飾の列参照が、内側 Window の定義する出力名（`$win` 等）と一致しないこと。
+   - 外側の参照列が修飾の有無にかかわらず、内側 Window の定義する出力名（`$win` 等）と一致しないこと。ワイルドカード `*` も出力を参照しうるため不発します。
 
 ## 意味論的根拠と多重度保存・例外保護
 
@@ -87,6 +88,9 @@ graph TD
 ```cpp
               const auto outer_uses_window = [](const LogicalExpression& outer,
                                                 const LogicalExpression& win) {
+                if (outer.target_list.empty()) {
+                  return true;
+                }
                 std::unordered_set<std::string> outputs;
                 for (const NamedExpression& target : win.target_list) {
                   if (!target.name.empty()) {
@@ -100,8 +104,9 @@ graph TD
                   if (TreeContainsWindowCall(target.expression)) {
                     return true;
                   }
-                  for (const auto& col : target.expression->TouchedColumns()) {
-                    if (col.schema.empty() && outputs.contains(col.name)) {
+                  for (const ColumnName& column :
+                       target.expression->TouchedColumns()) {
+                    if (column.name == "*" || outputs.contains(column.name)) {
                       return true;
                     }
                   }

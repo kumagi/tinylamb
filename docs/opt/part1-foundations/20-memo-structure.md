@@ -128,7 +128,7 @@ struct LogicalExpression {
   std::shared_ptr<const SelectStatement> relational_statement{};
   Schema output_schema{};
 
-  // Extended payload fields for Window / Grouping / Sample / RecursiveDepth:
+  // Extended payload fields for Window / Grouping / Marker / Assertion:
   std::vector<Expression> partition_by{};
   std::vector<Expression> grouping_sets{};
   std::string unnest_alias{};
@@ -198,6 +198,7 @@ struct Group {
 
 ```cpp
  private:
+  // ...(省略: 論理特性の再計算・依存無効化の private メソッド)...
   [[nodiscard]] static std::string GroupKey(
       const std::vector<std::string>& relations);
 
@@ -205,11 +206,17 @@ struct Group {
   std::unordered_map<std::string, GroupId> groups_by_key_;
   std::unordered_map<std::string, size_t> relation_index_;
   std::vector<Expression> conjuncts_;
+  // ...(省略: 各フィールドの説明コメント)...
   std::vector<uint64_t> conjunct_masks_;
   std::vector<uint8_t> conjunct_root_only_;
   std::vector<GroupId> touched_groups_;
   std::unordered_map<std::string, Schema> table_schemas_;
+  std::unordered_set<std::string> proven_one_to_one_;
+  std::unordered_map<std::string, double> relation_rows_;
+  // Parallel to groups_: 1 after join_enumeration has partitioned that group.
+  std::vector<uint8_t> join_enumerated_;
   const size_t expression_cap_;
+  size_t revision_{0};
   bool degraded_{false};
 ```
 
@@ -220,6 +227,7 @@ struct Group {
 - `conjuncts_` と `conjunct_masks_`: WHERE 句から抽出された連言述語のリストと、各述語が参照するテーブル群のビットマスクです。Memo 全体でどのテーブル間に結合条件が存在するかを示す結合グラフのメタデータを構成します。
 - `touched_groups_`: 探索中に新たな式が追加されたグループの記録であり、探索エンジンの作業リスト（ワークリスト）へ渡されます。
 - `expression_cap_` と `degraded_`: Memo に登録可能な式の総数上限と、上限到達による探索打ち切り（縮退）を示すフラグです。
+- `proven_one_to_one_` と `relation_rows_`: 1:1 結合の証明と結合行数見積もりのキャッシュです。`join_enumerated_` はグループごとに結合列挙を実行済みかを示すフラグ、`revision_` は Memo の変更検知に使うカウンタです（第 40 章）。
 
 ### 20-5.1 初期 Memo の構築 — `Memo::TryBuild`
 
@@ -479,6 +487,9 @@ LogicalExpression Memo::NewOuterJoin(GroupId left, GroupId right,
 ```cpp
 void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
   Group& target = Get(group);
+  if (target.sample_barrier) {
+    return;
+  }
   if (target.relations.size() != 1) {
     CHECK_MSG(false, "scan filter requires a single-relation group");
   }
@@ -486,11 +497,25 @@ void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
       target.filter
           ? BinaryExpressionExp(target.filter, BinaryOperation::kAnd, predicate)
           : predicate);
+  if ((!target.filter && !next) ||
+      (target.filter && next &&
+       target.filter->ToString() == next->ToString())) {
+    return;
+  }
   target.filter = next;
+  // Adding a predicate to the scan filter changes what this group proves
+  // (IS NOT NULL / equality conjuncts); stale logical properties would keep
+  // an older uniqueness or not-null verdict. Mirror AddExpression's
+  // invalidation so DeriveLogicalProperties rebuilds and notifies dependents.
+  target.logical_properties_expression_count.reset();
+  target.logical_properties_stale = true;
+  ++revision_;
+  touched_groups_.push_back(group);
+  DeriveLogicalProperties(group);
 }
 ```
 
-既存の述語と引数の述語を AND 結合した上で正規化（`CanonicalizeConjuncts`）して格納します。同じ述語が複数回押し下げられても、連言の正規化によって重複を除去するため、操作の冪等性が保たれます。
+まず `sample_barrier` が立っているグループは黙ってスキップします。通常のグループでは、既存の述語と引数の述語を AND 結合して正規化（`CanonicalizeConjuncts`）し、結果が変わらない場合（両方が空、または `ToString()` が一致）は書き込みを行いません。この明示的な冪等チェックにより、同じ述語が繰り返し押し下げられても無駄な更新が起きません。述語が実際に変わったときは論理特性を無効化して再導出させ、リビジョンを進めて探索側へ変更を通知します。
 
 ## 20-7. `AddExpression` — 不変条件の検証・重複排除・縮退制御
 
@@ -549,15 +574,19 @@ void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
 **2. 指紋による重複排除**: 同一の式が既に登録されていないかを判定します。
 
 ```cpp
-  // Duplicate rejection runs BEFORE the cap check counts against it, but a
-  // rejected duplicate must not trip the degradation flag either (§6.10):
-  // mirrored associativity rotations re-derive existing expressions by
-  // design and those retries have to stay free.
-  const std::string fingerprint = expression.Fingerprint();
+  // ...(省略: 重複棄却を上限チェックより前に置く理由と、Fingerprint の接頭辞による事前ふるいの説明)...
+  std::optional<std::string> fingerprint;
   const bool duplicate =
-
       std::ranges::any_of(target.expressions, [&](const auto& existing) {
-        return existing.Fingerprint() == fingerprint;
+        if (existing.operation != expression.operation ||
+            existing.table != expression.table ||
+            existing.children != expression.children) {
+          return false;
+        }
+        if (!fingerprint) {
+          fingerprint = expression.Fingerprint();
+        }
+        return existing.Fingerprint() == *fingerprint;
       });
   if (!duplicate && target.expressions.size() >= expression_cap_) {
     degraded_ = true;
@@ -565,17 +594,32 @@ void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
   if (duplicate || target.expressions.size() >= expression_cap_) {
     return false;
   }
-  target.expressions.push_back(std::move(expression));
+  if (target.logical_properties_expression_count != target.expressions.size()) {
+    target.logical_properties_expression_count.reset();
+    target.logical_properties_stale = true;
+  }
+  for (const GroupId child : expression.children) {
+    if (child >= groups_.size() || child == group) {
+      continue;
+    }
+    auto& dependents = groups_[child].logical_property_dependents;
+    if (std::ranges::find(dependents, group) == dependents.end()) {
+      dependents.push_back(group);
+    }
+  }
+  target.expressions.PushBack(std::move(expression));
+  ++revision_;
   touched_groups_.push_back(group);
   DeriveLogicalProperties(group);
   return true;
 }
 ```
 
-指紋が一致する式を既に登録している場合、追加処理は `false` を返します。
+まず `operation` / `table` / `children` の接頭辞が一致しない式をふるいにかけ、残った候補に対してだけ `Fingerprint()` を `std::optional` で遅延計算します。指紋が一致する式を既に登録している場合、追加処理は `false` を返します。
 左右の結合律 Rule（`join_associativity_left` と
 `join_associativity_right`）が同じ結合形状を導出しても、指紋検査が重複を
-除くため、式数上限を消費しません。
+除くため、式数上限を消費しません。追加が成功すると `PushBack` で登録され、
+`++revision_` が探索側の変更検知に使われます。
 
 **3. 式数上限の監視と縮退制御**: グループ内の式数が `expression_cap_`（既定値 4096、`Memo::kDefaultExpressionCap`）に達した場合、以降の式の追加を停止し、`degraded_` フラグを有効化します。探索処理全体を中断するのではなく、その時点で収集された候補群から最良のプランを選択して処理を完了します。
 
@@ -608,37 +652,47 @@ struct LogicalProperties {
 - `equivalence_classes`: 等価結合条件によって互いに等しいことが確定している列の集合（同値類）。
 - `max_1_row`: 演算結果の行数が最大 1 行であることを示す真偽値。
 
-これらの特性値は、式が追加されるたびに `Memo::DeriveLogicalProperties` がボトムアップに更新します（`plan/cascades.cpp`）。
+これらの特性値は、式が追加されるたびに `Memo::DeriveLogicalProperties` がボトムアップに更新します（`plan/cascades_search.cpp`）。
 
 ```cpp
-  if (group.relations.size() == 1) {
-    const std::string& rel = group.relations.front();
-    auto it = table_schemas_.find(rel);
-    if (it != table_schemas_.end()) {
-      const Schema& schema = it->second;
-      std::unordered_set<std::string> pk_cols;
-      for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-        const Column& col = schema.GetColumn(i);
-        // ...(省略: 列名を「テーブル名.列名」に正規化)...
-        if (col.GetConstraint().ctype == Constraint::kPrimaryKey) {
-          pk_cols.insert(col_name);
-        } else if (col.GetConstraint().IsUnique()) {
-          props.candidate_keys.push_back({col_name});
+    switch (expr.operation) {
+      case LogicalOperator::kScan: {
+        // Catalog constraints describe the scan, not every derived group
+        // whose relation set happens to contain this table. Projection,
+        // aggregation and NULL extension can invalidate those guarantees.
+        const auto found = table_schemas_.find(expr.table);
+        const Schema* schema = expr.output_schema.ColumnCount() != 0
+                                   ? &expr.output_schema
+                               : found != table_schemas_.end() ? &found->second
+                                                               : nullptr;
+        if (schema == nullptr) {
+          break;
         }
-        if (col.GetConstraint().ctype == Constraint::kNotNull ||
-            col.GetConstraint().ctype == Constraint::kPrimaryKey ||
-            col.GetConstraint().ctype == Constraint::kForeign) {
-          props.not_null_columns.insert(col_name);
+        std::unordered_set<std::string> primary_key;
+        for (size_t i = 0; i < schema->ColumnCount(); ++i) {
+          const Column& column = schema->GetColumn(i);
+          const std::string name = column.Name().schema.empty()
+                                       ? expr.table + "." + column.Name().name
+                                       : column.Name().ToString();
+          const auto constraint = column.GetConstraint().ctype;
+          if (constraint == Constraint::kPrimaryKey) {
+            primary_key.insert(name);
+          }
+          if (constraint == Constraint::kPrimaryKey ||
+              constraint == Constraint::kNotNull) {
+            props.not_null_columns.insert(name);
+          }
         }
+        if (!primary_key.empty()) {
+          props.candidate_keys.push_back(std::move(primary_key));
+        }
+        break;
       }
-      if (!pk_cols.empty()) {
-        props.candidate_keys.push_back(std::move(pk_cols));
-      }
+      // ...(省略: 他の演算子の伝播則)...
     }
-  }
 ```
 
-単一テーブルのスキャングループでは、ベーステーブルのスキーマ定義から PRIMARY KEY、UNIQUE、NOT NULL 制約を読み取って初期値を設定します。結合や射影、集約のグループでは、子グループの特性と演算子の性質（集約の GROUP BY 列は出力の候補キーとなる、GROUP BY のない集約は最大 1 行となる、など）を組み合わせて新たな特性を導出します。
+単一テーブルのスキャン式（`kScan`）では、式が保持する出力スキーマ、またはカタログのスキーマから PRIMARY KEY と NOT NULL 制約だけを読み取って候補キーと非 NULL 列の初期値を設定します。UNIQUE 制約由来の単列候補キーや外部キー由来の NOT NULL 推論は行いません。結合や射影、集約のグループでは、子グループの特性と演算子の性質（集約の GROUP BY 列は出力の候補キーとなる、GROUP BY のない集約は最大 1 行となる、など）を組み合わせて新たな特性を導出します。
 
 この推論情報は、第 2 部で詳述する削除・簡約系規則（`self_join_elimination` や `outer_to_inner_join_on_null_rejecting_filter` など）における事前条件（guard）の検証に用いられます。一意性や非 NULL 性を証明できない場合の削除を防ぎ、最適化の安全性を論理レベルで保証します。
 

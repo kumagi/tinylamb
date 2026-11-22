@@ -6,12 +6,18 @@
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigaction/SIGALRM
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "common/random_string.hpp"
 
 namespace tinylamb {
 
@@ -512,7 +518,8 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   const RestoreParseTimeoutEnv restore_parse_timeout_env{
       previous == nullptr ? std::nullopt
                           : std::optional<std::string>(previous)};
-  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "300", 1);  // NOLINT(clang-diagnostic-error)
+  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "300",
+               1);  // NOLINT(clang-diagnostic-error)
   // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
   // Without SA_RESTART the blocking read/write returns EINTR and must retry.
   struct sigaction saved = {};
@@ -539,6 +546,59 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
 // successful parse, so any silent exit-0 binary (broken install, wrong
 // --mode, stub) turned every statement into an "ok, empty AST" no-op.
 // Only whitespace input legitimately parses to nothing.
+TEST(GoogleSqlFrontendTest, SilentZygoteIsNotAcceptedAsParse) {
+  const std::string path = "/tmp/tlcs-zygote-" + RandomString();
+  const int server = socket(AF_UNIX, SOCK_STREAM, 0);
+  ASSERT_GE(server, 0);
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path) - 1);
+  ASSERT_EQ(
+      bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  ASSERT_EQ(listen(server, 1), 0);
+  std::thread worker([&] {
+    const int client = accept(server, nullptr, nullptr);
+    if (client < 0) return;
+    char byte = 0;
+    iovec io{.iov_base = &byte, .iov_len = 1};
+    alignas(cmsghdr) char control[CMSG_SPACE(2 * sizeof(int))]{};
+    msghdr message{};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    if (recvmsg(client, &message, 0) > 0) {
+      auto* control_message = CMSG_FIRSTHDR(&message);
+      if (control_message != nullptr) {
+        int fds[2];
+        std::memcpy(fds, CMSG_DATA(control_message), sizeof(fds));
+        close(fds[1]);
+        char buffer[256];
+        while (read(fds[0], buffer, sizeof(buffer)) > 0) {
+        }
+        close(fds[0]);
+        const char status = 0;
+        (void)write(client, &status, 1);
+      }
+    }
+    close(client);
+  });
+  const char* old = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  const std::optional<std::string> previous =
+      old ? std::optional<std::string>(old) : std::nullopt;
+  setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", path.c_str(), 1);
+  const auto parsed = GoogleSqlFrontend::Parse("SELECT 1054610546");
+  if (previous)
+    setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
+  else
+    unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  worker.join();
+  close(server);
+  unlink(path.c_str());
+  EXPECT_FALSE(parsed.ok);
+  EXPECT_NE(parsed.error.find("without output"), std::string::npos);
+}
+
 TEST(GoogleSqlFrontendTest, SilentExitZeroBinaryIsNotAcceptedAsParse) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";

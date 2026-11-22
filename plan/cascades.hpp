@@ -407,6 +407,12 @@ class Pattern {
   [[nodiscard]] bool Match(const Memo& memo, GroupId group,
                            const LogicalExpression& expression,
                            Bindings* bindings) const;
+  // Root operator this pattern can match; empty for Pattern::Any(), which is
+  // deliberately open to every operator. Rules use it to prefill their target
+  // set when no explicit target was declared.
+  [[nodiscard]] std::optional<LogicalOperator> RootOperation() const {
+    return operation_;
+  }
 
  private:
   using CaptureLog = std::vector<const std::string*>;
@@ -608,6 +614,12 @@ class Rule {
         transform_(std::move(transform)) {
     if (target) {
       targets_.push_back(*target);
+    } else if (auto root = pattern_.RootOperation()) {
+      // A concrete root pattern can only ever match this operator, so let the
+      // worklist prefilter on it instead of trying the rule on every node.
+      // Pattern::Any() has no root and keeps the historical "all operators"
+      // behavior; rules acting on several roots declare the full set.
+      targets_.push_back(*root);
     }
   }
 

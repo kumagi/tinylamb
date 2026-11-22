@@ -244,6 +244,39 @@ TEST(RowTest, Extract_WithOutOfBoundsIndices_ReportsError) {
   EXPECT_EQ(reordered.Value(), Row({Value(2), Value(1), Value(2)}));
 }
 
+TEST(RowTest, TryDeserializeProjected_RejectsOutOfRangeColumn) {
+  // The ascending fast path used to check only monotonicity, so a {100}
+  // projection on a 2-column schema decoded to a resized all-NULL row while
+  // TryExtract rejected the same index. Out-of-range is now an error on every
+  // path, ascending or not.
+  const Schema schema(
+      "s", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  const Row source({Value(1), Value(2)});
+  std::vector<char> image(source.Size());
+  source.Serialize(image.data());
+  for (const std::vector<slot_t>& projection :
+       {std::vector<slot_t>{100}, std::vector<slot_t>{6, 5},
+        std::vector<slot_t>{0, 2}}) {
+    std::string trace;
+    for (slot_t slot : projection) {
+      if (!trace.empty()) {
+        trace += ',';
+      }
+      trace += std::to_string(slot);
+    }
+    SCOPED_TRACE(trace);
+    Row restored;
+    EXPECT_EQ(restored.TryDeserializeProjected(image.data(), schema, projection)
+                  .GetStatus(),
+              Status::kInvalidArgument);
+  }
+  // A valid ascending projection still decodes.
+  Row restored;
+  ASSERT_TRUE(
+      restored.TryDeserializeProjected(image.data(), schema, {1}).HasValue());
+  EXPECT_EQ(restored, Row({Value(2)}));
+}
+
 TEST(RowTest, Deserialize_WithMismatchedColumnCount_ThrowsInsteadOfOob) {
   // A forged count drove sc.GetColumn(i) out of bounds (Schema::GetColumn is
   // operator[] without range checks). Stored images always carry the full

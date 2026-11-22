@@ -129,7 +129,7 @@ enum class Collation : uint8_t {
 // applies to the binary collation only (folding would miss every literal).
 [[nodiscard]] int CompareVarCharForOrderBy(std::string_view left,
                                            std::string_view right,
-                                           bool case_insensitive);
+                                           bool case_insensitive) noexcept;
 
 // ENUM member rank for synthetic ENUM values ("TESTENUMNEGATIVE" -> 0,
 // "TESTENUM0" -> 1, ...). Returns -1 for non-ENUM strings. Used by sort-key
@@ -140,7 +140,9 @@ enum class Collation : uint8_t {
 // collation. NULLs compare equal (placement is the caller's decision, see
 // SortKeyOrder) and every non-VARCHAR operand, every array, and every
 // collation the engine does not implement falls back to CompareForOrderBy
-// (binary) unchanged.
+// unchanged. For FLOAT64 operands that order places all NaNs together before
+// other FLOAT64 values; NULL placement and descending order are applied by
+// SortKeyOrder. Different value types use CompareForOrderBy's type ranks.
 [[nodiscard]] int CompareWithCollation(const Value& left, const Value& right);
 
 // The same comparison under a collation the caller already resolved. A sort

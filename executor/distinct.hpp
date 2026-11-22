@@ -69,7 +69,7 @@ class SortDistinctExecutor final : public ExecutorBase {
   size_t input_offset_{0};
   Row previous_;
   bool have_previous_{false};
-  // T1793: measured counters, surfaced by Dump only after a drain.
+  // T1793: see DistinctExecutor::Dump (counters surfaced after a drain).
   size_t input_rows_{0};
   size_t emitted_rows_{0};
 };

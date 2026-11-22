@@ -2482,8 +2482,9 @@ GROUP BY ca_zip, ca_state
 ORDER BY ca_zip, ca_state
 LIMIT 100)sql";
 
-// q5: per-channel sales/returns rollup over the 14-day window ending
-// 2002-08-22.  The web branch keeps the official web_returns LEFT JOIN
+// q5: per-channel sales/returns rollup from 2002-08-22 through 2002-09-05
+// inclusive (BETWEEN the start and start + 14 days). The web branch keeps the
+// official web_returns LEFT JOIN
 // web_sales shape; DECIMAL(7,2) zero casts become plain 0.
 inline constexpr std::string_view kQ5Sql = R"sql(WITH ssr AS
 (SELECT s_store_id,

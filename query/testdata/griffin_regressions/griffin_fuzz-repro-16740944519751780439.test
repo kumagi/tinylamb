@@ -17,4 +17,4 @@
 -- stmt: SELECT a, s, COUNT(*), COUNT(s), SUM(a), SUM(b), MIN(s), MAX(s) FROM gf_lst GROUP BY CUBE(a, s);
 -- stmt: SELECT a, COUNT(*) FILTER (WHERE s = 'x') AS cx, SUM(a) FILTER (WHERE b > 0) AS sb FROM gf_lst GROUP BY a HAVING COUNT(*) FILTER (WHERE s = 'x') >= 0;
 -- ran_select: true
--- failure: evaluation-path mismatch (statements regenerated after SubstituteIdentifiers became per-identifier consistent)
+-- failure: evaluation-path mismatch (statements regenerated after SubstituteIdentifiers became per-identifier consistent; guards the lstable gf_lst GROUP BY CUBE + FILTER aggregates path with ANALYZE, and the LEFT JOIN t1->tree / INSERT t1->tree identifier substitutions)

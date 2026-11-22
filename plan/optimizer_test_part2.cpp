@@ -1668,12 +1668,12 @@ TEST_F(OptimizerTest, BandJoinSurvivesJoinCommutativity) {
   }
   std::ranges::sort(expected);
 
-  // NOTE: FullScanPlan keeps its statistics by reference, so the scans' stats
-  // must outlive the plans.
-  const TableStatistics left_ts = *left_stats.Value();
-  const TableStatistics right_ts = *right_stats.Value();
-  Plan left_plan = std::make_shared<FullScanPlan>(*left.Value(), left_ts);
-  Plan right_plan = std::make_shared<FullScanPlan>(*right.Value(), right_ts);
+  // FullScanPlan owns a snapshot copy of its statistics, so the stats passed
+  // here need not outlive the plans (no local copy is required).
+  Plan left_plan =
+      std::make_shared<FullScanPlan>(*left.Value(), *left_stats.Value());
+  Plan right_plan =
+      std::make_shared<FullScanPlan>(*right.Value(), *right_stats.Value());
   const Expression written =
       BinaryExpressionExp(ColumnValueExp(ColumnName("BandLeft", "a")),
                           BinaryOperation::kLessThanEquals,
@@ -2088,11 +2088,10 @@ TEST_F(OptimizerTest, EqualityPrefixAndInListDriveCompositePointUnion) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(
-    OptimizerTest,
-    AccessMethodHintAndMemoDumpDiagnosticsSmoke) {  // Arrange: a plain equality
-                                                    // query planned with the
-                                                    // Access-method
+TEST_F(OptimizerTest,
+       AccessMethodHintAndMemoDumpDiagnosticsSmoke) {  // Arrange: a plain
+                                                       // equality query planned
+                                                       // with the Access-method
   // hint and Phase 9 memo dumping enabled.
   QueryData query{
       {"Sc1"},

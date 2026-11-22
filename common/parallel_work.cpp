@@ -141,11 +141,15 @@ class ParallelPool {
                               "cannot apply parallel task CPU affinity");
         }
       }
+      // Affinity is a scheduling constraint, not permission to skip work.
+      // Run every submitted index even when applying it failed, while still
+      // reporting the affinity failure to the coordinator.
+      const auto budget = batch->budget;
+      ScopedQueryParallelismBudget scope(budget.outstanding, budget.cpu_slots,
+                                         budget.snapshot_reads);
+      const Status task_error = Invoke(batch->task, index);
       if (error.ok()) {
-        const auto budget = batch->budget;
-        ScopedQueryParallelismBudget scope(budget.outstanding, budget.cpu_slots,
-                                           budget.snapshot_reads);
-        error = Invoke(batch->task, index);
+        error = task_error;
       }
       if (!error.ok()) {
         std::scoped_lock lock(batch->mutex);

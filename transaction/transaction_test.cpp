@@ -122,8 +122,8 @@ TEST_F(TransactionTest, ReservationDrainBailsWhenWounded) {
   ASSERT_SUCCESS(tm_->Abort(holder));
 }
 
-// The drain honors an explicit short budget: LSM index ops pass one wherever the
-// caller may hold an index write gate, because a multi-second wait under
+// The drain honors an explicit short budget: LSM index ops pass one wherever
+// the caller may hold an index write gate, because a multi-second wait under
 // the gate deadlocks against a reservation owner whose next index op needs
 // the same gate. Past the budget the honest kConflicts surfaces.
 TEST_F(TransactionTest, ReservationDrainHonorsShortBudget) {
@@ -146,6 +146,23 @@ TEST_F(TransactionTest, Construct) {
   Transaction txn = tm_->Begin();
   EXPECT_NE(txn.ID(), 0U);
   EXPECT_EQ(txn.PreCommit(), Status::kSuccess);
+}
+
+TEST(TransactionFinishHookTest, ConcurrentFinalizationRunsHookOnce) {
+  class Counter final : public TransactionFinishHook {
+   public:
+    void OnTransactionFinished(TransactionStatus) noexcept override { ++calls; }
+    std::atomic<int> calls{0};
+  };
+  auto hook = std::make_shared<Counter>();
+  Transaction txn;
+  txn.AddFinishHook(hook);
+  txn.SetStatus(TransactionStatus::kCommitted);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 16; ++i)
+    threads.emplace_back([&] { txn.FinalizeFinishHooks(); });
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(hook->calls.load(), 1);
 }
 
 TEST_F(TransactionTest, FinishHooksRunOnCommitAbortAndMove) {
@@ -189,6 +206,7 @@ TEST_F(TransactionTest, TransactionIdsIncrement) {
 // chain backlog and the live-transaction count move so a GC-pinning runaway
 // transaction is diagnosable before memory becomes a problem.
 TEST_F(TransactionTest, RuntimeStatsReportsGaugesForLongUptime) {
+  tm_->SetMetricsEnabled(true);
   const RowPosition row(7, 1);
   Transaction publisher = tm_->Begin();
   ASSERT_TRUE(publisher.AddWriteSet(row, "before"));
@@ -205,11 +223,25 @@ TEST_F(TransactionTest, RuntimeStatsReportsGaugesForLongUptime) {
   EXPECT_GE(stats.current_commit_ts, 1U);
   EXPECT_NE(stats.oldest_snapshot_ts, 0U);
   EXPECT_LE(stats.oldest_snapshot_ts, stats.current_commit_ts);
-  EXPECT_EQ(stats.write_intent_attempts, 0U);
+  // publisher.AddWriteSet(row, "before") above must register a measured
+  // attempt.
+  EXPECT_GE(stats.write_intent_attempts, 1U);
 
   ASSERT_EQ(tm_->Abort(writer), Status::kSuccess);
   ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
   EXPECT_EQ(tm_->RuntimeStats().active_transactions, 0U);
+}
+
+// RuntimeStats is an observability entry point that callers may invoke even
+// on a TransactionManager constructed without a logger (WAL-less setups).
+// It must report zero WAL gauges rather than dereferencing a null logger_.
+TEST_F(TransactionTest, RuntimeStatsWithoutLoggerReportsZeroWalGauges) {
+  TransactionManager no_logger(pm_.get(), nullptr, nullptr);
+  const TransactionRuntimeStats stats = no_logger.RuntimeStats();
+  EXPECT_EQ(stats.wal_sync_count, 0U);
+  EXPECT_EQ(stats.wal_sync_ns, 0U);
+  EXPECT_EQ(stats.wal_buffered_bytes, 0U);
+  EXPECT_EQ(stats.wal_durable_bytes, 0U);
 }
 
 TEST_F(TransactionTest, ReadOnlyTransactionCommit) {
@@ -541,12 +573,11 @@ TEST_F(TransactionTest, DefaultTransactionRegisterVersionWriteIsNoop) {
 }
 
 TEST_F(TransactionTest, CancelStagedVersionReleasesPayloadAccounting) {
-  // Cancelling a staged version (e.g. after an InsertLog/UpdateLog failure)
+  // Canceling a staged version (e.g. after an InsertLog/UpdateLog failure)
   // drops the write-set entry. It must also give back the resident payload
   // bytes that RegisterVersionWrite charged, or repeated failed writes leak.
   const RowPosition rp(14, 2);
-  const uint64_t baseline =
-      tm_->RuntimeStats().version_payload_resident_bytes;
+  const uint64_t baseline = tm_->RuntimeStats().version_payload_resident_bytes;
   Transaction txn = tm_->Begin();
   ASSERT_TRUE(txn.AddWriteSet(rp));
   txn.RegisterVersionWrite(rp, std::nullopt, "staged-payload-value");
@@ -944,13 +975,20 @@ class TransactionP6aTest : public ::testing::Test {
     std::ignore = std::remove((prefix_ + ".db.ckpt.tmp").c_str());
     std::ignore = std::remove((prefix_ + ".db.blocks").c_str());
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
-      const std::string fname = entry.path().filename().string();
+    const std::filesystem::directory_iterator end;
+    std::filesystem::directory_iterator it(".", ec);
+    EXPECT_FALSE(ec) << "cannot sweep companion artifacts: " << ec.message();
+    for (; !ec && it != end; it.increment(ec)) {
+      const std::string fname = it->path().filename().string();
       if (fname.starts_with(prefix_ + ".db.blocks.") ||
           fname.starts_with(prefix_ + ".db.lsm.")) {
-        std::filesystem::remove(entry.path(), ec);
+        std::error_code rem_ec;
+        std::filesystem::remove(it->path(), rem_ec);
+        EXPECT_FALSE(rem_ec)
+            << "failed to remove " << fname << ": " << rem_ec.message();
       }
     }
+    EXPECT_FALSE(ec) << "companion sweep failed: " << ec.message();
     RemoveLogAndSegments(prefix_ + ".log");
   }
 
@@ -960,6 +998,21 @@ class TransactionP6aTest : public ::testing::Test {
   std::unique_ptr<RecoveryManager> rm_;
   std::unique_ptr<TransactionManager> tm_;
 };
+
+TEST_F(TransactionP6aTest, WalRereadAbortUndoesFirstRecordAtZero) {
+  tm_->SetWalRereadThresholdBytesForTest(128);
+  Transaction txn = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                        pm_->AllocateNewPage(txn, PageType::kRowPage));
+  const page_id_t pid = page->PageID();
+  ASSERT_EQ(txn.FirstLSN(), 0U);
+  ASSERT_SUCCESS(page->Insert(txn, std::string(1024, 'x')).GetStatus());
+  page.PageUnlock();
+  EXPECT_TRUE(txn.IsWalRereadMode());
+  ASSERT_SUCCESS(txn.Abort());
+  EXPECT_FALSE(tm_->FailStopped());
+  EXPECT_FALSE(pm_->GetPage(pid).HasValue());
+}
 
 TEST_F(TransactionP6aTest,
        WalRereadModeCommitsAndAbortsBeyond4MiBAndSurvivesCrash) {
@@ -1355,7 +1408,8 @@ TEST_F(TransactionP6aTest,
 TEST_F(TransactionP6aTest,
        WriteSetSpillIoFailurePreservesStatusWithoutMaskingAsConflict) {
   tm_->SetWriteSetSpillThresholdForTest(64);
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
   struct InjectResetGuard {
     ~InjectResetGuard() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
   } guard;
@@ -1377,6 +1431,67 @@ TEST_F(TransactionP6aTest,
   // transaction whose invariants remain intact.
   EXPECT_FALSE(writer.IsFailed());
   ASSERT_SUCCESS(writer.Abort());
+}
+
+TEST_F(TransactionP6aTest,
+       WriteSetSpillBufferChargeFailureKeepsIntentsReleaseable) {
+  tm_->SetWriteSetSpillThresholdForTest(64);
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
+  struct InjectResetGuard {
+    ~InjectResetGuard() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
+  } guard;
+
+  constexpr size_t kRows = 64;
+  std::vector<RowPosition> rows;
+  rows.reserve(kRows);
+  for (size_t i = 0; i < kRows; ++i) {
+    rows.emplace_back(static_cast<page_id_t>(800), static_cast<slot_t>(i));
+  }
+
+  Transaction writer = tm_->Begin();
+  for (const RowPosition& rp : rows) {
+    ASSERT_TRUE(writer.AddWriteSet(rp, "before"));
+  }
+  ASSERT_FALSE(writer.IsWriteSetDiskSpilled());
+  auto staged_count = [&]() {
+    size_t count = 0;
+    for (const RowPosition& rp : rows) {
+      count += writer.HasWriteSet(rp) ? 1U : 0U;
+    }
+    return count;
+  };
+  ASSERT_EQ(staged_count(), kRows);
+
+  // The one-shot injection lands on the spill-buffer charge inside
+  // transition_to_disk. The already staged in-memory entries (and the write
+  // intents they track) must survive the failed spill transition intact.
+  ProcessMemoryBudget::Global().SetTestMemoryFailCountdown(1);
+  const RowPosition extra(800, static_cast<slot_t>(kRows));
+  EXPECT_FALSE(writer.TryAddWriteSet(extra));
+  EXPECT_EQ(writer.LastWriteSetFailureStatus().GetCode(),
+            StatusCode::kMemoryLimitExceeded);
+  EXPECT_FALSE(writer.IsWriteSetDiskSpilled());
+  EXPECT_EQ(staged_count(), kRows);
+  for (const RowPosition& rp : rows) {
+    EXPECT_TRUE(writer.HasWriteSet(rp));
+  }
+
+  // Every original intent is still held: no contender can take one, and all
+  // of them become available again once the writer aborts.
+  {
+    Transaction contender = tm_->Begin();
+    for (const RowPosition& rp : rows) {
+      EXPECT_FALSE(contender.TryAddWriteSet(rp));
+    }
+    ASSERT_SUCCESS(contender.Abort());
+  }
+  ASSERT_SUCCESS(writer.Abort());
+  for (const RowPosition& rp : rows) {
+    Transaction after = tm_->Begin();
+    EXPECT_TRUE(after.TryAddWriteSet(rp));
+    ASSERT_SUCCESS(after.Abort());
+  }
 }
 
 }  // namespace

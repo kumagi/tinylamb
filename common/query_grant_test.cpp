@@ -1,11 +1,11 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "common/query_grant.hpp"
 
-#include <limits>
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -165,7 +165,7 @@ TEST(QueryGrantTest, DynamicSharingLocalBatchCacheAndEffectiveDop) {
   {
     QueryMemoryGrant::LocalBatchCache cache(&grant, size_t{64} << 10);
     EXPECT_TRUE(cache.Reserve(1024));
-    EXPECT_GE(grant.UsedBytes(), size_t{64} << 10);
+    EXPECT_EQ(grant.UsedBytes(), size_t{64} << 10);
     EXPECT_EQ(cache.HeldBytes(), 1024U);
     cache.Release(1024);
   }

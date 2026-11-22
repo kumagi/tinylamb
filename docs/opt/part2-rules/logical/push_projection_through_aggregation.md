@@ -68,30 +68,36 @@ graph TD
 
 ## 実装の詳細
 
-集約が必要とする列(下の射影の出力)は、grouping sets と集約 target list の
-両方から集めます。
+集約が必要とする列(下の射影の出力)は grouping sets、`partition_by`、
+集約 target list、HAVING 述語のすべてから集めます。`*` は物理列ではないため
+除外します。
 
 ```cpp
             std::unordered_set<ColumnName> needed_cols;
-            for (const auto& g : agg.grouping_sets) {
-              if (g) {
-                for (const auto& c : g->TouchedColumns()) {
+            const auto collect_needed = [&](const Expression& e) {
+              if (!e) {
+                return;
+              }
+              for (const auto& c : e->TouchedColumns()) {
+                if (c.name != "*") {
                   needed_cols.insert(c);
                 }
               }
-            }
-            for (const auto& t : agg.target_list) {
-              if (t.expression) {
-                for (const auto& c : t.expression->TouchedColumns()) {
-                  needed_cols.insert(c);
-                }
+            };
+            for (const auto& g : agg.grouping_sets) collect_needed(g);
+            for (const auto& p : agg.partition_by) collect_needed(p);
+            for (const auto& t : agg.target_list) collect_needed(t.expression);
+            if (agg.predicate) {
+              collect_needed(*agg.predicate);
+              if (*agg.predicate) {
+                tag += "|having=" + (*agg.predicate)->ToString();
               }
             }
 ```
 
-グルーピングキーと集約引数が触れる列は全部下に残す、というのがこの Rule の
-剪定方針です。派生グループのタグには外側と集約の両方の target list を
-指紋化した文字列を使います。
+グルーピングキー、集約引数、HAVING が参照する列は下に残します。
+HAVING にしか現れない列も落とせません。派生グループのタグには入力グループ、
+両 target list、および HAVING 述語の指紋を含めます。
 
 ```cpp
             // The derived-group tag must identify the meaning, not just the
@@ -100,7 +106,7 @@ graph TD
             // pollute one group with another site's projection.
 ```
 
-タグが意味(両 target list)を識別するのは、第 20 章の D1(1 グループ 1 意味)
+タグが入力・両 target list・HAVING の意味を識別するのは、第 20 章の D1(1 グループ 1 意味)
 の実践です。タグが曖昧だと、別のクエリ部位が作った「同じリレーション集合の
 別の中間結果」グループに式が混入します。実際に追加される式は 3 個です。
 

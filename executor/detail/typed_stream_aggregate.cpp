@@ -35,6 +35,7 @@
 #include "common/constants.hpp"
 #include "common/exc_shim.hpp"
 #include "common/exception_status.hpp"
+#include "common/log_message.hpp"
 #include "common/parallel_work.hpp"
 #include "common/platform/extended_float.hpp"
 #include "common/platform/int128_conversion.hpp"
@@ -598,7 +599,8 @@ struct CompiledLSTableBlockFilter {
         }
         // NOLINTNEXTLINE(modernize-use-designated-initializers) positional init
         // is clear
-        Scratch::ActiveBranchSlice slice{  // NOLINT(modernize-use-designated-initializers)
+        Scratch::ActiveBranchSlice slice{
+            // NOLINT(modernize-use-designated-initializers)
             // NOLINT(modernize-use-designated-initializers)
             p_begin, p_end};  // NOLINT(modernize-use-designated-initializers)
         // BETWEEN branches otherwise dispatch two generic comparisons and
@@ -1230,8 +1232,8 @@ inline bool EvalDirectIntExpr(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kAdd: {
         int64_t v = 0;
         if (__builtin_add_overflow(stack[sp - 2], stack[sp - 1], &v)) {
-          *err =
-              StatusError(StatusCode::kIsInfinity, "integer overflow on '+'");
+          *err = StatusError(StatusCode::kInvalidArgument,
+                             "integer overflow on '+'");
           return false;
         }
         stack[sp - 2] = v;
@@ -1241,8 +1243,8 @@ inline bool EvalDirectIntExpr(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kSub: {
         int64_t v = 0;
         if (__builtin_sub_overflow(stack[sp - 2], stack[sp - 1], &v)) {
-          *err =
-              StatusError(StatusCode::kIsInfinity, "integer overflow on '-'");
+          *err = StatusError(StatusCode::kInvalidArgument,
+                             "integer overflow on '-'");
           return false;
         }
         stack[sp - 2] = v;
@@ -1252,8 +1254,8 @@ inline bool EvalDirectIntExpr(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kMul: {
         int64_t v = 0;
         if (__builtin_mul_overflow(stack[sp - 2], stack[sp - 1], &v)) {
-          *err =
-              StatusError(StatusCode::kIsInfinity, "integer overflow on '*'");
+          *err = StatusError(StatusCode::kInvalidArgument,
+                             "integer overflow on '*'");
           return false;
         }
         stack[sp - 2] = v;
@@ -1384,8 +1386,13 @@ StatusOr<std::optional<Relation>> BuildScalarDirectOutputChecked(
   std::vector<Column> output_columns;
   output_columns.reserve(stmt.SelectList().size());
   for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
-    Column col(ProjectionName(stmt.SelectList()[i], i),
-               row_values[i].IsNull() ? ValueTypeFromTypeTag(stmt.SelectList()[i].expression->ResultType(qualified_schema).GetType()) : ValueTypeOf(row_values[i]));
+    Column col(
+        ProjectionName(stmt.SelectList()[i], i),
+        row_values[i].IsNull()
+            ? ValueTypeFromTypeTag(stmt.SelectList()[i]
+                                       .expression->ResultType(qualified_schema)
+                                       .GetType())
+            : ValueTypeOf(row_values[i]));
     col.SetUnsigned(row_values[i].IsUnsigned());
     output_columns.push_back(std::move(col));
   }
@@ -1425,7 +1432,16 @@ Relation BuildScalarDirectOutput(
       plan, stmt, qualified_schema, table_schema, finished_values,
       total_scanned, total_matching, total_updates, publish_lstable_marker,
       fold_cache_key, scan_begin, merge_begin, runtime);
-  return std::move(*checked.MoveValue());  // NOLINT(bugprone-unchecked-optional-access)
+  // Every caller pre-checks that the fast-path plan has no post_agg emit item,
+  // so Checked must return a successful StatusOr holding a Relation. An empty
+  // optional means that plan invariant was broken; fail loudly at the boundary
+  // instead of dereferencing it (which is UB and would be reported as success).
+  CHECK_MSG(checked.HasValue(),
+            "BuildScalarDirectOutput: direct output check failed");
+  std::optional<Relation> output = checked.MoveValue();
+  CHECK_MSG(output.has_value(),
+            "BuildScalarDirectOutput: unsupported post_agg in fast-path plan");
+  return std::move(*output);
 }
 
 // Two-pass sharded parallel scalar COUNT(DISTINCT col) over LSTableStore.
@@ -2767,8 +2783,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
     if (flat_needed[c] == 0u) {
       continue;
     }
-    coalesce = c < store.integer_columns.size() &&
-               store.integer_columns[c].size() == store.total_rows &&
+    coalesce = store.IntegerColumn(c).size() == store.total_rows &&
                // NOLINTNEXTLINE(readability-uppercase-literal-suffix) literal
                // suffix style
                (store.column_has_null[c] ==
@@ -2844,8 +2859,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
         for (size_t c = 0; c < flat_needed.size(); ++c) {
           if (flat_needed[c])
             flat_block.columns[c].int_cells =
-                std::span<const int64_t>(store.integer_columns[c])
-                    .subspan(begin, flat_block.row_count);
+                store.IntegerColumn(c).subspan(begin, flat_block.row_count);
         }
       }
       const auto& blk = coalesce ? flat_block : store.blocks[bi];
@@ -4189,8 +4203,11 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   std::vector<Column> output_columns;
   output_columns.reserve(stmt.SelectList().size());
   for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
-    output_columns.emplace_back(ProjectionName(stmt.SelectList()[i], i),
-                                ValueTypeFromTypeTag(stmt.SelectList()[i].expression->ResultType(qualified_schema).GetType()));
+    output_columns.emplace_back(
+        ProjectionName(stmt.SelectList()[i], i),
+        ValueTypeFromTypeTag(stmt.SelectList()[i]
+                                 .expression->ResultType(qualified_schema)
+                                 .GetType()));
   }
   Relation output(runtime);
   size_t total_out_rows = 0;
@@ -4207,7 +4224,9 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   }
   if (!output.rows.empty()) {
     for (size_t i = 0; i < output_columns.size(); ++i) {
-      if (output.rows[0][i].IsNull()) { continue; }
+      if (output.rows[0][i].IsNull()) {
+        continue;
+      }
       output_columns[i] =
           Column(output_columns[i].Name(), ValueTypeOf(output.rows[0][i]));
       output_columns[i].SetUnsigned(output.rows[0][i].IsUnsigned());
@@ -4261,10 +4280,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       phase_begin = std::chrono::steady_clock::now();
     }
   };
-  auto direct_lstable_store =
-      SnapshotColumnStore(context, table, projection,
-                          qualified_schema.ColumnCount(),
-                          /*allow_lazy_build=*/false);
+  auto direct_lstable_store = SnapshotColumnStore(
+      context, table, projection, qualified_schema.ColumnCount(),
+      /*allow_lazy_build=*/false);
   const bool int_key =
       plan.key_offsets.size() == 1 &&
       (qualified_schema.GetColumn(plan.key_offsets[0]).Type() ==
@@ -4347,15 +4365,13 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             columnar_tlcs_result->rows.size());
       return std::move(*columnar_tlcs_result);
     }
-    direct_lstable_store =
-        SnapshotColumnStore(context, table, projection,
-                            qualified_schema.ColumnCount(),
-                            /*allow_lazy_build=*/true);
+    direct_lstable_store = SnapshotColumnStore(context, table, projection,
+                                               qualified_schema.ColumnCount(),
+                                               /*allow_lazy_build=*/true);
   } else if (direct_lstable_store == nullptr) {
-    direct_lstable_store =
-        SnapshotColumnStore(context, table, projection,
-                            qualified_schema.ColumnCount(),
-                            /*allow_lazy_build=*/true);
+    direct_lstable_store = SnapshotColumnStore(context, table, projection,
+                                               qualified_schema.ColumnCount(),
+                                               /*allow_lazy_build=*/true);
   }
   // A string's byte length is already available from the column's offsets.
   // Preserve the bytecode child for row/arena fallbacks and recognize only
@@ -5033,13 +5049,16 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     }
     ++*updates;
     if (local->slim) {
-      // Raw-cell fast path: every slim kind reads at most one column cell,
-      // so the common payload kinds (COUNT / SUM / AVG / COUNT(DISTINCT)
-      // over fixed-width cells) fold straight from batch.cells without
-      // boxing a Value per input.  NULL inputs skip exactly like the generic
-      // path (ApplySlimValue returns early on IsNull for every kind); a kind
-      // or cell type the raw switch does not cover falls through to the
-      // generic boxed call, which raises the same type-mismatch errors.
+      // Raw-cell fast path: the common payload kinds (COUNT / SUM / AVG /
+      // COUNT(DISTINCT) over fixed-width cells) read at most one column cell
+      // and fold straight from batch.cells without boxing a Value per input.
+      // Expression inputs are the exception: double_expr goes through
+      // EvaluateTypedDoubleExprCells, whose kGeneric shape reads several
+      // cells (up to 16 ops) and whose 2-3-column kinds read multiple cells.
+      // NULL inputs skip exactly like the generic path (ApplySlimValue
+      // returns early on IsNull for every kind); a kind or cell type the raw
+      // switch does not cover falls through to the generic boxed call, which
+      // raises the same type-mismatch errors.
       const std::vector<SlimAggKind>& kinds = *local->slim_kinds;
       std::array<Value, 8>& stack_values = *row_values;
       for (size_t i = 0; i < plan.aggregates.size(); ++i) {
@@ -5475,7 +5494,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   std::vector<Status> worker_errors(worker_count, Status::kSuccess);
   // Row-level instrumentation must not make all workers invalidate the same
   // cache line. Keep each worker's frequently updated counters together and
-  // isolate them from its neighbours; publish totals only after the join.
+  // isolate them from its neighbors; publish totals only after the join.
   struct alignas(64) WorkerCounters {
     size_t scanned{0};
     size_t emitted{0};
@@ -5668,10 +5687,10 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         df.full_column = full_col;
         const auto& dict = direct_lstable_store->dictionaries[full_col];
         const size_t n_entries = dict.value_type == ValueType::kVarChar
-                                     ? dict.entries.size()
+                                     ? dict.StringEntryCount()
                                      : (dict.value_type == ValueType::kDouble
-                                            ? dict.double_entries.size()
-                                            : dict.int_entries.size());
+                                            ? dict.DoubleEntryCount()
+                                            : dict.IntEntryCount());
         for (size_t code = 0; code < n_entries; ++code) {
           df.pass[code] = 1;
           df.pass_mask[code >> 6] |= uint64_t{1} << (code & 63);
@@ -5699,7 +5718,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           (cmp.op == BinaryOperation::kLike ||
            cmp.op == BinaryOperation::kNotLike) &&
           dictionary.wide_code_bytes != 0 &&
-          static_cast<double>(dictionary.entries.size()) <=
+          static_cast<double>(dictionary.StringEntryCount()) <=
               expected_filter_rows / 2) {
         wide_string_filters[fi] = CompileDictionaryPredicate(
             *direct_lstable_store, cmp, projection, wide_filter_charge);
@@ -5716,11 +5735,13 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       if (cmp.string_payload && dict.value_type == ValueType::kVarChar) {
         LSTableAggDictFilter& df = get_or_init_df(full_col);
         df.pass_mask = {0ULL, 0ULL, 0ULL, 0ULL};
-        for (size_t code = 0; code < dict.entries.size(); ++code) {
+        const size_t dict_size = dict.StringEntryCount();
+        for (size_t code = 0; code < dict_size; ++code) {
           if (df.pass[code] == 0) {
             continue;
           }
-          const bool ok = MatchTypedStringCompare(dict.entries[code], cmp);
+          const bool ok =
+              MatchTypedStringCompare(dict.StringEntryAt(code), cmp);
           if (!ok) {
             df.pass[code] = 0;
           } else {
@@ -5731,11 +5752,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       } else if (cmp.is_double && dict.value_type == ValueType::kDouble) {
         LSTableAggDictFilter& df = get_or_init_df(full_col);
         df.pass_mask = {0ULL, 0ULL, 0ULL, 0ULL};
-        for (size_t code = 0; code < dict.double_entries.size(); ++code) {
+        const auto double_entries = dict.DoubleEntries();
+        for (size_t code = 0; code < double_entries.size(); ++code) {
           if (df.pass[code] == 0) {
             continue;
           }
-          const double a = dict.double_entries[code];
+          const double a = double_entries[code];
           bool ok = false;
           switch (cmp.op) {
             case BinaryOperation::kEquals:
@@ -5777,11 +5799,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       if (list.is_string && dict.value_type == ValueType::kVarChar) {
         LSTableAggDictFilter& df = get_or_init_df(full_col);
         df.pass_mask = {0ULL, 0ULL, 0ULL, 0ULL};
-        for (size_t code = 0; code < dict.entries.size(); ++code) {
+        const size_t dict_size = dict.StringEntryCount();
+        for (size_t code = 0; code < dict_size; ++code) {
           if (df.pass[code] == 0) {
             continue;
           }
-          const std::string_view sv = dict.entries[code];
+          const std::string_view sv = dict.StringEntryAt(code);
           const bool matched = MatchTypedStringInList(sv, list);
           if (!matched) {
             df.pass[code] = 0;
@@ -5793,11 +5816,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       } else if (list.is_double && dict.value_type == ValueType::kDouble) {
         LSTableAggDictFilter& df = get_or_init_df(full_col);
         df.pass_mask = {0ULL, 0ULL, 0ULL, 0ULL};
-        for (size_t code = 0; code < dict.double_entries.size(); ++code) {
+        const auto double_entries = dict.DoubleEntries();
+        for (size_t code = 0; code < double_entries.size(); ++code) {
           if (df.pass[code] == 0) {
             continue;
           }
-          const double dv = dict.double_entries[code];
+          const double dv = double_entries[code];
           bool matched = false;
           for (const double item : list.double_values) {
             if (dv == item) {
@@ -5816,11 +5840,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                  dict.value_type == ValueType::kInt64) {
         LSTableAggDictFilter& df = get_or_init_df(full_col);
         df.pass_mask = {0ULL, 0ULL, 0ULL, 0ULL};
-        for (size_t code = 0; code < dict.int_entries.size(); ++code) {
+        const auto int_entries = dict.IntEntries();
+        for (size_t code = 0; code < int_entries.size(); ++code) {
           if (df.pass[code] == 0) {
             continue;
           }
-          const int64_t iv = dict.int_entries[code];
+          const int64_t iv = int_entries[code];
           bool matched = false;
           for (const int64_t item : list.int_values) {
             if (iv == item) {
@@ -5998,16 +6023,14 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         if (dictionary.active || dictionary.wide_code_bytes != 0) {
           size_t maximum = 0;
           // Persistent stores expose entries through flat views only.
-          for (size_t code = 0; code < dictionary.StringEntryCount();
-               ++code) {
+          for (size_t code = 0; code < dictionary.StringEntryCount(); ++code) {
             maximum = std::max(maximum, dictionary.StringEntryAt(code).size());
           }
           upper_bound = static_cast<platform::Int128>(maximum) *
                         direct_lstable_store->total_rows;
         } else {
           for (const auto& block : direct_lstable_store->blocks) {
-            upper_bound +=
-                block.columns[term.full_col0].VarcharBytes().size();
+            upper_bound += block.columns[term.full_col0].VarcharBytes().size();
           }
         }
         // Every prefix and worker subtotal is exact in both INT64 and
@@ -6519,18 +6542,23 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         if (worker != 0) {
           return;
         }
-        Status error = Status::kSuccess;
+        Status error = cached_relation->FinishSpill();
         size_t rows_output = 0;
         size_t updates = 0;
-        cached_relation->FinishSpill();
-        cached_relation->ForEachRow([&](const Row& row) {
-          if (error != Status::kSuccess) {
-            return;
+        if (error == Status::kSuccess) {
+          const Status read_status =
+              cached_relation->ForEachRow([&](const Row& row) {
+                if (error != Status::kSuccess) {
+                  return;
+                }
+                ++counters[worker].scanned;
+                accumulate_row(row, &workers[worker], &error, &rows_output,
+                               &updates, nullptr, &scratch);
+              });
+          if (error == Status::kSuccess && read_status != Status::kSuccess) {
+            error = read_status;
           }
-          ++counters[worker].scanned;
-          accumulate_row(row, &workers[worker], &error, &rows_output, &updates,
-                         nullptr, &scratch);
-        });
+        }
         worker_errors[worker] = error;
         counters[worker].emitted += rows_output;
         counters[worker].updates += updates;
@@ -7013,7 +7041,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 use_val_dict ? val_col.dict_codes.data() : nullptr;
             const double* val_dict =
                 use_val_dict ? direct_lstable_store->dictionaries[val_full_col]
-                                   .double_entries.data()
+                                   .DoubleEntries()
+                                   .data()
                              : nullptr;
             const uint32_t nrows = blk.row_count;
             counters[worker].scanned += nrows;
@@ -7048,7 +7077,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               uint8_t run_flags = 0;
               if (val_codes != nullptr) {
                 for (uint32_t k = r; k < r_end; ++k) {
-                  run_sum += val_dict[val_codes[k]];
+                  const double val = val_dict[val_codes[k]];
+                  if (std::isinf(val)) [[unlikely]] {
+                    run_flags |= 1;
+                  }
+                  run_sum += val;
                 }
               } else {
                 for (uint32_t k = r; k < r_end; ++k) {
@@ -7160,7 +7193,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     const auto& d =
                         direct_lstable_store->dictionaries[full_col];
                     *codes_out = blk.columns[full_col].dict_codes.data();
-                    *dict_out = d.double_entries.data();
+                    *dict_out = d.DoubleEntries().data();
                     if (omd_out != nullptr && k_omd == 1.0 &&
                         !d.one_minus_double_entries.empty()) {
                       *omd_out = d.one_minus_double_entries.data();
@@ -8627,7 +8660,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     int64_t v = 0;
                     if (__builtin_add_overflow(stack[sp - 2], stack[sp - 1],
                                                &v)) {
-                      *error = StatusError(StatusCode::kIsInfinity,
+                      *error = StatusError(StatusCode::kInvalidArgument,
                                            "integer overflow on '+'");
                       return false;
                     }
@@ -8639,7 +8672,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     int64_t v = 0;
                     if (__builtin_sub_overflow(stack[sp - 2], stack[sp - 1],
                                                &v)) {
-                      *error = StatusError(StatusCode::kIsInfinity,
+                      *error = StatusError(StatusCode::kInvalidArgument,
                                            "integer overflow on '-'");
                       return false;
                     }
@@ -8651,7 +8684,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     int64_t v = 0;
                     if (__builtin_mul_overflow(stack[sp - 2], stack[sp - 1],
                                                &v)) {
-                      *error = StatusError(StatusCode::kIsInfinity,
+                      *error = StatusError(StatusCode::kInvalidArgument,
                                            "integer overflow on '*'");
                       return false;
                     }
@@ -9562,7 +9595,6 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     const auto aggregate_begin = std::chrono::steady_clock::now();
     std::vector<std::vector<Row>> worker_outputs(worker_count);
     std::vector<Status> emit_errors(worker_count, Status::kSuccess);
-    Status emit_exception{Status::kSuccess};
     const auto emit_worker = [&](size_t w) {
       try {
         TypedWorkerGroups& local = workers[w];
@@ -9639,9 +9671,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         }
         local = TypedWorkerGroups{};
       } catch (...) {
-        if (emit_exception == Status::kSuccess) {
-          emit_exception = StatusFromCurrentException("emit worker failed");
-        }
+        emit_errors[w] = StatusFromCurrentException("emit worker failed");
       }
     };
     std::vector<std::jthread> emit_threads;
@@ -9655,9 +9685,6 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     }
     emit_worker(0);
     emit_threads.clear();
-    if (emit_exception != Status::kSuccess) {
-      return emit_exception;
-    }
     for (const Status& err : emit_errors) {
       if (err != Status::kSuccess) {
         return err;

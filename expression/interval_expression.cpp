@@ -17,10 +17,9 @@ StatusOr<Value> IntervalExpression::TryEvaluate(
   return Value(std::string(text_)).WithInterval();
 }
 
-Value IntervalExpression::Evaluate(const Row& /*row*/,
-                                   const Schema& /*schema*/) const {
+Value IntervalExpression::Evaluate(const Row& row, const Schema& schema) const {
   // EXC-SHIM: unwrap through the shared status boundary like other nodes.
-  return ExcShimUnwrap(TryEvaluate(Row(), Schema()),
+  return ExcShimUnwrap(TryEvaluate(row, schema),
                        "IntervalExpression::Evaluate");
 }
 
@@ -30,13 +29,11 @@ StatusOr<Value> IntervalExpression::TryEvaluate(
   return Value(std::string(text_)).WithInterval();
 }
 
-Value IntervalExpression::Evaluate(const Row* /*unused*/,
-                                   const Schema& /*unused*/,
-                                   const Row* /*unused*/,
-                                   const Schema& /*unused*/) const {
-  return ExcShimUnwrap(
-      TryEvaluate(static_cast<const Row*>(nullptr), Schema(), nullptr, Schema()),
-      "IntervalExpression::Evaluate");
+Value IntervalExpression::Evaluate(const Row* left, const Schema& left_schema,
+                                   const Row* right,
+                                   const Schema& right_schema) const {
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "IntervalExpression::Evaluate");
 }
 
 tinylamb::Type IntervalExpression::ResultType(const Schema& /*unused*/) const {

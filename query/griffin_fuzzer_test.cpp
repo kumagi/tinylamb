@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
+#include "expression/bytecode.hpp"
 #include "gtest/gtest.h"
 
 namespace tinylamb {
@@ -88,6 +90,25 @@ TEST(GriffinFuzzer, BytecodeDisabledPathStillExecutes) {
                              // deterministic seed for reproducibility
   GriffinTrace trace;
   trace.seed = (static_cast<uint64_t>(seed32) << 32) | seed32;
+
+  // The clean differential below is evidence only if the disable hook it
+  // relies on is live. With TINYLAMB_DISABLE_BYTECODE set the engine must
+  // actually leave the bytecode fast path; otherwise oracle (2) compares
+  // bytecode against bytecode and every seeded sweep passes vacuously.
+  const char* prior_disable = std::getenv("TINYLAMB_DISABLE_BYTECODE");
+  const std::string prior_value =
+      prior_disable == nullptr ? std::string() : std::string(prior_disable);
+  platform::SetEnv("TINYLAMB_DISABLE_BYTECODE", "1");
+  const bool ast_fallback_live = !BytecodeEnabled();
+  if (prior_disable == nullptr) {
+    platform::UnsetEnv("TINYLAMB_DISABLE_BYTECODE");
+  } else {
+    platform::SetEnv("TINYLAMB_DISABLE_BYTECODE", prior_value.c_str());
+  }
+  EXPECT_TRUE(ast_fallback_live)
+      << "TINYLAMB_DISABLE_BYTECODE no longer reaches the engine; the "
+         "AST-fallback differential is vacuous";
+
   ASSERT_EQ(RunGriffinIteration(rng, false, &trace), "");
   ASSERT_TRUE(trace.ran_select);
   bool saw_select = false;

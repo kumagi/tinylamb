@@ -22,8 +22,9 @@ class Statement;
 // otherwise.  Shared by TIMESTAMP literals, typed array elements, and the
 // SQL-template binder (which must reproduce the literal normalization when
 // re-binding a cached template).  Returns nullopt for literals the visitor
-// rejects (named zones, impossible dates, second >= 60) so the template
-// scanner can decline to cache them.
+// rejects (unparseable text, named zones, impossible dates, second >= 60,
+// fractional seconds without digits) so the template scanner can decline to
+// cache them.
 std::optional<std::string> NormalizeTimestampText(const std::string& text);
 
 // Decodes the backslash escape sequences inside an already quote-stripped,
@@ -35,18 +36,23 @@ std::optional<std::string> NormalizeTimestampText(const std::string& text);
 StatusOr<std::string> DecodeStringEscapes(std::string_view value, bool is_bytes,
                                           bool is_triple, char quote);
 
-// Session-scoped (thread-local) view registry: name -> defining query AST.
+struct StoredViewDefinition {
+  std::shared_ptr<GoogleSqlAstNode> query;
+  std::string source;
+};
+
+// Session-scoped (thread-local) view registry.
 // CREATE VIEW registers here immediately; SqlEngine re-registers persisted
 // definitions on demand so views survive a restart.  Declared here because
 // the engine seeds it in Prepare before the visitor runs.
-std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>&
-ViewRegistry();
+std::unordered_map<std::string, StoredViewDefinition>& ViewRegistry();
 
 // Clones `query` into the view registry under `name` (used by the engine to
 // re-seed persisted definitions after a reopen; CREATE VIEW registers
 // through the visitor directly).
 void RegisterViewDefinition(std::string_view name,
-                            const GoogleSqlAstNode& query);
+                            const GoogleSqlAstNode& query,
+                            std::string_view source);
 
 // Session scope for CREATE [TEMP] FUNCTION definitions, which live in a
 // thread-local registry. Each server connection scopes lookups to its own id,

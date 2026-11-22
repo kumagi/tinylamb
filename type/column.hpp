@@ -38,6 +38,10 @@ enum class AccessHint : uint8_t {
   kSortKey,
 };
 
+// STRING and TIMESTAMP share VARCHAR storage. Existing schemas may lack
+// the logical type, in which case the domain is unspecified.
+enum class TextDomain : uint8_t { kUnspecified, kString, kTimestamp };
+
 class Column {
  public:
   Column() = default;
@@ -50,10 +54,26 @@ class Column {
   [[nodiscard]] const ColumnName& Name() const { return col_name_; }
   ColumnName& Name() { return col_name_; }
   [[nodiscard]] ValueType Type() const { return type_; }
-  void SetType(ValueType type) { type_ = type; }
+  void SetType(ValueType type) {
+    type_ = type;
+    if (type_ != ValueType::kVarChar) {
+      text_domain_ = TextDomain::kUnspecified;
+    }
+  }
+  [[nodiscard]] TextDomain GetTextDomain() const { return text_domain_; }
+  void SetTextDomain(TextDomain domain) {
+    text_domain_ = type_ == ValueType::kVarChar && !interval_
+                       ? domain
+                       : TextDomain::kUnspecified;
+  }
   [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
   [[nodiscard]] bool IsInterval() const { return interval_; }
-  void SetInterval(bool value) { interval_ = value; }
+  void SetInterval(bool value) {
+    interval_ = value;
+    if (value) {
+      text_domain_ = TextDomain::kUnspecified;
+    }
+  }
   [[nodiscard]] uint8_t IntegerBits() const { return integer_bits_; }
   // Width of the declared integer domain: 8, 16, 32, or 64.
   void SetIntegerBits(uint8_t bits) {
@@ -76,7 +96,8 @@ class Column {
     return type_ == rhs.type_ && unsigned_ == rhs.unsigned_ &&
            interval_ == rhs.interval_ && col_name_ == rhs.col_name_ &&
            constraint_ == rhs.constraint_ &&
-           integer_bits_ == rhs.integer_bits_;
+           integer_bits_ == rhs.integer_bits_ &&
+           text_domain_ == rhs.text_domain_;
   }
   friend std::ostream& operator<<(std::ostream& o, const Column& c);
   friend Encoder& operator<<(Encoder& a, const Column& c);
@@ -87,6 +108,7 @@ class Column {
   ValueType type_{};
   bool unsigned_{false};
   bool interval_{false};
+  TextDomain text_domain_{TextDomain::kUnspecified};
   uint8_t integer_bits_{64};
   Constraint constraint_{Constraint::kNothing};
   AccessHint hint_{AccessHint::kUnknown};

@@ -165,8 +165,38 @@ std::string ErrnoMessage(std::string_view operation) {
 // brackets, and "localhost". An empty address resolves to the wildcard via
 // AI_PASSIVE and must still warn.
 bool IsLoopbackListenAddress(std::string_view address) {
-  if (address == "localhost" || address.starts_with("127.")) {
+  if (address == "localhost") {
     return true;
+  }
+  // Only a numeric 127.0.0.0/8 literal is loopback. A DNS name such as
+  // "127.0.0.1.evil.example" also starts with "127." but getaddrinfo (called
+  // without AI_NUMERICHOST) can resolve it to a public address; accepting the
+  // prefix would suppress the exposure warning for a publicly reachable
+  // listener.
+  if (address.starts_with("127.")) {
+    size_t pos = 4;  // skip the leading "127."
+    for (int octet = 0; octet < 3; ++octet) {
+      const size_t begin = pos;
+      int value = 0;
+      while (pos < address.size() && address[pos] >= '0' &&
+             address[pos] <= '9') {
+        value = value * 10 + (address[pos] - '0');
+        if (value > 255) {
+          break;
+        }
+        ++pos;
+      }
+      if (begin == pos || value > 255) {
+        return false;
+      }
+      if (octet == 2) {
+        return pos == address.size();
+      }
+      if (pos >= address.size() || address[pos] != '.') {
+        return false;
+      }
+      ++pos;
+    }
   }
   if (address.size() >= 2 && address.front() == '[' && address.back() == ']') {
     address = address.substr(1, address.size() - 2);
@@ -241,6 +271,26 @@ std::string UppercaseCommand(std::string_view sql) {
   return command;
 }
 
+// PostgreSQL starts a transaction with "BEGIN" or "START TRANSACTION" only:
+// a bare "START" (or "START foo") is a syntax error. UppercaseCommand looks
+// at the first word alone, so inspect the next word for the START spelling.
+bool IsBeginStatement(std::string_view sql) {
+  const std::string command = UppercaseCommand(sql);
+  if (command == "BEGIN") {
+    return true;
+  }
+  if (command != "START") {
+    return false;
+  }
+  const std::string_view rest = StripLeadingComments(sql);
+  const size_t begin = rest.find_first_not_of(" \t\r\n");
+  const size_t end = rest.find_first_of(" \t\r\n", begin);
+  if (end == std::string_view::npos) {
+    return false;
+  }
+  return UppercaseCommand(rest.substr(end)) == "TRANSACTION";
+}
+
 std::string CommandTag(StatementType type, int64_t affected_rows) {
   switch (type) {
     case StatementType::kCreateTable:
@@ -313,10 +363,16 @@ Status DrainCommandResult(QueryResult& result, int64_t* affected_rows) {
 
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding) field order is
 // logical, not size-packed
-class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding)
+class PostgresServer::
+    Impl {  // NOLINT(clang-analyzer-optin.performance.Padding)
  public:
   Impl(const std::string& database_path, PostgresServerOptions options)
       : options_(std::move(options)) {
+    if (options_.max_connections >
+        std::numeric_limits<size_t>::max() / kClientTxBufferFloorBytes) {
+      startup_error_ = "max_connections exceeds the server buffer limit";
+      return;
+    }
     // Honor force_recovery here as well as in postgres_server_main: an
     // embedder constructing PostgresServer directly with the flag set gets
     // the same torn-tail truncation behavior without touching the global
@@ -639,7 +695,8 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
  private:
   // Unpredictable BackendKeyData secret (CancelRequest is recognized on startup
   // but only closes the connection; the key must not be guessable from the fd
-  // alone).
+  // alone). Called only by AcceptClients on the Run event-loop thread;
+  // RequestStop and worker threads must not access secret_rng_.
   uint32_t NextSecret() { return static_cast<uint32_t>(secret_rng_()); }
 
   // Epoll owns socket lifetime. A completed worker may borrow it for one
@@ -768,6 +825,10 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     std::chrono::steady_clock::time_point read_started_at{};
     std::chrono::steady_clock::time_point last_activity{
         std::chrono::steady_clock::now()};
+    // Set when a reply starts queueing. The idle sweep grants a full
+    // idle_timeout measured from here before discarding a still-draining
+    // reply; WriteClient clears it once the queue is empty.
+    std::chrono::steady_clock::time_point output_pending_at{};
     bool output_overflow = false;
     bool permit_deferred_commit{false};
     lsn_t reply_durability_target{0};
@@ -954,10 +1015,18 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       // loop: PumpActiveStream refreshes last_activity per chunk. The
       // orphaned completion is dropped by the client-id check when it
       // eventually arrives.
+      // A reply still draining to a slow peer gets a full idle_timeout from
+      // the moment it was queued, so it is not discarded mid-send; the cap
+      // still bounds how long a non-reading peer can pin the connection.
+      const auto idle_since =
+          (client.output_offset < client.output.size() &&
+           client.output_pending_at != std::chrono::steady_clock::time_point{})
+              ? client.output_pending_at
+              : client.last_activity;
       const bool idle =
           client.read_query_in_flight
               ? now - client.read_started_at > options_.idle_timeout
-              : now - client.last_activity > options_.idle_timeout;
+              : now - idle_since > options_.idle_timeout;
       if (idle) {
         const int fd = it->first;
         ++it;
@@ -974,11 +1043,12 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       return false;
     }
     Client& client = found->second;
-    // Uninitialised on purpose: RecvSocket returns the number of valid
+    // Uninitialized on purpose: RecvSocket returns the number of valid
     // bytes and nothing reads past it, so the 8 KiB zero-fill per call
     // would just be hot-path memset.
-    std::array<char, 8192> buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-                                    // only bytes read are used
+    std::array<char, 8192>
+        buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+                 // only bytes read are used
     bool eof_seen = false;
     bool read_blocked = false;
     size_t cached_packets = 0;
@@ -1110,6 +1180,9 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
           continue;
         }
         if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+          // Keep kPollWritable armed for the unsent suffix. A peer-close flag
+          // raised in the same event is deliberately honored only after the
+          // queue drains: a FIN must not discard already-queued replies.
           UpdateClientInterest(client);
           return true;
         }
@@ -1118,6 +1191,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       if (client.output_offset == client.output.size()) {
         client.output.clear();
         client.output_offset = 0;
+        client.output_pending_at = {};
         const size_t retain_cap =
             client.active_stream != nullptr ? kClientStreamChunkBytes : 4096;
         // Only release buffers several times larger than the retain
@@ -1199,6 +1273,9 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     if (client.output_offset != 0) {
       client.output.erase(0, client.output_offset);
       client.output_offset = 0;
+    }
+    if (client.output.empty() && !message.empty()) {
+      client.output_pending_at = client.last_activity;
     }
     if (client.output.size() + message.size() > kMaxQueuedOutputBytes) {
       // Backpressure: refuse further buffering for a client that does not
@@ -1308,7 +1385,11 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     }
     const uint32_t length = length_field.Value();
     if (length < 8 || length > kMaxPreAuthInputBytes) {
-      Queue(client, pgwire::ErrorResponse("invalid startup packet", "08P01"));
+      // Every other fatal startup rejection (bad code field, parse failure,
+      // missing user) uses FATAL; this one disconnects too, so keep the
+      // severity consistent instead of falling back to the default ERROR.
+      Queue(client,
+            pgwire::ErrorResponse("invalid startup packet", "08P01", "FATAL"));
       client.close_after_write = true;
       return false;
     }
@@ -1417,6 +1498,9 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
 
   static void SendCachedLiteralReply(Client& client,
                                      const std::string& response) {
+    if (client.output_overflow) {
+      return;
+    }
     if (!client.output.empty()) {
       Queue(client, response);
       return;
@@ -1448,9 +1532,10 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
 
   bool TryCachedQueryPacket(Client& client, std::string_view packet) {
     if (!client.startup_complete || client.close_after_write ||
-        client.read_query_in_flight || client.active_stream != nullptr ||
-        client.transaction_status != 'I' || client.session_has_temp_objects ||
-        packet.size() < 6 || packet[0] != 'Q' || packet.back() != '\0') {
+        client.output_overflow || client.read_query_in_flight ||
+        client.active_stream != nullptr || client.transaction_status != 'I' ||
+        client.session_has_temp_objects || packet.size() < 6 ||
+        packet[0] != 'Q' || packet.back() != '\0') {
       return false;
     }
     const auto length = pgwire::ReadUint32(packet, 1);
@@ -1496,9 +1581,11 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       return;
     }
     // Mirror gate: while another session has an open block with an uncommitted
-    // catalog DDL, refuse this session's statements that touch the catalog.
-    // The catalog LSM has no per-txn visibility, so a phantom/rollback there
-    // can otherwise corrupt acknowledged writes from this session.
+    // catalog DDL, refuse this session's catalog statements (CREATE/DROP/
+    // ALTER/ANALYZE) AND its writes to user tables (INSERT/UPDATE/DELETE/
+    // MERGE). The latter are not catalog changes, but a concurrent writer
+    // would race the stable table image the DDL build relies on; rejecting
+    // them keeps that image -- and acknowledged writes -- consistent.
     if (open_block_ddl_sessions_.load(std::memory_order_acquire) != 0 &&
         client.transaction_status != 'T') {
       const bool touches_catalog =
@@ -1507,7 +1594,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
             return command == "CREATE" || command == "DROP" ||
                    command == "ALTER" || command == "ANALYZE" ||
                    command == "INSERT" || command == "UPDATE" ||
-                   command == "DELETE";
+                   command == "DELETE" || command == "MERGE";
           });
       if (touches_catalog) {
         if (client.transaction) {
@@ -1533,7 +1620,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       // user pages. Preserve the existing state machine while avoiding a
       // worker transfer for these bounded state transitions.
       if (client.transaction == nullptr &&
-          (command == "BEGIN" || command == "START" || command == "ROLLBACK" ||
+          (IsBeginStatement(statements[0]) || command == "ROLLBACK" ||
            command == "ABORT")) {
         ExecuteStatements(client, statements);
         return;
@@ -1561,10 +1648,10 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
           // pinned to the epoll thread just because of the SET.
           return command == "SELECT" || command == "INSERT" ||
                  command == "UPDATE" || command == "DELETE" ||
-                 command == "BEGIN" || command == "START" ||
-                 command == "COMMIT" || command == "END" ||
-                 command == "ROLLBACK" || command == "ABORT" ||
-                 command == "SET";
+                 command == "MERGE" || command == "BEGIN" ||
+                 command == "START" || command == "COMMIT" ||
+                 command == "END" || command == "ROLLBACK" ||
+                 command == "ABORT" || command == "SET";
         })) {
       ScheduleSessionQuery(client, statements);
       return;
@@ -1756,7 +1843,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
                         size_t next_statement_idx = 0,
                         size_t earlier_pending = 0) {
     const std::string command = UppercaseCommand(sql);
-    if (command == "BEGIN" || command == "START") {
+    if (IsBeginStatement(sql)) {
       // PostgreSQL: an explicit BEGIN inside an aborted transaction must not
       // clear the aborted state (25P02); only ROLLBACK/COMMIT recover it.
       if (client.transaction_status == 'E') {
@@ -2498,8 +2585,8 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     }
     // "CREATE TEMP VIEW" / "CREATE TEMPORARY AGGREGATE FUNCTION ..." land in
     // the same thread-local tables; skip the location modifiers.
-    while (index < count &&
-           (IdentifierEquals(words[index], "TEMP") || IdentifierEquals(words[index], "TEMPORARY"))) {
+    while (index < count && (IdentifierEquals(words[index], "TEMP") ||
+                             IdentifierEquals(words[index], "TEMPORARY"))) {
       ++index;
     }
     if (index < count && IdentifierEquals(words[index], "AGGREGATE")) {
@@ -2508,7 +2595,8 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     if (index >= count) {
       return false;
     }
-    if (IdentifierEquals(words[index], "VIEW") || IdentifierEquals(words[index], "FUNCTION") ||
+    if (IdentifierEquals(words[index], "VIEW") ||
+        IdentifierEquals(words[index], "FUNCTION") ||
         IdentifierEquals(words[index], "CONSTANT")) {
       return true;
     }
@@ -2522,10 +2610,10 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     // but waiting for their future COMMIT would add a useless batch delay.
     if (!task.cleanup_only && task.session && task.statements.size() == 1) {
       const auto command = UppercaseCommand(task.statements.front());
-      task.potential_commit =
-          command == "COMMIT" || command == "END" ||
-          (task.session->transaction_status == 'I' &&
-           (command == "INSERT" || command == "UPDATE" || command == "DELETE"));
+      task.potential_commit = command == "COMMIT" || command == "END" ||
+                              (task.session->transaction_status == 'I' &&
+                               (command == "INSERT" || command == "UPDATE" ||
+                                command == "DELETE" || command == "MERGE"));
     }
     size_t chosen = 0;
     {
@@ -2544,6 +2632,10 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
         if (!task.cleanup_only) {
           const auto stray = clients_.find(task.client_fd);
           if (stray != clients_.end() && stray->second.id == task.client_id) {
+            // ScheduleSessionQuery latched the in-flight gate before handing
+            // us this task. With no worker there is no completion to clear
+            // it, so release it here or ProcessInput stays blocked forever.
+            stray->second.read_query_in_flight = false;
             std::string response =
                 pgwire::ErrorResponse("no read workers available", "53000");
             response += pgwire::ReadyForQuery('I');
@@ -2641,7 +2733,8 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
     session->reply_durability_target = 0;
     session->transaction = std::move(client.transaction);
     session->transaction_status = client.transaction_status;
-    session->open_block_has_ddl = std::exchange(client.open_block_has_ddl, false);
+    session->open_block_has_ddl =
+        std::exchange(client.open_block_has_ddl, false);
     session->plan_cache = std::move(client.plan_cache);
     client.read_query_in_flight = true;
     client.read_started_at = std::chrono::steady_clock::now();
@@ -2722,7 +2815,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
 
   // P1483/P2084: park and join the durability worker (idempotent; tolerates
   // a never-started thread). deferred_commits_enabled_ gates the producer,
-  // so flip it BEFORE signalling to strand nothing in the queue.
+  // so flip it BEFORE signaling to strand nothing in the queue.
   void StopDurabilityWorker() {
     deferred_commits_enabled_.store(false, std::memory_order_release);
     {
@@ -2768,14 +2861,9 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       }
     }
     read_workers_.clear();
-    {
-      std::scoped_lock lock(durability_mutex_);
-      durability_stopping_ = true;
-    }
-    durability_ready_.notify_all();
-    if (durability_worker_.joinable()) {
-      durability_worker_.join();
-    }
+    // Use the shared helper rather than duplicating the durability stop
+    // sequence here, so both shutdown paths stay in lockstep.
+    StopDurabilityWorker();
   }
 
   void ReadWorkerLoop(size_t worker) {
@@ -3046,12 +3134,18 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
       }
       Status durable = Status::kSuccess;
       const auto sync_begin = std::chrono::steady_clock::now();
-      try {
-        durable = database_->WaitForCommitDurable(target);
-      } catch (const std::exception& error) {
-        durable = StatusError(StatusCode::kIOError, error.what());
-      } catch (...) {
-        durable = StatusError(StatusCode::kIOError, "durability worker failed");
+      // A wake can lose its batch to a stopping/shutdown race. LSN 0 is not
+      // a meaningful wait target -- skip it instead of taking the lock/log
+      // path for an empty cohort.
+      if (!batch.empty()) {
+        try {
+          durable = database_->WaitForCommitDurable(target);
+        } catch (const std::exception& error) {
+          durable = StatusError(StatusCode::kIOError, error.what());
+        } catch (...) {
+          durable =
+              StatusError(StatusCode::kIOError, "durability worker failed");
+        }
       }
       const auto sync_us =
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3065,11 +3159,18 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
         durability_batches_.fetch_add(1, std::memory_order_relaxed);
       }
       for (auto& completion : batch) {
+        if (!completion.session) {
+          // A completion without its session cannot safely restore the
+          // connection's transaction state, regardless of the sync result.
+          completion.active_stream.reset();
+          completion.reply_send_failed = true;
+          completion.ready_at = std::chrono::steady_clock::now();
+          PublishReadCompletion(std::move(completion));
+          continue;
+        }
         if (durable != Status::kSuccess) {
           completion.active_stream.reset();
-          if (completion.session) {
-            CleanupActiveStream(*completion.session);
-          }
+          CleanupActiveStream(*completion.session);
           const bool block = completion.session->transaction_status == 'T';
           AbortOpenTransaction(*completion.session);
           completion.session->transaction_status = block ? 'E' : 'I';
@@ -3345,7 +3446,8 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
         }
         client.transaction = std::move(completion.session->transaction);
         client.transaction_status = completion.session->transaction_status;
-        client.open_block_has_ddl = std::exchange(completion.session->open_block_has_ddl, false);
+        client.open_block_has_ddl =
+            std::exchange(completion.session->open_block_has_ddl, false);
         client.output_overflow |= completion.session->output_overflow;
         if (!completion.active_stream && completion.session->active_stream) {
           completion.active_stream =
@@ -3449,7 +3551,9 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
   // Without it an explicit block survived a refused message at status 'T'
   // and could still COMMIT; PostgreSQL tears the whole connection down
   // (FATAL), so an aborted block is the closest in-session equivalent.
-  void AbortTransactionForProtocolViolation(Client& client) {  // NOLINT(readability-convert-member-functions-to-static)
+  void AbortTransactionForProtocolViolation(
+      Client&
+          client) {  // NOLINT(readability-convert-member-functions-to-static)
     if (client.transaction_status == 'T') {
       AbortOpenTransaction(client);
       client.transaction_status = 'E';
@@ -3538,7 +3642,7 @@ class PostgresServer::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding
   std::deque<ReadCompletion> read_completions_;
   std::array<std::condition_variable, 16> read_task_ready_;
   std::array<std::deque<ReadTask>, 16> read_tasks_;
-  std::mt19937_64 secret_rng_{std::random_device{}()};
+  std::mt19937_64 secret_rng_{std::random_device{}()};  // Event-loop owned.
   int io_cpu_{-1};
   int listener_fd_{-1};
   // Registration is logically const for the event loop's bookkeeping.

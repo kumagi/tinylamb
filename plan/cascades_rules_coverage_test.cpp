@@ -521,7 +521,12 @@ TEST_F(CascadesRulesCoverageTest, ExplainSemiJoinMentionsJoinOperator) {
   const std::string plan = Explain(
       "SELECT sc1.c1 FROM sc1 WHERE EXISTS "
       "(SELECT 1 FROM fact WHERE fact.fk = sc1.c1)");
-  EXPECT_FALSE(plan.empty());
+  ASSERT_FALSE(plan.empty());
+  // The test promises a semi-join shows up in EXPLAIN; a non-empty plan alone
+  // would pass even if the optimizer picked an unrelated physical operator.
+  EXPECT_TRUE(plan.find("Join") != std::string::npos ||
+              plan.find("join") != std::string::npos)
+      << plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -574,11 +579,19 @@ TEST_F(CascadesRulesCoverageTest, GroupByWithResidualHaving) {
   EXPECT_EQ(rows.size(), 4U);
 }
 
-TEST_F(CascadesRulesCoverageTest, ScalarAggregatesWrapInMax1Row) {
+TEST_F(CascadesRulesCoverageTest, ScalarAggregatesReturnExactlyOneRow) {
+  // A keyless aggregate is a max-1-row node: it emits one row even when its
+  // input is empty.  The logical-property half of the contract is pinned by
+  // CascadesTest.LogicalPropertiesAggregationAndLimitOne.
   const auto rows =
       Run("SELECT SUM(c3), MIN(c1), MAX(c1), COUNT(*) FROM sc1 WHERE c1 < 10");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][3], Value(int64_t{10}));
+
+  const auto empty =
+      Run("SELECT SUM(c3), MIN(c1), MAX(c1), COUNT(*) FROM sc1 WHERE c1 < 0");
+  ASSERT_EQ(empty.size(), 1U);
+  EXPECT_EQ(empty[0][3], Value(int64_t{0}));
 }
 
 TEST_F(CascadesRulesCoverageTest, AggregateOverJoinWithUniqueSide) {
@@ -923,9 +936,5 @@ TEST_F(CascadesRulesCoverageTest, CastInPredicateStaysResidual) {
   const auto rows = Run("SELECT c1 FROM sc1 WHERE CAST(c1 AS DOUBLE) < 2.5");
   EXPECT_EQ(rows.size(), 3U);
 }
-
-// ---------------------------------------------------------------------------
-// Direct memo API: rule pattern-match failure branches
-// ---------------------------------------------------------------------------
 
 }  // namespace tinylamb

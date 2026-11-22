@@ -243,6 +243,24 @@ TEST_F(QueryTest, ColumnDefaultKeywordInValuesResolvesTargetColumn) {
   EXPECT_EQ(undeclared[0][1], Value(int64_t{2}));
 }
 
+TEST_F(QueryTest, InsertValidatesWidthBeforeEvaluatingValues) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE WidthCheck(a INT64 DEFAULT 7)");
+  SqlEngine engine(*db_);
+  for (const auto& [sql, message] :
+       {std::pair{"INSERT INTO WidthCheck VALUES (1, 1/0)",
+                  "value count does not match"},
+        std::pair{"INSERT INTO WidthCheck(a) VALUES (1, 1/0)",
+                  "column/value count mismatch"}}) {
+    const auto result = engine.Prepare(ctx, sql);
+    EXPECT_EQ(result.GetStatus(), Status::kInvalidArgument);
+    EXPECT_NE(engine.LastError().find(message), std::string::npos);
+  }
+  RunSql(ctx, *db_, "INSERT INTO WidthCheck VALUES (DEFAULT)");
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT a FROM WidthCheck"),
+            (std::vector<Row>{Row({Value(7)})}));
+}
+
 TEST_F(QueryTest, ColumnDefaultAppliesToInsertSelectAndPersists) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE ts (a INT64, b INT64 DEFAULT 42);");
@@ -311,9 +329,12 @@ TEST_F(QueryTest, ViewPersistsAcrossRestartAndDropsCleanly) {
   StatusOr<Executor> dropped = dropping.Prepare(reopened_ctx, "DROP VIEW vv; ");
   ASSERT_TRUE(dropped.HasValue()) << dropping.LastError();
   Row drop_row;
-  while (dropped.Value()->Next(&drop_row, nullptr)) {
-  }
+  ASSERT_TRUE(dropped.Value()->Next(&drop_row, nullptr))
+      << dropped.Value()->GetStatus();
+  ASSERT_GT(drop_row.Count(), 0U);
   EXPECT_EQ(drop_row[0], Value("DROP VIEW"));
+  EXPECT_FALSE(dropped.Value()->Next(&drop_row, nullptr));
+  EXPECT_EQ(dropped.Value()->GetStatus(), Status::kSuccess);
   StatusOr<Executor> gone = dropping.Prepare(reopened_ctx, "SELECT * FROM vv;");
   EXPECT_FALSE(gone.HasValue());
   reopened_ctx.txn_.Abort();
@@ -371,15 +392,14 @@ TEST_F(QueryTest, DropIfExistsOnMissingObjects) {
   SqlEngine engine(*db_);
   const auto drop_ok = [&](const std::string& sql, const char* tag) {
     StatusOr<Executor> exec = engine.Prepare(ctx, sql);
-    EXPECT_TRUE(exec.HasValue()) << sql << ": " << engine.LastError();
-    if (!exec.HasValue()) {
-      return;
-    }
+    ASSERT_TRUE(exec.HasValue()) << sql << ": " << engine.LastError();
     Row row;
-    while (exec.Value()->Next(&row, nullptr)) {
-    }
-    EXPECT_EQ(exec.Value()->GetStatus(), Status::kSuccess);
+    ASSERT_TRUE(exec.Value()->Next(&row, nullptr))
+        << sql << ": " << exec.Value()->GetStatus();
+    ASSERT_GT(row.Count(), 0U) << sql;
     EXPECT_EQ(row[0], Value(tag));
+    EXPECT_FALSE(exec.Value()->Next(&row, nullptr)) << sql;
+    EXPECT_EQ(exec.Value()->GetStatus(), Status::kSuccess) << sql;
   };
 
   // Missing objects: IF EXISTS turns the not-exists error into a no-op.
@@ -506,6 +526,22 @@ TEST_F(QueryTest, SiblingDerivedAggregatesFuseIntoSingleScan) {
   for (size_t i = 0; i < fused.size(); ++i) {
     EXPECT_EQ(bare[i], fused[i]);
   }
+}
+
+TEST_F(QueryTest, StoredQueryExpansionsPreserveSetOperationSource) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE stored_left(n INT64)");
+  RunSql(ctx, *db_, "INSERT INTO stored_left VALUES (1),(2)");
+  RunSql(ctx, *db_, "CREATE TABLE stored_right(n INT64)");
+  RunSql(ctx, *db_, "INSERT INTO stored_right VALUES (2),(3)");
+  const std::string body =
+      "SELECT n FROM stored_left |> EXCEPT DISTINCT (SELECT n FROM "
+      "stored_right)";
+  RunSql(ctx, *db_, "CREATE VIEW stored_view AS " + body);
+  RunSql(ctx, *db_, "CREATE TABLE FUNCTION stored_tvf() AS (" + body + ")");
+  const std::vector<Row> expected{Row({Value(1)})};
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT * FROM stored_view"), expected);
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT * FROM stored_tvf()"), expected);
 }
 
 // CREATE TABLE FUNCTION bodies expand at FROM-reference time with the
@@ -751,6 +787,60 @@ TEST_F(QueryTest, SqlEngineForUpdateNoWaitFailsFast) {
                                 .count();
   EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
   // The blocking policy would sit here for the 5s wait cap.
+  EXPECT_LT(elapsed_ms, 2000.0) << elapsed_ms << "ms";
+  other.txn_.Abort();
+  holder.txn_.Abort();
+  reader.txn_.Abort();
+}
+
+// The wait mode must also be part of the cache key when FOR and UPDATE are
+// separated by more than one space: a raw find("FOR UPDATE") misses that
+// spelling, so a kNoWait engine could replay the kWait plan filled below and
+// block on the conflicting row instead of failing fast.
+TEST_F(QueryTest, SqlEngineForUpdateNoWaitWhitespaceVariantFailsFast) {
+  TransactionContext seed = db_->BeginContext();
+  RunSql(seed, *db_, "CREATE TABLE fu_nowait_ws (k INT64, v INT64);");
+  RunSql(seed, *db_, "INSERT INTO fu_nowait_ws VALUES (1, 10), (2, 20);");
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  const std::string sql =
+      "SELECT k FROM fu_nowait_ws WHERE k >= 1 FOR  UPDATE;";
+  TransactionContext holder = db_->BeginContext();
+  SqlEngine holder_engine(*db_);
+  {
+    StatusOr<Executor> held = holder_engine.Prepare(holder, sql);
+    ASSERT_TRUE(held.HasValue()) << holder_engine.LastError();
+    Row row;
+    size_t rows = 0;
+    while (held.Value()->Next(&row, nullptr)) {
+      ++rows;
+    }
+    EXPECT_TRUE(held.Value()->ok()) << held.Value()->GetStatus().GetMessage();
+    EXPECT_EQ(rows, 2U);
+  }
+  TransactionContext reader = db_->BeginContext();
+  Table table = db_->GetTable(reader, "fu_nowait_ws").Value();
+  RowPosition first;
+  for (Iterator it = table.BeginFullScan(reader.txn_); it.IsValid(); ++it) {
+    if ((*it).values_[0] == Value(1)) {
+      first = it.Position();
+    }
+  }
+  ASSERT_TRUE(first.IsValid());
+  EXPECT_TRUE(holder.txn_.HasWriteSet(first));
+
+  SqlEngine nowait_engine(*db_);
+  nowait_engine.SetForUpdateWaitMode(SqlEngine::ForUpdateWaitMode::kNoWait);
+  TransactionContext other = db_->BeginContext();
+  const auto started = std::chrono::steady_clock::now();
+  StatusOr<Executor> prepared = nowait_engine.Prepare(other, sql);
+  ASSERT_TRUE(prepared.HasValue()) << nowait_engine.LastError();
+  Row row;
+  EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+  EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
   EXPECT_LT(elapsed_ms, 2000.0) << elapsed_ms << "ms";
   other.txn_.Abort();
   holder.txn_.Abort();
@@ -1212,8 +1302,7 @@ TEST_F(QueryTest, DmlWhereAnyFoldFailureSurfacesDivisionByZero) {
 
   SqlEngine engine(*db_);
   StatusOr<Executor> bad = engine.Prepare(
-      ctx,
-      "DELETE FROM any_div_d WHERE k = ANY (SELECT 1/x FROM any_div_s);");
+      ctx, "DELETE FROM any_div_d WHERE k = ANY (SELECT 1/x FROM any_div_s);");
   ASSERT_TRUE(bad.HasValue()) << engine.LastError();
   Row sink;
   while (bad.Value()->Next(&sink, nullptr)) {
@@ -2360,10 +2449,10 @@ TEST_F(QueryTest, StarSelectReportsExpandedColumnNames) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE star_names (a INT64, b VARCHAR);");
   SqlEngine engine(*db_);
-  StatusOr<QueryResult> result = engine.Execute(ctx, "SELECT * FROM star_names");
+  StatusOr<QueryResult> result =
+      engine.Execute(ctx, "SELECT * FROM star_names");
   ASSERT_EQ(result.GetStatus(), Status::kSuccess) << engine.LastError();
-  EXPECT_EQ(result.Value().ColumnNames(),
-            (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(result.Value().ColumnNames(), (std::vector<std::string>{"a", "b"}));
 }
 
 TEST_F(QueryTest, SetOperationKeepsFirstBranchColumnNames) {
@@ -2551,22 +2640,22 @@ TEST_F(QueryTest, UsingColumnSignednessMismatchDoesNotJoin) {
          "SELECT * FROM (SELECT -1 AS x) a "
          "JOIN (SELECT CAST(18446744073709551615 AS UINT64) AS x) b "
          "USING (x);");
-  const auto rows = RunSql(
-      ctx, *db_,
-      "SELECT * FROM (SELECT -1 AS x) a "
-      "JOIN (SELECT CAST(18446744073709551615 AS UINT64) AS x) b "
-      "USING (x);");
+  const auto rows =
+      RunSql(ctx, *db_,
+             "SELECT * FROM (SELECT -1 AS x) a "
+             "JOIN (SELECT CAST(18446744073709551615 AS UINT64) AS x) b "
+             "USING (x);");
   EXPECT_TRUE(rows.empty()) << "-1 INT64 must not equal UINT64_MAX in USING";
   ctx.txn_.Abort();
 }
 
 TEST_F(QueryTest, OocHashJoinDoesNotMatchSignedUnsignedBitTwins) {
   TransactionContext ctx = db_->BeginContext();
-  const auto rows = RunSql(
-      ctx, *db_,
-      "SELECT * FROM (SELECT -1 AS k) a "
-      "JOIN (SELECT CAST(18446744073709551615 AS UINT64) AS k) b "
-      "ON a.k = b.k;");
+  const auto rows =
+      RunSql(ctx, *db_,
+             "SELECT * FROM (SELECT -1 AS k) a "
+             "JOIN (SELECT CAST(18446744073709551615 AS UINT64) AS k) b "
+             "ON a.k = b.k;");
   EXPECT_TRUE(rows.empty())
       << "signed -1 must not equal unsigned 2^64-1 in the OOC hash join";
   ctx.txn_.Abort();

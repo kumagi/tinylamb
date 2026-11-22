@@ -160,13 +160,17 @@ Status SpillFile::Append(const Row& row) {
     return StatusError(StatusCode::kInvalidArgument,
                        "SpillFile position mode mismatch");
   }
-  has_positions_ = false;
   RETURN_IF_FAIL(OpenForWrite());
   Encoder enc(stream_);
   enc << row;
   if (!stream_) {
     return SpillWriteStatus("spill write failed", path_);
   }
+  // Commit the layout only after the row actually reached the file. A failed
+  // OpenForWrite/encode must leave has_positions_ alone, otherwise a later
+  // append of the other kind could proceed with count_ == 0 while the stream
+  // already carries the first kind's format (header/body mismatch).
+  has_positions_ = false;
   ++count_;
   return Status::kSuccess;
 }
@@ -180,21 +184,30 @@ Status SpillFile::Append(const Row& row, const RowPosition& position) {
     return StatusError(StatusCode::kInvalidArgument,
                        "SpillFile position mode mismatch");
   }
-  has_positions_ = true;
   RETURN_IF_FAIL(OpenForWrite());
   Encoder enc(stream_);
   enc << row << position;
   if (!stream_) {
     return SpillWriteStatus("spill write failed", path_);
   }
+  // Same as the row-only Append: publish the layout only on a successful
+  // write so an earlier failed attempt cannot pin a format that was never
+  // written.
+  has_positions_ = true;
   ++count_;
   return Status::kSuccess;
 }
 
 Status SpillFile::FinishWriting() {
-  if (!writing_ || finished_) {
-    finished_ = true;
+  if (finished_) {
     return Status::kSuccess;
+  }
+  if (!writing_) {
+    // No Append succeeded yet. Still write the count header (zero) so the
+    // "FinishWriting always produces a header" contract holds: setting
+    // finished_ on an unopened file left a headerless file that external
+    // 0-row validation could not parse.
+    RETURN_IF_FAIL(OpenForWrite());
   }
   stream_.flush();
   if (!stream_) {
@@ -221,13 +234,16 @@ Status SpillFile::FinishWriting() {
   }
   writing_ = false;
   finished_ = true;
-  if (count_ > 0 && !path_.empty()) {
+  // Record the real on-disk size for every finished file, including an empty
+  // one (its 8-byte count header), so FileBytes() never disagrees with the
+  // file that OpenRowReader will actually read.
+  if (!path_.empty()) {
     std::error_code ec;
     const uint64_t sz = std::filesystem::file_size(path_, ec);
     if (ec) {
       return StatusError(StatusCode::kIOError,
-                         "failed to size spill file: " + path_.string() +
-                             " (" + ec.message() + ")");
+                         "failed to size spill file: " + path_.string() + " (" +
+                             ec.message() + ")");
     }
     file_bytes_ = sz;
   }
@@ -247,13 +263,24 @@ StatusOr<SpillFile::RowReader> SpillFile::OpenRowReader() {
   }
   RowReader reader;
   reader.path_ = path_;
-  const auto bytes = static_cast<size_t>(
-      std::clamp<uint64_t>(file_bytes_, 4096, RowReader::kReadBufferBytes));
+  // Size the stream buffer to the actual file (capped at kReadBufferBytes).
+  // A fixed 4096-byte minimum wasted ~4 KiB for every concurrently read small
+  // spill. A stale/zero file_bytes_ falls back to the real on-disk size so a
+  // reader never shrinks its buffer below the file it is about to read.
+  uint64_t bytes_source = file_bytes_;
+  if (bytes_source == 0) {
+    std::error_code ec;
+    bytes_source = std::filesystem::file_size(path_, ec);
+    if (ec) {
+      bytes_source = 1;  // pubsetbuf still requires a non-empty buffer
+    }
+  }
+  const size_t bytes = static_cast<size_t>(
+      std::clamp<uint64_t>(bytes_source, 1, RowReader::kReadBufferBytes));
   reader.io_buffer_.assign(bytes, '\0');
   reader.stream_ = std::make_unique<std::ifstream>();
-  reader.stream_->rdbuf()->pubsetbuf(
-      reader.io_buffer_.data(),
-      static_cast<std::streamsize>(bytes));
+  reader.stream_->rdbuf()->pubsetbuf(reader.io_buffer_.data(),
+                                     static_cast<std::streamsize>(bytes));
   reader.stream_->open(path_, std::ios::binary | std::ios::in);
   if (!*reader.stream_) {
     return StatusError(StatusCode::kIOError,
@@ -286,12 +313,20 @@ Status SpillFile::RowReader::Next(Row* out, bool* has_row) {
     io_buffer_.shrink_to_fit();
     return Status::kSuccess;
   }
+  // Decode into a temporary first: decoding straight into *out would leave a
+  // partially decoded (wrong) row behind on failure, which a caller reusing
+  // that Row could then observe. Keep the count diagnostic so a truncated body
+  // is distinguishable from a header/body count mismatch.
   Decoder dec(*stream_);
-  dec >> *out;
+  Row decoded;
+  dec >> decoded;
   if (!*stream_) {
     return StatusError(StatusCode::kCorrupt,
-                       "truncated spill file: " + path_.string());
+                       "truncated spill file: " + path_.string() + " (" +
+                           std::to_string(remaining_) +
+                           " row(s) still expected by the count header)");
   }
+  *out = std::move(decoded);
   --remaining_;
   if (remaining_ == 0) {
     stream_.reset();

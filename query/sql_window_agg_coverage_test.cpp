@@ -21,6 +21,7 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/columnar_table.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/window_eval.hpp"
@@ -218,7 +219,8 @@ TEST_F(SqlWindowAggCoverageTest, SlidingSumIgnoresTransientFrameOverflow) {
          "(1, 9223372036854775807), (2, -1), (3, 9223372036854775807);");
 
   auto& budget = ProcessMemoryBudget::Global();
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
   struct ResetGuard {
     ResetGuard() = default;
     ResetGuard(const ResetGuard&) = delete;
@@ -529,6 +531,23 @@ TEST_F(WindowSqlCov, RangeOffsetFramesOnFloatKeys) {
                                              Row({Value(60)})})));
 }
 
+TEST_F(WindowSqlCov, FloatRangeIncludesExactBoundaryOnly) {
+  const auto rows = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN 1.0 PRECEDING "
+      "AND CURRENT ROW), "
+      "SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 1.0 PRECEDING "
+      "AND CURRENT ROW) "
+      "FROM UNNEST([STRUCT(1.5 AS k, 10 AS v), STRUCT(2.5 AS k, 20 AS v), "
+      "STRUCT(2.5000000004 AS k, 40 AS v), STRUCT(3.5 AS k, 80 AS v)]) "
+      "ORDER BY k");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus();
+  EXPECT_EQ(rows.Value(),
+            (std::vector<Row>{
+                Row({Value(10), Value(30)}), Row({Value(30), Value(140)}),
+                Row({Value(60), Value(120)}), Row({Value(140), Value(80)})}));
+}
+
 // INTERVAL boundaries turn RANGE frames into calendar-aware rolling windows
 // over DATE keys: day arithmetic for DAY/WEEK, month-end clamping for MONTH.
 TEST_F(WindowSqlCov, RangeIntervalFramesOnDateKeys) {
@@ -657,6 +676,16 @@ TEST_F(WindowSqlCov, RowsFrameCornerBounds) {
       << preceding_end.GetStatus().GetMessage();
   EXPECT_EQ(preceding_end.Value()[0], Row({Value()}));
   EXPECT_EQ(preceding_end.Value()[1], Row({Value(40)}));
+
+  // The engine accepts this extension for RANGE and GROUPS too. An
+  // UNBOUNDED PRECEDING endpoint pins the frame to the first ordered row.
+  const auto first_only =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT SUM(v) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED "
+                "PRECEDING AND UNBOUNDED PRECEDING) FROM wx WHERE g = 1 "
+                "ORDER BY k NULLS FIRST, v");
+  ASSERT_TRUE(first_only.HasValue()) << first_only.GetStatus().GetMessage();
+  EXPECT_EQ(first_only.Value(), std::vector<Row>(5, Row({Value(40)})));
 
   // UNBOUNDED FOLLOWING start bound selects only the last row.
   const auto last_only = TryRunSql(
@@ -846,6 +875,85 @@ TEST_F(WindowSqlCov, WindowIgnoreNullsFiltersAnalyticValues) {
     EXPECT_EQ(row[1], Value(10));
     EXPECT_EQ(row[2], Value(20));
     EXPECT_EQ(row[3], Value(20));
+  }
+}
+
+TEST_F(WindowSqlCov, ApproxQuantilesKeepsDeclaredTextDomains) {
+  constexpr const char* projections =
+      "SELECT APPROX_QUANTILES(s, 2), APPROX_QUANTILES(t, 2) FROM ";
+  constexpr const char* literal_source =
+      "SELECT '2026-01-01 10:00:00+00' AS s, "
+      "TIMESTAMP '2026-01-01 10:00:00+00' AS t";
+  ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(),
+                        "CREATE TABLE quantile_types (s STRING, t TIMESTAMP)")
+                  .HasValue());
+  ASSERT_TRUE(
+      TryRunSql(engine_.get(), context_.get(),
+                "INSERT INTO quantile_types " + std::string(literal_source))
+          .HasValue());
+  ASSERT_TRUE(
+      TryRunSql(engine_.get(), context_.get(),
+                "CREATE TABLE quantile_ctas AS " + std::string(literal_source))
+          .HasValue());
+  for (const std::string& source :
+       {std::string("(") + literal_source + ")", std::string("quantile_types"),
+        std::string("quantile_ctas")}) {
+    SCOPED_TRACE(source);
+    const auto rows =
+        TryRunSql(engine_.get(), context_.get(), projections + source);
+    ASSERT_TRUE(rows.HasValue()) << rows.GetStatus();
+    ASSERT_EQ(rows.Value().size(), 1U);
+    const Row& row = rows.Value()[0];
+    ASSERT_TRUE(row[0].IsArray());
+    ASSERT_TRUE(row[1].IsArray());
+    EXPECT_EQ(row[0].ArrayElementSqlType(), "STRING");
+    EXPECT_EQ(row[1].ArrayElementSqlType(), "TIMESTAMP");
+    EXPECT_EQ(row[0].ArrayElements(), row[1].ArrayElements());
+  }
+}
+
+TEST_F(WindowSqlCov, ApproxTopWindowPayloadsMatchGroupedAggregates) {
+  const std::string source = R"sql(
+    FROM UNNEST([
+      STRUCT('a"b\\c\n' AS x, 0.123456789 AS w),
+      STRUCT('other' AS x, 0.0 AS w)
+    ])
+  )sql";
+  auto grouped = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT APPROX_TOP_COUNT(w, 2), APPROX_TOP_SUM(x, w, 2) " + source);
+  ASSERT_TRUE(grouped.HasValue()) << grouped.GetStatus();
+  ASSERT_EQ(grouped.Value().size(), 1U);
+  auto analytic = TryRunSql(engine_.get(), context_.get(),
+                            "SELECT APPROX_TOP_COUNT(w, 2) OVER (), "
+                            "APPROX_TOP_SUM(x, w, 2) OVER () " +
+                                source);
+  ASSERT_TRUE(analytic.HasValue()) << analytic.GetStatus();
+  ASSERT_EQ(analytic.Value().size(), 2U);
+  for (const Row& row : analytic.Value()) {
+    ASSERT_TRUE(row[0].IsArray());
+    ASSERT_TRUE(row[1].IsArray());
+    EXPECT_EQ(row[0].ArrayElements(), grouped.Value()[0][0].ArrayElements());
+    EXPECT_EQ(row[1].ArrayElements(), grouped.Value()[0][1].ArrayElements());
+    EXPECT_EQ(row[1].ArrayElements()[0].AsStringView(),
+              R"json({"value":"a\"b\\c\n","sum":0.123456789})json");
+    EXPECT_EQ(row[1].ArrayElementSqlType(),
+              "STRUCT<value STRING, sum FLOAT64>");
+  }
+}
+
+TEST_F(WindowSqlCov, StringAggWindowUsesFirstOrderedDelimiter) {
+  const auto rows =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT STRING_AGG(x, d) OVER (), "
+                "STRING_AGG(x, d ORDER BY x DESC) OVER () "
+                "FROM UNNEST([STRUCT('a' AS x, '|' AS d), "
+                "STRUCT('b' AS x, ',' AS d), STRUCT('c' AS x, '/' AS d)])");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus();
+  ASSERT_EQ(rows.Value().size(), 3U);
+  for (const Row& row : rows.Value()) {
+    EXPECT_EQ(row[0], Value("a|b|c"));
+    EXPECT_EQ(row[1], Value("c/b/a"));
   }
 }
 
@@ -1114,6 +1222,50 @@ TEST_F(WindowSqlCov, SpilledOocRangeFramesWithNullAndNaNKeysFollowAst) {
     engine_env.Restore();
     ASSERT_TRUE(spilled.HasValue()) << spilled.GetStatus().GetMessage();
     EXPECT_EQ(spilled.Value(), c.expected) << "spill lane: " << c.sql;
+  }
+}
+
+TEST_F(WindowSqlCov, SpilledSlidingSumsForgetDepartedUnsignedValues) {
+  ASSERT_TRUE(
+      TryRunSql(engine_.get(), context_.get(), "CREATE TABLE wu (k INT64)")
+          .HasValue());
+  ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(),
+                        "INSERT INTO wu SELECT k "
+                        "FROM UNNEST(GENERATE_ARRAY(1, 200)) AS k")
+                  .HasValue());
+  const std::string input =
+      "CASE WHEN k = 2 THEN CAST('9223372036854775808' AS UINT64) "
+      "ELSE CAST(k AS FLOAT64) + 0.5 END";
+  const auto types = TryRunSql(engine_.get(), context_.get(),
+                               "SELECT " + input + " FROM wu ORDER BY k");
+  ASSERT_TRUE(types.HasValue()) << types.GetStatus();
+  ASSERT_EQ(types.Value().size(), 200U);
+  ASSERT_TRUE(types.Value()[1][0].IsUnsigned());
+  ASSERT_EQ(types.Value()[0][0].type, ValueType::kDouble);
+
+  EnvGuard engine_env("TINYLAMB_EXEC_ENGINE");
+  ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "pipeline", 1), 0);
+  auto& budget = ProcessMemoryBudget::Global();
+  const bool saved_spill = budget.AlwaysSpillEnabled();
+  const size_t saved_bytes = budget.OpMemoryOverrideBytes();
+  budget.SetTestAlwaysSpill(true);
+  budget.SetTestOpMemoryBytes(4096);
+  const std::string frame =
+      ") OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)";
+  const auto rows = TryRunSql(engine_.get(), context_.get(),
+                              "SELECT SUM(" + input + frame + ", AVG(" + input +
+                                  frame + " FROM wu ORDER BY k");
+  budget.SetTestAlwaysSpill(saved_spill);
+  budget.SetTestOpMemoryBytes(saved_bytes);
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus();
+  constexpr double big = 9223372036854775808.0;
+  ASSERT_EQ(rows.Value().size(), 200U);
+  EXPECT_EQ(rows.Value()[0], (Row{Value(1.5), Value(1.5)}));
+  EXPECT_EQ(rows.Value()[1], (Row{Value(big), Value(big / 2)}));
+  EXPECT_EQ(rows.Value()[2], (Row{Value(big), Value(big / 2)}));
+  for (size_t i = 3; i < rows.Value().size(); ++i) {
+    const double key = static_cast<double>(i + 1);
+    EXPECT_EQ(rows.Value()[i], (Row{Value(2 * key), Value(key)}));
   }
 }
 
@@ -1387,7 +1539,7 @@ class DirectWinCov : public ::testing::Test {
   static StatusOr<std::vector<Value>> ApplyOverStrings(
       TransactionContext& context,
       const std::shared_ptr<WindowFunctionCallExpression>& window,
-      const std::vector<Value>& values) {
+      const std::vector<Value>& values, bool columnar = false) {
     SelectStatement statement({NamedExpression("w", Expression(window))}, {},
                               nullptr);
     relational_detail::Relation input;
@@ -1397,7 +1549,16 @@ class DirectWinCov : public ::testing::Test {
     for (const Value& value : values) {
       rows.emplace_back(Row({value}));
     }
-    input.rows = std::move(rows);
+    if (columnar) {
+      auto table =
+          relational_detail::BuildColumnarTableFromRows(input.schema, rows);
+      if (!table.HasValue()) {
+        return table.GetStatus();
+      }
+      input.SetColumnarTable(table.MoveValue(), true);
+    } else {
+      input.rows = std::move(rows);
+    }
     auto windowed = relational_detail::ApplyWindows(
         context, statement, std::move(input), nullptr, {});
     if (!windowed.HasValue()) {
@@ -1450,6 +1611,26 @@ class DirectWinCov : public ::testing::Test {
   std::unique_ptr<Database> database_;
   std::unique_ptr<TransactionContext> context_;
 };
+
+TEST_F(DirectWinCov, WindowStringOrderUsesEnumRanks) {
+  auto rank = MakeWindow("RANK", {});
+  const std::vector<Value> values{Value("TESTENUM!"), Value("TESTENUM0"),
+                                  Value("TESTENUM!"), Value("TESTENUMNEGATIVE"),
+                                  Value()};
+  for (bool columnar : {false, true}) {
+    SCOPED_TRACE(columnar);
+    rank->order_by = {TermOnV(true)};
+    auto asc = ApplyOverStrings(*context_, rank, values, columnar);
+    ASSERT_TRUE(asc.HasValue()) << asc.GetStatus();
+    EXPECT_EQ(asc.Value(), (std::vector<Value>{Value(4), Value(3), Value(4),
+                                               Value(2), Value(1)}));
+    rank->order_by = {TermOnV(false)};
+    auto desc = ApplyOverStrings(*context_, rank, values, columnar);
+    ASSERT_TRUE(desc.HasValue()) << desc.GetStatus();
+    EXPECT_EQ(desc.Value(), (std::vector<Value>{Value(1), Value(3), Value(1),
+                                                Value(4), Value(5)}));
+  }
+}
 
 TEST_F(DirectWinCov, GroupsFramesWithEveryBoundKind) {
   // Peer groups of {10, 10}, {20}, {30}.
@@ -1542,6 +1723,26 @@ TEST_F(DirectWinCov, GroupsFrameDiagnosticsSurfaceAsStatus) {
                                WindowFrameBoundType::kOffsetPreceding, -1.5),
                            Bound(WindowFrameBoundType::kCurrentRow)),
               "must be non-negative");
+
+  for (double offset : {1.9, std::numeric_limits<double>::infinity()}) {
+    ExpectError(
+        *context_,
+        SumWithFrame(
+            WindowFrameUnit::kGroups,
+            OffsetBoundDouble(WindowFrameBoundType::kOffsetPreceding, offset),
+            Bound(WindowFrameBoundType::kCurrentRow)),
+        "GROUPS offset must be an integer");
+  }
+  auto wide =
+      Apply(*context_,
+            SumWithFrame(
+                WindowFrameUnit::kGroups,
+                OffsetBoundDouble(WindowFrameBoundType::kOffsetPreceding, 1e30),
+                Bound(WindowFrameBoundType::kCurrentRow)),
+            {Value(10), Value(20), Value(20), Value(30)});
+  ASSERT_TRUE(wide.HasValue()) << wide.GetStatus();
+  EXPECT_EQ(wide.Value(),
+            (std::vector<Value>{Value(10), Value(50), Value(50), Value(80)}));
 }
 
 TEST_F(DirectWinCov, RowsAndRangeOffsetDiagnosticsSurfaceAsStatus) {
@@ -1695,6 +1896,15 @@ TEST_F(DirectWinCov, PercentileOverNumericStringsSortsNumerically) {
   // Numeric ordering 2 < 10 < 33 puts the median at "10"; lexicographic
   // ordering would answer "2".
   EXPECT_EQ(rows.Value()[0], Value("10"));
+}
+
+TEST_F(DirectWinCov, PercentileInterpolatesNumericStrings) {
+  auto percentile = MakeWindow(
+      "PERCENTILE_CONT", {ColumnValueExp("v"), ConstantValueExp(Value(0.5))});
+  auto rows =
+      ApplyOverStrings(*context_, percentile, {Value("10"), Value("2")});
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  EXPECT_EQ(rows.Value(), (std::vector<Value>{Value(6.0), Value(6.0)}));
 }
 
 TEST_F(DirectWinCov, FirstLastNthValueWithExclusions) {
@@ -2021,8 +2231,9 @@ TEST_F(AggSmallCov, SingleSumUsesCheckedTypedFoldPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Parallel aggregation: a 10k-row table crosses kParallelAggregationMinRows
-// so GROUP BY plans route through ParallelAggregationExecutor.
+// Grouped aggregation coverage over 10k rows. This is below the current
+// parallel threshold; aggregate_shape_test verifies parallel operator
+// selection with inputs sized from kParallelAggregationMinRows.
 // ---------------------------------------------------------------------------
 
 class AggBigCov : public ::testing::Test {

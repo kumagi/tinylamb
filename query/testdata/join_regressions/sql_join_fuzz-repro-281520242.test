@@ -24,4 +24,4 @@
 -- expect: |2|,
 -- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f CROSS JOIN dim d;
 -- expect: |12|,|12|,|2|,|-8|,|-3|,|3|,
--- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501)
+-- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501) [seed 281520242]

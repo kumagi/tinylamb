@@ -4,7 +4,7 @@
 tinylamb
 ===========
 
-A simple implementation of RDBMS.
+A simple implementation of an RDBMS.
 
 SQL frontend
 ============
@@ -96,7 +96,11 @@ cmake --build build -j --target tinylamb_tpch_benchmark
 
 `--reuse-database` skips schema creation and loading for a previously loaded
 database, and `--query N` runs one query while investigating a plan. `--force`
-only replaces the tinylamb database artifacts at the exact path supplied (.db, .log, .log.meta, .log.meta.tmp, .last_checkpoint).
+only removes the tinylamb database artifacts at the exact path supplied
+(`<db>.db`, the base WAL `<db>.log`, and `<db>.log.meta` / `<db>.log.meta.tmp`;
+an obsolete `.last_checkpoint` sidecar is removed if present). Numbered WAL
+segments `<db>.log.<20-digit index>` are **not** removed — use a fresh path
+when a numbered series exists.
 Scale factors outside the official TPC-H set are accepted for quick engineering
 smoke tests but are reported as non-official.
 

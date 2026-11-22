@@ -76,6 +76,9 @@ def load(directory):
     for r in records:
         if not r['timing_qualified'] or not r['invariants']['valid'] or r['exit_code']:
             raise ValueError('unqualified measurement')
+        seconds = float(r['seconds'])
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError('invalid measurement duration')
         activity = json.loads((Path(r['_directory'])/f"activity-{r['engine']}-{r['trial']}.json").read_text())
         if not activity or any(s['competing'] for s in activity):
             raise ValueError('build/test/profiler overlaps measurement')
@@ -84,12 +87,12 @@ def load(directory):
             counts = [int(m[t + '.' + k]) for k in ('attempted', 'committed', 'user_rollback', 'engine_aborts')]
             if counts[0] != sum(counts[1:]) or not counts[0] or min(counts) < 0:
                 raise ValueError('transaction accounting mismatch')
-            if not math.isclose(float(m[t+'.tps']), counts[1]/r['seconds'], rel_tol=1e-5, abs_tol=.01):
+            if not math.isclose(float(m[t+'.tps']), counts[1]/seconds, rel_tol=1e-5, abs_tol=.01):
                 raise ValueError('TPS mismatch')
             latency = [float(m[t + '.' + p + '_ms']) for p in ('p50','p95','p99')]
             if latency != sorted(latency) or any(not math.isfinite(v) or v < 0 for v in latency):
                 raise ValueError('invalid percentiles')
-        if not math.isclose(float(m['tps']), sum(int(m[t+'.committed']) for t in TYPES)/r['seconds'], rel_tol=1e-5, abs_tol=.01):
+        if not math.isclose(float(m['tps']), sum(int(m[t+'.committed']) for t in TYPES)/seconds, rel_tol=1e-5, abs_tol=.01):
             raise ValueError('total TPS mismatch')
     for name, digest in env['runtime_source_sha256'].items():
         if hashlib.sha256((directory/'runtime-source'/name).read_bytes()).hexdigest() != digest:

@@ -1,4 +1,5 @@
 build/
+/=
 build-*/
 cmake-build-*/
 .idea/
@@ -16,6 +17,10 @@ ironlamb-compliance-*
 
 googlesql_compliance-*
 *.db
+# Companion storage families produced by PageManager / SpillStore.
+*.db.lsm.*
+*.db.blocks.*
+*.db.tlcs*
 *.log
 # WAL segment metadata sidecars next to the ignored *.log files; aborted
 # fault-injection tests leave them behind (clean_root_artifacts.py sweeps CI).
@@ -29,4 +34,8 @@ googlesql_compliance-*
 __pycache__/
 .freebuff/
 benchmark/comparison/results/
+# Compiler / experiment leftovers in the repo root.
+a.out
+*.out
+state*.json
 AGENTS.local.md

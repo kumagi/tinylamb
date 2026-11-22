@@ -320,8 +320,7 @@ EncodedCol EncStreamVByteI64(const std::vector<int64_t>& vals, size_t budget) {
   e.param = static_cast<uint32_t>(payload.size());
   AppendBE32(e.buf, static_cast<uint32_t>(payload.size()));
   AppendBE16(e.buf, static_cast<uint16_t>(nblk));
-  e.buf.insert(e.buf.end(), block_off.data(),
-               block_off.data() + offset_bytes);
+  e.buf.insert(e.buf.end(), block_off.data(), block_off.data() + offset_bytes);
   e.buf.insert(e.buf.end(), ctrl.begin(), ctrl.end());
   e.buf.insert(e.buf.end(), payload.begin(), payload.end());
   return e;
@@ -3896,7 +3895,7 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   }
   const auto bpv = static_cast<uint32_t>((BitsNeeded(range) + 7) / 8);
   const size_t nsym_total = static_cast<size_t>(n) * bpv;
-  if (nsym_total > UINT32_MAX) {
+  if (nsym_total == 0 || nsym_total > UINT32_MAX) {
     return {};
   }
   // Byte histogram over the little-endian offset stream.
@@ -3916,8 +3915,6 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
       continue;
     }
     f[s] = static_cast<uint32_t>(
-        // NOLINTNEXTLINE(clang-analyzer-core.UndefinedBinaryOperatorResult)
-        // intentional pattern in this code
         std::max<uint64_t>(static_cast<uint64_t>(cnt[s]) * M / nsym_total, 1));
     sum += f[s];
   }
@@ -4853,8 +4850,8 @@ EncodedCol EncFastPforI64(const std::vector<int64_t>& vals, size_t budget) {
       const uint64_t off = offs[start + t];
       low.push_back(off & lomask);
       if (bp.w < 64 && (off >> bp.w) != 0) {
-        bmp[t >> 3] |=
-            static_cast<char>(static_cast<uint8_t>(0x80U >> (t & 7U)));
+        char& byte = bmp[t >> 3];
+        byte = static_cast<char>(byte | (0x80 >> (t & 7U)));
         exc_vals.push_back(static_cast<uint64_t>(vals[start + t]));
       }
     }
@@ -5048,8 +5045,9 @@ EncodedCol EncDeltaFastPforI64(const std::vector<int64_t>& vals,
       const uint64_t rel = d - bp.dmin;
       low.push_back(rel & lomask);
       if (bp.w < 64 && (rel >> bp.w) != 0) {
-        bmp[(t - 1) >> 3] |=
-            static_cast<char>(static_cast<uint8_t>(0x80U >> ((t - 1) & 7U)));
+        const uint32_t bit = t - 1;
+        char& byte = bmp[bit >> 3];
+        byte = static_cast<char>(byte | (0x80 >> (bit & 7U)));
         exc_vals.push_back(d);
       }
     }
@@ -5480,7 +5478,7 @@ void MakeDeltasInto(const std::vector<int64_t>& vals,
 // publishes as -- it is passed rather than derived, because the mapping from
 // inner to outer stopped being a function of two cases when kDeltaSimd joined
 // the family (delta + kSimdFor), and a silent mis-derivation here would write
-// a region labelled as one scheme and decoded as another.
+// a region labeled as one scheme and decoded as another.
 EncodedCol EncDeltaCompositeI64(const std::vector<int64_t>& vals,
                                 const std::vector<int64_t>& deltas,
                                 Scheme outer, const EncodedCol& inner_enc,
@@ -10602,10 +10600,26 @@ void DecodeInt64All(const EncodedBlock& block, std::span<int64_t> output) {
   }
 
   if (block.scheme == Scheme::kDeltaFp) {
+    if (block.param > 64) {
+      std::fill(output.begin(), output.begin() + n, 0);
+      return;
+    }
     const uint32_t checkpoints =
         (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery;
-    const char* packed = region + 8 + (static_cast<size_t>(checkpoints) * 8);
-    if (packed > region_end || block.param > 64) {
+    const size_t checkpoint_bytes = static_cast<size_t>(checkpoints) * 8;
+    const size_t avail = static_cast<size_t>(region_end - region);
+    if (checkpoints == 0 || 8 + checkpoint_bytes > avail) {
+      std::fill(output.begin(), output.begin() + n, 0);
+      return;
+    }
+    const char* packed = region + 8 + checkpoint_bytes;
+    // The walk reads deltas 1..n-1, i.e. ceil((n-1)*param/8) bytes past
+    // `packed`. Checking only the start pointer let a truncated region be
+    // read past the vector; fail closed like the PBitS/wavelet arms.
+    const size_t packed_bytes =
+        ((static_cast<size_t>(n) - 1) * static_cast<size_t>(block.param) + 7) /
+        8;
+    if (packed_bytes > avail - 8 - checkpoint_bytes) {
       std::fill(output.begin(), output.begin() + n, 0);
       return;
     }
@@ -10621,21 +10635,58 @@ void DecodeInt64All(const EncodedBlock& block, std::span<int64_t> output) {
 
   if (block.scheme == Scheme::kDeltaFor ||
       block.scheme == Scheme::kDeltaBitweave) {
-    if (region + 2 > region_end) {
+    const size_t avail = static_cast<size_t>(region_end - region);
+    if (avail < 2) {
       std::fill(output.begin(), output.begin() + n, 0);
       return;
     }
     const uint32_t checkpoints = ReadBE16(region);
+    const uint32_t need_checkpoints =
+        (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery;
+    const size_t checkpoint_bytes = static_cast<size_t>(checkpoints) * 8;
+    if (checkpoints < need_checkpoints || 2 + checkpoint_bytes > avail) {
+      std::fill(output.begin(), output.begin() + n, 0);
+      return;
+    }
     const char* checkpoint = region + 2;
-    const char* inner = checkpoint + (static_cast<size_t>(checkpoints) * 8);
-    if (checkpoints == 0 || inner > region_end) {
+    const char* inner = checkpoint + checkpoint_bytes;
+    const size_t inner_avail = avail - 2 - checkpoint_bytes;
+    if (inner_avail < 8) {
+      std::fill(output.begin(), output.begin() + n, 0);
+      return;
+    }
+    // Inner payload: [base i64][offset stream]. FOR-BA stores n bpv-byte
+    // offsets; BitWeave stores a width byte then n*w bits. Validate the FULL
+    // extent before the loop indexes into it (the old check only tested the
+    // `inner` start pointer).
+    size_t inner_need = 0;
+    int bit_width = 0;
+    if (block.scheme == Scheme::kDeltaFor) {
+      if (block.param == 0 || block.param > 8) {
+        std::fill(output.begin(), output.begin() + n, 0);
+        return;
+      }
+      inner_need =
+          8 + static_cast<size_t>(n) * static_cast<size_t>(block.param);
+    } else {
+      if (inner_avail < 9) {
+        std::fill(output.begin(), output.begin() + n, 0);
+        return;
+      }
+      bit_width = static_cast<int>(static_cast<uint8_t>(inner[8]));
+      if (bit_width > 64) {
+        std::fill(output.begin(), output.begin() + n, 0);
+        return;
+      }
+      inner_need =
+          9 +
+          ((static_cast<size_t>(n) * static_cast<size_t>(bit_width) + 7) / 8);
+    }
+    if (inner_need > inner_avail) {
       std::fill(output.begin(), output.begin() + n, 0);
       return;
     }
     const auto delta_base = static_cast<int64_t>(ReadBE64(inner));
-    const int bit_width = block.scheme == Scheme::kDeltaBitweave
-                              ? static_cast<int>(static_cast<uint8_t>(inner[8]))
-                              : 0;
     uint64_t value = ReadBE64(checkpoint);
     output[0] = static_cast<int64_t>(value);
     for (uint32_t i = 1; i < n; ++i) {
@@ -10793,22 +10844,36 @@ void DecodeInt64All(const EncodedBlock& block, std::span<int64_t> output) {
   }
 
   if (block.scheme == Scheme::kPfor) {
-    if (region + 11 > region_end) {
+    const size_t avail = static_cast<size_t>(region_end - region);
+    if (avail < 11) {
       std::fill(output.begin(), output.begin() + n, 0);
       return;
     }
     const auto base = static_cast<int64_t>(ReadBE64(region));
     const int width = static_cast<int>(static_cast<uint8_t>(region[8]));
+    if (width > 64) {
+      std::fill(output.begin(), output.begin() + n, 0);
+      return;
+    }
     const uint32_t exceptions = ReadBE16(region + 9);
     const char* packed = region + 11;
+    // The packed plane is ceil(n*width/8) bytes and the exception table is
+    // 10 bytes per entry. Bound BOTH against the region before unpacking:
+    // a header-only check let a truncated packed plane be read out of bounds.
+    const size_t packed_bytes =
+        (static_cast<size_t>(n) * static_cast<size_t>(width) + 7) / 8;
+    const size_t exception_bytes = static_cast<size_t>(exceptions) * 10;
+    if (packed_bytes > avail - 11 ||
+        exception_bytes > avail - 11 - packed_bytes) {
+      std::fill(output.begin(), output.begin() + n, 0);
+      return;
+    }
     for (uint32_t i = 0; i < n; ++i) {
       const uint64_t offset = UnpackBitAt(
           packed, static_cast<uint64_t>(i) * static_cast<uint64_t>(width),
           width);
       output[i] = static_cast<int64_t>(static_cast<uint64_t>(base) + offset);
     }
-    const size_t packed_bytes =
-        (static_cast<size_t>(n) * static_cast<size_t>(width) + 7) / 8;
     const char* exception = packed + packed_bytes;
     for (uint32_t i = 0; i < exceptions && exception + 10 <= region_end; ++i) {
       const uint32_t position = ReadBE16(exception);

@@ -86,8 +86,8 @@ class JitDatePartHash {
             uint64_t seed) const noexcept;
 
  private:
-  using HashFn = void (*)(const int64_t*, const char*, const uint32_t*, int64_t*,
-                          uint64_t*, uint64_t, uint64_t);
+  using HashFn = void (*)(const int64_t*, const char*, const uint32_t*,
+                          int64_t*, uint64_t*, uint64_t, uint64_t);
   explicit JitDatePartHash(HashFn hash) : hash_(hash) {}
   HashFn hash_;
 };
@@ -262,6 +262,253 @@ class JitBranchlessProgram {
  private:
   explicit JitBranchlessProgram(std::shared_ptr<Impl> impl);
   std::shared_ptr<Impl> impl_;
+};
+
+// Shared SplitMix64 finalizer for packed 2x32 keys so C++ hash-table/radix
+// builders and LLVM ORC JIT kernels always agree on slot and bloom bits.
+[[nodiscard]] inline uint64_t HashPacked2x32Key(uint64_t k) noexcept {
+  uint64_t h = (k ^ (k >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  h = (h ^ (h >> 27U)) * 0x94d049bb133111ebULL;
+  return h ^ (h >> 31U);
+}
+
+inline void InsertPacked2x32Bloom(uint64_t hash, uint64_t* bloom_words,
+                                  uint64_t bloom_word_mask) noexcept {
+  const auto w0 = static_cast<size_t>((hash >> 6U) & bloom_word_mask);
+  const auto w1 = static_cast<size_t>((hash >> 30U) & bloom_word_mask);
+  bloom_words[w0] |= uint64_t{1} << (hash & 63U);
+  bloom_words[w1] |= uint64_t{1} << ((hash >> 24U) & 63U);
+}
+
+// Proof-backed LLVM ORC JIT kernels for 1-PK dense-split 2-phase radix
+// grouped aggregation over decoded LSTable blocks (TPC-DS Q11/Q74/Q04/etc.).
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (jit_dense_split_radix_agg_sound)
+class JitDenseSplitRadixAgg {
+ public:
+  enum class ExprOp : uint8_t {
+    kColDouble = 0,
+    kColInt64 = 1,
+    kSubDouble = 2,
+    kAddDouble = 3,
+    kSubDivConst = 4,
+    kSubSubAddDivConst = 5,
+    kMulDoubleInt = 6,
+    kCoalesceMulZero = 7,
+    kMulDoubleDouble = 8,
+    kCoalesceMulDoubleZero = 9,
+    kMulIntInt = 10,
+    kCoalesceMulIntZero = 11,
+  };
+
+  struct ExtractSpec {
+    ExprOp op{ExprOp::kColDouble};
+    bool use_sel{false};
+    bool jk_has_null{false};
+    bool pk0_has_null{false};
+    // Bitmask (bits 0..3) indicating which of v0..v3 have non-null null-byte
+    // pointers (`n0..n3`) to check per row.
+    uint8_t val_null_mask{0};
+    uint8_t part_shift{15};
+  };
+
+  using ExtractFn = uint32_t (*)(
+      uint32_t count, const uint32_t* sel, const int64_t* jk_vals,
+      const uint8_t* jk_nulls, int64_t jk_min, uint64_t jk_span,
+      const uint32_t* key_to_rsubgid, const int64_t* pk0_vals,
+      const uint8_t* pk0_nulls, int64_t pk0_min, uint64_t pk0_span,
+      const uint32_t* pk0_subgid, uint32_t pk0_card, const int64_t* v0,
+      const uint8_t* n0, const int64_t* v1, const uint8_t* n1,
+      const int64_t* v2, const uint8_t* n2, const int64_t* v3,
+      const uint8_t* n3, double div_const, uint32_t* out_tagged_gids,
+      double* out_vals, uint32_t* part_hist);
+
+  using ScatterFn = void (*)(uint32_t count, const uint32_t* in_tagged_gids,
+                             const double* in_vals, uint32_t* const* dst_gids,
+                             double* const* dst_vals, uint32_t* dst_pos);
+
+  using AccumFn = void (*)(uint32_t count, const uint32_t* local_tagged_gids,
+                           const double* vals, double* sums, uint64_t* counts,
+                           uint64_t* matched_bits, uint64_t* nonnull_bits,
+                           uint8_t* inf_flag);
+
+  class ExtractKernel {
+   public:
+    // Caller must zero-initialize `part_hist[0..P-1]` before calling.
+    [[nodiscard]] uint32_t Run(
+        uint32_t count, const uint32_t* sel, const int64_t* jk_vals,
+        const uint8_t* jk_nulls, int64_t jk_min, uint64_t jk_span,
+        const uint32_t* key_to_rsubgid, const int64_t* pk0_vals,
+        const uint8_t* pk0_nulls, int64_t pk0_min, uint64_t pk0_span,
+        const uint32_t* pk0_subgid, uint32_t pk0_card, const int64_t* v0,
+        const uint8_t* n0, const int64_t* v1, const uint8_t* n1,
+        const int64_t* v2, const uint8_t* n2, const int64_t* v3,
+        const uint8_t* n3, double div_const, uint32_t* out_tagged_gids,
+        double* out_vals, uint32_t* part_hist) const noexcept;
+
+   private:
+    friend class JitDenseSplitRadixAgg;
+    explicit ExtractKernel(ExtractFn fn) noexcept : fn_(fn) {}
+    ExtractFn fn_;  // Owned by the process-lifetime ORC cache.
+  };
+
+  class ScatterKernel {
+   public:
+    void Run(uint32_t count, const uint32_t* in_tagged_gids,
+             const double* in_vals, uint32_t* const* dst_gids,
+             double* const* dst_vals, uint32_t* dst_pos) const noexcept;
+
+   private:
+    friend class JitDenseSplitRadixAgg;
+    explicit ScatterKernel(ScatterFn fn) noexcept : fn_(fn) {}
+    ScatterFn fn_;  // Owned by the process-lifetime ORC cache.
+  };
+
+  class AccumKernel {
+   public:
+    void Run(uint32_t count, const uint32_t* local_tagged_gids,
+             const double* vals, double* sums, uint64_t* counts,
+             uint64_t* matched_bits, uint64_t* nonnull_bits,
+             uint8_t* inf_flag) const noexcept;
+
+   private:
+    friend class JitDenseSplitRadixAgg;
+    explicit AccumKernel(AccumFn fn) noexcept : fn_(fn) {}
+    AccumFn fn_;  // Owned by the process-lifetime ORC cache.
+  };
+
+  [[nodiscard]] static std::optional<ExtractKernel> CompileExtract(
+      ExtractSpec spec);
+  [[nodiscard]] static std::optional<ScatterKernel> CompileScatter(
+      uint8_t part_shift);
+  [[nodiscard]] static std::optional<AccumKernel> CompileAccum(bool is_avg,
+                                                               bool check_inf);
+};
+
+// Proof-backed LLVM ORC JIT kernel for 2-key packed int32x32 open-addressing
+// hash probing with optional L2 bloom filter and hardware prefetch (Q78/Q75).
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (jit_packed2x32_hash_probe_sound)
+class JitPacked2x32HashProbe {
+ public:
+  using ProbeFn = void (*)(uint32_t count, const int64_t* k0, const uint8_t* n0,
+                           const int64_t* k1, const uint8_t* n1, int64_t bias0,
+                           int64_t bias1, const uint64_t* bloom_words,
+                           uint64_t bloom_word_mask, const uint64_t* ht_keys,
+                           const uint32_t* ht_heads, uint64_t ht_mask,
+                           uint32_t* out_heads);
+
+  [[nodiscard]] static std::optional<JitPacked2x32HashProbe> Compile(
+      bool has_null0, bool has_null1, bool has_bloom, bool has_bias);
+
+  void Probe(uint32_t count, const int64_t* k0, const uint8_t* n0,
+             const int64_t* k1, const uint8_t* n1, int64_t bias0, int64_t bias1,
+             const uint64_t* bloom_words, uint64_t bloom_word_mask,
+             const uint64_t* ht_keys, const uint32_t* ht_heads,
+             uint64_t ht_mask, uint32_t* out_heads) const noexcept;
+
+ private:
+  explicit JitPacked2x32HashProbe(ProbeFn fn) noexcept : fn_(fn) {}
+  ProbeFn fn_;  // Owned by the process-lifetime ORC cache.
+};
+
+// Proof-backed LLVM ORC JIT kernels for 2-key packed int32x32 radix partition
+// pack/scatter and generation-stamped open-addressing deduplication (Q97).
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (jit_packed2x32_radix_dedup_sound)
+class JitPacked2x32RadixDedup {
+ public:
+  using PackFn = void (*)(uint32_t count, const uint32_t* sel,
+                          const int64_t* k0, const uint8_t* n0,
+                          const int64_t* k1, const uint8_t* n1,
+                          uint64_t* out_packed, uint32_t* out_hist,
+                          uint32_t* out_fb_rows, uint32_t* out_packed_count,
+                          uint32_t* out_fb_count);
+
+  using ScatterFn = void (*)(uint32_t count, const uint64_t* in_packed,
+                             uint64_t* const* dst_ptrs, uint32_t* dst_pos);
+
+  using DedupFn = uint32_t (*)(uint32_t count, const uint64_t* in_keys,
+                               uint64_t* ht_keys, uint32_t* ht_gens,
+                               uint32_t cur_gen, uint64_t ht_mask,
+                               uint32_t max_load, uint32_t* n_occ,
+                               int64_t* out_k0, int64_t* out_k1);
+
+  class PackKernel {
+   public:
+    // Caller must zero-initialize `out_hist` before calling.
+    void Run(uint32_t count, const uint32_t* sel, const int64_t* k0,
+             const uint8_t* n0, const int64_t* k1, const uint8_t* n1,
+             uint64_t* out_packed, uint32_t* out_hist, uint32_t* out_fb_rows,
+             uint32_t* out_packed_count, uint32_t* out_fb_count) const noexcept;
+
+   private:
+    friend class JitPacked2x32RadixDedup;
+    explicit PackKernel(PackFn fn) noexcept : fn_(fn) {}
+    PackFn fn_;
+  };
+
+  class ScatterKernel {
+   public:
+    void Run(uint32_t count, const uint64_t* in_packed,
+             uint64_t* const* dst_ptrs, uint32_t* dst_pos) const noexcept;
+
+   private:
+    friend class JitPacked2x32RadixDedup;
+    explicit ScatterKernel(ScatterFn fn) noexcept : fn_(fn) {}
+    ScatterFn fn_;
+  };
+
+  class DedupKernel {
+   public:
+    [[nodiscard]] uint32_t Run(uint32_t count, const uint64_t* in_keys,
+                               uint64_t* ht_keys, uint32_t* ht_gens,
+                               uint32_t cur_gen, uint64_t ht_mask,
+                               uint32_t max_load, uint32_t* n_occ,
+                               int64_t* out_k0, int64_t* out_k1) const noexcept;
+
+   private:
+    friend class JitPacked2x32RadixDedup;
+    explicit DedupKernel(DedupFn fn) noexcept : fn_(fn) {}
+    DedupFn fn_;
+  };
+
+  [[nodiscard]] static std::optional<PackKernel> CompilePack(
+      bool has_null0, bool has_null1, bool use_sel, uint8_t part_shift);
+  [[nodiscard]] static std::optional<ScatterKernel> CompileScatter(
+      uint8_t part_shift);
+  [[nodiscard]] static std::optional<DedupKernel> CompileOpenAddrDedup();
+};
+
+// Proof-backed LLVM ORC JIT kernel for generation-stamped open-addressing
+// radix-partition double SUM/AVG accumulation with software prefetch (Q67/Q65).
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (jit_radix_key_double_agg_sound)
+class JitRadixKeyDoubleAgg {
+ public:
+  using AggFn = uint32_t (*)(uint32_t count, const uint64_t* in_keys,
+                             const double* in_vals, const uint8_t* in_valids,
+                             uint64_t* ht_keys, double* ht_sums,
+                             uint64_t* ht_counts, uint32_t* ht_gens,
+                             uint8_t* ht_inf, uint32_t cur_gen,
+                             uint64_t ht_mask, uint32_t max_load,
+                             uint32_t* occupied, uint32_t* n_occ);
+
+  [[nodiscard]] static std::optional<JitRadixKeyDoubleAgg> Compile(
+      bool check_inf);
+
+  [[nodiscard]] uint32_t Accumulate(uint32_t count, const uint64_t* in_keys,
+                                    const double* in_vals,
+                                    const uint8_t* in_valids, uint64_t* ht_keys,
+                                    double* ht_sums, uint64_t* ht_counts,
+                                    uint32_t* ht_gens, uint8_t* ht_inf,
+                                    uint32_t cur_gen, uint64_t ht_mask,
+                                    uint32_t max_load, uint32_t* occupied,
+                                    uint32_t* n_occ) const noexcept;
+
+ private:
+  explicit JitRadixKeyDoubleAgg(AggFn fn) noexcept : fn_(fn) {}
+  AggFn fn_;  // Owned by the process-lifetime ORC cache.
 };
 
 }  // namespace tinylamb

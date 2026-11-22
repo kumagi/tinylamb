@@ -32,7 +32,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P2 実装済み: `common/spill
 3. 一時ファイルは、作成した直後に名前を消す。プロセスが落ちれば OS が回収するので、
    起動時の残骸掃除が要らない。名前を消したファイルを扱えない環境（Windows）では、
    閉じたときに削除される指定で開く。この差は `common/platform/file_io` に閉じ込める。
-4. 置き場は既存の `ProcessMemoryBudget::ResolveTempDirectory()`（`TINYLAMB_TEMP`）を使う。
+4. 置き場は `SpillStore` 専用の `TINYLAMB_TEMP_DIR`（`SpillStore::ResolveTempDir`）を使う。共通の `ProcessMemoryBudget::ResolveTempDirectory()` は別の目的の解決器であり、`SpillStore` は経由しない。この ADR の Status 行・`docs/environment_variables.md` の記載と一致させる。
 5. ディスク使用量の上限 `TINYLAMB_TEMP_LIMIT_BYTES` を新設する。超えたら `kNoSpace`。
 6. I/O バッファのメモリは、使う側の予約から払う（[ADR 0003](0003-memory-budget-thresholds.md)）。
 7. 書き終えたブロックは `AdviseDontNeed` でページキャッシュから外す。

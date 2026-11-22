@@ -33,10 +33,9 @@ std::optional<double> ConstantNumber(const Expression& expression) {
     return std::nullopt;
   }
   if (value.type == ValueType::kInt64) {
-    return value.IsUnsigned()
-                    ? static_cast<double>(
-                          static_cast<uint64_t>(value.value.int_value))
-                    : static_cast<double>(value.value.int_value);
+    return value.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                    value.value.int_value))
+                              : static_cast<double>(value.value.int_value);
   }
   if (value.type == ValueType::kDouble) {
     return value.value.double_value;
@@ -133,9 +132,15 @@ Schema SamplePlan::BuildSchema(const Schema& child,
     columns.push_back(child.GetColumn(i));
   }
   if (spec.with_weight) {
+    // A child may carry a mix of qualified and unqualified columns; the
+    // weight column must pick a real relation qualifier, not blindly take the
+    // first column's (which may be a derived, unqualified expression).
     std::string qualifier;
-    if (child.ColumnCount() != 0) {
-      qualifier = child.GetColumn(0).Name().schema;
+    for (size_t i = 0; i < child.ColumnCount(); ++i) {
+      if (!child.GetColumn(i).Name().schema.empty()) {
+        qualifier = child.GetColumn(i).Name().schema;
+        break;
+      }
     }
     columns.emplace_back(ColumnName(qualifier, spec.weight_alias),
                          ValueType::kDouble);

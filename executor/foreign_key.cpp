@@ -239,14 +239,19 @@ Status ForeignKeyCounts::BuildSortedSegment(
     if (block_entries == 0) {
       return Status::kSuccess;
     }
+    // Validate the framed size before allocating or copying: under a tight
+    // memory budget a huge leaf must be rejected before it is duplicated into
+    // `framed`, otherwise the check itself comes too late to avoid the OOM.
+    const size_t framed_size = sizeof(uint32_t) + block_buf.size();
+    if (!std::in_range<uint32_t>(framed_size)) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "foreign key spill leaf exceeds the file format limit");
+    }
     std::string framed;
-    framed.reserve(sizeof(uint32_t) + block_buf.size());
+    framed.reserve(framed_size);
     AppendUint32(&framed, block_entries);
     framed.append(block_buf);
-    if (!std::in_range<uint32_t>(framed.size())) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "foreign key spill leaf exceeds the file format limit");
-    }
     Status st = store_->Append(new_seg, framed.data(), framed.size());
     if (st != Status::kSuccess) {
       return st;
@@ -345,9 +350,15 @@ Status ForeignKeyCounts::BuildSortedSegment(
         AppendUint32(&dir_buf, lm.length);
       }
       if (!std::in_range<uint32_t>(dir_buf.size())) {
+        // DropSegment discards the whole segment, including the leaf pages
+        // already appended above (leaf data and directory pages share new_seg).
+        // Callers must therefore allocate a fresh segment on retry -- reusing
+        // this id would leave the old leaves orphaned/reused. No leaf survives
+        // a DropSegment call.
         store_->DropSegment(new_seg);
-        return StatusError(StatusCode::kInvalidArgument,
-                           "foreign key spill directory exceeds the file format limit");
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "foreign key spill directory exceeds the file format limit");
       }
       const Status dst =
           store_->Append(new_seg, dir_buf.data(), dir_buf.size());
@@ -438,7 +449,8 @@ Status ForeignKeyCounts::RebuildWithDeltas() {
               RETURN_IF_FAIL(decode_leaf_block(top.offset, top.length, emit));
             } else {
               // T4637: Read fills every byte; skip the memset.
-              std::unique_ptr<char[]> dir_raw(new char[top.length]);  // NOLINT(modernize-avoid-c-arrays)
+              std::unique_ptr<char[]> dir_raw(
+                  new char[top.length]);  // NOLINT(modernize-avoid-c-arrays)
               RETURN_IF_FAIL(
                   store_->Read(old_seg, top.offset, dir_raw.get(), top.length));
               std::string_view sv(dir_raw.get(), top.length);
@@ -506,7 +518,8 @@ StatusOr<int64_t> ForeignKeyCounts::LookupSpilledCount(
     // T4636: store_->Read overwrites every byte; the old
     // std::string(leaf->length, '\0') memset the same block again for
     // nothing. Default-new'ed char[] skips it, view keeps parsing identical.
-    std::unique_ptr<char[]> dir_raw(new char[leaf->length]);  // NOLINT(modernize-avoid-c-arrays)
+    std::unique_ptr<char[]> dir_raw(
+        new char[leaf->length]);  // NOLINT(modernize-avoid-c-arrays)
     RETURN_IF_FAIL(
         store_->Read(segment_id_, leaf->offset, dir_raw.get(), leaf->length));
     std::string_view sv(dir_raw.get(), leaf->length);
@@ -545,7 +558,8 @@ StatusOr<int64_t> ForeignKeyCounts::LookupSpilledCount(
   }
 
   // T4635: same uninit-buffer rule as the dir read above.
-  std::unique_ptr<char[]> leaf_raw(new char[leaf_len]);  // NOLINT(modernize-avoid-c-arrays)
+  std::unique_ptr<char[]> leaf_raw(
+      new char[leaf_len]);  // NOLINT(modernize-avoid-c-arrays)
   RETURN_IF_FAIL(store_->Read(segment_id_, leaf_off, leaf_raw.get(), leaf_len));
   std::string_view sv(leaf_raw.get(), leaf_len);
   uint32_t n = 0;
@@ -797,12 +811,29 @@ Status SpillableRowPositionList::PushBack(const RowPosition& pos) {
       return Status::kSuccess;
     }
   }
-  in_memory_.push_back(pos);
-  ++count_;
-  if (in_memory_.size() >= kRowPosFlushBatch || force_spill) {
+  // Post-spill staging tail: TransitionToSpill() released the whole charge,
+  // so without a budget check here the tail silently regrows to
+  // kRowPosFlushBatch entries (16 KiB) that are neither charged nor bounded
+  // by budget_bytes_ (which bottoms out at 4 KiB). Keep it both charged and
+  // bounded, flushing before it can exceed the budget.
+  const size_t add_bytes = sizeof(RowPosition);
+  const size_t tail_limit = std::max<size_t>(
+      1,
+      std::min<size_t>(kRowPosFlushBatch, budget_bytes_ / sizeof(RowPosition)));
+  if (!mem_charge_.TryAddWithReclaim(add_bytes) ||
+      in_memory_.size() >= tail_limit || force_spill) {
     RETURN_IF_FAIL(FlushBatchToSpill(in_memory_.data(), in_memory_.size()));
     in_memory_.clear();
+    mem_charge_.ReleaseAll();
+    if (!mem_charge_.TryAddWithReclaim(add_bytes)) {
+      // No room even for one staged row: write it straight to the spill file.
+      RETURN_IF_FAIL(FlushBatchToSpill(&pos, 1));
+      ++count_;
+      return Status::kSuccess;
+    }
   }
+  in_memory_.push_back(pos);
+  ++count_;
   return Status::kSuccess;
 }
 

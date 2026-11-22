@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/memory_budget.hpp"
 #include "common/platform/cpu_affinity.hpp"
 #include "common/platform/socket.hpp"
 #include "common/random_string.hpp"
@@ -80,13 +82,15 @@ std::string QueryMessage(const std::string& sql) {
 }
 
 // Reads messages until a ReadyForQuery ('Z') arrives or the 5s deadline
-// expires.  Returns the accumulated bytes ('Z' included).
+// expires.  Returns the accumulated bytes: a successful read ends with 'Z',
+// while a timeout yields whatever frames arrived so far (possibly none), so
+// callers can still inspect a partially received reply.
 std::string ReadUntilReady(int fd, size_t ready_count = 1) {
   std::string result;
   while (true) {
     pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
     if (poll(&descriptor, 1, 5000) <= 0) {
-      return {};
+      return result;
     }
     std::array<char, 4096> buffer{};
     const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
@@ -139,7 +143,9 @@ int ConnectClient(uint16_t port, size_t application_name_bytes = 0) {
       connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
           0 ||
       !SendAll(client, StartupMessage(application_name_bytes)) ||
-      ReadUntilReady(client).empty()) {
+      // A timeout may now return partial bytes; only a complete ReadyForQuery
+      // frame proves the startup handshake finished.
+      ReadyForQueryStatus(ReadUntilReady(client)) == '?') {
     close(client);
     return -1;
   }
@@ -223,6 +229,12 @@ TEST(PostgresServerExtraTest, AuditExplicitWorkerCountRespectsBucketCapacity) {
     PostgresServer server("postgres_worker_audit-" + RandomString(), options);
     std::string error;
     ASSERT_TRUE(server.Listen(&error)) << error;
+    // The scheduler has exactly 16 task buckets/condition variables; an
+    // explicit count above that cap must be clamped, not wrap or overflow.
+    const size_t expected_workers = workers < 16 ? workers : 16;
+    EXPECT_EQ(server.ReadWorkerCount(), expected_workers)
+        << "explicit read_worker_threads=" << workers;
+    EXPECT_LE(server.ReadWorkerCount(), 16U);
     std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
     StopGuard stop{&server};
     std::vector<int> clients;
@@ -239,6 +251,22 @@ TEST(PostgresServerExtraTest, AuditExplicitWorkerCountRespectsBucketCapacity) {
       close(client);
     }
   }
+}
+
+TEST(PostgresServerExtraTest, RejectsConnectionFloorOverflow) {
+  auto& budget = ProcessMemoryBudget::Global();
+  const size_t original_floor = budget.ServerBufferFloorBytes();
+  {
+    PostgresServerOptions options;
+    options.max_connections = std::numeric_limits<size_t>::max();
+    PostgresServer server("postgres_invalid_connections-" + RandomString(),
+                          options);
+    std::string error;
+    EXPECT_FALSE(server.Listen(&error));
+    EXPECT_NE(error.find("max_connections"), std::string::npos);
+    EXPECT_EQ(budget.ServerBufferFloorBytes(), original_floor);
+  }
+  EXPECT_EQ(budget.ServerBufferFloorBytes(), original_floor);
 }
 
 TEST(PostgresServerExtraTest, PendingDurableRepliesDoNotOccupySqlWorkers) {
@@ -321,6 +349,52 @@ TEST(PostgresServerExtraTest, PendingDurableRepliesDoNotOccupySqlWorkers) {
     EXPECT_EQ(context.PreCommit(), Status::kSuccess);
   }
   database->DeleteAll();
+}
+
+TEST(PostgresServerExtraTest, MergeDoesNotBlockEventLoopDuringDurability) {
+  PostgresServerOptions options;
+  options.port = 0;
+  options.read_worker_threads = 2;
+  PostgresServer server("postgres_merge_worker-" + RandomString(), options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
+  StopGuard stop{&server};
+  const int writer = ConnectClient(server.BoundPort());
+  const int control = ConnectClient(server.BoundPort());
+  ASSERT_GE(writer, 0);
+  ASSERT_GE(control, 0);
+  ASSERT_TRUE(
+      SendAll(writer, QueryMessage("CREATE TABLE merge_worker (k INT64)")));
+  ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(writer)), 'I');
+  ASSERT_TRUE(
+      SendAll(writer, QueryMessage("CREATE TABLE merge_source (k INT64)")));
+  ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(writer)), 'I');
+  ASSERT_TRUE(
+      SendAll(writer, QueryMessage("INSERT INTO merge_source VALUES (1)")));
+  ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(writer)), 'I');
+  SyncGate gate;
+  ASSERT_TRUE(SendAll(
+      writer, QueryMessage(
+                  "MERGE INTO merge_worker USING merge_source "
+                  "ON merge_worker.k = merge_source.k "
+                  "WHEN NOT MATCHED THEN INSERT (k) VALUES (merge_source.k)")));
+  if (!gate.Wait()) {
+    gate.Release();
+    const std::string reply = ReadUntilReady(writer);
+    FAIL() << "MERGE did not reach durability: " << reply;
+  }
+  ASSERT_TRUE(SendAll(control, QueryMessage("SELECT 42")));
+  pollfd descriptor{.fd = control, .events = POLLIN, .revents = 0};
+  const int ready = poll(&descriptor, 1, 3000);
+  gate.Release();
+  EXPECT_GT(ready, 0);
+  EXPECT_NE(ReadUntilReady(control).find(pgwire::DataRow(Row({Value(42)}))),
+            std::string::npos);
+  const std::string reply = ReadUntilReady(writer);
+  EXPECT_NE(reply.find("MERGE 1"), std::string::npos) << reply;
+  close(control);
+  close(writer);
 }
 
 TEST(PostgresServerExtraTest, FailedDurabilityNeverAcknowledgesCommit) {
@@ -1040,7 +1114,7 @@ TEST(PostgresServerExtraTest, DirectReplyRestartsIdleTimeout) {
   PostgresServerOptions options;
   options.port = 0;
   options.read_worker_threads = 2;
-  options.idle_timeout = std::chrono::seconds(2);
+  options.idle_timeout = std::chrono::seconds(3);
   PostgresServer server(path, options);
   std::string error;
   ASSERT_TRUE(server.Listen(&error)) << error;
@@ -1055,33 +1129,55 @@ TEST(PostgresServerExtraTest, DirectReplyRestartsIdleTimeout) {
     ASSERT_TRUE(SendAll(fd, QueryMessage(sql)));
     ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(fd)), 'I');
   }
-  // The control query is certified before the WAL sync hook is installed.
-  ASSERT_TRUE(SendAll(control, QueryMessage("SELECT 1")));
-  ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(control)), 'I');
+  // A passive peer connected at the same time as fd's last event-loop
+  // activity. Its closure by the idle sweep is an observable signal that the
+  // deadline for that pre-reply activity has passed: no fixed sleep has to
+  // land inside a narrow window between two timeouts.
+  const int stale = ConnectClient(server.BoundPort());
+  ASSERT_GE(stale, 0);
+  const auto control_roundtrip = [&] {
+    if (!SendAll(control, QueryMessage("SELECT 1"))) {
+      return false;
+    }
+    return ReadyForQueryStatus(ReadUntilReady(control)) == 'I';
+  };
+  ASSERT_TRUE(control_roundtrip());
+  const auto peer_closed = [](int socket_fd) {
+    pollfd descriptor{.fd = socket_fd, .events = POLLIN, .revents = 0};
+    return poll(&descriptor, 1, 0) > 0;
+  };
   const auto before = server.DirectReplyCount();
   SyncGate gate;
   ASSERT_TRUE(SendAll(fd, QueryMessage("UPDATE idle_rows SET id = 2")));
   ASSERT_TRUE(gate.Wait());
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
-  ASSERT_TRUE(SendAll(control, QueryMessage("SELECT 1")));
-  ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(control)), 'I');
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  // Separate "idle since request arrival" from "idle since reply", but stay
+  // well below idle_timeout so the in-flight read is never swept itself.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
   gate.Release();
   ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(fd)), 'I');
-  // More than the idle limit since request arrival, less than the limit
-  // since its reply. Another live client wakes epoll's idle sweep first.
-  std::this_thread::sleep_for(std::chrono::milliseconds(1150));
-  ASSERT_TRUE(SendAll(control, QueryMessage("SELECT 1")));
-  ASSERT_EQ(ReadyForQueryStatus(ReadUntilReady(control)), 'I');
+  // Let the epoll loop process the completion (which refreshes last_activity)
+  // before the sweep that closes `stale` inspects fd.
+  ASSERT_TRUE(control_roundtrip());
+  // T4979: DirectReplyCount is bumped by the worker before the completion is
+  // drained on the loop; poll for it instead of trusting the client's read.
+  WaitForDirectReplyAbove(server, before);
+  EXPECT_GT(server.DirectReplyCount(), before);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (std::chrono::steady_clock::now() < deadline && !peer_closed(stale)) {
+    // Keep the event loop awake so the sweep runs promptly after the deadline.
+    ASSERT_TRUE(control_roundtrip());
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_TRUE(peer_closed(stale)) << "idle sweep never crossed the deadline";
+  // fd was idle before `stale` when the reply was held, so the same sweep
+  // would have closed it too had the direct reply not restarted its timeout.
+  EXPECT_FALSE(peer_closed(fd))
+      << "direct reply did not restart the idle timeout";
   ASSERT_TRUE(SendAll(fd, QueryMessage("SELECT id FROM idle_rows")));
   EXPECT_NE(ReadUntilReady(fd).find(pgwire::DataRow(Row({Value(2)}))),
             std::string::npos);
-  // T4979: DirectReplyCount is bumped by the worker after its reply bytes
-  // are handed out; the client having read them does not prove the counter
-  // moved yet. Wait it out (generously -- it lands in microseconds unless
-  // the machine is oversubscribed) instead of failing on ctest -j load.
-  WaitForDirectReplyAbove(server, before);
-  EXPECT_GT(server.DirectReplyCount(), before);
+  close(stale);
   close(fd);
   close(control);
 }
@@ -1475,7 +1571,18 @@ TEST(PostgresServerExtraTest, ShedConnectionReceivesTooManyConnectionsFatal) {
   ASSERT_EQ(0, connect(second, reinterpret_cast<sockaddr*>(&address),
                        sizeof(address)));
   std::string wire;
+  // Bounded wait: if a regression leaves the shed connection open instead of
+  // sending FATAL, fall through to the assertions below rather than hanging
+  // until ctest's 60s timeout kills the whole test binary.
   while (true) {
+    pollfd descriptor{.fd = second, .events = POLLIN, .revents = 0};
+    const int ready = poll(&descriptor, 1, 5000);
+    if (ready < 0 && errno == EINTR) {
+      continue;
+    }
+    if (ready <= 0) {
+      break;
+    }
     char buffer[256];  // NOLINT(modernize-avoid-c-arrays)
     const ssize_t got = recv(second, buffer, sizeof(buffer), 0);
     if (got <= 0) {

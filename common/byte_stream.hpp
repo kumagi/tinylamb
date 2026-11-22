@@ -60,10 +60,18 @@ class ByteStream {
   size_t Varint() {
     size_t result = 0;
     size_t shift = 0;
+    constexpr size_t kBits = sizeof(size_t) * 8;
     for (int i = 0; i < 10; ++i) {
       const uint8_t b = U8();
-      if (shift < sizeof(size_t) * 8) {
-        result |= static_cast<size_t>(b & 0x7f) << shift;
+      if (shift < kBits) {
+        // On the final byte (shift 63 for 64-bit size_t) only one payload bit
+        // fits. Masking prevents the high bits from shifting past 64 and
+        // wrapping, so a malformed overlong varint yields a stable value.
+        const size_t remaining = kBits - shift;
+        const uint64_t mask =
+            remaining >= 7 ? 0x7fULL : ((uint64_t{1} << remaining) - 1);
+        const uint64_t payload = (static_cast<uint64_t>(b) & 0x7fULL) & mask;
+        result |= static_cast<size_t>(payload << shift);
       }
       if ((b & 0x80) == 0) {
         break;

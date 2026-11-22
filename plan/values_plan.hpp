@@ -30,8 +30,9 @@ class ValuesPlan final : public PlanBase {
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending,
       const std::vector<std::optional<bool>>& nulls_first) const override {
-    static_cast<void>(nulls_first);
-    return IsOrderedBy(expressions, ascending);
+    // No delivered ordering at all: even a NULL-placement-only requirement
+    // must not be claimed as satisfied.
+    return expressions.empty() && ascending.empty() && nulls_first.empty();
   }
   [[nodiscard]] const std::vector<Row>& Rows() const { return rows_; }
   [[nodiscard]] bool EnforcesDistinct() const override {

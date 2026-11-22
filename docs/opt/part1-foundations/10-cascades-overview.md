@@ -138,7 +138,7 @@ tinylamb の最適化処理では、独立した 3 種類の Rule セットを�
 
 | 層 | 定義場所 | 本数 | 役割 |
 |---|---|---|---|
-| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 71（2026-11-11 作業ツリー） | スカラー式の正規化および定数畳み込み（例: `1 + 2` を `3` に変換、`NOT (a AND b)` の展開） |
+| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 70（2026-11-21 作業ツリー、旧 71 から `if_to_case` 削除済み） | スカラー式の正規化および定数畳み込み（例: `1 + 2` を `3` に変換、`NOT (a AND b)` の展開） |
 | 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 95（2026-11-19 作業ツリー） | Memo に結果が等価となる別の論理表現を追加（結合順序の交換、述語の押し込みなど） |
 | 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 46 | 論理式を具体的な物理演算子（HashJoin や IndexScan など）へ変換し、コスト評価対象とする |
 
@@ -296,7 +296,10 @@ ORDER BY + LIMIT がそろえば `kTopN`、ORDER BY だけなら `kSort`、LIMIT
 構築された Memo は、探索エンジン（`SearchEngine`）に渡されて最適化されます（`plan/optimizer.cpp` の `Optimizer::Optimize`）。
 
 ```cpp
-  cascades::SearchEngine search(std::move(memo), options.relational_rules);
+  cascades::RuleSet sample_rules;
+  const cascades::RuleSet& active_logical_rules =
+      query.samples_.empty() ? options.relational_rules : sample_rules;
+  cascades::SearchEngine search(std::move(memo), active_logical_rules);
   search.SetStepBudget(options.search_step_budget);
   std::optional<cascades::BestPlan> best = search.Optimize(
       search_root, properties, *implementation_rules, rule_context);
@@ -305,7 +308,8 @@ ORDER BY + LIMIT がそろえば `kTopN`、ORDER BY だけなら `kSort`、LIMIT
   }
 ```
 
-`SearchEngine::Optimize` の処理は 2 つの段階に分かれています（`plan/cascades.cpp`）。
+サンプリングを含むクエリでは空の `sample_rules` が選ばれます。
+`SearchEngine::Optimize` の処理は 2 つの段階に分かれています（`plan/cascades_search.cpp`）。以下は計測処理を省いた概要です。
 
 ```cpp
 std::optional<BestPlan> SearchEngine::Optimize(

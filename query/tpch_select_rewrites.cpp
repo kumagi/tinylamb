@@ -150,12 +150,12 @@ bool ExprHasParamOrSubqueryOrVolatile(  // NOLINT(misc-no-recursion)
     return true;
   }
   if (expr->Type() == TypeTag::kFunctionCallExp) {
-    const std::string fn =
-        AsciiLower(expr->AsFunctionCallExpression().FuncName());
-    if (fn == "rand" || fn == "random" || fn == "uuid" ||
-        fn == "generate_uuid" || fn == "now" || fn == "current_timestamp" ||
-        fn == "current_date" || fn == "current_time" ||
-        fn == "clock_timestamp") {
+    // Use the single source of truth in expression/rewrite.hpp. A local name
+    // list drifted from GetFunctionVolatility() and let stable functions such
+    // as CURRENT_DATETIME (and volatile NEWID) through, which plan-time
+    // folding then froze into a cacheable Value.
+    if (GetFunctionVolatility(expr->AsFunctionCallExpression().FuncName()) !=
+        Volatility::kImmutable) {
       return true;
     }
   }
@@ -417,6 +417,14 @@ bool IsColumnCertifiedUniqueNotNull(const Table& table, slot_t col_idx,
     return false;
   }
   if (!ctx.txn_.IsReadOnly() && !ctx.txn_.WriteSetEmpty()) {
+    return false;
+  }
+  // LayoutGeneration() and the LS store built below describe the *current*
+  // table state. A read-write transaction with an empty write set can still
+  // hold a snapshot older than a committed row mutation; that snapshot may
+  // see historical rows the current-state proof never examined, so its
+  // uniqueness cannot be certified from this generation.
+  if (!ctx.txn_.IsReadOnly() && ctx.txn_.RequiresHistoricalRead()) {
     return false;
   }
   const uint64_t generation = table.LayoutGeneration();
@@ -689,8 +697,12 @@ void AppendDisjunctiveIntervalHulls(
         }
         if (cmp < 0) {
           global_lo = bi.lo;
-        } else if (cmp == 0 && bi.lo.inclusive) {
-          global_lo.inclusive = true;
+        } else if (cmp == 0) {
+          // The hull is an over-approximation of the OR of the branches.
+          // Its lower endpoint is inclusive as soon as ANY branch attaining
+          // that endpoint includes it; a sibling exclusive branch does not
+          // make the value absent from the union, so never clear the flag.
+          global_lo.inclusive = global_lo.inclusive || bi.lo.inclusive;
         }
       }
       if (!bi.has_hi) {
@@ -705,8 +717,10 @@ void AppendDisjunctiveIntervalHulls(
         }
         if (cmp > 0) {
           global_hi = bi.hi;
-        } else if (cmp == 0 && bi.hi.inclusive) {
-          global_hi.inclusive = true;
+        } else if (cmp == 0) {
+          // Symmetric to the lower endpoint: any branch attaining the hull's
+          // upper endpoint inclusively keeps it inclusive for the union.
+          global_hi.inclusive = global_hi.inclusive || bi.hi.inclusive;
         }
       }
     }
@@ -1177,7 +1191,7 @@ bool PreaggregateLeftJoinOneSelect(SelectStatement* stmt,
     for (const Expression& ch : orig) {
       children.push_back(qualify_r_expr(ch));
     }
-    return WithExpressionChildren(e, children);
+    return WithExpressionChildren(e, std::move(children));
   };
 
   const ColumnName r_key_col(rels[1].qualifier,
@@ -1260,12 +1274,12 @@ bool PreaggregateLeftJoinOneSelect(SelectStatement* stmt,
     for (const Expression& ch : orig) {
       children.push_back(rewrite_outer_expr(ch, allow_select_alias));
     }
-    return WithExpressionChildren(e, children);
+    return WithExpressionChildren(e, std::move(children));
   };
 
   std::vector<NamedExpression> new_select;
   new_select.reserve(stmt->SelectList().size());
-  for (const auto & old_item : stmt->SelectList()) {
+  for (const auto& old_item : stmt->SelectList()) {
     const std::string out_name =
         old_item.name.empty() ? old_item.expression->ToString() : old_item.name;
     new_select.emplace_back(out_name,
@@ -1360,7 +1374,7 @@ Expression CanonicalizeSingleTableExpr(  // NOLINT(misc-no-recursion)
       return expr;
     }
   }
-  return WithExpressionChildren(expr, children);
+  return WithExpressionChildren(expr, std::move(children));
 }
 
 bool AbsorbSelfSemijoinOneSelect(SelectStatement* stmt,
@@ -1519,6 +1533,11 @@ bool AbsorbSelfSemijoinOneSelect(SelectStatement* stmt,
           outer_t_local_idxs.push_back(ci);
           continue;
         }
+        // This rewrite is deliberately single-key: the subquery gate above
+        // requires `sub.GroupBy().size() == 1`, and the multiplicity-collapse
+        // proof only covers that one key. A second `t_idx = ...` equijoin is
+        // therefore not "discarded" -- it makes `conj_shape_ok` false below so
+        // the whole rewrite is skipped and the original query stays intact.
         if (crels.size() == 2 && c->Type() == TypeTag::kBinaryExp &&
             c->AsBinaryExpression().Op() == BinaryOperation::kEquals &&
             c->AsBinaryExpression().Left()->Type() == TypeTag::kColumnValue &&
@@ -1796,7 +1815,7 @@ bool AbsorbSelfSemijoinOneSelect(SelectStatement* stmt,
         for (const Expression& ch : orig) {
           children.push_back(rewrite_expr(ch, allow_alias));
         }
-        return WithExpressionChildren(e, children);
+        return WithExpressionChildren(e, std::move(children));
       };
 
       std::vector<SelectSource> new_sources = stmt->Sources();
@@ -1891,17 +1910,28 @@ bool AbsorbSelfSemijoinRecursive(  // NOLINT(misc-no-recursion)
 // ============================================================================
 
 size_t CountTableReferencesInExpr(  // NOLINT(misc-no-recursion)
-    const Expression& expr, std::string_view target_name);
+    const Expression& expr, std::string_view target_name,
+    std::unordered_set<const SelectStatement*>* visited_defs);
 
 size_t CountTableReferencesInSelect(  // NOLINT(misc-no-recursion)
     const SelectStatement& stmt, std::string_view target_name,
-    bool include_with_defs) {
+    bool include_with_defs,
+    std::unordered_set<const SelectStatement*>* visited_defs = nullptr) {
   size_t count = 0;
+  std::unordered_set<const SelectStatement*> local_visited;
+  if (visited_defs == nullptr) {
+    visited_defs = &local_visited;
+  }
   if (include_with_defs) {
     for (const auto& [wname, wbody] : stmt.WithQueries()) {
       (void)wname;
-      if (wbody != nullptr) {
-        count += CountTableReferencesInSelect(*wbody, target_name, true);
+      // A CTE body is a single definition. Without this guard a nested
+      // definition reachable from several references is walked (and its own
+      // internal references counted) once per path, breaking the "exactly
+      // two references" check in RewriteCteArgmax.
+      if (wbody != nullptr && visited_defs->insert(wbody.get()).second) {
+        count += CountTableReferencesInSelect(*wbody, target_name, true,
+                                              visited_defs);
       }
     }
   }
@@ -1910,33 +1940,41 @@ size_t CountTableReferencesInSelect(  // NOLINT(misc-no-recursion)
       ++count;
     }
     if (src.query != nullptr) {
-      count += CountTableReferencesInSelect(*src.query, target_name, true);
+      count += CountTableReferencesInSelect(*src.query, target_name, true,
+                                            visited_defs);
     }
-    count += CountTableReferencesInExpr(src.join_condition, target_name);
-    count += CountTableReferencesInExpr(src.unnest, target_name);
+    count += CountTableReferencesInExpr(src.join_condition, target_name,
+                                        visited_defs);
+    count += CountTableReferencesInExpr(src.unnest, target_name, visited_defs);
   }
-  count += CountTableReferencesInExpr(stmt.WhereClause(), target_name);
-  count += CountTableReferencesInExpr(stmt.Having(), target_name);
-  count += CountTableReferencesInExpr(stmt.Qualify(), target_name);
+  count +=
+      CountTableReferencesInExpr(stmt.WhereClause(), target_name, visited_defs);
+  count += CountTableReferencesInExpr(stmt.Having(), target_name, visited_defs);
+  count +=
+      CountTableReferencesInExpr(stmt.Qualify(), target_name, visited_defs);
   for (const NamedExpression& item : stmt.SelectList()) {
-    count += CountTableReferencesInExpr(item.expression, target_name);
+    count +=
+        CountTableReferencesInExpr(item.expression, target_name, visited_defs);
   }
   for (const Expression& g : stmt.GroupBy()) {
-    count += CountTableReferencesInExpr(g, target_name);
+    count += CountTableReferencesInExpr(g, target_name, visited_defs);
   }
   for (const auto& ob : stmt.OrderBy()) {
-    count += CountTableReferencesInExpr(ob.expression, target_name);
+    count +=
+        CountTableReferencesInExpr(ob.expression, target_name, visited_defs);
   }
   for (const auto& br : stmt.UnionAll()) {
     if (br != nullptr) {
-      count += CountTableReferencesInSelect(*br, target_name, true);
+      count +=
+          CountTableReferencesInSelect(*br, target_name, true, visited_defs);
     }
   }
   return count;
 }
 
 size_t CountTableReferencesInExpr(  // NOLINT(misc-no-recursion)
-    const Expression& expr, std::string_view target_name) {
+    const Expression& expr, std::string_view target_name,
+    std::unordered_set<const SelectStatement*>* visited_defs) {
   if (!expr) {
     return 0;
   }
@@ -1944,13 +1982,14 @@ size_t CountTableReferencesInExpr(  // NOLINT(misc-no-recursion)
   if (expr->Type() == TypeTag::kQueryExp) {
     const auto& q = expr->AsQueryExpression();
     if (q.Query() != nullptr) {
-      count += CountTableReferencesInSelect(*q.Query(), target_name, true);
+      count += CountTableReferencesInSelect(*q.Query(), target_name, true,
+                                            visited_defs);
     }
-    count += CountTableReferencesInExpr(q.Test(), target_name);
+    count += CountTableReferencesInExpr(q.Test(), target_name, visited_defs);
     return count;
   }
   for (const Expression& ch : ExpressionChildren(expr)) {
-    count += CountTableReferencesInExpr(ch, target_name);
+    count += CountTableReferencesInExpr(ch, target_name, visited_defs);
   }
   return count;
 }
@@ -2012,7 +2051,13 @@ bool SynthesizeTransitiveEquijoinsOneSelect(
 
   struct PairHash {
     size_t operator()(const std::pair<size_t, size_t>& p) const noexcept {
-      return (p.first << 16) ^ p.second;
+      // Mix both halves with the standard boost-style combination; a plain
+      // `first << 16` loses the high bits of large node ids and piles many
+      // distinct pairs into the same bucket on large joins.
+      const size_t a = std::hash<size_t>{}(p.first);
+      const size_t b = std::hash<size_t>{}(p.second);
+      return a ^ (b + static_cast<size_t>(0x9e3779b97f4a7c15ULL) + (a << 6) +
+                  (a >> 2));
     }
   };
   std::unordered_set<std::pair<size_t, size_t>, PairHash> existing_pairs;
@@ -2178,16 +2223,19 @@ bool DeferUniqueDimAfterTopNOneSelect(
 
   // Identify direct unique-keyed sources in GROUP BY: `r` has `(r, pk_slot)` in
   // `gb_cols` with `IsColumnCertifiedUniqueNotNull`.
-  std::unordered_map<size_t, slot_t> unique_rel_pk;
+  // A relation may expose several certified UNIQUE NOT NULL columns in the
+  // GROUP BY; keep them all so a later column can still serve as the deferred
+  // lookup key when an earlier one is pinned by a predicate/ORDER BY.
+  std::unordered_map<size_t, std::vector<slot_t>> unique_rel_pk;
   for (const ResolvedColRef& gr : gb_cols) {
-    if (unique_rel_pk.contains(gr.rel_idx)) {
-      continue;
-    }
     const Column& c = rels[gr.rel_idx].schema.GetColumn(gr.slot);
     if ((c.Type() == ValueType::kInt64 || c.Type() == ValueType::kDate) &&
         !c.IsInterval() &&
         IsColumnCertifiedUniqueNotNull(*rels[gr.rel_idx].table, gr.slot, ctx)) {
-      unique_rel_pk.emplace(gr.rel_idx, gr.slot);
+      auto& slots = unique_rel_pk[gr.rel_idx];
+      if (std::ranges::find(slots, gr.slot) == slots.end()) {
+        slots.push_back(gr.slot);
+      }
     }
   }
   if (unique_rel_pk.empty()) {
@@ -2232,7 +2280,10 @@ bool DeferUniqueDimAfterTopNOneSelect(
           ComparableEquijoinColumns(ca, cb) &&
           IsColumnCertifiedUniqueNotNull(*rels[to.rel_idx].table, to.slot,
                                          ctx)) {
-        unique_rel_pk.emplace(to.rel_idx, to.slot);
+        auto& slots = unique_rel_pk[to.rel_idx];
+        if (std::ranges::find(slots, to.slot) == slots.end()) {
+          slots.push_back(to.slot);
+        }
       }
     };
     try_fd_hop(*lr, *rr);
@@ -2345,7 +2396,9 @@ bool DeferUniqueDimAfterTopNOneSelect(
 
   for (const ResolvedColRef& gr : gb_cols) {
     const auto pk_it = unique_rel_pk.find(gr.rel_idx);
-    if (pk_it != unique_rel_pk.end() && gr.slot != pk_it->second &&
+    if (pk_it != unique_rel_pk.end() &&
+        std::ranges::find(pk_it->second.begin(), pk_it->second.end(),
+                          gr.slot) == pk_it->second.end() &&
         !is_pinned(gr)) {
       deferred_cols.push_back(gr);
       deferred_rels.insert(gr.rel_idx);
@@ -2367,11 +2420,31 @@ bool DeferUniqueDimAfterTopNOneSelect(
     return false;
   }
 
+  // Pick a certified unique key for a deferred relation, preferring one that
+  // is already retained (so no extra key column needs projecting).
+  auto pick_retained_pk = [&](size_t d_rel) -> std::optional<slot_t> {
+    const auto it = unique_rel_pk.find(d_rel);
+    if (it == unique_rel_pk.end() || it->second.empty()) {
+      return std::nullopt;
+    }
+    for (const slot_t s : it->second) {
+      const ResolvedColRef ref{.rel_idx = d_rel, .slot = s};
+      if (std::ranges::find(retained_gb_cols, ref) != retained_gb_cols.end()) {
+        return s;
+      }
+    }
+    return it->second.front();
+  };
+
   // Ensure every `deferred_rels` member's `pk_slot` is present in
   // `retained_gb_cols` so the outer query can join the K winners directly to
   // each deferred dimension by its certified PK!
   for (const size_t d_rel : deferred_rels) {
-    const ResolvedColRef pk_ref{.rel_idx = d_rel, .slot = unique_rel_pk[d_rel]};
+    const auto pk_slot = pick_retained_pk(d_rel);
+    if (!pk_slot.has_value()) {
+      return false;
+    }
+    const ResolvedColRef pk_ref{.rel_idx = d_rel, .slot = *pk_slot};
     if (std::ranges::find(retained_gb_cols, pk_ref) == retained_gb_cols.end()) {
       retained_gb_cols.push_back(pk_ref);
     }
@@ -2588,8 +2661,11 @@ bool DeferUniqueDimAfterTopNOneSelect(
     late_dim_alias.emplace(d_rel, dalias);
     outer_sources.emplace_back(rels[d_rel].table_name, dalias, nullptr,
                                JoinType::kCross, nullptr);
-    const slot_t pk_slot = unique_rel_pk[d_rel];
-    const ResolvedColRef pk_ref{.rel_idx = d_rel, .slot = pk_slot};
+    const auto pk_slot = pick_retained_pk(d_rel);
+    if (!pk_slot.has_value()) {
+      return false;
+    }
+    const ResolvedColRef pk_ref{.rel_idx = d_rel, .slot = *pk_slot};
     const auto kit = std::ranges::find(retained_gb_cols, pk_ref);
     const auto k_idx =
         static_cast<size_t>(std::distance(retained_gb_cols.begin(), kit));
@@ -2597,7 +2673,7 @@ bool DeferUniqueDimAfterTopNOneSelect(
         ColumnValueExp(ColumnName(core_alias, key_out_name(k_idx))),
         BinaryOperation::kEquals,
         ColumnValueExp(ColumnName(
-            dalias, rels[d_rel].schema.GetColumn(pk_slot).Name().name))));
+            dalias, rels[d_rel].schema.GetColumn(*pk_slot).Name().name))));
   }
 
   std::vector<NamedExpression> outer_select;
@@ -2610,9 +2686,17 @@ bool DeferUniqueDimAfterTopNOneSelect(
       outer_select.emplace_back(
           out_name, ColumnValueExp(ColumnName(core_alias, select_core_col[i])));
     } else {
+      // An empty core slot means this item was skipped as a deferred plain
+      // column. Never call AsColumnValue() on an unchecked expression: a
+      // computed scalar (or a missing expression) must abort the rewrite.
+      if (!old_item.expression ||
+          old_item.expression->Type() != TypeTag::kColumnValue) {
+        return false;
+      }
       const auto r = ResolveColRef(
           old_item.expression->AsColumnValue().GetColumnName(), rels);
-      if (!r.has_value()) {
+      if (!r.has_value() || !is_deferred(*r) ||
+          !late_dim_alias.contains(r->rel_idx)) {
         return false;
       }
       outer_select.emplace_back(
@@ -2724,9 +2808,36 @@ bool ExtractNullOnEmptyCorrelatedAggregate(const Expression& select_expr,
   return false;
 }
 
+void CollectCorrSumAliasesInUse(  // NOLINT(misc-no-recursion)
+    const SelectStatement& stmt, std::unordered_set<std::string>* used) {
+  for (const SelectSource& src : stmt.Sources()) {
+    if (!src.alias.empty()) {
+      used->insert(AsciiLower(src.alias));
+    }
+    if (!src.table.empty()) {
+      used->insert(AsciiLower(src.table));
+    }
+    if (src.query != nullptr) {
+      CollectCorrSumAliasesInUse(*src.query, used);
+    }
+  }
+  for (const auto& [name, body] : stmt.WithQueries()) {
+    used->insert(AsciiLower(name));
+    if (body != nullptr) {
+      CollectCorrSumAliasesInUse(*body, used);
+    }
+  }
+  for (const NamedExpression& item : stmt.SelectList()) {
+    if (!item.name.empty()) {
+      used->insert(AsciiLower(item.name));
+    }
+  }
+}
+
 bool DecorrelateCorrelatedSumOneSelect(
     SelectStatement* stmt, const std::unordered_set<std::string>& ctes,
-    TransactionContext& ctx, size_t* alias_seq) {
+    TransactionContext& ctx, size_t* alias_seq,
+    std::unordered_set<std::string>* used_aliases) {
   if (stmt == nullptr || stmt->Sources().empty() || !stmt->WhereClause() ||
       stmt->ForUpdate()) {
     return false;
@@ -3003,7 +3114,7 @@ bool DecorrelateCorrelatedSumOneSelect(
           return e;
         }
       }
-      return WithExpressionChildren(e, chs);
+      return WithExpressionChildren(e, std::move(chs));
     };
     Expression qualified_agg_child = qualify_inner_only(agg_ptr->Child());
     if (!agg_child_ok || qualified_agg_child->TouchedColumns().empty()) {
@@ -3099,9 +3210,15 @@ bool DecorrelateCorrelatedSumOneSelect(
       continue;
     }
 
-    // Build deduplicated inner GROUP BY keys and derived source!
-    const std::string cs_alias =
-        "__tpch_corr_sum_" + std::to_string((*alias_seq)++);
+    // Build deduplicated inner GROUP BY keys and derived source! The counter
+    // is shared across the whole statement tree, but a user-supplied alias can
+    // still spell the same name; skip those so the minted alias is unique in
+    // every scope it can be referenced from.
+    std::string cs_alias;
+    do {
+      cs_alias = "__tpch_corr_sum_" + std::to_string((*alias_seq)++);
+    } while (used_aliases->contains(AsciiLower(cs_alias)));
+    used_aliases->insert(AsciiLower(cs_alias));
     std::vector<slot_t> unique_inner_keys;
     unique_inner_keys.reserve(corr_pairs.size());
     for (const CorrPair& cp : corr_pairs) {
@@ -3191,7 +3308,8 @@ bool DecorrelateCorrelatedSumOneSelect(
 
 bool DecorrelateCorrelatedSumRecursive(  // NOLINT(misc-no-recursion)
     SelectStatement* stmt, std::unordered_set<std::string> ctes,
-    TransactionContext& ctx, size_t* alias_seq) {
+    TransactionContext& ctx, size_t* alias_seq,
+    std::unordered_set<std::string>* used_aliases) {
   if (stmt == nullptr) {
     return false;
   }
@@ -3199,17 +3317,18 @@ bool DecorrelateCorrelatedSumRecursive(  // NOLINT(misc-no-recursion)
   bool changed = false;
   for (const auto& [name, body] : stmt->WithQueries()) {
     if (!stmt->IsRecursiveWith(name) && body != nullptr) {
-      changed |=
-          DecorrelateCorrelatedSumRecursive(body.get(), ctes, ctx, alias_seq);
+      changed |= DecorrelateCorrelatedSumRecursive(body.get(), ctes, ctx,
+                                                   alias_seq, used_aliases);
     }
   }
   for (const SelectSource& src : stmt->Sources()) {
     if (src.query != nullptr && !src.is_lateral) {
       changed |= DecorrelateCorrelatedSumRecursive(src.query.get(), ctes, ctx,
-                                                   alias_seq);
+                                                   alias_seq, used_aliases);
     }
   }
-  changed |= DecorrelateCorrelatedSumOneSelect(stmt, ctes, ctx, alias_seq);
+  changed |= DecorrelateCorrelatedSumOneSelect(stmt, ctes, ctx, alias_seq,
+                                               used_aliases);
   return changed;
 }
 
@@ -3448,11 +3567,15 @@ bool RewriteCteArgmaxSubqueryToTopTies(SelectStatement* outer,
       if (col_it == cte_cols.end()) {
         continue;
       }
-      // A computed scalar can reference input columns hidden by its alias.
-      // WITH TIES evaluates ordering expressions against projected rows.
-      const auto& value_expr = cte_body->SelectList()[col_it - cte_cols.begin()].expression;
-      if (value_expr->Type() != TypeTag::kAggregateExp &&
-          value_expr->Type() != TypeTag::kColumnValue) {
+      // Guard against a missing expression at the StatusOr boundary. Computed
+      // scalars are allowed: the wrapper below orders by the *projected*
+      // `base.<val_col>` (not by the original formula), so a formula that
+      // reads input columns hidden by its alias cannot change WITH TIES
+      // ordering. Rejecting every non-aggregate/non-column item disabled the
+      // rewrite for the NULL/NaN trap cases altogether.
+      const auto& value_expr =
+          cte_body->SelectList()[col_it - cte_cols.begin()].expression;
+      if (!value_expr) {
         continue;
       }
       matched_conj_idx = ci;
@@ -3546,7 +3669,12 @@ bool DeferUniqueDimensionAttributesAfterTopN(SelectStatement* select,
 bool DecorrelateCorrelatedSumComparisons(SelectStatement* select,
                                          TransactionContext& ctx) {
   size_t alias_seq = 0;
-  return DecorrelateCorrelatedSumRecursive(select, {}, ctx, &alias_seq);
+  std::unordered_set<std::string> used_aliases;
+  if (select != nullptr) {
+    CollectCorrSumAliasesInUse(*select, &used_aliases);
+  }
+  return DecorrelateCorrelatedSumRecursive(select, {}, ctx, &alias_seq,
+                                           &used_aliases);
 }
 
 namespace {
@@ -3600,14 +3728,18 @@ std::optional<CertifiedInt64ColBounds> QueryCertifiedInt64Bounds(
         return std::nullopt;
       }
       for (const auto& blk : grp_or.Value()->blocks) {
+        // An all-NULL block contributes no value to SUM(col) and no row to
+        // COUNT(col); counting it only inflates the overflow bound. Blocks
+        // without metadata for this column stay counted (conservative).
+        if (col_idx < blk.columns.size() &&
+            blk.columns[col_idx].encoding == TlcsColumnEncoding::kConstNull) {
+          continue;
+        }
         out.row_upper_bound += blk.row_count;
         if (blk.row_count == 0 || col_idx >= blk.columns.size()) {
           continue;
         }
         const auto& meta = blk.columns[col_idx];
-        if (meta.encoding == TlcsColumnEncoding::kConstNull) {
-          continue;
-        }
         if (!meta.has_min_max) {
           return std::nullopt;
         }
@@ -3798,8 +3930,17 @@ bool RewriteAffineLinearSumsOneSelect(
         all_ok = false;
         break;
       }
-      const __int128 worst_lo = min_neg_sum + std::min<__int128>(0, max_shift);
-      const __int128 worst_hi = max_pos_sum + std::max<__int128>(0, max_shift);
+      // SUM(col + d) aggregates at most `n` non-NULL rows, each shifted into
+      // [lo+d, hi+d]. Compute the extremes of the *shifted* range directly:
+      // adding the sign-split unshifted sums to d*n assumed a fixed sign for
+      // n*hi and could both over- and under-estimate the true overflow range
+      // when d is negative (or positive) and rows span zero.
+      const __int128 shifted_lo = lo + d;
+      const __int128 shifted_hi = hi + d;
+      const __int128 worst_lo =
+          bounds->non_empty_bounds ? std::min<__int128>(0, n * shifted_lo) : 0;
+      const __int128 worst_hi =
+          bounds->non_empty_bounds ? std::max<__int128>(0, n * shifted_hi) : 0;
       if (worst_lo < i64_min || worst_hi > i64_max) {
         all_ok = false;
         break;
@@ -3814,7 +3955,8 @@ bool RewriteAffineLinearSumsOneSelect(
   }
 
   // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
-  //   (affine_sum_no_overflow_fusion_sound, affine_sum_row_overflow_unsound_bug)
+  //   (affine_sum_no_overflow_fusion_sound,
+  //   affine_sum_row_overflow_unsound_bug)
   // Share canonical `SUM(col)` / `COUNT(col)` AggregateExpression instances per
   // slot so `CollectAggregates` deduplicates 90+ shifted sums (ClickBench Q30)
   // into a single `(SUM(col), COUNT(col))` pair (< 128 typed aggregates).
@@ -3825,11 +3967,11 @@ bool RewriteAffineLinearSumsOneSelect(
     auto it = canon_slot_aggs.find(sl);
     if (it == canon_slot_aggs.end()) {
       it = canon_slot_aggs
-               .emplace(sl,
-                        std::pair{AggregateExpressionExp(AggregationType::kSum,
-                                                         col_e),
-                                  AggregateExpressionExp(
-                                      AggregationType::kCount, col_e)})
+               .emplace(
+                   sl,
+                   std::pair{
+                       AggregateExpressionExp(AggregationType::kSum, col_e),
+                       AggregateExpressionExp(AggregationType::kCount, col_e)})
                .first;
     }
     return it->second;
@@ -3894,7 +4036,7 @@ bool RewriteAffineLinearSumsOneSelect(
       }
       next.push_back(std::move(nr));
     }
-    return ch_changed ? WithExpressionChildren(e, next) : e;
+    return ch_changed ? WithExpressionChildren(e, std::move(next)) : e;
   };
 
   std::vector<NamedExpression> new_select = stmt->SelectList();
@@ -4010,17 +4152,15 @@ Expression FactorCommonConjunctsInOrTree(  // NOLINT(misc-no-recursion)
   for (const Expression& cand : branch_conjs[0]) {
     bool in_all = true;
     for (size_t bi = 1; bi < branch_conjs.size(); ++bi) {
-      const bool found =
-          std::ranges::any_of(branch_conjs[bi], [&](const Expression& other) {
-            return ExprAstEquals(cand, other);
-          });
+      const bool found = std::ranges::any_of(
+          branch_conjs[bi],
+          [&](const Expression& other) { return ExprAstEquals(cand, other); });
       if (!found) {
         in_all = false;
         break;
       }
     }
-    if (in_all &&
-        std::ranges::none_of(hoisted, [&](const Expression& prev) {
+    if (in_all && std::ranges::none_of(hoisted, [&](const Expression& prev) {
           return ExprAstEquals(cand, prev);
         })) {
       hoisted.push_back(cand);
@@ -4077,8 +4217,8 @@ bool RewriteCorrelatedPositiveCountOneSelect(
     return false;
   }
 
-  auto match_positive_count_cmp =
-      [](const Expression& conj, const QueryExpression** q_out) -> bool {
+  auto match_positive_count_cmp = [](const Expression& conj,
+                                     const QueryExpression** q_out) -> bool {
     if (!conj || conj->Type() != TypeTag::kBinaryExp) {
       return false;
     }
@@ -4236,8 +4376,8 @@ bool RewriteCorrelatedPositiveCountOneSelect(
         }
         const std::string& cname =
             inner_rels[0].schema.GetColumn(rr.slot).Name().name;
-        return ColumnValueExp(
-            with_qualifier ? ColumnName(inner_qual, cname) : ColumnName(cname));
+        return ColumnValueExp(with_qualifier ? ColumnName(inner_qual, cname)
+                                             : ColumnName(cname));
       }
       const auto orig = ExpressionChildren(e);
       if (orig.empty()) {
@@ -4251,7 +4391,7 @@ bool RewriteCorrelatedPositiveCountOneSelect(
           return e;
         }
       }
-      return WithExpressionChildren(e, next);
+      return WithExpressionChildren(e, std::move(next));
     };
 
     const Expression factored_where =
@@ -4291,9 +4431,8 @@ bool RewriteCorrelatedPositiveCountOneSelect(
       if (!touches_out) {
         qualify_ok = true;
         Expression unqual = rewrite_inner_cols(sc, /*with_qualifier=*/false);
-        if (!qualify_ok ||
-            !SafeToReduceEvaluationCountWithSchema(unqual,
-                                                   inner_rels[0].schema)) {
+        if (!qualify_ok || !SafeToReduceEvaluationCountWithSchema(
+                               unqual, inner_rels[0].schema)) {
           sub_ok = false;
           break;
         }
@@ -4314,9 +4453,11 @@ bool RewriteCorrelatedPositiveCountOneSelect(
         bool r_in = false;
         ResolvedColRef lr;
         ResolvedColRef rr;
-        if (!resolve_scoped(
-                sc->AsBinaryExpression().Left()->AsColumnValue().GetColumnName(),
-                &l_in, &lr) ||
+        if (!resolve_scoped(sc->AsBinaryExpression()
+                                .Left()
+                                ->AsColumnValue()
+                                .GetColumnName(),
+                            &l_in, &lr) ||
             !resolve_scoped(sc->AsBinaryExpression()
                                 .Right()
                                 ->AsColumnValue()
@@ -4367,8 +4508,8 @@ bool RewriteCorrelatedPositiveCountOneSelect(
             .schema.GetColumn(corr_eqs[0].outer_ref.slot)
             .Name()
             .name);
-    inner_local_preds.push_back(UnaryExpressionExp(
-        ColumnValueExp(inner_key_cn), UnaryOperation::kIsNotNull));
+    inner_local_preds.push_back(UnaryExpressionExp(ColumnValueExp(inner_key_cn),
+                                                   UnaryOperation::kIsNotNull));
 
     auto in_sub = std::make_shared<SelectStatement>();
     SelectSource inner_src = sub.Sources()[0];
@@ -4381,9 +4522,9 @@ bool RewriteCorrelatedPositiveCountOneSelect(
     in_sub->SetWhereClause(CombineAndConjuncts(inner_local_preds));
     in_sub->SetSelectList({NamedExpression("", ColumnValueExp(inner_key_cn))});
 
-    out_conjs.push_back(QueryExpressionExp(
-        std::move(in_sub), ColumnValueExp(outer_key_cn),
-        /*exists=*/false, /*negated=*/false));
+    out_conjs.push_back(
+        QueryExpressionExp(std::move(in_sub), ColumnValueExp(outer_key_cn),
+                           /*exists=*/false, /*negated=*/false));
     changed = true;
   }
 
@@ -4403,8 +4544,7 @@ bool RewriteCorrelatedPositiveCountRecursive(  // NOLINT(misc-no-recursion)
   bool changed = false;
   for (const auto& [name, body] : stmt->WithQueries()) {
     if (!stmt->IsRecursiveWith(name) && body != nullptr) {
-      changed |=
-          RewriteCorrelatedPositiveCountRecursive(body.get(), ctes, ctx);
+      changed |= RewriteCorrelatedPositiveCountRecursive(body.get(), ctes, ctx);
     }
   }
   for (const SelectSource& src : stmt->Sources()) {
@@ -4425,8 +4565,7 @@ bool RewriteCorrelatedPositiveCountRecursive(  // NOLINT(misc-no-recursion)
     }
     for (const auto& br : tree->branches) {
       if (br != nullptr) {
-        changed |=
-            RewriteCorrelatedPositiveCountRecursive(br.get(), ctes, ctx);
+        changed |= RewriteCorrelatedPositiveCountRecursive(br.get(), ctes, ctx);
       }
     }
   }
@@ -4443,6 +4582,4376 @@ bool RewriteCorrelatedPositiveCountRecursive(  // NOLINT(misc-no-recursion)
 bool RewriteCorrelatedPositiveCountToInSubquery(SelectStatement* select,
                                                 TransactionContext& ctx) {
   return RewriteCorrelatedPositiveCountRecursive(select, {}, ctx);
+}
+
+namespace {
+
+bool IsCountDistinctSimpleCol(const Expression& expr,
+                              const std::vector<ResolvedBaseRel>& bases,
+                              Expression* out_arg) {
+  if (!expr || expr->Type() != TypeTag::kAggregateExp) {
+    return false;
+  }
+  const auto& agg = expr->AsAggregateExpression();
+  if (agg.GetType() != AggregationType::kCount || !agg.Distinct() ||
+      agg.HasWhereFilter() || agg.NeedsGroupContext() || !agg.Child() ||
+      agg.Child()->Type() != TypeTag::kColumnValue) {
+    return false;
+  }
+  const ColumnName& cn = agg.Child()->AsColumnValue().GetColumnName();
+  if (cn.name == "*") {
+    return false;
+  }
+  const auto resolved = ResolveColRef(cn, bases);
+  if (!resolved.has_value()) {
+    return false;
+  }
+  const Column& col = bases[resolved->rel_idx].schema.GetColumn(resolved->slot);
+  // Exclude DOUBLE (NaN breaks total order) and collated VARCHAR.
+  if (col.Type() != ValueType::kInt64 && col.Type() != ValueType::kDate) {
+    return false;
+  }
+  *out_arg = agg.Child();
+  return true;
+}
+
+bool AsInt64ConstLiteral(const Expression& expr, int64_t* out) {
+  if (!expr || expr->Type() != TypeTag::kConstantValue ||
+      dynamic_cast<const ParameterSlot*>(expr.get()) != nullptr) {
+    return false;
+  }
+  const Value& v = expr->AsConstantValue().GetValue();
+  if (v.IsNull() || v.type != ValueType::kInt64 || v.IsUnsigned()) {
+    return false;
+  }
+  *out = v.value.int_value;
+  return true;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (count_distinct_gt_one_iff_min_lt_max,
+//    count_distinct_eq_one_iff_min_eq_max)
+bool RewriteHavingCountDistinctOneSelect(
+    SelectStatement* stmt, const std::unordered_set<std::string>& ctes,
+    TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->Having() == nullptr || stmt->GroupBy().empty() ||
+      stmt->Sources().empty()) {
+    return false;
+  }
+  std::vector<ResolvedBaseRel> bases;
+  if (!ResolvePlainBaseSources(*stmt, ctes, ctx, &bases)) {
+    return false;
+  }
+  std::vector<Expression> conjs = SplitAndConjuncts(stmt->Having());
+  bool changed = false;
+  for (Expression& conj : conjs) {
+    if (!conj || conj->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& bin = conj->AsBinaryExpression();
+    Expression arg;
+    int64_t c = 0;
+    BinaryOperation op = bin.Op();
+    bool matched = false;
+    if (IsCountDistinctSimpleCol(bin.Left(), bases, &arg) &&
+        AsInt64ConstLiteral(bin.Right(), &c)) {
+      matched = true;
+    } else if (IsCountDistinctSimpleCol(bin.Right(), bases, &arg) &&
+               AsInt64ConstLiteral(bin.Left(), &c)) {
+      // Flip comparison so COUNT(DISTINCT x) is on the left.
+      switch (op) {
+        case BinaryOperation::kEquals:
+          break;
+        case BinaryOperation::kLessThan:
+          op = BinaryOperation::kGreaterThan;
+          break;
+        case BinaryOperation::kLessThanEquals:
+          op = BinaryOperation::kGreaterThanEquals;
+          break;
+        case BinaryOperation::kGreaterThan:
+          op = BinaryOperation::kLessThan;
+          break;
+        case BinaryOperation::kGreaterThanEquals:
+          op = BinaryOperation::kLessThanEquals;
+          break;
+        default:
+          continue;
+      }
+      matched = true;
+    }
+    if (!matched) {
+      continue;
+    }
+    const bool is_gt_one =
+        (op == BinaryOperation::kGreaterThan && c == 1) ||
+        (op == BinaryOperation::kGreaterThanEquals && c == 2);
+    const bool is_eq_one = (op == BinaryOperation::kEquals && c == 1);
+    if (!is_gt_one && !is_eq_one) {
+      continue;
+    }
+    Expression min_e =
+        AggregateExpressionExp(AggregationType::kMin, arg, false);
+    Expression max_e =
+        AggregateExpressionExp(AggregationType::kMax, arg, false);
+    conj = BinaryExpressionExp(
+        std::move(min_e),
+        is_gt_one ? BinaryOperation::kLessThan : BinaryOperation::kEquals,
+        std::move(max_e));
+    changed = true;
+  }
+  if (changed) {
+    stmt->SetHaving(CombineAndConjuncts(conjs));
+  }
+  return changed;
+}
+
+bool RewriteHavingCountDistinctRecursive(  // NOLINT(misc-no-recursion)
+    SelectStatement* stmt, std::unordered_set<std::string> ctes,
+    TransactionContext& ctx) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  CollectCteNamesInScope(*stmt, &ctes);
+  bool changed = false;
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    if (!stmt->IsRecursiveWith(name) && body != nullptr) {
+      changed |= RewriteHavingCountDistinctRecursive(body.get(), ctes, ctx);
+    }
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if (src.query != nullptr && !src.is_lateral) {
+      changed |=
+          RewriteHavingCountDistinctRecursive(src.query.get(), ctes, ctx);
+    }
+  }
+  for (const auto& br : stmt->UnionAll()) {
+    if (br != nullptr) {
+      changed |= RewriteHavingCountDistinctRecursive(br.get(), ctes, ctx);
+    }
+  }
+  if (const auto& tree = stmt->GetSetOperationTree(); tree != nullptr) {
+    if (tree->first != nullptr) {
+      changed |=
+          RewriteHavingCountDistinctRecursive(tree->first.get(), ctes, ctx);
+    }
+    for (const auto& br : tree->branches) {
+      if (br != nullptr) {
+        changed |= RewriteHavingCountDistinctRecursive(br.get(), ctes, ctx);
+      }
+    }
+  }
+  changed |= RewriteHavingCountDistinctOneSelect(stmt, ctes, ctx);
+  return changed;
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (count_distinct_gt_one_iff_min_lt_max,
+//    count_distinct_eq_one_iff_min_eq_max)
+bool RewriteHavingCountDistinctToMinMax(SelectStatement* select,
+                                        TransactionContext& ctx) {
+  return RewriteHavingCountDistinctRecursive(select, {}, ctx);
+}
+
+namespace {
+
+bool SamePlainBaseSourceList(const SelectStatement& a,
+                             const SelectStatement& b) {
+  if (a.Sources().size() != b.Sources().size() || a.Sources().empty()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.Sources().size(); ++i) {
+    const SelectSource& sa = a.Sources()[i];
+    const SelectSource& sb = b.Sources()[i];
+    if (sa.query != nullptr || sb.query != nullptr || sa.unnest != nullptr ||
+        sb.unnest != nullptr || sa.is_lateral || sb.is_lateral ||
+        sa.table.empty() || sb.table.empty() || sa.sample.has_value() ||
+        sb.sample.has_value() || !sa.using_columns.empty() ||
+        !sb.using_columns.empty() || sa.from_nested_join ||
+        sb.from_nested_join) {
+      return false;
+    }
+    if ((sa.join_type != JoinType::kCross &&
+         sa.join_type != JoinType::kInner) ||
+        (sb.join_type != JoinType::kCross &&
+         sb.join_type != JoinType::kInner)) {
+      return false;
+    }
+    if (!IdentifierEqualsCI(sa.table, sb.table) ||
+        !IdentifierEqualsCI(sa.alias, sb.alias)) {
+      return false;
+    }
+    if ((sa.join_condition == nullptr) != (sb.join_condition == nullptr)) {
+      return false;
+    }
+    if (sa.join_condition != nullptr &&
+        !ExprAstEquals(sa.join_condition, sb.join_condition)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsSimpleNonDistinctSum(const Expression& expr, Expression* out_child) {
+  if (!expr || expr->Type() != TypeTag::kAggregateExp) {
+    return false;
+  }
+  const auto& agg = expr->AsAggregateExpression();
+  if (agg.GetType() != AggregationType::kSum || agg.Distinct() ||
+      agg.HasWhereFilter() || agg.NeedsGroupContext() || !agg.Child()) {
+    return false;
+  }
+  *out_child = agg.Child();
+  return true;
+}
+
+// Replaces every `SUM(val)` (matching `target_val`) inside `expr` with
+// `replacement`, rejecting any other AggregateExpression or ColumnValue.
+bool ReplaceMatchingSumInScalarSubquery(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Expression& target_val,
+    const Expression& replacement, Expression* out, size_t* hit_count) {
+  if (!expr) {
+    return false;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kConstantValue:
+      if (dynamic_cast<const ParameterSlot*>(expr.get()) != nullptr) {
+        return false;
+      }
+      *out = expr;
+      return true;
+    case TypeTag::kAggregateExp: {
+      Expression child;
+      if (!IsSimpleNonDistinctSum(expr, &child) ||
+          !ExprAstEquals(child, target_val)) {
+        return false;
+      }
+      *out = replacement;
+      ++(*hit_count);
+      return true;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& b = expr->AsBinaryExpression();
+      Expression nl, nr;
+      if (!ReplaceMatchingSumInScalarSubquery(b.Left(), target_val, replacement,
+                                              &nl, hit_count) ||
+          !ReplaceMatchingSumInScalarSubquery(b.Right(), target_val,
+                                              replacement, &nr, hit_count)) {
+        return false;
+      }
+      *out = BinaryExpressionExp(std::move(nl), b.Op(), std::move(nr));
+      return true;
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& u = expr->AsUnaryExpression();
+      Expression nc;
+      if (!ReplaceMatchingSumInScalarSubquery(u.Child(), target_val,
+                                              replacement, &nc, hit_count)) {
+        return false;
+      }
+      *out = UnaryExpressionExp(std::move(nc), u.Op());
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+// Rewrites expressions in outer HAVING by replacing `SUM(target_val)` with
+// `grp_sum_col` and the matched scalar subquery with `new_subquery`.
+bool RewriteFubiniHavingExpr(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Expression& target_val,
+    const Expression& grp_sum_col, const SelectStatement* target_sub,
+    const Expression& new_subquery, Expression* out, bool* sub_replaced) {
+  if (!expr) {
+    return false;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kConstantValue:
+      *out = expr;
+      return true;
+    case TypeTag::kAggregateExp: {
+      Expression child;
+      if (!IsSimpleNonDistinctSum(expr, &child) ||
+          !ExprAstEquals(child, target_val)) {
+        return false;
+      }
+      *out = grp_sum_col;
+      return true;
+    }
+    case TypeTag::kQueryExp: {
+      const auto& sq = expr->AsQueryExpression();
+      if (!sq.Exists() && !sq.Test() && sq.Query().get() == target_sub) {
+        *out = new_subquery;
+        *sub_replaced = true;
+        return true;
+      }
+      return false;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& b = expr->AsBinaryExpression();
+      Expression nl, nr;
+      if (!RewriteFubiniHavingExpr(b.Left(), target_val, grp_sum_col,
+                                   target_sub, new_subquery, &nl,
+                                   sub_replaced) ||
+          !RewriteFubiniHavingExpr(b.Right(), target_val, grp_sum_col,
+                                   target_sub, new_subquery, &nr,
+                                   sub_replaced)) {
+        return false;
+      }
+      *out = BinaryExpressionExp(std::move(nl), b.Op(), std::move(nr));
+      return true;
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& u = expr->AsUnaryExpression();
+      Expression nc;
+      if (!RewriteFubiniHavingExpr(u.Child(), target_val, grp_sum_col,
+                                   target_sub, new_subquery, &nc,
+                                   sub_replaced)) {
+        return false;
+      }
+      *out = UnaryExpressionExp(std::move(nc), u.Op());
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+void FindFirstScalarSubquery(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const SelectStatement** out) {
+  if (!expr || *out != nullptr) {
+    return;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kQueryExp: {
+      const auto& sq = expr->AsQueryExpression();
+      if (!sq.Exists() && !sq.Test() && sq.Query() != nullptr) {
+        *out = sq.Query().get();
+      }
+      return;
+    }
+    case TypeTag::kBinaryExp:
+      FindFirstScalarSubquery(expr->AsBinaryExpression().Left(), out);
+      FindFirstScalarSubquery(expr->AsBinaryExpression().Right(), out);
+      return;
+    case TypeTag::kUnaryExp:
+      FindFirstScalarSubquery(expr->AsUnaryExpression().Child(), out);
+      return;
+    default:
+      return;
+  }
+}
+
+// Rewrites ColumnValue references using a name map (for self-join CTE).
+bool RemapColumnsInExpr(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const std::vector<ResolvedBaseRel>& rels,
+    const std::string& cte_alias,
+    const std::vector<std::pair<ResolvedColRef, std::string>>& col_map,
+    Expression* out) {
+  if (!expr) {
+    *out = nullptr;
+    return true;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kConstantValue:
+      *out = expr;
+      return true;
+    case TypeTag::kColumnValue: {
+      const auto ref =
+          ResolveColRef(expr->AsColumnValue().GetColumnName(), rels);
+      if (!ref.has_value()) {
+        return false;
+      }
+      for (const auto& [k, mapped] : col_map) {
+        if (k == *ref) {
+          *out = ColumnValueExp(ColumnName(cte_alias, mapped));
+          return true;
+        }
+      }
+      return false;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& b = expr->AsBinaryExpression();
+      Expression nl, nr;
+      if (!RemapColumnsInExpr(b.Left(), rels, cte_alias, col_map, &nl) ||
+          !RemapColumnsInExpr(b.Right(), rels, cte_alias, col_map, &nr)) {
+        return false;
+      }
+      *out = BinaryExpressionExp(std::move(nl), b.Op(), std::move(nr));
+      return true;
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& u = expr->AsUnaryExpression();
+      Expression nc;
+      if (!RemapColumnsInExpr(u.Child(), rels, cte_alias, col_map, &nc)) {
+        return false;
+      }
+      *out = UnaryExpressionExp(std::move(nc), u.Op());
+      return true;
+    }
+    case TypeTag::kAggregateExp: {
+      const auto& a = expr->AsAggregateExpression();
+      if (a.HasWhereFilter() || a.NeedsGroupContext()) {
+        return false;
+      }
+      Expression nc;
+      if (a.Child() != nullptr &&
+          !RemapColumnsInExpr(a.Child(), rels, cte_alias, col_map, &nc)) {
+        return false;
+      }
+      *out = AggregateExpressionExp(a.GetType(), std::move(nc), a.Distinct());
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+void CollectResolvedColsInExpr(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const std::vector<ResolvedBaseRel>& rels,
+    std::vector<ResolvedColRef>* out, bool* ok) {
+  if (!expr || !*ok) {
+    return;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kConstantValue:
+      return;
+    case TypeTag::kColumnValue: {
+      const auto ref =
+          ResolveColRef(expr->AsColumnValue().GetColumnName(), rels);
+      if (!ref.has_value()) {
+        *ok = false;
+        return;
+      }
+      if (std::ranges::find(*out, *ref) == out->end()) {
+        out->push_back(*ref);
+      }
+      return;
+    }
+    case TypeTag::kBinaryExp:
+      CollectResolvedColsInExpr(expr->AsBinaryExpression().Left(), rels, out,
+                                ok);
+      CollectResolvedColsInExpr(expr->AsBinaryExpression().Right(), rels, out,
+                                ok);
+      return;
+    case TypeTag::kUnaryExp:
+      CollectResolvedColsInExpr(expr->AsUnaryExpression().Child(), rels, out,
+                                ok);
+      return;
+    case TypeTag::kAggregateExp: {
+      const auto& a = expr->AsAggregateExpression();
+      if (a.HasWhereFilter() || a.NeedsGroupContext()) {
+        *ok = false;
+        return;
+      }
+      CollectResolvedColsInExpr(a.Child(), rels, out, ok);
+      return;
+    }
+    default:
+      *ok = false;
+      return;
+  }
+}
+
+bool RewriteSubqueryAggArgToCteCol(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const std::string& sub_alias,
+    const std::string& sub_table, const std::string& cte_agg_col_name,
+    slot_t* out_fact_slot, const Schema& fact_schema, Expression* out,
+    size_t* agg_hits) {
+  if (!expr) {
+    return false;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kConstantValue:
+      if (dynamic_cast<const ParameterSlot*>(expr.get()) != nullptr) {
+        return false;
+      }
+      *out = expr;
+      return true;
+    case TypeTag::kAggregateExp: {
+      const auto& a = expr->AsAggregateExpression();
+      if ((a.GetType() != AggregationType::kAvg &&
+           a.GetType() != AggregationType::kSum &&
+           a.GetType() != AggregationType::kMin &&
+           a.GetType() != AggregationType::kMax) ||
+          a.Distinct() || a.HasWhereFilter() || a.NeedsGroupContext() ||
+          !a.Child() || a.Child()->Type() != TypeTag::kColumnValue) {
+        return false;
+      }
+      const ColumnName& cn = a.Child()->AsColumnValue().GetColumnName();
+      if (!cn.schema.empty() && !IdentifierEqualsCI(cn.schema, sub_alias) &&
+          !IdentifierEqualsCI(cn.schema, sub_table)) {
+        return false;
+      }
+      const auto slot = FindColInSchema(fact_schema, cn.name);
+      if (!slot.has_value()) {
+        return false;
+      }
+      if (*agg_hits > 0 && *out_fact_slot != *slot) {
+        return false;
+      }
+      *out_fact_slot = *slot;
+      ++(*agg_hits);
+      *out = AggregateExpressionExp(
+          a.GetType(), ColumnValueExp(ColumnName(cte_agg_col_name)), false);
+      return true;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& b = expr->AsBinaryExpression();
+      Expression nl, nr;
+      if (!RewriteSubqueryAggArgToCteCol(b.Left(), sub_alias, sub_table,
+                                         cte_agg_col_name, out_fact_slot,
+                                         fact_schema, &nl, agg_hits) ||
+          !RewriteSubqueryAggArgToCteCol(b.Right(), sub_alias, sub_table,
+                                         cte_agg_col_name, out_fact_slot,
+                                         fact_schema, &nr, agg_hits)) {
+        return false;
+      }
+      *out = BinaryExpressionExp(std::move(nl), b.Op(), std::move(nr));
+      return true;
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& u = expr->AsUnaryExpression();
+      Expression nc;
+      if (!RewriteSubqueryAggArgToCteCol(u.Child(), sub_alias, sub_table,
+                                         cte_agg_col_name, out_fact_slot,
+                                         fact_schema, &nc, agg_hits)) {
+        return false;
+      }
+      *out = UnaryExpressionExp(std::move(nc), u.Op());
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+//   (grouped_having_global_sum_fubini_sound,
+//    grouped_having_distinct_sum_fubini_bug)
+bool RewriteHavingGlobalSumFubini(SelectStatement* stmt,
+                                  TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->Having() == nullptr || stmt->GroupBy().empty() ||
+      !stmt->WithQueries().empty() || stmt->Distinct() || stmt->HasLimit() ||
+      stmt->Offset() != 0 || !stmt->UnionAll().empty() ||
+      stmt->GetSetOperationTree() != nullptr || stmt->SelectList().empty() ||
+      SelectListHasStarItem(*stmt)) {
+    return false;
+  }
+  std::vector<ResolvedBaseRel> rels;
+  if (!ResolvePlainBaseSources(*stmt, {}, ctx, &rels)) {
+    return false;
+  }
+  const SelectStatement* sub = nullptr;
+  FindFirstScalarSubquery(stmt->Having(), &sub);
+  if (sub == nullptr || !sub->GroupBy().empty() || sub->Having() != nullptr ||
+      sub->Distinct() || sub->HasLimit() || sub->Offset() != 0 ||
+      !sub->WithQueries().empty() || !sub->UnionAll().empty() ||
+      sub->GetSetOperationTree() != nullptr || sub->SelectList().size() != 1) {
+    return false;
+  }
+  if (!SamePlainBaseSourceList(*stmt, *sub)) {
+    return false;
+  }
+  if ((stmt->WhereClause() == nullptr) != (sub->WhereClause() == nullptr)) {
+    return false;
+  }
+  if (stmt->WhereClause() != nullptr &&
+      !ExprAstEquals(stmt->WhereClause(), sub->WhereClause())) {
+    return false;
+  }
+  // If HAVING is already a direct `SUM(e) <cmp> (SELECT SUM(e) * factor ...)`
+  // (where SUM(e) is in SELECT), executor/relational.cpp's single-pass
+  // post_having.is_self_sum_factor computes the grand total and filters
+  // groups inline without materializing a CTE.
+  if (stmt->Having()->Type() == TypeTag::kBinaryExp) {
+    const auto& hbin = stmt->Having()->AsBinaryExpression();
+    if (IsComparison(hbin.Op()) && hbin.Left() && hbin.Right() &&
+        hbin.Left()->Type() == TypeTag::kAggregateExp &&
+        hbin.Right()->Type() == TypeTag::kQueryExp &&
+        hbin.Right()->AsQueryExpression().Query().get() == sub) {
+      const Expression& se = sub->SelectList()[0].expression;
+      if (se && se->Type() == TypeTag::kBinaryExp &&
+          se->AsBinaryExpression().Op() == BinaryOperation::kMultiply) {
+        const auto& mbin = se->AsBinaryExpression();
+        const bool is_sum_times_const =
+            (mbin.Left() && mbin.Right() &&
+             ((ExprAstEquals(mbin.Left(), hbin.Left()) &&
+               mbin.Right()->Type() == TypeTag::kConstantValue) ||
+              (ExprAstEquals(mbin.Right(), hbin.Left()) &&
+               mbin.Left()->Type() == TypeTag::kConstantValue)));
+        if (is_sum_times_const) {
+          for (const auto& si : stmt->SelectList()) {
+            if (si.expression && ExprAstEquals(si.expression, hbin.Left())) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+  }
+  // Find a non-DISTINCT, non-filtered SUM(val) in stmt->SelectList() that also
+  // appears in sub->SelectList()[0].
+  const std::string cte_name = "__tpch_fubini_grp";
+  for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+    Expression sum_val;
+    if (!IsSimpleNonDistinctSum(stmt->SelectList()[i].expression, &sum_val)) {
+      continue;
+    }
+    const std::string sum_col_name = OutputColumnNameAt(*stmt, i);
+    if (sum_col_name.empty()) {
+      continue;
+    }
+    // Check all select list items have unique non-empty output names.
+    std::vector<std::string> out_names;
+    out_names.reserve(stmt->SelectList().size());
+    std::unordered_set<std::string> seen;
+    bool names_ok = true;
+    for (size_t j = 0; j < stmt->SelectList().size(); ++j) {
+      const std::string nm = OutputColumnNameAt(*stmt, j);
+      if (nm.empty() || !seen.insert(AsciiLower(nm)).second) {
+        names_ok = false;
+        break;
+      }
+      out_names.push_back(nm);
+    }
+    if (!names_ok) {
+      return false;
+    }
+    // Verify sub->SelectList()[0] is a pure function of SUM(sum_val).
+    Expression rewritten_sub_expr;
+    size_t hits = 0;
+    const Expression cte_sum_agg = AggregateExpressionExp(
+        AggregationType::kSum,
+        ColumnValueExp(ColumnName(cte_name, sum_col_name)), false);
+    if (!ReplaceMatchingSumInScalarSubquery(sub->SelectList()[0].expression,
+                                            sum_val, cte_sum_agg,
+                                            &rewritten_sub_expr, &hits) ||
+        hits == 0) {
+      continue;
+    }
+    auto new_sub_stmt = std::make_shared<SelectStatement>();
+    new_sub_stmt->SetSources(
+        {SelectSource(cte_name, "", nullptr, JoinType::kCross, nullptr)});
+    new_sub_stmt->SetSelectList(
+        {NamedExpression("__fubini_total", std::move(rewritten_sub_expr))});
+    const Expression new_sub_expr = std::make_shared<QueryExpression>(
+        std::move(new_sub_stmt), nullptr, false, false);
+
+    Expression new_where;
+    bool sub_replaced = false;
+    const Expression grp_col_ref =
+        ColumnValueExp(ColumnName(cte_name, sum_col_name));
+    if (!RewriteFubiniHavingExpr(stmt->Having(), sum_val, grp_col_ref, sub,
+                                 new_sub_expr, &new_where, &sub_replaced) ||
+        !sub_replaced) {
+      continue;
+    }
+
+    // Build CTE body = original grouped query without HAVING and ORDER BY.
+    auto cte_body = std::make_shared<SelectStatement>(*stmt);
+    cte_body->SetHaving(nullptr);
+    cte_body->SetOrderBy({});
+
+    SelectStatement outer;
+    outer.AddWithQuery(cte_name, std::move(cte_body));
+    outer.SetSources(
+        {SelectSource(cte_name, "", nullptr, JoinType::kCross, nullptr)});
+    std::vector<NamedExpression> outer_sel;
+    outer_sel.reserve(out_names.size());
+    for (const std::string& nm : out_names) {
+      outer_sel.emplace_back(nm, ColumnValueExp(ColumnName(cte_name, nm)));
+    }
+    outer.SetSelectList(std::move(outer_sel));
+    outer.SetWhereClause(std::move(new_where));
+    outer.SetOrderBy(stmt->OrderBy());
+    *stmt = std::move(outer);
+    return true;
+  }
+  return false;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (self_join_unique_dim_cte_decorrelate_sound)
+bool RewriteSelfJoinUniqueDimCorrelatedAgg(SelectStatement* stmt,
+                                           TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->Sources().size() != 2 ||
+      !stmt->WithQueries().empty() || stmt->WhereClause() == nullptr ||
+      !stmt->GroupBy().empty() || stmt->Having() != nullptr ||
+      stmt->Distinct() || stmt->HasLimit() || stmt->Offset() != 0 ||
+      !stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr ||
+      stmt->SelectList().empty() || SelectListHasStarItem(*stmt)) {
+    return false;
+  }
+  for (const SelectSource& s : stmt->Sources()) {
+    if (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner) {
+      return false;
+    }
+    if (s.join_condition != nullptr) {
+      return false;
+    }
+  }
+  std::vector<ResolvedBaseRel> rels;
+  if (!ResolvePlainBaseSources(*stmt, {}, ctx, &rels) || rels.size() != 2) {
+    return false;
+  }
+  const std::vector<Expression> conjs = SplitAndConjuncts(stmt->WhereClause());
+
+  // Locate the single correlated scalar subquery comparison conjunct.
+  std::optional<size_t> sub_conj_idx;
+  for (size_t ci = 0; ci < conjs.size(); ++ci) {
+    if (!conjs[ci] || conjs[ci]->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& bin = conjs[ci]->AsBinaryExpression();
+    const bool left_sq = bin.Left() && bin.Left()->Type() == TypeTag::kQueryExp;
+    const bool right_sq =
+        bin.Right() && bin.Right()->Type() == TypeTag::kQueryExp;
+    if (left_sq != right_sq) {
+      if (sub_conj_idx.has_value()) {
+        return false;
+      }
+      sub_conj_idx = ci;
+    }
+  }
+  if (!sub_conj_idx.has_value()) {
+    return false;
+  }
+
+  const auto& sub_bin = conjs[*sub_conj_idx]->AsBinaryExpression();
+  if (!IsStrictNullRejectingCompareOp(sub_bin.Op())) {
+    return false;
+  }
+  const bool sq_on_right = sub_bin.Right()->Type() == TypeTag::kQueryExp;
+  const Expression& lhs_expr = sq_on_right ? sub_bin.Left() : sub_bin.Right();
+  const auto& sq_node =
+      (sq_on_right ? sub_bin.Right() : sub_bin.Left())->AsQueryExpression();
+  if (sq_node.Exists() || sq_node.Test() || sq_node.Query() == nullptr) {
+    return false;
+  }
+  const SelectStatement& sub = *sq_node.Query();
+  if (sub.Sources().size() != 1 || sub.Sources()[0].query != nullptr ||
+      sub.Sources()[0].table.empty() || !sub.GroupBy().empty() ||
+      sub.Having() != nullptr || sub.Distinct() || sub.HasLimit() ||
+      sub.Offset() != 0 || !sub.WithQueries().empty() ||
+      !sub.UnionAll().empty() || sub.GetSetOperationTree() != nullptr ||
+      sub.SelectList().size() != 1 || sub.WhereClause() == nullptr) {
+    return false;
+  }
+
+  // Determine which outer relation is the fact table `F` (same table as sub)
+  // and which is the unique dimension `D`.
+  size_t fact_idx = 2;
+  for (size_t i = 0; i < 2; ++i) {
+    if (IdentifierEqualsCI(rels[i].table_name, sub.Sources()[0].table)) {
+      fact_idx = i;
+      break;
+    }
+  }
+  if (fact_idx >= 2) {
+    return false;
+  }
+  const size_t dim_idx = 1 - fact_idx;
+
+  // Verify outer equijoin F.fk = D.pk and D.pk is certified UNIQUE NOT NULL,
+  // and no other predicates touch F (all other conjuncts touch only D).
+  std::optional<slot_t> fact_fk_slot;
+  std::optional<slot_t> dim_pk_slot;
+  std::vector<Expression> base_where_conjs;
+  for (size_t ci = 0; ci < conjs.size(); ++ci) {
+    if (ci == *sub_conj_idx) {
+      continue;
+    }
+    const Expression& c = conjs[ci];
+    std::unordered_set<size_t> touched;
+    if (!CollectResolvedExprRelations(c, rels, &touched)) {
+      return false;
+    }
+    if (touched.size() == 1 && touched.contains(dim_idx)) {
+      base_where_conjs.push_back(c);
+      continue;
+    }
+    if (touched.size() == 2 && c->Type() == TypeTag::kBinaryExp &&
+        c->AsBinaryExpression().Op() == BinaryOperation::kEquals &&
+        c->AsBinaryExpression().Left()->Type() == TypeTag::kColumnValue &&
+        c->AsBinaryExpression().Right()->Type() == TypeTag::kColumnValue) {
+      const auto r1 = ResolveColRef(
+          c->AsBinaryExpression().Left()->AsColumnValue().GetColumnName(),
+          rels);
+      const auto r2 = ResolveColRef(
+          c->AsBinaryExpression().Right()->AsColumnValue().GetColumnName(),
+          rels);
+      if (!r1.has_value() || !r2.has_value()) {
+        return false;
+      }
+      if (r1->rel_idx == fact_idx && r2->rel_idx == dim_idx) {
+        fact_fk_slot = r1->slot;
+        dim_pk_slot = r2->slot;
+        base_where_conjs.push_back(c);
+        continue;
+      }
+      if (r2->rel_idx == fact_idx && r1->rel_idx == dim_idx) {
+        fact_fk_slot = r2->slot;
+        dim_pk_slot = r1->slot;
+        base_where_conjs.push_back(c);
+        continue;
+      }
+    }
+    // Any other predicate touching F disqualifies (would filter B vs F2).
+    return false;
+  }
+  if (!fact_fk_slot.has_value() || !dim_pk_slot.has_value()) {
+    return false;
+  }
+  if (!IsColumnCertifiedUniqueNotNull(*rels[dim_idx].table, *dim_pk_slot,
+                                      ctx)) {
+    return false;
+  }
+
+  // Verify subquery WHERE is ONLY `F2.fk = D.pk` (matching fact_fk_slot &
+  // dim_pk_slot).
+  const std::vector<Expression> sub_conjs =
+      SplitAndConjuncts(sub.WhereClause());
+  if (sub_conjs.size() != 1 || !sub_conjs[0] ||
+      sub_conjs[0]->Type() != TypeTag::kBinaryExp ||
+      sub_conjs[0]->AsBinaryExpression().Op() != BinaryOperation::kEquals ||
+      sub_conjs[0]->AsBinaryExpression().Left()->Type() !=
+          TypeTag::kColumnValue ||
+      sub_conjs[0]->AsBinaryExpression().Right()->Type() !=
+          TypeTag::kColumnValue) {
+    return false;
+  }
+  const ColumnName& s_l = sub_conjs[0]
+                              ->AsBinaryExpression()
+                              .Left()
+                              ->AsColumnValue()
+                              .GetColumnName();
+  const ColumnName& s_r = sub_conjs[0]
+                              ->AsBinaryExpression()
+                              .Right()
+                              ->AsColumnValue()
+                              .GetColumnName();
+  const std::string sub_alias = sub.Sources()[0].alias.empty()
+                                    ? sub.Sources()[0].table
+                                    : sub.Sources()[0].alias;
+  auto matches_sub_fk = [&](const ColumnName& cn) {
+    if (!cn.schema.empty() && !IdentifierEqualsCI(cn.schema, sub_alias) &&
+        !IdentifierEqualsCI(cn.schema, sub.Sources()[0].table)) {
+      return false;
+    }
+    const auto s = FindColInSchema(rels[fact_idx].schema, cn.name);
+    return s.has_value() && *s == *fact_fk_slot;
+  };
+  auto matches_outer_pk = [&](const ColumnName& cn) {
+    const auto r = ResolveColRef(cn, rels);
+    return r.has_value() && r->rel_idx == dim_idx && r->slot == *dim_pk_slot;
+  };
+  if (!((matches_sub_fk(s_l) && matches_outer_pk(s_r)) ||
+        (matches_sub_fk(s_r) && matches_outer_pk(s_l)))) {
+    return false;
+  }
+
+  // Rewrite subquery SELECT expression to read from CTE column `__c_agg`.
+  slot_t agg_fact_slot = 0;
+  size_t agg_hits = 0;
+  Expression rewritten_agg_expr;
+  const std::string cte_agg_col = "__self_agg_arg";
+  if (!RewriteSubqueryAggArgToCteCol(sub.SelectList()[0].expression, sub_alias,
+                                     sub.Sources()[0].table, cte_agg_col,
+                                     &agg_fact_slot, rels[fact_idx].schema,
+                                     &rewritten_agg_expr, &agg_hits) ||
+      agg_hits == 0) {
+    return false;
+  }
+
+  // Collect all outer columns needed in the CTE.
+  std::vector<ResolvedColRef> needed_cols;
+  needed_cols.push_back(ResolvedColRef{fact_idx, *fact_fk_slot});
+  const ResolvedColRef agg_ref{fact_idx, agg_fact_slot};
+  if (std::ranges::find(needed_cols, agg_ref) == needed_cols.end()) {
+    needed_cols.push_back(agg_ref);
+  }
+  bool cols_ok = true;
+  CollectResolvedColsInExpr(lhs_expr, rels, &needed_cols, &cols_ok);
+  for (const NamedExpression& item : stmt->SelectList()) {
+    CollectResolvedColsInExpr(item.expression, rels, &needed_cols, &cols_ok);
+  }
+  if (!cols_ok) {
+    return false;
+  }
+
+  // Build CTE projection & column name map.
+  const std::string cte_name = "__tpch_self_base";
+  const std::string base_alias = "__b";
+  const std::string grp_alias = "__g";
+  const std::string fk_col_name = "__self_fk";
+  const std::string agg_out_name = "__self_agg_val";
+
+  std::vector<std::pair<ResolvedColRef, std::string>> col_map;
+  std::vector<NamedExpression> cte_sel;
+  for (size_t i = 0; i < needed_cols.size(); ++i) {
+    const ResolvedColRef& ref = needed_cols[i];
+    std::string mapped;
+    if (ref.rel_idx == fact_idx && ref.slot == *fact_fk_slot) {
+      mapped = fk_col_name;
+    } else if (ref.rel_idx == fact_idx && ref.slot == agg_fact_slot) {
+      mapped = cte_agg_col;
+    } else {
+      mapped = "__self_c" + std::to_string(i);
+    }
+    col_map.emplace_back(ref, mapped);
+    const std::string orig_col =
+        rels[ref.rel_idx].schema.GetColumn(ref.slot).Name().name;
+    cte_sel.emplace_back(mapped, ColumnValueExp(ColumnName(
+                                     rels[ref.rel_idx].qualifier, orig_col)));
+  }
+  // If fact_fk_slot == agg_fact_slot, add a second alias for cte_agg_col.
+  if (*fact_fk_slot == agg_fact_slot) {
+    const std::string orig_col =
+        rels[fact_idx].schema.GetColumn(*fact_fk_slot).Name().name;
+    cte_sel.emplace_back(cte_agg_col, ColumnValueExp(ColumnName(
+                                          rels[fact_idx].qualifier, orig_col)));
+  }
+
+  auto cte_body = std::make_shared<SelectStatement>();
+  cte_body->SetSources(stmt->Sources());
+  cte_body->SetSelectList(std::move(cte_sel));
+  cte_body->SetWhereClause(CombineAndConjuncts(base_where_conjs));
+
+  // Build grouped derived table over CTE.
+  auto grp_query = std::make_shared<SelectStatement>();
+  grp_query->SetSources(
+      {SelectSource(cte_name, "", nullptr, JoinType::kCross, nullptr)});
+  grp_query->SetSelectList(
+      {NamedExpression(fk_col_name, ColumnValueExp(ColumnName(fk_col_name))),
+       NamedExpression(agg_out_name, std::move(rewritten_agg_expr))});
+  grp_query->SetGroupBy({ColumnValueExp(ColumnName(fk_col_name))});
+
+  // Remap outer lhs_expr & SELECT list to `__b.<mapped>`.
+  Expression new_lhs;
+  if (!RemapColumnsInExpr(lhs_expr, rels, base_alias, col_map, &new_lhs)) {
+    return false;
+  }
+  std::vector<NamedExpression> new_outer_sel;
+  new_outer_sel.reserve(stmt->SelectList().size());
+  for (const NamedExpression& item : stmt->SelectList()) {
+    Expression ne;
+    if (!RemapColumnsInExpr(item.expression, rels, base_alias, col_map, &ne)) {
+      return false;
+    }
+    new_outer_sel.emplace_back(item.name, std::move(ne));
+  }
+
+  const Expression grp_val_ref =
+      ColumnValueExp(ColumnName(grp_alias, agg_out_name));
+  const Expression cmp_expr =
+      sq_on_right
+          ? BinaryExpressionExp(std::move(new_lhs), sub_bin.Op(), grp_val_ref)
+          : BinaryExpressionExp(grp_val_ref, sub_bin.Op(), std::move(new_lhs));
+  const Expression join_eq =
+      BinaryExpressionExp(ColumnValueExp(ColumnName(base_alias, fk_col_name)),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName(grp_alias, fk_col_name)));
+
+  SelectStatement outer;
+  outer.AddWithQuery(cte_name, std::move(cte_body));
+  outer.SetSources(
+      {SelectSource(cte_name, base_alias, nullptr, JoinType::kCross, nullptr),
+       SelectSource("", grp_alias, std::move(grp_query), JoinType::kInner,
+                    join_eq)});
+  outer.SetSelectList(std::move(new_outer_sel));
+  outer.SetWhereClause(cmp_expr);
+  outer.SetOrderBy(stmt->OrderBy());
+  *stmt = std::move(outer);
+  return true;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (semijoin_domain_pushdown_in_subquery_sound)
+bool RewritePushOuterSemiJoinDomainIntoInSubquery(SelectStatement* stmt,
+                                                  TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->WhereClause() == nullptr ||
+      !stmt->WithQueries().empty() || !stmt->GroupBy().empty() ||
+      stmt->Having() != nullptr || stmt->Distinct() || stmt->HasLimit() ||
+      stmt->Offset() != 0 || !stmt->UnionAll().empty() ||
+      stmt->GetSetOperationTree() != nullptr || stmt->SelectList().empty() ||
+      SelectListHasStarItem(*stmt)) {
+    return false;
+  }
+  std::vector<ResolvedBaseRel> rels;
+  if (!ResolvePlainBaseSources(*stmt, {}, ctx, &rels)) {
+    return false;
+  }
+  std::vector<Expression> conjs = SplitAndConjuncts(stmt->WhereClause());
+  if (conjs.size() < 2) {
+    return false;
+  }
+  size_t in_idx = conjs.size();
+  for (size_t i = 0; i < conjs.size(); ++i) {
+    const Expression& c = conjs[i];
+    if (!c || c->Type() != TypeTag::kQueryExp) {
+      continue;
+    }
+    const auto& qe = c->AsQueryExpression();
+    if (!qe.Test() || qe.Exists() || qe.Negated() || qe.ArrayResult() ||
+        qe.Mode() != QuantifierMode::kIn || qe.Query() == nullptr) {
+      continue;
+    }
+    const SelectStatement& sub = *qe.Query();
+    if (sub.SelectList().size() != 1 || !sub.SelectList()[0].expression ||
+        sub.SelectList()[0].expression->Type() != TypeTag::kColumnValue ||
+        !sub.GroupBy().empty() || sub.Having() != nullptr || sub.HasLimit() ||
+        sub.Offset() != 0 || !sub.WithQueries().empty() ||
+        !sub.UnionAll().empty() || sub.GetSetOperationTree() != nullptr) {
+      continue;
+    }
+    const bool heavy_sub =
+        sub.Sources().size() >= 2 ||
+        (sub.WhereClause() != nullptr &&
+         ExprHasParamOrSubqueryOrVolatile(sub.WhereClause()));
+    if (!heavy_sub) {
+      continue;
+    }
+    if (in_idx != conjs.size()) {
+      return false;
+    }
+    in_idx = i;
+  }
+  if (in_idx == conjs.size()) {
+    return false;
+  }
+
+  std::vector<Expression> other_conjs;
+  other_conjs.reserve(conjs.size() - 1);
+  for (size_t i = 0; i < conjs.size(); ++i) {
+    if (i == in_idx) {
+      continue;
+    }
+    if (!conjs[i] || ExprHasParamOrSubqueryOrVolatile(conjs[i])) {
+      return false;
+    }
+    other_conjs.push_back(conjs[i]);
+  }
+  if (other_conjs.empty()) {
+    return false;
+  }
+
+  const auto& qe = conjs[in_idx]->AsQueryExpression();
+  if (qe.Test()->Type() != TypeTag::kColumnValue) {
+    return false;
+  }
+  const auto key_ref =
+      ResolveColRef(qe.Test()->AsColumnValue().GetColumnName(), rels);
+  if (!key_ref.has_value()) {
+    return false;
+  }
+
+  std::vector<ResolvedColRef> needed_cols;
+  needed_cols.push_back(*key_ref);
+  bool cols_ok = true;
+  for (const NamedExpression& item : stmt->SelectList()) {
+    CollectResolvedColsInExpr(item.expression, rels, &needed_cols, &cols_ok);
+  }
+  std::unordered_set<std::string> select_aliases;
+  for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+    const std::string out_nm = OutputColumnNameAt(*stmt, i);
+    if (!out_nm.empty()) {
+      select_aliases.insert(AsciiLower(out_nm));
+    }
+  }
+  for (const auto& term : stmt->OrderBy()) {
+    if (!term.expression) {
+      return false;
+    }
+    if (term.expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& cn = term.expression->AsColumnValue().GetColumnName();
+      if (cn.schema.empty() && select_aliases.contains(AsciiLower(cn.name))) {
+        continue;
+      }
+    }
+    CollectResolvedColsInExpr(term.expression, rels, &needed_cols, &cols_ok);
+  }
+  if (!cols_ok) {
+    return false;
+  }
+
+  const std::string cte_name = "__tpch_outer_dom";
+  const std::string dom_alias = "__d";
+  const std::string dom_key_col = "__dom_key";
+
+  std::vector<std::pair<ResolvedColRef, std::string>> col_map;
+  std::vector<NamedExpression> cte_sel;
+  for (size_t i = 0; i < needed_cols.size(); ++i) {
+    const ResolvedColRef& ref = needed_cols[i];
+    const std::string mapped =
+        (ref == *key_ref) ? dom_key_col : ("__dom_c" + std::to_string(i));
+    col_map.emplace_back(ref, mapped);
+    const std::string orig_col =
+        rels[ref.rel_idx].schema.GetColumn(ref.slot).Name().name;
+    cte_sel.emplace_back(mapped, ColumnValueExp(ColumnName(
+                                     rels[ref.rel_idx].qualifier, orig_col)));
+  }
+
+  auto cte_body = std::make_shared<SelectStatement>();
+  cte_body->SetSources(stmt->Sources());
+  cte_body->SetSelectList(std::move(cte_sel));
+  cte_body->SetWhereClause(CombineAndConjuncts(other_conjs));
+
+  auto make_dom_in = [&](Expression target_col) -> Expression {
+    auto dom_q = std::make_shared<SelectStatement>();
+    dom_q->SetSources(
+        {SelectSource(cte_name, "", nullptr, JoinType::kCross, nullptr)});
+    dom_q->SetSelectList(
+        {NamedExpression("", ColumnValueExp(ColumnName(dom_key_col)))});
+    return QueryExpressionExp(std::move(dom_q), std::move(target_col),
+                              /*exists=*/false, /*negated=*/false);
+  };
+
+  auto new_sub = std::make_shared<SelectStatement>(*qe.Query());
+  const Expression r_key_expr = new_sub->SelectList()[0].expression;
+
+  std::vector<Expression> sub_conjs;
+  if (new_sub->WhereClause() != nullptr) {
+    sub_conjs = SplitAndConjuncts(new_sub->WhereClause());
+  }
+  sub_conjs.push_back(make_dom_in(r_key_expr));
+  new_sub->SetWhereClause(CombineAndConjuncts(sub_conjs));
+
+  std::vector<NamedExpression> new_outer_sel;
+  new_outer_sel.reserve(stmt->SelectList().size());
+  for (size_t i = 0; i < stmt->SelectList().size(); ++i) {
+    const NamedExpression& item = stmt->SelectList()[i];
+    Expression ne;
+    if (!RemapColumnsInExpr(item.expression, rels, dom_alias, col_map, &ne)) {
+      return false;
+    }
+    std::string out_alias = item.name;
+    if (out_alias.empty()) {
+      out_alias = OutputColumnNameAt(*stmt, i);
+    }
+    new_outer_sel.emplace_back(std::move(out_alias), std::move(ne));
+  }
+  std::vector<SelectStatement::OrderByTerm> new_order_by;
+  new_order_by.reserve(stmt->OrderBy().size());
+  for (const auto& term : stmt->OrderBy()) {
+    if (term.expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& cn = term.expression->AsColumnValue().GetColumnName();
+      if (cn.schema.empty() && select_aliases.contains(AsciiLower(cn.name))) {
+        new_order_by.push_back(term);
+        continue;
+      }
+    }
+    Expression ne;
+    if (!RemapColumnsInExpr(term.expression, rels, dom_alias, col_map, &ne)) {
+      return false;
+    }
+    SelectStatement::OrderByTerm nt = term;
+    nt.expression = std::move(ne);
+    new_order_by.push_back(std::move(nt));
+  }
+
+  SelectStatement outer;
+  outer.AddWithQuery(cte_name, std::move(cte_body));
+  outer.SetSources(
+      {SelectSource(cte_name, dom_alias, nullptr, JoinType::kCross, nullptr)});
+  outer.SetSelectList(std::move(new_outer_sel));
+  outer.SetWhereClause(QueryExpressionExp(
+      std::move(new_sub), ColumnValueExp(ColumnName(dom_alias, dom_key_col)),
+      /*exists=*/false, /*negated=*/false));
+  outer.SetOrderBy(std::move(new_order_by));
+  *stmt = std::move(outer);
+  return true;
+}
+
+// ============================================================================
+// TPC-DS Q78: Disjunctive Left-Join Key-Domain Intersection Pushdown into
+// Grouped CTEs
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (disjunctive_left_join_semijoin_pushdown_sound)
+// ============================================================================
+
+bool RewriteDisjunctiveLeftJoinCteKeyDomain(SelectStatement* stmt,
+                                            TransactionContext& ctx) {
+  if (stmt == nullptr || stmt->WithQueries().size() < 3 ||
+      stmt->Sources().size() != 3 || !stmt->WhereClause() ||
+      !stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr ||
+      stmt->ForUpdate()) {
+    return false;
+  }
+  for (const auto& [name, _] : stmt->WithQueries()) {
+    if (stmt->IsRecursiveWith(name)) {
+      return false;
+    }
+  }
+  const SelectSource& src_l = stmt->Sources()[0];
+  const SelectSource& src_r1 = stmt->Sources()[1];
+  const SelectSource& src_r2 = stmt->Sources()[2];
+  if (src_l.query != nullptr || src_r1.query != nullptr ||
+      src_r2.query != nullptr || src_l.unnest != nullptr ||
+      src_r1.unnest != nullptr || src_r2.unnest != nullptr ||
+      src_l.sample.has_value() || src_r1.sample.has_value() ||
+      src_r2.sample.has_value() || src_r1.join_type != JoinType::kLeft ||
+      src_r2.join_type != JoinType::kLeft || !src_r1.join_condition ||
+      !src_r2.join_condition || !src_r1.using_columns.empty() ||
+      !src_r2.using_columns.empty()) {
+    return false;
+  }
+  auto find_cte_key = [&](const std::string& tbl) -> std::string {
+    for (const auto& [k, v] : stmt->WithQueries()) {
+      if (v != nullptr && IdentifierEqualsCI(k, tbl)) {
+        return k;
+      }
+    }
+    return {};
+  };
+  const std::string cte_l_name = find_cte_key(src_l.table);
+  const std::string cte_r1_name = find_cte_key(src_r1.table);
+  const std::string cte_r2_name = find_cte_key(src_r2.table);
+  if (cte_l_name.empty() || cte_r1_name.empty() || cte_r2_name.empty() ||
+      IdentifierEqualsCI(cte_l_name, cte_r1_name) ||
+      IdentifierEqualsCI(cte_l_name, cte_r2_name) ||
+      IdentifierEqualsCI(cte_r1_name, cte_r2_name)) {
+    return false;
+  }
+  if (stmt->WithQueries().contains("__lj_active_keys")) {
+    return false;
+  }
+  auto cte_used_in = [&](const SelectStatement& s, const std::string& target) {
+    for (const SelectSource& src : s.Sources()) {
+      if (src.query == nullptr && IdentifierEqualsCI(src.table, target)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (const auto& [name, body] : stmt->WithQueries()) {
+    if (body == nullptr) continue;
+    if (cte_used_in(*body, cte_l_name) || cte_used_in(*body, cte_r1_name) ||
+        cte_used_in(*body, cte_r2_name)) {
+      return false;
+    }
+  }
+  const std::shared_ptr<SelectStatement>& cte_l =
+      stmt->WithQueries().at(cte_l_name);
+  const std::shared_ptr<SelectStatement>& cte_r1 =
+      stmt->WithQueries().at(cte_r1_name);
+  const std::shared_ptr<SelectStatement>& cte_r2 =
+      stmt->WithQueries().at(cte_r2_name);
+  const std::string qual_l = src_l.alias.empty() ? src_l.table : src_l.alias;
+  const std::string qual_r1 =
+      src_r1.alias.empty() ? src_r1.table : src_r1.alias;
+  const std::string qual_r2 =
+      src_r2.alias.empty() ? src_r2.table : src_r2.alias;
+
+  auto collect_cte_out_cols =
+      [](const SelectStatement& cte,
+         std::unordered_map<std::string, size_t>* out) -> bool {
+    if (cte.SelectList().empty() || cte.GroupBy().empty() ||
+        cte.Having() != nullptr || cte.Distinct() || cte.HasDistinctOn() ||
+        cte.HasLimit() || cte.Offset() != 0 || !cte.UnionAll().empty() ||
+        cte.GetSetOperationTree() != nullptr || cte.Sources().size() < 2 ||
+        SelectListHasStarItem(cte)) {
+      return false;
+    }
+    for (size_t i = 0; i < cte.SelectList().size(); ++i) {
+      const std::string cname = OutputColumnNameAt(cte, i);
+      if (cname.empty()) return false;
+      out->emplace(AsciiLower(cname), i);
+    }
+    return true;
+  };
+  std::unordered_map<std::string, size_t> out_l, out_r1, out_r2;
+  if (!collect_cte_out_cols(*cte_l, &out_l) ||
+      !collect_cte_out_cols(*cte_r1, &out_r1) ||
+      !collect_cte_out_cols(*cte_r2, &out_r2)) {
+    return false;
+  }
+
+  auto resolve_outer_col = [&](const ColumnName& cn, int* rel_out,
+                               size_t* slot_out) -> bool {
+    const std::string lc = AsciiLower(cn.name);
+    if (!cn.schema.empty()) {
+      if (IdentifierEqualsCI(cn.schema, qual_l) && out_l.contains(lc)) {
+        *rel_out = 0;
+        *slot_out = out_l.at(lc);
+        return true;
+      }
+      if (IdentifierEqualsCI(cn.schema, qual_r1) && out_r1.contains(lc)) {
+        *rel_out = 1;
+        *slot_out = out_r1.at(lc);
+        return true;
+      }
+      if (IdentifierEqualsCI(cn.schema, qual_r2) && out_r2.contains(lc)) {
+        *rel_out = 2;
+        *slot_out = out_r2.at(lc);
+        return true;
+      }
+      return false;
+    }
+    int hits = 0;
+    if (out_l.contains(lc)) {
+      *rel_out = 0;
+      *slot_out = out_l.at(lc);
+      ++hits;
+    }
+    if (out_r1.contains(lc)) {
+      *rel_out = 1;
+      *slot_out = out_r1.at(lc);
+      ++hits;
+    }
+    if (out_r2.contains(lc)) {
+      *rel_out = 2;
+      *slot_out = out_r2.at(lc);
+      ++hits;
+    }
+    return hits == 1;
+  };
+
+  auto is_false_when_rel_null = [&](const Expression& e, int target_rel) {
+    if (!e) return false;
+    if (e->Type() == TypeTag::kUnaryExp) {
+      const auto& u = e->AsUnaryExpression();
+      if (u.Op() == UnaryOperation::kIsNotNull && u.Child() &&
+          u.Child()->Type() == TypeTag::kColumnValue) {
+        int r = -1;
+        size_t s = 0;
+        return resolve_outer_col(u.Child()->AsColumnValue().GetColumnName(), &r,
+                                 &s) &&
+               r == target_rel;
+      }
+      return false;
+    }
+    if (e->Type() != TypeTag::kBinaryExp) return false;
+    const auto& b = e->AsBinaryExpression();
+    if (b.Op() != BinaryOperation::kGreaterThan || !b.Left() || !b.Right() ||
+        b.Right()->Type() != TypeTag::kConstantValue) {
+      return false;
+    }
+    const Value& rhs = b.Right()->AsConstantValue().GetValue();
+    if (rhs.IsNull()) return false;
+    const bool rhs_nonneg =
+        (rhs.type == ValueType::kInt64 && rhs.value.int_value >= 0) ||
+        (rhs.type == ValueType::kDouble && rhs.value.double_value >= 0.0);
+    if (!rhs_nonneg) return false;
+    if (b.Left()->Type() == TypeTag::kColumnValue) {
+      int r = -1;
+      size_t s = 0;
+      return resolve_outer_col(b.Left()->AsColumnValue().GetColumnName(), &r,
+                               &s) &&
+             r == target_rel;
+    }
+    if (b.Left()->Type() == TypeTag::kFunctionCallExp) {
+      const auto& fn = b.Left()->AsFunctionCallExpression();
+      if ((IdentifierEqualsCI(fn.FuncName(), "coalesce") ||
+           IdentifierEqualsCI(fn.FuncName(), "ifnull")) &&
+          fn.Args().size() == 2 && fn.Args()[0] &&
+          fn.Args()[0]->Type() == TypeTag::kColumnValue && fn.Args()[1] &&
+          fn.Args()[1]->Type() == TypeTag::kConstantValue) {
+        const Value& def = fn.Args()[1]->AsConstantValue().GetValue();
+        const bool def_le_rhs =
+            !def.IsNull() &&
+            ((def.type == ValueType::kInt64 && rhs.type == ValueType::kInt64 &&
+              def.value.int_value <= rhs.value.int_value) ||
+             (def.type == ValueType::kInt64 && rhs.type == ValueType::kDouble &&
+              static_cast<double>(def.value.int_value) <=
+                  rhs.value.double_value) ||
+             (def.type == ValueType::kDouble && rhs.type == ValueType::kInt64 &&
+              def.value.double_value <=
+                  static_cast<double>(rhs.value.int_value)) ||
+             (def.type == ValueType::kDouble &&
+              rhs.type == ValueType::kDouble &&
+              def.value.double_value <= rhs.value.double_value));
+        int r = -1;
+        size_t s = 0;
+        return def_le_rhs &&
+               resolve_outer_col(fn.Args()[0]->AsColumnValue().GetColumnName(),
+                                 &r, &s) &&
+               r == target_rel;
+      }
+    }
+    return false;
+  };
+
+  const std::vector<Expression> outer_conjs =
+      SplitAndConjuncts(stmt->WhereClause());
+  bool found_disj_null_reject = false;
+  std::unordered_map<size_t, Expression> const_l_filters;
+  for (const Expression& c : outer_conjs) {
+    if (!c || c->Type() != TypeTag::kBinaryExp) continue;
+    const auto& b = c->AsBinaryExpression();
+    if (b.Op() == BinaryOperation::kOr) {
+      if ((is_false_when_rel_null(b.Left(), 1) &&
+           is_false_when_rel_null(b.Right(), 2)) ||
+          (is_false_when_rel_null(b.Left(), 2) &&
+           is_false_when_rel_null(b.Right(), 1))) {
+        found_disj_null_reject = true;
+      }
+    } else if (b.Op() == BinaryOperation::kEquals && b.Left() && b.Right()) {
+      auto check_eq = [&](const Expression& col_e, const Expression& val_e) {
+        if (col_e->Type() == TypeTag::kColumnValue &&
+            val_e->Type() == TypeTag::kConstantValue &&
+            dynamic_cast<const ParameterSlot*>(val_e.get()) == nullptr &&
+            !val_e->AsConstantValue().GetValue().IsNull()) {
+          int r = -1;
+          size_t s = 0;
+          if (resolve_outer_col(col_e->AsColumnValue().GetColumnName(), &r,
+                                &s) &&
+              r == 0) {
+            const_l_filters.emplace(s, val_e);
+          }
+        }
+      };
+      check_eq(b.Left(), b.Right());
+      check_eq(b.Right(), b.Left());
+    }
+  }
+  if (!found_disj_null_reject) {
+    return false;
+  }
+
+  auto extract_join_eqs = [&](const Expression& cond, int target_r,
+                              std::unordered_map<size_t, size_t>* l_to_r) {
+    const std::vector<Expression> eqs = SplitAndConjuncts(cond);
+    if (eqs.empty()) return false;
+    for (const Expression& e : eqs) {
+      if (!e || e->Type() != TypeTag::kBinaryExp ||
+          e->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+        return false;
+      }
+      const auto& b = e->AsBinaryExpression();
+      if (!b.Left() || !b.Right() ||
+          b.Left()->Type() != TypeTag::kColumnValue ||
+          b.Right()->Type() != TypeTag::kColumnValue) {
+        return false;
+      }
+      int r1 = -1, r2 = -1;
+      size_t s1 = 0, s2 = 0;
+      if (!resolve_outer_col(b.Left()->AsColumnValue().GetColumnName(), &r1,
+                             &s1) ||
+          !resolve_outer_col(b.Right()->AsColumnValue().GetColumnName(), &r2,
+                             &s2)) {
+        return false;
+      }
+      if (r1 == 0 && r2 == target_r) {
+        (*l_to_r)[s1] = s2;
+      } else if (r2 == 0 && r1 == target_r) {
+        (*l_to_r)[s2] = s1;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  };
+  std::unordered_map<size_t, size_t> l_to_r1, l_to_r2;
+  if (!extract_join_eqs(src_r1.join_condition, 1, &l_to_r1) ||
+      !extract_join_eqs(src_r2.join_condition, 2, &l_to_r2) ||
+      l_to_r1.size() != l_to_r2.size()) {
+    return false;
+  }
+  std::vector<size_t> non_const_l_slots;
+  std::vector<size_t> const_l_slots;
+  for (const auto& [ls, _] : l_to_r1) {
+    if (!l_to_r2.contains(ls)) return false;
+    if (const_l_filters.contains(ls)) {
+      const_l_slots.push_back(ls);
+    } else {
+      non_const_l_slots.push_back(ls);
+    }
+  }
+  std::ranges::sort(non_const_l_slots);
+  std::ranges::sort(const_l_slots);
+  if (non_const_l_slots.size() != 2) {
+    return false;
+  }
+
+  struct CteFactInfo {
+    std::string fact_table;
+    std::string fact_alias;
+    std::vector<ColumnName> key_cols;
+    std::vector<SelectSource> inner_dim_sources;
+    std::vector<Expression> dim_const_preds;
+    uint64_t fact_rows{0};
+  };
+  auto analyze_cte = [&](const SelectStatement& cte,
+                         const std::vector<size_t>& non_const_slots,
+                         const std::vector<size_t>& const_slots,
+                         CteFactInfo* info) -> bool {
+    const SelectSource& fsrc = cte.Sources()[0];
+    if (fsrc.query != nullptr || fsrc.unnest != nullptr ||
+        fsrc.sample.has_value() || fsrc.table.empty()) {
+      return false;
+    }
+    auto tbl = ctx.GetTable(fsrc.table);
+    if (!tbl.HasValue() || tbl.Value() == nullptr) return false;
+    auto st = ctx.GetStats(fsrc.table);
+    info->fact_rows = st.HasValue() ? st.Value()->Rows() : 0;
+    const Schema& fschema = tbl.Value()->GetSchema();
+    info->fact_table = fsrc.table;
+    info->fact_alias = fsrc.alias.empty() ? fsrc.table : fsrc.alias;
+
+    auto expr_in_gb = [&](const Expression& e) {
+      if (!e || e->Type() != TypeTag::kColumnValue) return false;
+      const ColumnName& cn = e->AsColumnValue().GetColumnName();
+      for (const Expression& g : cte.GroupBy()) {
+        if (g && g->Type() == TypeTag::kColumnValue) {
+          const ColumnName& gn = g->AsColumnValue().GetColumnName();
+          if (IdentifierEqualsCI(cn.name, gn.name) &&
+              (cn.schema.empty() || gn.schema.empty() ||
+               IdentifierEqualsCI(cn.schema, gn.schema))) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    for (const size_t sl : non_const_slots) {
+      const Expression& se = cte.SelectList()[sl].expression;
+      if (!se || se->Type() != TypeTag::kColumnValue || !expr_in_gb(se)) {
+        return false;
+      }
+      const ColumnName& cn = se->AsColumnValue().GetColumnName();
+      if (!FindColInSchema(fschema, cn.name).has_value()) {
+        return false;
+      }
+      info->key_cols.emplace_back(info->fact_alias, cn.name);
+    }
+    for (size_t i = 1; i < cte.Sources().size(); ++i) {
+      const SelectSource& s = cte.Sources()[i];
+      if (s.join_type == JoinType::kInner && s.query == nullptr &&
+          s.unnest == nullptr && !s.sample.has_value()) {
+        info->inner_dim_sources.push_back(s);
+      }
+    }
+    for (size_t i = 0; i < const_slots.size(); ++i) {
+      const size_t sl = const_slots[i];
+      const Expression& se = cte.SelectList()[sl].expression;
+      if (!se || se->Type() != TypeTag::kColumnValue || !expr_in_gb(se)) {
+        return false;
+      }
+      info->dim_const_preds.push_back(BinaryExpressionExp(
+          se, BinaryOperation::kEquals, const_l_filters.at(const_l_slots[i])));
+    }
+    return true;
+  };
+
+  std::vector<size_t> nc_r1, nc_r2, c_r1, c_r2;
+  for (const size_t ls : non_const_l_slots) {
+    nc_r1.push_back(l_to_r1.at(ls));
+    nc_r2.push_back(l_to_r2.at(ls));
+  }
+  for (const size_t ls : const_l_slots) {
+    c_r1.push_back(l_to_r1.at(ls));
+    c_r2.push_back(l_to_r2.at(ls));
+  }
+  CteFactInfo info_l, info_r1, info_r2;
+  if (!analyze_cte(*cte_l, non_const_l_slots, const_l_slots, &info_l) ||
+      !analyze_cte(*cte_r1, nc_r1, c_r1, &info_r1) ||
+      !analyze_cte(*cte_r2, nc_r2, c_r2, &info_r2)) {
+    return false;
+  }
+  if (info_l.fact_rows < 100000 && info_r1.fact_rows < 100000 &&
+      info_r2.fact_rows < 100000) {
+    return false;
+  }
+
+  auto make_key_sub = [&](const CteFactInfo& inf) {
+    auto sub = std::make_shared<SelectStatement>();
+    std::vector<SelectSource> srcs;
+    srcs.emplace_back(inf.fact_table, inf.fact_alias, nullptr, JoinType::kCross,
+                      nullptr);
+    for (const SelectSource& ds : inf.inner_dim_sources) {
+      srcs.push_back(ds);
+    }
+    sub->SetSources(std::move(srcs));
+    sub->SetSelectList({
+        NamedExpression("k0", ColumnValueExp(inf.key_cols[0])),
+        NamedExpression("k1", ColumnValueExp(inf.key_cols[1])),
+    });
+    if (!inf.dim_const_preds.empty()) {
+      sub->SetWhereClause(CombineAndConjuncts(inf.dim_const_preds));
+    }
+    return sub;
+  };
+
+  auto s_sub = make_key_sub(info_l);
+  auto o_sub = make_key_sub(info_r1);
+  o_sub->AddUnionAll(make_key_sub(info_r2));
+
+  const std::string active_cte_name = "__lj_active_keys";
+  auto active_cte = std::make_shared<SelectStatement>();
+  active_cte->SetDistinct(true);
+  active_cte->SetSelectList({
+      NamedExpression("__lj_k0", ColumnValueExp(ColumnName("__lj_s", "k0"))),
+      NamedExpression("__lj_k1", ColumnValueExp(ColumnName("__lj_s", "k1"))),
+  });
+  active_cte->SetSources({
+      SelectSource("", "__lj_s", std::move(s_sub), JoinType::kCross, nullptr),
+      SelectSource(
+          "", "__lj_o", std::move(o_sub), JoinType::kInner,
+          BinaryExpressionExp(
+              BinaryExpressionExp(ColumnValueExp(ColumnName("__lj_s", "k0")),
+                                  BinaryOperation::kEquals,
+                                  ColumnValueExp(ColumnName("__lj_o", "k0"))),
+              BinaryOperation::kAnd,
+              BinaryExpressionExp(ColumnValueExp(ColumnName("__lj_s", "k1")),
+                                  BinaryOperation::kEquals,
+                                  ColumnValueExp(ColumnName("__lj_o", "k1"))))),
+  });
+
+  auto rewrite_cte_body = [&](SelectStatement* body, const CteFactInfo& inf) {
+    std::vector<SelectSource> new_srcs;
+    new_srcs.reserve(body->Sources().size() + 1);
+    new_srcs.emplace_back(active_cte_name, active_cte_name, nullptr,
+                          JoinType::kCross, nullptr);
+    SelectSource fact_src = body->Sources()[0];
+    fact_src.join_type = JoinType::kInner;
+    fact_src.join_condition = BinaryExpressionExp(
+        BinaryExpressionExp(
+            ColumnValueExp(inf.key_cols[0]), BinaryOperation::kEquals,
+            ColumnValueExp(ColumnName(active_cte_name, "__lj_k0"))),
+        BinaryOperation::kAnd,
+        BinaryExpressionExp(
+            ColumnValueExp(inf.key_cols[1]), BinaryOperation::kEquals,
+            ColumnValueExp(ColumnName(active_cte_name, "__lj_k1"))));
+    new_srcs.push_back(std::move(fact_src));
+    for (size_t i = 1; i < body->Sources().size(); ++i) {
+      new_srcs.push_back(body->Sources()[i]);
+    }
+    body->SetSources(std::move(new_srcs));
+    if (!inf.dim_const_preds.empty()) {
+      std::vector<Expression> w = SplitAndConjuncts(body->WhereClause());
+      for (const Expression& cp : inf.dim_const_preds) {
+        w.push_back(cp);
+      }
+      body->SetWhereClause(CombineAndConjuncts(w));
+    }
+  };
+  rewrite_cte_body(cte_l.get(), info_l);
+  rewrite_cte_body(cte_r1.get(), info_r1);
+  rewrite_cte_body(cte_r2.get(), info_r2);
+
+  std::vector<std::pair<std::string, std::shared_ptr<SelectStatement>>> saved;
+  saved.reserve(stmt->WithQueryOrder().size());
+  for (const std::string& wname : stmt->WithQueryOrder()) {
+    auto it = stmt->WithQueries().find(wname);
+    if (it != stmt->WithQueries().end()) {
+      saved.emplace_back(wname, it->second);
+    }
+  }
+  stmt->ClearWithQueries();
+  stmt->AddWithQuery(active_cte_name, std::move(active_cte));
+  for (auto& [wname, wbody] : saved) {
+    stmt->AddWithQuery(std::move(wname), std::move(wbody));
+  }
+  return true;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (join_union_all_distribute_sound)
+// Distributes inner/cross joins and WHERE predicates over a UNION ALL derived
+// table of plain base-table projections:
+//   SELECT [DISTINCT] proj FROM (B1 UNION ALL B2 ...) AS u, R1, ..., Rm WHERE P
+//   ==>
+//   SELECT [DISTINCT] proj FROM (
+//     SELECT proj FROM B1, R1, ..., Rm WHERE P
+//     UNION ALL
+//     SELECT proj FROM B2, R1, ..., Rm WHERE P
+//   ) AS __du_u
+// Avoids materializing huge UNION ALL fact tables (e.g. TPC-DS Q54's 21.6M-row
+// catalog_sales UNION ALL web_sales) before selective dimension filters.
+bool RewriteDistributeJoinOverUnionAll(SelectStatement* stmt,
+                                       TransactionContext& ctx) {
+  if (stmt == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  for (const std::string& wname : stmt->WithQueryOrder()) {
+    auto it = stmt->WithQueries().find(wname);
+    if (it != stmt->WithQueries().end() && it->second != nullptr) {
+      if (RewriteDistributeJoinOverUnionAll(it->second.get(), ctx)) {
+        changed = true;
+      }
+    }
+  }
+  for (const auto& br : stmt->UnionAll()) {
+    if (br != nullptr && RewriteDistributeJoinOverUnionAll(br.get(), ctx)) {
+      changed = true;
+    }
+  }
+  for (const auto& src : stmt->Sources()) {
+    if (src.query != nullptr &&
+        RewriteDistributeJoinOverUnionAll(src.query.get(), ctx)) {
+      changed = true;
+    }
+  }
+  if (stmt->Sources().size() < 2 || !stmt->GroupBy().empty() ||
+      stmt->Having() != nullptr || stmt->Qualify() != nullptr ||
+      stmt->HasLimit() || stmt->Offset() != 0 || !stmt->OrderBy().empty() ||
+      !stmt->UnionAll().empty() || stmt->GetSetOperationTree() != nullptr ||
+      stmt->AsStruct() || stmt->ForUpdate() || stmt->SelectList().empty()) {
+    return changed;
+  }
+  auto has_agg_or_win = [&](const Expression& e) -> bool {
+    bool found = false;
+    std::function<void(const Expression&)> walk = [&](const Expression& node) {
+      if (!node || found) {
+        return;
+      }
+      if (node->Type() == TypeTag::kAggregateExp ||
+          node->Type() == TypeTag::kWindowFunctionExp ||
+          node->Type() == TypeTag::kQueryExp) {
+        found = true;
+        return;
+      }
+      for (const Expression& ch : ExpressionChildren(node)) {
+        walk(ch);
+      }
+    };
+    walk(e);
+    return found;
+  };
+  for (const NamedExpression& item : stmt->SelectList()) {
+    if (!item.expression || has_agg_or_win(item.expression)) {
+      return changed;
+    }
+    if (item.expression->Type() == TypeTag::kColumnValue &&
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      return changed;
+    }
+  }
+  if (stmt->WhereClause() != nullptr && has_agg_or_win(stmt->WhereClause())) {
+    return changed;
+  }
+  for (const SelectSource& src : stmt->Sources()) {
+    if ((src.join_type != JoinType::kCross &&
+         src.join_type != JoinType::kInner) ||
+        src.unnest || src.sample || !src.using_columns.empty() ||
+        (src.join_condition != nullptr && has_agg_or_win(src.join_condition))) {
+      return changed;
+    }
+  }
+  // Find a UNION ALL derived table source with 2..4 simple base-table branches
+  // (supporting both flat UnionAll() and SetOperationTree representations).
+  size_t u_idx = stmt->Sources().size();
+  std::vector<const SelectStatement*> branches;
+  for (size_t i = 0; i < stmt->Sources().size(); ++i) {
+    const SelectSource& src = stmt->Sources()[i];
+    if (src.query == nullptr || src.query->UnionByName() ||
+        src.query->UnionDistinct() || !src.query->WithQueries().empty() ||
+        src.query->HasLimit() || src.query->Offset() != 0 ||
+        !src.query->OrderBy().empty()) {
+      continue;
+    }
+    bool match_ok = true;
+    for (const SetOperationMatch& m : src.query->Matches()) {
+      if (m.by_name || m.corresponding || !m.columns.empty()) {
+        match_ok = false;
+        break;
+      }
+    }
+    if (!match_ok) {
+      continue;
+    }
+    std::vector<const SelectStatement*> cand;
+    if (const auto& tree = src.query->GetSetOperationTree(); tree != nullptr) {
+      if (tree->first == nullptr || tree->branches.empty() ||
+          tree->branches.size() > 3 ||
+          tree->kinds.size() != tree->branches.size()) {
+        continue;
+      }
+      bool all_ua = true;
+      for (SetOperationKind k : tree->kinds) {
+        if (k != SetOperationKind::kUnionAll) {
+          all_ua = false;
+          break;
+        }
+      }
+      if (!all_ua) {
+        continue;
+      }
+      cand.push_back(tree->first.get());
+      for (const auto& br : tree->branches) {
+        if (br == nullptr) {
+          all_ua = false;
+          break;
+        }
+        cand.push_back(br.get());
+      }
+      if (!all_ua) {
+        continue;
+      }
+    } else if (!src.query->UnionAll().empty() &&
+               src.query->UnionAll().size() <= 3) {
+      const auto& kinds = src.query->SetOperationKinds();
+      bool all_ua = true;
+      for (size_t k = 0; k < src.query->UnionAll().size(); ++k) {
+        const SetOperationKind kind =
+            k < kinds.size() ? kinds[k] : SetOperationKind::kUnionAll;
+        if (kind != SetOperationKind::kUnionAll ||
+            src.query->UnionAll()[k] == nullptr) {
+          all_ua = false;
+          break;
+        }
+      }
+      if (!all_ua) {
+        continue;
+      }
+      cand.push_back(src.query.get());
+      for (const auto& br : src.query->UnionAll()) {
+        cand.push_back(br.get());
+      }
+    } else {
+      continue;
+    }
+    if (cand.size() >= 2) {
+      u_idx = i;
+      branches = std::move(cand);
+      break;
+    }
+  }
+  if (u_idx >= stmt->Sources().size() || branches.size() < 2) {
+    return changed;
+  }
+  const SelectSource& u_src = stmt->Sources()[u_idx];
+  const std::string u_alias = u_src.alias;
+  if (u_alias.empty()) {
+    return changed;
+  }
+  const SelectStatement& head = *branches[0];
+  const size_t n_cols = head.SelectList().size();
+  if (n_cols == 0) {
+    return changed;
+  }
+  std::vector<std::string> u_out_names;
+  u_out_names.reserve(n_cols);
+  std::unordered_map<std::string, size_t> u_out_index;
+  for (size_t c = 0; c < n_cols; ++c) {
+    const NamedExpression& ne = head.SelectList()[c];
+    std::string nm = ne.name;
+    if (nm.empty() && ne.expression != nullptr &&
+        ne.expression->Type() == TypeTag::kColumnValue) {
+      nm = ne.expression->AsColumnValue().GetColumnName().name;
+    }
+    if (nm.empty() || nm == "*") {
+      return changed;
+    }
+    std::string low = AsciiLower(nm);
+    if (!u_out_index.emplace(low, c).second) {
+      return changed;
+    }
+    u_out_names.push_back(std::move(low));
+  }
+  struct BranchInfo {
+    std::string table;
+    std::string orig_alias;
+    std::vector<std::string> col_names;
+    Expression where_clause;
+  };
+  std::vector<BranchInfo> b_infos;
+  b_infos.reserve(branches.size());
+  for (const SelectStatement* br : branches) {
+    if (br->Sources().size() != 1 || br->Sources()[0].query != nullptr ||
+        br->Sources()[0].unnest || br->Sources()[0].sample ||
+        !br->GroupBy().empty() || br->Having() != nullptr || br->Distinct() ||
+        br->HasLimit() || br->Offset() != 0 || !br->OrderBy().empty() ||
+        !br->WithQueries().empty() || br->Qualify() != nullptr ||
+        br->SelectList().size() != n_cols) {
+      return changed;
+    }
+    const SelectSource& bsrc = br->Sources()[0];
+    if (bsrc.table.empty()) {
+      return changed;
+    }
+    StatusOr<std::shared_ptr<Table>> tbl = ctx.GetTable(bsrc.table);
+    if (!tbl.HasValue()) {
+      return changed;
+    }
+    const Schema& bschema = tbl.Value()->GetSchema();
+    BranchInfo info;
+    info.table = bsrc.table;
+    info.orig_alias = bsrc.alias.empty() ? bsrc.table : bsrc.alias;
+    info.where_clause = br->WhereClause();
+    info.col_names.reserve(n_cols);
+    for (size_t c = 0; c < n_cols; ++c) {
+      const Expression& e = br->SelectList()[c].expression;
+      if (!e || e->Type() != TypeTag::kColumnValue) {
+        return changed;
+      }
+      const ColumnName& cn = e->AsColumnValue().GetColumnName();
+      if (cn.name.empty() || cn.name == "*") {
+        return changed;
+      }
+      if (!cn.schema.empty() &&
+          AsciiLower(cn.schema) != AsciiLower(info.orig_alias) &&
+          AsciiLower(cn.schema) != AsciiLower(info.table)) {
+        return changed;
+      }
+      bool exists = false;
+      for (size_t sc = 0; sc < bschema.ColumnCount(); ++sc) {
+        if (AsciiLower(bschema.GetColumn(sc).Name().name) ==
+            AsciiLower(cn.name)) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) {
+        return changed;
+      }
+      info.col_names.push_back(cn.name);
+    }
+    b_infos.push_back(std::move(info));
+  }
+  std::unordered_set<std::string> other_cols;
+  for (size_t i = 0; i < stmt->Sources().size(); ++i) {
+    if (i == u_idx) {
+      continue;
+    }
+    const SelectSource& osrc = stmt->Sources()[i];
+    if (osrc.query == nullptr && !osrc.table.empty()) {
+      StatusOr<std::shared_ptr<Table>> ot = ctx.GetTable(osrc.table);
+      if (ot.HasValue()) {
+        const Schema& os = ot.Value()->GetSchema();
+        for (size_t sc = 0; sc < os.ColumnCount(); ++sc) {
+          other_cols.insert(AsciiLower(os.GetColumn(sc).Name().name));
+        }
+      }
+    }
+  }
+  const std::string u_alias_low = AsciiLower(u_alias);
+  bool rewrite_ok = true;
+  auto map_expr = [](const Expression& root, auto&& fn) -> Expression {
+    std::function<Expression(const Expression&)> rec =
+        [&](const Expression& node) -> Expression {
+      if (!node) {
+        return nullptr;
+      }
+      std::vector<Expression> children = ExpressionChildren(node);
+      bool child_changed = false;
+      for (Expression& ch : children) {
+        Expression next = rec(ch);
+        if (next.get() != ch.get()) {
+          child_changed = true;
+          ch = std::move(next);
+        }
+      }
+      Expression rebuilt =
+          child_changed ? WithExpressionChildren(node, std::move(children))
+                        : node;
+      return fn(rebuilt);
+    };
+    return rec(root);
+  };
+  auto rewrite_expr_for_branch = [&](const Expression& expr,
+                                     const std::string& br_alias,
+                                     const BranchInfo& bi) -> Expression {
+    return map_expr(expr, [&](const Expression& node) -> Expression {
+      if (node->Type() == TypeTag::kColumnValue) {
+        const ColumnName& cn = node->AsColumnValue().GetColumnName();
+        const std::string tlow = AsciiLower(cn.schema);
+        const std::string nlow = AsciiLower(cn.name);
+        if (tlow == u_alias_low) {
+          auto it = u_out_index.find(nlow);
+          if (it == u_out_index.end()) {
+            rewrite_ok = false;
+            return node;
+          }
+          return ColumnValueExp(ColumnName(br_alias, bi.col_names[it->second]));
+        }
+        if (tlow.empty()) {
+          auto it = u_out_index.find(nlow);
+          if (it != u_out_index.end()) {
+            if (other_cols.contains(nlow)) {
+              rewrite_ok = false;
+              return node;
+            }
+            return ColumnValueExp(
+                ColumnName(br_alias, bi.col_names[it->second]));
+          }
+        }
+      }
+      return node;
+    });
+  };
+  auto rewrite_branch_where = [&](const Expression& expr,
+                                  const std::string& br_alias,
+                                  const BranchInfo& bi) -> Expression {
+    const std::string oalow = AsciiLower(bi.orig_alias);
+    const std::string tlow_b = AsciiLower(bi.table);
+    return map_expr(expr, [&](const Expression& node) -> Expression {
+      if (node->Type() == TypeTag::kColumnValue) {
+        const ColumnName& cn = node->AsColumnValue().GetColumnName();
+        const std::string tl = AsciiLower(cn.schema);
+        if (tl.empty() || tl == oalow || tl == tlow_b) {
+          return ColumnValueExp(ColumnName(br_alias, cn.name));
+        }
+      }
+      return node;
+    });
+  };
+
+  std::vector<std::shared_ptr<SelectStatement>> built_branches;
+  built_branches.reserve(b_infos.size());
+  for (size_t bi = 0; bi < b_infos.size(); ++bi) {
+    const BranchInfo& info = b_infos[bi];
+    const std::string br_alias = "__du_b" + std::to_string(bi);
+    auto br_stmt = std::make_shared<SelectStatement>();
+    std::vector<NamedExpression> br_select;
+    br_select.reserve(stmt->SelectList().size());
+    for (size_t si = 0; si < stmt->SelectList().size(); ++si) {
+      const NamedExpression& item = stmt->SelectList()[si];
+      std::string alias = item.name;
+      if (alias.empty() && item.expression->Type() == TypeTag::kColumnValue) {
+        alias = item.expression->AsColumnValue().GetColumnName().name;
+      }
+      if (alias.empty()) {
+        alias = "__du_c" + std::to_string(si);
+      }
+      br_select.emplace_back(
+          alias, rewrite_expr_for_branch(item.expression, br_alias, info));
+    }
+    br_stmt->SetSelectList(std::move(br_select));
+    std::vector<SelectSource> br_sources;
+    br_sources.reserve(stmt->Sources().size());
+    std::vector<Expression> extra_preds;
+    for (size_t i = 0; i < stmt->Sources().size(); ++i) {
+      if (i == u_idx) {
+        br_sources.emplace_back(info.table, br_alias, nullptr, JoinType::kCross,
+                                nullptr);
+        if (stmt->Sources()[i].join_condition != nullptr) {
+          extra_preds.push_back(rewrite_expr_for_branch(
+              stmt->Sources()[i].join_condition, br_alias, info));
+        }
+      } else {
+        SelectSource copy = stmt->Sources()[i];
+        if (copy.join_condition != nullptr) {
+          copy.join_condition =
+              rewrite_expr_for_branch(copy.join_condition, br_alias, info);
+        }
+        br_sources.push_back(std::move(copy));
+      }
+    }
+    br_stmt->SetSources(std::move(br_sources));
+    std::vector<Expression> where_parts;
+    if (stmt->WhereClause() != nullptr) {
+      where_parts.push_back(
+          rewrite_expr_for_branch(stmt->WhereClause(), br_alias, info));
+    }
+    if (info.where_clause != nullptr) {
+      where_parts.push_back(
+          rewrite_branch_where(info.where_clause, br_alias, info));
+    }
+    for (auto& ep : extra_preds) {
+      where_parts.push_back(std::move(ep));
+    }
+    if (!where_parts.empty()) {
+      br_stmt->SetWhereClause(CombineAndConjuncts(where_parts));
+    }
+    if (!rewrite_ok) {
+      return changed;
+    }
+    built_branches.push_back(std::move(br_stmt));
+  }
+
+  auto union_sub = built_branches[0];
+  for (size_t bi = 1; bi < built_branches.size(); ++bi) {
+    union_sub->AddUnionAll(built_branches[bi]);
+  }
+  const std::string wrap_alias = "__du_union";
+  std::vector<NamedExpression> outer_select;
+  outer_select.reserve(stmt->SelectList().size());
+  for (size_t si = 0; si < stmt->SelectList().size(); ++si) {
+    const std::string& col_nm = built_branches[0]->SelectList()[si].name;
+    const std::string& orig_alias = stmt->SelectList()[si].name;
+    outer_select.emplace_back(orig_alias.empty() ? col_nm : orig_alias,
+                              ColumnValueExp(ColumnName(wrap_alias, col_nm)));
+  }
+  stmt->SetSelectList(std::move(outer_select));
+  stmt->SetSources({SelectSource("", wrap_alias, std::move(union_sub),
+                                 JoinType::kCross, nullptr)});
+  stmt->SetWhereClause(nullptr);
+  return true;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (grouped_sum_union_all_distribute_sound)
+// Distributes grouped SUM/MIN/MAX aggregation over a pure UNION ALL CTE or
+// derived table of plain base-table projections:
+//   SELECT g..., SUM(e1), ... FROM u, R1, ... WHERE P GROUP BY g...
+//   ==>
+//   SELECT __dg_u.g..., SUM(__dg_u.a1), ... FROM (
+//     SELECT g..., SUM(e1[B0]) AS a1, ... FROM B0, R1, ... WHERE P[B0] GROUP BY
+//     g... UNION ALL SELECT g..., SUM(e1[B1]) AS a1, ... FROM B1, R1, ... WHERE
+//     P[B1] GROUP BY g...
+//   ) AS __dg_u GROUP BY __dg_u.g...
+// Eliminates materializing multi-million-row UNION ALL fact tables (e.g.
+// TPC-DS Q02 `wscs` 8.76M rows) and lets each branch hit deferred fused
+// grouped-join directly on its base table.
+bool RewriteDistributeGroupedSumOverUnionAll(SelectStatement* root,
+                                             TransactionContext& ctx) {
+  if (root == nullptr) {
+    return false;
+  }
+  auto extract_union_branches =
+      [](const SelectStatement* q,
+         std::vector<const SelectStatement*>* out) -> bool {
+    out->clear();
+    if (q == nullptr || q->UnionByName() || q->UnionDistinct() ||
+        !q->WithQueries().empty() || q->HasLimit() || q->Offset() != 0 ||
+        !q->OrderBy().empty()) {
+      return false;
+    }
+    // Unwrap trivial pass-through wrapper `SELECT c1, c2 FROM (B1 UNION ALL B2)
+    // sq`.
+    if (q->UnionAll().empty() && q->GetSetOperationTree() == nullptr) {
+      if (!q->GroupBy().empty() || q->Having() != nullptr || q->Distinct() ||
+          q->WhereClause() != nullptr || q->Qualify() != nullptr ||
+          q->Sources().size() != 1 || q->Sources()[0].query == nullptr) {
+        return false;
+      }
+      const SelectStatement* inner = q->Sources()[0].query.get();
+      std::vector<const SelectStatement*> inner_brs;
+      if (inner == nullptr || inner->UnionByName() || inner->UnionDistinct() ||
+          !inner->WithQueries().empty() || inner->HasLimit() ||
+          inner->Offset() != 0 || !inner->OrderBy().empty()) {
+        return false;
+      }
+      if (const auto& tree = inner->GetSetOperationTree(); tree != nullptr) {
+        if (tree->first == nullptr || tree->branches.empty() ||
+            tree->branches.size() > 3 ||
+            tree->kinds.size() != tree->branches.size()) {
+          return false;
+        }
+        for (SetOperationKind k : tree->kinds) {
+          if (k != SetOperationKind::kUnionAll) return false;
+        }
+        inner_brs.push_back(tree->first.get());
+        for (const auto& b : tree->branches) {
+          if (!b) return false;
+          inner_brs.push_back(b.get());
+        }
+      } else if (!inner->UnionAll().empty() && inner->UnionAll().size() <= 3) {
+        const auto& kinds = inner->SetOperationKinds();
+        for (size_t k = 0; k < inner->UnionAll().size(); ++k) {
+          const SetOperationKind kind =
+              k < kinds.size() ? kinds[k] : SetOperationKind::kUnionAll;
+          if (kind != SetOperationKind::kUnionAll || !inner->UnionAll()[k]) {
+            return false;
+          }
+        }
+        inner_brs.push_back(inner);
+        for (const auto& b : inner->UnionAll()) {
+          inner_brs.push_back(b.get());
+        }
+      } else {
+        return false;
+      }
+      if (inner_brs.size() < 2 ||
+          inner_brs[0]->SelectList().size() != q->SelectList().size()) {
+        return false;
+      }
+      for (size_t c = 0; c < q->SelectList().size(); ++c) {
+        const NamedExpression& oe = q->SelectList()[c];
+        const NamedExpression& ie = inner_brs[0]->SelectList()[c];
+        if (!oe.expression || oe.expression->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        std::string in_nm = ie.name;
+        if (in_nm.empty() && ie.expression &&
+            ie.expression->Type() == TypeTag::kColumnValue) {
+          in_nm = ie.expression->AsColumnValue().GetColumnName().name;
+        }
+        std::string out_nm =
+            oe.name.empty()
+                ? oe.expression->AsColumnValue().GetColumnName().name
+                : oe.name;
+        if (in_nm.empty() ||
+            AsciiLower(oe.expression->AsColumnValue().GetColumnName().name) !=
+                AsciiLower(in_nm) ||
+            AsciiLower(out_nm) != AsciiLower(in_nm)) {
+          return false;
+        }
+      }
+      *out = std::move(inner_brs);
+      return true;
+    }
+    for (const SetOperationMatch& m : q->Matches()) {
+      if (m.by_name || m.corresponding || !m.columns.empty()) {
+        return false;
+      }
+    }
+    if (const auto& tree = q->GetSetOperationTree(); tree != nullptr) {
+      if (tree->first == nullptr || tree->branches.empty() ||
+          tree->branches.size() > 3 ||
+          tree->kinds.size() != tree->branches.size()) {
+        return false;
+      }
+      for (SetOperationKind k : tree->kinds) {
+        if (k != SetOperationKind::kUnionAll) return false;
+      }
+      out->push_back(tree->first.get());
+      for (const auto& b : tree->branches) {
+        if (!b) return false;
+        out->push_back(b.get());
+      }
+      return out->size() >= 2;
+    }
+    if (!q->UnionAll().empty() && q->UnionAll().size() <= 3) {
+      const auto& kinds = q->SetOperationKinds();
+      for (size_t k = 0; k < q->UnionAll().size(); ++k) {
+        const SetOperationKind kind =
+            k < kinds.size() ? kinds[k] : SetOperationKind::kUnionAll;
+        if (kind != SetOperationKind::kUnionAll || !q->UnionAll()[k]) {
+          return false;
+        }
+      }
+      out->push_back(q);
+      for (const auto& b : q->UnionAll()) {
+        out->push_back(b.get());
+      }
+      return out->size() >= 2;
+    }
+    return false;
+  };
+
+  auto map_expr = [](const Expression& root_e, auto&& fn) -> Expression {
+    std::function<Expression(const Expression&)> rec =
+        [&](const Expression& node) -> Expression {
+      if (!node) return nullptr;
+      std::vector<Expression> children = ExpressionChildren(node);
+      bool ch_changed = false;
+      for (Expression& ch : children) {
+        Expression next = rec(ch);
+        if (next.get() != ch.get()) {
+          ch_changed = true;
+          ch = std::move(next);
+        }
+      }
+      Expression rebuilt =
+          ch_changed ? WithExpressionChildren(node, std::move(children)) : node;
+      return fn(rebuilt);
+    };
+    return rec(root_e);
+  };
+
+  auto has_disallowed_inner = [](const Expression& e) -> bool {
+    bool bad = false;
+    std::function<void(const Expression&)> walk = [&](const Expression& node) {
+      if (!node || bad) return;
+      if (node->Type() == TypeTag::kAggregateExp ||
+          node->Type() == TypeTag::kWindowFunctionExp ||
+          node->Type() == TypeTag::kQueryExp) {
+        bad = true;
+        return;
+      }
+      for (const Expression& ch : ExpressionChildren(node)) walk(ch);
+    };
+    walk(e);
+    return bad;
+  };
+
+  std::unordered_set<std::string> consumed_ctes;
+  std::function<bool(
+      SelectStatement*,
+      const std::unordered_map<std::string, const SelectStatement*>&)>
+      rewrite_one =
+          [&](SelectStatement* stmt,
+              const std::unordered_map<std::string, const SelectStatement*>&
+                  cte_env) -> bool {
+    if (stmt == nullptr) return false;
+    bool changed = false;
+    auto local_env = cte_env;
+    for (const std::string& wname : stmt->WithQueryOrder()) {
+      auto it = stmt->WithQueries().find(wname);
+      if (it != stmt->WithQueries().end() && it->second != nullptr) {
+        if (rewrite_one(it->second.get(), local_env)) {
+          changed = true;
+        }
+        local_env[AsciiLower(wname)] = it->second.get();
+      }
+    }
+    for (const auto& br : stmt->UnionAll()) {
+      if (br != nullptr && rewrite_one(br.get(), local_env)) {
+        changed = true;
+      }
+    }
+    for (const auto& src : stmt->Sources()) {
+      if (src.query != nullptr && rewrite_one(src.query.get(), local_env)) {
+        changed = true;
+      }
+    }
+    if (stmt->Sources().size() < 2 || stmt->GroupBy().empty() ||
+        stmt->Having() != nullptr || stmt->Qualify() != nullptr ||
+        stmt->Distinct() || stmt->HasLimit() || stmt->Offset() != 0 ||
+        !stmt->OrderBy().empty() || !stmt->UnionAll().empty() ||
+        stmt->GetSetOperationTree() != nullptr || stmt->AsStruct() ||
+        stmt->ForUpdate() || stmt->SelectList().empty()) {
+      return changed;
+    }
+    if (stmt->WhereClause() != nullptr &&
+        has_disallowed_inner(stmt->WhereClause())) {
+      return changed;
+    }
+    for (const SelectSource& src : stmt->Sources()) {
+      if ((src.join_type != JoinType::kCross &&
+           src.join_type != JoinType::kInner) ||
+          src.unnest || src.sample || !src.using_columns.empty() ||
+          (src.join_condition != nullptr &&
+           has_disallowed_inner(src.join_condition))) {
+        return changed;
+      }
+    }
+    // Check that every SELECT item is either a plain group-key column or a
+    // top-level non-DISTINCT SUM/MIN/MAX(expr) with no nested aggs/windows.
+    std::vector<ColumnName> group_cols;
+    group_cols.reserve(stmt->GroupBy().size());
+    for (const Expression& ge : stmt->GroupBy()) {
+      if (!ge || ge->Type() != TypeTag::kColumnValue) {
+        return changed;
+      }
+      group_cols.push_back(ge->AsColumnValue().GetColumnName());
+    }
+    struct OutItemSpec {
+      bool is_agg{false};
+      size_t group_idx{0};
+      AggregationType agg_type{AggregationType::kSum};
+      Expression agg_child;
+      std::string out_name;
+    };
+    std::vector<OutItemSpec> out_specs;
+    out_specs.reserve(stmt->SelectList().size());
+    bool any_agg = false;
+    for (size_t si = 0; si < stmt->SelectList().size(); ++si) {
+      const NamedExpression& ne = stmt->SelectList()[si];
+      if (!ne.expression) return changed;
+      if (ne.expression->Type() == TypeTag::kAggregateExp) {
+        const auto& agg = ne.expression->AsAggregateExpression();
+        if (agg.Distinct() ||
+            (agg.GetType() != AggregationType::kSum &&
+             agg.GetType() != AggregationType::kMin &&
+             agg.GetType() != AggregationType::kMax) ||
+            !agg.Child() || has_disallowed_inner(agg.Child())) {
+          return changed;
+        }
+        any_agg = true;
+        out_specs.push_back(OutItemSpec{
+            .is_agg = true,
+            .group_idx = 0,
+            .agg_type = agg.GetType(),
+            .agg_child = agg.Child(),
+            .out_name =
+                ne.name.empty() ? ("__dg_a" + std::to_string(si)) : ne.name});
+      } else if (ne.expression->Type() == TypeTag::kColumnValue) {
+        const ColumnName& cn = ne.expression->AsColumnValue().GetColumnName();
+        size_t gidx = group_cols.size();
+        for (size_t gi = 0; gi < group_cols.size(); ++gi) {
+          if (AsciiLower(group_cols[gi].name) == AsciiLower(cn.name) &&
+              (group_cols[gi].schema.empty() || cn.schema.empty() ||
+               AsciiLower(group_cols[gi].schema) == AsciiLower(cn.schema))) {
+            gidx = gi;
+            break;
+          }
+        }
+        if (gidx >= group_cols.size()) return changed;
+        out_specs.push_back(
+            OutItemSpec{.is_agg = false,
+                        .group_idx = gidx,
+                        .agg_type = AggregationType::kSum,
+                        .agg_child = nullptr,
+                        .out_name = ne.name.empty() ? cn.name : ne.name});
+      } else {
+        return changed;
+      }
+    }
+    if (!any_agg) return changed;
+
+    // Locate a UNION ALL source (inline derived table or CTE).
+    size_t u_idx = stmt->Sources().size();
+    std::vector<const SelectStatement*> branches;
+    for (size_t i = 0; i < stmt->Sources().size(); ++i) {
+      const SelectSource& src = stmt->Sources()[i];
+      const SelectStatement* candidate = nullptr;
+      if (src.query != nullptr) {
+        candidate = src.query.get();
+      } else if (!src.table.empty()) {
+        auto it = local_env.find(AsciiLower(src.table));
+        if (it != local_env.end()) {
+          candidate = it->second;
+        }
+      }
+      if (candidate != nullptr &&
+          extract_union_branches(candidate, &branches)) {
+        u_idx = i;
+        break;
+      }
+    }
+    if (u_idx >= stmt->Sources().size() || branches.size() < 2) {
+      return changed;
+    }
+    const SelectSource& u_src = stmt->Sources()[u_idx];
+    const std::string u_alias = u_src.alias.empty() ? u_src.table : u_src.alias;
+    if (u_alias.empty()) return changed;
+    const SelectStatement& head = *branches[0];
+    const size_t n_cols = head.SelectList().size();
+    if (n_cols == 0) return changed;
+    std::unordered_map<std::string, size_t> u_out_index;
+    for (size_t c = 0; c < n_cols; ++c) {
+      const NamedExpression& ne = head.SelectList()[c];
+      std::string nm = ne.name;
+      if (nm.empty() && ne.expression &&
+          ne.expression->Type() == TypeTag::kColumnValue) {
+        nm = ne.expression->AsColumnValue().GetColumnName().name;
+      }
+      if (nm.empty() || nm == "*") return changed;
+      if (!u_out_index.emplace(AsciiLower(nm), c).second) return changed;
+    }
+    struct BranchInfo {
+      std::string table;
+      std::string orig_alias;
+      std::vector<std::string> col_names;
+      Expression where_clause;
+    };
+    std::vector<BranchInfo> b_infos;
+    b_infos.reserve(branches.size());
+    for (const SelectStatement* br : branches) {
+      if (br->Sources().size() != 1 || br->Sources()[0].query != nullptr ||
+          br->Sources()[0].unnest || br->Sources()[0].sample ||
+          !br->GroupBy().empty() || br->Having() != nullptr || br->Distinct() ||
+          br->HasLimit() || br->Offset() != 0 || !br->OrderBy().empty() ||
+          !br->WithQueries().empty() || br->Qualify() != nullptr ||
+          br->SelectList().size() != n_cols) {
+        return changed;
+      }
+      const SelectSource& bsrc = br->Sources()[0];
+      if (bsrc.table.empty()) return changed;
+      StatusOr<std::shared_ptr<Table>> tbl = ctx.GetTable(bsrc.table);
+      if (!tbl.HasValue()) return changed;
+      const Schema& bschema = tbl.Value()->GetSchema();
+      BranchInfo info;
+      info.table = bsrc.table;
+      info.orig_alias = bsrc.alias.empty() ? bsrc.table : bsrc.alias;
+      info.where_clause = br->WhereClause();
+      info.col_names.reserve(n_cols);
+      for (size_t c = 0; c < n_cols; ++c) {
+        const Expression& e = br->SelectList()[c].expression;
+        if (!e || e->Type() != TypeTag::kColumnValue) return changed;
+        const ColumnName& cn = e->AsColumnValue().GetColumnName();
+        if (cn.name.empty() || cn.name == "*") return changed;
+        if (!cn.schema.empty() &&
+            AsciiLower(cn.schema) != AsciiLower(info.orig_alias) &&
+            AsciiLower(cn.schema) != AsciiLower(info.table)) {
+          return changed;
+        }
+        bool exists = false;
+        for (size_t sc = 0; sc < bschema.ColumnCount(); ++sc) {
+          if (AsciiLower(bschema.GetColumn(sc).Name().name) ==
+              AsciiLower(cn.name)) {
+            exists = true;
+            break;
+          }
+        }
+        if (!exists) return changed;
+        info.col_names.push_back(cn.name);
+      }
+      b_infos.push_back(std::move(info));
+    }
+    std::unordered_set<std::string> other_cols;
+    for (size_t i = 0; i < stmt->Sources().size(); ++i) {
+      if (i == u_idx) continue;
+      const SelectSource& osrc = stmt->Sources()[i];
+      if (osrc.query == nullptr && !osrc.table.empty()) {
+        StatusOr<std::shared_ptr<Table>> ot = ctx.GetTable(osrc.table);
+        if (ot.HasValue()) {
+          const Schema& os = ot.Value()->GetSchema();
+          for (size_t sc = 0; sc < os.ColumnCount(); ++sc) {
+            other_cols.insert(AsciiLower(os.GetColumn(sc).Name().name));
+          }
+        }
+      }
+    }
+    const std::string u_alias_low = AsciiLower(u_alias);
+    bool rewrite_ok = true;
+    auto rewrite_expr_for_branch = [&](const Expression& expr,
+                                       const std::string& br_alias,
+                                       const BranchInfo& bi) -> Expression {
+      return map_expr(expr, [&](const Expression& node) -> Expression {
+        if (node->Type() == TypeTag::kColumnValue) {
+          const ColumnName& cn = node->AsColumnValue().GetColumnName();
+          const std::string tlow = AsciiLower(cn.schema);
+          const std::string nlow = AsciiLower(cn.name);
+          if (tlow == u_alias_low) {
+            auto it = u_out_index.find(nlow);
+            if (it == u_out_index.end()) {
+              rewrite_ok = false;
+              return node;
+            }
+            return ColumnValueExp(
+                ColumnName(br_alias, bi.col_names[it->second]));
+          }
+          if (tlow.empty()) {
+            auto it = u_out_index.find(nlow);
+            if (it != u_out_index.end()) {
+              if (other_cols.contains(nlow)) {
+                rewrite_ok = false;
+                return node;
+              }
+              return ColumnValueExp(
+                  ColumnName(br_alias, bi.col_names[it->second]));
+            }
+          }
+        }
+        return node;
+      });
+    };
+    auto rewrite_branch_where = [&](const Expression& expr,
+                                    const std::string& br_alias,
+                                    const BranchInfo& bi) -> Expression {
+      const std::string oalow = AsciiLower(bi.orig_alias);
+      const std::string tlow_b = AsciiLower(bi.table);
+      return map_expr(expr, [&](const Expression& node) -> Expression {
+        if (node->Type() == TypeTag::kColumnValue) {
+          const ColumnName& cn = node->AsColumnValue().GetColumnName();
+          const std::string tl = AsciiLower(cn.schema);
+          if (tl.empty() || tl == oalow || tl == tlow_b) {
+            return ColumnValueExp(ColumnName(br_alias, cn.name));
+          }
+        }
+        return node;
+      });
+    };
+
+    std::vector<std::shared_ptr<SelectStatement>> built_branches;
+    built_branches.reserve(b_infos.size());
+    for (size_t bi = 0; bi < b_infos.size(); ++bi) {
+      const BranchInfo& info = b_infos[bi];
+      const std::string br_alias = "__dg_b" + std::to_string(bi);
+      auto br_stmt = std::make_shared<SelectStatement>();
+      std::vector<NamedExpression> br_select;
+      std::vector<Expression> br_group_by;
+      br_group_by.reserve(group_cols.size());
+      for (size_t gi = 0; gi < group_cols.size(); ++gi) {
+        Expression ge = rewrite_expr_for_branch(ColumnValueExp(group_cols[gi]),
+                                                br_alias, info);
+        br_select.emplace_back("__dg_k" + std::to_string(gi), ge);
+        br_group_by.push_back(std::move(ge));
+      }
+      for (size_t si = 0; si < out_specs.size(); ++si) {
+        if (!out_specs[si].is_agg) continue;
+        Expression child =
+            rewrite_expr_for_branch(out_specs[si].agg_child, br_alias, info);
+        br_select.emplace_back(
+            "__dg_a" + std::to_string(si),
+            std::make_shared<AggregateExpression>(out_specs[si].agg_type,
+                                                  std::move(child), false));
+      }
+      br_stmt->SetSelectList(std::move(br_select));
+      br_stmt->SetGroupBy(std::move(br_group_by));
+      std::vector<SelectSource> br_sources;
+      br_sources.reserve(stmt->Sources().size());
+      std::vector<Expression> extra_preds;
+      for (size_t i = 0; i < stmt->Sources().size(); ++i) {
+        if (i == u_idx) {
+          br_sources.emplace_back(info.table, br_alias, nullptr,
+                                  JoinType::kCross, nullptr);
+          if (stmt->Sources()[i].join_condition != nullptr) {
+            extra_preds.push_back(rewrite_expr_for_branch(
+                stmt->Sources()[i].join_condition, br_alias, info));
+          }
+        } else {
+          SelectSource copy = stmt->Sources()[i];
+          if (copy.join_condition != nullptr) {
+            copy.join_condition =
+                rewrite_expr_for_branch(copy.join_condition, br_alias, info);
+          }
+          br_sources.push_back(std::move(copy));
+        }
+      }
+      br_stmt->SetSources(std::move(br_sources));
+      std::vector<Expression> where_parts;
+      if (stmt->WhereClause() != nullptr) {
+        where_parts.push_back(
+            rewrite_expr_for_branch(stmt->WhereClause(), br_alias, info));
+      }
+      if (info.where_clause != nullptr) {
+        where_parts.push_back(
+            rewrite_branch_where(info.where_clause, br_alias, info));
+      }
+      for (auto& ep : extra_preds) {
+        where_parts.push_back(std::move(ep));
+      }
+      if (!where_parts.empty()) {
+        br_stmt->SetWhereClause(CombineAndConjuncts(where_parts));
+      }
+      if (!rewrite_ok) return changed;
+      built_branches.push_back(std::move(br_stmt));
+    }
+
+    auto union_sub = built_branches[0];
+    for (size_t bi = 1; bi < built_branches.size(); ++bi) {
+      union_sub->AddUnionAll(built_branches[bi]);
+    }
+    const std::string wrap_alias = "__dg_union";
+    std::vector<NamedExpression> outer_select;
+    outer_select.reserve(out_specs.size());
+    for (size_t si = 0; si < out_specs.size(); ++si) {
+      if (!out_specs[si].is_agg) {
+        outer_select.emplace_back(
+            out_specs[si].out_name,
+            ColumnValueExp(ColumnName(
+                wrap_alias,
+                "__dg_k" + std::to_string(out_specs[si].group_idx))));
+      } else {
+        outer_select.emplace_back(
+            out_specs[si].out_name,
+            std::make_shared<AggregateExpression>(
+                out_specs[si].agg_type,
+                ColumnValueExp(
+                    ColumnName(wrap_alias, "__dg_a" + std::to_string(si))),
+                false));
+      }
+    }
+    std::vector<Expression> outer_group_by;
+    outer_group_by.reserve(group_cols.size());
+    for (size_t gi = 0; gi < group_cols.size(); ++gi) {
+      outer_group_by.push_back(ColumnValueExp(
+          ColumnName(wrap_alias, "__dg_k" + std::to_string(gi))));
+    }
+    if (u_src.query == nullptr && !u_src.table.empty()) {
+      consumed_ctes.insert(AsciiLower(u_src.table));
+    }
+    stmt->SetSelectList(std::move(outer_select));
+    stmt->SetSources({SelectSource("", wrap_alias, std::move(union_sub),
+                                   JoinType::kCross, nullptr)});
+    stmt->SetWhereClause(nullptr);
+    stmt->SetGroupBy(std::move(outer_group_by));
+    return true;
+  };
+
+  std::unordered_map<std::string, const SelectStatement*> empty_env;
+  const bool did_rewrite = rewrite_one(root, empty_env);
+  if (did_rewrite && !consumed_ctes.empty() && !root->WithQueries().empty()) {
+    std::unordered_set<std::string> live_refs;
+    std::function<void(const Expression&)> walk_expr =
+        [&](const Expression& e) {
+          if (!e) return;
+          if (e->Type() == TypeTag::kQueryExp) {
+            const auto& qe = e->AsQueryExpression();
+            if (qe.Query() != nullptr) {
+              // Conservative: mark all consumed_ctes as live if any subquery
+              // exists in an expression we don't recursively inspect deeply.
+              for (const std::string& c : consumed_ctes) {
+                live_refs.insert(c);
+              }
+            }
+          }
+          for (const Expression& ch : ExpressionChildren(e)) walk_expr(ch);
+        };
+    std::function<void(const SelectStatement*)> walk_stmt =
+        [&](const SelectStatement* s) {
+          if (s == nullptr) return;
+          for (const SelectSource& src : s->Sources()) {
+            if (src.query != nullptr) {
+              walk_stmt(src.query.get());
+            } else if (!src.table.empty()) {
+              live_refs.insert(AsciiLower(src.table));
+            }
+            walk_expr(src.join_condition);
+          }
+          for (const auto& br : s->UnionAll()) {
+            walk_stmt(br.get());
+          }
+          if (const auto& tree = s->GetSetOperationTree(); tree != nullptr) {
+            walk_stmt(tree->first.get());
+            for (const auto& br : tree->branches) {
+              walk_stmt(br.get());
+            }
+          }
+          for (const NamedExpression& ne : s->SelectList()) {
+            walk_expr(ne.expression);
+          }
+          walk_expr(s->WhereClause());
+          walk_expr(s->Having());
+          walk_expr(s->Qualify());
+        };
+    walk_stmt(root);
+    for (const auto& [wname, wbody] : root->WithQueries()) {
+      if (!consumed_ctes.contains(AsciiLower(wname))) {
+        walk_stmt(wbody.get());
+      }
+    }
+    std::vector<std::string> to_remove;
+    for (const auto& [wname, wbody] : root->WithQueries()) {
+      (void)wbody;
+      const std::string low = AsciiLower(wname);
+      if (consumed_ctes.contains(low) && !live_refs.contains(low) &&
+          !root->IsRecursiveWith(wname)) {
+        to_remove.push_back(wname);
+      }
+    }
+    for (const std::string& wname : to_remove) {
+      root->RemoveWithQuery(wname);
+    }
+  }
+  return did_rewrite;
+}
+
+bool PushTransitiveGroupedSubqueryDimSemiFilter(SelectStatement* root,
+                                                TransactionContext& ctx) {
+  if (root == nullptr) {
+    return false;
+  }
+  auto has_bad_node = [](const Expression& e) -> bool {
+    bool bad = false;
+    std::function<void(const Expression&)> walk = [&](const Expression& node) {
+      if (!node || bad) return;
+      if (node->Type() == TypeTag::kQueryExp ||
+          node->Type() == TypeTag::kAggregateExp ||
+          node->Type() == TypeTag::kWindowFunctionExp) {
+        bad = true;
+        return;
+      }
+      for (const Expression& ch : ExpressionChildren(node)) walk(ch);
+    };
+    walk(e);
+    return bad;
+  };
+  auto map_expr = [](const Expression& root_e, auto&& fn) -> Expression {
+    std::function<Expression(const Expression&)> rec =
+        [&](const Expression& node) -> Expression {
+      if (!node) return nullptr;
+      std::vector<Expression> children = ExpressionChildren(node);
+      bool ch_changed = false;
+      for (Expression& ch : children) {
+        Expression next = rec(ch);
+        if (next.get() != ch.get()) {
+          ch_changed = true;
+          ch = std::move(next);
+        }
+      }
+      Expression rebuilt =
+          ch_changed ? WithExpressionChildren(node, std::move(children)) : node;
+      return fn(rebuilt);
+    };
+    return rec(root_e);
+  };
+
+  // Count CTE references across `root` so we only restrict single-use CTEs
+  // here (shared CTEs are handled by PushSharedGroupedCteKeyRestrictions).
+  std::unordered_map<std::string, size_t> cte_ref_counts;
+  {
+    std::function<void(const SelectStatement*)> count_refs =
+        [&](const SelectStatement* s) {
+          if (s == nullptr) return;
+          for (const auto& [wn, wb] : s->WithQueries()) {
+            (void)wn;
+            count_refs(wb.get());
+          }
+          for (const SelectSource& src : s->Sources()) {
+            if (src.query != nullptr) {
+              count_refs(src.query.get());
+            } else if (!src.table.empty()) {
+              ++cte_ref_counts[AsciiLower(src.table)];
+            }
+          }
+          for (const auto& br : s->UnionAll()) {
+            count_refs(br.get());
+          }
+          if (const auto& tree = s->GetSetOperationTree(); tree != nullptr) {
+            count_refs(tree->first.get());
+            for (const auto& br : tree->branches) {
+              count_refs(br.get());
+            }
+          }
+        };
+    count_refs(root);
+  }
+
+  std::function<bool(SelectStatement*,
+                     const std::unordered_map<std::string, SelectStatement*>&)>
+      process_stmt =
+          [&](SelectStatement* stmt,
+              const std::unordered_map<std::string, SelectStatement*>& cte_env)
+      -> bool {
+    if (stmt == nullptr) return false;
+    bool changed = false;
+    auto local_env = cte_env;
+    for (const std::string& wn : stmt->WithQueryOrder()) {
+      auto it = stmt->WithQueries().find(wn);
+      if (it != stmt->WithQueries().end() && it->second != nullptr) {
+        if (process_stmt(it->second.get(), local_env)) {
+          changed = true;
+        }
+        if (!stmt->IsRecursiveWith(wn)) {
+          local_env[AsciiLower(wn)] = it->second.get();
+        }
+      }
+    }
+    for (const auto& br : stmt->UnionAll()) {
+      if (br != nullptr && process_stmt(br.get(), local_env)) {
+        changed = true;
+      }
+    }
+    for (const auto& src : stmt->Sources()) {
+      if (src.query != nullptr && process_stmt(src.query.get(), local_env)) {
+        changed = true;
+      }
+    }
+    if (stmt->Sources().size() < 2) {
+      return changed;
+    }
+    for (const SelectSource& src : stmt->Sources()) {
+      if ((src.join_type != JoinType::kCross &&
+           src.join_type != JoinType::kInner) ||
+          src.unnest || src.is_lateral || src.sample || src.from_nested_join ||
+          !src.using_columns.empty()) {
+        return changed;
+      }
+    }
+
+    const size_t nsrc = stmt->Sources().size();
+    struct SrcMeta {
+      std::string alias_low;
+      std::string table_low;
+      std::shared_ptr<Table> base_table;
+      SelectStatement* grouped_target{nullptr};
+      SelectStatement* union_target{nullptr};
+      std::unordered_map<std::string, std::string> cols;  // low -> canon
+    };
+    std::vector<SrcMeta> metas(nsrc);
+    for (size_t i = 0; i < nsrc; ++i) {
+      const SelectSource& src = stmt->Sources()[i];
+      metas[i].alias_low =
+          AsciiLower(src.alias.empty() ? src.table : src.alias);
+      metas[i].table_low = AsciiLower(src.table);
+      if (src.query != nullptr) {
+        SelectStatement* q = src.query.get();
+        if (!q->GroupBy().empty() && !q->Distinct() && !q->HasDistinctOn() &&
+            !q->HasLimit() && q->Offset() == 0 && q->UnionAll().empty() &&
+            q->GetSetOperationTree() == nullptr && q->WithQueries().empty()) {
+          metas[i].grouped_target = q;
+        } else if ((!q->UnionAll().empty() ||
+                    q->GetSetOperationTree() != nullptr) &&
+                   !q->HasLimit() && q->Offset() == 0 &&
+                   q->WithQueries().empty()) {
+          metas[i].union_target = q;
+        }
+        for (const NamedExpression& ne : q->SelectList()) {
+          std::string nm = ne.name;
+          if (nm.empty() && ne.expression &&
+              ne.expression->Type() == TypeTag::kColumnValue) {
+            nm = ne.expression->AsColumnValue().GetColumnName().name;
+          }
+          if (!nm.empty() && nm != "*") {
+            metas[i].cols[AsciiLower(nm)] = nm;
+          }
+        }
+      } else if (!src.table.empty()) {
+        auto cit = local_env.find(metas[i].table_low);
+        if (cit != local_env.end() && cit->second != nullptr) {
+          SelectStatement* q = cit->second;
+          if (cte_ref_counts[metas[i].table_low] == 1 &&
+              !q->GroupBy().empty() && !q->Distinct() && !q->HasDistinctOn() &&
+              !q->HasLimit() && q->Offset() == 0 && q->UnionAll().empty() &&
+              q->GetSetOperationTree() == nullptr && q->WithQueries().empty()) {
+            metas[i].grouped_target = q;
+          }
+          for (const NamedExpression& ne : q->SelectList()) {
+            std::string nm = ne.name;
+            if (nm.empty() && ne.expression &&
+                ne.expression->Type() == TypeTag::kColumnValue) {
+              nm = ne.expression->AsColumnValue().GetColumnName().name;
+            }
+            if (!nm.empty() && nm != "*") {
+              metas[i].cols[AsciiLower(nm)] = nm;
+            }
+          }
+        } else {
+          StatusOr<std::shared_ptr<Table>> t = ctx.GetTable(src.table);
+          if (t.HasValue() && t.Value() != nullptr) {
+            metas[i].base_table = t.Value();
+            const Schema& sc = t.Value()->GetSchema();
+            for (size_t c = 0; c < sc.ColumnCount(); ++c) {
+              const std::string& cname = sc.GetColumn(c).Name().name;
+              metas[i].cols[AsciiLower(cname)] = cname;
+            }
+          }
+        }
+      }
+    }
+
+    auto resolve_col = [&](const ColumnName& cn, size_t* src_out,
+                           std::string* col_low_out) -> bool {
+      const std::string nlow = AsciiLower(cn.name);
+      if (nlow.empty() || nlow == "*") return false;
+      const std::string slow = AsciiLower(cn.schema);
+      size_t hits = 0;
+      size_t hit_idx = 0;
+      for (size_t i = 0; i < nsrc; ++i) {
+        if (!slow.empty() && slow != metas[i].alias_low &&
+            slow != metas[i].table_low) {
+          continue;
+        }
+        if (metas[i].cols.contains(nlow)) {
+          hit_idx = i;
+          ++hits;
+        }
+      }
+      if (hits != 1) return false;
+      *src_out = hit_idx;
+      *col_low_out = nlow;
+      return true;
+    };
+
+    std::vector<Expression> conjs = SplitAndConjuncts(stmt->WhereClause());
+    for (const SelectSource& src : stmt->Sources()) {
+      if (src.join_condition != nullptr) {
+        for (Expression& jc : SplitAndConjuncts(src.join_condition)) {
+          conjs.push_back(std::move(jc));
+        }
+      }
+    }
+
+    // Union-Find over `(src_idx, col_low)` equality keys.
+    std::unordered_map<std::string, size_t> node_id;
+    std::vector<std::pair<size_t, std::string>> node_info;
+    std::vector<size_t> uf_parent;
+    auto get_node = [&](size_t sidx, const std::string& clow) -> size_t {
+      const std::string key = std::to_string(sidx) + ":" + clow;
+      auto [it, ins] = node_id.emplace(key, node_info.size());
+      if (ins) {
+        node_info.emplace_back(sidx, clow);
+        uf_parent.push_back(it->second);
+      }
+      return it->second;
+    };
+    auto uf_find = [&](size_t x) -> size_t {
+      while (uf_parent[x] != x) {
+        uf_parent[x] = uf_parent[uf_parent[x]];
+        x = uf_parent[x];
+      }
+      return x;
+    };
+    auto uf_union = [&](size_t a, size_t b) {
+      a = uf_find(a);
+      b = uf_find(b);
+      if (a != b) uf_parent[a] = b;
+    };
+
+    std::vector<std::vector<Expression>> dim_local_preds(nsrc);
+    for (const Expression& c : conjs) {
+      if (!c || has_bad_node(c)) continue;
+      if (c->Type() == TypeTag::kBinaryExp &&
+          c->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+        const Expression& l = c->AsBinaryExpression().Left();
+        const Expression& r = c->AsBinaryExpression().Right();
+        if (l && r && l->Type() == TypeTag::kColumnValue &&
+            r->Type() == TypeTag::kColumnValue) {
+          size_t ls = 0;
+          size_t rs = 0;
+          std::string lc;
+          std::string rc;
+          if (resolve_col(l->AsColumnValue().GetColumnName(), &ls, &lc) &&
+              resolve_col(r->AsColumnValue().GetColumnName(), &rs, &rc)) {
+            uf_union(get_node(ls, lc), get_node(rs, rc));
+            continue;
+          }
+        }
+      }
+      // Single-source local predicate?
+      const auto touched = c->TouchedColumns();
+      if (touched.empty()) continue;
+      size_t only_src = nsrc;
+      bool single_ok = true;
+      for (const ColumnName& cn : touched) {
+        size_t sidx = 0;
+        std::string clow;
+        if (!resolve_col(cn, &sidx, &clow)) {
+          single_ok = false;
+          break;
+        }
+        if (only_src == nsrc) {
+          only_src = sidx;
+        } else if (only_src != sidx) {
+          single_ok = false;
+          break;
+        }
+      }
+      if (single_ok && only_src < nsrc &&
+          metas[only_src].base_table != nullptr &&
+          metas[only_src].base_table->BackingColumnarRowCount() <= 250000) {
+        dim_local_preds[only_src].push_back(c);
+      }
+    }
+
+    // Try pushing a selective dimension semi-filter into each grouped target.
+    for (size_t g_idx = 0; g_idx < nsrc; ++g_idx) {
+      SelectStatement* g = metas[g_idx].grouped_target;
+      if (g == nullptr) continue;
+      bool g_sources_ok = !g->Sources().empty();
+      bool g_has_large_table = false;
+      std::vector<std::shared_ptr<Table>> g_tables(g->Sources().size());
+      for (size_t gi = 0; gi < g->Sources().size(); ++gi) {
+        const SelectSource& gs = g->Sources()[gi];
+        if ((gs.join_type != JoinType::kCross &&
+             gs.join_type != JoinType::kInner) ||
+            gs.unnest || gs.is_lateral || gs.sample || gs.from_nested_join ||
+            !gs.using_columns.empty()) {
+          g_sources_ok = false;
+          break;
+        }
+        if (gs.query == nullptr && !gs.table.empty()) {
+          StatusOr<std::shared_ptr<Table>> gt = ctx.GetTable(gs.table);
+          if (gt.HasValue() && gt.Value() != nullptr) {
+            g_tables[gi] = gt.Value();
+            if (gt.Value()->BackingColumnarRowCount() >= 200000) {
+              g_has_large_table = true;
+            }
+          }
+        }
+      }
+      if (!g_sources_ok || !g_has_large_table) continue;
+
+      // Map GROUP BY column names inside `g` to their output names.
+      for (const Expression& ge : g->GroupBy()) {
+        if (!ge || ge->Type() != TypeTag::kColumnValue) continue;
+        const ColumnName& gk_cn = ge->AsColumnValue().GetColumnName();
+        const std::string gk_low = AsciiLower(gk_cn.name);
+        std::string g_out_low;
+        for (const NamedExpression& ne : g->SelectList()) {
+          if (ne.expression && ne.expression->Type() == TypeTag::kColumnValue) {
+            const ColumnName& scn =
+                ne.expression->AsColumnValue().GetColumnName();
+            if (AsciiLower(scn.name) == gk_low &&
+                (gk_cn.schema.empty() || scn.schema.empty() ||
+                 AsciiLower(gk_cn.schema) == AsciiLower(scn.schema))) {
+              g_out_low = AsciiLower(ne.name.empty() ? scn.name : ne.name);
+              break;
+            }
+          }
+        }
+        if (g_out_low.empty()) continue;
+        const std::string g_node_key = std::to_string(g_idx) + ":" + g_out_low;
+        auto nit = node_id.find(g_node_key);
+        if (nit == node_id.end()) continue;
+        const size_t root_id = uf_find(nit->second);
+
+        // Find a selective dimension table in the same equivalence class.
+        size_t best_d = nsrc;
+        std::string best_d_col;
+        for (size_t nid = 0; nid < node_info.size(); ++nid) {
+          if (uf_find(nid) != root_id) continue;
+          const size_t cand_s = node_info[nid].first;
+          if (cand_s == g_idx || metas[cand_s].base_table == nullptr ||
+              dim_local_preds[cand_s].empty()) {
+            continue;
+          }
+          const std::string& clow = node_info[nid].second;
+          auto col_it = metas[cand_s].cols.find(clow);
+          if (col_it == metas[cand_s].cols.end()) continue;
+          const Schema& dsc = metas[cand_s].base_table->GetSchema();
+          const int doff = dsc.Offset(ColumnName("", col_it->second));
+          if (doff < 0) continue;
+          const Column& dc = dsc.GetColumn(static_cast<size_t>(doff));
+          if (dc.IsUnsigned() || (dc.Type() != ValueType::kInt64 &&
+                                  dc.Type() != ValueType::kDate)) {
+            continue;
+          }
+          best_d = cand_s;
+          best_d_col = col_it->second;
+          break;
+        }
+        if (best_d >= nsrc) continue;
+
+        // Collect all inner columns of `g` equal to `gk_cn` (including
+        // equi-join partners inside `g->WhereClause()`).
+        auto resolve_g_col = [&](const ColumnName& cn,
+                                 ColumnName* out) -> bool {
+          const std::string nl = AsciiLower(cn.name);
+          const std::string sl = AsciiLower(cn.schema);
+          size_t hits = 0;
+          ColumnName found;
+          for (size_t gi = 0; gi < g->Sources().size(); ++gi) {
+            if (g_tables[gi] == nullptr) continue;
+            const SelectSource& gs = g->Sources()[gi];
+            const std::string gal = gs.alias.empty() ? gs.table : gs.alias;
+            if (!sl.empty() && sl != AsciiLower(gal) &&
+                sl != AsciiLower(gs.table)) {
+              continue;
+            }
+            const Schema& gsc = g_tables[gi]->GetSchema();
+            for (size_t c = 0; c < gsc.ColumnCount(); ++c) {
+              if (AsciiLower(gsc.GetColumn(c).Name().name) == nl) {
+                found = ColumnName(gal, gsc.GetColumn(c).Name().name);
+                ++hits;
+                break;
+              }
+            }
+          }
+          if (hits != 1) return false;
+          *out = std::move(found);
+          return true;
+        };
+
+        ColumnName root_g_col;
+        if (!resolve_g_col(gk_cn, &root_g_col)) continue;
+        std::vector<ColumnName> target_g_cols = {root_g_col};
+        std::vector<Expression> g_conjs = SplitAndConjuncts(g->WhereClause());
+        for (const SelectSource& gs : g->Sources()) {
+          if (gs.join_condition != nullptr) {
+            for (Expression& jc : SplitAndConjuncts(gs.join_condition)) {
+              g_conjs.push_back(std::move(jc));
+            }
+          }
+        }
+        // Skip if `g` already has an IN-subquery on `root_g_col`.
+        bool already_filtered = false;
+        for (const Expression& gc : g_conjs) {
+          if (gc && gc->Type() == TypeTag::kQueryExp) {
+            const auto& qe = gc->AsQueryExpression();
+            if (!qe.Exists() && !qe.Negated() && qe.Test() &&
+                qe.Test()->Type() == TypeTag::kColumnValue) {
+              ColumnName tcn;
+              if (resolve_g_col(qe.Test()->AsColumnValue().GetColumnName(),
+                                &tcn) &&
+                  AsciiLower(tcn.schema) == AsciiLower(root_g_col.schema) &&
+                  AsciiLower(tcn.name) == AsciiLower(root_g_col.name)) {
+                already_filtered = true;
+                break;
+              }
+            }
+          }
+          if (gc && gc->Type() == TypeTag::kBinaryExp &&
+              gc->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+            const Expression& l = gc->AsBinaryExpression().Left();
+            const Expression& r = gc->AsBinaryExpression().Right();
+            if (l && r && l->Type() == TypeTag::kColumnValue &&
+                r->Type() == TypeTag::kColumnValue) {
+              ColumnName lcn;
+              ColumnName rcn;
+              if (resolve_g_col(l->AsColumnValue().GetColumnName(), &lcn) &&
+                  resolve_g_col(r->AsColumnValue().GetColumnName(), &rcn)) {
+                auto same_col = [](const ColumnName& a, const ColumnName& b) {
+                  return AsciiLower(a.schema) == AsciiLower(b.schema) &&
+                         AsciiLower(a.name) == AsciiLower(b.name);
+                };
+                if (same_col(lcn, root_g_col) && !same_col(rcn, root_g_col)) {
+                  target_g_cols.push_back(rcn);
+                } else if (same_col(rcn, root_g_col) &&
+                           !same_col(lcn, root_g_col)) {
+                  target_g_cols.push_back(lcn);
+                }
+              }
+            }
+          }
+        }
+        if (already_filtered) continue;
+
+        const std::string sub_alias = "__tsf_d";
+        std::vector<Expression> sub_preds;
+        sub_preds.reserve(dim_local_preds[best_d].size());
+        for (const Expression& dp : dim_local_preds[best_d]) {
+          sub_preds.push_back(map_expr(dp, [&](const Expression& node) {
+            if (node->Type() == TypeTag::kColumnValue) {
+              const ColumnName& cn = node->AsColumnValue().GetColumnName();
+              return ColumnValueExp(ColumnName(sub_alias, cn.name));
+            }
+            return node;
+          }));
+        }
+        std::vector<Expression> new_g_where;
+        if (g->WhereClause() != nullptr) {
+          new_g_where.push_back(g->WhereClause());
+        }
+        for (const ColumnName& tcol : target_g_cols) {
+          auto in_sub = std::make_shared<SelectStatement>();
+          in_sub->SetSources(
+              {SelectSource(stmt->Sources()[best_d].table, sub_alias, nullptr,
+                            JoinType::kCross, nullptr)});
+          in_sub->SetWhereClause(CombineAndConjuncts(sub_preds));
+          in_sub->SetSelectList({NamedExpression(
+              "", ColumnValueExp(ColumnName(sub_alias, best_d_col)))});
+          new_g_where.push_back(QueryExpressionExp(
+              std::move(in_sub), ColumnValueExp(tcol), /*exists=*/false,
+              /*negated=*/false));
+        }
+        g->SetWhereClause(CombineAndConjuncts(new_g_where));
+        changed = true;
+      }
+    }
+
+    // Also push selective dimension semi-filters into non-grouped UNION ALL /
+    // UNION DISTINCT derived tables (e.g. TPC-DS Q71: item.i_manager_id = 1
+    // and time_dim.t_meal_time IN (...) pushed into 3-way UNION ALL).
+    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    //   (union_semi_filter_pushdown_sound)
+    for (size_t u_idx = 0; u_idx < nsrc; ++u_idx) {
+      SelectStatement* u = metas[u_idx].union_target;
+      if (u == nullptr) continue;
+      std::vector<SelectStatement*> leaves;
+      auto collect_union_leaves = [&](auto& self, SelectStatement* s) -> bool {
+        if (s == nullptr) return false;
+        if (const auto& tree = s->GetSetOperationTree(); tree != nullptr) {
+          for (SetOperationKind k : tree->kinds) {
+            if (k != SetOperationKind::kUnionAll &&
+                k != SetOperationKind::kUnion) {
+              return false;
+            }
+          }
+          if (!self(self, tree->first.get())) return false;
+          for (const auto& br : tree->branches) {
+            if (!self(self, br.get())) return false;
+          }
+          return true;
+        }
+        if (s->UnionAll().empty()) {
+          leaves.push_back(s);
+          return true;
+        }
+        for (size_t k = 0; k < s->SetOperationKinds().size(); ++k) {
+          if (s->SetOperationKinds()[k] != SetOperationKind::kUnionAll &&
+              s->SetOperationKinds()[k] != SetOperationKind::kUnion) {
+            return false;
+          }
+        }
+        leaves.push_back(s);
+        for (const auto& br : s->UnionAll()) {
+          if (!self(self, br.get())) return false;
+        }
+        return true;
+      };
+      if (!collect_union_leaves(collect_union_leaves, u) || leaves.size() < 2) {
+        continue;
+      }
+      const size_t n_cols = leaves[0]->SelectList().size();
+      bool all_leaves_ok = (n_cols > 0);
+      bool any_large_table = false;
+      std::vector<std::vector<std::shared_ptr<Table>>> leaf_tables(
+          leaves.size());
+      for (size_t li = 0; li < leaves.size() && all_leaves_ok; ++li) {
+        SelectStatement* br = leaves[li];
+        if (!br->GroupBy().empty() || br->IsGroupAll() || br->Having() ||
+            br->HasLimit() || br->Offset() != 0 || !br->OrderBy().empty() ||
+            br->Qualify() || br->WithTies() || !br->WithQueries().empty() ||
+            br->SelectList().size() != n_cols || br->Sources().empty()) {
+          all_leaves_ok = false;
+          break;
+        }
+        leaf_tables[li].resize(br->Sources().size());
+        for (size_t si = 0; si < br->Sources().size(); ++si) {
+          const SelectSource& bs = br->Sources()[si];
+          if ((bs.join_type != JoinType::kCross &&
+               bs.join_type != JoinType::kInner) ||
+              bs.query != nullptr || bs.table.empty() || bs.unnest ||
+              bs.is_lateral || bs.sample || bs.from_nested_join) {
+            all_leaves_ok = false;
+            break;
+          }
+          StatusOr<std::shared_ptr<Table>> bt = ctx.GetTable(bs.table);
+          if (!bt.HasValue() || bt.Value() == nullptr) {
+            all_leaves_ok = false;
+            break;
+          }
+          leaf_tables[li][si] = bt.Value();
+          if (bt.Value()->BackingColumnarRowCount() >= 200000) {
+            any_large_table = true;
+          }
+        }
+      }
+      if (!all_leaves_ok || !any_large_table) continue;
+
+      for (size_t ci = 0; ci < n_cols; ++ci) {
+        const NamedExpression& ne0 = leaves[0]->SelectList()[ci];
+        std::string out_nm = ne0.name;
+        if (out_nm.empty() && ne0.expression &&
+            ne0.expression->Type() == TypeTag::kColumnValue) {
+          out_nm = ne0.expression->AsColumnValue().GetColumnName().name;
+        }
+        if (out_nm.empty() || out_nm == "*") continue;
+        const std::string out_low = AsciiLower(out_nm);
+        const std::string u_node_key = std::to_string(u_idx) + ":" + out_low;
+        auto nit = node_id.find(u_node_key);
+        if (nit == node_id.end()) continue;
+        const size_t root_id = uf_find(nit->second);
+
+        size_t best_d = nsrc;
+        std::string best_d_col;
+        for (size_t nid = 0; nid < node_info.size(); ++nid) {
+          if (uf_find(nid) != root_id) continue;
+          const size_t cand_s = node_info[nid].first;
+          if (cand_s == u_idx || metas[cand_s].base_table == nullptr ||
+              dim_local_preds[cand_s].empty()) {
+            continue;
+          }
+          const std::string& clow = node_info[nid].second;
+          auto col_it = metas[cand_s].cols.find(clow);
+          if (col_it == metas[cand_s].cols.end()) continue;
+          const Schema& dsc = metas[cand_s].base_table->GetSchema();
+          const int doff = dsc.Offset(ColumnName("", col_it->second));
+          if (doff < 0) continue;
+          const Column& dc = dsc.GetColumn(static_cast<size_t>(doff));
+          if (dc.IsUnsigned() || (dc.Type() != ValueType::kInt64 &&
+                                  dc.Type() != ValueType::kDate)) {
+            continue;
+          }
+          best_d = cand_s;
+          best_d_col = col_it->second;
+          break;
+        }
+        if (best_d >= nsrc) continue;
+
+        std::vector<ColumnName> leaf_cols;
+        leaf_cols.reserve(leaves.size());
+        bool cols_ok = true;
+        for (size_t li = 0; li < leaves.size(); ++li) {
+          const Expression& bexpr = leaves[li]->SelectList()[ci].expression;
+          if (!bexpr || bexpr->Type() != TypeTag::kColumnValue) {
+            cols_ok = false;
+            break;
+          }
+          const ColumnName& bcn = bexpr->AsColumnValue().GetColumnName();
+          const std::string nl = AsciiLower(bcn.name);
+          const std::string sl = AsciiLower(bcn.schema);
+          size_t hits = 0;
+          ColumnName resolved;
+          for (size_t si = 0; si < leaves[li]->Sources().size(); ++si) {
+            const SelectSource& bs = leaves[li]->Sources()[si];
+            const std::string bal = bs.alias.empty() ? bs.table : bs.alias;
+            if (!sl.empty() && sl != AsciiLower(bal) &&
+                sl != AsciiLower(bs.table)) {
+              continue;
+            }
+            const Schema& bsc = leaf_tables[li][si]->GetSchema();
+            for (size_t k = 0; k < bsc.ColumnCount(); ++k) {
+              if (AsciiLower(bsc.GetColumn(k).Name().name) == nl) {
+                resolved = ColumnName(bal, bsc.GetColumn(k).Name().name);
+                ++hits;
+                break;
+              }
+            }
+          }
+          if (hits != 1) {
+            cols_ok = false;
+            break;
+          }
+          // Skip if leaf already has an IN-subquery on this column.
+          for (const Expression& lc :
+               SplitAndConjuncts(leaves[li]->WhereClause())) {
+            if (lc && lc->Type() == TypeTag::kQueryExp) {
+              const auto& qe = lc->AsQueryExpression();
+              if (!qe.Exists() && !qe.Negated() && qe.Test() &&
+                  qe.Test()->Type() == TypeTag::kColumnValue) {
+                const ColumnName& tcn =
+                    qe.Test()->AsColumnValue().GetColumnName();
+                if (AsciiLower(tcn.name) == AsciiLower(resolved.name) &&
+                    (tcn.schema.empty() ||
+                     AsciiLower(tcn.schema) == AsciiLower(resolved.schema))) {
+                  cols_ok = false;
+                  break;
+                }
+              }
+            }
+          }
+          if (!cols_ok) break;
+          leaf_cols.push_back(std::move(resolved));
+        }
+        if (!cols_ok) continue;
+
+        const std::string sub_alias = "__tsf_ud";
+        std::vector<Expression> sub_preds;
+        sub_preds.reserve(dim_local_preds[best_d].size());
+        for (const Expression& dp : dim_local_preds[best_d]) {
+          sub_preds.push_back(map_expr(dp, [&](const Expression& node) {
+            if (node->Type() == TypeTag::kColumnValue) {
+              const ColumnName& cn = node->AsColumnValue().GetColumnName();
+              return ColumnValueExp(ColumnName(sub_alias, cn.name));
+            }
+            return node;
+          }));
+        }
+        for (size_t li = 0; li < leaves.size(); ++li) {
+          auto in_sub = std::make_shared<SelectStatement>();
+          in_sub->SetSources(
+              {SelectSource(stmt->Sources()[best_d].table, sub_alias, nullptr,
+                            JoinType::kCross, nullptr)});
+          in_sub->SetWhereClause(CombineAndConjuncts(sub_preds));
+          in_sub->SetSelectList({NamedExpression(
+              "", ColumnValueExp(ColumnName(sub_alias, best_d_col)))});
+          Expression in_pred = QueryExpressionExp(
+              std::move(in_sub), ColumnValueExp(leaf_cols[li]),
+              /*exists=*/false, /*negated=*/false);
+          leaves[li]->SetWhereClause(
+              leaves[li]->WhereClause()
+                  ? BinaryExpressionExp(leaves[li]->WhereClause(),
+                                        BinaryOperation::kAnd,
+                                        std::move(in_pred))
+                  : std::move(in_pred));
+        }
+        if (const auto& tree = u->GetSetOperationTree();
+            tree != nullptr && !tree->grouped && tree->first != nullptr &&
+            tree->first->UnionAll().empty() &&
+            tree->first->GetSetOperationTree() == nullptr) {
+          u->SetWhereClause(tree->first->WhereClause());
+        }
+        changed = true;
+      }
+    }
+    return changed;
+  };
+
+  std::unordered_map<std::string, SelectStatement*> empty_env;
+  return process_stmt(root, empty_env);
+}
+
+// Rewrites a single-pass self-correlated scalar AVG/SUM/MIN/MAX comparison
+// (e.g. TPC-DS Q32 / Q92:
+//   SELECT SUM(f.v) FROM F, D_item, D_date
+//   WHERE D_item.pk = F.fk AND D_date.pk = F.date_fk AND ...
+//     AND f.v > (SELECT 1.3 * AVG(f2.v) FROM F AS f2, D_date AS d2
+//                WHERE f2.fk = D_item.pk AND d2.pk = f2.date_fk AND ...))
+// into a single-pass window derived table `AVG(f.v) OVER (PARTITION BY F.fk)`
+// when `D_item.pk` is certified unique non-null and all non-correlated
+// predicates on `{F, D_date}` match identically between outer and subquery.
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (correlated_self_avg_to_window_sound)
+bool RewriteCorrelatedSelfAvgToWindow(SelectStatement* root,
+                                      TransactionContext& ctx) {
+  if (root == nullptr) {
+    return false;
+  }
+  auto has_bad_node = [](const Expression& root_expr) -> bool {
+    bool bad = false;
+    std::function<void(const Expression&)> walk = [&](const Expression& e) {
+      if (!e || bad) return;
+      if (e->Type() == TypeTag::kWindowFunctionExp ||
+          e->Type() == TypeTag::kQueryExp) {
+        bad = true;
+        return;
+      }
+      if (e->Type() == TypeTag::kConstantValue &&
+          dynamic_cast<const ParameterSlot*>(e.get()) != nullptr) {
+        bad = true;
+        return;
+      }
+      if (e->Type() == TypeTag::kFunctionCallExp &&
+          GetFunctionVolatility(e->AsFunctionCallExpression().FuncName()) !=
+              Volatility::kImmutable) {
+        bad = true;
+        return;
+      }
+      for (const Expression& ch : ExpressionChildren(e)) walk(ch);
+    };
+    walk(root_expr);
+    return bad;
+  };
+  auto map_expr = [](const Expression& root_expr,
+                     const std::function<Expression(const Expression&)>& fn) {
+    std::function<Expression(const Expression&)> rec =
+        [&](const Expression& e) -> Expression {
+      if (!e) return e;
+      Expression mapped = fn(e);
+      if (mapped.get() != e.get()) return mapped;
+      const std::vector<Expression> ch = ExpressionChildren(e);
+      if (ch.empty()) return e;
+      std::vector<Expression> next;
+      next.reserve(ch.size());
+      bool diff = false;
+      for (const Expression& c : ch) {
+        Expression mc = rec(c);
+        if (mc.get() != c.get()) diff = true;
+        next.push_back(std::move(mc));
+      }
+      return diff ? WithExpressionChildren(e, std::move(next)) : e;
+    };
+    return rec(root_expr);
+  };
+
+  if (root->Sources().size() < 2 || !root->GroupBy().empty() ||
+      root->Distinct() || root->HasDistinctOn() || root->Having() ||
+      root->Qualify() || !root->UnionAll().empty() ||
+      root->GetSetOperationTree() != nullptr || !root->WithQueries().empty() ||
+      root->ForUpdate() || root->WhereClause() == nullptr) {
+    return false;
+  }
+  const size_t nsrc = root->Sources().size();
+  std::vector<std::shared_ptr<Table>> outer_tables(nsrc);
+  std::vector<std::string> outer_alias_low(nsrc);
+  std::vector<std::string> outer_table_low(nsrc);
+  for (size_t i = 0; i < nsrc; ++i) {
+    const SelectSource& src = root->Sources()[i];
+    if ((src.join_type != JoinType::kCross &&
+         src.join_type != JoinType::kInner) ||
+        src.query != nullptr || src.table.empty() || src.unnest ||
+        src.is_lateral || src.sample || src.from_nested_join ||
+        !src.using_columns.empty() || src.join_condition != nullptr) {
+      return false;
+    }
+    StatusOr<std::shared_ptr<Table>> t = ctx.GetTable(src.table);
+    if (!t.HasValue() || t.Value() == nullptr) {
+      return false;
+    }
+    outer_tables[i] = t.Value();
+    outer_alias_low[i] = AsciiLower(src.alias.empty() ? src.table : src.alias);
+    outer_table_low[i] = AsciiLower(src.table);
+  }
+  auto resolve_in = [&](const std::vector<std::shared_ptr<Table>>& tbls,
+                        const std::vector<std::string>& alows,
+                        const std::vector<std::string>& tlows,
+                        const ColumnName& cn, size_t* src_out,
+                        std::string* col_canon_out) -> bool {
+    const std::string nl = AsciiLower(cn.name);
+    if (nl.empty() || nl == "*") return false;
+    const std::string sl = AsciiLower(cn.schema);
+    size_t hits = 0;
+    size_t hit_i = 0;
+    std::string hit_c;
+    for (size_t i = 0; i < tbls.size(); ++i) {
+      if (!sl.empty() && sl != alows[i] && sl != tlows[i]) continue;
+      const Schema& sc = tbls[i]->GetSchema();
+      for (size_t c = 0; c < sc.ColumnCount(); ++c) {
+        if (AsciiLower(sc.GetColumn(c).Name().name) == nl) {
+          hit_i = i;
+          hit_c = sc.GetColumn(c).Name().name;
+          ++hits;
+          break;
+        }
+      }
+    }
+    if (hits != 1) return false;
+    *src_out = hit_i;
+    *col_canon_out = std::move(hit_c);
+    return true;
+  };
+
+  std::vector<Expression> outer_conjs = SplitAndConjuncts(root->WhereClause());
+  // Find exactly one candidate subquery comparison conjunct.
+  for (size_t cj_idx = 0; cj_idx < outer_conjs.size(); ++cj_idx) {
+    const Expression& cj = outer_conjs[cj_idx];
+    if (!cj || cj->Type() != TypeTag::kBinaryExp) continue;
+    const auto& cmp = cj->AsBinaryExpression();
+    if (!IsStrictNullRejectingCompareOp(cmp.Op()) || !cmp.Left() ||
+        !cmp.Right()) {
+      continue;
+    }
+    bool sub_on_right = true;
+    Expression lhs_expr;
+    const QueryExpression* qexp = nullptr;
+    if (cmp.Left()->Type() == TypeTag::kColumnValue &&
+        cmp.Right()->Type() == TypeTag::kQueryExp) {
+      lhs_expr = cmp.Left();
+      qexp = &cmp.Right()->AsQueryExpression();
+      sub_on_right = true;
+    } else if (cmp.Right()->Type() == TypeTag::kColumnValue &&
+               cmp.Left()->Type() == TypeTag::kQueryExp) {
+      lhs_expr = cmp.Right();
+      qexp = &cmp.Left()->AsQueryExpression();
+      sub_on_right = false;
+    } else {
+      continue;
+    }
+    if (qexp->Exists() || qexp->Test() != nullptr || qexp->ArrayResult() ||
+        qexp->Query() == nullptr) {
+      continue;
+    }
+    const SelectStatement& sub = *qexp->Query();
+    if (sub.Sources().empty() || sub.Sources().size() >= nsrc ||
+        !sub.GroupBy().empty() || sub.IsGroupAll() || sub.Having() ||
+        sub.Qualify() || sub.Distinct() || sub.HasDistinctOn() ||
+        sub.HasLimit() || sub.Offset() != 0 || !sub.UnionAll().empty() ||
+        sub.GetSetOperationTree() != nullptr || !sub.WithQueries().empty() ||
+        sub.SelectList().size() != 1 || sub.WhereClause() == nullptr) {
+      continue;
+    }
+    const AggregateExpression* agg = nullptr;
+    Expression scale_const;
+    bool const_on_left = true;
+    if (!ExtractNullOnEmptyCorrelatedAggregate(sub.SelectList()[0].expression,
+                                               &agg, &scale_const,
+                                               &const_on_left) ||
+        agg == nullptr || !agg->Child() ||
+        agg->Child()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    std::string win_fn_name;
+    switch (agg->GetType()) {
+      case AggregationType::kAvg:
+        win_fn_name = "AVG";
+        break;
+      case AggregationType::kSum:
+        win_fn_name = "SUM";
+        break;
+      case AggregationType::kMin:
+        win_fn_name = "MIN";
+        break;
+      case AggregationType::kMax:
+        win_fn_name = "MAX";
+        break;
+      default:
+        continue;
+    }
+
+    // Map each subquery source 1-to-1 to an outer source with same base table.
+    const size_t nsub = sub.Sources().size();
+    std::vector<std::shared_ptr<Table>> sub_tables(nsub);
+    std::vector<std::string> sub_alias_low(nsub);
+    std::vector<std::string> sub_table_low(nsub);
+    std::vector<size_t> sub_to_outer(nsub, nsrc);
+    std::vector<bool> outer_in_sub(nsrc, false);
+    bool map_ok = true;
+    for (size_t si = 0; si < nsub; ++si) {
+      const SelectSource& ss = sub.Sources()[si];
+      if ((ss.join_type != JoinType::kCross &&
+           ss.join_type != JoinType::kInner) ||
+          ss.query != nullptr || ss.table.empty() || ss.unnest ||
+          ss.is_lateral || ss.sample || ss.from_nested_join ||
+          !ss.using_columns.empty() || ss.join_condition != nullptr) {
+        map_ok = false;
+        break;
+      }
+      StatusOr<std::shared_ptr<Table>> t = ctx.GetTable(ss.table);
+      if (!t.HasValue() || t.Value() == nullptr) {
+        map_ok = false;
+        break;
+      }
+      sub_tables[si] = t.Value();
+      sub_alias_low[si] = AsciiLower(ss.alias.empty() ? ss.table : ss.alias);
+      sub_table_low[si] = AsciiLower(ss.table);
+      size_t match_cnt = 0;
+      size_t match_oi = nsrc;
+      for (size_t oi = 0; oi < nsrc; ++oi) {
+        if (!outer_in_sub[oi] && outer_table_low[oi] == sub_table_low[si]) {
+          match_oi = oi;
+          ++match_cnt;
+        }
+      }
+      if (match_cnt != 1) {
+        map_ok = false;
+        break;
+      }
+      sub_to_outer[si] = match_oi;
+      outer_in_sub[match_oi] = true;
+    }
+    if (!map_ok) continue;
+
+    // Require exactly one outer-only source (e.g. `item`) for clarity & safety.
+    size_t dim_oi = nsrc;
+    size_t outer_only_cnt = 0;
+    for (size_t oi = 0; oi < nsrc; ++oi) {
+      if (!outer_in_sub[oi]) {
+        dim_oi = oi;
+        ++outer_only_cnt;
+      }
+    }
+    if (outer_only_cnt != 1) continue;
+
+    // Resolve agg column in sub.
+    size_t agg_sub_si = 0;
+    std::string agg_col_canon;
+    if (!resolve_in(sub_tables, sub_alias_low, sub_table_low,
+                    agg->Child()->AsColumnValue().GetColumnName(), &agg_sub_si,
+                    &agg_col_canon)) {
+      continue;
+    }
+    const size_t agg_outer_oi = sub_to_outer[agg_sub_si];
+
+    // Canonicalize an expression over sub or outer into string form using
+    // `(outer_src_idx, col_low)` so predicates can be compared identically.
+    auto canon_expr = [&](const Expression& e, bool is_sub,
+                          bool* ok_out) -> std::string {
+      *ok_out = true;
+      Expression rewritten = map_expr(e, [&](const Expression& node) {
+        if (node->Type() == TypeTag::kColumnValue) {
+          const ColumnName& cn = node->AsColumnValue().GetColumnName();
+          size_t si = 0;
+          std::string cc;
+          if (is_sub) {
+            if (!resolve_in(sub_tables, sub_alias_low, sub_table_low, cn, &si,
+                            &cc)) {
+              *ok_out = false;
+              return node;
+            }
+            return ColumnValueExp(ColumnName(
+                "__o" + std::to_string(sub_to_outer[si]), AsciiLower(cc)));
+          }
+          if (!resolve_in(outer_tables, outer_alias_low, outer_table_low, cn,
+                          &si, &cc)) {
+            *ok_out = false;
+            return node;
+          }
+          return ColumnValueExp(
+              ColumnName("__o" + std::to_string(si), AsciiLower(cc)));
+        }
+        return node;
+      });
+      if (!*ok_out) return {};
+      // Normalize commutative equality `a = b` vs `b = a`.
+      if (rewritten->Type() == TypeTag::kBinaryExp &&
+          rewritten->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+        const std::string ls =
+            rewritten->AsBinaryExpression().Left()->ToString();
+        const std::string rs =
+            rewritten->AsBinaryExpression().Right()->ToString();
+        return ls <= rs ? (ls + "=" + rs) : (rs + "=" + ls);
+      }
+      return rewritten->ToString();
+    };
+
+    // Inspect subquery conjuncts: expect 1 correlation equality `sub.fk =
+    // dim.pk` and all other conjuncts purely local to `sub`.
+    std::vector<Expression> sub_conjs = SplitAndConjuncts(sub.WhereClause());
+    bool corr_found = false;
+    size_t corr_fk_outer_oi = nsrc;
+    std::string corr_fk_col;
+    std::string corr_dim_pk_col;
+    std::unordered_set<std::string> sub_canon_preds;
+    bool sub_ok = true;
+    for (const Expression& sc : sub_conjs) {
+      if (!sc || has_bad_node(sc)) {
+        sub_ok = false;
+        break;
+      }
+      bool ok_local = false;
+      std::string cs = canon_expr(sc, /*is_sub=*/true, &ok_local);
+      if (ok_local) {
+        sub_canon_preds.insert(std::move(cs));
+        continue;
+      }
+      // Must be the single correlation equality `sub_col = dim_pk_col`.
+      if (corr_found || sc->Type() != TypeTag::kBinaryExp ||
+          sc->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+        sub_ok = false;
+        break;
+      }
+      const Expression& l = sc->AsBinaryExpression().Left();
+      const Expression& r = sc->AsBinaryExpression().Right();
+      if (!l || !r || l->Type() != TypeTag::kColumnValue ||
+          r->Type() != TypeTag::kColumnValue) {
+        sub_ok = false;
+        break;
+      }
+      size_t ls = 0;
+      size_t rs = 0;
+      std::string lc;
+      std::string rc;
+      const bool l_in_sub =
+          resolve_in(sub_tables, sub_alias_low, sub_table_low,
+                     l->AsColumnValue().GetColumnName(), &ls, &lc);
+      const bool r_in_sub =
+          resolve_in(sub_tables, sub_alias_low, sub_table_low,
+                     r->AsColumnValue().GetColumnName(), &rs, &rc);
+      if (l_in_sub == r_in_sub) {
+        sub_ok = false;
+        break;
+      }
+      size_t outer_s = 0;
+      std::string outer_c;
+      const ColumnName& o_cn = l_in_sub ? r->AsColumnValue().GetColumnName()
+                                        : l->AsColumnValue().GetColumnName();
+      if (!resolve_in(outer_tables, outer_alias_low, outer_table_low, o_cn,
+                      &outer_s, &outer_c) ||
+          outer_s != dim_oi) {
+        sub_ok = false;
+        break;
+      }
+      corr_found = true;
+      corr_fk_outer_oi = sub_to_outer[l_in_sub ? ls : rs];
+      corr_fk_col = l_in_sub ? lc : rc;
+      corr_dim_pk_col = outer_c;
+    }
+    if (!sub_ok || !corr_found) continue;
+
+    // Certify `dim_oi.corr_dim_pk_col` is unique non-null so joining `dim_oi`
+    // never duplicates any fact row.
+    const int pk_off = outer_tables[dim_oi]->GetSchema().Offset(
+        ColumnName("", corr_dim_pk_col));
+    if (pk_off < 0 ||
+        !IsColumnCertifiedUniqueNotNull(*outer_tables[dim_oi],
+                                        static_cast<slot_t>(pk_off), ctx)) {
+      continue;
+    }
+
+    // Verify outer conjuncts: every `sub_canon_preds` must be present in outer,
+    // the join `corr_fk_outer_oi.corr_fk_col = dim_oi.corr_dim_pk_col` must be
+    // present in outer, and any remaining outer conjunct must touch ONLY
+    // dim_oi.
+    std::string expected_dim_join_canon;
+    {
+      const std::string a = "__o" + std::to_string(corr_fk_outer_oi) + "." +
+                            AsciiLower(corr_fk_col);
+      const std::string b =
+          "__o" + std::to_string(dim_oi) + "." + AsciiLower(corr_dim_pk_col);
+      expected_dim_join_canon = a <= b ? (a + "=" + b) : (b + "=" + a);
+    }
+    std::unordered_set<std::string> matched_sub_preds;
+    bool found_dim_join = false;
+    bool outer_ok = true;
+    for (size_t oi_c = 0; oi_c < outer_conjs.size(); ++oi_c) {
+      if (oi_c == cj_idx) continue;
+      const Expression& oc = outer_conjs[oi_c];
+      if (!oc || has_bad_node(oc)) {
+        outer_ok = false;
+        break;
+      }
+      bool ok_c = false;
+      const std::string cs = canon_expr(oc, /*is_sub=*/false, &ok_c);
+      if (!ok_c) {
+        outer_ok = false;
+        break;
+      }
+      if (cs == expected_dim_join_canon) {
+        found_dim_join = true;
+        continue;
+      }
+      if (sub_canon_preds.contains(cs)) {
+        matched_sub_preds.insert(cs);
+        continue;
+      }
+      // Must touch ONLY `dim_oi`.
+      bool only_dim = true;
+      for (const ColumnName& cn : oc->TouchedColumns()) {
+        size_t s = 0;
+        std::string cc;
+        if (!resolve_in(outer_tables, outer_alias_low, outer_table_low, cn, &s,
+                        &cc) ||
+            s != dim_oi) {
+          only_dim = false;
+          break;
+        }
+      }
+      if (!only_dim) {
+        outer_ok = false;
+        break;
+      }
+    }
+    if (!outer_ok || !found_dim_join ||
+        matched_sub_preds.size() != sub_canon_preds.size()) {
+      continue;
+    }
+
+    // Collect all columns referenced by outer SelectList, OrderBy, and
+    // lhs_expr.
+    std::unordered_map<std::string, std::string> col_to_alias;
+    std::vector<NamedExpression> inner_select;
+    bool sel_ok = true;
+    auto register_col = [&](const ColumnName& cn) -> std::string {
+      size_t s = 0;
+      std::string cc;
+      if (!resolve_in(outer_tables, outer_alias_low, outer_table_low, cn, &s,
+                      &cc)) {
+        sel_ok = false;
+        return {};
+      }
+      const std::string key = std::to_string(s) + ":" + AsciiLower(cc);
+      auto [it, ins] = col_to_alias.emplace(
+          key, "__csa_c" + std::to_string(inner_select.size()));
+      if (ins) {
+        const SelectSource& ss = root->Sources()[s];
+        const std::string qual = ss.alias.empty() ? ss.table : ss.alias;
+        inner_select.emplace_back(it->second,
+                                  ColumnValueExp(ColumnName(qual, cc)));
+      }
+      return it->second;
+    };
+    const std::string sub_wrap_alias = "__csa_sub";
+    auto rewrite_outer_expr = [&](const Expression& e) -> Expression {
+      if (!e) return e;
+      if (has_bad_node(e)) {
+        sel_ok = false;
+        return e;
+      }
+      return map_expr(e, [&](const Expression& node) -> Expression {
+        if (node->Type() == TypeTag::kColumnValue) {
+          const std::string al =
+              register_col(node->AsColumnValue().GetColumnName());
+          if (!sel_ok) return node;
+          return ColumnValueExp(ColumnName(sub_wrap_alias, al));
+        }
+        return node;
+      });
+    };
+    const std::string lhs_alias =
+        register_col(lhs_expr->AsColumnValue().GetColumnName());
+    std::vector<NamedExpression> new_select;
+    new_select.reserve(root->SelectList().size());
+    for (const NamedExpression& ne : root->SelectList()) {
+      new_select.emplace_back(ne.name, rewrite_outer_expr(ne.expression));
+    }
+    auto new_order = root->OrderBy();
+    for (auto& ot : new_order) {
+      ot.expression = rewrite_outer_expr(ot.expression);
+    }
+    if (!sel_ok) continue;
+
+    const SelectSource& agg_src = root->Sources()[agg_outer_oi];
+    const std::string agg_qual =
+        agg_src.alias.empty() ? agg_src.table : agg_src.alias;
+    const SelectSource& fk_src = root->Sources()[corr_fk_outer_oi];
+    const std::string fk_qual =
+        fk_src.alias.empty() ? fk_src.table : fk_src.alias;
+    const std::string win_alias = "__csa_w";
+    inner_select.emplace_back(
+        win_alias, WindowFunctionCallExp(
+                       std::move(win_fn_name),
+                       {ColumnValueExp(ColumnName(agg_qual, agg_col_canon))},
+                       {ColumnValueExp(ColumnName(fk_qual, corr_fk_col))}, {}));
+
+    std::vector<Expression> inner_where_conjs;
+    inner_where_conjs.reserve(outer_conjs.size() - 1);
+    for (size_t i = 0; i < outer_conjs.size(); ++i) {
+      if (i != cj_idx) inner_where_conjs.push_back(outer_conjs[i]);
+    }
+    auto inner_stmt = std::make_shared<SelectStatement>();
+    inner_stmt->SetSources(root->Sources());
+    inner_stmt->SetWhereClause(CombineAndConjuncts(inner_where_conjs));
+    inner_stmt->SetSelectList(std::move(inner_select));
+
+    Expression win_col = ColumnValueExp(ColumnName(sub_wrap_alias, win_alias));
+    Expression rhs_val =
+        scale_const
+            ? (const_on_left
+                   ? BinaryExpressionExp(scale_const,
+                                         BinaryOperation::kMultiply, win_col)
+                   : BinaryExpressionExp(win_col, BinaryOperation::kMultiply,
+                                         scale_const))
+            : win_col;
+    Expression lhs_col = ColumnValueExp(ColumnName(sub_wrap_alias, lhs_alias));
+    Expression new_where =
+        sub_on_right ? BinaryExpressionExp(lhs_col, cmp.Op(), rhs_val)
+                     : BinaryExpressionExp(rhs_val, cmp.Op(), lhs_col);
+
+    root->SetSources({SelectSource("", sub_wrap_alias, std::move(inner_stmt),
+                                   JoinType::kCross, nullptr)});
+    root->SetWhereClause(std::move(new_where));
+    root->SetSelectList(std::move(new_select));
+    if (!new_order.empty()) {
+      root->SetOrderBy(std::move(new_order));
+    }
+    return true;
+  }
+  return false;
+}
+
+// Merges a cross-join of two ungrouped scalar-aggregate derived tables over
+// the same base join into a single-pass conditional-aggregate derived table.
+//   Case 1 (identical base sources, differing local predicates, e.g. TPC-DS
+//   Q90):
+//     FROM (SELECT AGG FROM B WHERE C AND P1) A, (SELECT AGG FROM B WHERE C AND
+//     P2) B
+//     -> FROM (SELECT COND_AGG(P1), COND_AGG(P2) FROM B WHERE C AND (P1 OR P2))
+//     M
+//   Case 2 (one side adds a single certified-unique-not-null PK table P, e.g.
+//   Q61):
+//     FROM (SELECT AGG FROM B, P WHERE C AND fk = P.pk AND Cp) A,
+//          (SELECT AGG FROM B WHERE C) B
+//     -> FROM (SELECT COND_AGG(__m_dim.__m_pk IS NOT NULL), AGG
+//              FROM B LEFT OUTER JOIN (SELECT P.pk AS __m_pk FROM P WHERE Cp)
+//              __m_dim ON fk = __m_dim.__m_pk WHERE C) M
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (scalar_agg_cross_join_merge_case1_sound,
+//    scalar_agg_cross_join_merge_case2_sound)
+bool RewriteScalarAggCrossJoinMerge(SelectStatement* root,
+                                    TransactionContext& ctx) {
+  if (root == nullptr || root->Sources().size() < 2 ||
+      root->Sources().size() > 16 || root->WhereClause() != nullptr ||
+      !root->GroupBy().empty() || root->Having() != nullptr ||
+      root->Distinct() || root->HasDistinctOn() ||
+      !root->WithQueries().empty() || !root->UnionAll().empty() ||
+      root->GetSetOperationTree() != nullptr || root->Qualify() != nullptr ||
+      relational_detail::HasWindowFunctions(*root)) {
+    return false;
+  }
+  const size_t n_subs = root->Sources().size();
+  for (const SelectSource& s : root->Sources()) {
+    if (!s.query || s.unnest || s.sample || s.join_condition ||
+        (s.join_type != JoinType::kCross && s.join_type != JoinType::kInner)) {
+      return false;
+    }
+  }
+  auto is_plain_scalar_agg = [](const SelectStatement& st) -> bool {
+    if (st.Sources().empty() || !st.GroupBy().empty() ||
+        st.Having() != nullptr || st.Distinct() || st.HasDistinctOn() ||
+        st.HasLimit() || st.Offset() != 0 || !st.OrderBy().empty() ||
+        !st.WithQueries().empty() || !st.UnionAll().empty() ||
+        st.GetSetOperationTree() != nullptr || st.Qualify() != nullptr ||
+        relational_detail::HasWindowFunctions(st) || st.SelectList().empty()) {
+      return false;
+    }
+    for (const auto& src : st.Sources()) {
+      if (src.query || src.unnest || src.sample || src.join_condition ||
+          (src.join_type != JoinType::kCross &&
+           src.join_type != JoinType::kInner)) {
+        return false;
+      }
+    }
+    for (const auto& item : st.SelectList()) {
+      if (item.name.empty() || !item.expression ||
+          item.expression->Type() != TypeTag::kAggregateExp) {
+        return false;
+      }
+      const auto& agg = item.expression->AsAggregateExpression();
+      if (agg.HasWhereFilter()) {
+        return false;
+      }
+      const AggregationType at = agg.GetType();
+      if (!agg.Distinct() &&
+          (at == AggregationType::kCount || at == AggregationType::kSum ||
+           at == AggregationType::kAvg)) {
+        continue;
+      }
+      return false;
+    }
+    return true;
+  };
+  std::unordered_set<std::string> out_names;
+  std::unordered_set<std::string> outer_aliases;
+  for (const SelectSource& s : root->Sources()) {
+    if (!is_plain_scalar_agg(*s.query)) {
+      return false;
+    }
+    outer_aliases.insert(s.alias.empty() ? s.table : s.alias);
+    for (const auto& it : s.query->SelectList()) {
+      if (!out_names.insert(it.name).second) return false;
+    }
+  }
+  auto src_key = [](const SelectSource& src) -> std::string {
+    return src.table + "#" + (src.alias.empty() ? src.table : src.alias);
+  };
+  auto expr_safe_pred = [](const Expression& root_e) -> bool {
+    if (!root_e) return false;
+    bool ok = true;
+    std::function<void(const Expression&)> walk = [&](const Expression& node) {
+      if (!ok || !node) return;
+      if (node->Type() == TypeTag::kQueryExp ||
+          node->Type() == TypeTag::kAggregateExp ||
+          node->Type() == TypeTag::kWindowFunctionExp) {
+        ok = false;
+        return;
+      }
+      if (node->Type() == TypeTag::kConstantValue &&
+          dynamic_cast<const ParameterSlot*>(node.get()) != nullptr) {
+        ok = false;
+        return;
+      }
+      if (node->Type() == TypeTag::kFunctionCallExp &&
+          GetFunctionVolatility(node->AsFunctionCallExpression().FuncName()) !=
+              Volatility::kImmutable) {
+        ok = false;
+        return;
+      }
+      for (const Expression& ch : ExpressionChildren(node)) walk(ch);
+    };
+    walk(root_e);
+    return ok;
+  };
+  auto map_expr = [](const Expression& root_e,
+                     const std::function<Expression(const Expression&)>& fn) {
+    std::function<Expression(const Expression&)> rec =
+        [&](const Expression& e) -> Expression {
+      if (!e) return e;
+      Expression mapped = fn(e);
+      if (mapped.get() != e.get()) return mapped;
+      const std::vector<Expression> ch = ExpressionChildren(e);
+      if (ch.empty()) return e;
+      std::vector<Expression> next;
+      next.reserve(ch.size());
+      bool diff = false;
+      for (const Expression& c : ch) {
+        Expression nc = rec(c);
+        if (nc.get() != c.get()) diff = true;
+        next.push_back(std::move(nc));
+      }
+      return diff ? WithExpressionChildren(e, std::move(next)) : e;
+    };
+    return rec(root_e);
+  };
+  auto make_cond_agg = [](const AggregateExpression& agg,
+                          const Expression& cond) -> Expression {
+    if (agg.GetType() == AggregationType::kCount) {
+      const bool is_star =
+          !agg.Child() ||
+          (agg.Child()->Type() == TypeTag::kColumnValue &&
+           agg.Child()->AsColumnValue().GetColumnName().name == "*");
+      Expression then_val =
+          is_star ? ConstantValueExp(Value(int64_t{1})) : agg.Child();
+      Expression c =
+          CaseExpressionExp({{cond, then_val}}, ConstantValueExp(Value()));
+      return AggregateExpressionExp(AggregationType::kCount, std::move(c),
+                                    agg.Distinct());
+    }
+    Expression c =
+        CaseExpressionExp({{cond, agg.Child()}}, ConstantValueExp(Value()));
+    return AggregateExpressionExp(agg.GetType(), std::move(c), false);
+  };
+  const std::string merged_alias = "__merged_scalar_agg";
+  auto finish_rewrite = [&](std::shared_ptr<SelectStatement> merged_stmt) {
+    auto rebind_outer = [&](const Expression& e) -> Expression {
+      return map_expr(e, [&](const Expression& node) -> Expression {
+        if (node && node->Type() == TypeTag::kColumnValue) {
+          const ColumnName& cn = node->AsColumnValue().GetColumnName();
+          if (cn.name == "*") {
+            return node;
+          }
+          if (outer_aliases.contains(cn.schema) ||
+              (cn.schema.empty() && out_names.contains(cn.name))) {
+            return ColumnValueExp(ColumnName(merged_alias, cn.name));
+          }
+        }
+        return node;
+      });
+    };
+    std::vector<NamedExpression> new_sel;
+    new_sel.reserve(root->SelectList().size());
+    for (const auto& item : root->SelectList()) {
+      new_sel.emplace_back(item.name, rebind_outer(item.expression));
+    }
+    auto new_ord = root->OrderBy();
+    for (auto& oi : new_ord) {
+      oi.expression = rebind_outer(oi.expression);
+    }
+    root->SetSources({SelectSource("", merged_alias, std::move(merged_stmt),
+                                   JoinType::kCross, nullptr)});
+    root->SetSelectList(std::move(new_sel));
+    if (!new_ord.empty()) {
+      root->SetOrderBy(std::move(new_ord));
+    }
+    return true;
+  };
+
+  // Build source key sets for all N subqueries.
+  std::vector<std::unordered_set<std::string>> sks(n_subs);
+  for (size_t i = 0; i < n_subs; ++i) {
+    for (const auto& src : root->Sources()[i].query->Sources()) {
+      if (!sks[i].insert(src_key(src)).second) return false;
+    }
+  }
+
+  // Case 1: all N subqueries share identical base sources with differing local
+  // WHERE conjuncts (e.g. TPC-DS Q90 [N=2], Q28 [N=6], Q88 [N=8]).
+  bool all_same_sources = true;
+  for (size_t i = 1; i < n_subs; ++i) {
+    if (sks[i] != sks[0]) {
+      all_same_sources = false;
+      break;
+    }
+  }
+  if (all_same_sources) {
+    std::vector<std::vector<Expression>> conjs(n_subs);
+    std::vector<std::unordered_set<std::string>> c_strs(n_subs);
+    for (size_t i = 0; i < n_subs; ++i) {
+      conjs[i] = SplitConjuncts(root->Sources()[i].query->WhereClause());
+      for (const auto& e : conjs[i]) {
+        c_strs[i].insert(e->ToString());
+      }
+    }
+    std::vector<Expression> common;
+    std::unordered_set<std::string> common_strs;
+    for (const auto& e : conjs[0]) {
+      const std::string s = e->ToString();
+      bool in_all = true;
+      for (size_t i = 1; i < n_subs; ++i) {
+        if (!c_strs[i].contains(s)) {
+          in_all = false;
+          break;
+        }
+      }
+      if (in_all && common_strs.insert(s).second) {
+        common.push_back(e);
+      }
+    }
+    auto has_or_node = [](const Expression& root_e) -> bool {
+      bool found = false;
+      std::function<void(const Expression&)> walk = [&](const Expression& n) {
+        if (found || !n) return;
+        if (n->Type() == TypeTag::kBinaryExp &&
+            n->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+          found = true;
+          return;
+        }
+        for (const Expression& ch : ExpressionChildren(n)) walk(ch);
+      };
+      walk(root_e);
+      return found;
+    };
+    std::vector<Expression> branch_preds;
+    branch_preds.reserve(n_subs);
+    for (size_t i = 0; i < n_subs; ++i) {
+      std::vector<Expression> diff;
+      for (const auto& e : conjs[i]) {
+        if (!common_strs.contains(e->ToString())) {
+          if (!expr_safe_pred(e) || has_or_node(e)) return false;
+          diff.push_back(e);
+        }
+      }
+      if (diff.empty()) {
+        return false;
+      }
+      branch_preds.push_back(CombineAndConjuncts(diff));
+    }
+    Expression disj = branch_preds[0];
+    for (size_t i = 1; i < n_subs; ++i) {
+      disj = BinaryExpressionExp(std::move(disj), BinaryOperation::kOr,
+                                 branch_preds[i]);
+    }
+    common.push_back(std::move(disj));
+
+    std::vector<NamedExpression> m_sel;
+    for (size_t i = 0; i < n_subs; ++i) {
+      for (const auto& item : root->Sources()[i].query->SelectList()) {
+        m_sel.emplace_back(
+            item.name, make_cond_agg(item.expression->AsAggregateExpression(),
+                                     branch_preds[i]));
+      }
+    }
+    auto merged = std::make_shared<SelectStatement>();
+    merged->SetSources(root->Sources()[0].query->Sources());
+    merged->SetWhereClause(CombineAndConjuncts(common));
+    merged->SetSelectList(std::move(m_sel));
+    return finish_rewrite(std::move(merged));
+  }
+
+  // Case 2 (N == 2): one side has exactly one extra certified-unique-not-null
+  // PK base table P (e.g. TPC-DS Q61: promotional_sales adds `promotion`).
+  if (n_subs != 2) {
+    return false;
+  }
+  const SelectStatement& sub0 = *root->Sources()[0].query;
+  const SelectStatement& sub1 = *root->Sources()[1].query;
+  const SelectStatement* big_sub = nullptr;
+  const SelectStatement* small_sub = nullptr;
+  const std::unordered_set<std::string>* small_sk = nullptr;
+  if (sub0.Sources().size() == sub1.Sources().size() + 1) {
+    big_sub = &sub0;
+    small_sub = &sub1;
+    small_sk = &sks[1];
+  } else if (sub1.Sources().size() == sub0.Sources().size() + 1) {
+    big_sub = &sub1;
+    small_sub = &sub0;
+    small_sk = &sks[0];
+  } else {
+    return false;
+  }
+  const SelectSource* extra_src = nullptr;
+  for (const auto& src : big_sub->Sources()) {
+    if (!small_sk->contains(src_key(src))) {
+      if (extra_src != nullptr) return false;
+      extra_src = &src;
+    }
+  }
+  if (extra_src == nullptr) return false;
+  auto extra_tbl_or = ctx.GetTable(extra_src->table);
+  if (!extra_tbl_or.HasValue()) return false;
+  const Schema& extra_schema = extra_tbl_or.Value()->GetSchema();
+  const std::string extra_qual =
+      extra_src->alias.empty() ? extra_src->table : extra_src->alias;
+  auto col_belongs_to_extra = [&](const ColumnName& cn) -> bool {
+    if (!cn.schema.empty() && cn.schema != extra_qual &&
+        cn.schema != extra_src->table) {
+      return false;
+    }
+    return extra_schema.Offset(ColumnName("", cn.name)) >= 0;
+  };
+  // Verify big_sub's aggregate expressions do not reference extra_src.
+  for (const auto& item : big_sub->SelectList()) {
+    for (const ColumnName& cn : item.expression->TouchedColumns()) {
+      if (col_belongs_to_extra(cn)) return false;
+    }
+  }
+  std::vector<Expression> c_big = SplitConjuncts(big_sub->WhereClause());
+  std::vector<Expression> c_small = SplitConjuncts(small_sub->WhereClause());
+  std::unordered_set<std::string> big_strs;
+  std::unordered_set<std::string> small_strs;
+  for (const auto& e : c_big) big_strs.insert(e->ToString());
+  for (const auto& e : c_small) small_strs.insert(e->ToString());
+  // Every conjunct of small_sub must appear in big_sub.
+  for (const auto& e : c_small) {
+    if (!big_strs.contains(e->ToString())) return false;
+  }
+  Expression fk_expr;
+  std::string pk_col_name;
+  std::vector<Expression> extra_local_preds;
+  for (const auto& e : c_big) {
+    if (small_strs.contains(e->ToString())) continue;
+    if (!expr_safe_pred(e)) return false;
+    // Check if this is `fk = P.pk`.
+    if (e->Type() == TypeTag::kBinaryExp &&
+        e->AsBinaryExpression().Op() == BinaryOperation::kEquals &&
+        e->AsBinaryExpression().Left() && e->AsBinaryExpression().Right() &&
+        e->AsBinaryExpression().Left()->Type() == TypeTag::kColumnValue &&
+        e->AsBinaryExpression().Right()->Type() == TypeTag::kColumnValue) {
+      const ColumnName& ln =
+          e->AsBinaryExpression().Left()->AsColumnValue().GetColumnName();
+      const ColumnName& rn =
+          e->AsBinaryExpression().Right()->AsColumnValue().GetColumnName();
+      const bool l_ext = col_belongs_to_extra(ln);
+      const bool r_ext = col_belongs_to_extra(rn);
+      if (l_ext != r_ext) {
+        if (fk_expr != nullptr) return false;
+        fk_expr = l_ext ? e->AsBinaryExpression().Right()
+                        : e->AsBinaryExpression().Left();
+        pk_col_name = l_ext ? ln.name : rn.name;
+        continue;
+      }
+    }
+    // Otherwise every touched column must belong strictly to extra_src.
+    const auto touched = e->TouchedColumns();
+    if (touched.empty()) return false;
+    for (const ColumnName& cn : touched) {
+      if (!col_belongs_to_extra(cn)) return false;
+    }
+    extra_local_preds.push_back(e);
+  }
+  const int pk_off = pk_col_name.empty()
+                         ? -1
+                         : extra_schema.Offset(ColumnName("", pk_col_name));
+  if (!fk_expr || pk_off < 0 ||
+      !IsColumnCertifiedUniqueNotNull(*extra_tbl_or.Value(),
+                                      static_cast<slot_t>(pk_off), ctx)) {
+    return false;
+  }
+  const std::string dim_sub_alias = "__m_dim";
+  const std::string dim_pk_alias = "__m_pk";
+  auto dim_sub = std::make_shared<SelectStatement>();
+  dim_sub->SetSources({SelectSource(extra_src->table, extra_src->alias, nullptr,
+                                    JoinType::kCross, nullptr)});
+  if (!extra_local_preds.empty()) {
+    dim_sub->SetWhereClause(CombineAndConjuncts(extra_local_preds));
+  }
+  dim_sub->SetSelectList({NamedExpression(
+      dim_pk_alias, ColumnValueExp(ColumnName(extra_qual, pk_col_name)))});
+
+  Expression pk_ref = ColumnValueExp(ColumnName(dim_sub_alias, dim_pk_alias));
+  Expression join_on =
+      BinaryExpressionExp(fk_expr, BinaryOperation::kEquals, pk_ref);
+  Expression matched_cond =
+      UnaryExpressionExp(pk_ref, UnaryOperation::kIsNotNull);
+
+  std::vector<SelectSource> m_sources = small_sub->Sources();
+  m_sources.emplace_back("", dim_sub_alias, std::move(dim_sub), JoinType::kLeft,
+                         std::move(join_on));
+
+  std::vector<NamedExpression> m_sel;
+  for (const auto& item : small_sub->SelectList()) {
+    m_sel.push_back(item);
+  }
+  for (const auto& item : big_sub->SelectList()) {
+    const auto& agg = item.expression->AsAggregateExpression();
+    if (agg.GetType() == AggregationType::kCount && !agg.Child()) {
+      m_sel.emplace_back(
+          item.name,
+          AggregateExpressionExp(AggregationType::kCount, pk_ref, false));
+    } else {
+      m_sel.emplace_back(item.name, make_cond_agg(agg, matched_cond));
+    }
+  }
+  auto merged = std::make_shared<SelectStatement>();
+  merged->SetSources(std::move(m_sources));
+  if (small_sub->WhereClause()) {
+    merged->SetWhereClause(small_sub->WhereClause());
+  }
+  merged->SetSelectList(std::move(m_sel));
+  return finish_rewrite(std::move(merged));
 }
 
 }  // namespace tinylamb

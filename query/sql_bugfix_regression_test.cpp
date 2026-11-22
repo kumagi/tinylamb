@@ -864,6 +864,25 @@ TEST_F(SqlBugfixRegressionTest, CreateViewRejectsSessionLocalUdfCapture) {
   EXPECT_EQ(Query("SELECT n FROM tv"), (std::vector<std::string>{"2", "3"}));
 }
 
+// A single declared field on ARRAY<STRUCT<a INT64>> must rename the eagerly
+// folded {"f1":...} key; the >= 2 gate used to leave .a as NULL.
+TEST_F(SqlBugfixRegressionTest, SingleDeclaredStructArrayFieldGetsItsName) {
+  EXPECT_EQ(Query("SELECT (ARRAY<STRUCT<a INT64>>[STRUCT(1)])[OFFSET(0)].a"),
+            (std::vector<std::string>{"1"}));
+  EXPECT_EQ(Query("SELECT (ARRAY<STRUCT<a INT64, b STRING>>[STRUCT(1, 'x')])"
+                  "[OFFSET(0)].a"),
+            (std::vector<std::string>{"1"}));
+}
+
+// A collated field inside a STRUCT must not lowercase every string field of
+// the folded value: projection/get_field sees the literal's original bytes.
+TEST_F(SqlBugfixRegressionTest, StructWithCollatedFieldKeepsOriginalText) {
+  EXPECT_EQ(Query("SELECT STRUCT(COLLATE('AbC', 'und:ci') AS x, 'XyZ' AS y).x"),
+            (std::vector<std::string>{"\"AbC\""}));
+  EXPECT_EQ(Query("SELECT STRUCT(COLLATE('AbC', 'und:ci') AS x, 'XyZ' AS y).y"),
+            (std::vector<std::string>{"\"XyZ\""}));
+}
+
 // Name-resolution errors must be reported on BOTH evaluator routes (default
 // lowering and the forced relational fallback).  Regressions for griffin_fuzz
 // GRIFFIN-RELATIONAL-PATH MISMATCH findings, where the default route ran

@@ -68,8 +68,9 @@ enum class BytecodeOp : uint8_t {
   // Applies CastSpec casts_[operand] to the stack top.
   kCast,
   // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean (in_const_set_3vl_sound)
-  // Pops one uncollated VARCHAR value and pushes 3VL membership (TRUE/FALSE/NULL)
-  // against StringSetSpec string_sets_[operand] in O(1) flat hash lookup.
+  // Pops one uncollated VARCHAR value and pushes 3VL membership
+  // (TRUE/FALSE/NULL) against StringSetSpec string_sets_[operand] in O(1) flat
+  // hash lookup.
   kInStringSet,
   // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
   //   (ascii_substr_1based_slice_sound)
@@ -169,11 +170,15 @@ class BytecodeProgram {
   // Fast-path evaluation straight on the row cells without constructing
   // intermediate Values.  The opcode set covers loads/stores, int64+double
   // arithmetic, comparisons, unary ops, control-flow jumps, EXTRACT date parts
-  // and CASTs (implemented natively on the fast stack); only the remaining
-  // VARCHAR/DATE operations delegate to the canonical scalar evaluator.  Semantics mirror the canonical
-  // interpreter instruction-for-instruction; differential_test compares both
-  // paths.  Only valid after a successful Compile (the shape flag is computed
-  // there; hand-built programs report kUnsupported).
+  // and CASTs (implemented natively on the fast stack). Collated/interval
+  // VARCHAR and other unsupported operand shapes return kUnsupported: the
+  // caller retries through the canonical bytecode VM, which may itself fall
+  // back to Expression::Evaluate (AST) when the shape is not compilable.
+  // "Canonical" here means that VM, not a direct call to the AST evaluator;
+  // semantics still mirror it instruction-for-instruction, and
+  // differential_test compares both paths. Only valid after a successful
+  // Compile (the shape flag is computed there; hand-built programs report
+  // kUnsupported).
   [[nodiscard]] FastEval TryEvaluateRowFast(const Row& row, Value* out,
                                             Status* error) const;
   // Vectorized SoA columnar evaluation over `row_count` tuples (indexed via

@@ -304,7 +304,11 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
     // Non-NULL values were observed but excluded from the envelope (arrays,
     // NaN-only zones) or the envelope was dropped as unreliable (mixed
     // types, reversed ranges): nothing can be proven, so keep every row.
-    return value_count_ > 0 || has_nan_;
+    // value_count_ is the single authority for "a non-NULL cell was seen" --
+    // every path that sets has_nan_ has already incremented it, so the two
+    // checks were redundant. has_nan_ only describes why the envelope is
+    // empty and must not independently disable pruning.
+    return value_count_ > 0;
   }
   // Cross-type comparisons (e.g. int constant vs double zone) may match after
   // implicit conversion; pruning them would silently drop rows.

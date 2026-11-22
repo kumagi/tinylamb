@@ -65,6 +65,31 @@ TEST(PlanMemoOracle, ShrinkNeverHidesMismatchNorGrows) {
               CheckExploreEquivalence(shrunk).empty())
         << "seed=" << seed;
   }
+
+  // Every generated graph is sound, so the default shrinker returns its
+  // input at the first check and the delta-shrink loop is never exercised.
+  // Drive it with a synthetic mismatch predicate instead: shrinking must
+  // reduce the graph while keeping the predicate true at every step.
+  GeneratedJoinGraph graph;
+  for (uint32_t seed = 0; seed < 200; ++seed) {
+    std::mt19937 r(seed);
+    graph = GenerateJoinGraph(r);
+    if (graph.conjuncts.size() >= 3 && graph.relations.size() >= 3) {
+      break;
+    }
+  }
+  ASSERT_GE(graph.conjuncts.size(), 3U);
+  ASSERT_GE(graph.relations.size(), 3U);
+  const auto synthetic_mismatch = [](const GeneratedJoinGraph& g) {
+    return g.conjuncts.size() >= 2 && g.relations.size() >= 2;
+  };
+  const GeneratedJoinGraph shrunk = ShrinkJoinGraph(graph, synthetic_mismatch);
+  EXPECT_LT(shrunk.conjuncts.size(), graph.conjuncts.size());
+  EXPECT_TRUE(synthetic_mismatch(shrunk));
+  // Conjuncts shrink one at a time to the minimum that still satisfies the
+  // predicate. Relations may stay put when dropping one would also drop a
+  // conjunct and break it, so only assert the guaranteed conjunct bound.
+  EXPECT_EQ(shrunk.conjuncts.size(), 2U);
 }
 
 // Sensitivity probe: a hand-built Join whose predicate diverges from the

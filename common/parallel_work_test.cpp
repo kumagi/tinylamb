@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "common/platform/cpu_affinity.hpp"
@@ -25,14 +26,23 @@ TEST(ParallelWorkTest, TeamSizeRespectsWorkAndConcurrentAdmission) {
 }
 
 TEST(ParallelWorkTest, ReusesHelpersAndExecutesEveryIndex) {
-  std::array<std::thread::id, 2> first{};
-  std::array<std::thread::id, 2> second{};
-  ASSERT_TRUE(RunParallelTasks(2, [&](size_t i) {
-                first[i] = std::this_thread::get_id();
-              }).ok());
-  ASSERT_TRUE(RunParallelTasks(2, [&](size_t i) {
-                second[i] = std::this_thread::get_id();
-              }).ok());
+  // Index 0 always runs on the caller; helpers are drawn from a bounded shared
+  // pool. Which helper draws which index is unspecified, so per-index thread
+  // IDs must not be compared across submissions. Reuse is pinned instead by
+  // the number of distinct threads observed over many submissions: a pool
+  // that spawned new helpers each time would blow past its 16-worker cap.
+  std::array<std::thread::id, 4> ids{};
+  std::unordered_set<std::thread::id> seen;
+  for (int repeat = 0; repeat < 32; ++repeat) {
+    ids = {};
+    ASSERT_TRUE(RunParallelTasks(ids.size(), [&](size_t i) {
+                  ids[i] = std::this_thread::get_id();
+                }).ok());
+    seen.insert(ids.begin(), ids.end());
+  }
+  EXPECT_GE(seen.size(), 2U);
+  EXPECT_LE(seen.size(), 17U);  // 16 pool helpers + the calling thread.
+
   std::array<std::atomic<int>, 17> counts{};
   ASSERT_TRUE(
       RunParallelTasks(counts.size(), [&](size_t i) { ++counts[i]; }).ok());

@@ -87,7 +87,6 @@ namespace tinylamb::relational_detail {
 
 ValueType ValueTypeFromTypeTag(TypeTag tag);
 
-
 // Chunked storage for the flat per-group accumulator states.  A plain
 // std::vector<AggregateAccumulator> reallocates on geometric growth, and the
 // realloc transient (old buffer + new buffer live together) peaks at ~3x the
@@ -1632,8 +1631,8 @@ std::optional<EncodedDictionaryPredicate> CompileDictionaryMask(
       dictionary.DictionaryCodeCount() != store.total_rows) {
     return std::nullopt;
   }
-  const size_t domain = string_payload ? dictionary.entries.size()
-                                       : dictionary.int_entries.size();
+  const size_t domain = string_payload ? dictionary.StringEntryCount()
+                                       : dictionary.IntEntryCount();
   // domain is a std::vector size and cannot be SIZE_MAX; only the
   // reservation check is meaningful here.
   if (!QueryMemoryBudget::Global().CanReserve(domain + 1)) {
@@ -1708,8 +1707,9 @@ inline std::optional<EncodedDictionaryPredicate> CompileDictionaryPredicate(
       store, column, filter.string_payload,
       [&](const LSTableColumnDictionary& dictionary, size_t code) {
         return filter.string_payload
-                   ? MatchTypedStringCompare(dictionary.entries[code], filter)
-                   : matches(dictionary.int_entries[code], filter.int_constant,
+                   ? MatchTypedStringCompare(dictionary.StringEntryAt(code),
+                                             filter)
+                   : matches(dictionary.IntEntryAt(code), filter.int_constant,
                              filter.op);
       },
       charge);
@@ -1740,11 +1740,11 @@ inline std::optional<EncodedDictionaryPredicate> CompileDictionaryInList(
       store, column, filter.is_string,
       [&](const LSTableColumnDictionary& dictionary, size_t code) {
         return filter.is_string
-                   ? std::binary_search(
-                         sorted_strings.begin(), sorted_strings.end(),
-                         std::string_view(dictionary.entries[code]))
+                   ? std::binary_search(sorted_strings.begin(),
+                                        sorted_strings.end(),
+                                        dictionary.StringEntryAt(code))
                    : std::binary_search(sorted_ints.begin(), sorted_ints.end(),
-                                        dictionary.int_entries[code]);
+                                        dictionary.IntEntryAt(code));
       },
       charge);
 }

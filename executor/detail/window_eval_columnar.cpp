@@ -31,8 +31,10 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/detail/window_eval_internal.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/window_function_expression.hpp"
+#include "type/collation.hpp"
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -283,17 +285,26 @@ Status AssembleColumnarWindowOutput(
                              size_t chunk_rows, ColumnarChunk* dst_chunk)>&
         append_win_cols,
     Relation* out) {
+  const bool can_move_src =
+      input.columnar != nullptr && input.columnar.use_count() == 1;
   const auto& src_table = *input.columnar;
+  ColumnarTable* mut_src_table =
+      can_move_src ? const_cast<ColumnarTable*>(input.columnar.get()) : nullptr;
   auto out_table = std::make_shared<ColumnarTable>();
-  out_table->keepalives.reserve(src_table.keepalives.size() + 1);
-  for (const auto& owner : src_table.keepalives) {
-    if (owner != nullptr) {
-      out_table->keepalives.push_back(owner);
+  if (can_move_src) {
+    out_table->keepalives = std::move(mut_src_table->keepalives);
+  } else {
+    out_table->keepalives.reserve(src_table.keepalives.size() + 1);
+    for (const auto& owner : src_table.keepalives) {
+      if (owner != nullptr) {
+        out_table->keepalives.push_back(owner);
+      }
     }
+    out_table->AppendKeepalive(input.columnar);
   }
-  out_table->AppendKeepalive(input.columnar);
   out_table->chunks.reserve(src_table.chunks.size());
 
+  std::vector<size_t> ref_counts;
   size_t row_off = 0;
   for (size_t ci = 0; ci < src_table.chunks.size(); ++ci) {
     const ColumnarChunk& src_chunk = src_table.chunks[ci];
@@ -303,8 +314,29 @@ Status AssembleColumnarWindowOutput(
     ColumnarChunk dst_chunk;
     dst_chunk.rows = src_chunk.rows;
     dst_chunk.columns.resize(extended_columns.size());
-    for (size_t k = 0; k < kept_slots.size(); ++k) {
-      dst_chunk.columns[k] = src_chunk.columns[kept_slots[k]];
+    if (can_move_src) {
+      ColumnarChunk& mut_chunk = mut_src_table->chunks[ci];
+      dst_chunk.string_arena = std::move(mut_chunk.string_arena);
+      dst_chunk.keepalives = std::move(mut_chunk.keepalives);
+      ref_counts.assign(mut_chunk.columns.size(), 0);
+      for (size_t s : kept_slots) {
+        if (s < ref_counts.size()) {
+          ++ref_counts[s];
+        }
+      }
+      for (size_t k = 0; k < kept_slots.size(); ++k) {
+        const size_t s = kept_slots[k];
+        dst_chunk.RetainColumnOwners(mut_chunk.columns[s]);
+        if (--ref_counts[s] == 0) {
+          dst_chunk.columns[k] = std::move(mut_chunk.columns[s]);
+        } else {
+          dst_chunk.columns[k] = mut_chunk.columns[s];
+        }
+      }
+    } else {
+      for (size_t k = 0; k < kept_slots.size(); ++k) {
+        dst_chunk.columns[k] = src_chunk.columns[kept_slots[k]];
+      }
     }
     append_win_cols(ci, row_off, src_chunk.rows, &dst_chunk);
     row_off += src_chunk.rows;
@@ -896,6 +928,304 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
       }
     }
   } else {
+    bool done_dense_part_agg = false;
+    bool can_dense_part_agg = !has_order && n >= 4096;
+    for (size_t w = 0; can_dense_part_agg && w < win_count; ++w) {
+      const FlatWindowSpec& spec = specs[w];
+      if (spec.out_type == ValueType::kNull) {
+        continue;
+      }
+      if (spec.kind != FlatWindowSpec::Kind::kPrefix ||
+          spec.frame_mode == PrefixFrameMode::kRows ||
+          (spec.prefix_op != PrefixOp::kSum &&
+           spec.prefix_op != PrefixOp::kAvg &&
+           spec.prefix_op != PrefixOp::kCount)) {
+        can_dense_part_agg = false;
+      } else if (spec.prefix_op != PrefixOp::kCount &&
+                 spec.arg_type != ValueType::kDouble &&
+                 spec.arg_type != ValueType::kInt64) {
+        can_dense_part_agg = false;
+      }
+    }
+    if (can_dense_part_agg) {
+      const size_t workers = std::min<size_t>(
+          {8, n / 4096,
+           QueryParallelWorkerLimit(std::thread::hardware_concurrency())});
+      const int64_t* pvals = part_col.vals;
+      std::vector<int64_t> w_min(workers, std::numeric_limits<int64_t>::max());
+      std::vector<int64_t> w_max(workers, std::numeric_limits<int64_t>::min());
+      std::vector<uint8_t> w_has(workers, 0);
+      RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+        const size_t begin = n * worker / workers;
+        const size_t end = n * (worker + 1) / workers;
+        int64_t lo = std::numeric_limits<int64_t>::max();
+        int64_t hi = std::numeric_limits<int64_t>::min();
+        bool has_any = false;
+        if (!part_col.any_null) {
+          if (begin < end) {
+            lo = hi = pvals[begin];
+            has_any = true;
+            for (size_t r = begin + 1; r < end; ++r) {
+              const int64_t v = pvals[r];
+              if (v < lo) lo = v;
+              if (v > hi) hi = v;
+            }
+          }
+        } else {
+          for (size_t r = begin; r < end; ++r) {
+            if (!part_col.IsNull(r)) {
+              const int64_t v = pvals[r];
+              if (!has_any) {
+                lo = hi = v;
+                has_any = true;
+              } else {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+              }
+            }
+          }
+        }
+        w_min[worker] = lo;
+        w_max[worker] = hi;
+        w_has[worker] = has_any ? 1 : 0;
+      }));
+      int64_t min_k = std::numeric_limits<int64_t>::max();
+      int64_t max_k = std::numeric_limits<int64_t>::min();
+      bool has_any_nonnull = false;
+      for (size_t w = 0; w < workers; ++w) {
+        if (w_has[w]) {
+          if (!has_any_nonnull) {
+            min_k = w_min[w];
+            max_k = w_max[w];
+            has_any_nonnull = true;
+          } else {
+            if (w_min[w] < min_k) min_k = w_min[w];
+            if (w_max[w] > max_k) max_k = w_max[w];
+          }
+        }
+      }
+      const uint64_t span = has_any_nonnull
+                                ? (static_cast<uint64_t>(max_k) -
+                                   static_cast<uint64_t>(min_k) + 1ULL)
+                                : 0ULL;
+      if (span <= 16384ULL) {
+        const size_t null_slot = static_cast<size_t>(span);
+        const size_t num_slots = null_slot + (part_col.any_null ? 1 : 0);
+        const uint64_t base_k = static_cast<uint64_t>(min_k);
+        for (size_t w = 0; w < win_count; ++w) {
+          const FlatWindowSpec& spec = specs[w];
+          if (spec.out_type == ValueType::kNull) {
+            continue;
+          }
+          if (spec.prefix_op == PrefixOp::kCount) {
+            std::vector<std::vector<int64_t>> w_cnt(
+                workers, std::vector<int64_t>(num_slots, 0));
+            const bool is_dbl_arg = (spec.arg_type == ValueType::kDouble);
+            RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+              const size_t begin = n * worker / workers;
+              const size_t end = n * (worker + 1) / workers;
+              int64_t* cnt = w_cnt[worker].data();
+              for (size_t r = begin; r < end; ++r) {
+                const bool arg_null =
+                    is_dbl_arg ? dbl_arg_cols[spec.col_data_idx].IsNull(r)
+                               : int_arg_cols[spec.col_data_idx].IsNull(r);
+                if (arg_null) continue;
+                const size_t slot =
+                    part_col.IsNull(r)
+                        ? null_slot
+                        : static_cast<size_t>(static_cast<uint64_t>(pvals[r]) -
+                                              base_k);
+                ++cnt[slot];
+              }
+            }));
+            std::vector<int64_t> tot_cnt(num_slots, 0);
+            for (size_t wk = 0; wk < workers; ++wk) {
+              for (size_t s = 0; s < num_slots; ++s) {
+                tot_cnt[s] += w_cnt[wk][s];
+              }
+            }
+            int64_t* dst = out_ints[w].data();
+            RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+              const size_t begin = n * worker / workers;
+              const size_t end = n * (worker + 1) / workers;
+              for (size_t r = begin; r < end; ++r) {
+                const size_t slot =
+                    part_col.IsNull(r)
+                        ? null_slot
+                        : static_cast<size_t>(static_cast<uint64_t>(pvals[r]) -
+                                              base_k);
+                dst[r] = tot_cnt[slot];
+              }
+            }));
+          } else if (spec.arg_type == ValueType::kDouble) {
+            const auto& src = dbl_arg_cols[spec.col_data_idx];
+            const double* svals = src.vals;
+            std::vector<std::vector<double>> w_sum(
+                workers, std::vector<double>(num_slots, 0.0));
+            std::vector<std::vector<int64_t>> w_cnt(
+                workers, std::vector<int64_t>(num_slots, 0));
+            RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+              const size_t begin = n * worker / workers;
+              const size_t end = n * (worker + 1) / workers;
+              double* sum = w_sum[worker].data();
+              int64_t* cnt = w_cnt[worker].data();
+              if (!part_col.any_null && !src.any_null) {
+                for (size_t r = begin; r < end; ++r) {
+                  const size_t slot = static_cast<size_t>(
+                      static_cast<uint64_t>(pvals[r]) - base_k);
+                  sum[slot] += svals[r];
+                  ++cnt[slot];
+                }
+              } else {
+                for (size_t r = begin; r < end; ++r) {
+                  if (src.IsNull(r)) continue;
+                  const size_t slot =
+                      part_col.IsNull(r)
+                          ? null_slot
+                          : static_cast<size_t>(
+                                static_cast<uint64_t>(pvals[r]) - base_k);
+                  sum[slot] += svals[r];
+                  ++cnt[slot];
+                }
+              }
+            }));
+            std::vector<double> slot_val(num_slots, 0.0);
+            std::vector<uint8_t> slot_null(num_slots, 1);
+            const bool is_avg = (spec.prefix_op == PrefixOp::kAvg);
+            bool any_slot_null = false;
+            for (size_t s = 0; s < num_slots; ++s) {
+              double tot = 0.0;
+              int64_t cnt = 0;
+              for (size_t wk = 0; wk < workers; ++wk) {
+                tot += w_sum[wk][s];
+                cnt += w_cnt[wk][s];
+              }
+              if (cnt > 0) {
+                slot_val[s] = is_avg ? (tot / static_cast<double>(cnt)) : tot;
+                slot_null[s] = 0;
+              } else {
+                any_slot_null = true;
+              }
+            }
+            double* dst = out_doubles[w].data();
+            uint8_t* dst_null = out_nulls[w].data();
+            std::atomic<bool> emitted_null{false};
+            RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+              const size_t begin = n * worker / workers;
+              const size_t end = n * (worker + 1) / workers;
+              bool local_null = false;
+              if (!part_col.any_null && !any_slot_null) {
+                for (size_t r = begin; r < end; ++r) {
+                  const size_t slot = static_cast<size_t>(
+                      static_cast<uint64_t>(pvals[r]) - base_k);
+                  dst[r] = slot_val[slot];
+                }
+              } else {
+                for (size_t r = begin; r < end; ++r) {
+                  const size_t slot =
+                      part_col.IsNull(r)
+                          ? null_slot
+                          : static_cast<size_t>(
+                                static_cast<uint64_t>(pvals[r]) - base_k);
+                  if (slot_null[slot]) {
+                    dst_null[r] = 1;
+                    local_null = true;
+                  } else {
+                    dst[r] = slot_val[slot];
+                  }
+                }
+              }
+              if (local_null) {
+                emitted_null.store(true, std::memory_order_relaxed);
+              }
+            }));
+            if (emitted_null.load(std::memory_order_relaxed)) {
+              win_any_null[w] = 1;
+            }
+          } else {
+            const auto& src = int_arg_cols[spec.col_data_idx];
+            const int64_t* svals = src.vals;
+            std::vector<std::vector<__int128>> w_sum(
+                workers, std::vector<__int128>(num_slots, 0));
+            std::vector<std::vector<int64_t>> w_cnt(
+                workers, std::vector<int64_t>(num_slots, 0));
+            RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+              const size_t begin = n * worker / workers;
+              const size_t end = n * (worker + 1) / workers;
+              __int128* sum = w_sum[worker].data();
+              int64_t* cnt = w_cnt[worker].data();
+              for (size_t r = begin; r < end; ++r) {
+                if (src.IsNull(r)) continue;
+                const size_t slot =
+                    part_col.IsNull(r)
+                        ? null_slot
+                        : static_cast<size_t>(static_cast<uint64_t>(pvals[r]) -
+                                              base_k);
+                sum[slot] += static_cast<__int128>(svals[r]);
+                ++cnt[slot];
+              }
+            }));
+            const bool is_avg = (spec.prefix_op == PrefixOp::kAvg);
+            std::vector<double> slot_dbl(num_slots, 0.0);
+            std::vector<int64_t> slot_i64(num_slots, 0);
+            std::vector<uint8_t> slot_null(num_slots, 1);
+            for (size_t s = 0; s < num_slots; ++s) {
+              __int128 tot = 0;
+              int64_t cnt = 0;
+              for (size_t wk = 0; wk < workers; ++wk) {
+                tot += w_sum[wk][s];
+                cnt += w_cnt[wk][s];
+              }
+              if (cnt > 0) {
+                if (tot < static_cast<__int128>(
+                              std::numeric_limits<int64_t>::min()) ||
+                    tot > static_cast<__int128>(
+                              std::numeric_limits<int64_t>::max())) {
+                  return StatusError(StatusCode::kIsInfinity,
+                                     "integer overflow in " + spec.fn_name);
+                }
+                if (is_avg) {
+                  slot_dbl[s] = static_cast<double>(static_cast<int64_t>(tot)) /
+                                static_cast<double>(cnt);
+                } else {
+                  slot_i64[s] = static_cast<int64_t>(tot);
+                }
+                slot_null[s] = 0;
+              }
+            }
+            uint8_t* dst_null = out_nulls[w].data();
+            std::atomic<bool> emitted_null{false};
+            RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+              const size_t begin = n * worker / workers;
+              const size_t end = n * (worker + 1) / workers;
+              bool local_null = false;
+              for (size_t r = begin; r < end; ++r) {
+                const size_t slot =
+                    part_col.IsNull(r)
+                        ? null_slot
+                        : static_cast<size_t>(static_cast<uint64_t>(pvals[r]) -
+                                              base_k);
+                if (slot_null[slot]) {
+                  dst_null[r] = 1;
+                  local_null = true;
+                } else if (is_avg) {
+                  out_doubles[w][r] = slot_dbl[slot];
+                } else {
+                  out_ints[w][r] = slot_i64[slot];
+                }
+              }
+              if (local_null) {
+                emitted_null.store(true, std::memory_order_relaxed);
+              }
+            }));
+            if (emitted_null.load(std::memory_order_relaxed)) {
+              win_any_null[w] = 1;
+            }
+          }
+        }
+        done_dense_part_agg = true;
+      }
+    }
     const bool nonnull_part_and_ord = !part_col.any_null && !check_ord_null;
     auto item_before_nonnull = [has_order](const FlatBucketItem& a,
                                            const FlatBucketItem& b) {
@@ -1077,10 +1407,12 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
       }
       return Status::kSuccess;
     };
-    if (n >= 65536) {
-      RETURN_IF_FAIL(run_partitioned_buckets.template operator()<256>());
-    } else {
-      RETURN_IF_FAIL(run_partitioned_buckets.template operator()<64>());
+    if (!done_dense_part_agg) {
+      if (n >= 65536) {
+        RETURN_IF_FAIL(run_partitioned_buckets.template operator()<256>());
+      } else {
+        RETURN_IF_FAIL(run_partitioned_buckets.template operator()<64>());
+      }
     }
   }
 
@@ -1415,12 +1747,22 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
   };
 
   struct MultiWinSpec {
-    enum class Kind : uint8_t { kRowNumber, kRank, kDenseRank, kPrefix };
+    enum class Kind : uint8_t {
+      kRowNumber,
+      kRank,
+      kDenseRank,
+      kPrefix,
+      kLag,
+      kLead
+    };
     size_t win_idx{0};
     Kind kind{Kind::kPrefix};
     PrefixOp prefix_op{PrefixOp::kSum};
     PrefixFrameMode frame_mode{PrefixFrameMode::kRows};
     size_t arg_col_idx{SIZE_MAX};  // SIZE_MAX for arg-less functions / COUNT(*)
+                                   // / const LAG/LEAD
+    uint64_t lag_offset{1};
+    int64_t lag_const_int{0};
     ValueType out_type{ValueType::kNull};
   };
 
@@ -1504,6 +1846,61 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
       spec.frame_mode = ClassifyPrefixFrame(win);
       spec.arg_col_idx = SIZE_MAX;
       spec.out_type = ValueType::kInt64;
+    } else if ((win.function == "LAG" || win.function == "LEAD") &&
+               (win.args.size() == 1 || win.args.size() == 2) &&
+               !win.distinct && !win.where_filter && !win.has_frame &&
+               !win.ignore_nulls && win.inner_order_by.empty() &&
+               !win.inner_limit &&
+               win.exclusion == WindowFrameExclusion::kNone) {
+      if (!win.args[0]) {
+        return std::nullopt;
+      }
+      int64_t offset = 1;
+      if (win.args.size() == 2) {
+        if (!win.args[1] || win.args[1]->Type() != TypeTag::kConstantValue) {
+          return std::nullopt;
+        }
+        const Value& ov = win.args[1]->AsConstantValue().GetValue();
+        if (ov.IsNull() || ov.type != ValueType::kInt64 || ov.IsUnsigned() ||
+            ov.value.int_value < 0) {
+          return std::nullopt;
+        }
+        offset = ov.value.int_value;
+      }
+      if (win.args[0]->Type() == TypeTag::kConstantValue) {
+        const Value& cv = win.args[0]->AsConstantValue().GetValue();
+        if (cv.IsNull() || cv.type != ValueType::kInt64 || cv.IsUnsigned()) {
+          return std::nullopt;
+        }
+        spec.kind = win.function == "LAG" ? MultiWinSpec::Kind::kLag
+                                          : MultiWinSpec::Kind::kLead;
+        spec.arg_col_idx = SIZE_MAX;
+        spec.lag_offset = static_cast<uint64_t>(offset);
+        spec.lag_const_int = cv.value.int_value;
+        spec.out_type = ValueType::kInt64;
+      } else if (win.args[0]->Type() == TypeTag::kColumnValue) {
+        const auto arg_slot = LocalColumnOffset(
+            schema, win.args[0]->AsColumnValue().GetColumnName());
+        if (!arg_slot.has_value()) {
+          return std::nullopt;
+        }
+        const auto col_idx = ensure_col(*arg_slot);
+        if (!col_idx.has_value()) {
+          return std::nullopt;
+        }
+        const ValueType avt = cols[*col_idx].type;
+        if (avt != ValueType::kDouble && avt != ValueType::kInt64 &&
+            avt != ValueType::kDate) {
+          return std::nullopt;
+        }
+        spec.kind = win.function == "LAG" ? MultiWinSpec::Kind::kLag
+                                          : MultiWinSpec::Kind::kLead;
+        spec.arg_col_idx = *col_idx;
+        spec.lag_offset = static_cast<uint64_t>(offset);
+        spec.out_type = avt;
+      } else {
+        return std::nullopt;
+      }
     } else {
       std::optional<size_t> arg_slot;
       if (!IsPrefixWindowEligible(win, schema, &arg_slot)) {
@@ -1570,8 +1967,10 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
     }
     grp.all_unsorted_fast = true;
     for (const MultiWinSpec& sp : grp.specs) {
-      if (sp.kind == MultiWinSpec::Kind::kPrefix &&
-          sp.frame_mode == PrefixFrameMode::kRows) {
+      if ((sp.kind == MultiWinSpec::Kind::kPrefix &&
+           sp.frame_mode == PrefixFrameMode::kRows) ||
+          sp.kind == MultiWinSpec::Kind::kLag ||
+          sp.kind == MultiWinSpec::Kind::kLead) {
         grp.all_unsorted_fast = false;
         break;
       }
@@ -1714,11 +2113,9 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
       }
       const std::string_view va = sc.vals[a];
       const std::string_view vb = sc.vals[b];
-      if (va == vb) {
-        return 0;
-      }
-      const bool less = term.ascending ? (va < vb) : (vb < va);
-      return less ? -1 : 1;
+      const int cmp =
+          CompareVarCharForOrderBy(va, vb, /*case_insensitive=*/false);
+      return term.ascending ? cmp : -cmp;
     }
     if (c.type == ValueType::kDouble) {
       const auto& dc = dbl_cols[c.typed_idx];
@@ -2157,6 +2554,70 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
                 rank = dense ? (rank + 1) : (static_cast<int64_t>(k) + 1);
               }
               dst[cur] = rank;
+            }
+            continue;
+          }
+
+          if (sp.kind == MultiWinSpec::Kind::kLag ||
+              sp.kind == MultiWinSpec::Kind::kLead) {
+            uint8_t* dst_null = out_nulls[w].data();
+            const uint64_t off = sp.lag_offset;
+            const bool is_lag = (sp.kind == MultiWinSpec::Kind::kLag);
+            if (sp.arg_col_idx == SIZE_MAX) {
+              int64_t* dst = out_ints[w].data();
+              const int64_t cval = sp.lag_const_int;
+              for (size_t k = 0; k < m; ++k) {
+                const uint32_t cur = part_rows[p_begin + k];
+                const bool in_bounds = is_lag ? (k >= off) : (off < m - k);
+                if (!in_bounds) {
+                  dst_null[cur] = 1;
+                  (*local_any_null)[w] = 1;
+                } else {
+                  dst[cur] = cval;
+                }
+              }
+            } else if (cols[sp.arg_col_idx].type == ValueType::kDouble) {
+              const auto& src = dbl_cols[cols[sp.arg_col_idx].typed_idx];
+              double* dst = out_doubles[w].data();
+              for (size_t k = 0; k < m; ++k) {
+                const uint32_t cur = part_rows[p_begin + k];
+                const bool in_bounds = is_lag ? (k >= off) : (off < m - k);
+                if (!in_bounds) {
+                  dst_null[cur] = 1;
+                  (*local_any_null)[w] = 1;
+                } else {
+                  const size_t tk = is_lag ? (k - static_cast<size_t>(off))
+                                           : (k + static_cast<size_t>(off));
+                  const uint32_t src_row = part_rows[p_begin + tk];
+                  if (src.IsNull(src_row)) {
+                    dst_null[cur] = 1;
+                    (*local_any_null)[w] = 1;
+                  } else {
+                    dst[cur] = src.vals[src_row];
+                  }
+                }
+              }
+            } else {
+              const auto& src = int_cols[cols[sp.arg_col_idx].typed_idx];
+              int64_t* dst = out_ints[w].data();
+              for (size_t k = 0; k < m; ++k) {
+                const uint32_t cur = part_rows[p_begin + k];
+                const bool in_bounds = is_lag ? (k >= off) : (off < m - k);
+                if (!in_bounds) {
+                  dst_null[cur] = 1;
+                  (*local_any_null)[w] = 1;
+                } else {
+                  const size_t tk = is_lag ? (k - static_cast<size_t>(off))
+                                           : (k + static_cast<size_t>(off));
+                  const uint32_t src_row = part_rows[p_begin + tk];
+                  if (src.IsNull(src_row)) {
+                    dst_null[cur] = 1;
+                    (*local_any_null)[w] = 1;
+                  } else {
+                    dst[cur] = src.vals[src_row];
+                  }
+                }
+              }
             }
             continue;
           }

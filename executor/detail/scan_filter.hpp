@@ -2,8 +2,10 @@
 #ifndef TINYLAMB_EXECUTOR_DETAIL_SCAN_FILTER_HPP
 #define TINYLAMB_EXECUTOR_DETAIL_SCAN_FILTER_HPP
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <string>
@@ -59,17 +61,6 @@ struct SimpleComparePredicate {
 // Every prefix must be plain ASCII: a leading multi-byte UTF-8 code point can
 // then never match, and for an ASCII first byte one code point is one byte,
 // so the byte-prefix verdict equals the AST's code-point substr verdict.
-struct PrefixInPredicate {
-  slot_t column{0};
-  std::vector<std::string> prefixes;
-};
-
-// `col [NOT] IN (uncorrelated single-column subquery)` compiled to one
-// immutable value set built once at filter-compile time.  Only peeled for
-// INT64/DATE probes whose type tag and unsigned tag statically equal the
-// build domain, so the int-value set verdict equals the per-row runtime
-// membership build's exact verdict and the matcher is total: every input gets
-// the SQL three-valued answer, no row defers to the contextual path.
 struct MembershipStringHash {
   using is_transparent = void;
   size_t operator()(std::string_view value) const noexcept {
@@ -78,6 +69,88 @@ struct MembershipStringHash {
 };
 using MembershipStringSet =
     std::unordered_set<std::string, MembershipStringHash, std::equal_to<>>;
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (packed_ascii_prefix_set_matches_iff)
+struct PrefixInPredicate {
+  slot_t column{0};
+  size_t prefix_len{0};
+  std::vector<std::string> prefixes;
+  // Flat open-addressed table for ASCII prefixes with 1 <= prefix_len <= 8
+  // (kEmptySlot = ~0ULL cannot occur because all ASCII bytes have bit 7 == 0).
+  std::vector<uint64_t> packed_table;
+  size_t packed_mask{0};
+  MembershipStringSet prefix_set;
+
+  static constexpr uint64_t kEmptySlot = ~uint64_t{0};
+
+  static uint64_t PackPrefix(const char* data, size_t len) noexcept {
+    uint64_t v = 0;
+    std::memcpy(&v, data, len);
+    return v;
+  }
+
+  void Finalize() {
+    if (prefixes.empty()) {
+      return;
+    }
+    prefix_len = prefixes[0].size();
+    if (prefixes.size() <= 8 || prefix_len == 0) {
+      return;
+    }
+    if (prefix_len <= 8) {
+      size_t cap = 16;
+      while (cap < prefixes.size() * 2) {
+        cap <<= 1U;
+      }
+      packed_table.assign(cap, kEmptySlot);
+      packed_mask = cap - 1;
+      for (const std::string& p : prefixes) {
+        const uint64_t key = PackPrefix(p.data(), prefix_len);
+        size_t pos = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 32U) &
+                     packed_mask;
+        while (packed_table[pos] != kEmptySlot && packed_table[pos] != key) {
+          pos = (pos + 1) & packed_mask;
+        }
+        packed_table[pos] = key;
+      }
+    } else {
+      prefix_set.reserve(prefixes.size());
+      for (const std::string& p : prefixes) {
+        prefix_set.insert(p);
+      }
+    }
+  }
+
+  [[nodiscard]] bool Matches(std::string_view text) const noexcept {
+    if (text.size() < prefix_len) {
+      return false;
+    }
+    if (!packed_table.empty()) {
+      const uint64_t key = PackPrefix(text.data(), prefix_len);
+      if (key == kEmptySlot) {
+        return false;
+      }
+      size_t pos = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 32U) &
+                   packed_mask;
+      while (true) {
+        const uint64_t slot = packed_table[pos];
+        if (slot == key) {
+          return true;
+        }
+        if (slot == kEmptySlot) {
+          return false;
+        }
+        pos = (pos + 1) & packed_mask;
+      }
+    }
+    if (!prefix_set.empty()) {
+      return prefix_set.contains(text.substr(0, prefix_len));
+    }
+    return std::ranges::any_of(
+        prefixes, [text](const std::string& p) { return text.starts_with(p); });
+  }
+};
 
 struct PrebuiltMembershipPredicate {
   slot_t column{0};

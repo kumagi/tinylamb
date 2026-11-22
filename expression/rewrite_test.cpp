@@ -45,6 +45,25 @@ namespace tinylamb {
 // and an unchanged node is returned as-is.  Pin that contract so a future
 // rule that structurally copies on every pass (which would silently rebuild
 // whole trees per iteration) fails here instead.
+TEST(RewriteTest, IfMixedNumericBranchesKeepDoublePromotion) {
+  const Schema schema(
+      "s", {Column("flag", ValueType::kInt64), Column("i", ValueType::kInt64),
+            Column("d", ValueType::kDouble)});
+  const auto expression = FunctionCallExp(
+      "if", {ColumnValueExp("flag"), ColumnValueExp("i"), ColumnValueExp("d")});
+  const auto rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  for (const Row& row : {Row({Value(1), Value(7), Value(2.5)}),
+                         Row({Value(0), Value(7), Value(2.5)})}) {
+    const auto expected = expression->TryEvaluate(row, schema);
+    const auto actual = rewritten->TryEvaluate(row, schema);
+    ASSERT_TRUE(expected.HasValue());
+    ASSERT_TRUE(actual.HasValue());
+    EXPECT_EQ(actual.Value().type, ValueType::kDouble);
+    EXPECT_EQ(actual.Value(), expected.Value());
+  }
+}
+
 TEST(ExpressionRewriteTest, NoOpRewritePreservesPointerIdentity) {
   const ExpressionRuleSet& rules = ExpressionRuleSet::Default();
   Expression column = ColumnValueExp("a");
@@ -1245,10 +1264,10 @@ TEST(ExpressionRewriteTest, TypedConstantReassociationStaysExact) {
       BinaryExpressionExp(a, BinaryOperation::kAdd, ConstantValueExp(Value(5))),
       BinaryOperation::kSubtract, ConstantValueExp(Value(8)));
   EXPECT_EQ(rewritten(mixed_add_sub)->ToString(), mixed_add_sub->ToString());
-  const Expression mixed_sub_add = BinaryExpressionExp(
-      BinaryExpressionExp(a, BinaryOperation::kSubtract,
-                          ConstantValueExp(Value(5))),
-      BinaryOperation::kAdd, ConstantValueExp(Value(3)));
+  const Expression mixed_sub_add =
+      BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kSubtract,
+                                              ConstantValueExp(Value(5))),
+                          BinaryOperation::kAdd, ConstantValueExp(Value(3)));
   EXPECT_EQ(rewritten(mixed_sub_add)->ToString(), mixed_sub_add->ToString());
 
   // A mixed-sign pair anywhere in a longer chain blocks the whole collapse:
@@ -1276,11 +1295,10 @@ TEST(ExpressionRewriteTest, TypedConstantReassociationStaysExact) {
               BinaryOperation::kAdd, 10);
 
   // Results must be identical on every input, NULLs included.
-  const Expression folded = rewritten(
-      BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kSubtract,
-                                              ConstantValueExp(Value(5))),
-                          BinaryOperation::kSubtract,
-                          ConstantValueExp(Value(3))));
+  const Expression folded = rewritten(BinaryExpressionExp(
+      BinaryExpressionExp(a, BinaryOperation::kSubtract,
+                          ConstantValueExp(Value(5))),
+      BinaryOperation::kSubtract, ConstantValueExp(Value(3))));
   ASSERT_EQ(folded->Type(), TypeTag::kBinaryExp);
   for (const int64_t probe : {12, 5, 0, -4}) {
     EXPECT_EQ(folded->Evaluate(Row({Value(probe), Value(0.0)}), schema),
@@ -1561,7 +1579,7 @@ TEST(ExpressionRewriteTest, MixedReassociationOfConstants) {
 }
 
 // Oracle-found: Kleene-3VL Boolean algebra (absorption, and the absorption
-// branch of the factor/pullup rules) is value-identical but DROPS a operand
+// branch of the factor/pullup rules) is value-identical but DROPS an operand
 // the AST still evaluates (and which may raise). `(NULL AND raising) OR NULL`
 // must keep the raise, not collapse to NULL.
 TEST(ExpressionRewriteTest, AbsorptionPreservesRaisingOperand) {
@@ -2364,7 +2382,7 @@ TEST(ExpressionRewriteTest, RegexpPrefixExtractionRefusesUnsafeRewrites) {
   ASSERT_EQ(rewritten_ci->Type(), TypeTag::kConstantValue);
   EXPECT_EQ(rewritten_ci->AsConstantValue().GetValue(), Value(false));
 
-  // AsString(12)='12' matches '^1' (TRUE); '12 LIKE '1%'' would error on
+  // AsString(12)='12' matches '^1' (TRUE); `12 LIKE '1%'` would error on
   // non-varchar operands and stay unfolded.
   Expression contains_int = FunctionCallExp(
       "regexp_contains",
@@ -3041,8 +3059,8 @@ TEST(ExpressionRewriteTest, PowIdentitiesFold) {
   const Schema numeric_schema("", {Column("x", ValueType::kInt64)});
   ExpressionRewriter typed(ExpressionRuleSet::Default());
   typed.set_schema(&numeric_schema);
-  const Expression to_first = typed.Rewrite(
-      FunctionCallExp("pow", {ColumnValueExp("x"), ConstantValueExp(Value(1))}));
+  const Expression to_first = typed.Rewrite(FunctionCallExp(
+      "pow", {ColumnValueExp("x"), ConstantValueExp(Value(1))}));
   ASSERT_EQ(to_first->Type(), TypeTag::kCastExp);
   EXPECT_EQ(to_first->AsCastExpression().Child()->ToString(),
             ColumnValueExp("x")->ToString());
@@ -3096,7 +3114,9 @@ TEST(ExpressionRewriteTest, BitwiseAndSafeArithmeticPreserveSemantics) {
       {ConstantValueExp(Value("foo")), ConstantValueExp(Value(int64_t{0}))});
   EXPECT_FALSE(invalid_bit->TryEvaluate(Row(), Schema()).HasValue());
 
-  // safe_add with NaN / Inf must return NULL, never rewritten to NaN / Inf.
+  // SAFE_* suppresses only finite-input overflow; a NaN/Inf already present
+  // in an input propagates through IEEE arithmetic (SAFE_ADD(NaN, 1) is NaN),
+  // so constant folding must preserve it rather than collapse it to NULL.
   const double nan_val = std::numeric_limits<double>::quiet_NaN();
   const double inf_val = std::numeric_limits<double>::infinity();
 
@@ -3104,31 +3124,43 @@ TEST(ExpressionRewriteTest, BitwiseAndSafeArithmeticPreserveSemantics) {
       "safe_add",
       {ConstantValueExp(Value(nan_val)), ConstantValueExp(Value(0.0))});
   Expression rewritten_add_nan = rewriter.Rewrite(safe_add_nan);
-  EXPECT_TRUE(rewritten_add_nan->Evaluate(Row(), Schema()).IsNull());
+  const Value add_nan = rewritten_add_nan->Evaluate(Row(), Schema());
+  ASSERT_EQ(add_nan.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isnan(add_nan.value.double_value));
 
   Expression safe_add_inf = FunctionCallExp(
       "safe_add",
       {ConstantValueExp(Value(inf_val)), ConstantValueExp(Value(0.0))});
   Expression rewritten_add_inf = rewriter.Rewrite(safe_add_inf);
-  EXPECT_TRUE(rewritten_add_inf->Evaluate(Row(), Schema()).IsNull());
+  const Value add_inf = rewritten_add_inf->Evaluate(Row(), Schema());
+  ASSERT_EQ(add_inf.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isinf(add_inf.value.double_value));
+  EXPECT_GT(add_inf.value.double_value, 0);
 
   Expression safe_sub_nan = FunctionCallExp(
       "safe_subtract",
       {ConstantValueExp(Value(nan_val)), ConstantValueExp(Value(0.0))});
   Expression rewritten_sub_nan = rewriter.Rewrite(safe_sub_nan);
-  EXPECT_TRUE(rewritten_sub_nan->Evaluate(Row(), Schema()).IsNull());
+  const Value sub_nan = rewritten_sub_nan->Evaluate(Row(), Schema());
+  ASSERT_EQ(sub_nan.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isnan(sub_nan.value.double_value));
 
   Expression safe_mul_nan = FunctionCallExp(
       "safe_multiply",
       {ConstantValueExp(Value(nan_val)), ConstantValueExp(Value(1.0))});
   Expression rewritten_mul_nan = rewriter.Rewrite(safe_mul_nan);
-  EXPECT_TRUE(rewritten_mul_nan->Evaluate(Row(), Schema()).IsNull());
+  const Value mul_nan = rewritten_mul_nan->Evaluate(Row(), Schema());
+  ASSERT_EQ(mul_nan.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isnan(mul_nan.value.double_value));
 
   Expression safe_mul_inf = FunctionCallExp(
       "safe_multiply",
       {ConstantValueExp(Value(inf_val)), ConstantValueExp(Value(1.0))});
   Expression rewritten_mul_inf = rewriter.Rewrite(safe_mul_inf);
-  EXPECT_TRUE(rewritten_mul_inf->Evaluate(Row(), Schema()).IsNull());
+  const Value mul_inf = rewritten_mul_inf->Evaluate(Row(), Schema());
+  ASSERT_EQ(mul_inf.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isinf(mul_inf.value.double_value));
+  EXPECT_GT(mul_inf.value.double_value, 0);
 
   // Column mixed with 0.0 must not collapse to INT64 column.
   Expression safe_add_col = FunctionCallExp(

@@ -26,7 +26,7 @@ graph TD
           if (!evaluated.HasValue() || !evaluated.Value().IsArray()) {
             return;
           }
-          const std::vector<Value> elements = evaluated.Value().ArrayElements();
+          const auto& elements = evaluated.Value().ArrayElements();
           if (elements.size() > kConstantUnnestValuesThreshold) {
             return;
           }

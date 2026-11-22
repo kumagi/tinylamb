@@ -108,7 +108,12 @@ void Ddl(Database& db, std::string_view sql) {
   SqlEngine engine(db);
   auto result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
-    throw std::runtime_error(engine.LastError());
+    // Some DDL/parser routes return a Status without populating LastError();
+    // fall back to the Status text so the failure is not an empty exception.
+    const std::string message = engine.LastError().empty()
+                                    ? result.GetStatus().GetMessage()
+                                    : engine.LastError();
+    throw std::runtime_error(message);
   }
   result.Value().Drain();
   Check(result.Value().GetStatus());
@@ -204,7 +209,8 @@ void Load(Database& db, const std::filesystem::path& directory,
   if (compact_after) {
     for (const auto& table : loaded_tables) {
       auto ctx = db.BeginContext();
-      Check(db.CompactTableToTlcs(ctx, table));
+      Check(db.CompactTableToTlcs(ctx, table, /*write_checkpoint=*/false,
+                                  /*refresh_statistics=*/false));
       Check(ctx.PreCommit());
       std::cerr << "compacted " << table << '\n';
     }
@@ -283,12 +289,17 @@ void Query(Database& db, std::string_view sql, bool profile) {
 
 int main(int argc, char** argv) {
   const std::string_view mode = argc >= 3 ? std::string_view(argv[2]) : "";
-  if (argc < 4 || argc > 6 ||
+  if (argc < 3 || argc > 6 ||
       (mode != "--load" && mode != "--load-compact" && mode != "--serve" &&
-       mode != "--compact")) {
+       mode != "--compact" && mode != "--compact-all") ||
+      (mode == "--compact-all" && argc != 3) ||
+      // Only --serve takes the optional threads / --profile arguments;
+      // --load/--load-compact/--compact take exactly one operand.
+      ((mode == "--load" || mode == "--load-compact" || mode == "--compact") &&
+       argc != 4)) {
     std::cerr << "usage: tinylamb_tpcds_compare DB --load DATASET | DB "
-                 "--load-compact DATASET | DB --compact TABLE | DB --serve "
-                 "QUERY_DIR\n";
+                 "--load-compact DATASET | DB --compact TABLE | DB "
+                 "--compact-all | DB --serve QUERY_DIR [THREADS] [--profile]\n";
     return 2;
   }
   try {
@@ -296,8 +307,9 @@ int main(int argc, char** argv) {
     // engine's GoogleSQL-compatible default or the host's TZ environment.
     tinylamb::SetDefaultTimeZone("UTC");
     const bool loading = mode == "--load" || mode == "--load-compact";
-    const bool load_compact = mode == "--load-compact";
+    const bool load_compact = loading;
     const bool compacting = mode == "--compact";
+    const bool compacting_all = mode == "--compact-all";
     const bool exists = std::filesystem::exists(std::string(argv[1]) + ".db");
     if (loading == exists) {
       throw std::runtime_error(loading ? "database already exists"
@@ -317,6 +329,27 @@ int main(int argc, char** argv) {
       Ddl(db, "ANALYZE");
       Check(db.WriteCheckpoint().GetStatus());
       std::cerr << "compacted " << argv[3] << '\n';
+    } else if (compacting_all) {
+      std::vector<std::string> tables;
+      {
+        auto ctx = db.BeginContext();
+        tables = db.ListTables(ctx);
+        Check(ctx.PreCommit());
+      }
+      for (const std::string& table : tables) {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto ctx = db.BeginContext();
+        Check(db.CompactTableToTlcs(ctx, table, /*write_checkpoint=*/false,
+                                    /*refresh_statistics=*/false));
+        Check(ctx.PreCommit());
+        const auto t1 = std::chrono::steady_clock::now();
+        const double sec = std::chrono::duration<double>(t1 - t0).count();
+        std::cerr << "compacted " << table << " in " << sec << "s\n";
+      }
+      Check(db.CompactAllTablesToTlcs());
+      Ddl(db, "ANALYZE");
+      Check(db.WriteCheckpoint().GetStatus());
+      std::cerr << "compacted all (" << tables.size() << " tables)\n";
     } else {
       const size_t threads = argc >= 5 ? Number<size_t>(argv[4]) : 1;
       if (threads == 0) {

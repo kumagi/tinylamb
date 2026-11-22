@@ -35,7 +35,14 @@ class Function {
   // Catalog entries can record name and arity before a typed signature is
   // available. Such entries serialize with an empty argument type vector.
   Function(std::string name, int argument_count)
-      : name_(std::move(name)), argument_count_(argument_count) {}
+      : name_(std::move(name)), argument_count_(argument_count) {
+    // The decoder rejects a negative arity; constructing one here would make
+    // a valid-looking catalog entry fail on the next open.
+    if (argument_count < 0) {
+      throw std::invalid_argument(
+          "function argument count must not be negative");
+    }
+  }
   Function(std::string name, std::vector<Type> args, Type return_type)
       : name_(std::move(name)),
         args_(std::move(args)),
@@ -57,7 +64,8 @@ class Function {
     // Name/arity-only signatures have no argument type vector.
     if (d.Failed() || argument_count < 0 ||
         argument_count > std::numeric_limits<int>::max() ||
-        (!f.args_.empty() && static_cast<size_t>(argument_count) != f.args_.size())) {
+        (!f.args_.empty() &&
+         static_cast<size_t>(argument_count) != f.args_.size())) {
       d.Fail();
       return d;
     }

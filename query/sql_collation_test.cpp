@@ -47,6 +47,7 @@ std::vector<Row> RunSql(TransactionContext& context, Database& database,
     rows.push_back(row);
     row = Row();
   }
+  EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
   return rows;
 }
 

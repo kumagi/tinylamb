@@ -41,6 +41,16 @@ class ScalarFunctionSqlTest : public ::testing::Test {
     std::filesystem::remove(db_name_ + ".db");
     tinylamb::RemoveLogAndSegments(db_name_ + ".log");
     std::filesystem::remove(db_name_ + ".last_checkpoint");
+    // Compaction/eviction leave <db>.db.lsm.<gen> / <db>.db.blocks.<gen>
+    // fragments behind; RemoveLogAndSegments only covers the WAL family.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+      const std::string name = entry.path().filename().string();
+      if (name.starts_with(db_name_ + ".db.lsm.") ||
+          name.starts_with(db_name_ + ".db.blocks.")) {
+        std::filesystem::remove(entry.path(), ec);
+      }
+    }
   }
 
   std::vector<Row> RunSql(std::string_view sql) {
@@ -52,6 +62,12 @@ class ScalarFunctionSqlTest : public ::testing::Test {
       Row row;
       while (prepared.Value()->Next(&row, nullptr)) {
         rows.push_back(row);
+      }
+      // Next()==false is also how a drain-time failure is reported; without
+      // checking the sticky status a partial result looks like a full one.
+      if (const Status drain = prepared.Value()->GetStatus();
+          drain != Status::kSuccess) {
+        ADD_FAILURE() << sql << " -> drain failed: " << drain;
       }
     } else {
       ADD_FAILURE() << sql << " -> " << engine.LastError();
@@ -79,8 +95,11 @@ class ScalarFunctionSqlTest : public ::testing::Test {
     }
     Row row;
     bool has_row = prepared.Value()->Next(&row, nullptr);
+    // An error raised while producing the first row is a failure; a clean
+    // zero-row result is not (the caller asserts the query must error).
+    const bool failed = prepared.Value()->GetStatus() != Status::kSuccess;
     ctx.txn_.Abort();
-    return !has_row;
+    return failed || !has_row;
   }
 
   std::string db_name_;
@@ -296,8 +315,12 @@ TEST(FunctionCallAstTest, MathFunctionsAstParity) {
     for (const auto& a : args) {
       exprs.push_back(ConstantValueExp(a));
     }
-    return FunctionCallExp(name, std::move(exprs))
-        ->TryEvaluate(dummy_row, dummy_schema);
+    const StatusOr<Value> result = FunctionCallExp(name, std::move(exprs))
+                                       ->TryEvaluate(dummy_row, dummy_schema);
+    // Callers unwrap with Value(), which aborts on an error Status. Check it
+    // here so a regressed function is named in the failure instead.
+    EXPECT_TRUE(result.HasValue()) << name << " -> " << result.GetStatus();
+    return result;
   };
 
   EXPECT_EQ(eval("abs", {Value(int64_t{-5})}).Value(), Value(int64_t{5}));
@@ -537,6 +560,55 @@ TEST(FunctionCallAstTest, ResultTypeMixedNumeric) {
   EXPECT_EQ(mod_mixed2->ResultType(dummy_schema).GetType(), TypeTag::kDouble);
   EXPECT_EQ(mod_mixed2->ResultType(dummy_schema, dummy_schema).GetType(),
             TypeTag::kDouble);
+}
+
+// IF/IFERROR normalize an int64 branch to double when any other branch is
+// double (NormalizeIfBranch). Their declared ResultType must report that same
+// promoted type, otherwise a typed ColumnVector sees a DOUBLE value appended
+// to a column declared INT64.
+TEST(FunctionCallAstTest, IfResultTypeMatchesRuntimePromotion) {
+  Schema dummy_schema;
+  Row dummy_row;
+  const Expression bigint = ConstantValueExp(Value(int64_t{1}));
+  const Expression dbl = ConstantValueExp(Value(2.5));
+  const Expression yes = ConstantValueExp(Value(true));
+  const Expression no = ConstantValueExp(Value(false));
+
+  Expression if_promote = FunctionCallExp("if", {yes, bigint, dbl});
+  EXPECT_EQ(if_promote->ResultType(dummy_schema).GetType(), TypeTag::kDouble);
+  EXPECT_EQ(if_promote->ResultType(dummy_schema, dummy_schema).GetType(),
+            TypeTag::kDouble);
+  EXPECT_EQ(if_promote->Evaluate(dummy_row, dummy_schema).type,
+            ValueType::kDouble);
+
+  // The untaken double branch still forces the promotion: this is the
+  // original mismatched case (cond false, int64 taken, double other branch).
+  Expression if_false = FunctionCallExp("if", {no, bigint, dbl});
+  EXPECT_EQ(if_false->ResultType(dummy_schema).GetType(), TypeTag::kDouble);
+  EXPECT_EQ(if_false->ResultType(dummy_schema, dummy_schema).GetType(),
+            TypeTag::kDouble);
+  EXPECT_EQ(if_false->Evaluate(dummy_row, dummy_schema).type,
+            ValueType::kDouble);
+
+  Expression if_same = FunctionCallExp("if", {yes, bigint, bigint});
+  EXPECT_EQ(if_same->ResultType(dummy_schema).GetType(), TypeTag::kBigInt);
+  EXPECT_EQ(if_same->ResultType(dummy_schema, dummy_schema).GetType(),
+            TypeTag::kBigInt);
+  EXPECT_EQ(if_same->Evaluate(dummy_row, dummy_schema).type, ValueType::kInt64);
+
+  // IFERROR's fallback participates in the promotion even when the primary
+  // succeeds, because the promotion is decided from static branch types.
+  Expression iferror_promote = FunctionCallExp("iferror", {bigint, dbl});
+  EXPECT_EQ(iferror_promote->ResultType(dummy_schema).GetType(),
+            TypeTag::kDouble);
+  EXPECT_EQ(iferror_promote->ResultType(dummy_schema, dummy_schema).GetType(),
+            TypeTag::kDouble);
+
+  // NULLIFERROR never evaluates its second argument, so it keeps arg0's type.
+  Expression nulliferror = FunctionCallExp("nulliferror", {bigint, dbl});
+  EXPECT_EQ(nulliferror->ResultType(dummy_schema).GetType(), TypeTag::kBigInt);
+  EXPECT_EQ(nulliferror->ResultType(dummy_schema, dummy_schema).GetType(),
+            TypeTag::kBigInt);
 }
 
 TEST(FunctionCallAstTest, StringScalarParity) {
@@ -795,6 +867,34 @@ TEST(FunctionCallTest, GenerateArrayKeepsExactIntegerBounds) {
                                 Value(-3).WithUnsigned()}));
 }
 
+TEST(FunctionCallTest, RoundAndTruncTreatLargeUnsignedDigitsAsPositive) {
+  const Value digits = Value(int64_t{-1}).WithUnsigned();
+  for (const char* name : {"round", "trunc", "truncate"}) {
+    const auto floating = ExecuteFunction(name, {Value(1.5), digits});
+    ASSERT_TRUE(floating.HasValue()) << name;
+    EXPECT_EQ(floating.Value(), Value(1.5)) << name;
+    const auto integer = ExecuteFunction(name, {Value(123), digits});
+    ASSERT_TRUE(integer.HasValue()) << name;
+    EXPECT_EQ(integer.Value(), Value(123)) << name;
+  }
+}
+
+TEST(FunctionCallTest, TimestampArrayHandlesHugeDaySteps) {
+  const Value start("2020-01-01 00:00:00+00");
+  const Value end("2021-01-01 00:00:00+00");
+  const auto forward = ExecuteFunction(
+      "generate_timestamp_array", {start, end, Value(int64_t{100000000000LL})});
+  ASSERT_TRUE(forward.HasValue());
+  ASSERT_EQ(forward.Value().ArrayElements().size(), 1U);
+  EXPECT_EQ(forward.Value().ArrayElements()[0], start);
+  const auto backward =
+      ExecuteFunction("generate_timestamp_array",
+                      {end, start, Value(int64_t{-100000000000LL})});
+  ASSERT_TRUE(backward.HasValue());
+  ASSERT_EQ(backward.Value().ArrayElements().size(), 1U);
+  EXPECT_EQ(backward.Value().ArrayElements()[0], end);
+}
+
 TEST(FunctionCallTest, GenerateArrayDefaultStepAndNaNValidation) {
   for (const auto& args : {std::vector<Value>{Value(5), Value(1)},
                            std::vector<Value>{Value(5.0), Value(1.0)}}) {
@@ -1040,6 +1140,42 @@ TEST(FunctionCallTest, UnsignedMathAndScalarFunctions) {
   EXPECT_GT(sqrt_res.Value().value.double_value, 0.0);
 }
 
+// Bug 10804: SAFE_* suppresses finite-input overflow, not IEEE propagation of
+// an already non-finite input. SAFE_ADD(NaN, 1) is NaN, not NULL.
+TEST(FunctionCallTest, SafeArithmeticPropagatesNonFiniteInputs) {
+  const Row row;
+  const Schema schema;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  auto eval = [&](const char* fn, double left, double right) {
+    return FunctionCallExp(fn, {ConstantValueExp(Value(left)),
+                                ConstantValueExp(Value(right))})
+        ->Evaluate(row, schema);
+  };
+
+  const Value add_nan = eval("safe_add", nan, 1.0);
+  ASSERT_EQ(add_nan.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isnan(add_nan.value.double_value));
+
+  const Value sub_nan = eval("safe_subtract", 1.0, nan);
+  ASSERT_EQ(sub_nan.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isnan(sub_nan.value.double_value));
+
+  const Value mul_nan = eval("safe_multiply", nan, 1.0);
+  ASSERT_EQ(mul_nan.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isnan(mul_nan.value.double_value));
+
+  const Value add_inf = eval("safe_add", inf, 1.0);
+  ASSERT_EQ(add_inf.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isinf(add_inf.value.double_value));
+
+  // Finite inputs overflowing to inf are still suppressed to NULL.
+  const double huge = 1.0e308;
+  EXPECT_TRUE(eval("safe_add", huge, huge).IsNull());
+  EXPECT_TRUE(eval("safe_multiply", huge, huge).IsNull());
+}
+
 TEST_F(ScalarFunctionSqlTest, UnsignedMathAndScalarFunctionsSql) {
   Value abs_v = Scalar("SELECT ABS(CAST(9223372036854775808 AS UINT64))");
   EXPECT_TRUE(abs_v.IsUnsigned());
@@ -1180,10 +1316,6 @@ TEST_F(ScalarFunctionSqlTest, BitwiseAndShiftOperatorsConformance) {
   EXPECT_EQ(u_xor.value.int_value, 2);
 }
 
-// Regression for the fuzz-found AddOrSubInterval union-member read:
-// DATE_ADD/DATE_SUB with a non-DATE non-VARCHAR operand must return a
-// Status, not dereference `value.varchar_value` of an INT64/DOUBLE union
-// member (a garbage string_view -> SEGV inside TryParseDateDays).
 TEST_F(ScalarFunctionSqlTest, ArrayToString_JoinsWithDelimiterAndNullHandling) {
   EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING([1, 2, 3], '-')"),
             Value(std::string("1-2-3")));
@@ -1206,6 +1338,10 @@ TEST_F(ScalarFunctionSqlTest, ArrayToString_JoinsWithDelimiterAndNullHandling) {
   EXPECT_TRUE(SqlFails("SELECT ARRAY_TO_STRING([1, 2], ',', '*', 4)"));
 }
 
+// Regression for the fuzz-found AddOrSubInterval union-member read:
+// DATE_ADD/DATE_SUB with a non-DATE non-VARCHAR operand must return a
+// Status, not dereference `value.varchar_value` of an INT64/DOUBLE union
+// member (a garbage string_view -> SEGV inside TryParseDateDays).
 TEST(FunctionCallTest, DateAddRejectsNonDateOperand) {
   Row dummy_row;
   Schema dummy_schema;
@@ -1238,9 +1374,6 @@ TEST(FunctionCallTest, DateAddRejectsNonDateOperand) {
   EXPECT_EQ(res_d.Value().AsString(), "2023-12-15");
 }
 
-// Regression for the fuzz-found ParseJsonSimple non-progress loop:
-// a '[' array whose first token is unrecognized consumed no input, so the
-// element loop pushed JVals forever -> OOM. Malformed JSON must terminate.
 TEST(FunctionCallTest, TypedIntervalExtractUsesSignedComponents) {
   const Schema schema("t", {Column("v", ValueType::kVarChar)});
   const std::vector<std::pair<std::string, int64_t>> parts{
@@ -1291,6 +1424,9 @@ TEST(FunctionCallTest, TypedIntervalExtractUsesSignedComponents) {
           .HasValue());
 }
 
+// Regression for the fuzz-found ParseJsonSimple non-progress loop:
+// a '[' array whose first token is unrecognized consumed no input, so the
+// element loop pushed JVals forever -> OOM. Malformed JSON must terminate.
 TEST(FunctionCallTest, JsonExtractMalformedArrayTerminates) {
   Row dummy_row;
   Schema dummy_schema;

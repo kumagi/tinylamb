@@ -175,7 +175,6 @@ class ParallelScan final : public ExecutorBase {
   std::mutex mutex_;
   std::condition_variable ready_cv_;
   std::condition_variable space_cv_;
-  size_t active_workers_{0};
   bool started_{false};
   bool typed_folded_{false};
   std::atomic<bool> cancelled_{false};

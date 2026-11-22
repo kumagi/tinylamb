@@ -86,6 +86,20 @@ TEST_F(SqlUdfTest, NullaryScalarFunction) {
   EXPECT_EQ(rows[0][0], Value(int64_t{1001}));
 }
 
+TEST_F(SqlUdfTest, DatePartNamedUdfTakesPrecedenceOverAlias) {
+  const auto builtin =
+      RunSql(engine_.get(), context_.get(), "SELECT DAY(DATE '2026-01-05')");
+  ASSERT_EQ(builtin.size(), 1U);
+  EXPECT_EQ(builtin[0][0], Value(int64_t{5}));
+  EXPECT_NO_THROW(RunSql(engine_.get(), context_.get(),
+                         "CREATE TEMP FUNCTION day(x INT64) AS (x + 1)"));
+  const auto udf = RunSql(engine_.get(), context_.get(), "SELECT day(1)");
+  ASSERT_EQ(udf.size(), 1U);
+  EXPECT_EQ(udf[0][0], Value(int64_t{2}));
+  EXPECT_THROW(RunSql(engine_.get(), context_.get(), "SELECT day(1, 2)"),
+               std::runtime_error);
+}
+
 TEST_F(SqlUdfTest, TypedParameterAndArgumentsEvaluatedOncePerRow) {
   EXPECT_NO_THROW(
       RunSql(engine_.get(), context_.get(),
@@ -1054,6 +1068,23 @@ TEST_F(AggregateHavingTest, SetOperationKeepsFirstBranchColumnTypes) {
   EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
 }
 
+// SetOperationExecutor coerces every branch to the column's common type, so
+// the declared type must follow the folded rows rather than the first
+// branch. Otherwise a first INT64 branch would make RowDescription claim int8
+// for the DOUBLE rows the executor actually returns.
+TEST_F(AggregateHavingTest, SetOperationDeclaresCommonTypeNotFirstBranch) {
+  StatusOr<QueryResult> result =
+      engine_->Execute(*context_,
+                       "SELECT CAST(g AS INT64) AS x FROM t UNION DISTINCT "
+                       "SELECT CAST(v AS FLOAT64) AS x FROM t");
+  ASSERT_TRUE(result.HasValue()) << engine_->LastError();
+  const auto& types = result.Value().ColumnTypes();
+  ASSERT_EQ(types.size(), 1U);
+  EXPECT_EQ(types[0], ValueType::kDouble);
+  result.Value().ForEach([](const Row&) {});
+  EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
+}
+
 TEST_F(AggregateHavingTest, StatementTimeoutAbortsLongQueryAndAllowsFollowup) {
   context_->txn_.SetStatementTimeout(std::chrono::milliseconds(20));
   StatusOr<Executor> exec =
@@ -1064,8 +1095,7 @@ TEST_F(AggregateHavingTest, StatementTimeoutAbortsLongQueryAndAllowsFollowup) {
     Row row;
     while (exec.Value()->Next(&row, nullptr)) {
     }
-    EXPECT_EQ(exec.Value()->GetStatus().GetCode(),
-              StatusCode::kQueryCanceled);
+    EXPECT_EQ(exec.Value()->GetStatus().GetCode(), StatusCode::kQueryCanceled);
     EXPECT_NE(exec.Value()->GetStatus().GetMessage().find("timeout"),
               std::string::npos);
   } else {

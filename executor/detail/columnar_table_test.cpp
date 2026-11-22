@@ -2,6 +2,8 @@
 
 #include "executor/detail/columnar_table.hpp"
 
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -10,6 +12,7 @@
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
+#include "table/lstable_bridge.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -25,6 +28,40 @@ using relational_detail::ColumnarChunk;
 using relational_detail::ColumnarColumn;
 using relational_detail::ColumnarTable;
 using relational_detail::CompiledColumnarProjection;
+
+TEST(ColumnarTableTest, DictionaryNullsStayNullThroughScalarAccessors) {
+  const std::array<uint8_t, 2> codes{0, LSTableColumnDictionary::kNullCode};
+  LSTableColumnDictionary dictionary;
+  dictionary.double_entries = {1.25};
+  ColumnarColumn column;
+  column.SetBorrowedNarrowDict(&dictionary, nullptr, ValueType::kDouble, false,
+                               false, true, codes.data(), nullptr,
+                               codes.size());
+  EXPECT_FALSE(column.IsNull(0));
+  EXPECT_EQ(column.DoubleAt(0), 1.25);
+  EXPECT_EQ(column.ValueAt(0), Value(1.25));
+  EXPECT_TRUE(column.IsNull(1));
+  EXPECT_EQ(column.DoubleAt(1), 0.0);
+  EXPECT_TRUE(column.ValueAt(1).IsNull());
+}
+
+TEST(ColumnarTableTest, FallbackSubstringOwnsItsBytes) {
+  ColumnarColumn source;
+  source.Init(ValueType::kVarChar);
+  source.AppendValue(Value("prefix" + std::string(120, 'x')).WithCollation(2),
+                     nullptr, 0);
+  source.AppendNull(1);
+  ASSERT_FALSE(source.is_uniform);
+
+  ColumnarColumn output;
+  output.Init(ValueType::kVarChar);
+  ASSERT_TRUE(
+      output.AppendSubstringFrom(source, 0, nullptr, 2, 7, 100, true, 0));
+  EXPECT_EQ(output.StringAt(0), std::string(100, 'x'));
+  EXPECT_NE(output.StringAt(0).data(),
+            source.fallback[0].AsStringView().data() + 6);
+  EXPECT_TRUE(output.ValueAt(1).IsNull());
+}
 
 TEST(ColumnarTableTest, PartialSliceRetainsColumnLocalArenaAfterSourceDrop) {
   auto input = std::make_shared<ColumnarTable>();

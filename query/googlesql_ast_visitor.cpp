@@ -434,6 +434,9 @@ Expression SubstituteParameters(
         rebuilt->SetInnerOrderBy(std::move(order));
       }
       rebuilt->SetInnerLimit(aggregate.InnerLimit());
+      if (!aggregate.ArrayElementSqlType().empty()) {
+        rebuilt->SetArrayElementSqlType(aggregate.ArrayElementSqlType());
+      }
       return rebuilt;
     }
     case TypeTag::kCaseExp: {
@@ -488,6 +491,9 @@ Expression SubstituteParameters(
           SubstituteParameters(query.Test(), bindings), query.Exists(),
           query.Negated(), query.Op(), query.Mode());
       rebuilt->SetArrayResult(query.ArrayResult());
+      if (!query.ArrayElementSqlType().empty()) {
+        rebuilt->SetArrayElementSqlType(query.ArrayElementSqlType());
+      }
       return {rebuilt};
     }
     default:
@@ -987,7 +993,6 @@ StatusOr<SelectSource> VisitTableSource(
             ASSIGN_OR_RETURN(std::string, hv167193_0, (Alias(*child)));
             source.alias = std::move(hv167193_0);
           }
-          break;
         }
       }
       Status st_off = capture_offset_alias();
@@ -1034,15 +1039,16 @@ StatusOr<SelectSource> VisitTableSource(
     // stays the name used at the reference site.
     const auto& views = ViewRegistry();
     const auto found_view = views.find(Lower(dotted));
-    if (found_view != views.end()) {
+    if (found_view != views.end() && found_view->second.query != nullptr) {
       if (ViewExpansionDepth() >= 16) {
         return AstError<SelectSource>("view expansion too deep: " + dotted);
       }
       ++ViewExpansionDepth();
       SelectSource view_source;
       Status st_view = [&]() -> Status {
+        const VisitSourceScope defining_source(found_view->second.source);
         ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, h_tmp_4601,
-                         (VisitQuery(*found_view->second)));
+                         VisitQuery(*found_view->second.query));
         view_source.query = std::move(h_tmp_4601);
         view_source.alias = source.alias.empty() ? Lower(dotted) : source.alias;
         return Status::kSuccess;
@@ -1268,6 +1274,7 @@ StatusOr<SelectSource> VisitTableSource(
                                       tvf.parameters[arg_index].first +
                                       " for table function " + function_name);
       }
+      const VisitSourceScope defining_source(tvf.table_function_source);
       ASSIGN_OR_RETURN(Expression, hv244003_0,
                        (VisitExpression(*default_expr)));
       Row dummy_row;
@@ -1287,8 +1294,12 @@ StatusOr<SelectSource> VisitTableSource(
       return AstError<SelectSource>("table function expansion too deep: " +
                                     function_name);
     }
+    const auto visit_body = [&] {
+      const VisitSourceScope defining_source(tvf.table_function_source);
+      return VisitQuery(*tvf.body);
+    };
     ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv244004_0,
-                     (VisitQuery(*tvf.body)));
+                     visit_body());
     std::shared_ptr<SelectStatement> expanded =
         SubstituteInSelect(*hv244004_0, bindings);
     if (source.alias.empty()) {
@@ -1768,11 +1779,30 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
       // The parser emits the OFFSET as a bare IntLiteral sibling of the
       // Limit node ("LimitOffset -> Limit(IntLiteral), IntLiteral(2)").
       // Older dumps wrapped it in an "Offset" node; accept both shapes so
-      // a literal OFFSET is never silently ignored.
+      // a literal OFFSET is never silently ignored. Invalid operands must
+      // fail like the non-pipe LIMIT/OFFSET path instead of leaving the
+      // offset at 0 and quietly changing the result window.
+      auto validate_pipe_offset = [](const GoogleSqlAstNode& operand)
+          -> StatusOr<std::shared_ptr<SelectStatement>> {
+        if (operand.kind == "NullLiteral") {
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "OFFSET must not be NULL");
+        }
+        if (operand.kind == "UnaryExpression" && operand.detail == "-" &&
+            !operand.children.empty() &&
+            operand.children.front()->kind == "IntLiteral") {
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "OFFSET must be non-negative");
+        }
+        return std::shared_ptr<SelectStatement>{};
+      };
       for (const auto& sub : limit_offset->children) {
         if (sub->kind == "Limit" || sub->kind == "Location" ||
-            sub->kind == "Hint") {
+            sub->kind == "Hint" || sub->kind == "WithTies") {
           continue;
+        }
+        if (auto h_off = validate_pipe_offset(*sub); !h_off.HasValue()) {
+          return h_off.GetStatus();
         }
         if (sub->kind == "Offset") {
           for (const auto& inner : sub->children) {
@@ -1791,18 +1821,26 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
           offset = hvpipe_offset;
         } else {
           // Constant expressions such as OFFSET 2+3 fold to a literal,
-          // matching the non-pipe LIMIT path's fold_int contract.
+          // matching the non-pipe LIMIT path's fold_int contract. Anything
+          // that does not fold to a non-negative integer literal fails
+          // loudly instead of being silently dropped.
           auto folded_or = VisitExpression(*sub);
           if (folded_or.HasValue()) {
             Expression folded = folded_or.MoveValue();
             if (folded && folded->Type() == TypeTag::kConstantValue) {
               const Value& constant = folded->AsConstantValue().GetValue();
-              if (constant.type == ValueType::kInt64 && !constant.IsNull() &&
-                  constant.value.int_value >= 0) {
+              if (constant.type == ValueType::kInt64 && !constant.IsNull()) {
+                if (constant.value.int_value < 0) {
+                  return AstError<std::shared_ptr<SelectStatement>>(
+                      "OFFSET must be non-negative");
+                }
                 offset = static_cast<size_t>(constant.value.int_value);
+                continue;
               }
             }
           }
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "OFFSET requires an integer literal in this engine");
         }
       }
       if (limit.has_value()) {
@@ -2006,6 +2044,10 @@ UdfRegistryState& UdfRegistryStateForThread() {
 
 void SetUdfSessionScope(uint64_t session_id) {
   UdfRegistryStateForThread().session_id = session_id;
+  // Keep the legacy string-constant ledger in lockstep with the typed,
+  // scope-keyed registries: a name defined by one connection must not resolve
+  // in another that shares the event-loop thread.
+  SetSessionConstantScope(session_id);
 }
 
 uint64_t UdfSessionScope() { return UdfRegistryStateForThread().session_id; }
@@ -2565,7 +2607,12 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       ASSIGN_OR_RETURN(NamedWindowParts, parts,
                        ParseWindowSpecification(*spec));
       ASSIGN_OR_RETURN(std::string, hv188409_0, (Identifier(*name_node)));
-      t_named_windows[std::move(hv188409_0)] = std::move(parts);
+      // GoogleSQL identifiers (including named windows) are case-insensitive.
+      if (!t_named_windows.emplace(Lower(hv188409_0), std::move(parts))
+               .second) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "duplicate named window: " + hv188409_0);
+      }
     }
   }
 
@@ -2764,7 +2811,11 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
   const bool as_value =
       select_as != nullptr &&
       UpperCopy(select_as->detail).find("VALUE") != std::string::npos;
-  if (as_value && projections.size() == 1) {
+  if (as_value && projections.size() != 1) {
+    return AstError<std::shared_ptr<SelectStatement>>(
+        "SELECT AS VALUE requires exactly one expression");
+  }
+  if (as_value) {
     projections.front().expression = FunctionCallExp(
         "__value_table_value", {projections.front().expression});
   }
@@ -3564,8 +3615,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         const bool entry_is_active =
             context.active_key_texts.contains(entry_text);
         const bool entry_is_inactive_key =
-            !entry_is_active &&
-            context.all_key_texts.contains(entry_text);
+            !entry_is_active && context.all_key_texts.contains(entry_text);
         const bool entry_aliases_inactive_key =
             !item.name.empty() && inactive_aliases.contains(Lower(item.name)) &&
             !entry_is_active;
@@ -3713,6 +3763,9 @@ StatusOr<std::unique_ptr<Statement>> VisitCreateFunction(
     // expand it with the call-site arguments (see the TVF table-source
     // branch).  Body references whose names match a parameter substitute
     // the argument value at expansion time.
+    if (t_visit_source != nullptr) {
+      udf.table_function_source = *t_visit_source;
+    }
     const GoogleSqlAstNode* body = root.Child("Query");
     if (body != nullptr) {
       auto cloned = CloneAstNode(root);
@@ -4045,8 +4098,7 @@ Status ValidateSelectAsProjections(
 }  // namespace
 }  // namespace ast_visitor_detail
 
-using ViewRegistryMap =
-    std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>;
+using ViewRegistryMap = std::unordered_map<std::string, StoredViewDefinition>;
 
 // NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
 // intentional
@@ -4055,19 +4107,17 @@ static std::unordered_map<uint64_t, ViewRegistryMap>& AllViewRegistries() {
   return registries;
 }
 
-std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>&
-ViewRegistry() {
+ViewRegistryMap& ViewRegistry() {
   // Key by session scope: sessions sharing an event-loop thread must not see
   // or wipe each other's TEMP views.
   return AllViewRegistries()[tinylamb::UdfSessionScope()];
 }
 
 void RegisterViewDefinition(std::string_view name,
-                            const GoogleSqlAstNode& query) {
-  std::shared_ptr<GoogleSqlAstNode> clone =
-      ast_visitor_detail::CloneAstNode(query);
-  ViewRegistry()[ast_visitor_detail::Lower(std::string(name))] =
-      std::move(clone);
+                            const GoogleSqlAstNode& query,
+                            std::string_view source) {
+  ViewRegistry()[ast_visitor_detail::Lower(std::string(name))] = {
+      ast_visitor_detail::CloneAstNode(query), std::string(source)};
 }
 StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     const GoogleSqlAstNode& root, std::string_view source) {

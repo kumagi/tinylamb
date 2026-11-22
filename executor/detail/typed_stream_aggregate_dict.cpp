@@ -291,7 +291,7 @@ const int64_t* BoundedIntegerAggregateColumn(
       store.blocks.front().columns[column].type != ValueType::kInt64 ||
       store.blocks.front().columns[column].is_unsigned ||
       store.column_has_null[column] != 0 ||
-      store.integer_columns[column].size() != store.total_rows ||
+      store.IntegerColumn(column).size() != store.total_rows ||
       store.column_min_int[column] > store.column_max_int[column]) {
     return nullptr;
   }
@@ -306,7 +306,7 @@ const int64_t* BoundedIntegerAggregateColumn(
   if (maximum > limit / store.total_rows) {
     return nullptr;
   }
-  return store.integer_columns[column].data();
+  return store.IntegerColumn(column).data();
 }
 
 }  // namespace
@@ -338,10 +338,10 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
     if ((column_schema.Type() != ValueType::kInt64 &&
          column_schema.Type() != ValueType::kDate) ||
         column_schema.IsUnsigned() || store.column_has_null[column] != 0U ||
-        store.integer_columns[column].size() != store.total_rows) {
+        store.IntegerColumn(column).size() != store.total_rows) {
       return std::optional<Relation>{};
     }
-    keys.push_back(store.integer_columns[column].data());
+    keys.push_back(store.IntegerColumn(column).data());
   }
   std::vector<const int64_t*> inputs;
   inputs.reserve(plan.aggregates.size());
@@ -782,7 +782,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
         const platform::Int128 bound = type == AggregationType::kAvg
                                            ? (platform::Int128{1} << 53)
                                            : platform::Int128{INT64_MAX};
-        for (int64_t value : dictionary.int_entries) {
+        for (int64_t value : dictionary.IntEntries()) {
           const platform::Int128 magnitude =
               value < 0 ? -platform::Int128{value} : value;
           if (magnitude * store.total_rows > bound) {
@@ -832,8 +832,8 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
                                transform_key != nullptr)) {
     return std::optional<Relation>{};
   }
-  const size_t domain = (numeric_dictionary ? dictionary.int_entries.size()
-                                            : dictionary.entries.size()) +
+  const size_t domain = (numeric_dictionary ? dictionary.IntEntryCount()
+                                            : dictionary.StringEntryCount()) +
                         1;
   const size_t null_code = domain - 1;
   if (domain >= 32768 && transform_key == nullptr && dependent_count == 0 &&
@@ -883,9 +883,8 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
   }
   size_t bytes = (domain * bytes_per_code) +
                  ((store.blocks.size() + 1) * sizeof(uint64_t));
-  const size_t distinct_domain = distinct_dictionary == nullptr
-                                     ? 0
-                                     : distinct_dictionary->int_entries.size();
+  const size_t distinct_domain =
+      distinct_dictionary == nullptr ? 0 : distinct_dictionary->IntEntryCount();
   const auto distinct_code_bits = static_cast<unsigned>(
       distinct_domain == 0 ? 0 : std::bit_width(distinct_domain - 1));
   // The product is an exact domain bound, not an NDV estimate. If the bitmap
@@ -957,9 +956,10 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
       allowed[null_code] = 0;
     } else if (numeric_dictionary && !compare.string_payload &&
                !compare.is_double && column_at(compare.left) == key_column) {
+      const auto int_entries = dictionary.IntEntries();
       for (size_t code = 0; code < null_code; ++code) {
-        allowed[code] &= static_cast<uint8_t>(matches(
-            dictionary.int_entries[code], compare.int_constant, compare.op));
+        allowed[code] &= static_cast<uint8_t>(
+            matches(int_entries[code], compare.int_constant, compare.op));
       }
       allowed[null_code] = 0;
     } else {
@@ -1367,22 +1367,22 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
         return Value();
       }
       if (type == AggregationType::kSum) {
-        return Value(dictionary.int_entries[code] *
+        return Value(dictionary.IntEntryAt(code) *
                      static_cast<int64_t>(merged.slots[code].count));
       }
       if (type == AggregationType::kAvg) {
         return Value(static_cast<double>(
-                         dictionary.int_entries[code] *
+                         dictionary.IntEntryAt(code) *
                          static_cast<int64_t>(merged.slots[code].count)) /
                      static_cast<double>(merged.slots[code].count));
       }
       if (dictionary.value_type == ValueType::kInt64) {
-        return Value(dictionary.int_entries[code]);
+        return Value(dictionary.IntEntryAt(code));
       }
       if (dictionary.value_type == ValueType::kDate) {
-        return Value::DateFromDays(dictionary.int_entries[code]);
+        return Value::DateFromDays(dictionary.IntEntryAt(code));
       }
-      return Value(std::string(dictionary.entries[code]));
+      return Value(std::string(dictionary.StringEntryAt(code)));
     }
     const size_t slot = numeric_slots[aggregate];
     if (slot == SIZE_MAX) {
@@ -1474,15 +1474,15 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
         for (size_t k = 0; k < dependent_count; ++k) {
           int64_t raw = 0;
           Status error = Status::kSuccess;
+          const auto int_entries = dictionary.IntEntries();
           if (code != null_code &&
               EvaluateTypedIntExprCells(
-                  plan.dependent_key_inputs[k], &dictionary.int_entries[code],
+                  plan.dependent_key_inputs[k], &int_entries[code],
                   [](slot_t) { return false; }, &raw, &error)) {
             dependent_values[(code * dependent_count) + k] = raw;
             continue;
           }
-          input[0] =
-              code == null_code ? Value() : Value(dictionary.int_entries[code]);
+          input[0] = code == null_code ? Value() : Value(int_entries[code]);
           auto value =
               TryEvaluateRowAuto(plan.dependent_key_programs[k], input);
           if (!value.HasValue()) {
@@ -1542,8 +1542,8 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
                                          transformed_keys[right]);
         } else if (numeric_dictionary) {
           comparison =
-              (dictionary.int_entries[left] > dictionary.int_entries[right]) -
-              (dictionary.int_entries[left] < dictionary.int_entries[right]);
+              (dictionary.IntEntryAt(left) > dictionary.IntEntryAt(right)) -
+              (dictionary.IntEntryAt(left) < dictionary.IntEntryAt(right));
         } else {
           // Borrow dictionary text only for this comparison. Value ordering
           // also handles interval-shaped strings correctly.
@@ -1635,8 +1635,8 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
               code == null_code
                   ? Value()
                   : (dictionary.value_type == ValueType::kDate
-                         ? Value::DateFromDays(dictionary.int_entries[code])
-                         : Value(dictionary.int_entries[code])));
+                         ? Value::DateFromDays(dictionary.IntEntryAt(code))
+                         : Value(dictionary.IntEntryAt(code))));
         } else {
           values.push_back(code == null_code
                                ? Value()
@@ -1755,9 +1755,9 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
     // equality); counting `entries` instead made the domain 0 and folded
     // every row into the single NULL group (P680).
     const size_t domain =
-        numeric ? dictionary.int_entries.size()
-                : (double_dictionary ? dictionary.double_entries.size()
-                                     : dictionary.entries.size());
+        numeric ? dictionary.IntEntryCount()
+                : (double_dictionary ? dictionary.DoubleEntryCount()
+                                     : dictionary.StringEntryCount());
     if (domain > UINT32_MAX ||
         dictionary.DictionaryCodeCount() != store.total_rows) {
       return std::optional<Relation>{};
@@ -2281,13 +2281,13 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
       }
       const auto& dictionary = *key.dictionary;
       if (dictionary.value_type == ValueType::kInt64) {
-        return Value(dictionary.int_entries[code]);
+        return Value(dictionary.IntEntryAt(code));
       }
       if (dictionary.value_type == ValueType::kDate) {
-        return Value::DateFromDays(dictionary.int_entries[code]);
+        return Value::DateFromDays(dictionary.IntEntryAt(code));
       }
       if (dictionary.value_type == ValueType::kDouble) {
-        return Value(dictionary.double_entries[code]);
+        return Value(dictionary.DoubleEntries()[code]);
       }
       if (own) {
         return Value(std::string(dictionary.entries[code]));

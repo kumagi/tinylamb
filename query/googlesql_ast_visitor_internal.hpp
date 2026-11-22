@@ -16,8 +16,8 @@
 #include <utility>
 #include <vector>
 
-#include "common/string_util.hpp"
 #include "common/status_or.hpp"
+#include "common/string_util.hpp"
 #include "expression/expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast.hpp"
@@ -59,6 +59,7 @@ struct SqlUdf {
   bool is_aggregate{false};
   std::shared_ptr<GoogleSqlAstNode> root;  // owns the AST copy
   const GoogleSqlAstNode* body{nullptr};
+  std::string table_function_source;
   // Body analysis: how often each parameter occurs, and whether the body is
   // too complex (subqueries, aggregates) for argument-once binding.
   std::vector<size_t> parameter_counts;

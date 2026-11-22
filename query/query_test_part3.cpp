@@ -159,13 +159,12 @@ TEST_F(QueryTest, SyntheticOrderByNameCannotCollideWithUserAlias) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE ord_a (k INT64, v VARCHAR);");
   RunSql(ctx, *db_, "CREATE TABLE ord_b (k INT64, pad VARCHAR);");
-  RunSql(ctx, *db_,
-         "INSERT INTO ord_a VALUES (1, 'aaa'), (2, 'zzz');");
+  RunSql(ctx, *db_, "INSERT INTO ord_a VALUES (1, 'aaa'), (2, 'zzz');");
   RunSql(ctx, *db_, "INSERT INTO ord_b VALUES (1, 'x'), (1, 'y'), (2, 'z');");
-  const auto rows = RunSql(
-      ctx, *db_,
-      "SELECT v AS __tinylamb_ord_0, COUNT(*) AS c FROM ord_a, ord_b "
-      "WHERE ord_a.k = ord_b.k GROUP BY v ORDER BY c DESC, v;");
+  const auto rows =
+      RunSql(ctx, *db_,
+             "SELECT v AS __tinylamb_ord_0, COUNT(*) AS c FROM ord_a, ord_b "
+             "WHERE ord_a.k = ord_b.k GROUP BY v ORDER BY c DESC, v;");
   ASSERT_EQ(rows.size(), 2U);
   // Ordered by the computed COUNT(*), not by the user column named like the
   // internal sort key.
@@ -413,6 +412,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
   SqlEngine engine(*db_);
   RunSql(ctx, *db_, "CREATE TABLE pcache_hit (k INT64, v INT64);");
   RunSql(ctx, *db_, "INSERT INTO pcache_hit VALUES (7, 70), (8, 80);");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
 
   // Act -- run the identical templatable SELECT twice.
   const std::string sql = "SELECT v FROM pcache_hit WHERE k = 7;";
@@ -579,6 +580,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
   SqlEngine engine(*db_);
   RunSql(ctx, *db_, "CREATE TABLE pcache_ddl (k INT64, v INT64);");
   RunSql(ctx, *db_, "INSERT INTO pcache_ddl VALUES (5, 50);");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
   ASSERT_EQ(
       RunPrepared(&engine, &ctx, "SELECT v FROM pcache_ddl WHERE k = 5;")[0][0],
       Value(50));
@@ -589,6 +592,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
   ASSERT_TRUE(engine.Prepare(ctx, "DROP TABLE pcache_ddl;").HasValue());
   RunSql(ctx, *db_, "CREATE TABLE pcache_ddl (k INT64, v INT64);");
   RunSql(ctx, *db_, "INSERT INTO pcache_ddl VALUES (5, 555);");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
   const uint64_t invalidations_before =
       PlanCacheStats().epoch_invalidations.load();
   std::vector<Row> recreated =
@@ -602,6 +607,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
   // Act (b) -- ANALYZE refreshes statistics and must invalidate too.
   RunSql(ctx, *db_, "INSERT INTO pcache_ddl VALUES (6, 60);");
   ASSERT_TRUE(engine.Prepare(ctx, "ANALYZE pcache_ddl;").HasValue());
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
   const uint64_t invalidations_mid =
       PlanCacheStats().epoch_invalidations.load();
   std::vector<Row> analyzed =
@@ -663,6 +670,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
   RunSql(ctx, *db_, "CREATE TABLE pcache_param (k INT64, v INT64);");
   RunSql(ctx, *db_,
          "INSERT INTO pcache_param VALUES (1, 10), (2, 20), (3, 30);");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
   ASSERT_EQ(RunPrepared(&engine, &ctx,
                         "SELECT v FROM pcache_param WHERE k = 1;")[0][0],
             Value(10));  // fills the entry with k=1's plan
@@ -685,6 +694,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
   // (2) INSERT artifacts are parametric: every repeated shape hits regardless
   // of its literal values because slots receive per-execution values.
   RunSql(ctx, *db_, "CREATE TABLE pcache_ins (a INT64, b STRING(8));");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
   RunSql(ctx, *db_, "INSERT INTO pcache_ins VALUES (11, 'x');");
   hits_before = PlanCacheStats().hits.load();
   RunSql(ctx, *db_, "INSERT INTO pcache_ins VALUES (12, 'y');");
@@ -716,6 +727,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheRebindsUpdateAndDelete) {
   SqlEngine engine(*db_);
   RunSql(ctx, *db_, "CREATE TABLE pcache_upd (k INT64 PRIMARY KEY, v INT64);");
   RunSql(ctx, *db_, "INSERT INTO pcache_upd VALUES (1, 10), (2, 20);");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
 
   RunSql(ctx, *db_, "UPDATE pcache_upd SET v = v + 1 WHERE k = 1;");
   const uint64_t hits = PlanCacheStats().hits.load();
@@ -754,6 +767,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheRebindsDuplicateKeyLiterals) {
          "NULL, d_next_o_id INT64, PRIMARY KEY (d_w_id, d_id));");
   RunSql(ctx, *db_,
          "INSERT INTO pcache_district VALUES (1, 1, 10), (1, 2, 20);");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
 
   std::vector<Row> first = RunPrepared(
       &engine, &ctx,
@@ -1039,9 +1054,10 @@ TEST_F(QueryTest, FetchFirstWithTiesExecution) {
   // Replaying the identical statement must keep WITH TIES. The compiled
   // SELECT cache used to force with_ties=false on the second execution,
   // silently dropping the tied peer at the fetch boundary.
-  std::vector<Row> replay = RunSql(ctx, *db_,
-                                   "SELECT name, score FROM score_ties ORDER BY "
-                                   "score DESC FETCH FIRST 2 ROWS WITH TIES;");
+  std::vector<Row> replay =
+      RunSql(ctx, *db_,
+             "SELECT name, score FROM score_ties ORDER BY "
+             "score DESC FETCH FIRST 2 ROWS WITH TIES;");
   ASSERT_EQ(replay.size(), 3U);
   EXPECT_EQ(replay[1][1], Value(90));
   EXPECT_EQ(replay[2][1], Value(90));
@@ -1061,16 +1077,49 @@ TEST_F(QueryTest, FetchFirstWithTiesCollatedOrdinal) {
          "INSERT INTO ordinal_ties VALUES ('a', 100), ('B', 90), "
          "('c', 90), ('D', 80);");
 
-  std::vector<Row> res = RunSql(
-      ctx, *db_,
-      "SELECT name, score FROM ordinal_ties ORDER BY 2 COLLATE 'und:ci' "
-      "FETCH FIRST 2 ROWS WITH TIES;");
+  std::vector<Row> res =
+      RunSql(ctx, *db_,
+             "SELECT name, score FROM ordinal_ties ORDER BY 2 COLLATE 'und:ci' "
+             "FETCH FIRST 2 ROWS WITH TIES;");
   // Ascending score: 80 then the tied pair of 90s; 100 is past the boundary.
   ASSERT_EQ(res.size(), 3U);
   EXPECT_EQ(res[0][0], Value("D"));
   EXPECT_EQ(res[0][1], Value(80));
   EXPECT_EQ(res[1][1], Value(90));
   EXPECT_EQ(res[2][1], Value(90));
+
+  ctx.txn_.Abort();
+}
+
+// A COLLATE-wrapped ORDER BY ordinal is still an ordinal: out-of-range
+// values must fail like the bare-integer form instead of degrading into a
+// constant sort key that orders nothing.
+TEST_F(QueryTest, CollatedOrderByOrdinalRangeChecked) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE coll_ord (x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO coll_ord VALUES (3), (1), (2);");
+
+  SqlEngine engine(*db_);
+  for (const char* sql :
+       {"SELECT x FROM coll_ord ORDER BY 99 COLLATE 'und:ci'",
+        "SELECT x FROM coll_ord ORDER BY 0 COLLATE 'und:ci'",
+        "SELECT x FROM coll_ord ORDER BY 2 COLLATE 'und:ci'"}) {
+    // The ordinal check runs when the sort executor is driven, so the
+    // failure surfaces through GetStatus after Next() drains to a stop.
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    ASSERT_TRUE(prepared.HasValue()) << sql << ": " << engine.LastError();
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
+  }
+
+  // The in-range collated ordinal still binds and sorts.
+  std::vector<Row> res =
+      RunSql(ctx, *db_, "SELECT x FROM coll_ord ORDER BY 1 COLLATE 'und:ci'");
+  ASSERT_EQ(res.size(), 3U);
+  EXPECT_EQ(res[0][0], Value(1));
+  EXPECT_EQ(res[2][0], Value(3));
 
   ctx.txn_.Abort();
 }
@@ -2002,12 +2051,11 @@ TEST_F(QueryTest, UnsignedInt64SumOverJoinGroupByDoesNotWrap) {
   RunSql(ctx, *db_,
          "INSERT INTO uj_fact VALUES "
          "(1, 18446744073709551600), (1, 5), (2, 100);");
-  RunSql(ctx, *db_,
-         "INSERT INTO uj_dim VALUES (1, 'a'), (2, 'b');");
-  const auto rows = RunSql(
-      ctx, *db_,
-      "SELECT f.k, SUM(f.u) AS s FROM uj_fact f "
-      "JOIN uj_dim d ON f.k = d.k GROUP BY f.k ORDER BY f.k");
+  RunSql(ctx, *db_, "INSERT INTO uj_dim VALUES (1, 'a'), (2, 'b');");
+  const auto rows =
+      RunSql(ctx, *db_,
+             "SELECT f.k, SUM(f.u) AS s FROM uj_fact f "
+             "JOIN uj_dim d ON f.k = d.k GROUP BY f.k ORDER BY f.k");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_TRUE(rows[0][1].IsUnsigned());
   EXPECT_EQ(rows[0][1].AsString(), "18446744073709551605");
@@ -2604,11 +2652,14 @@ TEST_F(QueryTest, UpdateWithInSubqueryDecorrelatesOnce) {
   }
   ASSERT_EQ(executor->GetStatus(), Status::kSuccess);
 
-  auto dump = [&]() {
+  auto dump = [&]() -> std::vector<Row> {
     SqlEngine reader(*db_);
     StatusOr<Executor> sel =
         reader.Prepare(ctx, "SELECT u, a FROM upd_t ORDER BY u;");
     EXPECT_TRUE(sel.HasValue()) << reader.LastError();
+    if (!sel.HasValue()) {
+      return {};
+    }
     std::vector<Row> rows;
     Executor ex = sel.MoveValue();
     Row r;
@@ -3309,23 +3360,23 @@ TEST_F(QueryTest, TemplateCacheDoesNotReplayStaleViewBody) {
               "INSERT INTO tpl_view_t VALUES (10, 1), (20, 2), (30, 3)");
   RunPrepared(&engine, &ctx,
               "CREATE VIEW tpl_view_v AS SELECT a, b FROM tpl_view_t");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
   const uint64_t fills_before = template_fills();
-  EXPECT_EQ(RunPrepared(&engine, &ctx,
-                        "SELECT a FROM tpl_view_v WHERE b = 1"),
+  EXPECT_EQ(RunPrepared(&engine, &ctx, "SELECT a FROM tpl_view_v WHERE b = 1"),
             (std::vector<Row>{Row({Value(int64_t{10})})}));
   // Precondition: the expanded-view tree really went into the template cache
   // (a view body containing literals would fail to rebind and skip the fill).
   EXPECT_EQ(template_fills(), fills_before + 1);
-  EXPECT_EQ(RunPrepared(&engine, &ctx,
-                        "SELECT a FROM tpl_view_v WHERE b = 2"),
+  EXPECT_EQ(RunPrepared(&engine, &ctx, "SELECT a FROM tpl_view_v WHERE b = 2"),
             (std::vector<Row>{Row({Value(int64_t{20})})}));
 
   RunPrepared(&engine, &ctx, "DROP VIEW tpl_view_v");
-  RunPrepared(
-      &engine, &ctx,
-      "CREATE VIEW tpl_view_v AS SELECT b AS a, b FROM tpl_view_t");
-  EXPECT_EQ(RunPrepared(&engine, &ctx,
-                        "SELECT a FROM tpl_view_v WHERE b = 3"),
+  RunPrepared(&engine, &ctx,
+              "CREATE VIEW tpl_view_v AS SELECT b AS a, b FROM tpl_view_t");
+  ASSERT_SUCCESS(ctx.PreCommit());
+  ctx = db_->BeginContext();
+  EXPECT_EQ(RunPrepared(&engine, &ctx, "SELECT a FROM tpl_view_v WHERE b = 3"),
             (std::vector<Row>{Row({Value(int64_t{3})})}));
   ctx.txn_.Abort();
 }

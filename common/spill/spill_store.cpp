@@ -66,7 +66,7 @@ Status PreadAll(int fd, uint8_t* dst, size_t len, int64_t offset) {
 }
 
 std::filesystem::path ResolveTempDir(const SpillStoreOptions& options) {
-  // T2066: an explicitly provided temp_dir is honoured verbatim, with ""
+  // T2066: an explicitly provided temp_dir is honored verbatim, with ""
   // resolving to the current working directory; only an option the caller
   // never set falls through to TINYLAMB_TEMP_DIR / the OS temp directory.
   if (options.temp_dir_set) {
@@ -90,14 +90,20 @@ SpillStore::SpillStore(SpillStoreOptions options)
 
 SpillStore::~SpillStore() {
   alive_token_.reset();
-  std::scoped_lock lk(mu_);
+  std::unique_lock lk(mu_);
+  // A Read() that dropped mu_ for PreadAll still needs mu_, segments_ and fd_
+  // to finish. Wait for those readers before destroying any of them; the
+  // lifetime token above stops new helper-driven drops but not Read() itself.
+  reads_done_cv_.wait(lk, [this] { return active_reads_total_ == 0; });
   segments_.clear();
   free_blocks_.clear();
   active_blocks_ = 0;
   current_active_bytes_ = 0;
   if (fd_ >= 0) {
     // A failed close on an unlinked temp file leaks the descriptor; retry on
-    // EINTR and report other failures instead of silently dropping them.
+    // EINTR. Other failures are intentionally ignored here: the file is
+    // unlinked and a destructor has no caller to report an error to, so there
+    // is no useful recovery or diagnostic to emit at this point.
     while (platform::CloseFile(fd_) != 0 && errno == EINTR) {
     }
     fd_ = -1;
@@ -264,7 +270,12 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
       }
     }
 
-    if (static_cast<uint64_t>(next_block_index_) + needed_blocks >
+    // Only blocks that cannot be reused from free_blocks_ advance
+    // next_block_index_; an Append served entirely from the free list must
+    // succeed even when the high-water mark is near UINT32_MAX.
+    const size_t fresh_blocks =
+        needed_blocks - std::min(needed_blocks, free_blocks_.size());
+    if (static_cast<uint64_t>(next_block_index_) + fresh_blocks >
         std::numeric_limits<uint32_t>::max()) {
       return StatusError(StatusCode::kNoSpace,
                          "spill store maximum addressable blocks reached");
@@ -334,7 +345,8 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
   // without lock contention.
   Status io_status = Status::kSuccess;
   const auto* bytes = static_cast<const uint8_t*>(data);
-  for (size_t idx = 0; idx < plan.size(); ++idx) {  // NOLINT(modernize-loop-convert)
+  for (size_t idx = 0; idx < plan.size();
+       ++idx) {  // NOLINT(modernize-loop-convert)
     // T37: consume once per physical Pwrite so "fail the N-th spill I/O
     // call" (docs/ooc_fuzzing.md) counts the same events the loop emits;
     // previously only the SECOND+ block of one Append consulted the
@@ -428,10 +440,6 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
     return StatusError(StatusCode::kInvalidArgument,
                        "null destination in SpillStore::Read");
   }
-  if (ProcessMemoryBudget::Global().ConsumeInjectedSpillIoFailure()) {
-    return StatusError(StatusCode::kIOError,
-                       "injected spill I/O failure during read");
-  }
 
   struct ReadSlice {
     uint32_t block_idx{0};
@@ -444,6 +452,7 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
   std::vector<ReadSlice> plan;
   {
     std::scoped_lock lk(mu_);
+    auto& self = const_cast<SpillStore&>(*this);
     auto it = segments_.find(id);
     if (it == segments_.end() || it->second.pending_drop) {
       return StatusError(StatusCode::kNotExists, "spill segment not found");
@@ -479,9 +488,19 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
       dst_off += take;
       rem -= take;
     }
+    // T37-style: a rejected Read (missing/dropped segment, out-of-range
+    // offset, corrupt block index, no backing fd) never issues I/O, so it
+    // must not burn a scheduled injection slot. Consume only after all
+    // validation above has passed.
+    if (ProcessMemoryBudget::Global().ConsumeInjectedSpillIoFailure()) {
+      return StatusError(StatusCode::kIOError,
+                         "injected spill I/O failure during read");
+    }
     // Pin the segment's blocks against DropSegment/Clear block reuse and
-    // file truncation while PreadAll runs outside mu_.
+    // file truncation while PreadAll runs outside mu_. The store-wide count
+    // also lets ~SpillStore wait for this read before destroying mu_/fd_.
     ++seg.active_reads;
+    ++self.active_reads_total_;
   }
 
   auto* out = static_cast<uint8_t*>(dst);
@@ -513,6 +532,9 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
         self.segments_.erase(it);
         self.MaybeTruncateWhenEmptyLocked();
       }
+    }
+    if (--self.active_reads_total_ == 0) {
+      self.reads_done_cv_.notify_all();
     }
   }
   RETURN_IF_FAIL(io_status);
@@ -562,6 +584,10 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
           seg.blocks.begin() + static_cast<ptrdiff_t>(completed_blocks));
       pending_blocks = heap_blocks.data();
     }
+    // Reserve the whole range under mu_ BEFORE issuing any advice outside the
+    // lock: a concurrent call with a larger up_to_offset then starts at this
+    // completed_blocks and only advises the newer blocks, so each block is
+    // handed to AdviseDontNeed at most once per segment lifetime.
     seg.advised_blocks = completed_blocks;
   }
   for (size_t i = 0; i < count; ++i) {
@@ -711,14 +737,23 @@ Status SpillSegmentWriter::Write(const void* data, size_t len) {
     }
     const size_t space = buffer_capacity_ - buffer_.size();
     const size_t take = std::min(rem, space);
-    buffer_.insert(buffer_.end(), src, src + take);
-    bytes_written_ += take;
+    try {
+      buffer_.insert(buffer_.end(), src, src + take);
+    } catch (const std::bad_alloc&) {
+      // Write returns Status: a reallocation failure must not escape into the
+      // OOC caller's Status boundary.
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "spill write buffer allocation failed");
+    }
     src += take;
     rem -= take;
     if (buffer_.size() == buffer_capacity_) {
       // Flush first: on failure the buffered bytes were not persisted and
-      // must not be counted as written.
+      // must not be counted as written. `bytes_written_` tracks persisted
+      // bytes only; BytesWritten() adds the still-buffered tail back so the
+      // returned logical offset stays stable across a failed flush + retry.
       RETURN_IF_FAIL(store_->Append(id_, buffer_.data(), buffer_.size()));
+      bytes_written_ += buffer_.size();
       buffer_.clear();
     }
   }
@@ -730,6 +765,7 @@ Status SpillSegmentWriter::Flush() {
     return Status::kSuccess;
   }
   RETURN_IF_FAIL(store_->Append(id_, buffer_.data(), buffer_.size()));
+  bytes_written_ += buffer_.size();
   buffer_.clear();
   return Status::kSuccess;
 }

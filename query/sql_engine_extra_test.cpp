@@ -223,8 +223,8 @@ TEST_F(SqlEngineExtraTest, CteNarrowingVersusMaterialization) {
             std::vector<Row>({Row({Value(2)}), Row({Value(3)})}));
   EXPECT_EQ(run("WITH x AS (SELECT k, s FROM t) SELECT a.k, a.s FROM x a "
                 "WHERE a.k > 1 ORDER BY a.k"),
-            std::vector<Row>({Row({Value(2), Value("b")}),
-                                Row({Value(3), Value("a")})}));
+            std::vector<Row>(
+                {Row({Value(2), Value("b")}), Row({Value(3), Value("a")})}));
   cte_ctx.Abort();
 }
 
@@ -455,6 +455,8 @@ TEST_F(SqlEngineExtraTest, CompiledPlanCacheKeepsAliasOrderingOnReplay) {
           table.Insert(context_->txn_, Row({Value(v), Value(v)})).GetStatus());
     }
   }
+  ASSERT_SUCCESS(context_->PreCommit());
+  *context_ = database_->BeginContext();
   const std::string query = "SELECT x + 1 AS y, z FROM ao ORDER BY y LIMIT 3";
   // y = 2, 5, 6 in sort order; scan order would give 6, 2, 5.
   const std::vector<Row> expected = {Row({Value(2), Value(1)}),

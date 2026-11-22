@@ -16,14 +16,10 @@
 
 // Shared building blocks for the storage-facing fuzz harnesses.
 //
-// The existing harnesses (pax_mutate_fuzzer) gate every decode behind
-// ValidateChunkBytes but always reuse the PRISTINE in-memory Footer, so the
-// serialized footer itself is never hostile: `column_offsets`, `row_counts`,
-// `encodings`, `params`, the null bitmaps, the hash index, the inverted index,
-// the Xor8 tables and the PGM segments are all untested surfaces. These
-// helpers let a harness rebuild a self-describing wire image, corrupt the
-// footer, RE-SIGN the CRC32C words so the structural walk is actually
-// reached, and then hammer every consumer of the reconstructed Footer.
+// pax_mutate_fuzzer reuses a pristine in-memory Footer. These helpers let
+// chunk_footer_fuzzer and footer_sections_fuzzer instead rebuild a wire
+// image, corrupt the serialized footer and re-sign the CRC32C words, so the
+// structural walk and consumers of the reconstructed Footer are exercised.
 
 #ifndef TINYLAMB_FUZZ_CHUNK_COMMON_HPP
 #define TINYLAMB_FUZZ_CHUNK_COMMON_HPP

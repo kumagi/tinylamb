@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/query_expression.hpp"
 
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -24,16 +25,6 @@ StatusOr<Value> TryEvaluateQuantifiedComparison(
     BinaryOperation op, QuantifierMode mode, const Value& test,
     const std::vector<Value>& rows) {
   const bool is_all = mode == QuantifierMode::kAll;
-  // Explicit collation conflict (e.g. `binary` vs `und:ci`) rejects, the
-  // same gate the IN arm applies: silently folding both sides to CI would
-  // contradict the ambiguity-rejects contract in type/collation.hpp.
-  for (const Value& candidate : rows) {
-    if (HaveConflictingCollations(test, candidate)) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "Collation conflict between the quantified "
-                         "comparison operands");
-    }
-  }
   // Collation resolution: an explicit case-insensitive collator on any
   // operand (test value or row) applies to the whole comparison set.
   bool any_ci = test.IsCaseInsensitive();
@@ -74,6 +65,17 @@ StatusOr<Value> TryEvaluateQuantifiedComparison(
   for (const Value& candidate : candidates) {
     Value result;
     if (!test_value.IsNull() && !candidate.IsNull()) {
+      // Explicit collation conflict (e.g. `binary` vs `und:ci`) rejects, the
+      // same gate the IN arm applies: silently folding both sides to CI would
+      // contradict the ambiguity-rejects contract in type/collation.hpp.
+      // Check it per candidate actually examined so that ANY's first TRUE
+      // (ALL's first FALSE) short-circuits before a later conflicting row,
+      // matching the `if (found) break;` rule of the IN arm.
+      if (HaveConflictingCollations(test_value, candidate)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Collation conflict between the quantified "
+                           "comparison operands");
+      }
       // A comparison error on one row is UNKNOWN for that row (three-valued
       // logic), matching the old catch-all around the throwing evaluator.
       auto compared = TryEvaluateBinary(op, test_value, candidate);
@@ -110,7 +112,7 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema) const {
 }
 
 // Canonical subquery semantics, evaluated against the abstract context
-//.  The shapes share one projection:
+// The shapes share one projection:
 //   EXISTS        : emptiness of the projection (never UNKNOWN)
 //   test IN (...) : SQL three-valued membership; a NULL test value or a NULL
 //                   row value turns a miss into UNKNOWN, and negation applies
@@ -120,6 +122,14 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema) const {
 StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
                                              const Schema& schema,
                                              EvaluationContext& context) const {
+  // AST ground truth (InExpression::TryMembership) evaluates the probe before
+  // the candidate list. For the IN/quantified shapes consume test_ first so a
+  // side-effecting probe is evaluated in the same order as on the AST path.
+  std::optional<Value> test_value;
+  if (test_ != nullptr) {
+    ASSIGN_OR_RETURN(Value, probe, test_->TryEvaluate(row, schema, context));
+    test_value = std::move(probe);
+  }
   StatusOr<EvaluationContext::SubqueryResult> rows =
       context.RunSubqueryDetailed(*query_, &row);
   if (!rows.HasValue()) {
@@ -150,36 +160,35 @@ StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
         element_type = "INT64";
       }
     }
-    return Value::Array(values, element_type);
+    return Value::Array(values, std::move(element_type));
   }
   if (exists_) {
     const bool any = !values.empty();
     return Value(negated_ ? !any : any);
   }
   if (test_) {
-    ASSIGN_OR_RETURN(Value, test_value,
-                     test_->TryEvaluate(row, schema, context));
+    Value probe = std::move(*test_value);
     if (mode_ != QuantifierMode::kIn) {
-      return TryEvaluateQuantifiedComparison(op_, mode_, test_value, values);
+      return TryEvaluateQuantifiedComparison(op_, mode_, probe, values);
     }
     bool found = false;
     // An empty candidate set is decisive (matches the relational path and
     // the DML folder): x IN () is FALSE / x NOT IN () is TRUE even when x
     // itself is NULL. Do not seed saw_null from the probe for that case.
-    bool saw_null = values.empty() ? false : test_value.IsNull();
+    bool saw_null = values.empty() ? false : probe.IsNull();
     for (const Value& candidate : values) {
       if (found) {
         break;
       }
-      if (HaveConflictingCollations(test_value, candidate)) {
+      if (HaveConflictingCollations(probe, candidate)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "Collation conflict between the IN operands");
       }
       saw_null = saw_null || candidate.IsNull();
-      if (!found && !test_value.IsNull() && !candidate.IsNull()) {
+      if (!found && !probe.IsNull() && !candidate.IsNull()) {
         ASSIGN_OR_RETURN(
             Value, equal,
-            TryEvaluateBinary(BinaryOperation::kEquals, test_value, candidate));
+            TryEvaluateBinary(BinaryOperation::kEquals, probe, candidate));
         if (equal.IsNull()) {
           saw_null = true;
         } else if (equal.Truthy()) {

@@ -41,16 +41,12 @@ graph TD
    }
    ```
 
-4. 列の修飾名が存在し、かつ以下のいずれかの経路で **NOT NULL が証明できること**。
-   - **カタログ宣言**: カタログに登録されたテーブル定義において、当該列が `NOT NULL` または主キー（`kPrimaryKey`）であること（`ColumnIsDeclaredNonNull`）。
-   - **派生プロパティ**: 入力 Group の論理プロパティにおいて、フィルタや結合条件によって当該列が非 NULL であると導出されていること（`input_group.logical_properties.IsNotNull`）。
+4. 列の修飾名が存在し、かつ **入力 Group の派生プロパティで NOT NULL が証明できること**（`input_group.logical_properties.IsNotNull`）。カタログ宣言 (`ColumnIsDeclaredNonNull`) は証明経路として使わない。入力 Group が証明の境界であり、ベーステーブルで `NOT NULL` と宣言されていても NULL を供給する OUTER JOIN 側を through するとその保証は失われるためである。
 
 ```cpp
-const bool declared =
-    ColumnIsDeclaredNonNull(memo, column.schema, column);
-const bool derived =
-    input_group.logical_properties.IsNotNull(column.ToString());
-if (!declared && !derived) {
+// The input group is the proof boundary: a base declaration
+// does not survive a NULL-supplying outer-join side.
+if (!input_group.logical_properties.IsNotNull(column.ToString())) {
   rewritten_targets.push_back(target);
   continue;
 }

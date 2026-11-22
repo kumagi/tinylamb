@@ -28,9 +28,10 @@ graph TD
 
 発火のためのガード条件は以下の通りです。
 
-1. 内側 Group（`bindings.at("inner")`）内に演算子 `kSort` を持つ式が存在すること。
-2. そのソート式が 1 つ以上の子ノードを持つこと（`!inner.children.empty()`）。
-3. そのソート式の最初の子 Group が、現在の親 Group 自身と一致しないこと（循環参照防止）。
+1. 集約の全ターゲットと HAVING 述語を再帰的に調べ、順序依存の集約が含まれないこと。`InnerOrderBy()` が非空の集約と、順序非依存として許可された種類以外の集約は拒否します。
+2. 内側 Group（`bindings.at("inner")`）内に演算子 `kSort` を持つ式が存在すること。
+3. そのソート式が 1 つ以上の子ノードを持つこと（`!inner.children.empty()`）。
+4. そのソート式の最初の子 Group が、現在の親 Group 自身と一致しないこと（循環参照防止）。
 
 ```cpp
     built.Add(Rule(
@@ -149,7 +150,11 @@ graph TD
                 group,
                 LogicalExpression{.operation = LogicalOperator::kAggregation,
                                   .children = inner.children,
-                                  .target_list = expression.target_list});
+                                  .predicate = expression.predicate,
+                                  .target_list = expression.target_list,
+                                  .output_schema = expression.output_schema,
+                                  .partition_by = expression.partition_by,
+                                  .grouping_sets = expression.grouping_sets});
 ```
 
 生成された等価式はソートなしでベーススキャン等から直接集約入力を取得します。元の `Aggregation(Sort)` 式も Memo 内に保持されるため、もしソート済みストリームを利用するソート集約（`StreamAggregatePlan`）がハッシュ集約より安価であると評価された場合は、コスト比較を経てソート付きプランが選択される余地も残されます。

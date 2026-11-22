@@ -73,9 +73,16 @@ bool KeyImageHasNull(const Row& key_image) {
                              [](const Value& value) { return value.IsNull(); });
 }
 
-TableLease AcquireTableLease(const Table& table, Transaction& txn) {
+TableLease AcquireTableLease(const Table& table, Transaction& txn,
+                             Status* failure) {
   StatusOr<TableLease> lease = table.AcquireLease(txn.ID());
-  return lease.HasValue() ? lease.MoveValue() : TableLease();
+  if (!lease.HasValue()) {
+    // Preserve the real cause (kNoSpace/kIOError/...) instead of letting the
+    // caller flatten every lease failure into kConflicts.
+    *failure = lease.GetStatus();
+    return TableLease();
+  }
+  return lease.MoveValue();
 }
 
 TransactionManager::IndexReadGuard AcquireIteratorIndexReadGuard(
@@ -170,13 +177,15 @@ IndexScanIterator::IndexScanIterator(
       ascending_(ascending),
       resolve_head_(resolve_head),
       is_unique_(index.StoresSingleValue()),
-      table_lease_(AcquireTableLease(table, txn)),
+      table_lease_(AcquireTableLease(table, txn, &status_)),
       index_read_lock_(AcquireIteratorIndexReadGuard(txn, index, resolve_head,
                                                      index_read_guard)),
       bpt_(index.Root()),
       iter_() {
   if (!table_lease_.Valid()) {
-    status_ = Status::kConflicts;
+    if (status_ == Status::kSuccess) {
+      status_ = Status::kConflicts;
+    }
     return;
   }
   iter_ = BPlusTreeIterator(&bpt_, &txn, EncodeParts(begin_key),
@@ -203,6 +212,20 @@ IndexScanIterator::IndexScanIterator(
 
 bool IndexScanIterator::IsValid() const {
   return !invalidated_ && iter_.IsValid();
+}
+
+bool IndexScanIterator::CheckTimeoutOnStep() {
+  // Mirrors FullScanIterator::operator++: check the statement budget every
+  // 256 steps so a long index range scan cannot pin MVCC state indefinitely.
+  if ((++advance_steps_ & 255U) == 0 && txn_.HasStatementTimeout()) {
+    const Status ts = txn_.CheckStatementTimeout();
+    if (ts != Status::kSuccess) {
+      status_ = ts;
+      Clear();
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string IndexScanIterator::GetValue() const { return iter_.Value(); }
@@ -282,6 +305,16 @@ void IndexScanIterator::Clear() {
   current_row_.Clear();
   value_list_.clear();
   entry_loaded_ = false;
+  // There is no row left to resolve: operator* must not re-enter ResolveRow()
+  // (otherwise ++/--/AdvanceToNextKey could resurrect a cleared row). Drop the
+  // heap-image cache as well -- with pos_ reset to {0,0} a retained
+  // heap_image_page_ could make the next resolution decode a stale copy.
+  current_row_resolved_ = true;
+  cache_heap_images_ = false;
+  last_heap_page_ = ~page_id_t{0};
+  heap_image_page_ = ~page_id_t{0};
+  heap_images_.clear();
+  heap_image_slots_.clear();
 }
 
 void IndexScanIterator::UpdateIteratorState() {
@@ -311,7 +344,7 @@ void IndexScanIterator::UpdateIteratorState() {
       return;
     }
     std::string value_copy;
-    const std::string_view encoded_value =
+    std::string_view encoded_value =
         iter_.stable_leaf_cache_
             ? (iter_.EnsureLeafCache() ? iter_.CachedValue(iter_.idx_)
                                        : std::string_view{})
@@ -322,6 +355,27 @@ void IndexScanIterator::UpdateIteratorState() {
       return;
     }
     if (StoredAsSingleValue()) {
+      // LsmIndexIterator::Value() yields an 8-byte all-zero "empty value
+      // list" when the key vanished between cursor creation and this probe.
+      // A single-value index has no list to empty, so skipping the stale
+      // entry is the only sound interpretation -- decoding it as a
+      // RowPosition would fail the whole scan with kCorrupt.
+      static constexpr char kEmptyList[sizeof(uint64_t)] = {};
+      while (encoded_value.size() == sizeof(uint64_t) &&
+             encoded_value == std::string_view(kEmptyList, sizeof(uint64_t))) {
+        ++iter_;
+        if (!iter_.IsValid()) {
+          Clear();
+          return;
+        }
+        value_copy = iter_.Value();
+        encoded_value = value_copy;
+        if (iter_.GetStatus() != Status::kSuccess) {
+          status_ = iter_.GetStatus();
+          Clear();
+          return;
+        }
+      }
       auto value = DecodeIndexValue(encoded_value);
       if (!value.HasValue()) {
         status_ = value.GetStatus();
@@ -350,7 +404,11 @@ void IndexScanIterator::UpdateIteratorState() {
               !txn_.HasPageVersionChains(first_val.pos.page_id)) {
             value_list_.resize(1);
             value_list_[0] = first_val;
-            value_offset_ = 0;
+            // operator++ pre-increments value_offset_ before calling
+            // UpdateIteratorState(); use the "unpositioned" sentinel so the
+            // common tail below positions this one-element list at 0 instead
+            // of stepping straight past it on the next ++.
+            value_offset_ = -1;
             pos_ = first_val.pos;
             include_.Clear();
             ++value_lists_decoded_;
@@ -431,6 +489,10 @@ void IndexScanIterator::ResolveRow() const {
       current_row_resolved_ = true;
       return;
     }
+    // Keep the page-sequence bookkeeping in step with the hydrated path:
+    // an early return here must not leave last_heap_page_ stale, or the next
+    // row on this page gets a different heap-image-cache verdict.
+    last_heap_page_ = pos_.page_id;
     DecodeVisibleRow(stub_image);
   };
   if (ref.Value()->body.row_page.IsColumnarStub()) {
@@ -539,6 +601,9 @@ void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
     }
     image = visible.Value();
   }
+  // A peek is a pre-decode rejection, not a SQL-level filter: the row was
+  // read, so register it before any peek can discard it.
+  txn_.AddReadSet(pos_);
   for (const IntegerPeekCompare& peek : integer_peeks_) {
     const auto peeked = Row::TryPeekInteger(
         image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
@@ -555,8 +620,6 @@ void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
       return;
     }
   }
-  // Only register rows that actually exist so the read set stays clean.
-  txn_.AddReadSet(pos_);
   // Length-prefixed page images: decoded by offsets, never as C strings.
   if (projection_) {
     current_row_.DeserializeProjected(
@@ -588,6 +651,9 @@ IteratorBase& IndexScanIterator::operator++() {
   }
   if (!ascending_) {
     return operator--();
+  }
+  if (CheckTimeoutOnStep()) {
+    return *this;
   }
   if (StoredAsSingleValue()) {
     ++iter_;
@@ -622,6 +688,9 @@ void IndexScanIterator::AdvanceToNextKey() {
   if (!IsValid()) {
     return;
   }
+  if (CheckTimeoutOnStep()) {
+    return;
+  }
   current_row_resolved_ = false;
   if (ascending_) {
     ++iter_;
@@ -636,6 +705,9 @@ void IndexScanIterator::AdvanceToNextKey() {
 IteratorBase& IndexScanIterator::operator--() {
   current_row_resolved_ = false;
   if (!IsValid()) {
+    return *this;
+  }
+  if (CheckTimeoutOnStep()) {
     return *this;
   }
   // NOTE: despite the name, operator-- on a descending scan steps toward
@@ -708,16 +780,21 @@ bool IndexScanIterator::TryReadIndexOnly(Row* dst) const {
   if (!chain_checked_free_) {
     return false;
   }
+  // Row::IsValid() is exactly "values_ is non-empty", so a zero-column
+  // result is the only way this fast path can decline. Check it BEFORE
+  // touching |dst|: a declined entry makes the caller fall back to the
+  // MVCC-resolved row and it must still find its Row untouched.
+  const size_t columns = keys_.Count() + include_.Count();
+  if (columns == 0) {
+    return false;
+  }
   // Batch consumers keep the Row and move only its cells. Reuse that
   // vector's capacity instead of allocating a concatenation for every
   // visible index entry; the returned Values remain owned copies.
-  dst->values_.resize(keys_.Count() + include_.Count());
+  dst->values_.resize(columns);
   std::copy(keys_.values_.begin(), keys_.values_.end(), dst->values_.begin());
   std::copy(include_.values_.begin(), include_.values_.end(),
             dst->values_.begin() + static_cast<ptrdiff_t>(keys_.Count()));
-  if (!dst->IsValid()) {
-    return false;
-  }
   txn_.RecordIndexOnlyVisibleServe();
   return true;
 }

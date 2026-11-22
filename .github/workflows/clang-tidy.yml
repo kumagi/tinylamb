@@ -15,7 +15,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake clang clang-tidy clang-tools
 
       - name: configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+        run: CC=clang CXX=clang++ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTINYLAMB_ENABLE_GOOGLESQL=OFF
 
       - name: clang-tidy diff
         env:
@@ -23,9 +23,11 @@ jobs:
           PUSH_BASE: ${{ github.event.before }}
         run: |
           # Ubuntu 24.04 ships the diff helper under a versioned name
-          # (clang-tidy-diff-18.py); pick whichever is present.
+          # (clang-tidy-diff-18.py); pick whichever is present.  It is a
+          # Python script and need not carry the executable bit, so run it
+          # through python3 instead of testing -x.
           TIDY_DIFF=$(command -v clang-tidy-diff.py || ls /usr/bin/clang-tidy-diff*.py 2>/dev/null | head -1 || true)
-          if [ -z "$TIDY_DIFF" ] || [ ! -x "$TIDY_DIFF" ]; then
+          if [ -z "$TIDY_DIFF" ]; then
             echo "clang-tidy-diff helper not found" >&2
             exit 1
           fi
@@ -36,10 +38,10 @@ jobs:
           else
             BASE="$PUSH_BASE"
           fi
-          CHANGED=$(git diff -U0 "$BASE" HEAD -- '*.cpp' '*.hpp')
+          CHANGED=$(git diff --no-prefix -U0 "$BASE" HEAD -- '*.cpp' '*.hpp')
           if [ -z "$CHANGED" ]; then
             echo "no C++ diff"
             exit 0
           fi
           printf '%s\n' "$CHANGED" | \
-            "$TIDY_DIFF" -path build -quiet
+            python3 "$TIDY_DIFF" -path build -quiet -j "$(nproc)"

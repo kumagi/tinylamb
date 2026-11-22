@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -68,12 +69,10 @@ std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
   }
   const Status st = prepared.Value()->GetStatus();
   if (st != Status::kSuccess) {
-    if (st != Status::kSuccess) {
-      std::ostringstream diag;
-      diag << st;
-      throw std::runtime_error(st.GetMessage().empty() ? diag.str()
-                                                       : st.GetMessage());
-    }
+    std::ostringstream diag;
+    diag << st;
+    throw std::runtime_error(st.GetMessage().empty() ? diag.str()
+                                                     : st.GetMessage());
   }
   return rows;
 }
@@ -295,7 +294,7 @@ TEST_F(TransactionCoverageTest, DirectIntentAcquisitionInstallsBeforeImage) {
   {
     Transaction reader = tm_->Begin(true);
     ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "img");
-    reader.PreCommit();
+    ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
   }
   ASSERT_TRUE(txn.AddWriteSet(rp));
   ASSERT_EQ(tm_->Abort(txn), Status::kSuccess);
@@ -872,13 +871,18 @@ TEST_F(TransactionCoverageTest, CommitWaitReturnsOnceRecordsAreFlushed) {
                     .AppendLog(LogRecord(writer.PrevLSN(), writer.ID(),
                                          LogType::kBegin))
                     .HasValue());
+    const lsn_t data_end = writer.PrevRecordEndLSN();
+    ASSERT_SUCCESS(slow->WaitForDurable(data_end));
     ASSERT_TRUE(writer.AddWriteSet(rp));
     writer.RegisterVersionWrite(rp, std::nullopt, "pipelined");
     ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+    const lsn_t commit_end = slow->BufferedLSN();
+    ASSERT_GT(commit_end, data_end);
+    EXPECT_EQ(writer.PrevRecordEndLSN(), commit_end);
     ASSERT_SUCCESS(writer.CommitWait());
-    EXPECT_GE(slow->CommittedLSN(), writer.PrevLSN());
+    EXPECT_GE(slow->DurableLSN(), commit_end);
   }
-  EXPECT_EQ(std::remove(slow_name.c_str()), 0);
+  tinylamb::RemoveLogAndSegments(slow_name);
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +929,7 @@ TEST_F(TransactionCoverageTest, GcTrimsOldVersionsBehindPinnedSnapshot) {
   // may still read (v2) plus the newest (v3).
   EXPECT_TRUE(WaitForCondition(
       [&] {
-        return CountCommittedEntries(tm_->DebugDumpVersionChains(rp.page_id)) <=
+        return CountCommittedEntries(tm_->DebugDumpVersionChains(rp.page_id)) ==
                2;
       },
       std::chrono::seconds(5)));
@@ -1606,7 +1610,8 @@ TEST_F(TransactionCoverageRecoveryTest,
   EXPECT_EQ(page->body.row_page.GetRow(1), "source");
 }
 
-TEST_F(TransactionCoverageRecoveryTest, AbortReversesStagedRecordsAndTerminates) {
+TEST_F(TransactionCoverageRecoveryTest,
+       AbortReversesStagedRecordsAndTerminates) {
   Transaction txn = tm_->Begin();
   // Staged (in-memory) records are reversed by abort; there is no WAL undo
   // walk.  Two kBegin appends give the abort terminator a non-zero PrevLSN
@@ -1616,13 +1621,14 @@ TEST_F(TransactionCoverageRecoveryTest, AbortReversesStagedRecordsAndTerminates)
                   .HasValue());
   ASSERT_TRUE(txn.AppendLog(LogRecord(txn.PrevLSN(), txn.ID(), LogType::kBegin))
                   .HasValue());
-  ASSERT_GT(txn.PrevLSN(), 0U);
+  const lsn_t pre_abort_lsn = txn.PrevLSN();
+  ASSERT_GT(pre_abort_lsn, 0U);
   ASSERT_EQ(l_->WaitForDurable(txn.PrevRecordEndLSN()), Status::kSuccess);
 
   ASSERT_EQ(txn.Abort(), Status::kSuccess);
   EXPECT_TRUE(txn.IsFinished());
   // The abort terminator was appended above the reversed staged records.
-  EXPECT_GT(txn.PrevLSN(), 0U);
+  EXPECT_GT(txn.PrevLSN(), pre_abort_lsn);
 }
 
 TEST_F(TransactionCoverageRecoveryTest, AbortSurvivesUnreadableTailAndDeadWal) {
@@ -1705,8 +1711,21 @@ TEST_F(TransactionCoverageRecoveryTest, AbortSurvivesUnreadableTailAndDeadWal) {
     EXPECT_NE(pending.Abort(), Status::kSuccess);
     EXPECT_TRUE(pending.IsFinished());
   }
-  std::ignore = std::remove(slow_log.c_str());
+  tinylamb::RemoveLogAndSegments(slow_log);
   std::ignore = std::remove(slow_db.c_str());
+  std::ignore = std::remove((slow_db + ".blocks").c_str());
+  std::ignore = std::remove((slow_db + ".lsm").c_str());
+  // Compaction leaves <db>.blocks.<gen> / <db>.lsm.<gen> / <db>.tlcs*
+  // companions behind; the fixture TearDown only sweeps its own prefix.
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+    const std::string name = entry.path().filename().string();
+    if (name.starts_with(slow_db + ".blocks.") ||
+        name.starts_with(slow_db + ".lsm.") ||
+        name.starts_with(slow_db + ".tlcs")) {
+      std::filesystem::remove(entry.path(), ec);
+    }
+  }
 }
 
 TEST_F(TransactionCoverageRecoveryTest, RealStorageCommitFailureStopsNewWork) {

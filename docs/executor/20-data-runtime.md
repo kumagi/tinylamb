@@ -119,7 +119,7 @@ SQL のフィルタでは `TRUE` だけが選択される。`FALSE` と `NULL` �
 - 保持した行数
 - 推定保持バイト数
 
-これにより、実行制御側はパイプライン境界を列挙し、事前実体化、メモリ見積もり、診断表示を行える。`SortExecutor`、`IncrementalSortExecutor`、`HashJoin`、`SharedBuildParallelHashJoin`、`BatchNestedLoopJoin`、`ParallelMergeJoin` などが該当する。
+これにより、実行制御側はパイプライン境界を列挙し、事前実体化、メモリ見積もり、診断表示を行える。`SortExecutor`、`IncrementalSortExecutor`、`HashJoin`、`SharedBuildParallelHashJoin`（旧称 `ParallelHashJoin`）、`BatchNestedLoopJoin`、`ParallelMergeJoin` などが該当する。
 
 ## 7. 問い合わせ作業メモリとプロセス予算
 
@@ -131,7 +131,7 @@ SQL のフィルタでは `TRUE` だけが選択される。`FALSE` と `NULL` �
 
 ## 8. 演算子単位のメモリ予約
 
-`OperatorMemoryReservation` は現行コードに存在しない。作業メモリの予算は `executor/query_memory.hpp` と各演算子のメモリ方針を参照する。
+`OperatorMemoryReservation` は現行コードに存在しない。既定経路の作業メモリ予算は `common/memory_budget.hpp`、`common/query_grant.hpp` と各演算子のメモリ方針を参照する。旧経路については `executor/query_memory.hpp` も参照する。
 
 ## 9. `SpillStore` / OOC 部品 と旧 `SpillFile`
 

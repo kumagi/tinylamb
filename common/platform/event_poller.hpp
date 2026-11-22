@@ -20,14 +20,17 @@
 #include <atomic>
 #include <cstdint>
 #ifdef _WIN32
-#include <condition_variable>
 #include <winsock2.h>
+
+#include <condition_variable>
 #endif
 #include <mutex>
 #include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "common/platform/socket.hpp"
 
 namespace tinylamb::platform {
 
@@ -42,19 +45,22 @@ enum PollEvent : uint32_t {
 };
 
 struct PollResult {
-  int fd{-1};
+  SocketFd fd{-1};
   uint32_t events{0};
 };
 
 // Level-triggered readiness notification over file descriptors: epoll(7) on
 // Linux, kqueue(2) on macOS/BSD, WSAPoll on Windows. Semantics follow epoll's
-// level-triggered
-// mode: a descriptor is reported on every Wait while it stays ready, and at
+// level-triggered mode: a descriptor is reported on every Wait while ready, and
 // most once per Wait (kqueue's separate read/write filters are merged).
 // kPollPeerClosed is only observable together with kPollReadable interest
 // (kqueue reports EOF on the read filter); request both.
 //
 // Add/Modify/Remove may be called from any thread; Wait from one thread.
+// Close() is NOT a cross-thread stop signal: closing the kernel poll fd does
+// not reliably interrupt a blocked Wait (notably Linux epoll_wait(-1)). Call
+// Close() from the polling thread, or wake a registered Waker and join the
+// Wait-er before closing. The server does the latter in ~Impl().
 class EventPoller {
  public:
   EventPoller() = default;
@@ -70,9 +76,9 @@ class EventPoller {
   void Close();
 
   // Each returns false with errno set on failure.
-  bool Add(int fd, uint32_t interest);
-  bool Modify(int fd, uint32_t interest);
-  bool Remove(int fd);
+  bool Add(SocketFd fd, uint32_t interest);
+  bool Modify(SocketFd fd, uint32_t interest);
+  bool Remove(SocketFd fd);
 
   // Blocks up to `timeout_ms` (-1 = forever) and fills `out`. Returns the
   // number of entries written, or -1 with errno set (EINTR included).
@@ -87,10 +93,10 @@ class EventPoller {
   // kqueue registers read and write as independent filters, so Modify needs
   // the previous interest to know which filters to add or delete.
   std::mutex mu_;
-  std::unordered_map<int, uint32_t> interest_;
+  std::unordered_map<SocketFd, uint32_t> interest_;
 #ifdef _WIN32
   // Cached WSAPOLLFD inputs: rebuilt only when the interest set changes.
-  std::vector<std::pair<int, uint32_t>> poll_cache_snapshot_;
+  std::vector<std::pair<SocketFd, uint32_t>> poll_cache_snapshot_;
   std::vector<WSAPOLLFD> poll_cache_fds_;
   std::vector<uint32_t> poll_cache_interests_;
 #endif
@@ -114,16 +120,16 @@ class Waker {
   bool Open();  // false with errno set on failure
   [[nodiscard]] bool IsOpen() const { return read_fd_ >= 0; }
   void Close();
-  [[nodiscard]] int ReadFd() const { return read_fd_; }
+  [[nodiscard]] SocketFd ReadFd() const { return read_fd_; }
   void Wake() const;
   void Drain() const;
 
  private:
-  int read_fd_{-1};
+  SocketFd read_fd_{-1};
   // == read_fd_ for eventfd. Atomic because the header contract lets any
   // thread call Wake() while the polling thread may run Close(); a plain
   // int made the Wake()/Close() pair a data race (TSAN) on the fd number.
-  std::atomic<int> write_fd_{-1};
+  std::atomic<SocketFd> write_fd_{-1};
 };
 
 }  // namespace tinylamb::platform

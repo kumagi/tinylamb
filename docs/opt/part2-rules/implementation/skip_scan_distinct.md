@@ -85,11 +85,10 @@ graph TD
 条件を満たした場合、`SkipScanDistinctPlan` を構築します。
 
 ```cpp
-          std::vector<NamedExpression> select_items = index_only->SelectItems();
-          if (select_items.empty()) {
-            select_items.emplace_back(distinct_column.name,
-                                      ColumnValueExp(distinct_column));
-          }
+          // IndexOnlyScanPlan carries no projection of its own.
+          std::vector<NamedExpression> select_items;
+          select_items.emplace_back(distinct_column.name,
+                                    ColumnValueExp(distinct_column));
           Plan skip_scan = std::make_shared<SkipScanDistinctPlan>(
               *table, index, index_only->GetStats(), index_only->IsAscending(),
               std::move(select_items), scan_schema);

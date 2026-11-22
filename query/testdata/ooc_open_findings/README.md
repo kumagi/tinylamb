@@ -1,7 +1,12 @@
 # `sql_ooc_fuzzer` open findings
 
 Minimized traces of findings the engine **still fails**.  Nothing in ctest
-replays this directory; it is the list of known bugs for campaigns:
+replays this directory; it is the list of known bugs for campaigns.
+
+The directory currently holds no `.test` files: every filed finding has been
+fixed and promoted to `../ooc_regressions/`.  An empty `replay` / `--known`
+input is therefore expected while there are no known open bugs; this README is
+the only tracked file until a new open finding is filed here.
 
 ```bash
 # which filed findings still fail, which are fixed

@@ -18,8 +18,10 @@
 #define TINYLAMB_CONSTANTS_HPP
 
 #include <bit>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <ostream>
@@ -85,6 +87,10 @@ enum class StatusCode : uint8_t {
   // Distinct from kRuntimeError so clients can tell a cancel/timeout from
   // a server fault (PostgreSQL SQLSTATE 57014 query_canceled).
   kQueryCanceled = 17,
+  // Iteration bound, not a real status: every code above must precede this
+  // sentinel so status_or_test can walk the whole declared range and fail
+  // when a new enumerator forgets its ToString case.
+  kStatusCodeCount,
 };
 
 // A status code plus an optional human-readable message. Equality (and every
@@ -286,6 +292,8 @@ inline std::string_view ToString(StatusCode s) {
       return "MemoryLimitExceeded";
     case StatusCode::kQueryCanceled:
       return "QueryCanceled";
+    case StatusCode::kStatusCodeCount:
+      return "INVALID STATUS";
   }
   return "INVALID STATUS";
 }

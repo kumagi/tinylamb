@@ -130,6 +130,40 @@ TEST(PaxChunkCodecsTest, AuditProjectionSupportsWideSchemas) {
   EXPECT_FALSE(cache.IsColumnSelected(1024));
 }
 
+TEST(PaxChunkCodecsTest, ScanAggregateChecksProductsAndPartialSums) {
+  const Schema schema(
+      "agg", {Column("id", ValueType::kInt64), Column("v", ValueType::kInt64)});
+  std::vector<Row> rows;
+  constexpr size_t kRows = 2 * PaxChunk::kRowGroupSize;
+  for (size_t i = 0; i < kRows; ++i) {
+    const int64_t value = i % PaxChunk::kRowGroupSize == 0 ? INT64_MIN : 0;
+    rows.emplace_back(Row({Value(static_cast<int64_t>(i)), Value(value)}));
+  }
+  auto chunk =
+      PaxChunk::BuildFromSortedRun(fuzz::MakeRun(rows, schema), schema);
+  ASSERT_TRUE(chunk.HasValue());
+  ASSERT_EQ(chunk.Value().GetFooter().row_group_count, 2u);
+  for (const bool parallel : {false, true}) {
+    AggPlan plan;
+    for (const auto& terms : std::vector<std::vector<AggTerm>>{
+             {{1, {1, 1, 1}}}, {{1, {1, 1}}, {1, {1, 1}}}, {{1, {1, 1}}}}) {
+      plan.terms = terms;
+      EXPECT_EQ(
+          PaxChunk::ScanAggregate(chunk.Value(), plan, parallel, 2, 1, &schema)
+              .GetStatus(),
+          Status::kIsInfinity);
+    }
+
+    plan.terms = {{2, {1}}};
+    const auto valid =
+        PaxChunk::ScanAggregate(chunk.Value(), plan, parallel, 2, 1, &schema);
+    ASSERT_TRUE(valid.HasValue()) << valid.GetStatus();
+    EXPECT_EQ(valid.Value().count, kRows);
+    EXPECT_TRUE(valid.Value().sum ==
+                static_cast<platform::Int128>(INT64_MIN) * 4);
+  }
+}
+
 TEST(PaxChunkCodecsTest, AuditReduceRejectsScaledOverflowAcrossSchemes) {
   const std::vector<int64_t> values(1024, INT64_MAX);
   for (Scheme scheme :
@@ -152,6 +186,46 @@ TEST(PaxChunkCodecsTest, AuditReduceRejectsScaledOverflowAcrossSchemes) {
   }
 }
 
+// A hostile column offset makes DecodeInt64ColumnRg throw std::out_of_range.
+// The non-Status pushdown kernels must fail closed (invalid/empty/false) just
+// like they do for the other hand-built-footer guards; the exception must not
+// escape the kernel boundary into the caller.
+TEST(PaxChunkCodecsTest, AuditNonStatusKernelsFailClosedOnHostileOffset) {
+  PaxChunk::Footer footer;
+  footer.row_group_count = 1;
+  footer.column_count = 1;
+  footer.row_counts = {4};
+  footer.column_offsets = {0xFFFFFFFF};  // impossible offset
+  footer.encodings = {static_cast<uint8_t>(Scheme::kPlain)};
+  footer.params = {0};
+  const PaxChunk chunk(std::vector<char>(8, 0), std::move(footer));
+
+  ReducePlan sum;
+  sum.op = AggOp::kSum;
+  sum.col = 0;
+  EXPECT_FALSE(ReduceColumn(chunk, sum).valid);
+
+  ReducePlan filtered;
+  filtered.op = AggOp::kCount;
+  filtered.col = 0;
+  filtered.preds.push_back(Predicate{.col = 0, .op = ScanOp::kEq, .lit = 1});
+  EXPECT_FALSE(ReduceColumn(chunk, filtered).valid);
+
+  EXPECT_TRUE(TopKColumn(chunk, 0, 1, false).empty());
+
+  uint64_t count = 0;
+  double total = 0.0;
+  EXPECT_FALSE(Chimp128ColumnCountSum(chunk, 0, PaxChunk::CompareOp::kLe, 1.0,
+                                      &count, &total));
+  EXPECT_FALSE(AlpRdTansColumnCountSum(chunk, 0, PaxChunk::CompareOp::kLe, 1.0,
+                                       &count, &total));
+  EXPECT_FALSE(PatasColumnCountSum(chunk, 0, PaxChunk::CompareOp::kLe, 1.0,
+                                   &count, &total));
+  const auto grouped = GroupBySumColumn(chunk, 0, 0);
+  ASSERT_TRUE(grouped.HasValue());
+  EXPECT_TRUE(grouped.Value().empty());
+}
+
 // With kLane, row l + nd*t belongs to lane l. A predicate whose window is
 // empty for one real lane must not leave `all_full` set: otherwise the
 // full-select shortcut admits that lane's rows too.
@@ -166,13 +240,13 @@ TEST(PaxChunkCodecsTest, AuditLanePredicateWithEmptyLaneKeepsOtherLaneOnly) {
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   const auto& encoded_block = *encoded;
   ASSERT_EQ(encoded_block.scheme, Scheme::kLane);
-  auto chunk = AuditSingleColumnChunk(Scheme::kLane, kRows,
-                                      encoded_block.bytes, encoded_block.param);
+  auto chunk = AuditSingleColumnChunk(Scheme::kLane, kRows, encoded_block.bytes,
+                                      encoded_block.param);
 
   ReducePlan plan;
   plan.op = AggOp::kCount;
   plan.col = 0;
-  plan.preds.push_back(Predicate{.col=0, .op=ScanOp::kEq, .lit=50});
+  plan.preds.push_back(Predicate{.col = 0, .op = ScanOp::kEq, .lit = 50});
   const auto result = ReduceColumn(chunk, plan);
   ASSERT_TRUE(result.valid);
   EXPECT_EQ(result.count, kRows / 2);
@@ -224,6 +298,20 @@ TEST(PaxChunkCodecsTest, AuditCodecBenchmarkRejectsOversizedBlock) {
   EXPECT_FALSE(
       codec_benchmark::EncodeVarcharBlock(Scheme::kFrontCode, strings));
   EXPECT_TRUE(codec_benchmark::EncodeVarcharBlock(Scheme::kPlain, strings));
+}
+
+TEST(PaxChunkCodecsTest, SerialKernelsReportInvalidOffsets) {
+  auto original =
+      AuditSingleColumnChunk(Scheme::kPlain, 2, std::vector<char>(16));
+  auto footer = original.GetFooter();
+  footer.column_offsets[0] = UINT32_MAX;
+  PaxChunk corrupt(original.Data(), std::move(footer));
+  EXPECT_FALSE(VectorizedScanColumn(corrupt, 0, ScanOp::kEq, 1).HasValue());
+  const std::vector<int64_t> values{1};
+  EXPECT_FALSE(VectorizedScanColumnInList(corrupt, 0, values).HasValue());
+  AggPlan plan;
+  plan.terms.push_back(AggTerm{.coeff = 1, .cols = {0}});
+  EXPECT_FALSE(PaxChunk::ScanAggregate(corrupt, plan).HasValue());
 }
 
 TEST(PaxChunkCodecsTest, AuditGroupSumReportsCorruptGroupAndOverflows) {
@@ -583,9 +671,19 @@ TEST(PaxChunkCodecsTest, BitWriterAndWordBitReaderRoundTrip) {
 }
 
 TEST(PaxChunkCodecsTest, ZigZagEncodingRoundTrip) {
-  const std::vector<int64_t> inputs = {
-      0, 1, -1, 2, -2, 42, -42, 1000000000LL, -1000000000LL,
-      INT32_MIN, INT32_MAX, INT64_MIN, INT64_MAX};
+  const std::vector<int64_t> inputs = {0,
+                                       1,
+                                       -1,
+                                       2,
+                                       -2,
+                                       42,
+                                       -42,
+                                       1000000000LL,
+                                       -1000000000LL,
+                                       INT32_MIN,
+                                       INT32_MAX,
+                                       INT64_MIN,
+                                       INT64_MAX};
   for (int64_t v : inputs) {
     const uint64_t zz = StreamVByteZigZag(v);
     EXPECT_EQ(StreamVByteUnZigZag(zz), v);

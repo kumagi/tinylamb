@@ -49,7 +49,10 @@ class UnnestExecutor final : public ExecutorBase {
   std::string offset_alias_;
   // LEFT OUTER UNNEST: when the array is empty (or NULL) the driving
   // row still emits once with NULL-extended unnest columns instead of
-  // disappearing.  INNER (the default) drops the row entirely.
+  // disappearing.  INNER (the default) drops the row entirely. There is no
+  // FULL OUTER UNNEST mode: UNNEST emits the array's elements, not a second
+  // independent relation whose unmatched rows could be preserved, so the
+  // planner has no full-outer path to wire here.
   bool left_outer_{false};
   Schema output_schema_;
 

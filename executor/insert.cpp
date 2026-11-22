@@ -45,9 +45,17 @@ namespace {
 // primary_key), so NULLs must NOT behave as pairwise-distinct here.
 std::string KeyString(const Value& value) {
   if (value.IsNull()) {
+    // Sentinel starts with 0x01. Real strings whose first byte is 0x01 are
+    // escaped below, so this exact byte sequence cannot be produced by a
+    // non-NULL value (a VARCHAR literally equal to "\x01NULL" must not
+    // masquerade as a NULL key).
     return "\x01NULL";
   }
-  return value.AsString();
+  std::string text = value.AsString();
+  if (!text.empty() && text[0] == '\x01') {
+    text.insert(text.begin(), '\x01');
+  }
+  return text;
 }
 
 }  // namespace
@@ -73,9 +81,12 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
     }
   }
   if (mode_ != InsertExecutionMode::kDefault && key_offsets.empty()) {
-    // Conflict handling is only defined for tables with a primary key.
+    // Conflict handling is only defined for tables with a primary key. This
+    // is a malformed-statement error, not a uniqueness violation: like the
+    // other input-shape checks in this function it must map to kInvalidArgument
+    // (42601), not kDuplicates (23505 unique_violation).
     return FailWith(StatusError(
-        StatusCode::kDuplicates,
+        StatusCode::kInvalidArgument,
 
         "INSERT conflict clause is not allowed because the table does not "
         "have a primary key"));
@@ -103,11 +114,26 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
     }
     return key;
   };
+  // A PRIMARY KEY can reference any column (a composite key's later columns,
+  // or a column not filled in by a narrow/listed INSERT source row). Only a
+  // row that actually carries every key column may be passed to row_key();
+  // checking values_.empty() alone lets row[offset] read past the end.
+  const auto has_key_columns = [&key_offsets](const Row& row) {
+    if (key_offsets.empty() || row.values_.empty()) {
+      return false;
+    }
+    for (const size_t offset : key_offsets) {
+      if (offset >= row.values_.size()) {
+        return false;
+      }
+    }
+    return true;
+  };
   if (!key_offsets.empty()) {
     auto it = target_->BeginFullScan(*txn_);
     for (; it.IsValid(); ++it) {
       const Row& current = *it;
-      if (current.values_.empty()) {
+      if (!has_key_columns(current)) {
         continue;
       }
       std::string key = row_key(current);
@@ -206,7 +232,7 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
         }
       }
       new_row = src_batch.RowAt(row_idx);
-      const bool has_key = !key_offsets.empty() && !new_row.values_.empty();
+      const bool has_key = has_key_columns(new_row);
       const std::string key = has_key ? row_key(new_row) : std::string();
       const bool exists = has_key && existing_keys.contains(key);
       // Rows arrive in full schema layout; listed columns keep their
@@ -229,9 +255,9 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
                 // its end, and a narrow stored row must not be grown.
                 if (offset >= updated.values_.size() ||
                     offset >= new_row.values_.size()) {
-                  return FailWith(StatusError(
-                      StatusCode::kInvalidArgument,
-                      "upsert column outside input row"));
+                  return FailWith(
+                      StatusError(StatusCode::kInvalidArgument,
+                                  "upsert column outside input row"));
                 }
                 updated[offset] = new_row[offset];
               }
@@ -299,8 +325,8 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
             return FailWith(
                 StatusError(StatusCode::kDuplicates,
 
-                            "insert failed on table: duplicate primary key (" + key +
-                                ") due to previously existing row"));
+                            "insert failed on table: duplicate primary key (" +
+                                key + ") due to previously existing row"));
         }
       }
       if (const Status fk_status = check_child_row(new_row);

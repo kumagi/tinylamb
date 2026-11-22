@@ -45,7 +45,9 @@
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/parameter_slot.hpp"
+#include "expression/proto_schema.hpp"
 #include "expression/query_expression.hpp"
+#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "gtest/gtest.h"
@@ -1521,6 +1523,19 @@ TEST(ExpressionTest, ColumnValue_EvaluateWithTwoSchemas_ResolvesCorrectSchema) {
                std::runtime_error);
 }
 
+TEST(ExpressionTest, ColumnValueSkipsSchemaForMissingRow) {
+  Schema left_schema("l", {Column("shared", ValueType::kInt64)});
+  Schema right_schema("r", {Column("shared", ValueType::kInt64)});
+  Row left({Value(1)}), right({Value(2)});
+  Expression column = ColumnValueExp("shared");
+  EXPECT_EQ(column->Evaluate(nullptr, left_schema, &right, right_schema),
+            Value(2));
+  EXPECT_EQ(column->Evaluate(&left, left_schema, nullptr, right_schema),
+            Value(1));
+  EXPECT_FALSE(column->TryEvaluate(nullptr, left_schema, nullptr, right_schema)
+                   .HasValue());
+}
+
 TEST(ExpressionTest, ColumnValue_Accessors_ReturnExpectedProperties) {
   Expression column = ColumnValueExp("col");
 
@@ -1559,10 +1574,10 @@ TEST(ExpressionTest,
   EXPECT_TRUE(EvaluateUnary(UnaryOperation::kMinus, Value()).IsNull());
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kMinus,
                           Value(static_cast<uint64_t>(0)).WithUnsigned()),
-            Value(static_cast<uint64_t>(0)).WithUnsigned());
-  EXPECT_TRUE(EvaluateUnary(UnaryOperation::kMinus,
-                            Value(static_cast<uint64_t>(0)).WithUnsigned())
-                  .IsUnsigned());
+            Value(int64_t{0}));
+  EXPECT_FALSE(EvaluateUnary(UnaryOperation::kMinus,
+                             Value(static_cast<uint64_t>(0)).WithUnsigned())
+                   .IsUnsigned());
   EXPECT_THROW(
       (void)EvaluateUnary(UnaryOperation::kMinus,
                           Value(static_cast<uint64_t>(5)).WithUnsigned()),
@@ -1813,7 +1828,8 @@ TEST(ExpressionTest, NamedExpression_OutputOperator_StreamsExpectedFormat) {
   // T2107: EXCEPT / REPLACE must not dump as a bare star.
   StarModifiers mods;
   mods.except_columns = {"b"};
-  mods.replace_items = {StarReplaceItem{.column = "c", .expression = ConstantValueExp(Value(9))}};
+  mods.replace_items = {
+      StarReplaceItem{.column = "c", .expression = ConstantValueExp(Value(9))}};
   NamedExpression star("s", ColumnValueExp("*"));
   star.star_modifiers = std::make_shared<const StarModifiers>(std::move(mods));
   std::ostringstream star_out;
@@ -1989,6 +2005,34 @@ class FakeEvaluationContext : public EvaluationContext {
   std::vector<std::vector<Value>> results_{};
   size_t next_result_{0};
 };
+
+TEST(ExpressionTest, UnsignedDateAdditionChecksBothOperandOrders) {
+  const Value date = Value::DateFromDays(0);
+  const Value too_large = Value(INT64_MIN).WithUnsigned();
+  EXPECT_EQ(
+      TryEvaluateBinary(BinaryOperation::kAdd, too_large, date).GetStatus(),
+      Status::kInvalidArgument);
+  EXPECT_EQ(
+      TryEvaluateBinary(BinaryOperation::kAdd, date, too_large).GetStatus(),
+      Status::kInvalidArgument);
+  const auto valid =
+      TryEvaluateBinary(BinaryOperation::kAdd, Value(1).WithUnsigned(), date);
+  ASSERT_TRUE(valid.HasValue());
+  EXPECT_EQ(valid.Value(), Value::DateFromDays(1));
+}
+
+TEST(ExpressionTest, ContextBinaryRejectsMissingOperands) {
+  FakeEvaluationContext context;
+  const Schema schema("s", {});
+  const Row row;
+  const auto constant = ConstantValueExp(Value(1));
+  for (const auto& expression :
+       {BinaryExpressionExp(Expression(), BinaryOperation::kAdd, constant),
+        BinaryExpressionExp(constant, BinaryOperation::kAdd, Expression())}) {
+    const auto result = expression->TryEvaluate(row, schema, context);
+    EXPECT_EQ(result.GetStatus(), Status::kInvalidArgument);
+  }
+}
 
 TEST(ExpressionTest, FunctionCall_Validate_RegistersThroughEvaluationContext) {
   Schema schema("s", {Column("a", ValueType::kVarChar)});
@@ -2349,7 +2393,8 @@ TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
     for (const auto& a : args) {
       exprs.push_back(ConstantValueExp(a));
     }
-    return FunctionCallExp(name, exprs)->Evaluate(dummy, dummy_schema);
+    return FunctionCallExp(name, std::move(exprs))
+        ->Evaluate(dummy, dummy_schema);
   };
 
   EXPECT_EQ(eval("coalesce", {Value(), Value(42)}), Value(42));
@@ -2979,10 +3024,9 @@ TEST(ExpressionTest, TimestampShapedTextIsNotIntervalArithmetic) {
   // reporting the unsupported operation.
   for (const BinaryOperation op :
        {BinaryOperation::kAdd, BinaryOperation::kSubtract}) {
-    EXPECT_THROW(
-        static_cast<void>(
-            BinaryExpressionExp(ts, op, ts)->Evaluate(row, schema)),
-        std::runtime_error);
+    EXPECT_THROW(static_cast<void>(
+                     BinaryExpressionExp(ts, op, ts)->Evaluate(row, schema)),
+                 std::runtime_error);
   }
 }
 
@@ -3016,6 +3060,94 @@ TEST(ExpressionTest, QuantifiedComparisonRejectsExplicitCollationConflict) {
       {Value(std::string("A"))});
   ASSERT_TRUE(binary.HasValue());
   EXPECT_FALSE(binary.Value().Truthy());
+}
+
+// Bug 10781: quantified comparisons short-circuit on the first decisive row,
+// so a collation conflict in a later, never-examined candidate must not turn a
+// decided TRUE (ANY) / FALSE (ALL) into an error — matching IN's
+// `if (found) break;` rule.
+TEST(ExpressionTest, QuantifiedComparisonShortCircuitsBeforeLaterConflict) {
+  const Value probe = Value(std::string("A")).WithCollation(1);
+  const Value matching = Value(std::string("A")).WithCollation(1);
+  const Value binary_other = Value(std::string("b")).WithCollation(1);
+  const Value ci_conflict = Value(std::string("b")).WithCollation(2);
+
+  // ANY: the first row already equals the probe, so the conflicting second
+  // row is never examined and the result stays TRUE.
+  const StatusOr<Value> any = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kEquals, QuantifierMode::kAny, probe,
+      {matching, ci_conflict});
+  ASSERT_TRUE(any.HasValue()) << ToString(any.GetStatus());
+  EXPECT_TRUE(any.Value().Truthy());
+
+  // ALL: the first row already differs, so the conflicting second row is
+  // never examined and the result stays FALSE.
+  const StatusOr<Value> all = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kEquals, QuantifierMode::kAll, probe,
+      {binary_other, ci_conflict});
+  ASSERT_TRUE(all.HasValue()) << ToString(all.GetStatus());
+  EXPECT_FALSE(all.Value().Truthy());
+}
+
+// Bug 10783: bare enum member-name lookups are case sensitive (like
+// EnumValueForMember); only the enum *type* name folds case. Lowercase
+// spellings must not be accepted as member names.
+TEST(ExpressionTest, OrdinalForEnumMemberNameIsCaseSensitive) {
+  EXPECT_EQ(OrdinalForEnumMemberName("TESTENUMNEGATIVE"), -1);
+  EXPECT_EQ(OrdinalForEnumMemberName("FIRSTENUM_WITHALIAS"), 0);
+  EXPECT_FALSE(OrdinalForEnumMemberName("testenumnegative").has_value());
+  EXPECT_FALSE(OrdinalForEnumMemberName("firstenum_withalias").has_value());
+  EXPECT_FALSE(OrdinalForEnumMemberName("TeStEnUmNeGaTiVe").has_value());
+}
+
+// Bug 10785: STRUCT canonical text is JSON, which has no bare NaN/Infinity
+// literals. std::to_chars renders non-finite doubles as "nan"/"inf"/"-inf";
+// they must be quoted (the json_text::ToJsonText convention) so the text stays
+// parseable and both rendering paths agree.
+TEST(ExpressionTest, StructJsonQuotesNonFiniteDoubles) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const std::vector<std::pair<std::string, Value>> fields = {
+      {"nan", Value(nan)},
+      {"pos_inf", Value(inf)},
+      {"neg_inf", Value(-inf)},
+      {"finite", Value(3.0)},
+  };
+  EXPECT_EQ(
+      EncodeStructJson(fields),
+      R"({"nan":"NaN","pos_inf":"Infinity","neg_inf":"-Infinity","finite":3})");
+}
+
+// Bug 10787: a window call's static type must match the values the executor
+// produces, so consumers that read ResultType ahead of execution (UNION
+// coercion, ORDER BY encoding, server type reporting) do not see a blanket
+// VARCHAR for e.g. ROW_NUMBER (INT64) or PERCENT_RANK (FLOAT64).
+TEST(ExpressionTest, WindowFunctionResultTypeDeclaredFromFunctionName) {
+  const Schema schema(
+      "t", {Column("x", ValueType::kInt64), Column("s", ValueType::kVarChar)});
+  auto win = [](std::string fn, Expression arg = nullptr) {
+    auto w = std::make_shared<WindowFunctionCallExpression>();
+    w->function = std::move(fn);
+    if (arg) {
+      w->args.push_back(std::move(arg));
+    }
+    return w;
+  };
+
+  EXPECT_EQ(win("ROW_NUMBER")->ResultType(schema).GetType(), TypeTag::kBigInt);
+  EXPECT_EQ(win("rank")->ResultType(schema).GetType(), TypeTag::kBigInt);
+  EXPECT_EQ(win("PERCENT_RANK")->ResultType(schema).GetType(),
+            TypeTag::kDouble);
+  EXPECT_EQ(win("AVG")->ResultType(schema).GetType(), TypeTag::kDouble);
+  EXPECT_EQ(win("LAG", ColumnValueExp("x"))->ResultType(schema).GetType(),
+            TypeTag::kBigInt);
+  EXPECT_EQ(
+      win("FIRST_VALUE", ColumnValueExp("s"))->ResultType(schema).GetType(),
+      TypeTag::kVarChar);
+  EXPECT_EQ(win("STRING_AGG")->ResultType(schema).GetType(), TypeTag::kVarChar);
+  // The two-schema overload stays in sync.
+  EXPECT_EQ(win("ROW_NUMBER")->ResultType(schema, schema).GetType(),
+            TypeTag::kBigInt);
 }
 
 // Issue 1314: TypeTag carries both SQL type tags and expression node kinds;

@@ -48,7 +48,7 @@ if (comparable && cast_side != nullptr && *cast_side &&
 // original is not. Soundness rests on three gates: (1) an allowlist of
 // domain pairs (same-domain redundancy, DATE -> TIMESTAMP), so lossy maps
 // such as INT64 -> FLOAT64 never rewrite; (2) a constant round-trip
-// proof CAST_BACK(const) folds and CAST_FWD(folded) reproduces const, so
+// proof the back/round_trip expressions reproduce const, so
 // the boundary value survives the domain change exactly; (3) totality of
 // the allowlisted maps, so no row can throw in the original and vanish
 // in the rewrite. Only single-relation selections are rewritten; joins
@@ -62,7 +62,7 @@ if (comparable && cast_side != nullptr && *cast_side &&
 1. **単射性と順序保存性の保証**:
    写像が単射でなければ、逆変換によって満たされる解空間が元の述語と一致しなくなります。たとえば `INT64 -> FLOAT64` のキャストは精度の欠損（桁落ち）により相異なる整数が同一の浮動小数点数に丸められる可能性があるため、許可リストから厳格に排除されています。
 2. **定数の往復一致証明（Round-trip Proof）**:
-   `DATE -> TIMESTAMP` のキャストで、定数側が `'2026-01-01 12:34:56'` のように時刻成分を含む場合、単純に DATE 型へ切り捨てると境界条件が変わります。逆方向キャスト `CAST_BACK(const)` の結果を再び順方向へ `CAST_FWD` し、元の定数値とビット単位で一致する場合だけ、境界値が同値であるとして変換します。
+   `DATE -> TIMESTAMP` のキャストで、定数側が `'2026-01-01 12:34:56'` のように時刻成分を含む場合、単純に DATE 型へ切り捨てると境界条件が変わります。逆方向キャスト式 `back` の畳み込み結果を再び順方向へ `round_trip` でキャストし、元の定数値と一致する場合だけ、境界値が同値であるとして変換します。
 3. **全域性（Totality）と例外消去の防止**:
    許可する型変換は入力ドメインの全域で例外を送出しない（total）ため、書き換えによって本来のキャスト例外が消えることはありません。
 

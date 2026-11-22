@@ -96,6 +96,49 @@ TEST(ChunkCodecTest, RoundTripsTypedNullHeteroPositionsAndLargeStrings) {
   EXPECT_FALSE(has_chunk.Value());
 }
 
+TEST(ChunkCodecTest, NullOnlySliceRetainsColumnCollation) {
+  DataChunk source;
+  source.Append(Row({Value("Alpha").WithCollation(
+      static_cast<uint8_t>(Collation::kCaseInsensitive))}));
+  source.Append(Row({Value()}));
+
+  DataChunk fragment;
+  fragment.AppendFrom(source, 1);
+  ASSERT_EQ(fragment.ColumnAt(0).ColumnCollation(),
+            Collation::kCaseInsensitive);
+
+  std::string encoded;
+  ASSERT_EQ(EncodeDataChunk(fragment, &encoded), Status::kSuccess);
+  std::string_view payload(encoded);
+  DataChunk decoded;
+  ASSERT_EQ(DecodeDataChunk(&payload, &decoded), Status::kSuccess);
+  EXPECT_TRUE(payload.empty());
+  ASSERT_EQ(decoded.Size(), 1U);
+  EXPECT_EQ(decoded.ColumnAt(0).Type(), ValueType::kVarChar);
+  EXPECT_TRUE(decoded.ColumnAt(0).IsNull(0));
+  EXPECT_EQ(decoded.ColumnAt(0).ColumnCollation(), Collation::kCaseInsensitive);
+}
+
+TEST(ChunkCodecTest, NullColumnsRoundTripWithoutPositions) {
+  DataChunk chunk;
+  chunk.Initialize({ValueType::kNull, ValueType::kNull}, 0);
+  const Row row({Value(), Value()});
+  for (int i = 0; i < 128; ++i) {
+    chunk.Append(row);
+  }
+  std::string encoded;
+  ASSERT_EQ(EncodeDataChunk(chunk, &encoded), Status::kSuccess);
+  std::string_view payload(encoded);
+  DataChunk decoded;
+  ASSERT_EQ(DecodeDataChunk(&payload, &decoded), Status::kSuccess);
+  EXPECT_TRUE(payload.empty());
+  ASSERT_EQ(decoded.Size(), chunk.Size());
+  for (size_t r = 0; r < decoded.Size(); ++r) {
+    EXPECT_EQ(decoded.RowAt(r), row);
+    EXPECT_FALSE(decoded.PositionAt(r).IsValid());
+  }
+}
+
 TEST(ChunkCodecTest, WriteSplitsOversizedChunkIntoBoundedFrames) {
   TempDirGuard dir("ooc_chunk_split");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
@@ -229,8 +272,9 @@ TEST(SpillableStoreTest, InMemoryFastPathAvoidsDiskIo) {
 TEST(SpillableStoreTest, FailedTransitionPreservesBufferedChunks) {
   TempDirGuard dir("ooc_spillable_failed_transition");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
-  SpillableStore sstore(SpillableStore::Options{
-      .spill_store = &store, .memory_budget_bytes = 4096, .io_buffer_bytes = 0});
+  SpillableStore sstore(SpillableStore::Options{.spill_store = &store,
+                                                .memory_budget_bytes = 4096,
+                                                .io_buffer_bytes = 0});
   for (int value : {1, 2}) {
     DataChunk chunk;
     chunk.Append(Row({Value(value)}), RowPosition());
@@ -245,6 +289,8 @@ TEST(SpillableStoreTest, FailedTransitionPreservesBufferedChunks) {
   EXPECT_EQ(failure.GetCode(), StatusCode::kIOError);
   ASSERT_FALSE(sstore.Spilled());
   EXPECT_EQ(store.Stats().live_segments, 0U);
+  ASSERT_EQ(sstore.AppendChunk(std::move(large)), Status::kSuccess);
+  ASSERT_TRUE(sstore.Spilled());
   ASSERT_EQ(sstore.Seal(), Status::kSuccess);
   Row row;
   for (int value : {1, 2}) {
@@ -253,9 +299,13 @@ TEST(SpillableStoreTest, FailedTransitionPreservesBufferedChunks) {
     ASSERT_TRUE(found.Value());
     EXPECT_EQ(row, Row({Value(value)}));
   }
-  const auto found = sstore.NextRow(&row);
-  ASSERT_TRUE(found.HasValue());
-  EXPECT_FALSE(found.Value());
+  const auto retried = sstore.NextRow(&row);
+  ASSERT_TRUE(retried.HasValue());
+  ASSERT_TRUE(retried.Value());
+  EXPECT_EQ(row, Row({Value(std::string(8192, 'x'))}));
+  const auto ended = sstore.NextRow(&row);
+  ASSERT_TRUE(ended.HasValue());
+  EXPECT_FALSE(ended.Value());
 }
 
 TEST(SpillableStoreTest, SpillsOverBudgetAndCleansUpOnReset) {
@@ -437,7 +487,8 @@ TEST(OocPrimitivesSorterTest, WideRowsRoundTripUnderSmallBudget) {
   TempDirGuard dir("ooc_sorter_wide");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ExternalSorter sorter(ExternalSorter::Options{
-      .spill_store = &store, .memory_budget_bytes = 8192,
+      .spill_store = &store,
+      .memory_budget_bytes = 8192,
       .keys = {OocSortKey{.column_index = 0, .ascending = true}},
       .limit = std::nullopt});
   const Row large({Value(int64_t{2}), Value(std::string(16000, 'b'))});
@@ -548,6 +599,21 @@ TEST(OocPrimitivesSorterTest, FaultInjectionAndTempLimitCleanUpAllSegments) {
     EXPECT_EQ(store.Stats().live_segments, 0U);
     EXPECT_EQ(store.Stats().current_active_bytes, 0U);
   }
+}
+
+TEST(RecursivePartitionerTest, RejectsUseAfterSpillStoreDestruction) {
+  auto store = std::make_unique<SpillStore>();
+  auto partitioner = std::make_unique<RecursivePartitioner>(
+      RecursivePartitioner::Options{.spill_store = store.get(),
+                                    .memory_budget_bytes = 65536,
+                                    .force_spill = true},
+      [](const Row&) { return uint64_t{0}; });
+  ASSERT_EQ(partitioner->AddRow(Row({Value(1)})), Status::kSuccess);
+  store.reset();
+  PartitionLeafSet result;
+  EXPECT_NE(partitioner->Finalize(&result), Status::kSuccess);
+  EXPECT_NE(partitioner->AddRow(Row({Value(2)})), Status::kSuccess);
+  partitioner.reset();  // writer cleanup must not access the dead store
 }
 
 TEST(RecursivePartitionerTest, UniformKeysReachDepth3AndReconstructAllRows) {
@@ -669,6 +735,59 @@ TEST(RecursivePartitionerTest,
   EXPECT_EQ(store.Stats().live_segments, 0U);
 }
 
+TEST(RecursivePartitionerTest, FailedSpillTransitionKeepsRowsForRetry) {
+  for (bool retry : {false, true}) {
+    SCOPED_TRACE(retry);
+    TempDirGuard dir("ooc_part_transition_retry");
+    SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+    RecursivePartitioner part(
+        RecursivePartitioner::Options{.spill_store = &store,
+                                      .memory_budget_bytes = 44ULL << 10},
+        [](const Row&) { return uint64_t{0}; });
+    const std::string text(6000, 'x');
+    for (int64_t i = 0; i < 7; ++i) {
+      ASSERT_EQ(part.AddRow(Row({Value(i), Value(std::string(text))})),
+                Status::kSuccess);
+    }
+    ASSERT_FALSE(part.Spilled());
+    const Row incoming({Value(7), Value(std::string(text))});
+    auto& budget = ProcessMemoryBudget::Global();
+    budget.SetTestSpillIoFailCountdown(2);
+    const Status failed = part.AddRow(incoming);
+    budget.SetTestSpillIoFailCountdown(0);
+    ASSERT_EQ(failed, StatusCode::kIOError);
+    EXPECT_FALSE(part.Spilled());
+    EXPECT_EQ(part.TotalRows(), 7U);
+    EXPECT_EQ(store.Stats().live_segments, 0U);
+    if (retry) {
+      ASSERT_EQ(part.AddRow(incoming), Status::kSuccess);
+      ASSERT_TRUE(part.Spilled());
+      EXPECT_EQ(part.TotalRows(), 8U);
+    }
+    PartitionLeafSet leaves;
+    ASSERT_EQ(part.Finalize(&leaves), Status::kSuccess);
+    std::vector<int64_t> ids;
+    for (const PartitionLeaf& leaf : leaves.leaves) {
+      ASSERT_EQ(RecursivePartitioner::ReadLeafRows(
+                    &store, leaf,
+                    [&](Row&& row) {
+                      if (row.Count() != 2) {
+                        return Status::kCorrupt;
+                      }
+                      EXPECT_EQ(row[1].AsStringView(), text);
+                      ids.push_back(row[0].AsInt64());
+                      return Status::kSuccess;
+                    }),
+                Status::kSuccess);
+    }
+    std::vector<int64_t> expected{0, 1, 2, 3, 4, 5, 6};
+    if (retry) {
+      expected.push_back(7);
+    }
+    EXPECT_EQ(ids, expected);
+  }
+}
+
 TEST(RecursivePartitionerTest, FaultInjectionDropsPartialBucketsCleanly) {
   TempDirGuard dir("ooc_part_fault");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
@@ -687,14 +806,16 @@ TEST(RecursivePartitionerTest, FaultInjectionDropsPartialBucketsCleanly) {
     PartitionLeafSet leaves;
     RecursivePartitioner part(
         RecursivePartitioner::Options{.spill_store = &store,
-                                      .memory_budget_bytes = 64ULL << 10},
-        [](const Row& r) { return static_cast<uint64_t>(r[0].AsInt64()); });
-    const std::string pad(200, 'F');
-    for (int i = 0; i < 600; ++i) {
-      ASSERT_EQ(part.AddRow(Row({Value(int64_t{i}), Value(std::string(pad))})),
-                Status::kSuccess);
-    }
-    mem.SetTestSpillIoFailCountdown(1);
+                                      .memory_budget_bytes = 64ULL << 10,
+                                      .force_spill = true},
+        [](const Row& r) {
+          return static_cast<uint64_t>(r[0].AsInt64()) << 63;
+        });
+    ASSERT_EQ(part.AddRow(Row({Value(int64_t{0})})), Status::kSuccess);
+    ASSERT_EQ(part.AddRow(Row({Value(int64_t{1})})), Status::kSuccess);
+    // The two rows use separate root buckets and stay buffered until
+    // Finalize. Fail the second write after sealing the first bucket.
+    mem.SetTestSpillIoFailCountdown(2);
     const Status st = part.Finalize(&leaves);
     EXPECT_EQ(st.GetCode(), StatusCode::kIOError);
     EXPECT_EQ(store.Stats().live_segments, 0U);
@@ -724,7 +845,9 @@ TEST(OocPrimitivesSorterTest, ShouldSkipTopKChunkRowRespectsCutoffs) {
   DataChunk probe;
   probe.Reserve(4);
   probe.Append(Row({Value(int64_t{15}), Value(seq++)}));  // 15 < 20 -> skip
-  probe.Append(Row({Value(int64_t{20}), Value(seq++)}));  // tie == 20 -> skip (later tie-breaker seq; all SQL keys compare equal)
+  probe.Append(Row({Value(int64_t{20}),
+                    Value(seq++)}));  // tie == 20 -> skip (later tie-breaker
+                                      // seq; all SQL keys compare equal)
   probe.Append(Row({Value(int64_t{25}), Value(seq++)}));  // 25 > 20 -> keep
   probe.Append(
       Row({Value(), Value(seq++)}));  // NULL (NULLS LAST in DESC) -> skip
@@ -749,7 +872,8 @@ TEST(SpillableStoreTest, AppendRowStagingRespectsTightGrantAndMoveAppendWorks) {
   TempDirGuard dir("ooc_spillable_tight_grant");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
   struct ResetGuard {
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
@@ -792,6 +916,45 @@ TEST(SpillableStoreTest, AppendRowStagingRespectsTightGrantAndMoveAppendWorks) {
   EXPECT_EQ(grant.UsedBytes(), 0U);
 }
 
+TEST(SpillableStoreTest, SpilledRowsChargeGrantOrFlushImmediately) {
+  TempDirGuard dir("ooc_spillable_spilled_staging");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
+  struct ResetGuard {
+    ProcessMemoryBudget* budget;
+    ~ResetGuard() { budget->ResetForTest(0); }
+  } guard{&mb};
+  mb.ResetForTest(64ULL << 20, 64ULL << 20, 64ULL << 20, false);
+  QueryMemoryCoordinator coord(&mb);
+  auto grant = coord.AcquireGrant(64ULL << 10, 64ULL << 10).MoveValue();
+  {
+    SpillableStore sstore(SpillableStore::Options{
+        .spill_store = &store,
+        .memory_budget_bytes = 64ULL << 10,
+        .grant = &grant,
+        .force_spill = true,
+    });
+    DataChunk first;
+    first.Append(Row({Value("first")}));
+    ASSERT_EQ(sstore.AppendChunk(std::move(first)), Status::kSuccess);
+    ASSERT_TRUE(sstore.Spilled());
+    ASSERT_EQ(sstore.AppendRow(Row({Value("staged")})), Status::kSuccess);
+    EXPECT_GT(grant.UsedBytes(), 0U);
+    const std::string large(128ULL << 10, 'x');
+    ASSERT_EQ(sstore.AppendRow(Row({Value(std::string(large))})),
+              Status::kSuccess);
+    ASSERT_EQ(sstore.Seal(), Status::kSuccess);
+    ASSERT_EQ(sstore.ResetCursor(), Status::kSuccess);
+    Row out;
+    ASSERT_TRUE(sstore.NextRow(&out).Value());
+    ASSERT_TRUE(sstore.NextRow(&out).Value());
+    ASSERT_TRUE(sstore.NextRow(&out).Value());
+    EXPECT_TRUE(out[0].AsStringView() == large);
+    EXPECT_FALSE(sstore.NextRow(&out).Value());
+  }
+  EXPECT_EQ(grant.UsedBytes(), 0U);
+}
+
 TEST(RecursivePartitionerTest,
      RadixBucketAtOffsetPreventsOverlapAcrossBudgetShifts) {
   // Root consumed top 6 MSB bits [58, 64); child uses 2 bits at offset 6 ->
@@ -805,12 +968,13 @@ TEST(RecursivePartitionerTest,
   EXPECT_EQ(RecursivePartitioner::RadixBucketAtOffset(h2, 6, 2), 2U);
   EXPECT_EQ(RecursivePartitioner::RadixBucketAtOffset(h3, 6, 2), 3U);
 
-  // Also test dynamic grant change between AddRow() and Finalize() forcing
-  // fanout reduction from 6 bits to 2 bits.
+  // Also exercise a dynamic grant change between AddRow() and Finalize().
+  // The split fanout stays fixed at the root's value; see the note below.
   TempDirGuard dir("ooc_part_dynamic_bits");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
   struct ResetGuard {
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
@@ -838,8 +1002,11 @@ TEST(RecursivePartitionerTest,
     ASSERT_EQ(part.AddRow(Row({Value(int64_t{i}), Value(std::string(pad))})),
               Status::kSuccess);
   }
-  // Shrink operator budget drastically right before Finalize() splits so
-  // ComputeFanoutBits changes from 5 bits (root) to 2 bits (children).
+  // Shrink the operator budget drastically right before Finalize() splits.
+  // Finalize() deliberately discards ComputeFanoutBits for the new budget and
+  // keeps child_fanout_bits = root_fanout_bits_, so a budget change only
+  // re-sizes the writer buffers; it does NOT change the child fanout (that
+  // fixed fanout is what preserves the refinement guarantee).
   std::vector<QueryMemoryGrant::ActiveConsumerGuard> consumers;
   consumers.reserve(7);
   for (int i = 0; i < 7; ++i) {
@@ -860,11 +1027,13 @@ TEST(RecursivePartitionerTest,
   EXPECT_EQ(total, 4200U);
 }
 
-TEST(OocPrimitivesSorterTest, GrantExhaustionDuringAddRowSpillsSingleRowRunSafely) {
+TEST(OocPrimitivesSorterTest,
+     GrantExhaustionDuringAddRowSpillsSingleRowRunSafely) {
   TempDirGuard dir("ooc_sorter_grant_exhaustion");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
   struct ResetGuard {
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }

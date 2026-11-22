@@ -514,19 +514,18 @@ std::vector<MRow> PreparedRows(const AggSpec& spec,
     });
     // DISTINCT orders by the aggregated value (see generation): ASC puts
     // NULL first, DESC puts it last (GoogleSQL default null ordering).
-    std::stable_sort(rows.begin(), rows.end(),
-                     [&](const MRow& x, const MRow& y) {
-                       const int64_t vx = CellOf(x, spec.col);
-                       const int64_t vy = CellOf(y, spec.col);
-                       if (vx == vy) {
-                         return false;
-                       }
-                       if (vx == kNullRepr || vy == kNullRepr) {
-                         return spec.order_desc ? vy == kNullRepr
-                                                : vx == kNullRepr;
-                       }
-                       return spec.order_desc ? vx > vy : vx < vy;
-                     });
+    std::stable_sort(
+        rows.begin(), rows.end(), [&](const MRow& x, const MRow& y) {
+          const int64_t vx = CellOf(x, spec.col);
+          const int64_t vy = CellOf(y, spec.col);
+          if (vx == vy) {
+            return false;
+          }
+          if (vx == kNullRepr || vy == kNullRepr) {
+            return spec.order_desc ? vy == kNullRepr : vx == kNullRepr;
+          }
+          return spec.order_desc ? vx > vy : vx < vy;
+        });
   }
   if (spec.inner_limit > 0 &&
       rows.size() > static_cast<size_t>(spec.inner_limit)) {
@@ -945,17 +944,16 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
+  const auto execute_fixture_sql = [&](std::string_view sql) -> Status {
+    ASSIGN_OR_RETURN(QueryResult, result, engine.Execute(ctx, sql));
+    // QueryResults are lazy: draining can surface a separate execution error.
+    result.Drain();
+    return result.GetStatus();
+  };
   for (const std::string& sql : t.setup) {
-    StatusOr<QueryResult> result = engine.Execute(ctx, sql);
-    if (!result.HasValue()) {
-      return "[AGG FUZZ SETUP ERROR] " + sql + ": " +
-             result.GetStatus().GetMessage();
-    }
-    // QueryResults are lazy: drain or the INSERT never happens.
-    result.Value().Drain();
-    if (result.Value().GetStatus() != Status::kSuccess) {
-      return "[AGG FUZZ SETUP ERROR] " + sql + ": " +
-             result.Value().GetStatus().GetMessage();
+    if (const Status status = execute_fixture_sql(sql);
+        status != Status::kSuccess) {
+      return "[AGG FUZZ SETUP ERROR] " + sql + ": " + status.GetMessage();
     }
   }
   // Commit setup so read-only queries can trigger lazy LSTableStore creation
@@ -1183,8 +1181,8 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         }
       }
       // Inline WHERE (GoogleSQL `AGG(arg WHERE cond)`) and HAVING MIN/MAX.
-      // STRING_AGG and ARRAY_AGG supply any ORDER BY and LIMIT. Grammar order is
-      // `AGG(arg [WHERE c] [HAVING {MIN|MAX} e] [ORDER BY ...] [LIMIT n])`,
+      // STRING_AGG and ARRAY_AGG supply any ORDER BY and LIMIT. Grammar order
+      // is `AGG(arg [WHERE c] [HAVING {MIN|MAX} e] [ORDER BY ...] [LIMIT n])`,
       // so all insert at the same anchor: before ORDER BY/LIMIT when
       // `where_pos` marks one, else before the closing paren.
       for (AggSpec& spec : aggs) {
@@ -1865,7 +1863,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
 
   // On multi-super-block (`large`) rounds, explicitly probe the 3 selectivity
   // regimes of the selectivity-adaptive LSTable kernels across the 4,096-row
-  // super-block boundaries:
+  // super-block boundaries, plus one ungrouped scalar-SUM probe:
   //   0: Pattern A (<5% sparse gather across block 0 & block 1 boundary)
   //   1: Pattern C (100% block 0) + Pattern B (~22% block 1) + 0% block 2
   //   2: Pattern B (>90% high-selectivity block 0) + Pattern C (100% block 1/2)
@@ -2006,11 +2004,21 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   // under the Cascades grouped route (TINYLAMB_GROUPED_ROUTE=cascades).
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_a ON t(a) INCLUDE(b);");
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_b ON t(b);");
-  if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
-    res.Value().Drain();
+  {
+    auto analyze = engine.Execute(ctx, "ANALYZE t;");
+    if (!analyze.HasValue()) {
+      return "[AGG FUZZ SETUP ERROR] ANALYZE failed: " +
+             std::string(analyze.GetStatus().GetMessage()) + "\n";
+    }
+    analyze.Value().Drain();
+    if (analyze.Value().GetStatus() != Status::kSuccess) {
+      return "[AGG FUZZ SETUP ERROR] ANALYZE stream failed: " +
+             std::string(analyze.Value().GetStatus().GetMessage()) + "\n";
+    }
   }
-  if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    return "";
+  if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+    return "[AGG FUZZ SETUP ERROR] PreCommit after index setup: " +
+           std::string(pre.GetMessage()) + "\n";
   }
   ctx = db.BeginContext();
   const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
@@ -2094,7 +2102,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     // NaN oracle silently never ran. c_val is integral: print it as such.
     const std::string c_lit =
         std::to_string(static_cast<int64_t>(c_val)) + ".0";
-    const std::array<std::string, 5> nan_setup = {
+    const std::array<std::string, 6> nan_setup = {
         "CREATE TABLE t_nan_heap (u INT64 PRIMARY KEY, a INT64, f FLOAT64);",
         "CREATE TABLE t_nan_lst (u INT64 PRIMARY KEY, a INT64, f FLOAT64) "
         "USING lstable;",
@@ -2114,76 +2122,60 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             c_lit +
             "), (4, 20, CAST('NaN' AS FLOAT64)), "
             "(5, 20, CAST('NaN' AS FLOAT64)), (6, 20, NULL);",
-        "ANALYZE t_nan_heap;"};
-    bool nan_ok = true;
-    for (const std::string& s : nan_setup) {
-      auto r = engine.Execute(ctx, s);
-      if (!r.HasValue()) {
-        nan_ok = false;
-        break;
+        "ANALYZE t_nan_heap;",
+        "ANALYZE t_nan_lst;"};
+    for (const std::string& sql : nan_setup) {
+      if (const Status status = execute_fixture_sql(sql);
+          status != Status::kSuccess) {
+        return "[NAN-ZONEMAP/WINDOW SETUP ERROR] " + sql + ": " +
+               status.GetMessage();
       }
-      r.Value().Drain();
     }
-    if (nan_ok) {
-      auto analyze = engine.Execute(ctx, "ANALYZE t_nan_lst;");
-      if (!analyze.HasValue()) {
-        nan_ok = false;
-      } else {
-        analyze.Value().Drain();
-        if (analyze.Value().GetStatus() != Status::kSuccess) {
-          nan_ok = false;
-        }
+    if (const Status status = ctx.txn_.PreCommit();
+        status != Status::kSuccess) {
+      return "[NAN-ZONEMAP/WINDOW SETUP ERROR] PreCommit: " +
+             std::string(status.GetMessage());
+    }
+    ctx = db.BeginContext();
+    const std::array<std::pair<std::string, std::string>, 4> nan_probes = {{
+        {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " + c_lit + ";",
+         "SELECT COUNT(*), COUNT(f) FROM t_nan_lst WHERE f <> " + c_lit + ";"},
+        {"SELECT a, COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " + c_lit +
+             " GROUP BY a ORDER BY a;",
+         "SELECT a, COUNT(*), COUNT(f) FROM t_nan_lst WHERE f <> " + c_lit +
+             " GROUP BY a ORDER BY a;"},
+        {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f = " + c_lit + ";",
+         "SELECT COUNT(*), COUNT(f) FROM t_nan_lst WHERE f = " + c_lit + ";"},
+        {"SELECT u, a, APPROX_QUANTILES(f, 2) OVER (PARTITION BY a) FROM "
+         "t_nan_heap ORDER BY u;",
+         "SELECT u, a, APPROX_QUANTILES(f, 2) OVER (PARTITION BY a) FROM "
+         "t_nan_lst ORDER BY u;"},
+    }};
+    for (const auto& [q_heap, q_lst] : nan_probes) {
+      std::string err_h, err_l;
+      auto got_h = RunQuery(db, ctx, q_heap, &err_h);
+      auto got_l = RunQuery(db, ctx, q_lst, &err_l);
+      if (got_h.has_value() != got_l.has_value()) {
+        // One storage answered and the other raised: that divergence is
+        // exactly what this oracle exists to catch.
+        report += "[NAN-ZONEMAP/WINDOW ERROR MISMATCH]\n  heap: ";
+        report.append(q_heap)
+            .append(got_h.has_value() ? " -> ok" : " -> " + err_h)
+            .append("\n  lst:  ")
+            .append(q_lst)
+            .append(got_l.has_value() ? " -> ok" : " -> " + err_l)
+            .append("\n");
+        return report;
       }
-      if (nan_ok && ctx.txn_.PreCommit() == Status::kSuccess) {
-        ctx = db.BeginContext();
-        const std::array<std::pair<std::string, std::string>, 4> nan_probes = {{
-            {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " + c_lit +
-                 ";",
-             "SELECT COUNT(*), COUNT(f) FROM t_nan_lst WHERE f <> " + c_lit +
-                 ";"},
-            {"SELECT a, COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " +
-                 c_lit + " GROUP BY a ORDER BY a;",
-             "SELECT a, COUNT(*), COUNT(f) FROM t_nan_lst WHERE f <> " + c_lit +
-                 " GROUP BY a ORDER BY a;"},
-            {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f = " + c_lit +
-                 ";",
-             "SELECT COUNT(*), COUNT(f) FROM t_nan_lst WHERE f = " + c_lit +
-                 ";"},
-            {"SELECT u, a, APPROX_QUANTILES(f, 2) OVER (PARTITION BY a) FROM "
-             "t_nan_heap ORDER BY u;",
-             "SELECT u, a, APPROX_QUANTILES(f, 2) OVER (PARTITION BY a) FROM "
-             "t_nan_lst ORDER BY u;"},
-        }};
-        for (const auto& [q_heap, q_lst] : nan_probes) {
-          std::string err_h, err_l;
-          auto got_h = RunQuery(db, ctx, q_heap, &err_h);
-          auto got_l = RunQuery(db, ctx, q_lst, &err_l);
-          if (got_h.has_value() != got_l.has_value()) {
-            // One storage answered and the other raised: that divergence is
-            // exactly what this oracle exists to catch.
-            report += "[NAN-ZONEMAP/WINDOW ERROR MISMATCH]\n  heap: ";
-            report.append(q_heap)
-                .append(got_h.has_value() ? " -> ok" : " -> " + err_h)
-                .append("\n  lst:  ")
-                .append(q_lst)
-                .append(got_l.has_value() ? " -> ok" : " -> " + err_l)
-                .append("\n");
-            return report;
-          }
-          if (!got_h.has_value()) {
-            continue;  // Both rejected the probe alike.
-          }
-          const std::vector<std::string> rows_h = FormatRows(*got_h);
-          const std::vector<std::string> rows_l = FormatRows(*got_l);
-          if (rows_h != rows_l) {
-            report += "[NAN-ZONEMAP/WINDOW MISMATCH]\n  heap: ";
-            report.append(q_heap)
-                .append("\n  lst:  ")
-                .append(q_lst)
-                .append("\n");
-            return report;
-          }
-        }
+      if (!got_h.has_value()) {
+        continue;  // Both rejected the probe alike.
+      }
+      const std::vector<std::string> rows_h = FormatRows(*got_h);
+      const std::vector<std::string> rows_l = FormatRows(*got_l);
+      if (rows_h != rows_l) {
+        report += "[NAN-ZONEMAP/WINDOW MISMATCH]\n  heap: ";
+        report.append(q_heap).append("\n  lst:  ").append(q_lst).append("\n");
+        return report;
       }
     }
   }
@@ -2253,11 +2245,21 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
   }
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_a ON t(a) INCLUDE(b);");
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_b ON t(b);");
-  if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
-    res.Value().Drain();
+  {
+    auto analyze = engine.Execute(ctx, "ANALYZE t;");
+    if (!analyze.HasValue()) {
+      return "[AGG FUZZ SETUP ERROR] ANALYZE failed on replay: " +
+             std::string(analyze.GetStatus().GetMessage()) + "\n";
+    }
+    analyze.Value().Drain();
+    if (analyze.Value().GetStatus() != Status::kSuccess) {
+      return "[AGG FUZZ SETUP ERROR] ANALYZE stream failed on replay: " +
+             std::string(analyze.Value().GetStatus().GetMessage()) + "\n";
+    }
   }
-  if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    return "";
+  if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+    return "[AGG FUZZ SETUP ERROR] PreCommit after replay index setup: " +
+           std::string(pre.GetMessage()) + "\n";
   }
   ctx = db.BeginContext();
   if (std::string rep = check_all("[AGGREGATE-INDEXED REPLAY MISMATCH]");

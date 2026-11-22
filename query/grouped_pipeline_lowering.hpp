@@ -18,7 +18,8 @@ namespace tinylamb {
 // Attempts to lower an aggregated / grouped SELECT statement executed on top of
 // a Cascades FROM+WHERE `core_plan` into a purely out-of-core `PipelineGraph`
 // (`OocGroupAggSink` -> optional `FilterOp(HAVING)` -> `ProjectOp` -> optional
-// `OocDistinctSink` -> optional `OocSortSink`/`LimitOp` -> `ProjectOp`).
+// `OocDistinctSink` -> optional `OocSortSink`/`LimitOp`, followed by a final
+// `ProjectOp` only when ORDER BY needs hidden sort keys stripped).
 //
 // Returns `std::nullopt` when the statement relies on complex relational
 // features not yet in the P3a pipeline (representative-row ungrouped columns,

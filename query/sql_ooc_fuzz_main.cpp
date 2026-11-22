@@ -28,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/platform/synced_stream.hpp"
 #include "query/sql_ooc_fuzzer.hpp"
 
 namespace {
@@ -70,7 +71,12 @@ bool ParseArgs(int argc, char** argv, Args* a) {
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     auto value = [&]() -> const char* {
-      return i + 1 < argc ? argv[++i] : nullptr;
+      // A missing value must not silently swallow the next option (e.g.
+      // `--seed --verbose` would otherwise yield seed 0 and drop --verbose).
+      if (i + 1 >= argc || std::string_view(argv[i + 1]).starts_with("--")) {
+        return nullptr;
+      }
+      return argv[++i];
     };
     if (arg == "--verbose") {
       a->verbose = true;
@@ -153,10 +159,16 @@ class Watchdog {
         op = op_;
       }
       const std::string kind = op.substr(0, op.find(' '));
-      std::cout << "FINDING: op ran longer than " << timeout_
-                << " s (hang or livelock): " << op.substr(0, 400) << "\n"
-                << "SIGNATURE: hang / " << kind << "\n"
-                << std::flush;
+      {
+        // A disarmed watchdog can still be inside this block while the main
+        // thread prints a report; osyncstream serialises the two writers so a
+        // SIGNATURE line is never interleaved with other stdout output.
+        tinylamb::platform::SyncedOStream out(std::cout);
+        out << "FINDING: op ran longer than " << timeout_
+            << " s (hang or livelock): " << op.substr(0, 400) << "\n"
+            << "SIGNATURE: hang / " << kind << "\n"
+            << std::flush;
+      }
       std::_Exit(3);
     }
   }
@@ -171,29 +183,31 @@ class Watchdog {
 };
 
 void PrintStats(const OocStats& stats) {
-  std::cout << "STATS: " << stats.Summary() << "\n";
-  std::cout << "SHAPES:";
+  tinylamb::platform::SyncedOStream out(std::cout);
+  out << "STATS: " << stats.Summary() << "\n";
+  out << "SHAPES:";
   for (const auto& [name, n] : stats.shapes) {
-    std::cout << " " << name << "=" << n;
+    out << " " << name << "=" << n;
   }
-  std::cout << "\nOPERATORS:";
+  out << "\nOPERATORS:";
   for (const auto& [name, n] : stats.operators) {
-    std::cout << " " << name << "=" << n;
+    out << " " << name << "=" << n;
   }
-  std::cout << "\n";
+  out << "\n";
   for (const auto& [name, n] : stats.routes) {
-    std::cout << "ROUTE: " << n << " " << name << "\n";
+    out << "ROUTE: " << n << " " << name << "\n";
   }
 }
 
 int Report(const std::string& report, const OocStats& stats) {
   PrintStats(stats);
+  tinylamb::platform::SyncedOStream out(std::cout);
   if (report.empty()) {
-    std::cout << "OK\n";
+    out << "OK\n";
     return 0;
   }
-  std::cout << "FINDING: " << report << (report.ends_with('\n') ? "" : "\n")
-            << "SIGNATURE: " << tinylamb::OocFailureSignature(report) << "\n";
+  out << "FINDING: " << report << (report.ends_with('\n') ? "" : "\n")
+      << "SIGNATURE: " << tinylamb::OocFailureSignature(report) << "\n";
   return 1;
 }
 

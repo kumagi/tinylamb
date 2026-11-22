@@ -18,6 +18,35 @@
 
 namespace tinylamb {
 namespace {
+TEST_F(RelationalRegressionTest, ScalarSubqueryReadsEachInheritedCteBinding) {
+  auto subquery = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("n", ColumnValueExp("n"))},
+      std::vector<std::string>{}, nullptr);
+  SelectSource source;
+  source.table = "work";
+  subquery->SetSources({source});
+  const Expression expression = QueryExpressionExp(subquery);
+  auto context = rs_->BeginReadOnlyContext();
+  relational_detail::ExecutionRuntime runtime;
+  context.set_execution_runtime(&runtime);
+  relational_detail::CteMap ctes;
+  for (int n : {1, 2, 3}) {
+    auto input = std::make_shared<relational_detail::Relation>();
+    input->schema = Schema("work", {Column("n", ValueType::kInt64)});
+    input->AddRow(Row({Value(n)}));
+    ctes["work"] = std::move(input);
+    const Row outer_row;
+    const Schema outer_schema;
+    const relational_detail::Scope outer{.row = &outer_row,
+                                         .schema = &outer_schema};
+    ASSIGN_OR_ASSERT_FAIL(Value, result,
+                          relational_detail::TryEvaluate(
+                              expression, outer, nullptr, context, ctes));
+    EXPECT_EQ(result, Value(n));
+  }
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(RelationalRegressionTest,
        CorrelatedScalarExtremaKeepNullAndNanSemantics) {
   using namespace relational_detail;
@@ -41,7 +70,7 @@ TEST_F(RelationalRegressionTest,
     for (const auto& value : groups[k]) {
       rows.emplace_back(
           std::vector<Value>{Value(static_cast<int64_t>(k)), value});
-}
+    }
   }
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<ColumnarTable>, columns,
                         BuildColumnarTableFromRows(input->schema, rows));
@@ -64,11 +93,13 @@ TEST_F(RelationalRegressionTest,
           ctx, statement, scope, {{"d", input}}, false, nullptr, &scalar);
       ASSERT_TRUE(result.has_value());
       ASSERT_TRUE(scalar.has_value());
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+      // success
       const Value& actual = *scalar;
       AggregateAccumulator reference(aggregate.get(), &input->schema);
-      for (const auto& value : groups[k]) { ASSERT_SUCCESS(reference.Add(value));
-}
+      for (const auto& value : groups[k]) {
+        ASSERT_SUCCESS(reference.Add(value));
+      }
       ASSIGN_OR_ASSERT_FAIL(Value, expected, reference.TryFinish());
       if (expected.type == ValueType::kDouble &&
           std::isnan(expected.value.double_value)) {
@@ -118,8 +149,7 @@ TEST_F(RelationalRegressionTest, PackedProbeCountGroupsKeepSignedKeysAndNulls) {
                 .GetStatus());
       }
       ASSERT_SUCCESS(
-          fact->Insert(setup.txn_, Row({Value(1), Value(3)}))
-              .GetStatus());
+          fact->Insert(setup.txn_, Row({Value(1), Value(3)})).GetStatus());
       ASSERT_SUCCESS(setup.PreCommit());
     }
     const auto deadline =
@@ -268,7 +298,8 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
     deferred_left.schema = left.schema;
     for (int mode : {0, 1, 2}) {
       const bool direct_scan = mode != 0;
-      // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+      // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type
+      // is non-copyable by design
       struct RestoreColumnarLimit {
         size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
         ~RestoreColumnarLimit() {
@@ -277,7 +308,7 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
       } restore;
       if (mode == 1) {
         ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(1);
-}
+      }
       ASSIGN_OR_ASSERT_FAIL(
           std::optional<Relation>, output,
           TryFusedGroupedJoin(
@@ -301,12 +332,15 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
       }));
       ASSERT_EQ(actual.size(), direct_scan ? 888U : 962U);
       for (int64_t i = 0; i < 1024; ++i) {
-        if (i % 17 == 0 || i == 42 || (direct_scan && i % 13 == 0)) { continue;
-}
+        if (i % 17 == 0 || i == 42 || (direct_scan && i % 13 == 0)) {
+          continue;
+        }
         EXPECT_EQ(
-            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
+            // is unambiguous
             actual.at((i + probe_begin) * 4 + key_bias),
-            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
+            // is unambiguous
             Row({Value((i + probe_begin) * 4 + key_bias),
                  Value((i + probe_begin) % 7),
                  nullable && i % 11 == 0 ? Value()
@@ -333,7 +367,8 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
       size_t rows = 0;
       ASSERT_SUCCESS(output->ForEachRow([&](const Row& row) {
         ++rows;
-        // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+        // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
+        // unambiguous
         const int64_t i = (row[0].value.int_value - key_bias) / 4 - probe_begin;
         EXPECT_EQ(row[2], Value(i == 1 ? 50.0 : 25.0));
       }));
@@ -356,10 +391,11 @@ TEST_F(RelationalRegressionTest,
                           ctx.GetTable("MembershipProbe"));
     for (int64_t k = 0; k < 33; ++k) {
       ASSERT_SUCCESS(
-          // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+          // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
+          // unambiguous
           probe->Insert(ctx.txn_, Row({Value(k * 1800000 - 28800000)}))
               .GetStatus());
-}
+    }
     for (size_t nullable = 0; nullable < 2; ++nullable) {
       ASSIGN_OR_ASSERT_FAIL(
           std::shared_ptr<Table>, build,
@@ -370,17 +406,19 @@ TEST_F(RelationalRegressionTest,
           const bool is_null = (nullable != 0U) && k % 7 == 0;
           ASSERT_SUCCESS(
               build
-                  ->Insert(ctx.txn_,
-                           // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
-                           Row({Value(k * 1800000 - 28800000),
-                                is_null ? Value() : Value(a), Value(0)}))
+                  ->Insert(
+                      ctx.txn_,
+                      // NOLINTNEXTLINE(readability-math-missing-parentheses)
+                      // precedence is unambiguous
+                      Row({Value(k * 1800000 - 28800000),
+                           is_null ? Value() : Value(a), Value(0)}))
                   .GetStatus());
           if (!is_null) {
             const std::array<bool, 6> passed = {a == 0, a != 0, a < 0,
                                                 a <= 0, a > 0,  a >= 0};
             for (size_t op = 0; op < 6; ++op) {
               matches[nullable][op][k] |= passed[op];
-}
+            }
           }
         }
       }
@@ -390,7 +428,7 @@ TEST_F(RelationalRegressionTest,
   for (const auto* name :
        {"MembershipProbe", "MembershipFlat", "MembershipNullable"}) {
     RelationalRun(*rs_, std::string("ANALYZE ") + name);
-}
+  }
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (rs_->TransactionStats().version_chains != 0) {
@@ -405,8 +443,9 @@ TEST_F(RelationalRegressionTest,
     for (size_t nullable = 0; nullable < 2; ++nullable) {
       for (size_t op = 0; op < operators.size(); ++op) {
         int64_t expected = 0;
-        for (bool found : matches[nullable][op]) { expected += static_cast<int64_t>(found);
-}
+        for (bool found : matches[nullable][op]) {
+          expected += static_cast<int64_t>(found);
+        }
         const std::string table =
             (nullable != 0U) ? "MembershipNullable" : "MembershipFlat";
         const std::string body = "EXISTS (SELECT 1 FROM " + table +
@@ -450,8 +489,9 @@ TEST_F(RelationalRegressionTest,
                  i == 9 ? Value() : Value(base + i), Value(i % 2),
                  Value(std::string(1024, 'p'))});
         right_rows.push_back(row);
-        if (duplicate && i == 3) { right_rows.push_back(row);
-}
+        if (duplicate && i == 3) {
+          right_rows.push_back(row);
+        }
       }
       for (int64_t i = 0; i < 41; ++i) {
         const int64_t key = i % 20;
@@ -472,9 +512,10 @@ TEST_F(RelationalRegressionTest,
             for (size_t begin = 0; begin < rows.size(); begin += 7) {
               ColumnarChunk chunk;
               chunk.InitFromSchema(schema, 7);
-              for (size_t i = begin; i < std::min(begin + 7, rows.size()); ++i) {
+              for (size_t i = begin; i < std::min(begin + 7, rows.size());
+                   ++i) {
                 chunk.AppendRow(rows[i]);
-}
+              }
               table->AppendChunk(std::move(chunk));
             }
             return table;
@@ -553,7 +594,7 @@ TEST_F(RelationalRegressionTest,
                      (l[2].IsNull() || r[2].IsNull() ||
                       l[2].value.int_value != r[2].value.int_value + 1))) {
                   continue;
-}
+                }
                 matched = true;
                 expected[(right_group ? r[3] : l[3]).value.int_value] +=
                     l[4].value.double_value;
@@ -561,7 +602,7 @@ TEST_F(RelationalRegressionTest,
               if (!matched && kind == JoinType::kLeft) {
                 expected[right_group ? -1 : l[3].value.int_value] +=
                     l[4].value.double_value;
-}
+              }
             }
             ASSERT_SUCCESS(result->ForEachRow([&](const Row& row) {
               EXPECT_TRUE(
@@ -612,10 +653,13 @@ TEST_F(RelationalRegressionTest, GroupedJoinUsesProjectedFactStore) {
     }
     for (int64_t i = 0; i < 33000; ++i) {
       ASSERT_SUCCESS(
-          fact->Insert(ctx.txn_, Row({i % 37 == 0 ? Value() : Value(i % 31),
-                                      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
-                                      i % 19 == 0 ? Value() : Value(i % 7 - 2),
-                                      Value(std::string(64, 'x'))}))
+          fact->Insert(
+                  ctx.txn_,
+                  Row({i % 37 == 0 ? Value() : Value(i % 31),
+                       // NOLINTNEXTLINE(readability-math-missing-parentheses)
+                       // precedence is unambiguous
+                       i % 19 == 0 ? Value() : Value(i % 7 - 2),
+                       Value(std::string(64, 'x'))}))
               .GetStatus());
     }
     ASSERT_SUCCESS(ctx.PreCommit());
@@ -706,8 +750,9 @@ TEST_F(RelationalRegressionTest, ColumnarCorrelatedFilterRetainsPayloads) {
       Row row({key == 0 ? Value() : Value(key),
                Value(std::string(256, static_cast<char>('a' + (i * 2) + j)))});
       chunk.AppendRow(row);
-      if (key == 2 || key == 4) { expected.push_back(row);
-}
+      if (key == 2 || key == 4) {
+        expected.push_back(row);
+      }
     }
     columns->AppendChunk(std::move(chunk));
   }
@@ -761,12 +806,15 @@ TEST_F(RelationalRegressionTest, CorrelationDomainReadsGatheredKeyOnly) {
     const auto filter = CorrelationDomainFilter(source, 1, ColumnName("o", "k"),
                                                 {1, 0}, runtime);
     ASSERT_TRUE(filter.has_value());
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+    // success
     EXPECT_EQ(filter->column, 0);
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+    // success
     EXPECT_EQ(filter->type, type);
     for (int64_t k = -10; k <= 10; ++k) {
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+      // success
       EXPECT_EQ(!filter->group->Reject(k), k == -3 || k == 2);
     }
     // A new domain must not retain keys from the previous gathered image.
@@ -775,9 +823,11 @@ TEST_F(RelationalRegressionTest, CorrelationDomainReadsGatheredKeyOnly) {
     const auto replacement = CorrelationDomainFilter(
         source, 1, ColumnName("o", "k"), {1, 0}, runtime);
     ASSERT_TRUE(replacement.has_value());
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+    // success
     EXPECT_FALSE(replacement->group->Reject(7));
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
+    // success
     EXPECT_TRUE(replacement->group->Reject(2));
   }
 }
@@ -947,7 +997,7 @@ TEST_F(RelationalRegressionTest, ScalarFloatingFiltersKeepAllComparisons) {
         v = -std::numeric_limits<double>::infinity();
       } else if (i % 107 == 0) {
         v = -0.0;
-}
+      }
       rows.emplace_back(std::vector<Value>{
           Value(i % 17), i % 13 == 0 ? Value() : Value(v), Value(v)});
       ASSERT_SUCCESS(table->Insert(ctx.txn_, rows.back()).GetStatus());
@@ -966,10 +1016,12 @@ TEST_F(RelationalRegressionTest, ScalarFloatingFiltersKeepAllComparisons) {
         int64_t count = 0, sum = 0;
         for (const auto& row : rows) {
           const int64_t k = row[0].value.int_value;
-          if (selected && (k < 3 || k > 9)) { continue;
-}
-          if (row[column].IsNull()) { continue;
-}
+          if (selected && (k < 3 || k > 9)) {
+            continue;
+          }
+          if (row[column].IsNull()) {
+            continue;
+          }
           const double v = row[column].value.double_value;
           const bool hit = op == "="    ? v == 0.0
                            : op == "<>" ? v != 0.0
@@ -999,8 +1051,9 @@ TEST_F(RelationalRegressionTest, ScalarFloatingFiltersKeepAllComparisons) {
       double product = 0;
       for (const auto& row : rows) {
         const int64_t k = row[0].value.int_value;
-        if (k < 3 || k > 9 || row[column].IsNull()) { continue;
-}
+        if (k < 3 || k > 9 || row[column].IsNull()) {
+          continue;
+        }
         const double value = row[column].value.double_value;
         if (value >= lo && value <= hi) {
           ++count;
@@ -1013,11 +1066,13 @@ TEST_F(RelationalRegressionTest, ScalarFloatingFiltersKeepAllComparisons) {
         const std::string lower = name + ">=" + std::to_string(lo);
         const std::string upper = name + "<=" + std::to_string(hi);
         const std::string sql =
-            // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
+            // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
+            // short fixed concatenations
             "SELECT SUM(k*k+1),COUNT(*),SUM(" + name + "*" + name +
             ") FROM FloatSelection WHERE k BETWEEN 3 "
             "AND 9 AND " +
-            // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
+            // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
+            // short fixed concatenations
             (reversed ? upper + " AND " + lower : lower + " AND " + upper);
         EXPECT_EQ(
             RelationalRun(*rs_, sql),
@@ -1052,7 +1107,7 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
         v = Value(std::numeric_limits<double>::infinity());
       } else if (i % 103 == 0) {
         v = Value(-std::numeric_limits<double>::infinity());
-}
+      }
       input.emplace_back(
           std::vector<Value>{keys[i % keys.size()], Value(i % 5), v});
       ASSERT_SUCCESS(table->Insert(ctx.txn_, input.back()).GetStatus());
@@ -1082,11 +1137,14 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
           row[0].value.int_value > hi || row[1].value.int_value < 1 ||
           row[1].value.int_value > 3 || row[2].IsNull()) {
         continue;
-}
+      }
       const double v = row[2].value.double_value;
       // SQL comparisons with NaN are false, so NaN fails both BETWEENs; the
       // negated form `(v < 0 || v > 1) && ...` would wrongly admit it.
-      if (!((v >= 0 && v <= 1) || (v >= 4 && v <= 6))) {  // NOLINT(readability-simplify-boolean-expr): NaN must fail both ranges
+      if (!((v >= 0 && v <= 1) ||
+            (v >= 4 &&
+             v <= 6))) {  // NOLINT(readability-simplify-boolean-expr):
+                          // NaN must fail both ranges
         continue;
       }
       ++count;
@@ -1098,7 +1156,8 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
         "k BETWEEN " +
         std::to_string(lo) + " AND " + std::to_string(hi) +
         " AND j BETWEEN 1 AND 3 AND (v BETWEEN 0 AND 1 OR v BETWEEN 4 AND 6)";
-    const Row expected({(count != 0) ? Value(sum / count) : Value(), Value(count),
+    const Row expected({(count != 0) ? Value(sum / count) : Value(),
+                        Value(count),
                         Value(static_cast<int64_t>(distinct.size()))});
     EXPECT_EQ(RelationalRun(*rs_, branch), std::vector<Row>({expected}));
     std::string reversed = branch;
@@ -1106,7 +1165,8 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
     ASSERT_NE(pos, std::string::npos);
     reversed.replace(pos, std::string("v BETWEEN 0 AND 1").size(),
                      "(v <= 1 AND v >= 0)");
-    // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
+    // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed
+    // concatenations
     EXPECT_EQ(RelationalRun(*rs_, branch + " UNION ALL " + reversed),
               std::vector<Row>({expected, expected}));
   }
@@ -1124,10 +1184,12 @@ TEST_F(RelationalRegressionTest,
       std::vector<int64_t>{-2, 0, 4, 9}));
   secondary_parts.push_back(std::make_unique<MinMaxRuntimeFilter>(-2, 4, 3));
   for (int64_t i = 1000; i < 17000; ++i) {
-    if (i % 17 != 0) { primary_builder.Observe(i);
-}
-    if (i % 257 == 0) { sparse_builder.Observe(i);
-}
+    if (i % 17 != 0) {
+      primary_builder.Observe(i);
+    }
+    if (i % 257 == 0) {
+      sparse_builder.Observe(i);
+    }
   }
   const auto primary = primary_builder.Build();
   const auto sparse = sparse_builder.Build();
@@ -1190,17 +1252,22 @@ TEST_F(RelationalRegressionTest,
         std::map<int64_t, Row> expected, actual;
         for (const Row& row : input) {
           const int64_t id = row[0].value.int_value;
-          if (row[1].IsNull()) { continue;
-}
+          if (row[1].IsNull()) {
+            continue;
+          }
           const int64_t k = row[1].value.int_value;
-          if (k != -2 && k != 0 && k != 4) { continue;
-}
-          if (with_primary && (id < 1000 || id >= 17000)) { continue;
-}
-          if (primary_mode == 1 && id % 17 == 0) { continue;
-}
-          if (primary_mode == 2 && id % 257 != 0) { continue;
-}
+          if (k != -2 && k != 0 && k != 4) {
+            continue;
+          }
+          if (with_primary && (id < 1000 || id >= 17000)) {
+            continue;
+          }
+          if (primary_mode == 1 && id % 17 == 0) {
+            continue;
+          }
+          if (primary_mode == 2 && id % 257 != 0) {
+            continue;
+          }
           expected.emplace(id, row);
         }
         ASSERT_SUCCESS(result.ForEachRow([&](const Row& row) {
@@ -1226,11 +1293,12 @@ TEST_F(RelationalRegressionTest, IndexedRuntimeFilterKeepsRunsAndResiduals) {
     rows.reserve(9000);
     RuntimeFilterBuilder builder;
     for (int64_t group = 0; group < 1300; ++group) {
-      if (group % 31 == 0) { builder.Observe(base + (group * 4));
-}
+      if (group % 31 == 0) {
+        builder.Observe(base + (group * 4));
+      }
       if (group % 29 == 0) {
         builder.Observe(base + (group * 4) + 1);  // absent keys
-}
+      }
     }
     const auto filter = builder.Build();
     {
@@ -1274,7 +1342,8 @@ TEST_F(RelationalRegressionTest, IndexedRuntimeFilterKeepsRunsAndResiduals) {
     ASSERT_TRUE(secondary.runtime_filter->has_dense_bits());
     predicates.prebuilt_membership.push_back(secondary);
     for (bool allow_index : {false, true}) {
-      // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+      // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type
+      // is non-copyable by design
       struct RestoreLimit {
         size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
         ~RestoreLimit() {
@@ -1283,7 +1352,7 @@ TEST_F(RelationalRegressionTest, IndexedRuntimeFilterKeepsRunsAndResiduals) {
       } restore;
       if (!allow_index) {
         ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(1);
-}
+      }
       for (size_t workers : {size_t{1}, size_t{3}}) {
         std::atomic<size_t> active{0};
         ScopedQueryParallelismBudget budget(&active, workers);
@@ -1312,7 +1381,7 @@ TEST_F(RelationalRegressionTest, IndexedRuntimeFilterKeepsRunsAndResiduals) {
                   row[1].value.int_value == 3 && row[3].value.int_value >= 3 &&
                   row[3].value.int_value <= 7) {
                 expected.emplace(id, row);
-}
+              }
             }
             ASSERT_SUCCESS(result.ForEachRow([&](const Row& row) {
               EXPECT_TRUE(actual.emplace(row[2].value.int_value, row).second);
@@ -1344,7 +1413,7 @@ TEST_F(RelationalRegressionTest, RangePrefilterKeepsResidualsNullsAndBounds) {
         key = Value(std::numeric_limits<int64_t>::max());
       } else if (i % 23 == 0) {
         key = Value();
-}
+      }
       input.emplace_back(std::vector<Value>{
           key,
           i == 112 ? Value(std::numeric_limits<int64_t>::max())
@@ -1386,13 +1455,14 @@ TEST_F(RelationalRegressionTest, RangePrefilterKeepsResidualsNullsAndBounds) {
         schema);
     std::map<int64_t, Row> expected;
     for (const Row& row : input) {
-      if (row[0].IsNull() || row[1].IsNull()) { continue;
-}
+      if (row[0].IsNull() || row[1].IsNull()) {
+        continue;
+      }
       const int64_t k = row[0].value.int_value;
       if (k >= lo && k <= hi && k <= row[1].value.int_value &&
           row[2] == Value("A")) {
         expected.emplace(row[3].value.int_value, row);
-}
+      }
     }
     for (size_t workers : {size_t{1}, size_t{3}}) {
       std::atomic<size_t> active{0};
@@ -1806,6 +1876,24 @@ TEST_F(RelationalRegressionTest,
   EXPECT_NE(profile.find("streamed_grouped_joins=1"), std::string::npos)
       << profile;
   EXPECT_NE(profile.find("relation_spills=0"), std::string::npos) << profile;
+  const std::string no_groups =
+      "SELECT d.g AS g, COUNT(*) AS n FROM StreamDim d "
+      "JOIN StreamFact f ON f.k=d.k WHERE d.g<0 GROUP BY d.g";
+  const auto empty_profile = ExplainAnalyze(*rs_, no_groups);
+  EXPECT_NE(empty_profile.find("streamed_grouped_joins=1"), std::string::npos)
+      << empty_profile;
+  EXPECT_TRUE(RelationalRun(*rs_, no_groups).empty());
+  RelationalRun(*rs_, "CREATE TABLE StreamEmpty AS " + no_groups);
+  {
+    auto catalog = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, empty,
+                          catalog.GetTable("StreamEmpty"));
+    const auto& schema = empty->GetSchema();
+    ASSERT_EQ(schema.ColumnCount(), 2U);
+    EXPECT_EQ(schema.GetColumn(0).Type(), ValueType::kInt64);
+    EXPECT_EQ(schema.GetColumn(1).Type(), ValueType::kInt64);
+    ASSERT_SUCCESS(catalog.PreCommit());
+  }
   auto old = rs_->BeginReadOnlyContext();
   SqlEngine engine(*rs_);
   const auto read_old = [&] {
@@ -4171,6 +4259,619 @@ TEST_F(RelationalRegressionTest,
     EXPECT_EQ(sum_overflow.GetStatus(), Status::kIsInfinity);
   }
   context.Abort();
+}
+
+TEST_F(RelationalRegressionTest, ParallelScanPushesNullCoalesce) {
+  RelationalRun(*rs_, "CREATE TABLE CoalesceScan(a STRING, b STRING)");
+  {
+    auto ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          ctx.GetTable("CoalesceScan"));
+    for (int i = 0; i < 9000; ++i) {
+      ASSERT_TRUE(
+          table
+              ->Insert(ctx.txn_, Row({i % 2 ? Value() : Value("first"),
+                                      i % 3 ? Value("second") : Value()}))
+              .HasValue());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  auto ctx = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable("CoalesceScan"));
+  relational_detail::PushedScanProjection projection{
+      .expressions = {FunctionCallExp(
+          "coalesce", {ColumnValueExp("a"), ColumnValueExp("b")})},
+      .output_schema = Schema("out", {Column("v", ValueType::kVarChar)})};
+  relational_detail::Relation result;
+  Status error = Status::kSuccess;
+  bool applied = false;
+  ASSERT_TRUE(relational_detail::TryParallelTableScan(
+      ctx, *table, nullptr, nullptr, ValueType::kNull, std::nullopt, false,
+      nullptr, table->GetSchema(), nullptr, {}, &result, &error, nullptr, true,
+      &projection, &applied));
+  ASSERT_SUCCESS(error);
+  ASSERT_TRUE(applied);
+  size_t first = 0, second = 0, nulls = 0;
+  ASSERT_SUCCESS(result.ForEachRow([&](const Row& row) {
+    if (row[0].IsNull())
+      ++nulls;
+    else if (row[0] == Value("first"))
+      ++first;
+    else if (row[0] == Value("second"))
+      ++second;
+    else
+      ADD_FAILURE() << "unexpected value";
+  }));
+  EXPECT_EQ(first, 4500U);
+  EXPECT_EQ(second, 3000U);
+  EXPECT_EQ(nulls, 1500U);
+  ctx.Abort();
+}
+
+TEST_F(RelationalRegressionTest, SelfSumHavingKeepsIntegerPrecision) {
+  RelationalRun(*rs_, "CREATE TABLE HavingPrecision(k INT64, v INT64)");
+  RelationalRun(
+      *rs_, "INSERT INTO HavingPrecision VALUES (1,9007199254740993),(2,-1)");
+  const auto rows = RelationalRun(*rs_,
+                                  "SELECT a.k, SUM(f.v) FROM HavingPrecision f "
+                                  "JOIN KeyTable a ON f.k = a.k "
+                                  "GROUP BY a.k HAVING SUM(f.v) > "
+                                  "(SELECT SUM(f.v) * 1 FROM HavingPrecision f "
+                                  "JOIN KeyTable a ON f.k = a.k)",
+                                  true);
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(int64_t{9007199254740993LL})}));
+}
+
+TEST_F(RelationalRegressionTest,
+       StreamingProbePairBitsDenseRemapAndBloomFallback) {
+  RelationalRun(*rs_, "CREATE TABLE Sb1(a INT64, b INT64, v INT64)");
+  RelationalRun(*rs_, "CREATE TABLE Sf1(k1 INT64, k2 INT64, p INT64)");
+  struct BRow {
+    std::optional<int64_t> a;
+    std::optional<int64_t> b;
+    int64_t v;
+  };
+  std::vector<BRow> b1_rows;
+  {
+    std::string sql = "INSERT INTO Sb1 VALUES ";
+    for (int64_t i = 0; i <= 210; ++i) {
+      if (i > 0) {
+        sql += ",";
+      }
+      const int64_t a = i * 500;
+      const int64_t b = (i * 2) % 401;
+      const int64_t v = i + 1;
+      b1_rows.push_back({a, b, v});
+      sql += "(" + std::to_string(a) + "," + std::to_string(b) + "," +
+             std::to_string(v) + ")";
+    }
+    b1_rows.push_back({int64_t{0}, int64_t{0}, int64_t{1000}});
+    b1_rows.push_back({std::nullopt, int64_t{0}, int64_t{500}});
+    b1_rows.push_back({int64_t{0}, std::nullopt, int64_t{500}});
+    sql += ",(0,0,1000),(NULL,0,500),(0,NULL,500)";
+    RelationalRun(*rs_, sql);
+  }
+  std::map<std::pair<int64_t, int64_t>, std::vector<int64_t>> b1_map;
+  for (const auto& br : b1_rows) {
+    if (br.a.has_value() && br.b.has_value()) {
+      b1_map[{*br.a, *br.b}].push_back(br.v);
+    }
+  }
+  int64_t exp_cnt1 = 0;
+  int64_t exp_sum1 = 0;
+  {
+    std::string sql = "INSERT INTO Sf1 VALUES ";
+    for (int64_t j = 0; j < 4000; ++j) {
+      if (j > 0) {
+        sql += ",";
+      }
+      if (j % 17 == 0) {
+        sql += "(NULL,0," + std::to_string(j) + ")";
+      } else if (j % 19 == 0) {
+        sql += "(500,NULL," + std::to_string(j) + ")";
+      } else if (j % 13 == 0) {
+        sql += "(100,0," + std::to_string(j) + ")";
+      } else {
+        const int64_t k1 = (j % 211) * 500;
+        const int64_t k2 = (j % 211 == 0 && j % 3 == 0) ? 999 : ((j * 2) % 401);
+        const int64_t p = j;
+        sql += "(" + std::to_string(k1) + "," + std::to_string(k2) + "," +
+               std::to_string(p) + ")";
+        if (auto it = b1_map.find({k1, k2}); it != b1_map.end()) {
+          for (int64_t v : it->second) {
+            ++exp_cnt1;
+            exp_sum1 += v + p;
+          }
+        }
+      }
+    }
+    RelationalRun(*rs_, sql);
+  }
+  for (bool force_rel : {false, true}) {
+    const auto out =
+        RelationalRun(*rs_,
+                      "SELECT COUNT(*), COALESCE(SUM(b.v + f.p), 0) "
+                      "FROM Sb1 b JOIN Sf1 f ON b.a = f.k1 AND b.b = f.k2",
+                      force_rel);
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(out[0][0], Value(exp_cnt1));
+    EXPECT_EQ(out[0][1], Value(exp_sum1));
+  }
+
+  // Fallback packed_bloom case: d_outer = 31, d_inner = 3,500,001 -> product >
+  // 64M.
+  RelationalRun(*rs_, "CREATE TABLE Sb2(a INT64, b INT64, v INT64)");
+  RelationalRun(*rs_, "CREATE TABLE Sf2(k1 INT64, k2 INT64, p INT64)");
+  std::map<std::pair<int64_t, int64_t>, std::vector<int64_t>> b2_map;
+  {
+    std::string sql = "INSERT INTO Sb2 VALUES ";
+    for (int64_t i = 0; i <= 30; ++i) {
+      if (i > 0) {
+        sql += ",";
+      }
+      const int64_t b = (i % 2 == 0) ? 0 : 3500000;
+      const int64_t v = i + 1;
+      b2_map[{i, b}].push_back(v);
+      sql += "(" + std::to_string(i) + "," + std::to_string(b) + "," +
+             std::to_string(v) + ")";
+    }
+    b2_map[{0, 0}].push_back(100);
+    sql += ",(0,0,100),(NULL,0,999),(1,NULL,999)";
+    RelationalRun(*rs_, sql);
+  }
+  int64_t exp_cnt2 = 0;
+  int64_t exp_sum2 = 0;
+  {
+    std::string sql = "INSERT INTO Sf2 VALUES ";
+    for (int64_t j = 0; j < 400; ++j) {
+      if (j > 0) {
+        sql += ",";
+      }
+      if (j % 11 == 0) {
+        sql += "(NULL,0," + std::to_string(j) + ")";
+      } else {
+        const int64_t k1 = j % 35;
+        const int64_t k2 = (j % 3 == 0) ? 0 : ((j % 3 == 1) ? 3500000 : 12345);
+        sql += "(" + std::to_string(k1) + "," + std::to_string(k2) + "," +
+               std::to_string(j) + ")";
+        if (auto it = b2_map.find({k1, k2}); it != b2_map.end()) {
+          for (int64_t v : it->second) {
+            ++exp_cnt2;
+            exp_sum2 += v + j;
+          }
+        }
+      }
+    }
+    RelationalRun(*rs_, sql);
+  }
+  for (bool force_rel : {false, true}) {
+    const auto out =
+        RelationalRun(*rs_,
+                      "SELECT COUNT(*), COALESCE(SUM(b.v + f.p), 0) "
+                      "FROM Sb2 b JOIN Sf2 f ON b.a = f.k1 AND b.b = f.k2",
+                      force_rel);
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(out[0][0], Value(exp_cnt2));
+    EXPECT_EQ(out[0][1], Value(exp_sum2));
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       ExactIntegerTotalParallelFlatNullableAndOverflowFallback) {
+  RelationalRun(*rs_, "CREATE TABLE ExSeq(x INT64)");
+  {
+    std::string sql = "INSERT INTO ExSeq VALUES ";
+    for (int64_t x = 0; x < 300; ++x) {
+      if (x > 0) {
+        sql += ",";
+      }
+      sql += "(" + std::to_string(x) + ")";
+    }
+    RelationalRun(*rs_, sql);
+  }
+  RelationalRun(*rs_, "CREATE TABLE ExDim(k INT64)");
+  RelationalRun(*rs_, "INSERT INTO ExDim VALUES (1),(2)");
+  RelationalRun(*rs_, "CREATE TABLE ExFact(k INT64, v INT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO ExFact "
+                "SELECT MOD(a.x, 2) + 1, "
+                "CASE WHEN MOD(a.x + b.x, 7) = 0 THEN NULL "
+                "ELSE (a.x - 150) * 10 + MOD(b.x, 10) END "
+                "FROM ExSeq a, ExSeq b");
+
+  std::array<int64_t, 3> exp_sum{};
+  for (int64_t ax = 0; ax < 300; ++ax) {
+    for (int64_t bx = 0; bx < 300; ++bx) {
+      if ((ax + bx) % 7 == 0) {
+        continue;
+      }
+      exp_sum[(ax % 2) + 1] += (ax - 150) * 10 + (bx % 10);
+    }
+  }
+  for (bool force_rel : {false, true}) {
+    const auto rows = RelationalRun(
+        *rs_,
+        "SELECT d.k, SUM(f.v) FROM ExFact f JOIN ExDim d ON f.k = d.k "
+        "GROUP BY d.k ORDER BY d.k",
+        force_rel);
+    ASSERT_EQ(rows.size(), 2U);
+    EXPECT_EQ(rows[0], Row({Value(int64_t{1}), Value(exp_sum[1])}));
+    EXPECT_EQ(rows[1], Row({Value(int64_t{2}), Value(exp_sum[2])}));
+  }
+
+  // Trigger magnitude > kExactLimit / pairs fallback with INT64_MIN boundary +
+  // large cancelling values while keeping true SUM exact in int64_t.
+  RelationalRun(
+      *rs_,
+      "INSERT INTO ExFact VALUES "
+      "(1, 100000000000000),(1, -100000000000000),"
+      "(2, -9223372036854775807 - 1),(2, 9223372036854775807),(2, 1)");
+  for (bool force_rel : {false, true}) {
+    const auto rows = RelationalRun(
+        *rs_,
+        "SELECT d.k, SUM(f.v) FROM ExFact f JOIN ExDim d ON f.k = d.k "
+        "GROUP BY d.k ORDER BY d.k",
+        force_rel);
+    ASSERT_EQ(rows.size(), 2U);
+    EXPECT_EQ(rows[0], Row({Value(int64_t{1}), Value(exp_sum[1])}));
+    EXPECT_EQ(rows[1], Row({Value(int64_t{2}), Value(exp_sum[2])}));
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       LeftPackGatheredDictAndScaledStddevDirectEmit) {
+  RelationalRun(*rs_, "CREATE TABLE LpWh(w_sk INT64, w_name STRING)");
+  RelationalRun(*rs_,
+                "INSERT INTO LpWh VALUES "
+                "(1,'alpha'),(2,'beta'),(3,NULL),(4,'gamma'),(99,'unused_wh')");
+  RelationalRun(*rs_, "CREATE TABLE LpDd(d_sk INT64, d_moy INT64)");
+  RelationalRun(*rs_, "INSERT INTO LpDd VALUES (1,10),(2,20),(3,30)");
+  RelationalRun(*rs_, "CREATE TABLE LpTopDim(d_moy INT64)");
+  RelationalRun(*rs_, "INSERT INTO LpTopDim VALUES (10),(20),(30)");
+  RelationalRun(*rs_, "CREATE TABLE LpS100(x INT64)");
+  {
+    std::string sql = "INSERT INTO LpS100 VALUES ";
+    for (int64_t x = 0; x < 100; ++x) {
+      if (x > 0) sql += ",";
+      sql += "(" + std::to_string(x) + ")";
+    }
+    RelationalRun(*rs_, sql);
+  }
+  RelationalRun(*rs_, "CREATE TABLE LpS90(y INT64)");
+  {
+    std::string sql = "INSERT INTO LpS90 VALUES ";
+    for (int64_t y = 0; y < 90; ++y) {
+      if (y > 0) sql += ",";
+      sql += "(" + std::to_string(y) + ")";
+    }
+    RelationalRun(*rs_, sql);
+  }
+  RelationalRun(*rs_,
+                "CREATE TABLE LpFact(w_sk INT64, d_sk INT64, qty DOUBLE)");
+  // w_sk = 5 triggers LEFT JOIN NULL padding; w_sk = 99 stays unused in LpWh.
+  RelationalRun(*rs_,
+                "INSERT INTO LpFact "
+                "SELECT MOD(x + y, 5) + 1, MOD(y, 3) + 1, "
+                "(CAST(MOD(x * 3 + y * 5, 17) AS DOUBLE) + 0.5) * "
+                "(1.0 + 0.2 * CAST(MOD(x + y, 5) + 1 AS DOUBLE) + "
+                "0.05 * CAST(MOD(y, 3) + 1 AS DOUBLE)) "
+                "FROM LpS100, LpS90");
+
+  struct Stat {
+    int64_t n{0};
+    double sx{0.0};
+    double sxx{0.0};
+  };
+  std::map<std::pair<std::optional<std::string>, int64_t>, Stat> stats;
+  for (int64_t x = 0; x < 100; ++x) {
+    for (int64_t y = 0; y < 90; ++y) {
+      const int64_t wsk = ((x + y) % 5) + 1;
+      const int64_t dsk = (y % 3) + 1;
+      std::optional<std::string> wn;
+      if (wsk == 1)
+        wn = "alpha";
+      else if (wsk == 2)
+        wn = "beta";
+      else if (wsk == 4)
+        wn = "gamma";
+      const int64_t dmoy = dsk * 10;
+      const double q = (static_cast<double>((x * 3 + y * 5) % 17) + 0.5) *
+                       (1.0 + 0.2 * static_cast<double>(wsk) +
+                        0.05 * static_cast<double>(dsk));
+      Stat& st = stats[{wn, dmoy}];
+      ++st.n;
+      st.sx += q;
+      st.sxx += q * q;
+    }
+  }
+  struct ExpRow {
+    std::optional<std::string> wn;
+    int64_t dmoy;
+    double sd;
+    double nv;
+  };
+  std::vector<ExpRow> expected;
+  for (const auto& [key, st] : stats) {
+    const double mean = st.sx / static_cast<double>(st.n);
+    const double var =
+        std::max(0.0, (st.sxx - static_cast<double>(st.n) * mean * mean) /
+                          static_cast<double>(st.n - 1));
+    expected.push_back(
+        {key.first, key.second, std::sqrt(var) * 1.000, var * -2.0});
+  }
+  std::ranges::sort(expected, [](const ExpRow& a, const ExpRow& b) {
+    if (a.nv != b.nv) return a.nv < b.nv;
+    if (a.wn.has_value() != b.wn.has_value()) return a.wn.has_value();
+    if (a.wn.has_value() && *a.wn != *b.wn) return *a.wn < *b.wn;
+    return a.dmoy < b.dmoy;
+  });
+  const std::vector<ExpRow> all_expected = expected;
+  expected.resize(6);
+
+  const std::string sql =
+      "SELECT j.w_name, t.d_moy, STDDEV_SAMP(j.qty) * 1.000 AS sd, "
+      "VAR_SAMP(j.qty) * -2.0 AS nv "
+      "FROM ("
+      "  SELECT w.w_name, d.d_moy, f.qty "
+      "  FROM LpFact f LEFT JOIN LpWh w ON f.w_sk = w.w_sk "
+      "  JOIN LpDd d ON f.d_sk = d.d_sk"
+      ") j "
+      "JOIN LpTopDim t ON j.d_moy = t.d_moy "
+      "GROUP BY j.w_name, t.d_moy "
+      "ORDER BY nv, j.w_name NULLS LAST, t.d_moy "
+      "LIMIT 6";
+  for (bool force_rel : {false, true}) {
+    const auto rows = RelationalRun(*rs_, sql, force_rel);
+    ASSERT_EQ(rows.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      if (expected[i].wn.has_value()) {
+        ASSERT_FALSE(rows[i][0].IsNull());
+        EXPECT_EQ(rows[i][0], Value(std::string(*expected[i].wn)));
+      } else {
+        EXPECT_TRUE(rows[i][0].IsNull());
+      }
+      EXPECT_EQ(rows[i][1], Value(expected[i].dmoy));
+      EXPECT_NEAR(rows[i][2].value.double_value, expected[i].sd, 1e-9);
+      EXPECT_NEAR(rows[i][3].value.double_value, expected[i].nv, 1e-9);
+    }
+  }
+
+  // Exercise left_pack_unpack_only + fast_col_emit (dict + packed int +
+  // kStddevSamp + kVarSamp) without LIMIT over all 12 groups.
+  const std::string unpack_sql =
+      "SELECT j.w_name, j.d_moy, STDDEV_SAMP(j.qty) * 1.000 AS sd, "
+      "VAR_SAMP(j.qty) * -2.0 AS nv "
+      "FROM ("
+      "  SELECT w.w_name, d.d_moy, f.qty "
+      "  FROM LpFact f LEFT JOIN LpWh w ON f.w_sk = w.w_sk "
+      "  JOIN LpDd d ON f.d_sk = d.d_sk"
+      ") j "
+      "JOIN LpTopDim t ON j.d_moy = t.d_moy "
+      "GROUP BY j.w_name, j.d_moy "
+      "ORDER BY nv, j.w_name NULLS LAST, j.d_moy";
+  for (bool force_rel : {false, true}) {
+    const auto rows = RelationalRun(*rs_, unpack_sql, force_rel);
+    ASSERT_EQ(rows.size(), all_expected.size());
+    for (size_t i = 0; i < all_expected.size(); ++i) {
+      if (all_expected[i].wn.has_value()) {
+        ASSERT_FALSE(rows[i][0].IsNull());
+        EXPECT_EQ(rows[i][0], Value(std::string(*all_expected[i].wn)));
+      } else {
+        EXPECT_TRUE(rows[i][0].IsNull());
+      }
+      EXPECT_EQ(rows[i][1], Value(all_expected[i].dmoy));
+      EXPECT_NEAR(rows[i][2].value.double_value, all_expected[i].sd, 1e-9);
+      EXPECT_NEAR(rows[i][3].value.double_value, all_expected[i].nv, 1e-9);
+    }
+  }
+
+  // Pin BytecodeProgram ORDER BY + LIMIT Top-N correctness (non-trivial combo
+  // expression must not be mis-sorted by key column 0 inside fast_topn).
+  std::vector<ExpRow> combo_expected = all_expected;
+  std::ranges::sort(combo_expected, [](const ExpRow& a, const ExpRow& b) {
+    const double ca = a.sd + a.nv;
+    const double cb = b.sd + b.nv;
+    if (ca != cb) return ca < cb;
+    if (a.wn.has_value() != b.wn.has_value()) return a.wn.has_value();
+    if (a.wn.has_value() && *a.wn != *b.wn) return *a.wn < *b.wn;
+    return a.dmoy < b.dmoy;
+  });
+  combo_expected.resize(6);
+  const std::string combo_sql =
+      "SELECT j.w_name, t.d_moy, "
+      "STDDEV_SAMP(j.qty) + VAR_SAMP(j.qty) * -2.0 AS combo "
+      "FROM ("
+      "  SELECT w.w_name, d.d_moy, f.qty "
+      "  FROM LpFact f LEFT JOIN LpWh w ON f.w_sk = w.w_sk "
+      "  JOIN LpDd d ON f.d_sk = d.d_sk"
+      ") j "
+      "JOIN LpTopDim t ON j.d_moy = t.d_moy "
+      "GROUP BY j.w_name, t.d_moy "
+      "ORDER BY combo, j.w_name NULLS LAST, t.d_moy "
+      "LIMIT 6";
+  for (bool force_rel : {false, true}) {
+    const auto rows = RelationalRun(*rs_, combo_sql, force_rel);
+    ASSERT_EQ(rows.size(), combo_expected.size());
+    for (size_t i = 0; i < combo_expected.size(); ++i) {
+      if (combo_expected[i].wn.has_value()) {
+        ASSERT_FALSE(rows[i][0].IsNull());
+        EXPECT_EQ(rows[i][0], Value(std::string(*combo_expected[i].wn)));
+      } else {
+        EXPECT_TRUE(rows[i][0].IsNull());
+      }
+      EXPECT_EQ(rows[i][1], Value(combo_expected[i].dmoy));
+      EXPECT_NEAR(rows[i][2].value.double_value,
+                  combo_expected[i].sd + combo_expected[i].nv, 1e-9);
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       Packed2x32RadixBlockFastPathNullAndLargeKeyFallback) {
+  RelationalRun(*rs_, "CREATE TABLE RxDim(k INT64)");
+  {
+    std::string sql = "INSERT INTO RxDim VALUES ";
+    for (int64_t k = 1; k <= 40; ++k) {
+      if (k > 1) sql += ",";
+      sql += "(" + std::to_string(k) + ")";
+    }
+    RelationalRun(*rs_, sql);
+  }
+  RelationalRun(*rs_, "CREATE TABLE Rx100(x INT64)");
+  {
+    std::string sql = "INSERT INTO Rx100 VALUES ";
+    for (int64_t x = 0; x < 100; ++x) {
+      if (x > 0) sql += ",";
+      sql += "(" + std::to_string(x) + ")";
+    }
+    RelationalRun(*rs_, sql);
+  }
+  RelationalRun(
+      *rs_, "CREATE TABLE RxFact(fk INT64, k0 INT64, k1 INT64, amt DOUBLE)");
+  RelationalRun(*rs_,
+                "INSERT INTO RxFact "
+                "SELECT MOD(a.x, 40) + 1, "
+                "CASE WHEN MOD(a.x * 100 + b.x, 500) = 0 THEN NULL "
+                "     WHEN MOD(a.x * 100 + b.x, 500) = 1 THEN 5000000000 "
+                "     ELSE MOD(a.x * 23 + b.x, 2500) END, "
+                "CASE WHEN MOD(a.x * 100 + b.x, 500) = 2 THEN NULL "
+                "     ELSE MOD(b.x * 7 + a.x, 200) END, "
+                "CASE WHEN MOD(a.x * 23 + b.x, 2500) = 2499 "
+                "       OR MOD(a.x * 100 + b.x, 500) = 3 THEN NULL "
+                "     ELSE CAST(MOD(a.x + b.x, 19) AS DOUBLE) + 0.25 END "
+                "FROM Rx100 a, Rx100 b");
+
+  using Key = std::pair<std::optional<int64_t>, std::optional<int64_t>>;
+  struct Acc {
+    bool has_val{false};
+    double sum{0.0};
+  };
+  std::map<Key, Acc> expected;
+  for (int64_t ax = 0; ax < 100; ++ax) {
+    for (int64_t bx = 0; bx < 100; ++bx) {
+      const int64_t idx = ax * 100 + bx;
+      std::optional<int64_t> k0;
+      if (idx % 500 == 1)
+        k0 = int64_t{5000000000LL};
+      else if (idx % 500 != 0)
+        k0 = (ax * 23 + bx) % 2500;
+      std::optional<int64_t> k1;
+      if (idx % 500 != 2) k1 = (bx * 7 + ax) % 200;
+      Acc& a = expected[{k0, k1}];
+      if ((ax * 23 + bx) % 2500 != 2499 && idx % 500 != 3) {
+        a.has_val = true;
+        a.sum += static_cast<double>((ax + bx) % 19) + 0.25;
+      }
+    }
+  }
+
+  const std::string sql =
+      "SELECT f.k0, f.k1, SUM(f.amt) "
+      "FROM RxFact f JOIN RxDim d ON f.fk = d.k "
+      "GROUP BY f.k0, f.k1 "
+      "ORDER BY f.k0 NULLS FIRST, f.k1 NULLS FIRST";
+  for (bool force_rel : {false, true}) {
+    const auto rows = RelationalRun(*rs_, sql, force_rel);
+    ASSERT_EQ(rows.size(), expected.size());
+    size_t ri = 0;
+    for (const auto& [k, acc] : expected) {
+      if (k.first.has_value()) {
+        EXPECT_EQ(rows[ri][0], Value(*k.first));
+      } else {
+        EXPECT_TRUE(rows[ri][0].IsNull());
+      }
+      if (k.second.has_value()) {
+        EXPECT_EQ(rows[ri][1], Value(*k.second));
+      } else {
+        EXPECT_TRUE(rows[ri][1].IsNull());
+      }
+      if (acc.has_val) {
+        ASSERT_FALSE(rows[ri][2].IsNull());
+        EXPECT_DOUBLE_EQ(rows[ri][2].value.double_value, acc.sum);
+      } else {
+        EXPECT_TRUE(rows[ri][2].IsNull());
+      }
+      ++ri;
+    }
+  }
+
+  // Exercise monotonic sorted join-key TLCS table with contiguous BETWEEN range
+  // filter (`mono_contiguous_rf` + boundary lower_bound/upper_bound).
+  RelationalRun(
+      *rs_,
+      "CREATE TABLE RxMonoFact(fk INT64, k0 INT64, k1 INT64, amt DOUBLE)");
+  RelationalRun(*rs_,
+                "INSERT INTO RxMonoFact "
+                "SELECT DIV(a.x, 3) + 1, "
+                "CASE WHEN MOD(a.x * 100 + b.x, 500) = 0 THEN NULL "
+                "     WHEN MOD(a.x * 100 + b.x, 500) = 1 THEN 5000000000 "
+                "     ELSE MOD(a.x * 23 + b.x, 2500) END, "
+                "CASE WHEN MOD(a.x * 100 + b.x, 500) = 2 THEN NULL "
+                "     ELSE MOD(b.x * 7 + a.x, 200) END, "
+                "CASE WHEN MOD(a.x * 23 + b.x, 2500) = 2499 "
+                "       OR MOD(a.x * 100 + b.x, 500) = 3 THEN NULL "
+                "     ELSE CAST(MOD(a.x + b.x, 19) AS DOUBLE) + 0.25 END "
+                "FROM Rx100 a, Rx100 b");
+  {
+    auto ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CompactTableToTlcs(ctx, "RxMonoFact"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+    RelationalRun(*rs_, "ANALYZE");
+  }
+  std::map<Key, Acc> mono_expected;
+  for (int64_t ax = 0; ax < 100; ++ax) {
+    const int64_t fk = (ax / 3) + 1;
+    if (fk < 10 || fk > 25) {
+      continue;
+    }
+    for (int64_t bx = 0; bx < 100; ++bx) {
+      const int64_t idx = ax * 100 + bx;
+      std::optional<int64_t> k0;
+      if (idx % 500 == 1)
+        k0 = int64_t{5000000000LL};
+      else if (idx % 500 != 0)
+        k0 = (ax * 23 + bx) % 2500;
+      std::optional<int64_t> k1;
+      if (idx % 500 != 2) k1 = (bx * 7 + ax) % 200;
+      Acc& a = mono_expected[{k0, k1}];
+      if ((ax * 23 + bx) % 2500 != 2499 && idx % 500 != 3) {
+        a.has_val = true;
+        a.sum += static_cast<double>((ax + bx) % 19) + 0.25;
+      }
+    }
+  }
+  const std::string mono_sql =
+      "SELECT f.k0, f.k1, SUM(f.amt) "
+      "FROM RxMonoFact f JOIN RxDim d ON f.fk = d.k "
+      "WHERE d.k BETWEEN 10 AND 25 "
+      "GROUP BY f.k0, f.k1 "
+      "ORDER BY f.k0 NULLS FIRST, f.k1 NULLS FIRST";
+  for (bool force_rel : {false, true}) {
+    const auto rows = RelationalRun(*rs_, mono_sql, force_rel);
+    ASSERT_EQ(rows.size(), mono_expected.size());
+    size_t ri = 0;
+    for (const auto& [k, acc] : mono_expected) {
+      if (k.first.has_value()) {
+        EXPECT_EQ(rows[ri][0], Value(*k.first));
+      } else {
+        EXPECT_TRUE(rows[ri][0].IsNull());
+      }
+      if (k.second.has_value()) {
+        EXPECT_EQ(rows[ri][1], Value(*k.second));
+      } else {
+        EXPECT_TRUE(rows[ri][1].IsNull());
+      }
+      if (acc.has_val) {
+        ASSERT_FALSE(rows[ri][2].IsNull());
+        EXPECT_DOUBLE_EQ(rows[ri][2].value.double_value, acc.sum);
+      } else {
+        EXPECT_TRUE(rows[ri][2].IsNull());
+      }
+      ++ri;
+    }
+  }
 }
 
 }  // namespace

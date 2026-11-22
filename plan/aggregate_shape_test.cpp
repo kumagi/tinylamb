@@ -1294,8 +1294,8 @@ TEST_F(AggregateShapeTest, EachShapeEmitsItsOwnStrategySettings) {
    public:
     Executor EmitExecutor(TransactionContext& /*ctx*/) const override {
       std::vector<Row> rows;
-      rows.reserve(kParallelAggregationMinRows);
-      for (int64_t i = 0; std::cmp_less(i, kParallelAggregationMinRows); ++i) {
+      rows.reserve(kManyRows);
+      for (int64_t i = 0; std::cmp_less(i, kManyRows); ++i) {
         rows.emplace_back(Row({Value(i), Value("row"), Value(1.0)}));
       }
       return std::make_shared<ConstantExecutor>(std::move(rows));
@@ -1567,7 +1567,9 @@ TEST_F(AggregateShapeTest, PlanDumpTruncatesDeepChildren) {
        pos = text.find("Limit: 10 offset 0", pos + 1)) {
     ++limit_lines;
   }
-  EXPECT_EQ(limit_lines, 256U)  // one per two indentation units up to kMaxPlanDumpDepth (512)
+  EXPECT_EQ(
+      limit_lines,
+      256U)  // one per two indentation units up to kMaxPlanDumpDepth (512)
       << "exactly the levels up to the cap render";
   EXPECT_EQ(text.find("Leaf"), std::string::npos) << "deep child truncated";
 

@@ -60,7 +60,8 @@ TEST(SpillFileTest, RowReaderRejectsMissingOutputsWithoutConsumingRow) {
   auto reader = opened.MoveValue();
   Row row;
   bool found = false;
-  EXPECT_EQ(reader.Next(nullptr, &found).GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(reader.Next(nullptr, &found).GetCode(),
+            StatusCode::kInvalidArgument);
   EXPECT_EQ(reader.Next(&row, nullptr).GetCode(), StatusCode::kInvalidArgument);
   ASSERT_EQ(reader.Next(&row, &found), Status::kSuccess);
   EXPECT_TRUE(found);
@@ -111,6 +112,22 @@ TEST(SpillFileTest, ForEachRowStopsAtCallbackFailure) {
     ++calls;
     return StatusError(StatusCode::kInvalidArgument, "callback error");
   });
+  EXPECT_EQ(status.GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(status.GetMessage(), "callback error");
+  EXPECT_EQ(calls, 1);
+}
+
+TEST(SpillFileTest, ForEachPositionedStopsAtCallbackFailure) {
+  SpillFile spill;
+  ASSERT_SUCCESS(spill.Append(Row({Value(7)}), RowPosition(0, 0)));
+  ASSERT_SUCCESS(spill.Append(Row({Value(8)}), RowPosition(0, 1)));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  int calls = 0;
+  const Status status =
+      spill.ForEachPositioned([&](const Row&, const RowPosition&) {
+        ++calls;
+        return StatusError(StatusCode::kInvalidArgument, "callback error");
+      });
   EXPECT_EQ(status.GetCode(), StatusCode::kInvalidArgument);
   EXPECT_EQ(status.GetMessage(), "callback error");
   EXPECT_EQ(calls, 1);

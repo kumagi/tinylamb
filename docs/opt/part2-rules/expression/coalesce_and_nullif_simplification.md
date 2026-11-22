@@ -53,14 +53,14 @@ graph TD
 - NULL 定数は結果に寄与しないためリストからスキップ（除去）。
 - 非 NULL 定数に到達した場合、短絡評価によりそれ以降の引数は決して評価されないため、以降の引数を完全に刈り込み（打ち切り）。
 - ネストした `coalesce` 引数は平坦化して展開。
-- 残余引数が空なら NULL 定数、1 個ならその式そのものへ縮退。
+- 残余引数が空なら NULL 定数、1 個ならその式そのものへ縮退。ただしゼロ引数の `COALESCE()` は arity エラーを維持するため変換せず、`fn.Args().empty()` のときは `Expression{}` を返します。
 
 ### 2. NULLIF の簡約条件
 引数数が 2 個の場合に限定され、以下の優先順位で判定します。
 
 1. **両辺定数**: `TryEvaluateBinary(kEquals, ...)` による即時評価。
 2. **同一引数 `Same(a, b)`**: 以下の guard をすべて満たす場合に限り NULL 定数へ畳み込み。
-   - `!StaticallyDouble(a)`（NaN 比較の例外性を回避）
+   - `StaticallyProvesNonDouble(a)`（`a` が非 double と静的に証明できた場合のみ許可。列参照など型が解決できない引数は fail-closed で拒否）
    - `ExpressionCannotThrow(a)`（例外消去を抑止）
    - `SafeToReduceEvaluationCount(a)`（揮発性関数の多重評価変動を抑止）
 3. **第 1 引数が NULL 定数**: 第 2 引数が定数ノードである場合に限り NULL 定数へ畳み込み（未評価式の例外消去抑止）。
@@ -69,7 +69,7 @@ graph TD
 ## 意味論的根拠と例外・IEEE 754 保護
 
 ### 1. 同一引数 NULLIF と IEEE 754 NaN
-命題論理では $a = a$ は常に真ですが、SQL および浮動小数点数規格（IEEE 754）において $\text{NaN} = \text{NaN}$ は `FALSE` と評価されます。したがって、$x$ が NaN の場合、$\text{NULLIF}(x, x)$ は NULL ではなく NaN 自身を返却しなければなりません。`StaticallyDouble(a)` が真となる場合、値が NaN となり得るため、同一引数であっても NULL 定数への縮退は拒絶されます。
+命題論理では $a = a$ は常に真ですが、SQL および浮動小数点数規格（IEEE 754）において $\text{NaN} = \text{NaN}$ は `FALSE` と評価されます。したがって、$x$ が NaN の場合、$\text{NULLIF}(x, x)$ は NULL ではなく NaN 自身を返却しなければなりません。現行のガードは `!StaticallyProvesNonDouble(a)` という fail-closed の判定です。すなわち「静的に非 double と証明できた」場合にだけ畳み込みを許可し、double と分かる場合だけでなく列参照など型が未解決な場合も拒絶します。旧来の `StaticallyDouble(a)` による fail-open 判定では型未解決の引数を誤って受け入れていましたが、現行実装はその穴を塞いでいます。
 
 ### 2. 未評価式の脱落に伴う例外消去の防止
 $\text{NULLIF}(\text{NULL}, b)$ において、結果は常に NULL ですが、第 2 引数 $b$ の評価を消去することは危険を伴います。ファジング検証において、$\text{NULLIF}(\text{NULL}, x \pmod 0)$ が 0 除算エラーを送出せずに NULL を返してしまう不具合が確認されたため、$b$ が非定数である場合の畳み込みは明示的に禁止されています。

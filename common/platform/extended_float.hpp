@@ -70,13 +70,19 @@ class SoftExtended {
     }
   }
 
+  // bool follows the C++ arithmetic conversion of the `long double` this
+  // class replaces: any non-zero value (including NaN/Inf and subnormals)
+  // is true, only signed zero is false. It is deliberately NOT a truncating
+  // integral conversion -- `static_cast<bool>(-0.5)` must be true.
+  explicit operator bool() const { return Sign() != 0; }
   explicit operator double() const { return ToDouble(); }
   explicit operator float() const { return static_cast<float>(ToDouble()); }
   // Truncates toward zero exactly, saturating finite overflow to the target
-  // integer range. Non-finite inputs map to zero.
+  // integer range. Non-finite inputs map to zero. bool is handled above by
+  // the dedicated conversion, not by this truncation rule.
   template <typename T>
   explicit operator T() const
-    requires(std::is_integral_v<T>)
+    requires(std::is_integral_v<T> && !std::is_same_v<T, bool>)
   {
     if (kind_ != Kind::kFinite || exponent_ <= -64) {
       return T{0};
@@ -87,9 +93,6 @@ class SoftExtended {
     }
     const uint64_t magnitude =
         exponent_ == 0 ? mantissa_ : mantissa_ >> (-exponent_);
-    if constexpr (std::is_same_v<T, bool>) {
-      return magnitude != 0;
-    }
     if (negative_) {
       if constexpr (std::is_signed_v<T>) {
         const uint64_t limit =

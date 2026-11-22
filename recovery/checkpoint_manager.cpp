@@ -40,10 +40,7 @@ namespace tinylamb {
 CheckpointManager::CheckpointManager(std::string_view path,
                                      TransactionManager* tm, PageManager* pm,
                                      size_t interval)
-    : master_record_path(path),
-      tm_(tm),
-      pm_(pm),
-      interval_seconds_(interval) {
+    : master_record_path(path), tm_(tm), pm_(pm), interval_seconds_(interval) {
   // Do NOT start the worker in the member-init list. SetCompactionCallback
   // copies a std::function and can throw bad_alloc; if the constructor body
   // throws after a joinable thread was started, ~thread calls terminate
@@ -60,10 +57,15 @@ CheckpointManager::CheckpointManager(std::string_view path,
 CheckpointManager::~CheckpointManager() { Stop(); }
 
 void CheckpointManager::Start() {
+  // Serialize the whole lifecycle transition with Stop(): callback
+  // registration and the worker (re)spawn must be observed as one step,
+  // otherwise the loser of a Start/Stop race can leave a stale callback or
+  // erase a freshly installed one.
+  std::scoped_lock lifecycle_guard(lifecycle_mu_);
   // T3687: Stop() joined the worker thread out of existence, so a plain
   // predicate flip could never resume processing.  Re-arm stop_, re-
   // register the compaction callback and spawn a fresh worker; the old
-  // behaviour was a silent no-op that left every later compaction request
+  // behavior was a silent no-op that left every later compaction request
   // unconsumed (WAL grew forever).
   if (interval_seconds_ == 0) {
     LOG(WARN) << "CheckpointManager::Start() ignored: checkpointing is "
@@ -89,6 +91,9 @@ void CheckpointManager::Start() {
 }
 
 void CheckpointManager::Stop() {
+  // Pairs with Start()'s lifecycle_guard: a concurrent Stop/Start pair can no
+  // longer interleave their SetCompactionCallback calls.
+  std::scoped_lock lifecycle_guard(lifecycle_mu_);
   if (pm_ != nullptr) {
     pm_->SetCompactionCallback({});
   }
@@ -144,7 +149,12 @@ void CheckpointManager::WorkerThreadTask() {
         continue;
       }
       // Periodic watchdog pass: only checkpoint when the retained (durable
-      // but not yet recycled) WAL has grown past the lag threshold.
+      // but not yet recycled) WAL has grown past the lag threshold. An
+      // embedded caller may run without a transaction manager / logger, in
+      // which case there is no WAL lag to measure.
+      if (tm_ == nullptr || tm_->logger_ == nullptr) {
+        continue;
+      }
       const lsn_t lowest_retained = tm_->logger_->LowestRetainedLSN();
       const lsn_t durable_lsn = tm_->logger_->DurableLSN();
       const uint64_t retained_bytes =
@@ -193,6 +203,10 @@ void CheckpointManager::WorkerThreadTask() {
 StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
     const std::function<void()>& func_for_test) {
   std::scoped_lock checkpoint_guard(checkpoint_mu_);
+  if (tm_ == nullptr || tm_->logger_ == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "cannot checkpoint without a transaction logger");
+  }
   if (tm_->FailStopped() || tm_->logger_->Failed()) {
     return StatusError(StatusCode::kIOError,
                        "cannot checkpoint a failed transaction engine");
@@ -226,8 +240,13 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
 
   func_for_test();
 
-  const lsn_t durable_end = tm_->logger_->BufferedLSN();
-  RETURN_IF_FAIL(tm_->logger_->WaitForDurable(durable_end));
+  // Wait for the LSN captured under the transaction-table lock, not a fresh
+  // BufferedLSN(): the snapshot's replay anchor is derived from snap_lsn, so
+  // WAL appended after the capture (by func_for_test or unrelated txns) is not
+  // part of this checkpoint and must not hold up the fsync wait. See
+  // docs/recovery_invariants.md ("waits for the WAL's captured durable
+  // target").
+  RETURN_IF_FAIL(tm_->logger_->WaitForDurable(snap_lsn));
 
   if (pm_ != nullptr) {
     RETURN_IF_FAIL(pm_->WriteFuzzyCheckpoint(replay_start_lsn));
@@ -299,7 +318,7 @@ void CheckpointManager::MaybeWarnWalRetention(
             << ", replay_anchor_lsn=" << replay_anchor_lsn
             << ", oldest_active_txn=" << oldest_txn
             << ", oldest_active_first_lsn="
-            << (oldest_txn != 0 ? oldest_first_lsn : 0)
+            << (oldest_txn != 0 ? oldest_first_lsn : replay_anchor_lsn)
             << "). Finish or abort long-running transactions to recycle old "
                "WAL segments.";
 }

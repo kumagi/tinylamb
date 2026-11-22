@@ -1,5 +1,5 @@
 -- tinylamb-session-test v1
--- seed: 1
+-- seed: 43
 -- stmt: CREATE TABLE tbl3 (u INT64, c1 VARCHAR(8), c2 VARCHAR(8), c3 INT64);
 -- ddl: CREATE UNIQUE INDEX idx0 ON tbl3 KEY(0,3)
 -- stmt: INSERT INTO tbl3 VALUES (0, 'bb', 'bb', NULL);

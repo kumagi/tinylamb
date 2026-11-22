@@ -197,6 +197,12 @@ std::vector<std::pair<std::string, RowEntry>> MemTable::SnapshotShard(
     SkipList::ConstIterator& it = take_active ? ai : si;
     SkipList::ConstIterator& other = take_active ? si : ai;
     // When keys tie, emit once from the newer list and drop the stale one.
+    // `active` is strictly newer: Phase 1 swaps the old active into `sealed`
+    // (or keeps an even older leftover sealed at the head), then writes go
+    // into a fresh active. The node_invisible skip above already removed any
+    // active node whose head AND older_versions are all invisible, so a
+    // fully-invisible active node can never mask a visible version that only
+    // survives in sealed's chain -- sealed wins the walk in that case.
     const bool dupes_other = other.Valid() && MemKeyEq(other.Key(), it.Key());
     const RowEntry& head = it.Entry();
     const RowEntry* visible = &head;
@@ -366,10 +372,12 @@ Status MemTable::Put(const Row& r, bool sync) {
     const Value& kv = r.values_[key_idx_];
     if (kv.type == ValueType::kVarChar) {
       // A varchar encodes to 9 bytes PER 8-char group, so it cannot use the
-      // 9-byte stack buffer -- and the general path (which encodes by value
-      // type, not schema type) accepts this same schema/value mismatch.
-      // Delegate so both routes apply the same gate instead of rejecting
-      // only when the schema key happens to be INT64/DOUBLE.
+      // 9-byte stack buffer. Delegate to the general path. That path also
+      // encodes by the value's *runtime* type
+      // (Row::EncodeKeyMemcomparableFormat only uses the schema to locate the
+      // key column, then dispatches on Value::type), so this schema/value
+      // mismatch yields the identical key image on both routes -- no
+      // fast/general key-order divergence.
       put_entry(r.EncodeKeyMemcomparableFormat(schema_));
     } else {
       size_t klen = 0;
@@ -555,11 +563,12 @@ Status MemTable::Sync(std::vector<char>* blob_out,
     // The budget must include the ROW payload: the previous form reserved
     // space for the key only, so a large row appended after the check
     // could still push the blob past the cap and wrap row_off. The budget
-    // is normally UINT32_MAX (the uint32-offset ceiling) and is injectable
-    // so tests can exercise the kNoSpace recovery path cheaply. Clamped to
-    // that ceiling here: a caller that sets a larger budget (e.g. SIZE_MAX
-    // "to disable" the cap) would otherwise let blob_out grow past 4 GiB
-    // and wrap the uint32 key/row offsets into a corrupt run.
+    // is fixed at UINT32_MAX (the uint32-offset ceiling): drain_budget_ has
+    // no setter, so the kNoSpace branch below is a defensive guard rather
+    // than a path the current tests exercise. The clamp keeps the ceiling
+    // explicit if injection is added later: a larger budget (e.g. SIZE_MAX
+    // "to disable" the cap) would let blob_out grow past 4 GiB and wrap the
+    // uint32 key/row offsets into a corrupt run.
     const size_t row_size = entry.is_deleted ? 0 : entry.row.Size();
     const size_t row_bytes = entry.is_deleted ? 0 : row_size + sizeof(uint32_t);
     if (blob_out->size() + key.size() + 16 + row_bytes > drain_budget) {
@@ -605,14 +614,10 @@ Status MemTable::Sync(std::vector<char>* blob_out,
     }
   }
 
-  // Phase 3: release drained arenas. Shards were sealed together, so their
-  // combined contents form one run with one generation bump.
-  for (Shard& s : shards_) {
-    std::scoped_lock lk(s.lock);
-    s.draining = false;
-    s.sealed.Clear();
-  }
-  *generation_out = global_version_mode_ ? NextGlobalVersion() : generation_++;
+  // Durability must precede the release of the drained arenas: if the hook
+  // fails, the sealed lists have to stay intact so a retry can re-drain and
+  // re-persist the same entries. Clearing them first made a failed hook
+  // unrecoverable -- the data existed only in the returned blob.
   // flush_mutex_ is held, so this read is ordered against
   // SetDurabilityCallback's store; (fn, ctx) are always a matched pair.
   if (durability_fn_ != nullptr) {
@@ -627,6 +632,14 @@ Status MemTable::Sync(std::vector<char>* blob_out,
       return StatusError(StatusCode::kIOError, "WAL durability hook failed");
     }
   }
+  // Phase 3: release drained arenas. Shards were sealed together, so their
+  // combined contents form one run with one generation bump.
+  for (Shard& s : shards_) {
+    std::scoped_lock lk(s.lock);
+    s.draining = false;
+    s.sealed.Clear();
+  }
+  *generation_out = global_version_mode_ ? NextGlobalVersion() : generation_++;
   return Status::kSuccess;
 }
 

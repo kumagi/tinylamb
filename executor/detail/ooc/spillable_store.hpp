@@ -20,8 +20,9 @@ namespace tinylamb {
 
 // Budget-bounded batch container that stays purely in RAM (0 SpillStore FDs)
 // until resident memory exceeds its budget or forced spill triggers, then
-// streams remaining batches into a single `SpillStore` segment and allows
-// bounded multi-pass sequential cursors.
+// streams remaining batches into a single `SpillStore` segment. Reads use a
+// single sequential cursor (reader_ / mem_cursor_idx_) that ResetCursor()
+// rewinds; concurrent multiple cursors are not supported.
 class SpillableStore {
  public:
   struct Options {

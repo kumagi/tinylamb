@@ -17,9 +17,13 @@
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "executor/executor_base.hpp"
+#include "query/googlesql_ast.hpp"
+#include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
+#include "query/statement.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -345,6 +349,30 @@ TEST_F(SqlSubqueryShapesCoverageTest, VolatileUncorrelatedSubqueryIsNotReused) {
   const Value first = Scalar("SELECT (SELECT RAND() FROM custs LIMIT 1)");
   const Value second = Scalar("SELECT (SELECT RAND() FROM custs LIMIT 1)");
   EXPECT_NE(first, second);
+}
+
+TEST_F(SqlSubqueryShapesCoverageTest, SetOperandOrderDeterminesVolatility) {
+  for (const bool volatile_order : {false, true}) {
+    const std::string sql = std::string("(SELECT id FROM orders ORDER BY ") +
+                            (volatile_order ? "RAND()" : "id") +
+                            " LIMIT 1) UNION ALL SELECT 0";
+    const auto parsed = GoogleSqlFrontend::Parse(sql);
+    ASSERT_TRUE(parsed.ok) << parsed.error;
+    auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+    ASSERT_TRUE(ast.HasValue()) << ast.GetStatus();
+    auto statement = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+    ASSERT_TRUE(statement.HasValue()) << statement.GetStatus();
+    const auto* select =
+        dynamic_cast<const SelectStatement*>(statement.Value().get());
+    ASSERT_NE(select, nullptr);
+    EXPECT_TRUE(select->OrderBy().empty());
+    const auto& tree = select->GetSetOperationTree();
+    ASSERT_NE(tree, nullptr);
+    ASSERT_NE(tree->first, nullptr);
+    ASSERT_FALSE(tree->first->OrderBy().empty());
+    EXPECT_EQ(relational_detail::StatementContainsVolatileFunction(*select),
+              volatile_order);
+  }
 }
 
 TEST_F(SqlSubqueryShapesCoverageTest, SiblingExistsBuildsShareOneScan) {

@@ -18,8 +18,8 @@
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "query/fuzz_scoped_db.hpp"
-#include "query/sql_engine.hpp"
 #include "query/plan_cache.hpp"
+#include "query/sql_engine.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
@@ -466,15 +466,26 @@ std::string ReplayPlanCacheTrace(const PlanCacheTrace& trace, bool verbose) {
     return "replay setup failed";
   }
   bool ok = false;
+  // Mirror the generation-side phase checks: equal results alone cannot tell
+  // a warm cache hit from a cache that was disabled and missed every phase,
+  // which is exactly the stale-special-plan bug this fuzzer guards.
+  const auto phase1_before = PlanCacheStats().fills.load();
   const std::vector<std::vector<Value>> r1 =
       ExecuteAll(*db_a, trace.queries, &ok);
   if (!ok) {
     return "replay query failed";
   }
+  if (PlanCacheStats().fills.load() == phase1_before) {
+    return "[PLANCACHE REPLAY COVERAGE ERROR] phase1 observed no fills";
+  }
+  const auto phase2_before = PlanCacheStats().replays.load();
   const std::vector<std::vector<Value>> r2 =
       ExecuteAll(*db_a, trace.queries, &ok);
   if (!ok) {
     return "replay query failed (hit phase)";
+  }
+  if (PlanCacheStats().replays.load() == phase2_before) {
+    return "[PLANCACHE REPLAY COVERAGE ERROR] phase2 observed no replays";
   }
   {
     TransactionContext ctx = db_a->BeginContext();
@@ -487,10 +498,14 @@ std::string ReplayPlanCacheTrace(const PlanCacheTrace& trace, bool verbose) {
       return "replay mutation commit failed";
     }
   }
+  const auto phase3_before = PlanCacheStats().replays.load();
   const std::vector<std::vector<Value>> r3 =
       ExecuteAll(*db_a, trace.queries, &ok);
   if (!ok) {
     return "replay query failed (drift phase)";
+  }
+  if (PlanCacheStats().replays.load() == phase3_before) {
+    return "[PLANCACHE REPLAY COVERAGE ERROR] phase3 observed no replays";
   }
   std::vector<std::string> setup_b = trace.setup;
   setup_b.insert(setup_b.end(), trace.mutations.begin(), trace.mutations.end());
@@ -498,10 +513,14 @@ std::string ReplayPlanCacheTrace(const PlanCacheTrace& trace, bool verbose) {
   if (!BuildDatabase(setup_b, &db_b)) {
     return "replay db_b setup failed";
   }
+  const auto phase4_before = PlanCacheStats().fills.load();
   const std::vector<std::vector<Value>> r4 =
       ExecuteAll(*db_b, trace.queries, &ok);
   if (!ok) {
     return "replay query failed (fresh phase)";
+  }
+  if (PlanCacheStats().fills.load() == phase4_before) {
+    return "[PLANCACHE REPLAY COVERAGE ERROR] phase4 observed no fills";
   }
 
   const std::vector<std::string> m1 = FormatRows(r1);

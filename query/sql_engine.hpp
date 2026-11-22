@@ -104,6 +104,25 @@ class SqlEngine {
   static void SetThreadRuntimeProfiling(bool enabled);
   [[nodiscard]] static SqlRuntimeStats ThreadRuntimeStats();
   [[nodiscard]] const std::string& LastError() const { return last_error_; }
+  // True only for the external parser child's transient start-up failures
+  // (pipe/fork creation, worker spawn, deadline). These are safe to retry:
+  // no statement was prepared, so no write could have been published.
+  // Every other failure -- including a status-only failure that left
+  // LastError() empty after a write was published -- must NOT be replayed.
+  [[nodiscard]] bool LastErrorIsTransientParseFailure() const {
+    static constexpr std::string_view kTransientPrefixes[] = {
+        "cannot create GoogleSQL pipe",
+        "cannot start GoogleSQL",
+        "cannot start parser pipe workers",
+        "GoogleSQL parser timed out",
+    };
+    for (const std::string_view prefix : kTransientPrefixes) {
+      if (last_error_.starts_with(prefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
   // Conservative certification of a parsed, table-free literal arithmetic
   // SELECT. Consumers may reuse a successful complete result under exact SQL.
   // Functions, variables, subqueries and statement modifiers never qualify.
@@ -224,7 +243,7 @@ class SqlEngine {
   // scalar evaluator raises "requires relational evaluation" (masks as a
   // runtime error) or the decorated semi-join drops row positions.
   // Correlated or failing inner statements stay untouched (fallback
-  // behaviour), never a wrong answer produced from this helper itself.
+  // behavior), never a wrong answer produced from this helper itself.
   StatusOr<Expression> DecorateDmlWhere(TransactionContext& ctx,
                                         const Expression& expression);
 

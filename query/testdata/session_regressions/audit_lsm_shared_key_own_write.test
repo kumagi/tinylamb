@@ -62,7 +62,9 @@
 -- expect: [3, 1, "a", NULL]
 -- expect: [4, NULL, "a", "a"]
 -- check: tbl0
--- checksql: SELECT c1 FROM tbl0 WHERE c1 = NULL;
+-- checksql: SELECT c1 FROM tbl0 WHERE c1 IS NULL;
+-- expect: [NULL]
+-- expect: [NULL]
 -- stmt: INSERT INTO tbl0 VALUES (6, -1, NULL, NULL);
 -- fail2: UPDATE tbl0 SET c1 = u WHERE tbl0.u = 2;
 -- stmt2: INSERT INTO tbl0 VALUES (7, -1, NULL, 'a');

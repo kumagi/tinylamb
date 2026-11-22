@@ -26,7 +26,7 @@
 | 60 | Rule 追加・無効化・事前条件ゲート(D5) | draft |
 | 70 | 式書き換え: フレームワーク + 自明な Rule の一括解説 | draft |
 
-70 章で一括解説する式書き換え Rule(35 本、1 本も飛ばさない):
+70 章で一括解説する式書き換え Rule(34 本、1 本も飛ばさない):
 `fold_binary` / `fold_unary` / `fold_in` / `fold_function` / `singleton_in` /
 `canonicalize_comparison` / `boolean_identity` / `double_negation` /
 `simplify_case` / `and_idempotent` / `or_idempotent` / `identity_add_zero` /
@@ -37,7 +37,7 @@
 `reassociate_add_constants` / `reassociate_subtract_constants` /
 `reassociate_subtract_add_constants` / `reassociate_add_subtract_constants` /
 `dedupe_in_list` / `uniform_case_result` / `empty_in_list` / `abs_of_abs` /
-`if_to_case` / `concat_flatten` / `array_flatten_optimization` /
+`concat_flatten` / `array_flatten_optimization` /
 `canonicalize_boolean` / `pow_identities` / `greatest_least_fold`
 
 ## 第2部 Rule リファレンス(`part2-rules/`)
@@ -193,7 +193,7 @@
 | `zigzag_join` | 現行登録 | draft |
 | `late_materialization_join` | 現行登録 | draft |
 
-### 式書き換え Rule — 個別章(36 本、第 70 章 35 本と合わせて全 71 本)
+### 式書き換え Rule — 個別章(36 本、第 70 章 34 本と合わせて全 70 本)
 
 | Rule 名 | 状態 |
 |---|---|

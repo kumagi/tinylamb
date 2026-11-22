@@ -244,8 +244,37 @@ std::optional<TypedFilterCompare> TryCompileTypedFilterCompare(
     if (trailing) {
       literal.remove_suffix(1);
     }
-    if (literal.find_first_of("%_") != std::string_view::npos) {
+    if (literal.find_first_of("_\\") != std::string_view::npos) {
       return std::nullopt;
+    }
+    const size_t mid_pct = literal.find('%');
+    if (mid_pct != std::string_view::npos) {
+      // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+      //   (two_segment_like_greedy_earliest_iff,
+      //    two_segment_like_no_first_literal)
+      // Support `%seg1%seg2%` (leading + trailing `%` with one interior `%`
+      // and no other wildcards/escapes).
+      if (!leading || !trailing) {
+        return std::nullopt;
+      }
+      const std::string_view seg1 = literal.substr(0, mid_pct);
+      std::string_view seg2 = literal.substr(mid_pct + 1);
+      while (!seg2.empty() && seg2.front() == '%') {
+        seg2.remove_prefix(1);
+      }
+      if (seg1.empty() || seg2.empty() ||
+          seg2.find('%') != std::string_view::npos) {
+        return std::nullopt;
+      }
+      return TypedFilterCompare{
+          .left = static_cast<slot_t>(*offset),
+          .op = binary.Op(),
+          .constant_payload = true,
+          .string_payload = true,
+          .string_constant = std::string(seg1),
+          .string_constant2 = std::string(seg2),
+          .string_match = TypedFilterCompare::StringMatchKind::kContainsTwo,
+      };
     }
     using Kind = TypedFilterCompare::StringMatchKind;
     TypedFilterCompare compiled{.left = static_cast<slot_t>(*offset),
@@ -1903,7 +1932,8 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
       if (e->Type() == TypeTag::kQueryExp) {
         return false;
       }
-      for (const Expression& sub : ExpressionChildren(e)) {  // NOLINT(readability-use-anyofallof)
+      for (const Expression& sub :
+           ExpressionChildren(e)) {  // NOLINT(readability-use-anyofallof)
         if (self(self, sub)) {
           return true;
         }
@@ -2187,15 +2217,30 @@ bool CanUseExactIntegerGroupingSets(TransactionContext& context,
   return !head_aggs.empty() &&
          std::ranges::all_of(
              head_aggs, [&](const AggregateExpression* aggregate) {
-               if (aggregate == nullptr || !aggregate->Child() ||
-                   aggregate->Child()->Type() != TypeTag::kColumnValue) {
+               if (aggregate == nullptr || !aggregate->Child()) {
                  return false;
                }
-               const auto slot = LocalColumnOffset(
-                   schema, aggregate->Child()->AsColumnValue().GetColumnName());
-               return slot &&
-                      schema.GetColumn(*slot).Type() == ValueType::kInt64 &&
-                      !schema.GetColumn(*slot).IsUnsigned();
+               const Expression& child = aggregate->Child();
+               // Exact SUM/AVG partials work for any immutable INT64-valued
+               // expression (e.g. TPC-DS Q67's COALESCE(a*b, 0)), not just a
+               // bare column -- PlanExactIntegerGroupingSets already accepts
+               // that shape via valid_partial_agg_child().
+               // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+               //   (rollup_two_level_state_combine_sound,
+               //    rollup_three_level_state_combine_sound)
+               if (ContainsQuery(child) || ContainsAggregate(child) ||
+                   ContainsParameterSlot(child) ||
+                   ContainsVolatileCall(child)) {
+                 return false;
+               }
+               if (child->Type() == TypeTag::kColumnValue) {
+                 const auto slot = LocalColumnOffset(
+                     schema, child->AsColumnValue().GetColumnName());
+                 return slot &&
+                        schema.GetColumn(*slot).Type() == ValueType::kInt64 &&
+                        !schema.GetColumn(*slot).IsUnsigned();
+               }
+               return child->ResultType(schema).GetType() == TypeTag::kBigInt;
              });
 }
 
@@ -2366,8 +2411,25 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
       }
       return spec;
     }
+    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    //   (order_by_projected_expr_ordinal_sound)
     if (term.expression->Type() != TypeTag::kColumnValue) {
-      return spec;
+      const std::string want = term.expression->ToString();
+      size_t hits = 0;
+      size_t match_pos = statement.SelectList().size();
+      for (size_t pos = 0; pos < statement.SelectList().size(); ++pos) {
+        const Expression& item = statement.SelectList()[pos].expression;
+        if (item && item->ToString() == want) {
+          match_pos = pos;
+          ++hits;
+        }
+      }
+      if (hits != 1) {
+        return spec;
+      }
+      term.expression =
+          ConstantValueExp(Value(static_cast<int64_t>(match_pos + 1)));
+      continue;
     }
     const ColumnName& column = term.expression->AsColumnValue().GetColumnName();
     if (!column.schema.empty()) {
@@ -2393,22 +2455,24 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
           return !item.name.empty() && IdentifierEquals(item.name, column.name);
         });
     if (!matches_alias) {
-      size_t position = 0;
-      for (; position < statement.SelectList().size(); ++position) {
-        const NamedExpression& item = statement.SelectList()[position];
-        if (item.name.empty() && item.expression &&
+      size_t hits = 0;
+      size_t match_pos = statement.SelectList().size();
+      for (size_t pos = 0; pos < statement.SelectList().size(); ++pos) {
+        const NamedExpression& item = statement.SelectList()[pos];
+        if (item.expression &&
             item.expression->Type() == TypeTag::kColumnValue &&
             IdentifierEquals(
                 item.expression->AsColumnValue().GetColumnName().name,
                 column.name)) {
-          break;
+          match_pos = pos;
+          ++hits;
         }
       }
-      if (position == statement.SelectList().size()) {
+      if (hits != 1) {
         return spec;
       }
       term.expression =
-          ConstantValueExp(Value(static_cast<int64_t>(position + 1)));
+          ConstantValueExp(Value(static_cast<int64_t>(match_pos + 1)));
     }
   }
   // GROUP BY () and the grand-total ROLLUP branch carry a synthetic

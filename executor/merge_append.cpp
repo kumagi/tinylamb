@@ -26,8 +26,8 @@ StatusOr<Value> CoerceTo(const Value& value, ValueType type) {
   }
   if (type == ValueType::kDouble && value.type == ValueType::kInt64) {
     if (value.IsUnsigned()) {
-      return Value(static_cast<double>(
-          static_cast<uint64_t>(value.value.int_value)));
+      return Value(
+          static_cast<double>(static_cast<uint64_t>(value.value.int_value)));
     }
     return Value(static_cast<double>(value.value.int_value));
   }
@@ -95,8 +95,7 @@ bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
     const SortExecutor::Key& key = keys_[ki];
     const Value& lhs = left.sort_keys[ki];
     const Value& rhs = right.sort_keys[ki];
-    const int comparison =
-        MakeSortKeyOrder(key).Compare(lhs, rhs);
+    const int comparison = MakeSortKeyOrder(key).Compare(lhs, rhs);
     if (comparison != 0) {
       return comparison < 0;
     }
@@ -130,6 +129,10 @@ Status MergeAppendExecutor::Initialize() {
   }
   source_batches_.resize(sources_.size());
   source_offsets_.assign(sources_.size(), 0);
+  // Mark initialized before pulling: every failure below is sticky via
+  // status_, and re-entering Initialize() would re-pull the sources whose
+  // heads were already buffered, duplicating rows in heads_.
+  initialized_ = true;
   for (size_t source = 0; source < sources_.size(); ++source) {
     Head head;
     head.source = source;
@@ -143,7 +146,6 @@ Status MergeAppendExecutor::Initialize() {
       return sources_[source]->GetStatus();
     }
   }
-  initialized_ = true;
   return Status::kSuccess;
 }
 

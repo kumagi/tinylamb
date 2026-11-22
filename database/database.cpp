@@ -71,6 +71,16 @@ constexpr page_id_t kDefaultFunctionRoot = 3;
 
 namespace {
 
+bool AutoTlcsEnabled() noexcept {
+  const char* env = std::getenv("TINYLAMB_AUTO_TLCS");
+  if (env == nullptr || *env == '\0') {
+    return true;
+  }
+  const std::string_view v(env);
+  return v != "0" && v != "false" && v != "FALSE" && v != "off" && v != "OFF" &&
+         v != "no" && v != "NO";
+}
+
 #ifdef __GLIBC__
 // Engine heap tuning.  Join/sort/aggregation row stores repeatedly grow and
 // free multi-hundred-MB blocks; with the default glibc thresholds every such
@@ -121,10 +131,6 @@ StatusOr<std::unique_ptr<Database>> Database::Create(std::string_view dbname,
   ASSIGN_OR_RETURN(
       std::unique_ptr<PageStorage>, storage,
       PageStorage::Create(dbname, wal_sync_ms, preallocate_new_wal));
-  {
-    const std::scoped_lock lock(created_databases_mutex);
-    created_databases.insert(std::string(dbname));
-  }
   // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
   auto database = std::unique_ptr<Database>(
       new Database(dbname, std::move(storage)));  // NOLINT
@@ -139,6 +145,13 @@ StatusOr<std::unique_ptr<Database>> Database::Create(std::string_view dbname,
                    BPlusTree::Open(ctx.txn_, kDefaultFunctionRoot));
   database->functions_ = functions;
   RETURN_IF_FAIL(ctx.txn_.PreCommit());
+  // Register only after every fallible step succeeded: a failed Create() must
+  // not leave a name behind that RemoveCreatedDatabaseFiles() keeps deleting,
+  // potentially unlinking files a later process created under the same name.
+  {
+    const std::scoped_lock lock(created_databases_mutex);
+    created_databases.insert(std::string(dbname));
+  }
   return database;
 }
 
@@ -271,6 +284,11 @@ constexpr uint64_t kStatisticsMetaMagic =
     0x544C53544D455441ULL;  // "TLSTMETA" (historical; do not change)
 
 std::string StatisticsColumnKey(std::string_view table, slot_t column) {
+  // slot_t is a 16-bit column id, so the two-byte big-endian suffix below is
+  // exhaustive: there is no addressable column >= 65536 whose statistics key
+  // could wrap onto an existing column's key.
+  static_assert(sizeof(slot_t) == 2,
+                "statistics key encodes a 16-bit column id");
   std::string key;
   key.reserve(table.size() + 3);
   key.append(table);
@@ -511,8 +529,13 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
     }
     auto page = storage_->pm_->GetPage(new_table.first_pid_);
     if (page.HasValue()) {
+      // DestroyPage() takes blocks_mu_; drop the exclusive page latch from
+      // GetPage() first to keep the documented lock order. This page was just
+      // allocated by this txn and is not published to other writers.
+      Page* target = &*page.Value();
+      page.Value().PageUnlock();
       record_cleanup("table page",
-                     storage_->pm_->DestroyPage(ctx.txn_, &*page.Value()));
+                     storage_->pm_->DestroyPage(ctx.txn_, target));
     } else {
       record_cleanup("table page lookup", page.GetStatus());
     }
@@ -523,6 +546,9 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     const Column& col = schema.GetColumn(i);
     if (col.GetConstraint().IsUnique()) {
+      // This is a descriptive label scoped to the owning table's catalog
+      // entry (it is not a standalone catalog key): two tables whose
+      // "table|column" strings happen to collide still keep separate indexes.
       std::string index_name(schema.Name());
       index_name.push_back('|');
       index_name += col.Name().ToString();
@@ -557,6 +583,10 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
         new_table.incarnation_state_;
   }
   // Compiled plans may reference the previous catalog shape; drop them.
+  // The catalog write is transaction-local until commit: an abort rolls it
+  // back without rewinding the epoch, so the txn must be flagged dirty for
+  // the abort path to invalidate any plan/cache stamped from this view.
+  ctx.txn_.MarkCatalogDirty();
   BumpSchemaEpoch();
   return new_table;
 }
@@ -651,14 +681,27 @@ Status Database::DropTable(TransactionContext& ctx,
   }
   RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, canonical));
   page_id_t pid = current.first_pid_;
+  std::unordered_set<page_id_t> seen;
   while (pid != 0) {
+    // A corrupted next-page link can make the chain loop forever on the DDL
+    // thread (which runs on the event loop), so refuse to follow a revisit.
+    if (!seen.insert(pid).second) {
+      return StatusError(StatusCode::kCorrupt,
+                         "cycle detected while dropping table chain");
+    }
     ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(pid));
     if (!page.IsValid()) {
       break;
     }
     const page_id_t next = page->body.row_page.next_page_id_;
-    RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, &*page));
+    // GetPage() latches the page exclusively by default, while DestroyPage()
+    // takes blocks_mu_. Release the latch first so we never hold a page latch
+    // while acquiring blocks_mu_ (docs/lock_order.md). The quiescence checks
+    // above keep other writers off this chain, and the PageRef still owns the
+    // page while the raw pointer is passed to DestroyPage().
+    Page* target = &*page;
     page.PageUnlock();
+    RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, target));
     pid = next;
   }
   for (size_t i = 0; i < current.IndexCount(); ++i) {
@@ -698,7 +741,12 @@ Status Database::PutMaterializedViewDefinition(TransactionContext& ctx,
   if (existing != Status::kSuccess && existing != Status::kNotExists) {
     return existing;
   }
-  return functions_.Insert(ctx.txn_, key, std::string(query_text));
+  RETURN_IF_FAIL(functions_.Insert(ctx.txn_, key, std::string(query_text)));
+  // The definition write is buffered in this txn until commit; an abort still
+  // needs to invalidate templates/plans stamped from this catalog view.
+  ctx.txn_.MarkCatalogDirty();
+  BumpSchemaEpoch();
+  return Status::kSuccess;
 }
 
 StatusOr<std::string> Database::GetMaterializedViewDefinition(
@@ -722,6 +770,10 @@ Status Database::DeleteMaterializedViewDefinition(TransactionContext& ctx,
   if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
     return deleted;
   }
+  // Mirror PutMaterializedViewDefinition: stale definitions must not survive
+  // in epoch-keyed view registration or compiled-plan caches.
+  ctx.txn_.MarkCatalogDirty();
+  BumpSchemaEpoch();
   return Status::kSuccess;
 }
 
@@ -938,13 +990,21 @@ Status Database::RenameTable(TransactionContext& ctx,
   }
   // Views and materialized views share the object-name namespace with tables
   // during FROM resolution (ViewRegistry is consulted first).
-  if (GetViewDefinition(ctx, target).HasValue()) {
+  const auto view = GetViewDefinition(ctx, target);
+  if (view.HasValue()) {
     return StatusError(StatusCode::kConflicts,
                        "view " + target + " already exists");
   }
-  if (GetMaterializedViewDefinition(ctx, target).HasValue()) {
+  if (view.GetStatus() != Status::kNotExists) {
+    return view.GetStatus();
+  }
+  const auto matview = GetMaterializedViewDefinition(ctx, target);
+  if (matview.HasValue()) {
     return StatusError(StatusCode::kConflicts,
                        "materialized view " + target + " already exists");
+  }
+  if (matview.GetStatus() != Status::kNotExists) {
+    return matview.GetStatus();
   }
   // A FOREIGN KEY stores its parent table name as a
   // string; renaming the parent would silently dangle it (DropTable refuses
@@ -1041,6 +1101,10 @@ Status Database::RenameTable(TransactionContext& ctx,
   EraseCaseVariants(ctx.stats_, canonical);
   EraseCaseVariants(ctx.tables_, target);
   EraseCaseVariants(ctx.stats_, target);
+  // Like CreateIndex: the catalog/stats rename is buffered in this txn. If it
+  // aborts, the epoch stays advanced while the catalog reverts to the old
+  // name, so plans built with the new name must be invalidated on abort.
+  ctx.txn_.MarkCatalogDirty();
   BumpSchemaEpoch();
   return Status::kSuccess;
 }
@@ -1107,6 +1171,7 @@ Status Database::RenameColumn(TransactionContext& ctx,
   renamed.schema_ = tbl.GetSchema().WithRenamedColumn(
       static_cast<size_t>(offset), new_column);
   RETURN_IF_FAIL(catalog_.Update(ctx.txn_, canonical, Serialize(renamed)));
+  ctx.txn_.MarkCatalogDirty();
   EraseCaseVariants(ctx.tables_, canonical);
   EraseCaseVariants(ctx.stats_, canonical);
   BumpSchemaEpoch();
@@ -1167,6 +1232,10 @@ StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
     Function new_func{std::string(function_name), argument_count};
     RETURN_IF_FAIL(
         functions_.Insert(ctx.txn_, function_name, Serialize(new_func)));
+    // A new signature can change plan validity and the thread-local UDF
+    // registry; invalidate caches stamped from the pre-registration epoch.
+    ctx.txn_.MarkCatalogDirty();
+    BumpSchemaEpoch();
     return new_func;
   }
   Function func;
@@ -1274,13 +1343,21 @@ StatusOr<TableStatistics> Database::GetStatistics(
   struct ThreadStatsCache {
     const Database* owner{nullptr};
     uint64_t epoch{0};
-    std::unordered_map<std::string, TableStatistics, NameHash, std::equal_to<>> entries;
+    // The read below goes through ctx.txn_'s snapshot. Keying only on the
+    // live epoch lets a stale-snapshot txn plant its old statistics under a
+    // fresh epoch, which later txns would then keep reading.
+    uint64_t snapshot{0};
+    std::unordered_map<std::string, TableStatistics, NameHash, std::equal_to<>>
+        entries;
   };
   thread_local ThreadStatsCache cache;
   const uint64_t epoch = SchemaEpoch();
-  if (cache.owner != this || cache.epoch != epoch) {
+  const uint64_t snapshot = ctx.txn_.SnapshotTimestamp();
+  if (cache.owner != this || cache.epoch != epoch ||
+      cache.snapshot != snapshot) {
     cache.owner = this;
     cache.epoch = epoch;
+    cache.snapshot = snapshot;
     cache.entries.clear();
   }
   if (const auto found = cache.entries.find(schema_name);
@@ -1356,6 +1433,11 @@ Status Database::UpdateStatistics(TransactionContext& ctx,
   if (updated == Status::kSuccess) {
     // ANALYZE (and any other refresh) changes cost inputs for compiled plans.
     BumpSchemaEpoch();
+    // The statistics write is buffered in the caller's transaction until
+    // commit. An abort restores the old statistics, so caches stamped with
+    // the new epoch must be invalidated via the catalog-dirty rollback path
+    // (same contract as CreateIndex / catalog writes).
+    ctx.txn_.MarkCatalogDirty();
   }
   return updated;
 }
@@ -1388,6 +1470,25 @@ Database::~Database() {
 void Database::EmulateCrash() { storage_->DiscardAllUpdates(); }
 
 StatusOr<lsn_t> Database::WriteCheckpoint() {
+  if (AutoTlcsEnabled() && storage_ != nullptr && storage_->pm_ != nullptr &&
+      !auto_tlcs_in_progress_.exchange(true, std::memory_order_acq_rel)) {
+    struct ResetGuard {
+      std::atomic<bool>& flag;
+      ~ResetGuard() { flag.store(false, std::memory_order_release); }
+    } guard{auto_tlcs_in_progress_};
+    TransactionContext ctx = BeginContext();
+    ctx.txn_.SweepCommittedVersionChains();
+    if (!ctx.txn_.HasAnyPageVersionChains()) {
+      const std::vector<std::string> tables = ListTables(ctx);
+      for (const std::string& name : tables) {
+        if (ctx.txn_.HasAnyPageVersionChains()) {
+          break;
+        }
+        (void)TryAutoCompactTable(ctx, name);
+      }
+    }
+    (void)ctx.PreCommit();
+  }
   return storage_->cm_->WriteCheckpoint();
 }
 
@@ -1476,7 +1577,10 @@ void Database::MaybeAttachBackingTlcs(Table& table) {
 }
 
 Status Database::CompactTableToTlcs(TransactionContext& ctx,
-                                    std::string_view schema_name) {
+                                    std::string_view schema_name,
+                                    bool write_checkpoint,
+                                    bool refresh_statistics,
+                                    bool non_blocking_quiescence) {
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
   if (tbl.FirstPageId() == 0) {
     return Status::kNotExists;
@@ -1487,7 +1591,12 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
   }
 
   std::shared_ptr<const TlcsFile> existing_tlcs = tbl.GetBackingTlcsStore();
-  if (existing_tlcs != nullptr) {
+  if (existing_tlcs != nullptr &&
+      existing_tlcs->FormatVersion() >= TlcsFile::kFormatVersion) {
+    if (existing_tlcs->LayoutGeneration() == tbl.LayoutGeneration() &&
+        existing_tlcs->FirstPageId() == tbl.FirstPageId()) {
+      return Status::kSuccess;
+    }
     bool all_stub_pages = true;
     size_t chain_count = 0;
     std::unordered_set<page_id_t> seen;
@@ -1532,6 +1641,9 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
                        "cannot compact table with secondary indexes in a "
                        "read-only transaction");
   }
+  if (non_blocking_quiescence && ctx.txn_.HasAnyPageVersionChains()) {
+    return Status::kConflicts;
+  }
 
   ASSIGN_OR_RETURN(
       PendingTlcsCommit, pending,
@@ -1557,7 +1669,7 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
   }
   ResumeTableGuard resume_guard(incarnation, true);
 
-  if (!incarnation->WaitForQuiescence(ctx.txn_.ID())) {
+  if (!incarnation->WaitForQuiescence(ctx.txn_.ID(), non_blocking_quiescence)) {
     return Status::kConflicts;
   }
   if (tbl.LayoutGeneration() != before_gen) {
@@ -1780,12 +1892,112 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
   incarnation->AbortDrop();
   resume_guard.active = false;
 
-  RETURN_IF_FAIL(storage_->cm_->WriteCheckpoint().GetStatus());
+  if (write_checkpoint) {
+    RETURN_IF_FAIL(storage_->cm_->WriteCheckpoint().GetStatus());
+  }
 
-  if (!ctx.txn_.IsReadOnly()) {
+  if (refresh_statistics && !ctx.txn_.IsReadOnly()) {
     RETURN_IF_FAIL(RefreshStatistics(ctx, schema_name));
   } else {
     BumpSchemaEpoch();
+  }
+  return Status::kSuccess;
+}
+
+bool Database::TryAutoCompactTable(TransactionContext& ctx,
+                                   std::string_view schema_name) {
+  if (storage_ == nullptr || storage_->pm_ == nullptr ||
+      !ctx.txn_.WriteSetEmpty() || ctx.txn_.HasLogRecord()) {
+    return false;
+  }
+  ctx.txn_.SweepCommittedVersionChains();
+  if (ctx.txn_.HasAnyPageVersionChains()) {
+    return false;
+  }
+  auto tbl_or = GetTable(ctx, schema_name);
+  if (!tbl_or.HasValue()) {
+    return false;
+  }
+  const Table& tbl = tbl_or.Value();
+  const page_id_t first_pid = tbl.FirstPageId();
+  if (first_pid == 0 || !LSTableStore::SupportsSchema(tbl.GetSchema())) {
+    return false;
+  }
+  if (const auto existing = tbl.GetBackingTlcsStore();
+      existing != nullptr &&
+      existing->LayoutGeneration() == tbl.LayoutGeneration() &&
+      existing->FirstPageId() == first_pid) {
+    return false;
+  }
+  {
+    StatusOr<PageRef> first_page =
+        storage_->pm_->GetPage(first_pid, /*shared=*/true);
+    if (!first_page.HasValue() || first_page.Value().IsNull() ||
+        first_page.Value()->Type() != PageType::kRowPage) {
+      return false;
+    }
+    const RowPage& rp = first_page.Value()->body.row_page;
+    const bool empty_uncompacted =
+        !rp.IsColumnarStub() && rp.next_page_id_ == 0 && rp.RowMax() == 0;
+    if (rp.IsColumnarStub() || empty_uncompacted) {
+      return false;
+    }
+  }
+  const Status st = CompactTableToTlcs(
+      ctx, schema_name, /*write_checkpoint=*/false,
+      /*refresh_statistics=*/false, /*non_blocking_quiescence=*/true);
+  if (st == Status::kSuccess) {
+    return true;
+  }
+  if (st != Status::kConflicts && st != Status::kNotImplemented &&
+      st != Status::kInvalidArgument && st != Status::kMemoryLimitExceeded) {
+    LOG(WARN) << "Auto-TLCS skipped for " << schema_name << ": " << st;
+  }
+  return false;
+}
+
+bool Database::AutoCompactTableForAnalyze(TransactionContext& ctx,
+                                          std::string_view schema_name) {
+  const char* analyze_tlcs = std::getenv("TINYLAMB_ANALYZE_AUTO_TLCS");
+  if (analyze_tlcs == nullptr || analyze_tlcs[0] == '\0' ||
+      analyze_tlcs[0] == '0') {
+    return false;
+  }
+  if (!AutoTlcsEnabled()) {
+    return false;
+  }
+  return TryAutoCompactTable(ctx, schema_name);
+}
+
+Status Database::CompactAllTablesToTlcs() {
+  if (storage_ == nullptr || storage_->pm_ == nullptr) {
+    return Status::kInvalidArgument;
+  }
+  std::vector<std::string> tables;
+  {
+    TransactionContext list_ctx = BeginContext();
+    tables = ListTables(list_ctx);
+    RETURN_IF_FAIL(list_ctx.PreCommit());
+  }
+  std::vector<std::string> compacted;
+  for (const std::string& name : tables) {
+    TransactionContext ctx = BeginContext();
+    const Status st = CompactTableToTlcs(ctx, name, /*write_checkpoint=*/false,
+                                         /*refresh_statistics=*/false,
+                                         /*non_blocking_quiescence=*/false);
+    if (st == Status::kNotImplemented) {
+      (void)ctx.PreCommit();
+      continue;
+    }
+    RETURN_IF_FAIL(st);
+    RETURN_IF_FAIL(ctx.PreCommit());
+    compacted.push_back(name);
+  }
+  RETURN_IF_FAIL(storage_->cm_->WriteCheckpoint().GetStatus());
+  for (const std::string& name : compacted) {
+    TransactionContext sctx = BeginContext();
+    RETURN_IF_FAIL(RefreshStatistics(sctx, name));
+    RETURN_IF_FAIL(sctx.PreCommit());
   }
   return Status::kSuccess;
 }

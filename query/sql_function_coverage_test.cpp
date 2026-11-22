@@ -362,10 +362,10 @@ TEST_F(SqlFunctionCoverageTest, InstrStartsEndsWithBranches) {
   ExpectError("SELECT INSTR('a')");
   ExpectError("SELECT INSTR('banana', 'an', 0)");
   ExpectError("SELECT INSTR('banana', 'an', 1, 0)");
-  EXPECT_EQ(RunSql(engine_.get(), context_.get(),
-                   "SELECT INSTR('abc', '', 1, 3)")
-                .front()[0],
-            Value(int64_t{0}));
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(), "SELECT INSTR('abc', '', 1, 3)")
+          .front()[0],
+      Value(int64_t{0}));
 }
 
 TEST_F(SqlFunctionCoverageTest, LpadRpadBranches) {
@@ -449,7 +449,8 @@ TEST_F(SqlFunctionCoverageTest, CodePointsBranches) {
   ExpectScalar("SELECT CODE_POINTS_TO_BYTES([65, 66])", Value("AB"));
   ExpectScalar("SELECT CODE_POINTS_TO_STRING([])", Value(""));
   ExpectNullScalar("SELECT CODE_POINTS_TO_STRING(NULL)");
-  ExpectNullScalar("SELECT CODE_POINTS_TO_STRING(5)");
+  ExpectError("SELECT CODE_POINTS_TO_STRING(5)");
+  ExpectError("SELECT CODE_POINTS_TO_BYTES(5)");
   ExpectNullScalar("SELECT CODE_POINTS_TO_BYTES(NULL)");
   ExpectError("SELECT CODE_POINTS_TO_STRING([55296])");
   ExpectError("SELECT CODE_POINTS_TO_STRING([-1])");
@@ -889,6 +890,12 @@ TEST_F(SqlFunctionCoverageTest, BinaryLikeBranches) {
   ExpectError("SELECT ENDS_WITH(1, 2)");
 }
 
+TEST_F(SqlFunctionCoverageTest, LikeEscapedWildcardIsLiteral) {
+  ExpectRow(R"(SELECT 'abc%' LIKE r'abc\%', 'abcd' LIKE r'abc\%',
+                      'x_a' LIKE r'%\_a', 'xxa' LIKE r'%\_a')",
+            Row({Value(true), Value(false), Value(true), Value(false)}));
+}
+
 TEST_F(SqlFunctionCoverageTest, BinaryUnsignedMixedBranches) {
   ExpectScalar("SELECT CAST(5 AS UINT64) + 3", Value(8));
   ExpectScalar("SELECT CAST(5 AS UINT64) * CAST(4 AS UINT64)", Value(20));
@@ -1077,14 +1084,14 @@ TEST_F(SqlFunctionCoverageTest, FormatSpecifierMatrix) {
 // Date / time function family (explicit UTC keeps expectations deterministic).
 // ---------------------------------------------------------------------------
 
-TEST_F(SqlFunctionCoverageTest, UnixDateTimestampStringAppliesTimezoneInBatchPath) {
+TEST_F(SqlFunctionCoverageTest,
+       UnixDateTimestampStringAppliesTimezoneInBatchPath) {
   // The batch fast path used to truncate a TIMESTAMP literal to its first 10
   // characters and read the wall-clock date, ignoring the +05:00 offset.
   // UTC is the previous day (2020-06-14) => 18427.
   ExpectScalar("SELECT UNIX_DATE('2020-06-15 01:00:00+05:00')",
                Value(int64_t{18427}));
-  RunSql(engine_.get(), context_.get(),
-         "CREATE TABLE unix_date_tz(d INT64)");
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE unix_date_tz(d INT64)");
   RunSql(engine_.get(), context_.get(),
          "INSERT INTO unix_date_tz VALUES "
          "(UNIX_DATE('2020-06-15 01:00:00+05:00'))");

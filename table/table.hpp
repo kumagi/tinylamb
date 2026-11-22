@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -45,15 +46,39 @@ class Encoder;
 struct Row;
 struct RowPosition;
 struct LSTableStore;
+struct LSTableColumnCacheEntry;
+struct LSTableBlockLayout;
 class TlcsFile;
+
+struct TablePageDirectory {
+  uint64_t layout_generation{0};
+  page_id_t first_pid{0};
+  std::vector<page_id_t> page_ids;
+  using IntBoundsVec = std::vector<std::pair<int64_t, int64_t>>;
+  mutable std::mutex zone_mu;
+  mutable std::unordered_map<slot_t, std::shared_ptr<const IntBoundsVec>>
+      col_int_bounds;
+
+  [[nodiscard]] std::shared_ptr<const IntBoundsVec> GetColIntBounds(
+      slot_t col) const {
+    std::scoped_lock lk(zone_mu);
+    auto it = col_int_bounds.find(col);
+    return it == col_int_bounds.end() ? nullptr : it->second;
+  }
+  void SetColIntBounds(slot_t col,
+                       std::shared_ptr<const IntBoundsVec> bounds) const {
+    std::scoped_lock lk(zone_mu);
+    col_int_bounds[col] = std::move(bounds);
+  }
+};
 
 class Table {
  public:
   using ScanMorsel = std::vector<page_id_t>;
   // IndexValueType moved to index/index_schema.hpp.  The
   // using-declaration is a compatibility bridge for TUs that still spell
-  // Table::IndexValueType (table.cpp, index_scan_iterator.cpp); it adds no
-  // second definition and the disk encoding is unchanged.
+  // Table::IndexValueType (table.cpp, executor/skip_scan_distinct.cpp); it adds
+  // no second definition and the disk encoding is unchanged.
   using IndexValueType = tinylamb::IndexValueType;
 
   Table() : incarnation_state_(std::make_shared<TableIncarnation>()) {}
@@ -188,13 +213,36 @@ class Table {
   void RefillLSTableStore(std::shared_ptr<const LSTableStore> store) const;
   [[nodiscard]] std::shared_ptr<const LSTableStore> GetProjectedLSTableStore()
       const;
-  void SetProjectedLSTableStore(
-      std::shared_ptr<const LSTableStore> store);
+  void SetProjectedLSTableStore(std::shared_ptr<const LSTableStore> store);
   void RefillProjectedLSTableStore(
       std::shared_ptr<const LSTableStore> store) const;
+  [[nodiscard]] std::shared_ptr<const LSTableColumnCacheEntry>
+  GetCachedLSTableColumn(slot_t col, uint64_t generation) const;
+  void RefillCachedLSTableColumn(
+      slot_t col, uint64_t generation, size_t bytes,
+      std::shared_ptr<const LSTableColumnCacheEntry> entry) const;
+  [[nodiscard]] std::shared_ptr<const LSTableStore> GetCachedLSTableView(
+      uint64_t generation, const std::vector<uint32_t>& projection) const;
+  void RefillCachedLSTableView(uint64_t generation,
+                               std::vector<uint32_t> projection,
+                               std::shared_ptr<const LSTableStore> store) const;
+  [[nodiscard]] std::shared_ptr<const LSTableBlockLayout> GetLSTableBlockLayout(
+      uint64_t generation) const;
+  void RefillLSTableBlockLayout(
+      uint64_t generation,
+      std::shared_ptr<const LSTableBlockLayout> layout) const;
+  [[nodiscard]] bool LSTableColumnRejected(slot_t col,
+                                           uint64_t generation) const;
+  void NoteLSTableColumnRejected(slot_t col, uint64_t generation) const;
+  size_t EvictIdleColumnarHeadroom(size_t target_bytes) const;
+  [[nodiscard]] size_t CachedColumnCountForTest() const;
   [[nodiscard]] std::shared_ptr<const TlcsFile> GetBackingTlcsStore() const;
   void SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store);
   void RefillBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const;
+  [[nodiscard]] std::shared_ptr<const TablePageDirectory>
+  GetCleanPageDirectory() const;
+  void SetCleanPageDirectory(
+      std::shared_ptr<const TablePageDirectory> dir) const;
   [[nodiscard]] uint64_t BackingColumnarRowCount() const;
   Status EnsurePageHydratedIfStub(Transaction& txn, page_id_t pid) const;
   [[nodiscard]] bool LSTableCapacityRejected(uint64_t generation) const {
@@ -257,12 +305,13 @@ class Table {
                                PageRef& successor) const;
   [[nodiscard]] StatusOr<Row> ReadLatest(Transaction& txn,
                                          RowPosition pos) const;
-  [[nodiscard]] StatusOr<Row> ReadFromStub(RowPosition pos) const;
-  Status   // |hint_leaf| threads a BPlusTree landing-leaf cursor so consecutive index
+  [[nodiscard]] StatusOr<Row> ReadFromStub(Transaction& txn,
+                                           RowPosition pos) const;
+  // |hint_leaf| threads a BPlusTree landing-leaf cursor so consecutive index
   // operations on the same tree (e.g. the delete+insert pair of one UPDATE)
   // skip the root-to-leaf walk when the remembered leaf still covers the
   // key. nullptr keeps the plain always-descend behavior.
-IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
+  Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
                      const RowPosition& pos,
                      page_id_t* hint_leaf = nullptr) const;
   // Gate-held RMW bodies; see the escalation loops in IndexInsert/IndexDelete

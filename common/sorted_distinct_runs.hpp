@@ -15,8 +15,9 @@
 
 namespace tinylamb {
 // Exact external union of sorted uint64 runs. Binary carries keep at most
-// 16-way merge keeps at most log2_16(runs) temp files open; every merge has fixed-size I/O
-// buffers. Temporary files are closed/deleted on both success and failure.
+// 16-way merge keeps at most log2_16(runs) temp files open; every merge has
+// fixed-size I/O buffers. Temporary files are closed/deleted on both success
+// and failure.
 class SortedDistinctRuns {
  public:
   Status Add(std::span<const uint64_t> sorted);
@@ -69,7 +70,9 @@ class SortedDistinctRuns {
   // failure so callers retain the strong exception guarantee.
   static StatusOr<Run> Merge(const Run& left, const Run& right);
   Status Insert(Run run, size_t level);
-  static inline bool fail_next_merge_for_test_{false};
+  // thread_local so a fault injected by one test/thread cannot leak into an
+  // unrelated concurrently running test's Merge.
+  static inline thread_local bool fail_next_merge_for_test_{false};
   std::vector<std::optional<Run>> levels_;
 };
 }  // namespace tinylamb

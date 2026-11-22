@@ -236,7 +236,8 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 - aggregate transpose: 結合キー、group key、反対側の一意性と重複影響を検証する。
 - IN-list semi join: 収集できなかったOR枝を捨てず、全枝を保持する。
 - double sort elimination: キー式、方向、NULL順序、collationを比較する。
-- rank/row_number to TopN: windowのpartition、order、frame、列出自を検証する。
+- rank/row_number to TopN: 撤去済みルール(`docs/optimizer_rule_audit.md` の
+  「撤去した登録」表を参照)。現行ルールの必須ゲートではない。
 - derived group: 固定文字列や件数ではなく、意味内容を含むfingerprintで識別する。
 - rule生成: `AddExpression` のschema、arity、child group、property契約を検証し、
   不正な代替を成功した候補として登録しない。
@@ -434,7 +435,9 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 
 ### 受け入れ条件
 
-1. `DISABLED_LiftUpBranchOrphansSiblingRows`を有効化して成功させる。
+1. 【歴史的記録】当時は `DISABLED_LiftUpBranchOrphansSiblingRows` を有効化して
+   成功させることを受け入れ条件とした。B+Tree 廃止に伴い現行ツリーにはこの
+   テストは存在しない(:45 の注記を参照)。
 2. 1葉1行相当のサイズでrandom insert/deleteを1万回行い、構造検査と前後スキャンが
    期待集合と一致する。
 3. lift前後で到達可能ページ、free list、max page countが整合する。

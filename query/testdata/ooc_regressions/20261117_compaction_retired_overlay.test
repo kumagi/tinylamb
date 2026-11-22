@@ -6,4 +6,5 @@ create t0 36 211 2190
 ins_bulk t0 1 492 367
 compact t0
 ins_copy t0 t0 237 261 256
-sweep mem 337 :: ins_bulk t0 518 591 749
+-- The original failure occurs on the first injected allocation.
+sweep mem 16 :: ins_bulk t0 518 591 749

@@ -469,7 +469,8 @@ StatusOr<bool> AggregationExecutor::TryFoldDistinctColumn(Row* dst) {
   if (offset < 0) {
     return false;
   }
-  const Column& definition = input_schema_.GetColumn(static_cast<size_t>(offset));
+  const Column& definition =
+      input_schema_.GetColumn(static_cast<size_t>(offset));
   const ValueType type = definition.Type();
   // A raw scan column carries the stored schema's semantics. COLLATE is an
   // expression and is excluded above by the bare-column gate. INTERVAL
@@ -1102,15 +1103,6 @@ StatusOr<int64_t> CheckedAdd(int64_t lhs, int64_t rhs) {
   return result;
 }
 
-StatusOr<double> CheckedDoubleAdd(double lhs, double rhs) {
-  const double result = lhs + rhs;
-  if (std::isinf(result) && std::isfinite(lhs) && std::isfinite(rhs)) {
-    return StatusError(StatusCode::kIsInfinity,
-                       "SUM overflow: result is infinite");
-  }
-  return result;
-}
-
 // The typed fast path handles COUNT/SUM/AVG plus MIN/MAX, BIT_* and
 // LOGICAL_* (see the case list below). Everything else — STRING_AGG,
 // COUNTIF, ARRAY_AGG, statistical and sketch aggregates — routes through the
@@ -1149,14 +1141,18 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
   }
   // Bind every column reference first: a batch whose runtime storage does
   // not match the declared numeric type must fall back wholesale, before any
-  // accumulator state has moved.
+  // accumulator state has moved. Keep the validated pointers so the second
+  // loop reads the same storage that was type-checked (re-resolving through
+  // chunk.ColumnAt could pick up a promoted/rebound column after the check).
+  std::vector<const ColumnVector*> bound_columns(inputs_.size(), nullptr);
   for (size_t i = 0; i < inputs_.size(); ++i) {
     const AggregateInput& input = inputs_[i];
     if (input.kind != AggregateInputKind::kTypedColumn) {
       continue;
     }
-    const ColumnVector& column = chunk.ColumnAt(input.column);
-    const ValueType actual = column.Type();
+    const ColumnVector* column = &chunk.ColumnAt(input.column);
+    bound_columns[i] = column;
+    const ValueType actual = column->Type();
     // An all-null kNull column contributes nothing, which matches the
     // generic path; anything else unexpected defers to the generic loop.
     if (actual != input.type && actual != ValueType::kNull) {
@@ -1221,11 +1217,12 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
             for (size_t r = 0; r < rows; ++r) {
               if ((*results)[i].IsNull()) {
                 // The first contributing row assigns the constant outright
-                // (no CheckedDoubleAdd, matching the generic path).
+                // (no relational_detail::CheckedDoubleSumAdd, matching the
+                // generic path).
                 (*results)[i] = Value(c);
               } else {
-                StatusOr<double> next =
-                    CheckedDoubleAdd((*results)[i].value.double_value, c);
+                StatusOr<double> next = relational_detail::CheckedDoubleSumAdd(
+                    (*results)[i].value.double_value, c);
                 if (!next.HasValue()) {
                   return FailWith(next.GetStatus());
                 }
@@ -1261,7 +1258,7 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
       }
       continue;
     }
-    const ColumnVector& column = chunk.ColumnAt(input.column);
+    const ColumnVector& column = *bound_columns[i];
     if (column.Type() == ValueType::kNull) {
       continue;  // all-null batch
     }
@@ -1331,7 +1328,8 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
             if (column.IsNull(row)) {
               continue;
             }
-            StatusOr<double> next = CheckedDoubleAdd(running, doubles[row]);
+            StatusOr<double> next =
+                relational_detail::CheckedDoubleSumAdd(running, doubles[row]);
             if (!next.HasValue()) {
               return FailWith(next.GetStatus());
             }
@@ -1749,7 +1747,7 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
               results[i] = val;
             } else if (val.type == ValueType::kDouble &&
                        results[i].type == ValueType::kDouble) {
-              StatusOr<double> next = CheckedDoubleAdd(
+              StatusOr<double> next = relational_detail::CheckedDoubleSumAdd(
                   results[i].value.double_value, val.value.double_value);
               if (!next.HasValue()) {
                 return FailWith(next.GetStatus());

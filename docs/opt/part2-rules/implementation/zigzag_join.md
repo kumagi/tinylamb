@@ -3,7 +3,7 @@
 - 状態: draft / 更新基準: `9ce7837` 上の作業ツリー (2026-10-06)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()`
   (`ZigZagJoinAlternative`)
-- 実行器: `executor/zigzag_join.cpp` (`ZigZagJoinPlan::EmitExecutor`)
+- 実行器: `executor/relational_factory.cpp` 経由 (`ZigZagJoinPlan::EmitExecutor`)
 
 ## 概要
 

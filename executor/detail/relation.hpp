@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <vector>
 
 #include "common/exc_shim.hpp"
@@ -35,6 +36,8 @@ struct Relation {
   // EnsureRowsMaterialized() when needed, while columnar operators consume
   // `columnar` directly with zero Row/Value boxing.
   std::shared_ptr<const ColumnarTable> columnar;
+  // Spill generations are stored oldest first; any remaining in-memory rows
+  // form a newer suffix after these files.
   std::shared_ptr<SpillFile> spill;
   std::vector<std::shared_ptr<SpillFile>> extra_spills;
   std::shared_ptr<SpillFile> spill_tail_;
@@ -147,9 +150,6 @@ struct Relation {
       }
       return first;
     }
-    for (const Row& row : rows) {
-      fn(row);
-    }
     if (spill) {
       const Status st = spill->ForEachRow(fn);
       if (st != Status::kSuccess) {
@@ -178,6 +178,9 @@ struct Relation {
         }
       }
     }
+    for (const Row& row : rows) {
+      fn(row);
+    }
     if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
       first = spill_error_;
     }
@@ -186,7 +189,7 @@ struct Relation {
 
   // NOTE: SpillFile::ForEachRow advances a single internal read cursor and is
   // non-const; the const_cast calls below mean a shared spilled Relation must
-  // not be traversed concurrently without external synchronisation.
+  // not be traversed concurrently without external synchronization.
   template <typename Fn>
   Status ForEachRow(Fn&& fn) const {
     Status first{Status::kSuccess};
@@ -203,9 +206,6 @@ struct Relation {
       }
       return first;
     }
-    for (const Row& row : rows) {
-      fn(row);
-    }
     if (spill) {
       const Status st = const_cast<SpillFile*>(spill.get())->ForEachRow(fn);
       if (st != Status::kSuccess) {
@@ -221,9 +221,9 @@ struct Relation {
       }
     }
     if (spill_tail_) {
-      // FinishSpill finalises the tail spill file (a one-way state change);
+      // FinishSpill finalizes the tail spill file (a one-way state change);
       // the only mutation in this const path. Callers sharing a spilled
-      // Relation across threads must provide external synchronisation.
+      // Relation across threads must provide external synchronization.
       const Status fs = const_cast<Relation*>(this)->FinishSpill();
       if (fs != Status::kSuccess && first == Status::kSuccess) {
         first = fs;
@@ -234,19 +234,34 @@ struct Relation {
         first = st;
       }
     }
+    for (const Row& row : rows) {
+      fn(row);
+    }
     if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
       first = spill_error_;
     }
     return first;
   }
 
-  // Visit rows in ForEachRow() order but stop after `max_rows` rows.
+  // Visit rows in ForEachRow() order. Stop after `max_rows` rows or when
+  // a visitor returning bool returns false.
   // Spilled parts stream through independent buffered RowReaders so a
   // sampling caller bounds the decode instead of paying a full pass.
   template <typename Fn>
   [[nodiscard]] Status ForEachRowBounded(size_t max_rows, Fn&& fn) const {
     Status first{Status::kSuccess};
     size_t seen = 0;
+    const auto visit = [&](auto& row) {
+      ++seen;
+      if constexpr (std::is_same_v<std::invoke_result_t<Fn&, decltype(row)>,
+                                   bool>) {
+        if (!fn(row)) {
+          seen = max_rows;
+        }
+      } else {
+        fn(row);
+      }
+    };
     const auto drain = [&](const std::shared_ptr<SpillFile>& file) -> Status {
       if (file == nullptr || seen >= max_rows) {
         return Status::kSuccess;
@@ -259,8 +274,7 @@ struct Relation {
         if (!has_row) {
           break;
         }
-        ++seen;
-        fn(row);
+        visit(row);
       }
       return Status::kSuccess;
     };
@@ -269,21 +283,13 @@ struct Relation {
       for (const ColumnarChunk& chunk : columnar->chunks) {
         for (size_t r = 0; r < chunk.rows && seen < max_rows; ++r) {
           chunk.MaterializeRowInto(r, &scratch);
-          ++seen;
-          fn(scratch);
+          visit(scratch);
         }
       }
       if (spill_error_ != Status::kSuccess) {
         first = spill_error_;
       }
       return first;
-    }
-    for (const Row& row : rows) {
-      if (seen >= max_rows) {
-        break;
-      }
-      ++seen;
-      fn(row);
     }
     if (const Status st = drain(spill); st != Status::kSuccess) {
       first = st;
@@ -294,10 +300,14 @@ struct Relation {
         first = st;
       }
     }
-    if (spill_tail_) {
+    if (spill_tail_ && seen < max_rows) {
       // FinishSpill finalises the tail spill file (a one-way state change);
-      // the only mutation in this const path. Callers sharing a spilled
-      // Relation across threads must provide external synchronisation.
+      // the only mutation in this const path. Only do it when the tail is
+      // actually about to be read: finalising on an early exit (caller stopped
+      // before max_rows, or an earlier spill already filled the budget) would
+      // make any later Append fail with "Append after FinishWriting".
+      // Callers sharing a spilled Relation across threads must provide external
+      // synchronization.
       const Status fs = const_cast<Relation*>(this)->FinishSpill();
       if (fs != Status::kSuccess && first == Status::kSuccess) {
         first = fs;
@@ -306,6 +316,12 @@ struct Relation {
           st != Status::kSuccess && first == Status::kSuccess) {
         first = st;
       }
+    }
+    for (const Row& row : rows) {
+      if (seen >= max_rows) {
+        break;
+      }
+      visit(row);
     }
     if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
       first = spill_error_;
@@ -328,7 +344,14 @@ struct Relation {
   }
 
   [[nodiscard]] size_t TotalRows() const {
-    size_t total = HasColumnarOnly() ? columnar->total_rows : rows.size();
+    // Row and columnar storage are disjoint: SetColumnarTable clears rows and
+    // a full materialization resets columnar. During a partial materialization
+    // both can hold rows, so count both instead of skipping columnar whenever
+    // HasColumnarOnly() is false (which would under-report the row count).
+    size_t total = rows.size();
+    if (columnar) {
+      total += columnar->total_rows;
+    }
     if (spill) {
       total += spill->Count();
     }
@@ -349,6 +372,7 @@ struct Relation {
   // separately built Relations) so the shared atomic stops being the
   // serialization point of every parallel scan/join row append.
   void FlushPendingCharge();
+  Status SealSpillTail();
   void AddRowSlowWithBytes(Row row, size_t bytes, size_t flush_granularity);
 
   ExecutionRuntime* runtime_{nullptr};

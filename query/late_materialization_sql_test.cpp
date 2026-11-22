@@ -38,6 +38,9 @@ std::vector<Row> RunSql(TransactionContext& context, Database& database,
     rows.push_back(row);
     row = Row();
   }
+  // Without this, an executor that fails mid-stream returns partial (or zero)
+  // rows that a later `empty()` assertion would mistake for success.
+  EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
   return rows;
 }
 

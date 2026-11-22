@@ -6,9 +6,9 @@
 
 ## 概要
 
-`interval_normalize` は、`INTERVAL` 型リテラルに対する定数演算をコンパイル時に評価する Rule です。対象は、リテラル同士の加減算、整数定数との乗算、単項マイナスによる符号反転、`JUSTIFY_HOURS` / `JUSTIFY_DAYS` / `JUSTIFY_INTERVAL` の適用です。たとえば `INTERVAL '1' DAY + INTERVAL '2' DAY` を `INTERVAL '3' DAY` へ畳み込みます。
+`interval_normalize` は、`INTERVAL` 型リテラルに対する定数演算をコンパイル時に評価する Rule です。対象は、リテラル同士の加減算、整数定数との乗算、`JUSTIFY_HOURS` / `JUSTIFY_DAYS` / `JUSTIFY_INTERVAL` の適用です。ただし単項マイナスは対象外で、式をそのまま残します（後述）。たとえば `INTERVAL '1' DAY + INTERVAL '2' DAY` を `INTERVAL '3' DAY` へ畳み込みます。
 
-算術オーバーフローが生じる場合には、実行時エンジンが送出すべき例外を消去しないよう、畳み込みを即座に中止して元の構文木のまま保持します。
+算術オーバーフローや不正な区間が生じる場合には、実行時エンジンが送出すべき例外を消去しないよう、畳み込みを即座に中止して元の構文木のまま保持します。生の高速路では `__builtin_*_overflow` と `IntervalValue::TryTotalNanos()`、一般路では `TryPlus` / `TryMinus` / `TryMultiply` / `TryJustify*` の `StatusOr` で判定します。
 
 ## 変換前後の関係
 
@@ -25,7 +25,7 @@ graph TD
 
 ## 適用条件
 
-パターンは `Any()` であり、ノード種別に応じて以下の 4 経路で判定します。
+パターンは `Any()` であり、ノード種別に応じて以下の 3 経路で判定します。
 
 1. **二項加減算経路**: 左右両オペランドがともに `INTERVAL` リテラルの場合。
    同一単位かつ複合量テキストを持たない場合は、コンパイラ組み込み関数で 64 ビット整数のオーバーフローを検出します。
@@ -52,27 +52,30 @@ graph TD
 2. **整数倍乗算経路**: `INTERVAL * 整数定数` および `整数定数 * INTERVAL` の場合。
    `__builtin_mul_overflow` により乗算オーバーフローを検査し、オーバーフロー時は畳み込みを拒絶します。
 
-3. **単項符号反転経路**: 単項マイナスが `INTERVAL` リテラルに適用されている場合。
-   ただし、`INT64_MIN` の符号反転は C++ の未定義動作（UB）であり、実行時エラーと厳密に一致させるため畳み込みを抑止します。
+3. **正規化関数経路**: 1 引数の `justify_hours` / `justify_days` / `justify_interval` が `INTERVAL` リテラルを受け取った場合。正規化後の `INTERVAL` リテラルを返します。
+
+   なお現行実装には単項マイナス（`kMinus`）を `INTERVAL` リテラルへ畳み込む経路は存在しません。`expression/rewrite.cpp` の同 Rule は次のコメント付きで式を無変更のまま残します。
 
    ```cpp
-   // INT64_MIN negation is UB on int64; leave it to the runtime
-   // path which throws like the AST ground truth.
-   if (child.Amount() == std::numeric_limits<int64_t>::min()) {
-     return Expression{};
-   }
-   return IntervalExpressionExp(-child.Amount(), child.Unit());
+   // `-INTERVAL ...` is rejected by the canonical AST evaluator
+   // (UnaryExpression::Evaluate kMinus accepts only numbers). Do not
+   // fold it into a value: leaving it unfolded lets the runtime raise
+   // the same error the AST ground truth does.
    ```
-
-4. **正規化関数経路**: 1 引数の `justify_hours` / `justify_days` / `justify_interval` が `INTERVAL` リテラルを受け取った場合。正規化後の `INTERVAL` リテラルを返します。
 
 ## 意味論的根拠と三値論理・例外保護
 
 本 Rule における最大の規律は、**実行時エンジンとの例外契約の一致**です。
 
-tinylamb の実行時評価器における `IntervalValue` の算術演算は、int64 の桁あふれが発生した際に例外を送出します。もしオプティマイザの定数畳み込み側で符号付き整数の wrap-around を静かに許容してしまうと、「実行時例外でクエリがアボートするはずの処理」が「予期せぬ値で完走する不正なクエリ」へと変貌してしまいます。したがって、組み込み演算オーバーフロー検出機能（`__builtin_*_overflow`）を用いて、例外を送出すべきケースでは一切の畳み込みを行わず、実行時の例外ハンドラに処理を委ねます。
+tinylamb の実行時評価器における `IntervalValue` の算術演算は、int64 の桁あふれが発生した際にエラー（`Status`）を返します。もしオプティマイザの定数畳み込み側で符号付き整数の wrap-around を静かに許容してしまうと、「実行時エラーでクエリがアボートするはずの処理」が「予期せぬ値で完走する不正なクエリ」へと変貌してしまいます。したがって、例外を送出すべきケースでは一切の畳み込みを行わず、実行時のエラーパスに処理を委ねます。
 
-また、`INT64_MIN` の反転を避けるガードも同様に、未定義動作を回避しつつ実行時エラー契約を正確に保つためのものです。
+オーバーフロー検査は経路ごとに次のように行います。
+
+- 同一単位の生の加減算・整数倍乗算の高速路では `__builtin_add_overflow` / `__builtin_sub_overflow` / `__builtin_mul_overflow` を用い、さらに `IntervalValue::TryTotalNanos()` で区間領域（約 ±106751 日）を検証します。
+- 単位が異なる場合や複合量を含む一般の加減算・乗算は `IntervalValue::TryPlus` / `TryMinus` / `TryMultiply` / `TryParse` の `StatusOr` を経由し、値が不正なら畳み込みを拒絶します。
+- `JUSTIFY_*` は `TryJustifyHours` / `TryJustifyDays` / `TryJustifyInterval` を経由します。
+
+いずれも投げるラッパー（`StatusOr` 境界を越える例外）を避け、式を無変更で残すことでランタイムと同じ結果にしています。また単項マイナスは AST 評価器が `INTERVAL` を受け付けないため、畳み込まずに残すことが例外契約の一致につながります。
 
 ## 実装の詳細
 
@@ -95,6 +98,6 @@ tinylamb の実行時評価器における `IntervalValue` の算術演算は、
 
 `expression/rewrite_test.cpp` の `ExpressionRewriteTest.IntervalNormalize` において以下を検証しています。
 
-- 日時加減算、整数乗算（左右両オペランド）、単項マイナス反転、および `JUSTIFY_*` 関数が単一の `INTERVAL` リテラルに正規化されること。
-- オーバーフローする加算および乗算において、静かな桁あふれを起こさず書き換えが安全に拒絶されること。
-- `INT64_MIN` の符号反転が正しく拒絶されること。
+- 日時加減算、整数乗算（左右両オペランド）、および `JUSTIFY_*` 関数が単一の `INTERVAL` リテラルに正規化されること。
+- オーバーフローする加算および乗算において、静かな桁あふれを起こさず書き換えが安全に拒絶されること（YEAR→月換算のオーバーフローを含む）。
+- `- INTERVAL` は単項マイナスのまま書き換えられずに残ること（AST 評価器のエラーを隠さないため）。

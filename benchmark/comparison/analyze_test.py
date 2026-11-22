@@ -63,6 +63,17 @@ class AnalyzeTest(unittest.TestCase):
         _, latency, _, _ = oltp_tables(records)
         self.assertIn("成功1件、有値1/3試行", latency)
 
+    def test_missing_engine_is_reported_instead_of_raising(self):
+        olap_records = [dict(kind="olap", suite="micro", rows=10000, workload="count",
+                             engine="tinylamb", status="ok", median_ms=1., correct=True)]
+        table, _ = olap_table(olap_records, "micro", 10000)
+        self.assertIn("n/a", table)
+        oltp_records = [dict(kind="oltp", workload="update", clients=1, engine="tinylamb",
+                             tps=10., valid=True, errors=0, completed=1000,
+                             workers=[{"attempted": 100}], p95_ms=1., p99_ms=2.)]
+        table, _, _, _ = oltp_tables(oltp_records)
+        self.assertIn("n/a", table)
+
 
 if __name__ == "__main__":
     unittest.main()

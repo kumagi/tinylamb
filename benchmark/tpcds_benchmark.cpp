@@ -7,7 +7,8 @@
 // then times the ported queries in tpcds_queries.hpp.
 //
 //   tinylamb_tpcds_benchmark <new-database-path> [--scale N] [--runs N]
-//                             [--query qNN ...] [--plan]
+//                             [--batch-rows N] [--query qNN ...] [--plan]
+//                             [--audit] [--force]
 //
 // This harness is for engine workload measurement; it is not an official
 // TPC-DS result publication.
@@ -165,6 +166,13 @@ bool PrepareDatabasePath(const Options& options, std::string* error) {
     *error = "cannot remove database: " + ec.message();
     return false;
   }
+  // A legacy (non-segmented) WAL lives in the base .log file. Leaving it
+  // behind makes Logger try MigrateLegacyLog on the fresh database and replay
+  // records from the previous generation.
+  if (!std::filesystem::remove(log_path, ec) && ec) {
+    *error = "cannot remove WAL: " + ec.message();
+    return false;
+  }
   if (!std::filesystem::remove(checkpoint_path, ec) && ec) {
     *error = "cannot remove checkpoint: " + ec.message();
     return false;
@@ -287,6 +295,9 @@ struct QueryProfile {
 };
 
 size_t CountOccurrences(std::string_view text, std::string_view needle) {
+  if (needle.empty()) {
+    return 0;  // Otherwise find(needle, pos) never advances past pos.
+  }
   size_t count = 0;
   for (size_t position = text.find(needle); position != std::string_view::npos;
        position = text.find(needle, position + needle.size())) {

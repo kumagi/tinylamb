@@ -338,6 +338,8 @@ struct ProgramShape {
   uint16_t extract_date_part{0};
   int32_t mul_col0{-1};
   int32_t mul_col1{-1};
+  int32_t coalesce_mul_col0{-1};
+  int32_t coalesce_mul_col1{-1};
   int32_t mul_one_minus_col0{-1};
   int32_t mul_one_minus_col1{-1};
   double mul_one_minus_const{1.0};
@@ -361,6 +363,7 @@ struct ProgramShape {
   enum class CaseValKind : uint8_t {
     kNone = 0,
     kIntConst1,
+    kDirectInt64Col,
     kDirectDoubleCol,
     kMulOneMinus,
     kDoubleArith,
@@ -381,13 +384,16 @@ struct ProgramShape {
     int32_t subtract{-1};
     BinaryOperation op{BinaryOperation::kEquals};
     int64_t constant{0};
+    bool is_date{false};
   };
   std::vector<IntCaseComparison> case_int_comparisons;
 
   [[nodiscard]] bool HasPairDirect() const noexcept {
     return direct_column >= 0 || extract_date_col >= 0 || mul_col0 >= 0 ||
-           mul_one_minus_col0 >= 0 || profit_col0 >= 0 ||
-           (case_cond != CaseCondKind::kNone && case_val != CaseValKind::kNone &&
+           coalesce_mul_col0 >= 0 || mul_one_minus_col0 >= 0 ||
+           profit_col0 >= 0 ||
+           (case_cond != CaseCondKind::kNone &&
+            case_val != CaseValKind::kNone &&
             case_val != CaseValKind::kDoubleArith);
   }
 };

@@ -19,7 +19,12 @@ bool LimitExecutor::NextInput(Row* dst, RowPosition* position,
       return false;
     }
   }
-  *dst = input_batch_.RowAt(input_offset_);
+  // Callers that only count skipped rows pass nullptr (the skip loop below
+  // uses a dummy Row today; position is already optional). Keep dst optional
+  // in the same way so that contract holds for future call sites.
+  if (dst != nullptr) {
+    *dst = input_batch_.RowAt(input_offset_);
+  }
   if (position != nullptr) {
     *position = input_batch_.PositionAt(input_offset_);
   }

@@ -13,10 +13,16 @@ namespace tinylamb {
 
 size_t MinMaxIndexExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
+  if (GetStatus() != Status::kSuccess) {
+    return 0;
+  }
   if (max_rows == 0 || emitted_) {
     return 0;
   }
-  emitted_ = true;
+  // emitted_ is set only once a row is actually produced. Setting it before
+  // reading the source would make a later retry after a source error return 0
+  // immediately instead of re-notifying the sticky failure (GetStatus()
+  // contract).
 
   // T3767: pull the source in vector-sized batches and probe the wanted
   // column through ColumnVector::IsNull.  The old loop asked for one row per
@@ -31,7 +37,10 @@ size_t MinMaxIndexExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
     const ColumnVector& column = batch.ColumnAt(value_slot_);
     for (size_t i = 0; i < batch.Size(); ++i) {
       if (!column.IsNull(i)) {
+        // Valid only because the source is ordered on value_slot_ (ascending
+        // for MIN / descending for MAX) -- see the constructor contract.
         destination->Append(Row({column.ValueAt(i)}));
+        emitted_ = true;
         return 1;
       }
     }
@@ -43,6 +52,7 @@ size_t MinMaxIndexExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
 
   // MIN/MAX over an empty or all-NULL input is one row containing NULL.
   destination->Append(Row({Value()}));
+  emitted_ = true;
   return 1;
 }
 

@@ -108,15 +108,25 @@ def main() -> int:
                 # are swept recursively, but only with --fuzz-artifacts.
                 if (entry.is_dir() and args.fuzz_artifacts
                         and is_artifact(entry.name, True)):
+                    # .fuzz_findings* is an add-only evidence store: retiring a
+                    # finding must go through `fuzz_collector.py --retire` so
+                    # retired.jsonl records the decision. A sweep must never
+                    # recursively delete it.
+                    if entry.name.startswith(".fuzz_findings"):
+                        print(f"kept (add-only findings store): {entry}/")
+                        continue
                     try:
                         relative_dir = entry.resolve().relative_to(
                             repo_root.resolve())
                     except ValueError:
                         continue
-                    if tracked is not None and any(
+                    # When git failed, `tracked` is None: the tracked set is
+                    # unknown, so nothing may be deleted (same rule as the
+                    # regular-file branch below).
+                    if tracked is None or any(
                             f.startswith(str(relative_dir) + os.sep)
                             for f in tracked):
-                        continue  # a versioned findings dir that merely matches
+                        continue  # unknown or versioned findings dir
                     verb = "would remove" if args.dry_run else "removed"
                     print(f"{verb}: {entry}/")
                     if not args.dry_run:

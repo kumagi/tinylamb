@@ -145,9 +145,8 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
     return hybrid_partitions_ != 0 ? hybrid_partitions_
                                    : kDefaultHybridPartitions;
   }
-  [[nodiscard]] JoinKind Kind() const {
-    return kind_;
-  }  // Non-null only when a join key is null-safe; parallels left_cols_/
+  [[nodiscard]] JoinKind Kind() const { return kind_; }
+  // Non-null only when a join key is null-safe; parallels left_cols_/
   // right_cols_. Passed to the key encoders so a NULL component hashes and
   // compares equal to another NULL (IS NOT DISTINCT FROM semantics) instead of
   // rejecting the row.

@@ -116,6 +116,12 @@ Status DecodeRowBlockPayload(uint32_t row_count, std::string_view payload,
 
 }  // namespace
 
+// Heap-owned VARCHAR/ARRAY payload bookkeeping (the StringPayload/
+// ArrayPayload headers and allocator overhead). Those structs are private to
+// value.cpp, so use a conservative bound rather than undercounting: the OOC
+// memory budget relies on this estimate.
+constexpr size_t kHeapPayloadOverhead = 96;
+
 size_t EstimateValueMemoryBytes(const Value& val) noexcept {
   size_t total = sizeof(Value);
   switch (val.type) {
@@ -127,14 +133,21 @@ size_t EstimateValueMemoryBytes(const Value& val) noexcept {
     case ValueType::kVarChar:
       // Count the full VARCHAR payload conservatively (including short
       // strings that may live in SSO) so string-heavy skew never undercounts.
-      total += val.value.varchar_value.size();
+      total += kHeapPayloadOverhead + val.value.varchar_value.size();
       break;
-    case ValueType::kArray:
-      total += val.ArrayElementSqlType().size();
-      for (const Value& elem : val.ArrayElements()) {
+    case ValueType::kArray: {
+      const auto& elements = val.ArrayElements();
+      total += kHeapPayloadOverhead + val.ArrayElementSqlType().size();
+      // Live elements are counted recursively below; only the vector's spare
+      // capacity is extra heap memory that would otherwise be missed.
+      if (elements.capacity() > elements.size()) {
+        total += (elements.capacity() - elements.size()) * sizeof(Value);
+      }
+      for (const Value& elem : elements) {
         total += EstimateValueMemoryBytes(elem);
       }
       break;
+    }
   }
   return total;
 }
@@ -175,7 +188,10 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
   switch (vt) {
     case ValueType::kNull: {
       Value out;
-      out.SetCollation(collation);
+      // Tag 3 is the unsigned marker, not a collation: applying it to a NULL
+      // would make IsUnsigned() true on a NULL value. Other collation tags
+      // are meaningful on NULL and round-trip by contract.
+      out.SetCollation(collation == 3 ? 0 : collation);
       return out;
     }
     case ValueType::kInt64: {
@@ -369,10 +385,20 @@ StatusOr<bool> ReadRowBlock(SpillSegmentReader* reader,
   std::string* buf = (scratch_buffer != nullptr) ? scratch_buffer : &local;
   buf->resize(payload_bytes);
   if (payload_bytes > 0) {
-    RETURN_IF_FAIL(reader->ReadExact(buf->data(), payload_bytes));
+    const Status read = reader->ReadExact(buf->data(), payload_bytes);
+    if (read != Status::kSuccess) {
+      // Do not leave a resized scratch buffer full of stale bytes after a
+      // failed read: mirror WriteRowBlock's clear-on-failure contract.
+      buf->clear();
+      return read;
+    }
   }
-  RETURN_IF_FAIL(
-      DecodeRowBlockPayload(row_count, std::string_view(*buf), rows_out));
+  const Status decoded =
+      DecodeRowBlockPayload(row_count, std::string_view(*buf), rows_out);
+  if (decoded != Status::kSuccess) {
+    buf->clear();
+    return decoded;
+  }
   return true;
 }
 

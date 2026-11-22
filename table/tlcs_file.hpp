@@ -72,8 +72,17 @@ class TlcsFile {
  public:
   static constexpr uint64_t kDefaultResidentMmapLimitBytes = uint64_t{1}
                                                              << 30;  // 1 GiB
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 3;
   static constexpr uint32_t kDirGroupSize = 128;
+
+  struct ColumnSynopsis {
+    bool has_null{false};
+    bool is_monotonic{false};
+    bool is_unique_nonnull{false};
+    bool is_identity_1_to_n{false};
+    int64_t min_int{std::numeric_limits<int64_t>::max()};
+    int64_t max_int{std::numeric_limits<int64_t>::min()};
+  };
 
   struct DirGroupMeta {
     uint64_t group_offset{0};
@@ -250,6 +259,9 @@ class TlcsFile {
   [[nodiscard]] std::string_view SerializedColumnStats() const noexcept {
     return serialized_column_stats_;
   }
+  [[nodiscard]] uint32_t FormatVersion() const noexcept {
+    return format_version_;
+  }
   [[nodiscard]] StatusOr<uint32_t> BlockRowCount(uint32_t idx) const;
   [[nodiscard]] bool BlockAllRowsMatchPeek(
       uint32_t block_idx,
@@ -269,7 +281,7 @@ class TlcsFile {
   // first_value. The summary belongs to this immutable file.
   [[nodiscard]] StatusOr<std::shared_ptr<const IntFrequencies>>
   GetOrComputeIntFrequencies(slot_t col, const Schema& schema,
-                            bool allow_dense_range) const;
+                             bool allow_dense_range) const;
 
   [[nodiscard]] uint32_t FindBlockIndex(page_id_t pid) const noexcept;
 
@@ -277,6 +289,13 @@ class TlcsFile {
       uint32_t block_idx, const std::vector<IntegerPeekCompare>* peek_compares,
       const RuntimeFilterGroup* runtime_filter,
       std::optional<slot_t> runtime_filter_column) const noexcept;
+
+  // Reads the integer/date zone-map [min_out, max_out] for `(block_idx, col)`.
+  // Returns false if the block is empty, out of range, non-integer, or lacks
+  // min/max statistics (or if the directory group failed to load).
+  [[nodiscard]] bool BlockIntBounds(uint32_t block_idx, slot_t col,
+                                    int64_t* min_out,
+                                    int64_t* max_out) const noexcept;
 
   // Streaming decode of only `column_ids` for `block_idx` into caller-owned
   // reusable buffers (`out`, optional `io_scratch`). Safe to call concurrently
@@ -296,6 +315,18 @@ class TlcsFile {
       std::span<const uint8_t> varchar_lengths_only,
       bool read_projected_streams_directly = false,
       std::span<const uint32_t> varchar_rows = {}) const;
+
+  // Sparse O(|rows|) direct gather from resident mmap for fixed-width numeric
+  // encodings (kFor, kRawDouble, non-varchar kNarrowDict). Returns true on
+  // success (populating `out->columns[i]` with `rows.size()` dense entries),
+  // or false if mmap is unavailable or any requested column requires full
+  // block decode.
+  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  //   (gather_decode_commutes)
+  [[nodiscard]] bool TryGatherMmapFixedColumns(
+      uint32_t block_idx, std::span<const slot_t> column_ids,
+      std::span<const uint32_t> rows, const Schema& schema,
+      DecodedBlock* out) const;
 
   [[nodiscard]] uint32_t DirGroupCount() const noexcept {
     return static_cast<uint32_t>(dir_groups_.size());
@@ -380,7 +411,32 @@ class TlcsFile {
       const Schema& schema, const std::vector<slot_t>* projection,
       uint64_t effective_max_bytes, bool* capacity_rejected = nullptr) const;
 
+  [[nodiscard]] size_t EstimateColumnsCacheBytes(
+      const Schema& schema, const std::vector<slot_t>& columns) const;
+
+  [[nodiscard]] std::shared_ptr<const LSTableBlockLayout> BuildBlockLayout(
+      const Schema& schema, uint64_t generation,
+      bool* capacity_rejected = nullptr) const;
+
+  [[nodiscard]] std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>
+  BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
+                          const std::vector<slot_t>& columns,
+                          uint64_t effective_max_bytes,
+                          std::vector<slot_t>* rejected_cols = nullptr) const;
+
  private:
+  struct ColumnDecodePlan {
+    bool zero_copy_64{false};
+    bool need_int_vec{false};
+    uint64_t mapped_bytes{0};
+    uint64_t heap_bytes{0};
+  };
+
+  [[nodiscard]] bool LoadAllDirGroups(
+      std::vector<std::shared_ptr<const DirGroup>>* groups_out) const;
+  [[nodiscard]] ColumnDecodePlan PlanColumnDecode(
+      slot_t col, bool using_mmap,
+      const std::vector<std::shared_ptr<const DirGroup>>& groups) const;
   [[nodiscard]] static StatusOr<std::shared_ptr<TlcsFile>> OpenInternal(
       const std::string& path, const Schema* expected_schema,
       Schema* schema_out);
@@ -430,11 +486,13 @@ class TlcsFile {
   [[nodiscard]] std::shared_ptr<LSTableStore> BuildResidentStoreInternal(
       const Schema& schema, const std::vector<slot_t>* projection,
       uint64_t max_bytes,
-      const std::shared_ptr<const platform::MemoryMap>& mmap, bool* capacity_rejected = nullptr) const;
+      const std::shared_ptr<const platform::MemoryMap>& mmap,
+      bool* capacity_rejected = nullptr) const;
 
   std::string path_;
   int fd_{-1};
   uint64_t file_size_{0};
+  uint32_t format_version_{kFormatVersion};
   uint64_t layout_generation_{0};
   page_id_t first_pid_{0};
   uint64_t total_rows_{0};
@@ -454,6 +512,8 @@ class TlcsFile {
   std::string serialized_column_stats_;
   uint64_t stats_file_offset_{0};
   uint64_t stats_file_size_{0};
+  std::vector<ColumnSynopsis> col_synopses_;
+  bool has_col_synopses_{false};
 
   mutable std::mutex resident_mu_;
   mutable std::shared_ptr<const platform::MemoryMap> resident_mmap_;
@@ -512,6 +572,7 @@ struct PendingTlcsCommit {
   std::vector<LSTableColumnDictionary> dicts;
   std::vector<TlcsDictKind> dict_kinds;
   std::string serialized_column_stats;
+  std::vector<TlcsFile::ColumnSynopsis> col_synopses;
 
   PendingTlcsCommit() = default;
   PendingTlcsCommit(const PendingTlcsCommit&) = delete;

@@ -100,11 +100,22 @@ size_t EstimatedBuildBytes(const Plan& right_src) {
   return SaturatingMul(right_src->EmitRowCount(), kHashJoinRowBytesEstimate);
 }
 
-// Resolves a (possibly relation-aliased) column name against `schema`,
-// ignoring the qualifier. Returns nullptr when the column is absent.
+// Resolves a column name against `schema`. An explicit qualifier is honoured
+// whenever it resolves: a join input can carry two columns with the same name
+// from different relations (a self join, or two unaliased tables sharing a
+// field name), and dropping the qualifier would grab the first match -- maybe
+// the other side -- defeating the type and range-column identity checks in
+// SetLookupRange. Falls back to a name-only match for a query alias that does
+// not name the physical schema.
 const Column* ResolveUnqualified(const Schema& schema,
                                  const ColumnName& column) {
-  const int offset = schema.Offset(ColumnName("", column.name));
+  int offset = -1;
+  if (!column.schema.empty()) {
+    offset = schema.Offset(column);
+  }
+  if (offset < 0) {
+    offset = schema.Offset(ColumnName("", column.name));
+  }
   if (offset < 0) {
     return nullptr;
   }
@@ -317,10 +328,14 @@ size_t EstimatedJoinRowCount(JoinKind kind, size_t left_rows, size_t right_rows,
   if (IsFullOuterJoinKind(kind)) {
     const size_t matched_left = std::min(left_rows, matches);
     const size_t matched_right = std::min(right_rows, matches);
+    // Full outer emits every matched pair plus each side's unmatched rows.
+    // The pair term must be `matches` itself: in a many-to-many match it
+    // exceeds either input's row count, and charging only `matched_left`
+    // pair-slots drops the surplus pairs from the estimate.
     const size_t paired = SaturatingAdd(
-        matched_left,
+        matches,
         SaturatingAdd(left_rows - matched_left, right_rows - matched_right));
-    return std::max(matches, paired);
+    return paired;
   }
   return matches;
 }
@@ -455,6 +470,10 @@ double SemiReductionKeptRows(double probe_rows, double build_rows,
   if (build_domain >= 1.0) {
     return build_rows * std::min(1.0, domain / build_domain);
   }
+  // No build-side statistics: the most the probe can admit is `domain`
+  // distinct build keys. `domain` saturates at build_rows only when the probe
+  // is not smaller than the build; SemiReductionIsProfitable already rejects
+  // such a probe up front, so this ceiling cannot mask a material shrink.
   return std::min(build_rows, domain);
 }
 
@@ -581,7 +600,9 @@ size_t ProductPlan::AccessRowCount() const {
   const size_t build_bytes = EstimatedBuildBytes(right_src_);
   if (hash_mode_ == HashJoinMode::kHybrid) {
     // Hybrid pays spill I/O on non-resident partitions (~1.5x scan cost).
-    return base + (base / 2);
+    // Saturate like every other branch: `base` can already be SIZE_MAX, and a
+    // plain add would wrap to a tiny estimate that makes hybrid look cheapest.
+    return SaturatingAdd(base, base / 2);
   }
   // Penalize in-memory hash when the build side clearly will not fit so
   // Cascades prefers HybridHashJoin.

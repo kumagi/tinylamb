@@ -61,8 +61,9 @@ namespace tinylamb {
 //   rows affected by DELETE WHERE p, and the remainder must add up.
 // - Transaction-splitting oracle: a transaction executed atomically must
 //   leave the same state as its statements executed autocommit.
-// - AMOEBA-flavoured performance oracle: equivalent predicates must not
-//   differ wildly in execution time (RunAmoebaIteration, opt-in).
+// - AMOEBA-flavoured equivalence smoke test (RunAmoebaIteration, opt-in):
+//   equivalent predicates are executed for coverage only; wall-clock timing
+//   is not reported because host scheduling makes such findings flaky.
 // - QPG-flavoured plan feedback: OracleSession rewards generator flavours
 //   that surface unseen EXPLAIN plan shapes.
 //

@@ -46,6 +46,16 @@ StatusOr<Value> TryCoerceArrayElement(Value value, std::string_view sql_type) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY<BOOL> element must be 0 or 1");
     }
+    if (value.type == ValueType::kDouble) {
+      // Accept the numeric BOOL literals 0.0 / 1.0 just like 0 / 1 so the
+      // spelling of a literal does not decide whether ARRAY<BOOL> parses.
+      const double d = value.value.double_value;
+      if (d == 0.0 || d == 1.0) {
+        return Value(static_cast<int64_t>(d));
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ARRAY<BOOL> element must be 0 or 1");
+    }
   }
   if (type == "FLOAT" || type == "FLOAT32" || type == "FLOAT64" ||
       type == "DOUBLE") {

@@ -21,11 +21,43 @@ namespace {
 
 uint64_t HashGroupKeyRow(const Row& key) { return std::hash<Row>{}(key); }
 
+// Returns the aggregate when `aggregates` is exactly one plain DISTINCT
+// aggregate whose DISTINCT semantics the sorted skew fallback can reproduce
+// by feeding each distinct value once to a DISTINCT-stripped accumulator.
+// Every modifier the sorted path cannot replay disqualifies it: WHERE
+// filters, HAVING modifiers, inner ORDER BY/LIMIT, secondary/trailing args
+// and inner GROUP BY (NeedsGroupContext/HasInnerGroupBy cover them all).
+// Per-entry byte estimate for a live DISTINCT-set element when the skew
+// path charges group memory: an unordered_set node plus the Value payload
+// (varchar heap bytes are not introspectable, so this is a floor -- the
+// guard still bounds cardinality, which is the unbounded-growth axis).
+inline constexpr size_t kSkewDistinctEntryEstimateBytes = 128;
+
+// Only COUNT/SUM/AVG qualify: they are the non-idempotent-insensitive
+// aggregates whose distinct set is the only growing state, and a plain
+// non-distinct clone over deduplicated input yields the DISTINCT result.
+[[nodiscard]] const AggregateExpression* SingleStrippableDistinctAggregate(
+    const std::vector<const AggregateExpression*>& aggregates) noexcept {
+  if (aggregates.size() != 1 || aggregates[0] == nullptr) {
+    return nullptr;
+  }
+  const AggregateExpression* agg = aggregates[0];
+  const AggregationType t = agg->GetType();
+  if (!agg->Distinct() || agg->HasWhereFilter() || agg->NeedsGroupContext() ||
+      agg->HasInnerGroupBy() || agg->Child() == nullptr ||
+      (t != AggregationType::kCount && t != AggregationType::kSum &&
+       t != AggregationType::kAvg)) {
+    return nullptr;
+  }
+  return agg;
+}
+
 // Streams finished aggregate rows lazily from PartitionLeafSet one leaf at a
 // time so working memory stays <= B_op throughout Finalize -> NextBatch.
 // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
 // non-copyable by design
-class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguidelines-special-member-functions)
+class GroupAggLeafSource final
+    : public PipelineSource {  // NOLINT(cppcoreguidelines-special-member-functions)
  public:
   GroupAggLeafSource(
       SpillStore* store, PartitionLeafSet leaves, Schema input_schema,
@@ -34,6 +66,7 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
       std::vector<Expression> aggregate_owners,
       std::vector<const AggregateExpression*> aggregates, bool partial_mode,
       bool has_collection_agg, std::optional<slot_t> single_distinct_child_slot,
+      std::shared_ptr<AggregateExpression> skew_strip_aggregate,
       size_t budget_bytes, QueryMemoryGrant* grant,
       std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard,
       std::string label, std::shared_ptr<std::atomic<size_t>> output_groups)
@@ -47,6 +80,7 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
         partial_mode_(partial_mode),
         has_collection_agg_(has_collection_agg),
         single_distinct_child_slot_(single_distinct_child_slot),
+        skew_strip_aggregate_(std::move(skew_strip_aggregate)),
         budget_bytes_(budget_bytes),
         grant_(grant),
         consumer_guard_(std::move(consumer_guard)),
@@ -57,7 +91,16 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
       if (aggregates_[a] != nullptr) {
         shapes_[a] = relational_detail::AggregateAccumulator::AnalyzeShape(
             aggregates_[a], &input_schema_);
+        if (shapes_[a].distinct_mode) {
+          has_distinct_state_agg_ = true;
+        }
       }
+    }
+    if (skew_strip_aggregate_ != nullptr) {
+      // The skew table accumulates the DISTINCT-stripped clone instead of
+      // the original aggregate: the sorter already feeds each distinct
+      // value once, so the clone's plain state stays O(1) per group.
+      skew_table_aggregates_.push_back(skew_strip_aggregate_.get());
     }
     if (grant_ != nullptr) {
       const size_t refill =
@@ -169,6 +212,9 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
             store_, leaf, [&](Row&& raw) -> Status {
               ASSIGN_OR_RETURN(Row, key, ExtractKeyFromRaw(raw));
               const size_t before = table->size();
+              // FindOrCreate(Row) takes by value and stores the key in its own
+              // index node, so this local `key` is owned by the table and
+              // stays valid for the Accumulate below.
               ASSIGN_OR_RETURN(size_t, gid, table->FindOrCreate(key));
               if (table->size() > before) {
                 RETURN_IF_FAIL(account_new_group(key));
@@ -248,11 +294,8 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
 
   [[nodiscard]] bool UseSingleCountDistinctSort() const noexcept {
     return single_distinct_child_slot_.has_value() ||
-           (!partial_mode_ && aggregates_.size() == 1 &&
-            aggregates_[0] != nullptr && aggregates_[0]->Distinct() &&
-            !aggregates_[0]->HasWhereFilter() &&
-            aggregates_[0]->GetType() == AggregationType::kCount &&
-            aggregates_[0]->Child() != nullptr);
+           (!partial_mode_ &&
+            SingleStrippableDistinctAggregate(aggregates_) != nullptr);
   }
 
   void EnsureConsumerGuard() {
@@ -310,7 +353,8 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
     } else {
       // Raw mode: prefix sort keys as trailing columns [raw_cols...,
       // key_0..g-1]
-      // (+ optional distinct_val column for O(1) skewed COUNT(DISTINCT)).
+      // (+ optional distinct_val column for the O(1) skewed
+      // single-DISTINCT path).
       const size_t raw_width = input_schema_.ColumnCount();
       // T4853: the raw suffix indexes land in OocSortKey::column_index
       // (uint16); reject wrap-around instead of silently aliasing a low
@@ -401,8 +445,10 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
 
       if (have_active_skew_key_ &&
           !relational_detail::GroupKeyEqual{}(active_skew_key_, cur_key)) {
-        // Flush finished group before starting next group -> strictly O(1)
-        // active group memory regardless of partition skew!
+        // Flush the finished group before starting the next -> at most one
+        // group's state is resident regardless of partition skew. Per-group
+        // bytes are O(1) on the stripped-distinct path and budget-guarded
+        // (kTooBigData) for collection/distinct-state aggregates below.
         ASSIGN_OR_RETURN(Row, fin, skew_table_->Finish(0));
         out->Append(std::move(fin));
         skew_table_.reset();
@@ -413,8 +459,10 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
 
       if (!have_active_skew_key_) {
         active_skew_key_ = std::move(cur_key);
-        skew_table_ =
-            std::make_unique<AggregateGroupTable>(&input_schema_, &aggregates_);
+        skew_table_ = std::make_unique<AggregateGroupTable>(
+            &input_schema_, skew_strip_aggregate_ != nullptr
+                                ? &skew_table_aggregates_
+                                : &aggregates_);
         ASSIGN_OR_RETURN(size_t, gid,
                          skew_table_->FindOrCreate(active_skew_key_));
         (void)gid;
@@ -434,8 +482,9 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
         }
       } else if (UseSingleCountDistinctSort()) {
         // Sorted by (group_key, distinct_val): deduplicate adjacent equal
-        // distinct_vals in O(1) memory instead of materializing a
-        // distinct-value set!
+        // distinct_vals and feed each once into the DISTINCT-stripped
+        // skew-table clone, so the accumulator keeps O(1) state per group
+        // instead of materializing a distinct-value set!
         const Value& dval = sorted_row[skew_raw_width_ + gcnt];
         if (!dval.IsNull()) {
           if (!have_prev_distinct_ || !relational_detail::DistinctValueEqual{}(
@@ -447,14 +496,38 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
         }
       } else {
         sorted_row.values_.resize(skew_raw_width_);
-        skew_group_bytes_ += EstimateRowMemoryBytes(sorted_row);
-        if (has_collection_agg_ && budget_bytes_ > 0 &&
-            skew_group_bytes_ > budget_bytes_) {
+        RETURN_IF_FAIL(skew_table_->Accumulate(0, sorted_row));
+        size_t accounted_bytes = 0;
+        if (has_collection_agg_) {
+          // Collection aggregates (ARRAY_AGG/STRING_AGG) buffer every input
+          // row, so the raw-row byte estimate is the retained-state size.
+          skew_group_bytes_ += EstimateRowMemoryBytes(sorted_row);
+          accounted_bytes += skew_group_bytes_;
+        }
+        if (has_distinct_state_agg_) {
+          // DISTINCT accumulators retain one set entry per distinct value,
+          // not per row: charging raw row bytes would reject
+          // duplicate-heavy inputs whose real footprint is tiny. Charge the
+          // live distinct-set cardinalities instead (a stripped single
+          // DISTINCT aggregate never reaches this branch -- its clone is
+          // not distinct_mode).
+          size_t entries = 0;
+          for (size_t a = 0; a < aggregates_.size(); ++a) {
+            if (aggregates_[a] == nullptr || !shapes_[a].distinct_mode) {
+              continue;
+            }
+            const relational_detail::AggregateAccumulator& st =
+                skew_table_->StateFor(0, a);
+            entries += st.DistinctIntCount() + st.DistinctValueCount();
+          }
+          accounted_bytes += entries * kSkewDistinctEntryEstimateBytes;
+        }
+        if ((has_collection_agg_ || has_distinct_state_agg_) &&
+            budget_bytes_ > 0 && accounted_bytes > budget_bytes_) {
           return StatusError(
               StatusCode::kTooBigData,
               "Single aggregate group exceeds operator memory budget");
         }
-        RETURN_IF_FAIL(skew_table_->Accumulate(0, sorted_row));
       }
     }
     return Status::kSuccess;
@@ -473,6 +546,13 @@ class GroupAggLeafSource final : public PipelineSource {  // NOLINT(cppcoreguide
   bool partial_mode_{false};
   bool has_collection_agg_{false};
   std::optional<slot_t> single_distinct_child_slot_;
+  // Owned DISTINCT-stripped clone used by the skew table when the whole
+  // aggregate list is one plain DISTINCT aggregate (see
+  // SingleStrippableDistinctAggregate). Non-null implies the skew path is
+  // the sorted single-distinct path, so its per-group state stays O(1).
+  std::shared_ptr<AggregateExpression> skew_strip_aggregate_;
+  std::vector<const AggregateExpression*> skew_table_aggregates_;
+  bool has_distinct_state_agg_{false};
   size_t budget_bytes_{0};
   QueryMemoryGrant* grant_{nullptr};
   std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard_;
@@ -539,6 +619,7 @@ OocGroupAggSink::~OocGroupAggSink() {
 Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
   consumer_guard_.emplace(&ctx->grant);
   budget_bytes_ = ctx->OperatorBudgetBytes();
+  partition_key_status_ = Status::kSuccess;
   const size_t refill =
       budget_bytes_ > 0
           ? std::min<size_t>(
@@ -555,7 +636,9 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
       // T4853: schema offsets also feed slot_t; keep a too-wide schema
       // column out of the fast-path slot list rather than wrapping it.
       if (offset >= 0 &&
-          static_cast<uint64_t>(offset) <= std::numeric_limits<slot_t>::max()) {  // NOLINT(modernize-use-integer-sign-comparison)
+          static_cast<uint64_t>(offset) <=
+              std::numeric_limits<slot_t>::
+                  max()) {  // NOLINT(modernize-use-integer-sign-comparison)
         group_key_slots_[i] = static_cast<slot_t>(offset);
       }
     }
@@ -588,19 +671,28 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
     }
   }
 
-  // Detect single COUNT/SUM/etc.(DISTINCT col) for O(1) sorted skew fallback.
+  // Detect a single plain COUNT/SUM/AVG(DISTINCT expr) for the O(1) sorted
+  // skew fallback: the sorter feeds each distinct value once, so the skew
+  // table accumulates a DISTINCT-stripped clone whose state stays O(1).
   single_distinct_child_slot_.reset();
-  if (aggregates_.size() == 1 && aggregates_[0] != nullptr &&
-      aggregates_[0]->Distinct() && !aggregates_[0]->HasWhereFilter() &&
-      aggregates_[0]->GetType() == AggregationType::kCount &&
-      aggregates_[0]->Child() &&
-      aggregates_[0]->Child()->Type() == TypeTag::kColumnValue) {
-    const int off = input_schema_.Offset(
-        aggregates_[0]->Child()->AsColumnValue().GetColumnName());
-    // T4853: same uint16 bound as the group-key slots above.
-    if (off >= 0 &&
-        static_cast<uint64_t>(off) <= std::numeric_limits<slot_t>::max()) {  // NOLINT(modernize-use-integer-sign-comparison)
-      single_distinct_child_slot_ = static_cast<slot_t>(off);
+  skew_strip_aggregate_.reset();
+  const AggregateExpression* strip_agg =
+      SingleStrippableDistinctAggregate(aggregates_);
+  if (strip_agg != nullptr) {
+    auto stripped = std::make_shared<AggregateExpression>(
+        strip_agg->GetType(), strip_agg->Child(), false);
+    stripped->SetIgnoreNulls(strip_agg->IgnoreNulls());
+    skew_strip_aggregate_ = std::move(stripped);
+    if (strip_agg->Child()->Type() == TypeTag::kColumnValue) {
+      const int off = input_schema_.Offset(
+          strip_agg->Child()->AsColumnValue().GetColumnName());
+      // T4853: same uint16 bound as the group-key slots above.
+      if (off >= 0 &&
+          static_cast<uint64_t>(off) <=
+              std::numeric_limits<slot_t>::
+                  max()) {  // NOLINT(modernize-use-integer-sign-comparison)
+        single_distinct_child_slot_ = static_cast<slot_t>(off);
+      }
     }
   }
 
@@ -677,7 +769,13 @@ Status OocGroupAggSink::TransitionNonCombinableToSpill(PipelineContext* ctx) {
   partitioner_ = std::make_unique<RecursivePartitioner>(
       opts, [this](const Row& raw) -> uint64_t {
         Row key;
-        if (ExtractCanonicalGroupKeys(raw, &key) != Status::kSuccess) {
+        Status st = ExtractCanonicalGroupKeys(raw, &key);
+        if (st != Status::kSuccess) {
+          // The hash functor cannot return Status. Remember the first failure
+          // so Finalize surfaces it instead of producing a wrong grouping.
+          if (partition_key_status_.ok()) {
+            partition_key_status_ = st;
+          }
           return 0;
         }
         return HashGroupKeyRow(key);
@@ -866,10 +964,15 @@ StatusOr<std::shared_ptr<PipelineSource>> OocGroupAggSink::Finalize(
   }
 
   if (all_combinable_) {
+    // Flush the last partial table. An empty table is a no-op; groups flushed
+    // by earlier Consume calls are already in the partitioner, so an empty
+    // LeafSet here only happens for genuinely empty grouped input (which
+    // correctly yields zero groups).
     RETURN_IF_FAIL(FlushPartialTableToPartitioner());
   }
   PartitionLeafSet leaves;
   RETURN_IF_FAIL(partitioner_->Finalize(&leaves));
+  RETURN_IF_FAIL(partition_key_status_);
   partitioner_.reset();
   if (grant_cache_.has_value()) {
     grant_cache_->ReleaseAll();
@@ -882,8 +985,9 @@ StatusOr<std::shared_ptr<PipelineSource>> OocGroupAggSink::Finalize(
   return std::make_shared<GroupAggLeafSource>(
       &ctx->spill_store, std::move(leaves), input_schema_, group_keys_,
       group_key_slots_, aggregate_owners_, aggregates_, all_combinable_,
-      has_collection_agg_, single_distinct_child_slot_, budget_bytes_,
-      &ctx->grant, std::move(leaf_guard), label_ + "Output", output_groups_);
+      has_collection_agg_, single_distinct_child_slot_, skew_strip_aggregate_,
+      budget_bytes_, &ctx->grant, std::move(leaf_guard), label_ + "Output",
+      output_groups_);
 }
 
 StatusOr<std::shared_ptr<PipelineSource>>
@@ -926,9 +1030,15 @@ OocGroupAggSink::TryConsumeExactRowCount(PipelineContext* /*ctx*/,
 
 void OocGroupAggSink::Explain(std::ostream& out, int indent) const {
   const std::string pad(static_cast<size_t>(std::max(0, indent)), ' ');
+  // After a spill the real path is GroupAggLeafSource over sorted partition
+  // streams (merging partial states when all_combinable_, re-folding raw rows
+  // otherwise), not the in-memory hash table.
+  const char* strategy = group_keys_.empty() ? "scalar"
+                         : spilled_
+                             ? (all_combinable_ ? "sort-combine" : "sort")
+                             : "hash";
   out << pad << (explain_header_.empty() ? label_ : explain_header_)
-      << " Aggregate strategy=" << (group_keys_.empty() ? "scalar" : "hash")
-      << "\n";
+      << " Aggregate strategy=" << strategy << "\n";
 }
 
 void OocGroupAggSink::DumpExplain(std::ostream& out, int indent) const {

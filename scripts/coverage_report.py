@@ -23,8 +23,8 @@ import os
 import subprocess
 import sys
 
-# This lcov caps how many error kinds a single --ignore-errors flag
-# accepts, so the kinds are split across two flags.
+# lcov accepts a comma-separated list per --ignore-errors flag; the kinds are
+# split into two flags only to keep each line short/readable.
 IGNORE_A = "negative,mismatch,unused,empty,corrupt,unsupported,format"
 IGNORE_B = "inconsistent,count,category,source,gcov"
 
@@ -60,7 +60,7 @@ def main() -> int:
     # report targets the production engine sources.
     remove = subprocess.run(
         ["lcov", "--remove", args.info, "*_test*", "*fuzzer*",
-         "*/benchmark/*", "*main.cpp", "*/build-*/_deps/*", "*/.freebuff/*"]
+         "*/benchmark/*", "*/main.cpp", "*/build-*/_deps/*", "*/.freebuff/*"]
         + ignore_flags
         + [f"--output-file={args.info}"],
         capture_output=True,

@@ -11,6 +11,10 @@ def window_metrics(points, start, duration):
         return None
     first, last = inside[0], inside[-1]
     elapsed = (last['time_ns'] - first['time_ns']) / 1e9
+    if elapsed <= 0:
+        # Duplicate timestamps give no measurement interval; every rate below
+        # would divide by zero (or describe an imaginary interval).
+        return None
     def delta(name): return last[name] - first[name]
     def per(name, count):
         return delta(name) / delta(count) / 1e6 if delta(count) else None
@@ -54,10 +58,13 @@ def main():
             continue
         entry = {k:r[k] for k in ('workload','clients','trial','seconds','tps','p50_ms','p95_ms','p99_ms','valid','errors')}
         entry['metrics'] = window_metrics(points, r['measure_start_monotonic'], r['seconds'])
-        entry['roles'] = r['role_tps']
+        # role_tps is HTAP-specific: older/foreign runs may omit it for plain
+        # OLTP workloads, and no role means no crossing counters either.
+        roles = r.get('role_tps', {})
+        entry['roles'] = roles
         entry['role_latency'] = r.get('role_latency')
         entry['crossing'] = {role:sum(w.get('crossing',0) for w in r['workers'] if w['role']==role)
-                             for role in r['role_tps']}
+                             for role in roles}
         records.append(entry)
     (a.directory / 'trial-metrics.json').write_text(json.dumps(records, indent=2))
     print(json.dumps(records, indent=2))

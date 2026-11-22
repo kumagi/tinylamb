@@ -90,7 +90,7 @@ TEST(PlanCacheParameterSlotTest, ResultTypeCoversAllValueTypes) {
       {ValueType::kVarChar, TypeTag::kVarChar},
       {ValueType::kDate, TypeTag::kDate},
       {ValueType::kArray, TypeTag::kArray},
-      {ValueType::kNull, TypeTag::kInvalid},
+      {ValueType::kNull, TypeTag::kBigInt},
   };
   for (const auto& [value_type, tag] : cases) {
     const ParameterSlot slot(0, value_type, values);
@@ -172,8 +172,7 @@ TEST(PlanCacheParameterSlotTest, ContainsParameterSlotWalksEveryNodeKind) {
   // The walkers descend into cast nodes: SlotizeLiterals still refuses to
   // parameterize inside a CAST today, but a slot that reaches one (hand-built
   // IR, a future slotizer) must be found and rebound, not silently kept.
-  EXPECT_TRUE(
-      ContainsParameterSlot(CastExpressionExp(slot(), "INT64", false)));
+  EXPECT_TRUE(ContainsParameterSlot(CastExpressionExp(slot(), "INT64", false)));
   // Nested two levels deep.
   EXPECT_TRUE(ContainsParameterSlot(
       BinaryExpressionExp(UnaryExpressionExp(slot(), UnaryOperation::kNot),
@@ -200,7 +199,11 @@ TEST(PlanCacheParameterSlotTest, CloneWithPreparedValuesRewritesSlotsInPlace) {
 
   Expression aggregate =
       AggregateExpressionExp(AggregationType::kSum, slot(), false);
-  EXPECT_NO_THROW((void)CloneWithPreparedValues(aggregate, values));
+  // Slots are rebound (not removed), so a successful descent is observed as
+  // the node being rebuilt rather than returned untouched.
+  Expression cloned_aggregate = CloneWithPreparedValues(aggregate, values);
+  EXPECT_NE(cloned_aggregate.get(), aggregate.get());
+  EXPECT_TRUE(ContainsParameterSlot(cloned_aggregate));
 
   Expression searched = CaseExpressionExp(
       {{slot(), ConstantValueExp(Value(int64_t{9}))}}, slot());
@@ -209,7 +212,9 @@ TEST(PlanCacheParameterSlotTest, CloneWithPreparedValuesRewritesSlotsInPlace) {
 
   Expression in_list =
       InExpressionExp(slot(), {slot(), ConstantValueExp(Value(int64_t{5}))});
-  EXPECT_NO_THROW((void)CloneWithPreparedValues(in_list, values));
+  Expression cloned_in_list = CloneWithPreparedValues(in_list, values);
+  EXPECT_NE(cloned_in_list.get(), in_list.get());
+  EXPECT_TRUE(ContainsParameterSlot(cloned_in_list));
 
   // A slot under a CAST is rebound too: CAST(42 AS INT64) evaluates to 42.
   Expression cast = CastExpressionExp(slot(), "INT64", false);

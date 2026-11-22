@@ -3,12 +3,12 @@
 - 状態: draft / 更新基準: `9ce7837` 上の作業ツリー (2026-10-06)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()`
   (`LateMaterializationAlternative`)
-- 実行器: `executor/late_materialization_join.cpp`
+- 実行器: `executor/relational_factory.cpp` 経由
   (`LateMaterializationJoinPlan::EmitExecutor`)
 
 ## 概要
 
-寬い (列数の多い) 右側表を、結合キー + RowPosition だけの狭い投影で
+広い (列数の多い) 右側表を、結合キー + RowPosition だけの狭い投影で
 ハッシュ結合し、生存した行だけを `RowPosition` で元表へ再シークして
 残りの列を遅延物質化します。ワイド行の hash build コストを
  Narrow キー表 + 生存行分のランダムアクセスに置き換えます。

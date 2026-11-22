@@ -344,7 +344,9 @@ class Transaction final {
     read_state_mutex_ = std::move(o.read_state_mutex_);
     serialization_scratch_ = std::move(o.serialization_scratch_);
     finish_hooks_ = std::move(o.finish_hooks_);
-    finish_hooks_finalized_ = o.finish_hooks_finalized_;
+    finish_hooks_finalized_.store(
+        o.finish_hooks_finalized_.load(std::memory_order_acquire),
+        std::memory_order_release);
     failed_.store(o.failed_.load(std::memory_order_acquire),
                   std::memory_order_release);
     // chain_mu_ is deliberately NOT transferred: every Transaction object
@@ -757,9 +759,7 @@ class Transaction final {
   // counter, so the abort path must bump the epoch for caches that were
   // stamped from the transaction-local catalog view to go stale.
   void MarkCatalogDirty() noexcept { catalog_dirty_ = true; }
-  [[nodiscard]] bool IsCatalogDirty() const noexcept {
-    return catalog_dirty_;
-  }
+  [[nodiscard]] bool IsCatalogDirty() const noexcept { return catalog_dirty_; }
   // Diagnostic (round 9): where this transaction is currently parked, set
   // just before each potentially-blocking engine wait (write-intent wait,
   // tail reservation wait, durability barrier, undo walk, WAL append) and
@@ -806,7 +806,7 @@ class Transaction final {
   Status PreCommit();
   // Commit publication without blocking this execution thread. The caller
   // must pass the returned own/dependency target to WaitForWalDurable and
-  // surface any failure BEFORE delivering results or a commit acknowledgement.
+  // surface any failure BEFORE delivering results or a commit acknowledgment.
   StatusOr<lsn_t> PrepareCommitForDurableReply();
   Status Abort();
 
@@ -1051,7 +1051,7 @@ class Transaction final {
   bool wal_reread_mode_{false};
   std::atomic<bool> has_log_{false};
   std::atomic<bool> has_table_drop_{false};
-  bool finish_hooks_finalized_{false};
+  std::atomic<bool> finish_hooks_finalized_{false};
   std::atomic<TransactionStatus> status_{TransactionStatus::kUnknown};
   std::atomic<bool> failed_{false};
   bool read_only_{false};

@@ -52,6 +52,7 @@
 #include "index_scan_plan.hpp"
 #include "merge_join_plan.hpp"
 #include "page/page_manager.hpp"
+#include "plan/optimizer_test.hpp"
 #include "product_plan.hpp"
 #include "projection_plan.hpp"
 #include "selection_plan.hpp"
@@ -138,7 +139,7 @@ class PlanTest : public ::testing::Test {
       ASSERT_SUCCESS(
           tbl.Insert(ctx.txn_, Row({Value(52), Value(53.4)})).GetStatus());
     }
-    rs_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0}));
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0})));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -167,18 +168,8 @@ class PlanTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
-namespace {
-
-// gtest ASSERT_TRUE is invisible to clang-tidy's dataflow, so the optional
-// probe is unwrapped through this helper: the assert keeps
-// bugprone-unchecked-optional-access quiet while the failure mode (abort in
-// debug, a benign static_cast in release) matches the tests' expectations.
-const LookupSeek& SeekOf(const std::optional<LookupSeek>& probe) {
-  assert(probe.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-  return *probe;
-}
-}  // namespace
+// SeekOf() is shared with optimizer_test.hpp (already included above), so the
+// clang-tidy optional-unwrap workaround lives in exactly one place.
 TEST_F(PlanTest, OuterJoinCardinalityDoesNotDoubleCountMatchedRows) {
   const Schema left_schema("left", {Column("id", ValueType::kInt64),
                                     Column("value", ValueType::kInt64)});
@@ -210,6 +201,27 @@ TEST_F(PlanTest, OuterJoinCardinalityDoesNotDoubleCountMatchedRows) {
                         {ColumnName("right", "id")}, JoinKind::kFullOuter, 12);
   EXPECT_EQ(many_left.EmitRowCount(), 12U);
   EXPECT_EQ(many_full.EmitRowCount(), 12U);
+}
+
+TEST_F(PlanTest, FullOuterJoinCardinalityCountsSurplusMatchedPairs) {
+  const Schema left_schema("left", {Column("id", ValueType::kInt64)});
+  const Schema right_schema("right", {Column("id", ValueType::kInt64)});
+  auto left = std::make_shared<ValuesPlan>(
+      left_schema,
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})});
+  std::vector<Row> right_rows;
+  for (int64_t i = 1; i <= 10; ++i) {
+    right_rows.emplace_back(Row({Value(i)}));
+  }
+  auto right =
+      std::make_shared<ValuesPlan>(right_schema, std::move(right_rows));
+
+  // Many-to-many estimate: 8 matched pairs against 3 left / 10 right rows.
+  // Full outer must emit 8 pairs + 0 unmatched left + 2 unmatched right = 10;
+  // charging matched_left pair-slots instead of `matches` yields 8.
+  ProductPlan full_join(left, {ColumnName("left", "id")}, right,
+                        {ColumnName("right", "id")}, JoinKind::kFullOuter, 8);
+  EXPECT_EQ(full_join.EmitRowCount(), 10U);
 }
 
 TEST_F(PlanTest, Construct) {
@@ -771,6 +783,29 @@ TEST_F(PlanTest, ProjectionTranslatesAliasedOrderKeysToChildExpressions) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
+TEST_F(PlanTest, ProjectionRejectsAmbiguousOrderKeys) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+  const Expression source_key = ColumnValueExp(ColumnName("Sc1.c1"));
+  Plan sorted = std::make_shared<SortPlan>(
+      std::make_shared<FullScanPlan>(*table, *stats),
+      std::vector<SortKey>{{source_key, true, std::nullopt}});
+  Plan projected = std::make_shared<ProjectionPlan>(
+      sorted, std::vector<NamedExpression>{
+                  NamedExpression("duplicate", source_key),
+                  NamedExpression("duplicate", ColumnValueExp("Sc1.c2")),
+                  NamedExpression("unique", source_key)});
+  const Expression duplicate = ColumnValueExp("duplicate");
+  const Expression unique = ColumnValueExp("unique");
+  EXPECT_FALSE(projected->IsOrderedBy({duplicate}, {true}));
+  EXPECT_FALSE(projected->IsOrderedBy({duplicate}, {true}, {std::nullopt}));
+  EXPECT_TRUE(projected->IsOrderedBy({unique}, {true}));
+  EXPECT_TRUE(projected->IsOrderedBy({unique}, {true}, {std::nullopt}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 TEST_F(PlanTest, CompositeIndexRangeUsesTrailingKeyWithDampedCorrelation) {
   auto ctx = rs_->BeginContext();
   const Schema schema("composite_range",
@@ -821,6 +856,27 @@ TEST_F(PlanTest, AuditAffineOrderingRejectsMultiplierOverflow) {
                           factor),
       BinaryOperation::kMultiply, factor);
   EXPECT_FALSE(scan.IsOrderedBy({key}, {true}));
+}
+
+TEST_F(PlanTest, IndexOnlyScanRejectsOrderWithTrailingDoubleKey) {
+  auto ctx = rs_->BeginContext();
+  const Schema schema("trailing_double", {Column("a", ValueType::kInt64),
+                                          Column("b", ValueType::kInt64),
+                                          Column("c", ValueType::kDouble)});
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(ctx, schema));
+  ASSERT_SUCCESS(table.CreateIndex(
+      ctx.txn_, IndexSchema("abc_idx", {0, 1, 2}, {}, IndexMode::kNonUnique)));
+  TableStatistics stats(schema);
+  const ColumnName b("trailing_double.b");
+  const ColumnName c("trailing_double.c");
+  IndexOnlyScanPlan scan(table, table.GetIndex(0), stats, {Value(1)},
+                         {Value(1)}, true, nullptr, {b, c});
+  EXPECT_TRUE(scan.IsOrderedBy({ColumnValueExp(b)}, {true}));
+  EXPECT_FALSE(
+      scan.IsOrderedBy({ColumnValueExp(b), ColumnValueExp(c)}, {true, true}));
+  EXPECT_FALSE(scan.IsOrderedBy({ColumnValueExp(b), ColumnValueExp(c)},
+                                {true, true}, {true, true}));
+  ASSERT_SUCCESS(ctx.PreCommit());
 }
 
 TEST_F(PlanTest, DoubleKeyIndexDoesNotAdvertiseNaNIncompatibleOrder) {
@@ -1205,7 +1261,9 @@ TEST_F(PlanTest, NullSafeIndexJoinShapeFallsBackToHashJoin) {
           *tbl1_or.Value(), TableStatistics(tbl1_or.Value()->GetSchema())),
       {ColumnName("Sc1.c1")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
       {ColumnName("Sc2.d1")}, *stats2_or.Value()));
-  static_cast<ProductPlan&>(*prop).SetJoinNotes({true}, Expression());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  static_cast<ProductPlan&>(*prop).SetJoinNotes(
+      {true},
+      Expression());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   Executor executor = prop->EmitExecutor(ctx);
   std::ostringstream dump;
   executor->Dump(dump, 0);
@@ -1241,7 +1299,8 @@ TEST_F(PlanTest, LookupProbeDerivesPrefixInIndexKeyOrder) {
       *reloaded.Value(), reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d4"), ColumnName("Sc2.d1"), ColumnName("Sc2.d3")},
       *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(*plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  auto& product = static_cast<ProductPlan&>(
+      *plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   const std::optional<LookupSeek>& probe = product.Lookup();
   ASSERT_TRUE(probe.has_value());
   assert(probe.has_value());
@@ -1294,7 +1353,8 @@ TEST_F(PlanTest, LookupRangeAcceptsOnlyInt64AndDate) {
       {ColumnName("Sc1.c1"), ColumnName("Sc1.c2")}, *reloaded.Value(),
       reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d1"), ColumnName("Sc2.d3")}, *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(*plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  auto& product = static_cast<ProductPlan&>(
+      *plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
   // The bound has to land on the index key column at that offset; d3 is a
   // plain column of the table, so a bound there cannot order the seek.
@@ -1370,7 +1430,8 @@ TEST_F(PlanTest, LookupRangeRejectsNonWhitelistedKeyColumnType) {
       {ColumnName("Sc1.c1"), ColumnName("Sc1.c3")}, *reloaded.Value(),
       reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d1"), ColumnName("Sc2.d4")}, *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(*plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  auto& product = static_cast<ProductPlan&>(
+      *plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
   // d3 is the right index key column at that offset and both operands are
   // VARCHAR, but
@@ -1401,7 +1462,9 @@ TEST_F(PlanTest, LookupSeekIsAbsentWithoutALeadingKeyJoinColumn) {
       std::make_shared<FullScanPlan>(*tbl1_or.Value(), left_stats),
       {ColumnName("Sc1.c3")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
       {ColumnName("Sc2.d4")}, *stats2_or.Value()));
-  EXPECT_EQ(static_cast<ProductPlan&>(*plan).Lookup(), std::nullopt);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  EXPECT_EQ(
+      static_cast<ProductPlan&>(*plan).Lookup(),
+      std::nullopt);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   Executor executor = plan->EmitExecutor(ctx);
   std::ostringstream dump;
   executor->Dump(dump, 0);

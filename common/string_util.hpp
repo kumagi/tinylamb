@@ -156,7 +156,7 @@ template <typename T>
       ++i;
       continue;
     }
-    if (lead >= 0xC2 && lead < 0xDF) {
+    if (lead >= 0xC2 && lead <= 0xDF) {
       continuation_count = 1;
     } else if (lead >= 0xE0 && lead < 0xF0) {
       continuation_count = 2;
@@ -197,16 +197,16 @@ template <typename T>
 // intact because TrimCodePoints matches whole code points.
 inline constexpr char kDefaultTrimCutset[] =
     " \t\n\v\f\r"
-    "\xC2\x85"  // U+0085 NEXT LINE
-    "\xC2\xA0"  // U+00A0 NO-BREAK SPACE
+    "\xC2\x85"      // U+0085 NEXT LINE
+    "\xC2\xA0"      // U+00A0 NO-BREAK SPACE
     "\xE1\x9A\x80"  // U+1680 OGHAM SPACE MARK
     "\xE2\x80\x80\xE2\x80\x81\xE2\x80\x82\xE2\x80\x83\xE2\x80\x84"
     "\xE2\x80\x85\xE2\x80\x86\xE2\x80\x87\xE2\x80\x88\xE2\x80\x89"
-    "\xE2\x80\x8A"  // U+2000..U+200A
+    "\xE2\x80\x8A"              // U+2000..U+200A
     "\xE2\x80\xA8\xE2\x80\xA9"  // U+2028 LINE / U+2029 PARAGRAPH SEPARATOR
-    "\xE2\x80\xAF"  // U+202F NARROW NO-BREAK SPACE
-    "\xE2\x81\x9F"  // U+205F MEDIUM MATHEMATICAL SPACE
-    "\xE3\x80\x80";  // U+3000 IDEOGRAPHIC SPACE
+    "\xE2\x80\xAF"              // U+202F NARROW NO-BREAK SPACE
+    "\xE2\x81\x9F"              // U+205F MEDIUM MATHEMATICAL SPACE
+    "\xE3\x80\x80";             // U+3000 IDEOGRAPHIC SPACE
 
 [[nodiscard]] inline std::string_view TrimCodePoints(std::string_view text,
                                                      std::string_view cutset,

@@ -17,7 +17,9 @@ namespace tinylamb {
 namespace {
 
 bool ParseLocation(std::string& label, size_t* start, size_t* end) {
-  if (label.empty() || label.back() != ']') {
+  // A location is at least " [n-m]" (six bytes); keep the length check here
+  // so label.size() - 2 below can never wrap on a truncated dump.
+  if (label.size() < 6 || label.back() != ']') {
     return false;
   }
   const size_t open = label.rfind(" [");
@@ -27,9 +29,6 @@ bool ParseLocation(std::string& label, size_t* start, size_t* end) {
   // The end offset follows the LAST '-' in the location range.
   const size_t dash = label.rfind('-', label.size() - 2);
   if (dash == std::string::npos || dash < open + 2) {
-    return false;
-  }
-  if (dash == std::string::npos) {
     return false;
   }
   const char* first = label.data() + open + 2;
@@ -82,15 +81,20 @@ bool LabelContinues(std::string_view label) {
       label.starts_with("BytesLiteral(") ||
       label.starts_with("BytesLiteralComponent(")) {
     size_t cursor = label.find('(') + 1;
+    // Only r/R makes a literal raw. b/B (bytes) still processes backslash
+    // escapes, so treating it as raw skips escaped quotes and can mistake a
+    // `b'''a\''` line for a closed triple-quoted literal.
+    bool raw_prefix = false;
     while (cursor < label.size() &&
            (label[cursor] == 'r' || label[cursor] == 'R' ||
             label[cursor] == 'b' || label[cursor] == 'B')) {
+      raw_prefix = raw_prefix || label[cursor] == 'r' || label[cursor] == 'R';
       ++cursor;
     }
     if (cursor >= label.size()) {
       return true;
     }
-    const bool raw = cursor > label.find('(') + 1;
+    const bool raw = raw_prefix;
     const char quote = label[cursor];
     if (quote != '\'' && quote != '"') {
       return false;
@@ -112,9 +116,32 @@ bool LabelContinues(std::string_view label) {
     }
     return true;
   }
+  // Only structural parentheses count. A quoted detail — most notably a
+  // backtick identifier such as `a(` — may itself contain an unbalanced '(';
+  // counting it makes a complete line like "Identifier(`a(`) [7-11]" look
+  // unfinished, so the join loop below absorbs every following line and
+  // silently truncates the tree. Skip quoted spans before counting. (The
+  // StringLiteral/BytesLiteral spellings above need their own handling because
+  // their detail can be cut at a newline before the closing quote.)
   size_t open = 0;
   size_t close = 0;
-  for (const char c : label) {
+  for (size_t i = 0; i < label.size(); ++i) {
+    const char c = label[i];
+    if (c == '\'' || c == '"' || c == '`') {
+      const char quote = c;
+      ++i;
+      while (i < label.size()) {
+        if (label[i] == '\\') {
+          i += 2;  // escaped character inside the quoted span
+          continue;
+        }
+        if (label[i] == quote) {
+          break;
+        }
+        ++i;
+      }
+      continue;
+    }
     if (c == '(') {
       ++open;
     } else if (c == ')') {
@@ -129,9 +156,16 @@ bool LabelContinues(std::string_view label) {
 const GoogleSqlAstNode* GoogleSqlAstNode::Child(std::string_view child_kind,
                                                 size_t occurrence) const {
   for (const auto& child : children) {
-    if (child->kind == child_kind && occurrence-- == 0) {
+    if (child->kind != child_kind) {
+      continue;
+    }
+    // Stop at the requested occurrence without decrementing past zero: a
+    // post-decrement on every match would eventually wrap a size_t counter
+    // and return the wrong child for huge occurrence values.
+    if (occurrence == 0) {
       return child.get();
     }
+    --occurrence;
   }
   return nullptr;
 }
@@ -218,7 +252,6 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       parents.resize(depth + 1);
     }
     parents[depth] = raw;
-    parents.resize(depth + 1);
     previous_depth = depth;
   }
   if (!root) {

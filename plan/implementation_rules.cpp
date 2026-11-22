@@ -154,11 +154,10 @@ size_t RowEstimate(double rows);
 struct Range {
   std::optional<Value> min;
   std::optional<Value> max;
-  // NOTE: these inclusivity flags are currently write-only; effective range
-  // keys are always inclusive and the scan rechecks the original predicate.
-  bool min_inclusive{false};
-  bool max_inclusive{false};
-
+  // Bounds are only index seek keys (always inclusive); the scan rechecks the
+  // original predicate, so the planner deliberately does not distinguish open
+  // from closed endpoints. `<` and `<=` therefore share one estimate and no
+  // inclusivity state needs to be carried here.
   enum class Direction : bool { kRight, kLeft };
 
   void Update(BinaryOperation operation, const Value& value,
@@ -175,9 +174,13 @@ struct Range {
     switch (operation) {
       case BinaryOperation::kEquals:
         min = max = value;
-        min_inclusive = max_inclusive = true;
         return;
       case BinaryOperation::kNotEquals:
+        // `a != v` removes a point, not a prefix: one inclusive [min,max] seek
+        // envelope cannot express both remaining sides. Widening one side to
+        // cover the hole would change the rows actually visited, so leave the
+        // bounds alone and let the residual recheck drop v. The row estimate
+        // is intentionally conservative here (see ReboundIndexKeys' twin).
         return;
       case BinaryOperation::kLessThan:
       case BinaryOperation::kGreaterThan: {
@@ -189,12 +192,10 @@ struct Range {
           if (!max || value < *max) {
             max = value;
           }
-          max_inclusive = false;
         } else {
           if (!min || *min < value) {
             min = value;
           }
-          min_inclusive = false;
         }
         return;
       }
@@ -204,15 +205,15 @@ struct Range {
                             operation == BinaryOperation::kLessThanEquals) ||
                            (direction == Direction::kLeft &&
                             operation == BinaryOperation::kGreaterThanEquals);
+        // Same bounds as the strict form: endpoint inclusivity is enforced by
+        // the residual predicate, not by the seek key.
         if (upper) {
-          if (!max || value < *max || (value == *max && !max_inclusive)) {
+          if (!max || value < *max) {
             max = value;
-            max_inclusive = true;
           }
         } else {
-          if (!min || *min < value || (*min == value && !min_inclusive)) {
+          if (!min || *min < value) {
             min = value;
-            min_inclusive = true;
           }
         }
         return;
@@ -318,13 +319,10 @@ std::optional<std::pair<std::string, std::string>> LikePrefixBounds(
       return std::nullopt;
     }
   }
+  // All bytes are ASCII (< 0x80) by the check above, so incrementing the last
+  // byte can never carry. A multi-byte carry/0xff-stripping loop would be
+  // unreachable here; the result is still a valid single-byte upper bound.
   std::string upper(prefix);
-  while (!upper.empty() && static_cast<unsigned char>(upper.back()) == 0xff) {
-    upper.pop_back();
-  }
-  if (upper.empty()) {
-    return std::nullopt;
-  }
   ++upper.back();
   return std::pair{std::string(prefix), std::move(upper)};
 }
@@ -374,7 +372,7 @@ Expression QualifyDown(
   for (const Expression& child : ExpressionChildren(expression)) {
     children.push_back(QualifyDown(child, relation, physical));
   }
-  return WithExpressionChildren(expression, children);
+  return WithExpressionChildren(expression, std::move(children));
 }
 
 // Drops relation qualifiers from column references.  The pushed group filter
@@ -472,14 +470,20 @@ double EstimateDistinctRows(const Plan& input,
   std::vector<size_t> offsets;
   offsets.reserve(columns.size());
   for (const Expression& column : columns) {
+    // A single renamed/derived expression must not disable the whole estimate:
+    // keep the resolvable part of the key and only fall back when nothing can
+    // be resolved at all.
     if (!column || column->Type() != TypeTag::kColumnValue) {
-      return rows;
+      continue;
     }
     const int offset = schema.Offset(column->AsColumnValue().GetColumnName());
     if (offset < 0) {
-      return rows;
+      continue;
     }
     offsets.push_back(static_cast<size_t>(offset));
+  }
+  if (offsets.empty()) {
+    return rows;
   }
   return statistics.EstimateDistinctRows(offsets);
 }
@@ -509,9 +513,16 @@ Plan BuildIndexScan(const Table& table, const Index& index,
                     bool require_row_position, bool wait_for_write_intent,
                     std::vector<ColumnName> provided_order,
                     size_t limit_hint = std::numeric_limits<size_t>::max()) {
-  std::unordered_set<ColumnName> touched = predicate->TouchedColumns();
+  // A caller may pass no residual predicate; match Selectivity()'s
+  // null-tolerant contract instead of dereferencing it unconditionally.
+  std::unordered_set<ColumnName> touched;
+  if (predicate) {
+    touched = predicate->TouchedColumns();
+  }
   for (const NamedExpression& item : select) {
-    touched.merge(item.expression->TouchedColumns());
+    if (item.expression) {
+      touched.merge(item.expression->TouchedColumns());
+    }
   }
   std::unordered_set<slot_t> touched_offsets;
   touched_offsets.reserve(touched.size());
@@ -555,6 +566,11 @@ void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
                          context.query->order_nulls_first_)) {
     return;
   }
+  // A matching key list produced under another collation is not the required
+  // order, so it cannot justify the early-stop discount either.
+  if (!cascades::SatisfiesOrderingCollation(plan, required)) {
+    return;
+  }
   // The discount models "stop the scan after the requested prefix". Only a
   // structurally ordered scan can: a measured clustered order saves a sort, but
   // the LIMIT stays above a scan that still walks the whole chain, so
@@ -567,7 +583,7 @@ void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
   *estimated_rows = std::min(*estimated_rows, rows);
 }
 
-// Clustering penalty for range index scans . A range scan
+// Clustering penalty for range index scans. A range scan
 // over a physically clustered column reads heap rows mostly sequentially,
 // while the same range over randomly ordered rows pays a seek per row.
 // Point lookups (full equality prefix) are excluded by the caller: they
@@ -597,7 +613,7 @@ double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
 // Lookup locality (Phase 2 "ソート済み外側からのlookup locality").  When the
 // outer side already arrives in the probe key order, consecutive probes either
 // land on the leaf the previous one used or on the one next to it, so the
-// the looked-up run position stays hot in the index scan instead
+// looked-up run position stays hot in the index scan instead
 // of being re-read per row.  True when `plan` delivers `columns` ascending; the
 // probe's own left-column names are handed over unchanged because every
 // IsOrderedBy implementation resolves the qualified and unqualified spellings.
@@ -861,8 +877,8 @@ std::vector<PlanAlternative> ScanAlternatives(
   std::vector<PlanAlternative> candidates;
   if (include_indexes) {
     std::unordered_map<slot_t, Range> ranges;
-    // Constant IN lists per column (Phase 8 B): each distinct value becomes
-    // one point-lookup range on a leading index key.
+    // Constant IN lists per column (post-Phase 8 follow-up #3): each distinct
+    // value becomes one point-lookup range on a leading index key.
     std::unordered_map<slot_t, std::vector<Value>> point_sets;
     std::vector<Expression> disjunctions;
     std::vector<Expression> range_predicates;
@@ -947,11 +963,9 @@ std::vector<PlanAlternative> ScanAlternatives(
               const Value upper(std::string(bounds->second));
               if (!range.min || *range.min < lower) {
                 range.min = lower;
-                range.min_inclusive = true;
               }
               if (!range.max || upper < *range.max) {
                 range.max = upper;
-                range.max_inclusive = false;
               }
               range_predicates.push_back(conjunct);
             }
@@ -1423,7 +1437,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         local_cost = std::min(
             local_cost,
             EqualityPrefixRows(statistics, index, equality_prefix_values));
-        // Random heap I/O for range scans : a range over a
+        // Random heap I/O for range scans: a range over a
         // clustered column reads mostly sequentially, while the same range
         // over randomly ordered rows seeks per matching row and can cost
         // more than a full sequential scan. Model it as
@@ -1847,12 +1861,17 @@ double JoinCardinality(
     for (const ColumnName& column : conjunct->TouchedColumns()) {
       const int lo = left.plan->GetSchema().Offset(column);
       const int ro = right.plan->GetSchema().Offset(column);
+      if (lo < 0 && ro < 0) {
+        return estimate;
+      }
+      // Both checks must run: a self-join (or two relations sharing a column
+      // name) can resolve the same ColumnName on both sides, and an `else if`
+      // would misclassify such a spanning predicate as left-only.
       if (lo >= 0) {
         touches_left = true;
-      } else if (ro >= 0) {
+      }
+      if (ro >= 0) {
         touches_right = true;
-      } else {
-        return estimate;
       }
     }
     if (touches_left && touches_right) {
@@ -3280,8 +3299,16 @@ std::vector<PlanAlternative> MergeJoinAlternative(
           ? (residual_conjuncts.empty() ? nullptr
                                         : CombineConjuncts(residual_conjuncts))
           : merge_residual;
-  const double equi_estimate =
+  double equi_estimate =
       JoinCardinality(left, right, equality_pairs, estimate_residual);
+  // Semi/anti emit at most one row per probe row. The equi-cardinality
+  // estimate can exceed |L| when the build side has duplicates, so cap it or
+  // the plan's row count (and the alternative's estimate taken from it) skews
+  // downstream cost and the join choice.
+  if (kind == JoinAlternativeKind::kSemi ||
+      kind == JoinAlternativeKind::kAnti) {
+    equi_estimate = std::min(equi_estimate, left.estimated_rows);
+  }
   Plan merge = std::make_shared<MergeJoinPlan>(
       std::move(left_plan), left_columns, std::move(right_plan), right_columns,
       physical_kind, std::move(merge_residual), RowEstimate(equi_estimate));
@@ -4782,11 +4809,11 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               index.sc_.key_.front() != static_cast<slot_t>(offset)) {
             return alternatives;
           }
-          std::vector<NamedExpression> select_items = index_only->SelectItems();
-          if (select_items.empty()) {
-            select_items.emplace_back(distinct_column.name,
-                                      ColumnValueExp(distinct_column));
-          }
+          // IndexOnlyScanPlan carries no projection of its own; synthesize the
+          // distinct key as the skip-scan output item.
+          std::vector<NamedExpression> select_items;
+          select_items.emplace_back(distinct_column.name,
+                                    ColumnValueExp(distinct_column));
           Plan skip_scan = std::make_shared<SkipScanDistinctPlan>(
               *table, index, index_only->GetStats(), index_only->IsAscending(),
               std::move(select_items), scan_schema);

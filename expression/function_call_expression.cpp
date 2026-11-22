@@ -89,6 +89,19 @@ namespace tinylamb {
 
 namespace {
 
+// ResultType must not infer ARRAY from a name suffix: a future scalar UDF
+// ending in `_array` would otherwise get a bogus static type and break schema
+// inference / UNION coercion. Keep the array-producing builtins explicit.
+bool IsArrayReturningFunction(std::string_view name) {
+  return name == "split" || name == "regexp_extract_all" ||
+         name == "regexp_extract_groups" || name == "json_keys" ||
+         name == "to_code_points" || name == "generate_series" ||
+         name == "generate_array" || name == "generate_date_array" ||
+         name == "generate_timestamp_array" || name == "json_extract_array" ||
+         name == "json_extract_string_array" || name == "json_query_array" ||
+         name == "json_value_array";
+}
+
 struct CivilTime {
   int year{1970};
   int month{1};
@@ -111,12 +124,15 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   bool matched = false;
   // Conversion errors are tolerated: unparsed fields fall through to the
   // alternative formats below and remain zero-initialized on total failure.
+  // A field width of 9 caps each conversion at 9 characters, so the result
+  // always fits in `int` (no C11 7.21.6.2p10 UB for overlong numbers); every
+  // value that passes the range checks below is far shorter.
   // NOLINTNEXTLINE(cert-err34-c)
-  if (sscanf(input.c_str(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) >=
-          3 ||
+  if (sscanf(input.c_str(), "%9d-%9d-%9d %9d:%9d:%9d", &Y, &M, &D, &h, &m,
+             &sec) >= 3 ||
       // NOLINTNEXTLINE(cert-err34-c)
-      sscanf(input.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) >=
-          3) {
+      sscanf(input.c_str(), "%9d-%9d-%9dT%9d:%9d:%9d", &Y, &M, &D, &h, &m,
+             &sec) >= 3) {
     ct->year = Y;
     ct->month = M;
     ct->day = D;
@@ -146,7 +162,7 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
     matched = true;
   }
   // NOLINTNEXTLINE(cert-err34-c)
-  else if (sscanf(input.c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
+  else if (sscanf(input.c_str(), "%9d:%9d:%9d", &h, &m, &sec) >= 3) {
     ct->year = 1970;
     ct->month = 1;
     ct->day = 1;
@@ -248,7 +264,8 @@ StatusOr<int> ParseTimeZoneOffset(std::string_view zone,
                                   bool at_utc = false) {
   // Pass the real year through: the tz database carries the full historical
   // transition table (wartime DST, pre-1966 US standard time, LMT), so a
-  // pre-epoch civil time must not be re-dated to 1970.
+  // pre-epoch civil time must not be re-dated to the helper's default
+  // 2000-01-01 when a real CivilTime is supplied.
   return TryTimeZoneOffsetAtLocalTime(
       zone, ct != nullptr ? ct->year : 2000,
       ct != nullptr ? static_cast<unsigned>(ct->month) : 1,
@@ -353,13 +370,19 @@ std::string FormatTimeZoneOffset(int tz_offset_sec) {
   int abs_sec = std::abs(tz_offset_sec);
   int h = abs_sec / 3600;
   int m = (abs_sec % 3600) / 60;
+  // Historical (LMT) offsets carry a non-zero second component; dropping it
+  // would mislabel the rendered instant (e.g. -07:52:58 became -07:52).
+  int s = abs_sec % 60;
   char sign = tz_offset_sec < 0 ? '-' : '+';
-  if (m == 0) {
+  if (m == 0 && s == 0) {
     // NOLINTNEXTLINE(cert-err33-c)
     snprintf(buf.data(), buf.size(), "%c%02d", sign, h);
-  } else {
+  } else if (s == 0) {
     // NOLINTNEXTLINE(cert-err33-c)
     snprintf(buf.data(), buf.size(), "%c%02d:%02d", sign, h, m);
+  } else {
+    // NOLINTNEXTLINE(cert-err33-c)
+    snprintf(buf.data(), buf.size(), "%c%02d:%02d:%02d", sign, h, m, s);
   }
   return std::string{buf.data()};
 }
@@ -1263,7 +1286,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kInvalidArgument,
                            "ROUND digits must be an integer");
       }
-      digits = values[1].value.int_value;
+      digits = values[1].IsUnsigned() && values[1].value.int_value < 0
+                   ? std::numeric_limits<int64_t>::max()
+                   : values[1].value.int_value;
     }
     if (values[0].type == ValueType::kInt64) {
       if (values[0].IsUnsigned()) {
@@ -1351,8 +1376,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return val.AsString();
   };
-  const auto raw_view = [&](const Value& value, std::string& storage)
-      -> std::string_view {
+  const auto raw_view = [&](const Value& value,
+                            std::string& storage) -> std::string_view {
     if (value.type == ValueType::kVarChar) {
       return value.AsStringView();
     }
@@ -1361,7 +1386,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   };
   auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
     if (v.type == ValueType::kInt64) {
-      return v.value.int_value;
+      return v.IsUnsigned() ? SaturatingUnsignedToInt64(
+                                  static_cast<uint64_t>(v.value.int_value))
+                            : v.value.int_value;
     }
     if (v.type == ValueType::kDouble) {
       return SaturatingDoubleToInt64(v.value.double_value);
@@ -1520,6 +1547,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "__struct_set requires 3 arguments");
     }
+    // A NULL struct or field name must propagate like get_field below;
+    // otherwise Value::AsString() turns the NULL name into a literal
+    // "NULL" member.  A NULL *value* is a legitimate JSON null member.
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
     return TryStructSetField(values[0], raw_str(values[1]), values[2]);
   }
   if (name_view == "get_field") {
@@ -1648,10 +1681,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(uniform(rng));
   }
   if (name_view == "coalesce") {
-    if (values.empty()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "COALESCE requires at least one argument");
-    }
+    // Match the AST reference (TryEvaluate on an empty args_ loop): a
+    // degenerate zero-argument COALESCE is NULL, not an error. SQL syntax
+    // requires at least one argument, so only direct API/constant-fold
+    // callers can reach this form; all evaluation paths must agree.
     for (const auto& val : values) {
       if (!val.IsNull()) {
         return val;
@@ -1874,7 +1907,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     // The engine keeps text in composed form and has no decompose/compose
     // tables: NFC/NFKC are identity-preserving for composed input.  Decomposed
-    // input (combining diacriticals, e.g. 'e' + U+0301) is rejected instead of
+    // input (combining marks, e.g. 'e' + U+0301) is rejected instead of being
     // silently mis-normalized; the decomposed normalization modes are rejected
     // outright.  NFKC compatibility mappings are likewise not applied.
     if (values.size() == 2) {
@@ -1983,7 +2016,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kInvalidArgument,
                            name + " digits must be an integer");
       }
-      digits = values[1].value.int_value;
+      digits = values[1].IsUnsigned() && values[1].value.int_value < 0
+                   ? std::numeric_limits<int64_t>::max()
+                   : values[1].value.int_value;
     }
     if (values[0].type == ValueType::kInt64) {
       if (values[0].IsUnsigned()) {
@@ -2579,20 +2614,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "SUBSTR argument type mismatch");
     }
     const std::string input = raw_str(values[0]);
-    const int64_t start = values[1].value.int_value;
+    const int64_t start = to_i64(values[1], 1);
     if (values.size() == 3) {
-      const int64_t len = values[2].value.int_value;
-      if (!values[2].IsUnsigned() && len < 0) {
+      const int64_t len = to_i64(values[2], 0);
+      if (len < 0) {
         return StatusError(StatusCode::kInvalidArgument,
                            "SUBSTR length cannot be negative");
-      }
-      if (values[2].IsUnsigned() &&
-          static_cast<uint64_t>(len) >
-              static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-        // A huge unsigned length covers the whole remaining string.
-        const size_t from = std::min<size_t>(
-            input.size(), static_cast<size_t>(std::max<int64_t>(start, 0)));
-        return Value(input.substr(from));
       }
       if (len == 0) {
         return Value(std::string());
@@ -2614,8 +2641,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
 
     const size_t length = values.size() == 3
-                              ? static_cast<size_t>(std::max(
-                                    int64_t{0}, values[2].value.int_value))
+                              ? static_cast<size_t>(to_i64(values[2], 0))
                               : total_cps;
     return Value(utf8_substr(input, static_cast<size_t>(actual_start), length));
   }
@@ -2636,9 +2662,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "BYTE_SUBSTR argument type mismatch");
     }
     const std::string input = raw_str(values[0]);
-    const int64_t start = values[1].value.int_value;
+    const int64_t start = to_i64(values[1], 1);
     if (values.size() == 3) {
-      const int64_t len = values[2].value.int_value;
+      const int64_t len = to_i64(values[2], 0);
       if (len < 0) {
         return StatusError(StatusCode::kInvalidArgument,
                            "SUBSTR length cannot be negative");
@@ -2742,8 +2768,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const std::string target = raw_str(values[1]);
     const int64_t position = values.size() >= 3 ? to_i64(values[2], 1) : 1;
     const int64_t occurrence = values.size() == 4 ? to_i64(values[3], 1) : 1;
-    // Match REGEXP_INSTR's argument contract: a zero/negative position or
-    // occurrence is an invalid argument, not a "no match" result.
+    // A zero position or a non-positive occurrence is an invalid argument,
+    // not a "no match" result. A negative position is valid and requests a
+    // backward search from the end of the string (like MySQL's INSTR).
     if (position == 0 || occurrence <= 0) {
       return StatusError(StatusCode::kInvalidArgument,
                          "position and occurrence must be positive");
@@ -2921,8 +2948,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // T2237: CONTAINS_SUBSTR(expression, search[, json_scope]) — case
     // insensitive containment across a STRING or the STRING leaves of an
     // ARRAY (STRUCTs have no representation in the engine's Value tier).
-    // GoogleSQL layers NFKC normalization on top; the engine has no NFKC
-    // anywhere (LOWER behaves the same way), so the fold here is
+    // GoogleSQL layers NFKC normalization on top; this function does not
+    // apply it (the engine exposes NFKC only via explicit NORMALIZE(x,
+    // 'NFKC'), and LOWER behaves the same way), so the fold here is
     // UnicodeCaseFold only. json_scope is accepted and validated but has no
     // JSON-path semantics to change.
     if (values.size() < 2 || values.size() > 3) {
@@ -3425,7 +3453,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     const Value& arr = values[0];
     if (arr.type != ValueType::kArray) {
-      return Value();
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CODE_POINTS_TO_STRING requires an ARRAY<INT64>");
     }
     std::string res;
     res.reserve(arr.ArrayElements().size());
@@ -3483,7 +3512,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     const Value& arr = values[0];
     if (arr.type != ValueType::kArray) {
-      return Value();
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CODE_POINTS_TO_BYTES requires an ARRAY<INT64>");
     }
     std::string res;
     res.reserve(arr.ArrayElements().size());
@@ -3763,8 +3793,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       start_idx = 0;
     }
 
-    int64_t end_idx =
-        std::min(start_idx + len, static_cast<int64_t>(parts.size()));
+    const int64_t remaining = static_cast<int64_t>(parts.size()) - start_idx;
+    const int64_t end_idx = start_idx + std::min(len, remaining);
     std::string res = parts[static_cast<size_t>(start_idx)];
     res.reserve(static_cast<size_t>(end_idx - start_idx));
     for (int64_t i = start_idx + 1; i < end_idx; ++i) {
@@ -4212,7 +4242,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const double checked = name_view == "safe_add"
                                ? l + r
                                : (name_view == "safe_subtract" ? l - r : l * r);
-    if (std::isinf(checked) || std::isnan(checked)) {
+    // SAFE_* suppresses the overflow error (finite inputs producing inf), but
+    // must not swallow a NaN/Inf that was already in an input: IEEE propagation
+    // is the answer, not an error to mask (SAFE_ADD(NaN, 1) is NaN). Mirror the
+    // finite-inputs + non-finite-result gate of TryEvaluateBinary.
+    if (std::isfinite(l) && std::isfinite(r) && !std::isfinite(checked)) {
       return Value();
     }
     return Value(checked);
@@ -4484,20 +4518,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       // the two straddle DST transitions and can differ by an hour.
       ASSIGN_OR_RETURN(int, tz_offset_sec,
                        (ParseTimeZoneOffset(tz_str, &ct, /*at_utc=*/true)));
-      ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
-      int rem_mins = (tz_offset_sec % 3600) / 60;
-      if (rem_mins != 0) {
-        int total_m = ct.minute + rem_mins;
-        if (total_m >= 60) {
-          ct.minute = total_m - 60;
-          ct = ShiftCivilTimeHours(ct, 1);
-        } else if (total_m < 0) {
-          ct.minute = total_m + 60;
-          ct = ShiftCivilTimeHours(ct, -1);
-        } else {
-          ct.minute = total_m;
-        }
-      }
+      // Shift by the whole offset: minute *and second* residues (LMT zones
+      // such as -07:52:58) carry correctly across minute/day boundaries.
+      ct = ShiftCivilTimeSeconds(ct, tz_offset_sec);
       return Value(FormatCivilTime(ct) + FormatTimeZoneOffset(tz_offset_sec));
     }
     if (values[0].type == ValueType::kDate) {
@@ -4544,20 +4567,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         tz_offset_sec = parsed_offset;
       }
     }
-    ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
-    int rem_mins = (tz_offset_sec % 3600) / 60;
-    if (rem_mins != 0) {
-      int total_m = ct.minute + rem_mins;
-      if (total_m >= 60) {
-        ct.minute = total_m - 60;
-        ct = ShiftCivilTimeHours(ct, 1);
-      } else if (total_m < 0) {
-        ct.minute = total_m + 60;
-        ct = ShiftCivilTimeHours(ct, -1);
-      } else {
-        ct.minute = total_m;
-      }
-    }
+    // Apply the full offset (including sub-minute LMT seconds) in one go.
+    ct = ShiftCivilTimeSeconds(ct, tz_offset_sec);
     struct tm tm = {};
     tm.tm_year = ct.year - 1900;
     tm.tm_mon = ct.month - 1;
@@ -4941,10 +4952,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(floor_div(*nanos, 1000LL));
   }
 
-  // IS_NAN / IS_INF: the AST ground truth must implement every scalar the
-  // scope-based relational evaluator supports (expression_eval.cpp), or a
-  // plan-shape change that routes the predicate through this evaluator turns
-  // a working query into "not yet executable".
+  // IS_NAN / IS_INF: as with NULLIF/IFNULL above, the AST ground truth must
+  // implement every scalar the scope-based relational evaluator supports
+  // (executor/detail/expression_eval.cpp), or a plan-shape change that routes
+  // the predicate through this evaluator turns a working query into
+  // "not yet executable".
   if (name_view == "is_inf" || name_view == "is_nan") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -5257,9 +5269,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
 
   // GENERATE_SERIES (PostgreSQL spelling) is the element-wise twin of
   // GENERATE_ARRAY with integer-exact stepping and its own error surface.
-  // The body mirrors the executor's detail evaluator one-to-one; both and
-  // the plan-layer folds share this exact code, so the engines cannot
-  // diverge element-wise.
+  // The body mirrors the executor's detail evaluator one-to-one; all three
+  // (this evaluator, the detail evaluator, and the plan-layer folds) share
+  // this exact code, so the engines cannot diverge element-wise.
   if (name_view == "generate_series") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -5599,11 +5611,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "TIMESTAMP value out of range");
     }
-    int64_t step_us = kDayMicros;  // INTERVAL DAY(1) default, date-array parity
+    platform::Int128 step_us = kDayMicros;  // INTERVAL DAY(1) default
     if (values.size() == 3) {
       const Value& step = values[2];
       if (step.type == ValueType::kInt64) {
-        step_us = step.value.int_value * kDayMicros;
+        step_us =
+            static_cast<platform::Int128>(step.value.int_value) * kDayMicros;
       } else {
         const std::string text = raw_str(step);
         ASSIGN_OR_RETURN(IntervalValue, parsed,
@@ -5615,7 +5628,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
               "unsupported GENERATE_TIMESTAMP_ARRAY step unit: the step must "
               "be DAY or smaller");
         }
-        step_us = parsed.days * kDayMicros +
+        step_us = static_cast<platform::Int128>(parsed.days) * kDayMicros +
                   parsed.nanos /
                       1000;  // NOLINT(readability-math-missing-parentheses)
       }
@@ -5658,9 +5671,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         text += "+00";
         elements.push_back(
             Value(std::move(text)));  // NOLINT(modernize-use-emplace)
-        if (__builtin_add_overflow(t, step_us, &t)) {
+        const platform::Int128 next =
+            static_cast<platform::Int128>(t) + step_us;
+        if (next < std::numeric_limits<int64_t>::min() ||
+            next > std::numeric_limits<int64_t>::max()) {
           break;
         }
+        t = static_cast<int64_t>(next);
       }
     }
     return Value::Array(std::move(elements), "TIMESTAMP");
@@ -5700,7 +5717,8 @@ std::string UnicodeCaseFold(std::string_view value) {
   // Full case folding for the entries where folding diverges from lowercase
   // within the engine's Latin/Latin-1/Greek coverage; everything else falls
   // back to lowercase.  Comparison-oriented: casefold('STRASSE') and
-  // casefold('stra\303\237e') both normalize the sharp s to "ss".
+  // casefold('STRA\303\237E') both yield "strasse" — the sharp s folds to
+  // "ss" via the kFullFolding entry below.
   static const std::unordered_map<uint32_t, std::string> kFullFolding = {
       {0x00DF, "ss"},  // ß
       {
@@ -5866,9 +5884,9 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
       }
     }
     std::string_view key = TrimJson(member.substr(0, colon));
-    const std::string_view value_text =
-        colon == std::string_view::npos ? std::string_view{}
-                                       : member.substr(colon + 1);
+    const std::string_view value_text = colon == std::string_view::npos
+                                            ? std::string_view{}
+                                            : member.substr(colon + 1);
     if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
       key = key.substr(1, key.size() - 2);
     }
@@ -5908,6 +5926,9 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
 
 bool JsonTextToValue(std::string_view text, Value* parsed) {
   const std::string_view trimmed = TrimJson(text);
+  if (trimmed.empty()) {
+    return false;
+  }
   if (trimmed == "null") {
     *parsed = Value();
     return true;
@@ -6042,7 +6063,7 @@ bool JsonTextToValue(std::string_view text, Value* parsed) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
   }
-  if (trimmed.front() == '[' && trimmed.back() == ']') {
+  if (trimmed.size() >= 2 && trimmed.front() == '[' && trimmed.back() == ']') {
     // JSON array member: struct cells store ARRAY fields as JSON arrays
     // (TryEncodeStructMemberJson).  Bare `[...]` cannot be a quoted STRING
     // (writers quote strings), so decode it as an array.  Elements reuse
@@ -6333,34 +6354,39 @@ Value NormalizeIfBranch(Value value, const bool to_double) {
   }
   return value;
 }
+
+// Bare alias row reference ("SELECT s FROM t s"): encodes the columns
+// qualified by the given alias as a struct JSON object. Shared by all three
+// TryEvaluate overloads so the same AST cannot diverge by evaluation path.
+StatusOr<Value> EvaluateRowStruct(const std::vector<Expression>& args,
+                                  const Row& row, const Schema& schema) {
+  if (args.size() != 1 || args[0]->Type() != TypeTag::kConstantValue) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "__row_struct requires an alias literal");
+  }
+  std::string alias;
+  const Value& alias_value = args[0]->AsConstantValue().GetValue();
+  if (!alias_value.IsNull()) {
+    alias = alias_value.type == ValueType::kVarChar
+                ? std::string(alias_value.value.varchar_value)
+                : alias_value.AsString();
+  }
+  std::vector<std::pair<std::string, Value>> fields;
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    const ColumnName& column = schema.GetColumn(i).Name();
+    if (!alias.empty() && !IdentifierEquals(column.schema, alias)) {
+      continue;
+    }
+    fields.emplace_back(column.name, row.values_[i]);
+  }
+  return Value(EncodeStructJson(fields));
+}
 }  // namespace
 
 StatusOr<Value> FunctionCallExpression::TryEvaluate(
     const Row& row, const Schema& schema) const {
   if (func_name_ == "__row_struct") {
-    // Bare alias row reference ("SELECT s FROM t s"): encodes the columns
-    // qualified by the given alias as a struct JSON object.  Evaluated with
-    // the scope's full row so multi-source queries pick their own columns.
-    if (args_.size() != 1 || args_[0]->Type() != TypeTag::kConstantValue) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "__row_struct requires an alias literal");
-    }
-    std::string alias;
-    const Value& alias_value = args_[0]->AsConstantValue().GetValue();
-    if (!alias_value.IsNull()) {
-      alias = alias_value.type == ValueType::kVarChar
-                  ? std::string(alias_value.value.varchar_value)
-                  : alias_value.AsString();
-    }
-    std::vector<std::pair<std::string, Value>> fields;
-    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      const ColumnName& column = schema.GetColumn(i).Name();
-      if (!alias.empty() && !IdentifierEquals(column.schema, alias)) {
-        continue;
-      }
-      fields.emplace_back(column.name, row.values_[i]);
-    }
-    return Value(EncodeStructJson(fields));
+    return EvaluateRowStruct(args_, row, schema);
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
@@ -6470,6 +6496,11 @@ void FunctionCallExpression::Dump(std::ostream& o) const { o << ToString(); }
 StatusOr<Value> FunctionCallExpression::TryEvaluate(
     const Row* left, const Schema& left_schema, const Row* right,
     const Schema& right_schema) const {
+  if (func_name_ == "__row_struct") {
+    const Row combined =
+        (left != nullptr ? *left : Row()) + (right != nullptr ? *right : Row());
+    return EvaluateRowStruct(args_, combined, left_schema + right_schema);
+  }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -6577,6 +6608,11 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
 // threaded into every argument (A1 stage 3).
 StatusOr<Value> FunctionCallExpression::TryEvaluate(
     const Row& row, const Schema& schema, EvaluationContext& context) const {
+  if (func_name_ == "__row_struct") {
+    // The row struct is built from the current row/schema; the context is
+    // threaded only into argument evaluation, which __row_struct never uses.
+    return EvaluateRowStruct(args_, row, schema);
+  }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -6723,26 +6759,53 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
+    if (func_name_ == "coalesce" || func_name_ == "ifnull") {
+      // These return the first non-NULL argument. A NULL literal constant
+      // declares kInvalid, so COALESCE(NULL, double_col) must report DOUBLE
+      // rather than the first argument's NULL type.
+      for (const auto& arg : args_) {
+        const tinylamb::Type candidate = arg->ResultType(schema);
+        if (candidate.GetType() != TypeTag::kInvalid) {
+          return candidate;
+        }
+      }
+    }
     return args_[0]->ResultType(schema);
   }
   if (func_name_ == "if") {
     if (args_.size() < 2) {
       return {TypeTag::kInvalid};
     }
+    // Keep the declared type in sync with NormalizeIfBranch, which promotes
+    // an int64 result to double when another branch is double.
+    if (IfBranchesPromoteToDouble(args_, schema, 1)) {
+      return {TypeTag::kDouble};
+    }
     return args_[1]->ResultType(schema);
   }
-  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+  if (func_name_ == "iferror") {
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
+    // Like IF, both the expression and its fallback participate in the
+    // promotion, so a double branch makes the declared type double.
+    if (IfBranchesPromoteToDouble(args_, schema, 0)) {
+      return {TypeTag::kDouble};
+    }
+    return args_[0]->ResultType(schema);
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
+    // NULLIFERROR has no fallback branch to promote against: it never uses
+    // args_[1], so its declared type is just the expression's type.
     return args_[0]->ResultType(schema);
   }
   if (func_name_ == "iserror") {
     return {TypeTag::kBigInt};
   }
-  if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
-      func_name_ == "regexp_extract_groups" || func_name_ == "json_keys" ||
-      func_name_ == "to_code_points" || func_name_.ends_with("_array")) {
+  if (IsArrayReturningFunction(func_name_)) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "json_array_length" || func_name_ == "lax_int64" ||
@@ -6884,15 +6947,37 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
+    if (func_name_ == "coalesce" || func_name_ == "ifnull") {
+      for (const auto& arg : args_) {
+        const tinylamb::Type candidate = arg->ResultType(left, right);
+        if (candidate.GetType() != TypeTag::kInvalid) {
+          return candidate;
+        }
+      }
+    }
     return args_[0]->ResultType(left, right);
   }
   if (func_name_ == "if") {
     if (args_.size() < 2) {
       return {TypeTag::kInvalid};
     }
+    // Mirror the single-schema overload and NormalizeIfBranch: an int64
+    // result is promoted to double when another branch is double.
+    if (IfBranchesPromoteToDouble(args_, left, right, 1)) {
+      return {TypeTag::kDouble};
+    }
     return args_[1]->ResultType(left, right);
   }
-  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+  if (func_name_ == "iferror") {
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
+    if (IfBranchesPromoteToDouble(args_, left, right, 0)) {
+      return {TypeTag::kDouble};
+    }
+    return args_[0]->ResultType(left, right);
+  }
+  if (func_name_ == "nulliferror") {
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
@@ -6901,9 +6986,7 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   if (func_name_ == "iserror") {
     return {TypeTag::kBigInt};
   }
-  if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
-      func_name_ == "regexp_extract_groups" || func_name_ == "json_keys" ||
-      func_name_ == "to_code_points" || func_name_.ends_with("_array")) {
+  if (IsArrayReturningFunction(func_name_)) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "json_array_length" || func_name_ == "lax_int64" ||

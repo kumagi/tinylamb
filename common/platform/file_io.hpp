@@ -73,7 +73,9 @@ int Dup2(int oldfd, int newfd);
 // failure.
 int Dup(int fd);
 
-// Sequential write to `fd` (honours append mode if opened with append=true).
+// Sequential write to `fd` (honors append mode if opened with append=true).
+// Returns the number of bytes written, which may be less than `count` on a
+// short write; check the result before assuming the whole buffer was persisted.
 ssize_t Write(int fd, const void* buf, size_t count);
 
 // Positional read/write without relying on the caller's stream state.
@@ -99,7 +101,8 @@ int TryLockExclusive(int fd);
 int UnlockFile(int fd);
 
 // Flushes the directory entry metadata of `dir` to durable storage (open +
-// fsync on POSIX; no-op returning 0 on Windows).
+// fsync on POSIX; CreateFileW + FlushFileBuffers on Windows, so the durability
+// guarantee applies on both platforms).
 int SyncDirectory(const std::filesystem::path& dir);
 
 // Makes the data (and the metadata needed to read it back) of `fd` durable.

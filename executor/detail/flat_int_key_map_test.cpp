@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <limits>
 #include <set>
+#include <thread>
 #include <vector>
 
 namespace tinylamb {
@@ -110,6 +111,42 @@ TEST(FlatIntKeyMapTest, ForEachOnEmptyMapVisitsNothing) {
   size_t visited = 0;
   map.ForEach([&](int64_t, int64_t) { ++visited; });
   EXPECT_EQ(visited, 0U);
+}
+
+TEST(FlatIntSetTest, ConcurrentInsertPublishesAtomicBounds) {
+  // Insert used to update has_bounds_/min_key_/max_key_ with plain reads and
+  // writes. Several workers could both take the "first insert" branch and
+  // overwrite each other's extreme key, leaving Contains' range gate blind to
+  // members that were actually inserted.
+  constexpr int64_t kKeys = 4096;
+  constexpr int kWorkers = 8;
+  constexpr int kKeysPerWorker = static_cast<int>(kKeys / kWorkers);
+  relational_detail::FlatIntSet set;
+  ASSERT_TRUE(set.TryReserveDense(0, kKeys - 1));
+  std::vector<std::jthread> workers;
+  workers.reserve(kWorkers);
+  for (int w = 0; w < kWorkers; ++w) {
+    workers.emplace_back([&, w] {
+      // Half the workers insert their slice ascending, half descending, so the
+      // first-insert and min/max-merge branches race with each other.
+      for (int i = 0; i < kKeysPerWorker; ++i) {
+        const int64_t key = (w % 2 == 0)
+                                ? w + (kWorkers * i)
+                                : w + (kWorkers * (kKeysPerWorker - 1 - i));
+        set.Insert(key);
+      }
+    });
+  }
+  workers.clear();  // join every writer before probing
+  ASSERT_TRUE(set.HasBounds());
+  EXPECT_EQ(set.MinKey(), int64_t{0});
+  EXPECT_EQ(set.MaxKey(), kKeys - 1);
+  EXPECT_EQ(set.Size(), static_cast<size_t>(kKeys));
+  for (int64_t key = 0; key < kKeys; ++key) {
+    EXPECT_TRUE(set.Contains(key)) << "key " << key;
+  }
+  EXPECT_FALSE(set.Contains(-1));
+  EXPECT_FALSE(set.Contains(kKeys));
 }
 
 }  // namespace tinylamb

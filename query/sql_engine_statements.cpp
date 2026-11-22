@@ -574,10 +574,18 @@ std::optional<ExplainRequest> ParseExplain(std::string_view sql) {
         return false;
       }
     }
-    if (input->size() != keyword.size() &&
-        !std::isspace(static_cast<unsigned char>((*input)[keyword.size()])) &&
-        (*input)[keyword.size()] != ';') {
-      return false;
+    if (input->size() != keyword.size()) {
+      const unsigned char next =
+          static_cast<unsigned char>((*input)[keyword.size()]);
+      // A comment begins a new token just like whitespace or ';', so
+      // EXPLAIN/*c*/ANALYZE and EXPLAIN/**/SELECT stay recognisable.
+      const bool comment_boundary =
+          keyword.size() + 1 < input->size() &&
+          ((next == '/' && (*input)[keyword.size() + 1] == '*') ||
+           (next == '-' && (*input)[keyword.size() + 1] == '-'));
+      if (!std::isspace(next) && next != ';' && !comment_boundary) {
+        return false;
+      }
     }
     input->remove_prefix(keyword.size());
     return true;
@@ -636,6 +644,34 @@ std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
     }
     return value;
   };
+  // Strip trailing comments and every trailing semicolon, not just one: a
+  // trace prefix such as `ANALYZE t;;` or `ANALYZE t; --c` must still parse.
+  auto strip_tail = [&](std::string_view value) {
+    for (;;) {
+      value = trim(value);
+      const size_t dash = value.rfind("--");
+      if (dash != std::string_view::npos &&
+          (dash == 0 ||
+           std::isspace(static_cast<unsigned char>(value[dash - 1])))) {
+        value.remove_suffix(value.size() - dash);
+        continue;
+      }
+      if (value.size() >= 2 && value.back() == '/' &&
+          value[value.size() - 2] == '*') {
+        const size_t open = value.rfind("/*", value.size() - 2);
+        if (open != std::string_view::npos) {
+          value.remove_suffix(value.size() - open);
+          continue;
+        }
+      }
+      if (!value.empty() && value.back() == ';') {
+        value.remove_suffix(1);
+        continue;
+      }
+      break;
+    }
+    return trim(value);
+  };
   auto consume = [&](std::string_view* input, std::string_view keyword) {
     *input = trim(*input);
     if (input->size() < keyword.size()) {
@@ -646,10 +682,18 @@ std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
         return false;
       }
     }
-    if (input->size() != keyword.size() &&
-        !std::isspace(static_cast<unsigned char>((*input)[keyword.size()])) &&
-        (*input)[keyword.size()] != ';') {
-      return false;
+    if (input->size() != keyword.size()) {
+      const unsigned char next =
+          static_cast<unsigned char>((*input)[keyword.size()]);
+      // A comment begins a new token just like whitespace or ';', so
+      // EXPLAIN/*c*/ANALYZE and EXPLAIN/**/SELECT stay recognisable.
+      const bool comment_boundary =
+          keyword.size() + 1 < input->size() &&
+          ((next == '/' && (*input)[keyword.size() + 1] == '*') ||
+           (next == '-' && (*input)[keyword.size() + 1] == '-'));
+      if (!std::isspace(next) && next != ';' && !comment_boundary) {
+        return false;
+      }
     }
     input->remove_prefix(keyword.size());
     return true;
@@ -659,11 +703,7 @@ std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
   if (!consume(&remainder, "ANALYZE")) {
     return std::nullopt;
   }
-  remainder = trim(remainder);
-  if (!remainder.empty() && remainder.back() == ';') {
-    remainder.remove_suffix(1);
-    remainder = trim(remainder);
-  }
+  remainder = strip_tail(remainder);
   std::ignore = consume(&remainder, "TABLE");
   remainder = trim(remainder);
 
@@ -709,7 +749,11 @@ StatusOr<Executor> ExecuteAnalyze(Database& database, TransactionContext& ctx,
   }
   std::vector<Row> rows;
   rows.reserve(tables.size());
+  bool any_compacted = false;
   for (const std::string& table : tables) {
+    if (database.AutoCompactTableForAnalyze(ctx, table)) {
+      any_compacted = true;
+    }
     const Status refreshed = database.RefreshStatistics(ctx, table);
     if (refreshed != Status::kSuccess) {
       return refreshed;
@@ -723,6 +767,9 @@ StatusOr<Executor> ExecuteAnalyze(Database& database, TransactionContext& ctx,
     rows.emplace_back(std::vector<Value>{
         Value(std::string("ANALYZE")), Value(std::string(table)),
         Value(static_cast<int64_t>(stats->Rows()))});
+  }
+  if (any_compacted) {
+    RETURN_IF_FAIL(database.WriteCheckpoint().GetStatus());
   }
   return Executor(std::make_shared<ConstantExecutor>(std::move(rows)));
 }
@@ -1200,8 +1247,9 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       // Preserve the storage/MVCC status code so retryable conflicts and
       // no-space errors are distinguishable from schema errors.
       return StatusError(updated.GetStatus().GetCode(),
-                         "update failed on table " + std::string(schema.Name()) +
-                             ": " + ToString(updated.GetStatus()));
+                         "update failed on table " +
+                             std::string(schema.Name()) + ": " +
+                             ToString(updated.GetStatus()));
     }
     ++modified_rows;
   }
@@ -1569,7 +1617,7 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     for (const auto& target : field_targets) {
       Value& cell = new_row.values_[target.offset];
       // Struct JSON objects start with '{'; proto TEXT payloads never do.
-      // Proto cells (and NULLs whose target addresses a modelled proto
+      // Proto cells (and NULLs whose target addresses a modeled proto
       // field) rewrite through the shared dotted-field setter; required-
       // field and enum-member violations surface as errors.
       const bool json_cell = !cell.IsNull() &&
@@ -1647,8 +1695,9 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
       // Preserve the storage/MVCC status code so retryable conflicts and
       // no-space errors are distinguishable from schema errors.
       return StatusError(updated.GetStatus().GetCode(),
-                         "update failed on table " + std::string(schema.Name()) +
-                             ": " + ToString(updated.GetStatus()));
+                         "update failed on table " +
+                             std::string(schema.Name()) + ": " +
+                             ToString(updated.GetStatus()));
     }
     ++modified_rows;
   }
@@ -2652,6 +2701,7 @@ StatusOr<Executor> SqlEngine::ExecuteCreateTable(
       columns.emplace_back(col_name, vtype, constraint);
       columns.back().SetIntegerBits(schema_column.IntegerBits());
       columns.back().SetUnsigned(schema_column.IsUnsigned());
+      columns.back().SetTextDomain(schema_column.GetTextDomain());
       columns.back().SetInterval(schema_column.IsInterval() ||
                                  std::ranges::any_of(rows, [i](const Row& row) {
                                    return i < row.Count() &&
@@ -2698,14 +2748,6 @@ StatusOr<Executor> SqlEngine::ExecuteCreateTable(
 
 StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
                                             InsertStatement& insert) {
-  // VALUES entries fold non-correlated subqueries like the WHERE/SET
-  // paths do.
-  for (auto& value_row : insert.MutableValues()) {
-    for (Expression& value : value_row) {
-      ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
-      value = std::move(folded);
-    }
-  }
   ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                    ctx.GetTable(insert.TableName()));
   last_dml_table_ = insert.TableName();
@@ -2727,7 +2769,7 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
         // A duplicate target would silently overwrite the earlier
         // value; reject it instead.
         last_error_ = "duplicate INSERT column: " + column;
-        return Status::kUnknown;
+        return Status::kInvalidArgument;
       }
       const int destination = table->GetSchema().Offset(ColumnName(column));
       if (destination < 0) {
@@ -2737,9 +2779,37 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
       upsert_offsets.push_back(static_cast<size_t>(destination));
     }
   }
+  const size_t schema_width = table->GetSchema().ColumnCount();
+  const auto validate_width = [&](size_t count, bool allow_struct) -> Status {
+    if (!insert.Columns().empty()) {
+      if (count != upsert_offsets.size()) {
+        last_error_ = "INSERT column/value count mismatch";
+        return Status::kInvalidArgument;
+      }
+    } else if (count != schema_width && !(allow_struct && count == 1)) {
+      last_error_ = "INSERT value count does not match table schema (got " +
+                    std::to_string(count) + ", expected " +
+                    std::to_string(schema_width) + ")";
+      return Status::kInvalidArgument;
+    }
+    return Status::kSuccess;
+  };
+  // Validate every VALUES tuple before folding expressions or binding a
+  // DEFAULT marker to the column map. One unqualified expression may be a
+  // STRUCT or whole-row NULL and is validated again after expansion.
+  for (const auto& value_row : insert.Values()) {
+    RETURN_IF_FAIL(validate_width(value_row.size(), /*allow_struct=*/true));
+  }
+  // VALUES entries fold non-correlated subqueries like the WHERE/SET
+  // paths do.
+  for (auto& value_row : insert.MutableValues()) {
+    for (Expression& value : value_row) {
+      ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
+      value = std::move(folded);
+    }
+  }
   const auto column_default = [&table](size_t column_index) -> Value {
-    const Column& column =
-        table->GetSchema().GetColumn(static_cast<slot_t>(column_index));
+    const Column& column = table->GetSchema().GetColumn(column_index);
     if (column.GetConstraint().ctype == Constraint::kDefault) {
       return column.GetConstraint().value;
     }
@@ -2812,11 +2882,8 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
     }
   }
   for (auto& row : rows) {
+    RETURN_IF_FAIL(validate_width(row.values_.size(), /*allow_struct=*/true));
     if (!insert.Columns().empty()) {
-      if (insert.Columns().size() != row.values_.size()) {
-        last_error_ = "INSERT column/value count mismatch";
-        return Status::kInvalidArgument;
-      }
       std::vector<Value> reordered(table->GetSchema().ColumnCount());
       std::vector<bool> specified(table->GetSchema().ColumnCount(), false);
       for (size_t i = 0; i < insert.Columns().size(); ++i) {
@@ -2842,11 +2909,9 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
         row = Row(std::move(expanded));
       }
     }
-    if (row.values_.size() != table->GetSchema().ColumnCount()) {
-      last_error_ = "INSERT value count does not match table schema (got " +
-                    std::to_string(row.values_.size()) + ", expected " +
-                    std::to_string(table->GetSchema().ColumnCount()) + ")";
-      return Status::kInvalidArgument;
+    if (insert.Columns().empty()) {
+      RETURN_IF_FAIL(
+          validate_width(row.values_.size(), /*allow_struct=*/false));
     }
     for (size_t i = 0; i < row.values_.size(); ++i) {
       const auto& col = table->GetSchema().GetColumn(i);
@@ -2854,18 +2919,18 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
       if (Status st_ni = ValidateNarrowInteger(col, row[i]);
           st_ni != Status::kSuccess) {
         last_error_ = st_ni.GetMessage();
-        return Status::kUnknown;
+        return Status::kInvalidArgument;
       }
       if (col.IsUnsigned()) {
         if (!row[i].IsNull()) {
           if (row[i].type != ValueType::kInt64) {
             last_error_ = "INSERT type mismatch for column " + col.Name().name;
-            return Status::kUnknown;
+            return Status::kInvalidArgument;
           }
           if (!row[i].IsUnsigned() && row[i].value.int_value < 0) {
             last_error_ =
                 "assignment out of range for column " + col.Name().name;
-            return Status::kUnknown;
+            return Status::kInvalidArgument;
           }
           row[i] = row[i].WithUnsigned();
         }
@@ -2889,7 +2954,7 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
         continue;
       }
       last_error_ = "INSERT type mismatch for column " + col.Name().name;
-      return Status::kUnknown;
+      return Status::kInvalidArgument;
     }
   }
   // Compiled-plan fill: build the parametric INSERT artifact. Bindable
@@ -2999,8 +3064,7 @@ StatusOr<Executor> SqlEngine::ExecuteUpdate(TransactionContext& ctx,
     // SET values share the WHERE clause's prepare-time subquery fold;
     // a correlated or WITH-bearing inner keeps its legacy route.
     const Schema& update_schema = table->GetSchema();
-    for (auto& [target, value] :
-         update.MutableSetClause()) {
+    for (auto& [target, value] : update.MutableSetClause()) {
       ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
       value = std::move(folded);
       // SET col = DEFAULT resolves to the column's declared default;
@@ -3056,8 +3120,7 @@ StatusOr<Executor> SqlEngine::ExecuteUpdate(TransactionContext& ctx,
     };
     bool dotted_target = false;
     bool plain_target = false;
-    for (auto& [target, expression] :
-         update.MutableSetClause()) {
+    for (auto& [target, expression] : update.MutableSetClause()) {
       strip_relation_qualifier(&target);
       if (!target.schema.empty() && !target.name.empty()) {
         dotted_target = true;
@@ -3725,7 +3788,7 @@ StatusOr<Executor> SqlEngine::ExecuteCreateView(
     last_error_ = "view " + create.ViewName() + " already exists";
   }
   RETURN_IF_FAIL(stored);
-  RegisterViewDefinition(create.ViewName(), *query_node);
+  RegisterViewDefinition(create.ViewName(), *query_node, create.QueryText());
   database_->BumpSchemaEpoch();
   return Executor(std::make_shared<ConstantExecutor>(
       Row({Value("CREATE VIEW"), Value(0)})));
@@ -3863,8 +3926,18 @@ StatusOr<Executor> SqlEngine::ExecuteExplain(
     return Status::kNotImplemented;
   }
   last_statement_type_ = StatementType::kSelect;
-  const auto* explain_select =
-      static_cast<const SelectStatement*>(statement.get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  const auto* explain_select = static_cast<const SelectStatement*>(
+      statement
+          .get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  // Snapshot the catalog names once.  Probing ctx.GetTable() here would
+  // deserialize every base table and cache it in the transaction context,
+  // making read-only EXPLAIN mutate the statement's table cache.
+  std::unordered_set<std::string> explain_catalog_tables;
+  if (database_ != nullptr) {
+    for (const std::string& name : database_->ListTables(ctx)) {
+      explain_catalog_tables.insert(AsciiToLower(name));
+    }
+  }
   std::vector<std::string> explain_base_tables;
   bool explain_has_inner_join_source = false;
   for (const SelectSource& source : explain_select->Sources()) {
@@ -3879,7 +3952,7 @@ StatusOr<Executor> SqlEngine::ExecuteExplain(
     // CTE names never resolve to catalog tables (materialized CTEs scan
     // shared row cells instead); listing them would fake join-elimination
     // annotations below, so only physical tables participate.
-    if (!ctx.GetTable(source.table).HasValue()) {
+    if (!explain_catalog_tables.contains(AsciiToLower(source.table))) {
       continue;
     }
     if (source.join_type == JoinType::kInner) {
@@ -3936,6 +4009,9 @@ StatusOr<Executor> SqlEngine::ExecuteExplain(
   std::ostringstream output;
   prepared.Value()->Explain(output, 0);
   const std::string body = output.str();
+  // SQL identifiers are case-insensitive and plan renderings may normalize
+  // table names, so compare in lower case when looking for survivors.
+  const std::string body_lower = AsciiToLower(body);
   if (explain.pipeline) {
     const ExecutorBase* root_exec = prepared.Value().get();
     if (const auto* wrapped =
@@ -3959,7 +4035,7 @@ StatusOr<Executor> SqlEngine::ExecuteExplain(
     bool any_survives = false;
     bool any_eliminated = false;
     for (const std::string& table : explain_base_tables) {
-      if (body.find(table) == std::string::npos) {
+      if (body_lower.find(AsciiToLower(table)) == std::string::npos) {
         any_eliminated = true;
       } else {
         any_survives = true;

@@ -44,7 +44,10 @@ the server CMake target is not restricted to Linux.
   there is no hard 1M-row result cap; large results are governed by query memory grants. `StatusCode::kMemoryLimitExceeded`
   maps to PostgreSQL SQLSTATE `53200` (`out_of_memory`), and `kNoSpace` maps to
   `53100` (`disk_full`). An unset `read_worker_threads` uses hardware concurrency (1–16 workers).
-  An explicit zero runs tasks inline.
+  An explicit zero leaves no worker: only read-only queries run inline;
+  session tasks (DML, BEGIN/COMMIT/ROLLBACK, cleanup) have no consumer and
+  are answered with `53000 no read workers available` instead of running
+  inline.
 
 Catalog changes stay on epoll and fail with SQLSTATE 55006 while a foreign
 transaction block or worker task/completion/cleanup is outstanding. There is
@@ -59,11 +62,12 @@ Simple-Query multi-statement + streaming responses. Do not claim full
 protocol compatibility — extended-protocol support does not exist.
 `Execute`/`Prepare` on `SqlEngine` is the only DB entry; no direct storage
 calls from here. One registered exception: `--force`/`force_recovery` sets
-the process-static `RecoveryManager::SetTornTailTruncationAllowed(true)`
-(recovery/ header included by both `postgres_server.cpp` and
-`postgres_server_main.cpp`) — that flag cannot travel through a SQL
-statement, so don't infer from the contract that the server never names a
-storage-layer symbol.
+the process-static `RecoveryManager::SetTornTailTruncationAllowed(true)`.
+The recovery/ header is included by `postgres_server.cpp`,
+`postgres_server_main.cpp`, and the CLI entry point `main.cpp` (which also
+sets the flag from its own `--force` option) — that flag cannot travel
+through a SQL statement, so don't infer from the contract that neither
+entry point ever names a storage-layer symbol.
 
 Test: `./build/postgres_server_test`, `postgres_protocol_test`,
 `postgres_server_extra_test`.

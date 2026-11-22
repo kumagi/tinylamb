@@ -138,7 +138,10 @@ class PushdownDb {
       res.Value().Drain();
     }
 
-    // Create indexes on tables for index scan / index join rules.
+    // Create indexes on tables for index scan / index join rules. A silently
+    // missing index would quietly drop the index-side NoREC coverage, so any
+    // failure must make Setup fail rather than leave the sweep green.
+    bool setup_ok = true;
     auto add_idx = [&](std::string_view tbl, std::string_view idx_name,
                        const std::vector<slot_t>& cols,
                        IndexMode mode = IndexMode::kUnique) {
@@ -147,6 +150,7 @@ class PushdownDb {
       if (s != Status::kSuccess) {
         std::cerr << "Setup index failed on " << tbl << " (" << idx_name
                   << ")\n";
+        setup_ok = false;
       }
     };
     add_idx("t1", "t1_pk", {0}, IndexMode::kUnique);
@@ -168,9 +172,13 @@ class PushdownDb {
           engine.Execute(ctx, std::string("ANALYZE ") + table + ";");
       if (analyzed.HasValue()) {
         analyzed.Value().Drain();
+      } else {
+        std::cerr << "Setup ANALYZE failed on " << table
+                  << " err: " << engine.LastError() << "\n";
+        setup_ok = false;
       }
     }
-    return true;
+    return setup_ok;
   }
 
   std::string name_;
@@ -214,7 +222,7 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
 
 bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
                            std::string* mismatch_report) {
-  const int flavor = static_cast<int>(rng() % 32);
+  const int flavor = static_cast<int>(rng() % 33);
   std::string from_clause;
   std::string predicate;
   // Shapes whose two sides are not the same predicate on the same FROM
@@ -303,12 +311,19 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
       std::string err;
       auto opt_cnt = RunScalarCount(db, ctx, opt_sql, &err);
       if (!opt_cnt) {
-        return true;
+        // A query that now errors is itself a regression: silently accepting
+        // it hides planner/runtime failures behind a green oracle (same rule
+        // as flavour 31 and the shared NoREC tail).
+        *mismatch_report = "[NoREC QUERY ERROR]\n  optimized: " + opt_sql +
+                           "\n  error=" + err + "\n";
+        return false;
       }
       SqlEngine engine(db);
       StatusOr<QueryResult> ref_res = engine.Execute(ctx, ref_sql);
       if (!ref_res.HasValue()) {
-        return true;
+        *mismatch_report = "[NoREC QUERY ERROR]\n  reference: " + ref_sql +
+                           "\n  error=" + ToString(ref_res.GetStatus()) + "\n";
+        return false;
       }
       int64_t actual_rows = 0;
       Row r;
@@ -710,8 +725,9 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
       *mismatch_report += "\n";
       return false;
     }
-    default: {
-      // Flavour 24: Self-join with triangle conditions
+    case 32: {
+      // Flavour 32: self-join with triangle conditions. Kept reachable in
+      // the flavour range instead of living in the (unreachable) default.
       from_clause = "t1 AS a JOIN t1 AS b ON a.flag = b.flag";
       static const std::array<const char*, 3> kPreds = {
           "a.id < b.id AND a.val + b.val > 20",
@@ -719,6 +735,12 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
           "a.val IS NOT NULL AND b.val IS NOT NULL AND a.val > b.val",
       };
       predicate = kPreds[rng() % kPreds.size()];
+      break;
+    }
+    default: {
+      // Defensive fallback; flavor is always within [0, 32].
+      from_clause = "t1";
+      predicate = "val > 0";
       break;
     }
   }

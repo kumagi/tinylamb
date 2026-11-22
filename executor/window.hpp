@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/spill_file.hpp"
@@ -96,7 +97,12 @@ class WindowExecutor : public ExecutorBase {
   // The PARTITION BY list every call shares, or nullptr when the calls
   // disagree (then the input cannot be split without cutting a partition).
   const std::vector<Expression>* SharedPartitionKey() const;
-  [[nodiscard]] Schema InputSchema() const;
+  // Internal-only inference helper for the window calls: recover the input
+  // schema by stripping the per-call suffix columns from the output schema.
+  // Not part of the public API -- callers must go through NextChunk(), which
+  // sets up rows_/outputs_ consistently before this is used (see window.cpp
+  // for the underflow guard).
+  [[nodiscard]] StatusOr<Schema> InputSchema() const;
 
   TransactionContext& context_;
   Executor child_;

@@ -4,7 +4,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -43,8 +42,9 @@ std::unique_ptr<SelectStatement> ParseSelect(const std::string& sql) {
   if (statement == nullptr || statement->Type() != StatementType::kSelect) {
     return nullptr;
   }
-  return std::unique_ptr<SelectStatement>(
-      static_cast<SelectStatement*>(statement.release()));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  return std::unique_ptr<SelectStatement>(static_cast<SelectStatement*>(
+      statement
+          .release()));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 class SelectRewritesTest : public ::testing::Test {
@@ -350,6 +350,38 @@ TEST_F(SelectRewritesTest, MergeCompatibleUnionBranchesFusesSameTableScan) {
                                     Row({Value(2), Value("b")}),
                                     Row({Value(3), Value("c")})}));
   EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
+}
+
+TEST_F(SelectRewritesTest,
+       MergeCompatibleUnionBranchesRebindsOrdinalAfterStarExpansion) {
+  const std::string sql =
+      "SELECT * FROM items WHERE category = 10 "
+      "UNION ALL "
+      "SELECT * FROM items WHERE category = 20 ORDER BY 1 LIMIT 3";
+  auto stmt = ParseSelect(sql);
+  ASSERT_NE(stmt, nullptr);
+  ASSERT_EQ(stmt->OrderBy().size(), 1U);
+  ASSERT_NE(stmt->OrderBy()[0].expression, nullptr);
+  ASSERT_EQ(stmt->OrderBy()[0].expression->Type(), TypeTag::kConstantValue);
+
+  ASSERT_TRUE(MergeCompatibleUnionBranches(stmt.get(), *ctx_));
+  EXPECT_TRUE(stmt->UnionAll().empty());
+  // The ordinal must now name a real output column. Binding it to the
+  // literal `*` would leave an unresolvable sort key once the select list is
+  // expanded into the table's columns.
+  ASSERT_EQ(stmt->OrderBy().size(), 1U);
+  const Expression& key = stmt->OrderBy()[0].expression;
+  ASSERT_NE(key, nullptr);
+  EXPECT_EQ(key->Type(), TypeTag::kColumnValue);
+  EXPECT_EQ(key->AsColumnValue().GetColumnName().name, "id");
+
+  auto result = engine_->Execute(*ctx_, sql);
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+  auto rows = result.Value().Collect();
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(2));
+  EXPECT_EQ(rows[2][0], Value(3));
 }
 
 TEST_F(SelectRewritesTest, FlattenDerivedSourcesInlinesSimpleSubquery) {
@@ -1097,6 +1129,11 @@ TEST_F(SelectRewritesTest, TpchSf10DiscoveryRulesAndAllSemanticTraps) {
       "SELECT s_key FROM tpch_s, revenue "
       "WHERE s_key = supplier_no "
       "  AND total_rev = (SELECT MAX(total_rev) FROM revenue)";
+  {
+    auto parsed = ParseSelect(trap4a_nan_sql);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(RewriteCteArgmaxSubqueryToTopTies(parsed.get(), *ctx_));
+  }
   EXPECT_EQ(run_rows(false, trap4a_nan_sql), run_rows(true, trap4a_nan_sql));
   EXPECT_TRUE(run_rows(false, trap4a_nan_sql).empty());
 

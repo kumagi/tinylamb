@@ -298,8 +298,9 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
 
     std::vector<Column> cols;
     cols.reserve(specs.size());
-    for (const auto& c : specs) {
-      if (&c == &specs[key_idx]) {
+    for (size_t i = 0; i < specs.size(); ++i) {
+      const ColSpec& c = specs[i];
+      if (i == key_idx) {
         cols.emplace_back(ColumnName{"", c.name}, c.type,
                           Constraint{Constraint::kPrimaryKey});
       } else {
@@ -327,11 +328,11 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
       std::vector<Value> vals;
       vals.reserve(specs.size());
       for (size_t ci = 0; ci < specs.size(); ++ci) {
-        vals.push_back(MakeValue(rng, specs[ci], i, max_len,
-                                 /*allow_null=*/ci !=
-                                     static_cast<size_t>(key_idx)));
+        vals.push_back(
+            MakeValue(rng, specs[ci], i, max_len,
+                      /*allow_null=*/ci != static_cast<size_t>(key_idx)));
       }
-      Row r(vals);
+      Row r(std::move(vals));
       std::string key = r.EncodeKeyMemcomparableFormat(sc);
       if (key_is_int64) {
         const int64_t k = r[static_cast<size_t>(key_idx)].AsInt64();

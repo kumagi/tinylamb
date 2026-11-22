@@ -98,6 +98,9 @@ StatusOr<SortedDistinctRuns::Run> SortedDistinctRuns::Merge(const Run& left,
   size_t used = 0;
   std::optional<uint64_t> previous;
   const auto flush = [&]() -> Status {
+    if (used == 0) {
+      return Status::kSuccess;  // no buffered values; skip the zero-byte write
+    }
     if (std::fwrite(buffer.data(), sizeof(uint64_t), used, output.file.get()) !=
         used) {
       return StatusError(StatusCode::kIOError, "distinct merge write failed");
@@ -143,12 +146,58 @@ Status SortedDistinctRuns::Insert(Run run, size_t level) {
 }
 
 Status SortedDistinctRuns::Absorb(SortedDistinctRuns&& other) try {
-  for (size_t level = 0; level < other.levels_.size(); ++level) {
-    auto& run = other.levels_[level];
-    if (run) {
-      RETURN_IF_FAIL(Insert(std::move(*run), level));
+  if (&other == this) {
+    return StatusError(StatusCode::kInvalidArgument, "cannot absorb self");
+  }
+  struct StagedRun {
+    Run* borrowed{nullptr};
+    std::optional<Run> owned;
+    const Run& Get() const { return owned ? *owned : *borrowed; }
+    bool HasValue() const { return borrowed != nullptr || owned.has_value(); }
+  };
+  // Each level holds either an original run or a newly merged temporary.
+  // Original files are untouched until every merge has succeeded.
+  const size_t max_levels = std::max(levels_.size(), other.levels_.size());
+  std::vector<StagedRun> staged(max_levels + 1);
+  for (size_t i = 0; i < levels_.size(); ++i) {
+    if (levels_[i]) {
+      staged[i].borrowed = &*levels_[i];
     }
   }
+  for (size_t i = 0; i < other.levels_.size(); ++i) {
+    if (!other.levels_[i]) {
+      continue;
+    }
+    Run* borrowed = &*other.levels_[i];
+    std::optional<Run> carry;
+    size_t level = i;
+    while (staged[level].HasValue()) {
+      const Run& incoming = carry ? *carry : *borrowed;
+      ASSIGN_OR_RETURN(Run, merged, Merge(staged[level].Get(), incoming));
+      staged[level].borrowed = nullptr;
+      staged[level].owned.reset();
+      carry = std::move(merged);
+      borrowed = nullptr;
+      ++level;
+    }
+    if (carry) {
+      staged[level].owned = std::move(carry);
+    } else {
+      staged[level].borrowed = borrowed;
+    }
+  }
+  std::vector<std::optional<Run>> result(staged.size());
+  for (size_t i = 0; i < staged.size(); ++i) {
+    if (staged[i].owned) {
+      result[i] = std::move(staged[i].owned);
+    } else if (staged[i].borrowed) {
+      result[i] = std::move(*staged[i].borrowed);
+    }
+  }
+  while (!result.empty() && !result.back()) {
+    result.pop_back();
+  }
+  levels_ = std::move(result);
   other.levels_.clear();
   return Status::kSuccess;
 } catch (const std::exception& error) {
@@ -159,17 +208,27 @@ Status SortedDistinctRuns::Absorb(SortedDistinctRuns&& other) try {
 
 Status SortedDistinctRuns::ForEach(
     const std::function<void(uint64_t)>& consume) try {
-  std::optional<Run> final;
-  for (auto& run : levels_) {
-    if (!run) {
+  // Keep every input owned by levels_ until all merges succeed. A failed
+  // merge then leaves the original runs intact for a retry.
+  std::optional<Run> merged_run;
+  size_t first_level = levels_.size();
+  for (size_t i = 0; i < levels_.size(); ++i) {
+    if (!levels_[i]) {
       continue;
     }
-    if (!final) {
-      final = std::move(run);
-    } else {
-      ASSIGN_OR_RETURN(Run, merged, Merge(*final, *run));
-      final = std::move(merged);
+    if (first_level == levels_.size()) {
+      first_level = i;
+      continue;
     }
+    const Run& left = merged_run ? *merged_run : *levels_[first_level];
+    ASSIGN_OR_RETURN(Run, merged, Merge(left, *levels_[i]));
+    merged_run = std::move(merged);
+  }
+  std::optional<Run> final;
+  if (merged_run) {
+    final = std::move(merged_run);
+  } else if (first_level < levels_.size()) {
+    final = std::move(levels_[first_level]);
   }
   levels_.clear();
   if (!final) {

@@ -9,4 +9,4 @@
 -- expect: |0|,
 -- expect: |0|,|10|,
 -- expect: |1|,
--- failure: seed guard (honest trace): cached plans must keep matching fresh execution across a mutation; keeps the replay directory non-empty
+-- failure: cache-consistency guard for UPDATE; cached and fresh execution must agree across the mutation

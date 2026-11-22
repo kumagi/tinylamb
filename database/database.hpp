@@ -19,6 +19,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <ostream>
 #include <string>
@@ -55,8 +57,8 @@ class Database final : public CatalogReader {
       std::string_view dbname, size_t wal_sync_ms = 1,
       bool preallocate_new_wal = false);
 
-  // Filesystem bookkeeping: every Create() records the database's base name
-  // for this process; RemoveCreatedDatabaseFiles() unlinks the
+  // Filesystem bookkeeping: every successful Create() records the database's
+  // base name for this process; RemoveCreatedDatabaseFiles() unlinks the
   // <name>.db/.log/.last_checkpoint/.last_checkpoint.tmp artifacts of every
   // recorded name (missing files are ignored). The test-workspace cleanup
   // environment calls it at binary exit so throwaway databases never outlive
@@ -209,7 +211,15 @@ class Database final : public CatalogReader {
   // columnar file alongside `<db>.db` and replaces the in-memory pages with
   // columnar stub pages bound to the backing `TlcsFile`.
   Status CompactTableToTlcs(TransactionContext& ctx,
-                            std::string_view schema_name);
+                            std::string_view schema_name,
+                            bool write_checkpoint = true,
+                            bool refresh_statistics = true,
+                            bool non_blocking_quiescence = false);
+
+  Status CompactAllTablesToTlcs();
+
+  bool AutoCompactTableForAnalyze(TransactionContext& ctx,
+                                  std::string_view schema_name);
 
   void DeleteAll();
 
@@ -234,7 +244,20 @@ class Database final : public CatalogReader {
   // epoch range (see schema_epoch_ below).
   static uint64_t next_database_epoch_base() noexcept {
     static std::atomic<uint64_t> base{0};
-    return base.fetch_add(1ULL << 32, std::memory_order_acq_rel) + 1;
+    constexpr uint64_t kStride = uint64_t{1} << 32;
+    uint64_t current = base.load(std::memory_order_relaxed);
+    while (true) {
+      // 2^32 instances exhaust the 64-bit epoch space. Wrapping would reuse a
+      // predecessor's range and revive its stale plans, so fail fast instead.
+      if (current > std::numeric_limits<uint64_t>::max() - kStride) {
+        std::abort();
+      }
+      if (base.compare_exchange_weak(current, current + kStride,
+                                     std::memory_order_acq_rel,
+                                     std::memory_order_relaxed)) {
+        return current + 1;
+      }
+    }
   }
 
   // Persistent { Name => Table } storage.
@@ -278,6 +301,10 @@ class Database final : public CatalogReader {
   // database starting at 0 would otherwise replay artifacts that reference
   // the destroyed predecessor's tables.
   std::atomic<uint64_t> schema_epoch_{next_database_epoch_base()};
+  std::atomic<bool> auto_tlcs_in_progress_{false};
+
+  bool TryAutoCompactTable(TransactionContext& ctx,
+                           std::string_view schema_name);
 
   std::unique_ptr<PageStorage> storage_;
 

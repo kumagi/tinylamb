@@ -5,7 +5,7 @@
 
 ## 概要
 
-`extract_year_sargable` は、`EXTRACT(YEAR FROM date_col) <op> year` 形式の述語を、DATE 型列の範囲比較へ変換する論理 Rule です。元の述語は SARGable（Search Argument Able）ではありません。変換後は半開区間 `[year-01-01, (year+1)-01-01)` を使う述語となり、対象テーブルの scan filter へ追加されます。
+`extract_year_sargable` は、`EXTRACT(YEAR FROM date_col) <op> year` 形式の述語を、DATE 型列の範囲比較へ変換する論理 Rule です。元の述語は SARGable（Search Argumentable）ではありません。変換後は半開区間 `[year-01-01, (year+1)-01-01)` を使う述語となり、対象テーブルの scan filter へ追加されます。
 
 列値に関数を適用した比較はインデックス走査の探索キーとして利用できません。等価な日付リテラルの範囲条件を生成してベーステーブルの走査プロパティに注入することで、インデックス範囲走査（LsmIndex Range Scan）やストレージ層のゾーンマップによるブロック枝刈りを可能にします。
 
@@ -27,6 +27,8 @@ graph TD
 
 連言（AND）の各項を走査し、以下のすべてのガード条件を満たす述語に対して発火します。
 
+最初に `SelectionMayStrengthenSharedScans(memo, group)` を確認します。現在の実装では、Selection の Group が `branch_local` の場合は共有スキャンのフィルタを強化せず、ルール全体を終了します。
+
 1. 式が `kSelection` であり、子が 1 個、かつ述語を保持していること。
 2. オプティマイザのカタログ内に 1 つ以上のテーブルスキーマが存在すること。
 3. 述語が二項比較であり、片辺が関数呼び出し式（`kFunctionCallExp`）、他辺が定数値（`kConstantValue`）であること（左右の被演算子の順序は問わない）。
@@ -44,8 +46,8 @@ graph TD
 
 - **単一リレーショングループにおける正確性契約**:
   Cascades 実装において、単一リレーション Group では scan filter が物理スキャン時に唯一評価される述語となるケースがあり、ルートの SelectionPlan による再評価（フィルタラップ）が存在しない場合があります。そのため、不正確に緩い範囲を設定して「後で残留フィルタで絞る」という二段構えは許容されず、scan filter に注入する境界条件は元の `extract_year` 述語と数学的に完全同値でなければなりません。
-- **8 通りの厳密な境界写像**:
-  被演算子の左右順序（正規形および鏡像形）に応じた境界変換テーブルを厳密に定義し、不等号の逆転と境界日の対応関係を保持します。
+- **9 通りの厳密な境界写像**:
+  不等号の左右順序（正規形 4 通りと鏡像形 4 通り）に等値 1 通りを加えた境界変換テーブルを厳密に定義し、不等号の逆転と境界日の対応関係を保持します。
 
   | 式の形状 | 変換後の範囲境界条件 |
   | :--- | :--- |
@@ -80,7 +82,7 @@ graph TD
             const Expression lower = ConstantValueExp(lower_status.Value());
             const Expression upper = ConstantValueExp(upper_status.Value());
             std::vector<Expression> bounds;
-            // ... switch 文による 8 通りの境界条件組み立て ...
+            // ... switch 文による 5 case (=, <, <=, >, >=) の境界条件組み立て ...
             memo.MergeScanFilter(memo.EnsureGroup({column.schema}),
                                  CombineConjuncts(bounds));
 ```

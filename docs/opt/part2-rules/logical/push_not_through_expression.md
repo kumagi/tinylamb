@@ -1,6 +1,7 @@
 # push_not_through_expression
 
 - 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 注: 比較の否定に関する記述と引用は 2026-11-21 時点の実装に更新。
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`(`built.Add(Rule("push_not_through_expression", …)`)
   登録式。依存ヘルパーなし(ラムダ内部の自己再帰ラムダ `normalize_not`)。
 
@@ -15,11 +16,11 @@ Selection の述語の中の `NOT` を、比較の否定・二重否定・ド・
 
 ```mermaid
 graph TD
-  subgraph before["変換前: Selection(Scan t, NOT (t.v < 10))"]
-    S1["Selection NOT (v &lt; 10)"] --> T1["Scan t"]
+  subgraph before["変換前: Selection(Scan t, NOT (t.v = 10))"]
+    S1["Selection NOT (v = 10)"] --> T1["Scan t"]
   end
-  subgraph after["変換後: 同じグループに Selection(v >= 10) の代替式を追加"]
-    S2["Selection v &gt;= 10"] --> T2["Scan t"]
+  subgraph after["変換後: 同じグループに Selection(v != 10) の代替式を追加"]
+    S2["Selection v != 10"] --> T2["Scan t"]
   end
 ```
 
@@ -44,10 +45,8 @@ guard は次の 2 つだけです。
 再帰ラムダ `normalize_not` が行う書き換えは次の 3 族です。
 
 1. **二重否定**: `NOT (NOT x)` → `x`(中身を再帰的に正規化して返す)。
-2. **比較の否定**(6 種の対応):
-   `NOT (a = b)` → `a <> b`、`NOT (a <> b)` → `a = b`、
-   `NOT (a > b)` → `a <= b`、`NOT (a >= b)` → `a < b`、
-   `NOT (a < b)` → `a >= b`、`NOT (a <= b)` → `a > b`。
+2. **等値比較の否定**: `NOT (a = b)` → `a <> b`、
+   `NOT (a <> b)` → `a = b`。順序比較は変換しません。
 3. **ド・モルガン**: `NOT (a AND b)` → `NOT a OR NOT b`、
    `NOT (a OR b)` → `NOT a AND NOT b`。
 
@@ -61,8 +60,7 @@ guard は次の 2 つだけです。
 フィルタは TRUE だけを通します。このとき `x op y` と
 `NOT (x neg_op y)` の関係を見ると:
 
-- 両辺が非 NULL なら `op` と `neg_op` は標準的な否定関係
-  (たとえば `<` の否定は `>=`)を満たすので真偽が一致します。
+- 等値・不等値は非 NULL の値について互いに否定の関係にあります。
 - どちらかの辺が NULL なら **両方とも** UNKNOWN になり、フィルタは
   どちらも同じ行を落とします。
 
@@ -71,8 +69,9 @@ guard は次の 2 つだけです。
 `T AND U = U`、`F OR U = U` など)で検算すると恒等式です。
 二重否定は `NOT UNKNOWN = UNKNOWN` により安全に消せます。
 
-一方、対応表にない演算（`LIKE` など）には、ここで使える否定の等価形が
-定義されていません。そのため、`default: break;` で変換しません。
+順序比較は型を証明できないため変換しません。例えば NaN では
+`NaN < 10` と `NaN >= 10` がともに偽なので、前者の NOT を後者に置換すると
+結果が変わります。対応していない `LIKE` なども変換しません。そのため、`default: break;` で変換しません。
 なお `IS NULL` の否定は `IS NOT NULL` に相当しますが、これは本 Rule では
 扱わず(`default: break;` で無変換)、式書き換え層(`expression/rewrite.cpp`)の
 `not_is_null` 等の Rule の担当です — 論理 Rule は Memo 内の述語に現れた形だけを
@@ -105,13 +104,13 @@ guard は次の 2 つだけです。
 
 二重否定の中身を再帰に渡して**結果をそのまま返す**ため、
 `NOT NOT NOT x` のような奇数重ねは外側 2 つを消して `NOT x` に
-落ち着きます。比較の否定の switch は 6 ケースで、代表を引用します。
+落ち着きます。等値比較の否定の switch から一例を引用します。
 
 ```cpp
-                    case BinaryOperation::kGreaterThan:
-                      return BinaryExpressionExp(
-                          self(self, l), BinaryOperation::kLessThanEquals,
-                          self(self, r));
+                    case BinaryOperation::kEquals:
+                      return BinaryExpressionExp(self(self, l),
+                                                 BinaryOperation::kNotEquals,
+                                                 self(self, r));
 ```
 
 両辺を再帰的に正規化してから否定後の演算子で組み立てるのが
@@ -151,7 +150,7 @@ guard は次の 2 つだけです。
 
 ## 関連 Rule との相互作用
 
-- `merge_selections` / `merge_selections`: 合成後の述語が
+- `merge_selections`: 合成後の述語が
   本 Rule の入力になります。
 - `push_selection_into_scan` / `push_selection_through_join`:
   正規形になった連言を下流へ押し込みます。
@@ -162,8 +161,9 @@ guard は次の 2 つだけです。
 ## 検証テスト
 
 - `plan/cascades_test_part*.cpp` の `CascadesTest.PushNotThroughExpression` —
-  `NOT (t.v < 10)` を探索すると、`kGreaterThanEquals` の述語を持つ
-  Selection 代替が現れることを検証します。
+  `NOT (t.v = 10)` の `kNotEquals` への変換を検証します。
+- `CascadesTest.PushNotThroughExpressionPreservesOrderedComparison` —
+  `NOT (t.v < 10)` を `kGreaterThanEquals` に書き換えないことを検証します。
 - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms` —
   `rules.Contains("push_not_through_expression")` による既定セットへの
   登録確認。

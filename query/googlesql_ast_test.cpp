@@ -25,6 +25,7 @@
 #include "query/googlesql_ast_visitor_internal.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/statement.hpp"
+#include "type/interval.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -85,6 +86,35 @@ TEST(GoogleSqlAstAuditTest, BoundsDepthBeforeRecursiveWalks) {
   EXPECT_NE(visited.GetStatus().GetMessage().find("depth"), std::string::npos);
 }
 
+TEST(GoogleSqlAstAuditTest, SelectAsValueRequiresOneExpression) {
+  constexpr std::string_view sql = "SELECT AS VALUE 1, 2";
+  const auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  const auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("exactly one expression"),
+            std::string::npos);
+  EXPECT_NE(VisitSql("SELECT AS VALUE 1"), nullptr);
+}
+
+TEST(GoogleSqlAstAuditTest, DuplicateNamedWindowsAreRejected) {
+  constexpr std::string_view sql =
+      "SELECT SUM(v) OVER w FROM t WINDOW w AS (ORDER BY a), "
+      "w AS (ORDER BY b DESC)";
+  const auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  const auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("duplicate named window"),
+            std::string::npos);
+  EXPECT_NE(VisitSql("SELECT SUM(v) OVER w FROM t WINDOW w AS (ORDER BY a)"),
+            nullptr);
+}
+
 TEST(GoogleSqlAstAuditTest, MultilineLiteralIgnoresFakeLocationsAndParens) {
   for (std::string text :
        {"first [1-2]\nsecond", "first ) [1-2]\nsecond", "first )\nsecond",
@@ -99,6 +129,28 @@ TEST(GoogleSqlAstAuditTest, MultilineLiteralIgnoresFakeLocationsAndParens) {
     ASSERT_TRUE(value.HasValue()) << value.GetStatus();
     EXPECT_EQ(value.Value(), Value(std::string(text)));
   }
+}
+
+TEST(GoogleSqlAstAuditTest, BacktickDetailParensDoNotAbsorbSiblingLines) {
+  // A raw dump whose Identifier detail contains an unbalanced '('. The line
+  // is complete; only the paren inside the backticks is unbalanced. Counting
+  // it as structural made LabelContinues join every following line into this
+  // node, dropping the second SelectColumn from the tree.
+  const std::string dump =
+      "QueryStatement\n"
+      "  Query\n"
+      "    SelectList\n"
+      "      SelectColumn\n"
+      "        Identifier(`a(`) [7-11]\n"
+      "      SelectColumn\n"
+      "        IntLiteral(1) [15-15]\n";
+  const auto ast = GoogleSqlAstParser::Parse(dump);
+  ASSERT_TRUE(ast.HasValue());
+  const auto* query = ast.Value()->Child("Query");
+  ASSERT_NE(query, nullptr);
+  const auto* select_list = query->Child("SelectList");
+  ASSERT_NE(select_list, nullptr);
+  EXPECT_EQ(select_list->Children("SelectColumn").size(), 2U);
 }
 
 TEST(GoogleSqlAstAuditTest, SourceLessUnionKeepsDistinctMode) {
@@ -464,6 +516,30 @@ TEST(GoogleSqlAstTest, AggregateFunctionsIncludingDistinct) {
   EXPECT_EQ(select.SelectList()[5].expression->ToString(), "COUNT(DISTINCT e)");
 }
 
+TEST(GoogleSqlAstTest, CountRejectsMultipleArguments) {
+  EXPECT_EQ(VisitSql("SELECT COUNT(1, 2) FROM UNNEST([1, 2]) AS x"), nullptr);
+  EXPECT_EQ(VisitSql("SELECT COUNT(1, 2) OVER () FROM UNNEST([1, 2]) AS x"),
+            nullptr);
+  EXPECT_NE(VisitSql("SELECT COUNT(*) OVER (), COUNT(x) OVER () "
+                     "FROM UNNEST([1, 2]) AS x"),
+            nullptr);
+}
+
+TEST(GoogleSqlAstTest, NestedInsertRejectsReturningClause) {
+  EXPECT_NE(VisitSql("UPDATE t SET (INSERT arr VALUES (1)) WHERE id = 1"),
+            nullptr);
+  constexpr std::string_view sql =
+      "UPDATE t SET (INSERT arr VALUES (1) THEN RETURN *) WHERE id = 1";
+  const auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue()) << ast.GetStatus();
+  const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("nested DML RETURNING"),
+            std::string::npos);
+}
+
 TEST(GoogleSqlAstTest, FoldBooleanChains) {
   auto statement = VisitSql("SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
   ASSERT_TRUE(statement);
@@ -745,6 +821,22 @@ TEST(GoogleSqlAstTest, BacktickIdentifiersAreDecoded) {
   EXPECT_EQ(select.FromClause()[0], "table name");
 }
 
+TEST(GoogleSqlAstAuditTest,
+     BacktickIdentifierWithUnbalancedParenKeepsSiblingColumns) {
+  // A backtick-quoted identifier may contain an unbalanced '(' in its raw AST
+  // detail ("Identifier(`a(`) [s-e]"). The line is complete, but counting that
+  // '(' as structural made LabelContinues swallow every following dump line,
+  // silently dropping later select columns (or ORDER BY / LIMIT).
+  auto statement = VisitSql("SELECT `a(` AS x, 1 AS y;");
+  ASSERT_NE(statement, nullptr);
+  const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_EQ(select->SelectList().size(), 2U);
+  EXPECT_EQ(select->SelectList()[0].name, "x");
+  EXPECT_EQ(select->SelectList()[0].expression->ToString(), "a(");
+  EXPECT_EQ(select->SelectList()[1].name, "y");
+}
+
 TEST(GoogleSqlAstTest, TripleQuotedStringDecodesEmbeddedQuote) {
   // GoogleSQL allows a triple-quoted string literal that contains an escaped
   // single quote (''), which the visitor must decode into one quote character.
@@ -778,9 +870,12 @@ TEST(GoogleSqlAstTest, TableValuedFunctionExpandsStoredBody) {
   const std::unique_ptr<Statement>& create =
       VisitSqlOrThrow("CREATE TABLE FUNCTION my_func(x INT64) AS SELECT x;");
   ASSERT_EQ(create->Type(), StatementType::kCreateFunction);
-  EXPECT_EQ(static_cast<const CreateObjectStatement*>(create.get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
-                ->RunSideEffect(),
-            Status::kSuccess);
+  EXPECT_EQ(
+      static_cast<const CreateObjectStatement*>(
+          create
+              .get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+          ->RunSideEffect(),
+      Status::kSuccess);
   const std::unique_ptr<Statement>& statement =
       VisitSqlOrThrow("SELECT * FROM my_func(1);");
   const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
@@ -1005,6 +1100,28 @@ TEST(GoogleSqlAstTest, DistinguishesLateralFromMultilineDerivedTable) {
     ASSERT_EQ(select->Sources().size(), 1U) << test.sql;
     EXPECT_EQ(select->Sources()[0].is_lateral, test.is_lateral) << test.sql;
   }
+}
+
+TEST(GoogleSqlAstTest, RejectsMultipleUnnestArraysWithoutDroppingOperands) {
+  const std::string sql = "SELECT * FROM UNNEST([1, 2], [3, 4])";
+  const auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  const auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  const auto result = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_FALSE(result.HasValue());
+  EXPECT_NE(result.GetStatus().GetMessage().find(
+                "UNNEST with multiple arrays is not supported"),
+            std::string::npos);
+
+  const auto single =
+      VisitSql("SELECT item, i FROM UNNEST([1, 2]) AS item WITH OFFSET AS i");
+  const auto* select = dynamic_cast<const SelectStatement*>(single.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_EQ(select->Sources().size(), 1u);
+  EXPECT_EQ(select->Sources()[0].alias, "item");
+  EXPECT_EQ(select->Sources()[0].offset_alias, "i");
+  EXPECT_TRUE(select->Sources()[0].unnest);
 }
 
 TEST(GoogleSqlAstTest, DistinctOnAstVisitor) {
@@ -1288,7 +1405,7 @@ TEST(GoogleSqlAstTest, UnitlessIntervalLiteralsReturnStatusNotThrow) {
   });
   // The original crash input must actually reach one of the two paths; a
   // parser that rejects it before parsing must still do so without throwing.
-  EXPECT_TRUE(exercised || true) << kCrashInput;
+  EXPECT_TRUE(exercised) << kCrashInput;
 }
 
 TEST(GoogleSqlAstTest, UdfDefinitionsAreScopedToTheirSession) {
@@ -1339,11 +1456,11 @@ TEST(GooglesqlSessionRegistryTest, ClearSessionRegistriesIsSessionScoped) {
   constexpr uint64_t kSessionA = 0x5E5510AAULL;
   constexpr uint64_t kSessionB = 0x5E5510BBULL;
   SetUdfSessionScope(kSessionA);
-  ViewRegistry()["only_a"] = nullptr;
+  ViewRegistry().try_emplace("only_a");
   ast_visitor_detail::SessionConstantExpressions()["c_a"] =
       ConstantValueExp(Value(int64_t{1}));
   SetUdfSessionScope(kSessionB);
-  ViewRegistry()["only_b"] = nullptr;
+  ViewRegistry().try_emplace("only_b");
   ast_visitor_detail::SessionConstantExpressions()["c_b"] =
       ConstantValueExp(Value(int64_t{2}));
 
@@ -1360,6 +1477,39 @@ TEST(GooglesqlSessionRegistryTest, ClearSessionRegistriesIsSessionScoped) {
   ClearSessionRegistries();
   EXPECT_TRUE(ViewRegistry().empty());
   EXPECT_TRUE(ast_visitor_detail::SessionConstantExpressions().empty());
+  SetUdfSessionScope(0);
+}
+
+// The legacy string-constant ledger shares the event-loop thread with other
+// sessions; it must be bucketed by scope exactly like the typed expression
+// registry. A name defined in one session must not resolve in another, and a
+// disconnect must only drop the leaving session's names.
+TEST(GooglesqlSessionRegistryTest, StringConstantsAreSessionScoped) {
+  constexpr uint64_t kSessionA = 0x5E5510CCULL;
+  constexpr uint64_t kSessionB = 0x5E5510DDULL;
+  SetUdfSessionScope(kSessionA);
+  SetSessionConstant("c", "from_a");
+  ASSERT_TRUE(HasSessionConstant("c"));
+  ASSERT_EQ(GetSessionConstant("c"), "from_a");
+
+  SetUdfSessionScope(kSessionB);
+  EXPECT_FALSE(HasSessionConstant("c"))
+      << "session B resolved session A's string constant";
+  EXPECT_EQ(GetSessionConstant("c"), "");
+  SetSessionConstant("c", "from_b");
+  EXPECT_EQ(GetSessionConstant("c"), "from_b");
+
+  // Clearing B's registries must leave A's string constant intact.
+  ClearSessionRegistries();
+  EXPECT_FALSE(HasSessionConstant("c"));
+  SetUdfSessionScope(kSessionA);
+  EXPECT_TRUE(HasSessionConstant("c"));
+  EXPECT_EQ(GetSessionConstant("c"), "from_a");
+
+  // Leave no state behind for other tests sharing this thread.
+  ClearSessionRegistries();
+  SetUdfSessionScope(kSessionB);
+  ClearSessionRegistries();
   SetUdfSessionScope(0);
 }
 

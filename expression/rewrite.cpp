@@ -87,15 +87,16 @@ namespace {
 const Schema* ActiveRewriteSchema();
 }  // namespace
 
-// Reducing x + x to x * 2 must not change the number of evaluations of a
-// volatile expression or a subquery. An immutable expression can still raise
-// an evaluation error (e.g. `1/0`, `CAST('abc' AS INT64)`); duplicating or
-// fanning it out changes which branch raises first.  That error-freedom proof
-// needs column types, so it is applied when a schema is in scope
-// (SafeToReduceEvaluationCountWithSchema).  Without one, every column
-// comparison would count as "may throw" and the schema-free Cascades rules
-// (filter pushdown through unnest/window/aggregate/semi join, ...) could never
-// fire; those rules carry their own error-freedom guards where it matters.
+// Reducing x + x to x * 2 changes the number of evaluations of x from two to
+// one, so it must not be applied when x is volatile or is a subquery. An
+// immutable expression can still raise an evaluation error (e.g. `1/0`,
+// `CAST('abc' AS INT64)`); duplicating or fanning it out changes which branch
+// raises first.  That error-freedom proof needs column types, so it is applied
+// when a schema is in scope (SafeToReduceEvaluationCountWithSchema).  Without
+// one, every column comparison would count as "may throw" and the schema-free
+// Cascades rules (filter pushdown through unnest/window/aggregate/semi join,
+// ...) could never fire; those rules carry their own error-freedom guards where
+// it matters.
 bool SafeToReduceEvaluationCount(  // NOLINT(misc-no-recursion)
     const Expression& expression) {
   if (!expression) {
@@ -1857,21 +1858,19 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         "identity_add_zero",
         Binary(BinaryOperation::kAdd, Any("left"), Any("right")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          // NOTE: intentional deviation from the AST ground truth (kept for
-          // optimizer quality, pinned by the optimizer_arithmetic compliance
-          // file): the identities fire on numeric/int columns even though
-          // the AST types e.g. `a + 0.0` as double.  Known IEEE gap: a
-          // -0.0 survivor is normalized to +0.0.
+          // A floating zero can promote the other operand to DOUBLE.
           const Expression& left = bindings.at("left");
           const Expression& right = bindings.at("right");
           if (IsZero(left)) {
-            if (StaticallyNonNumeric(right)) {
+            if (StaticallyNonNumeric(right) ||
+                (!IsInt64Constant(left) && !StaticallyDouble(right))) {
               return Expression{};
             }
             return right;
           }
           if (IsZero(right)) {
-            if (StaticallyNonNumeric(left)) {
+            if (StaticallyNonNumeric(left) ||
+                (!IsInt64Constant(right) && !StaticallyDouble(left))) {
               return Expression{};
             }
             return left;
@@ -1884,13 +1883,13 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         "identity_subtract_zero",
         Binary(BinaryOperation::kSubtract, Any("left"), Any("right")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          if (!IsZero(bindings.at("right"))) {
+          const Expression& left = bindings.at("left");
+          const Expression& right = bindings.at("right");
+          if (!IsZero(right) || StaticallyNonNumeric(left) ||
+              (!IsInt64Constant(right) && !StaticallyDouble(left))) {
             return Expression{};
           }
-          if (StaticallyNonNumeric(bindings.at("left"))) {
-            return Expression{};
-          }
-          return bindings.at("left");
+          return left;
         }));
     // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
     //   (int64_identities_negation_and_abs_sound)
@@ -1901,13 +1900,15 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           const Expression& left = bindings.at("left");
           const Expression& right = bindings.at("right");
           if (IsOne(left)) {
-            if (StaticallyNonNumeric(right)) {
+            if (StaticallyNonNumeric(right) ||
+                (!IsInt64Constant(left) && !StaticallyDouble(right))) {
               return Expression{};
             }
             return right;
           }
           if (IsOne(right)) {
-            if (StaticallyNonNumeric(left)) {
+            if (StaticallyNonNumeric(left) ||
+                (!IsInt64Constant(right) && !StaticallyDouble(left))) {
               return Expression{};
             }
             return left;
@@ -2725,7 +2726,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               // A single ArrayExpression carries one declared element type.
               // Only merge when every contributor agrees on it; mixing e.g.
               // INT64 and STRING literals would silently re-label the result
-              // and change equality/casting behaviour. On a conflict keep the
+              // and change equality/casting behavior. On a conflict keep the
               // original function call so the evaluator applies its own rules.
               std::string elem_type;
               bool type_conflict = false;
@@ -2874,10 +2875,10 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // (1, NULL), exactly inverted.  Reintroduce only with correct
     // three-valued logic and an actual producer.
 
-    // x = TRUE -> x (for boolean-typed column references)
-    // x = FALSE -> NOT x (for boolean-typed column references)
-    // Conservative: only apply when right side is an IS TRUE / IS FALSE check
-    // or a literal 1/0 that came from a boolean context.
+    // (x IS TRUE) = 1 -> (x IS TRUE),  (x IS TRUE) = 0 -> (x IS NOT TRUE):
+    // fold an equality against a boolean 0/1 literal into the IS-predicate.
+    // The IS TRUE / IS FALSE check is on the left; the right side must be a
+    // literal 1/0 that came from a boolean context.
     // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
     //   (boolean_eq_true_false_three_valued_sound)
     built.Add(ExpressionRule(
@@ -3114,21 +3115,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
 
           return Expression{};
-        }));
-
-    // IF(condition, then, else) -> CASE WHEN condition THEN then ELSE else END
-    // Only for 3-argument IF. Canonical form for further rewrite.
-    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
-    //   (case_and_if_pushdown_rules_sound)
-    built.Add(ExpressionRule(
-        "if_to_case", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (fn.FuncName() != "if" || fn.Args().size() != 3) {
-            return Expression{};
-          }
-          return CaseExpressionExp({{fn.Args()[0], fn.Args()[1]}},
-                                   fn.Args()[2]);
         }));
 
     // empty IN list -> FALSE
@@ -3596,19 +3582,22 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               std::optional<IntervalValue> justified;
               if (fn.FuncName() == "justify_hours") {
                 auto r = iv.TryJustifyHours();
-                if (r.HasValue())
+                if (r.HasValue()) {
                   justified =
                       r.MoveValue();  // NOLINT(readability-braces-around-statements)
+                }
               } else if (fn.FuncName() == "justify_days") {
                 auto r = iv.TryJustifyDays();
-                if (r.HasValue())
+                if (r.HasValue()) {
                   justified =
                       r.MoveValue();  // NOLINT(readability-braces-around-statements)
+                }
               } else if (fn.FuncName() == "justify_interval") {
                 auto r = iv.TryJustifyInterval();
-                if (r.HasValue())
+                if (r.HasValue()) {
                   justified =
                       r.MoveValue();  // NOLINT(readability-braces-around-statements)
+                }
               } else {
                 return Expression{};
               }
@@ -4619,11 +4608,11 @@ bool IsInt64Constant(const Expression& expression, int64_t* value) {
   return true;
 }
 
-// Reassociation and sign absorption only fire on operands the input schema
-// types as plain integer: floating-point addition/multiplication is neither
-// associative nor distributive (rounding), so folding it would change
-// results. Sign absorption and repeated-addend doubling are exact for
-// doubles and therefore allowed there.
+// Reassociation only fires on operands the input schema types as plain INT64:
+// floating-point addition/multiplication is neither associative nor
+// distributive (rounding), so folding it would change results. Sign absorption
+// and repeated-addend doubling, by contrast, are exact for doubles too and
+// are allowed there (IsNumericOperand below accepts kBigInt or kDouble).
 bool IsInt64Column(const Expression& expression, const Schema& schema) {
   if (!expression || expression->Type() != TypeTag::kColumnValue) {
     return false;
@@ -5052,8 +5041,9 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
           expression->AsCastExpression().Child(), schema);
     case TypeTag::kWindowFunctionExp:
       // Window partition/order keys, arguments and frame offsets can all
-      // hide a NOT(ordered double comparison); inspect every child the
-      // same way the aggregate arm does.
+      // hide a NOT(ordered double comparison). Unlike the aggregate arm (which
+      // inspects its single Child()), window functions carry partition/order/
+      // frame expressions, so inspect every child here.
       return std::ranges::any_of(
           ExpressionChildren(expression), [&schema](const Expression& child) {
             return ContainsNotOfOrderedDoubleComparison(child, schema);

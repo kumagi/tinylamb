@@ -7,10 +7,10 @@
 #include <charconv>
 #include <cinttypes>
 #include <cmath>
-#include <cstdlib>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -28,19 +28,21 @@ namespace tinylamb {
 
 namespace {
 // Smallest/largest doubles that still convert to int64_t without undefined
-// behaviour.  The old ±9.3e18 guards let values in (INT64_MAX, 9.3e18] reach
+// behavior.  The old ±9.3e18 guards let values in (INT64_MAX, 9.3e18] reach
 // the cast (UBSan: "9.24222e+18 is outside the range of representable values
 // of type 'long'", found by INTERVAL fuzzing).
 constexpr double kInt64MinAsDouble = -9223372036854775808.0;  // -2^63 exact
 constexpr double kInt64MaxExclusive = 9223372036854775808.0;  // 2^63
 
 // Index of a unit name inside a composite "X to Y" range (0=year ..
-// 5=second), or -1. Trailing 's' letters are stripped for the plural
+// 5=second), or -1. A single trailing 's' is stripped for the plural
 // spelling, then the name must match EXACTLY: a prefix match would let
 // "yearxyz to month" parse as a year-month range.
 int RangeUnitIndex(std::string_view name) {
   std::string base(name);
-  while (!base.empty() && base.back() == 's') {
+  // Strip exactly one trailing 's' for the plural spelling. Stripping all of
+  // them would accept misspellings such as "monthss" as valid units.
+  if (!base.empty() && base.back() == 's') {
     base.pop_back();
   }
   static constexpr std::array<std::string_view, 6> kNames = {
@@ -56,8 +58,8 @@ int RangeUnitIndex(std::string_view name) {
 std::optional<StatusOr<IntervalValue>> ScaleIntegerInterval(
     int64_t amount, std::string_view unit) {
   bool overflowed = false;
-  const auto checked_return = [&](const IntervalValue& value)
-      -> StatusOr<IntervalValue> {
+  const auto checked_return =
+      [&](const IntervalValue& value) -> StatusOr<IntervalValue> {
     if (overflowed) {
       return StatusError(StatusCode::kInvalidArgument,
                          "generic::out_of_range: INTERVAL value out of range");
@@ -78,14 +80,16 @@ std::optional<StatusOr<IntervalValue>> ScaleIntegerInterval(
         IntervalValue{.months = mul(3), .days = 0, .nanos = 0});
   }
   if (unit == "month" || unit == "months") {
-    return checked_return(IntervalValue{.months = amount, .days = 0, .nanos = 0});
+    return checked_return(
+        IntervalValue{.months = amount, .days = 0, .nanos = 0});
   }
   if (unit == "week" || unit == "weeks") {
     return checked_return(
         IntervalValue{.months = 0, .days = mul(7), .nanos = 0});
   }
   if (unit == "day" || unit == "days") {
-    return checked_return(IntervalValue{.months = 0, .days = amount, .nanos = 0});
+    return checked_return(
+        IntervalValue{.months = 0, .days = amount, .nanos = 0});
   }
   if (unit == "hour" || unit == "hours") {
     return checked_return(IntervalValue{
@@ -100,15 +104,16 @@ std::optional<StatusOr<IntervalValue>> ScaleIntegerInterval(
         .months = 0, .days = 0, .nanos = mul(int64_t{1000000000LL})});
   }
   if (unit == "millisecond" || unit == "milliseconds") {
-    return checked_return(IntervalValue{
-        .months = 0, .days = 0, .nanos = mul(int64_t{1000000})});
+    return checked_return(
+        IntervalValue{.months = 0, .days = 0, .nanos = mul(int64_t{1000000})});
   }
   if (unit == "microsecond" || unit == "microseconds") {
     return checked_return(
         IntervalValue{.months = 0, .days = 0, .nanos = mul(int64_t{1000})});
   }
   if (unit == "nanosecond" || unit == "nanoseconds") {
-    return checked_return(IntervalValue{.months = 0, .days = 0, .nanos = amount});
+    return checked_return(
+        IntervalValue{.months = 0, .days = 0, .nanos = amount});
   }
   return std::nullopt;
 }
@@ -117,7 +122,20 @@ std::optional<StatusOr<IntervalValue>> ScaleIntegerInterval(
 
 namespace {
 
-thread_local std::unordered_map<std::string, std::string> tls_session_constants;
+// Keyed by session scope, not just by thread: the event-loop thread runs many
+// connections, and a constant defined by one must never resolve in another
+// (nor be cleared by another's disconnect). Switching scope only selects a
+// bucket; the previous session's entries stay available when it is restored.
+struct SessionConstantState {
+  uint64_t scope{0};
+  std::unordered_map<uint64_t, std::unordered_map<std::string, std::string>>
+      constants;
+};
+
+SessionConstantState& SessionConstantStateForThread() {
+  static thread_local SessionConstantState state;
+  return state;
+}
 
 // snprintf whose result is enforced: a negative return means an encoding
 // failure that would otherwise surface as stale buffer contents. Truncation
@@ -148,36 +166,51 @@ std::string Trim(std::string_view s) {
 }
 
 std::string ToLower(std::string_view s) {
-  std::string out(s);
-  for (char& c : out) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  return out;
+  // Use the same ASCII-only fold as value/date/collation and SetSessionConstant
+  // below: std::tolower is locale-dependent, so unit acceptance must not vary
+  // with the process locale.
+  return AsciiToLower(s);
 }
 
 }  // namespace
+
+void SetSessionConstantScope(uint64_t scope) {
+  SessionConstantStateForThread().scope = scope;
+}
 
 void SetSessionConstant(std::string_view name, std::string_view value) {
   // Key on the ASCII-folded name, matching SessionConstantExpressions()
   // (which keys on Lower(name)): the two ledgers must agree about case or a
   // mixed-case CREATE CONSTANT resolves differently depending on which one
   // answers first.
-  tls_session_constants[AsciiToLower(name)] = std::string(value);
+  SessionConstantState& state = SessionConstantStateForThread();
+  state.constants[state.scope][AsciiToLower(name)] = std::string(value);
 }
 
 std::string GetSessionConstant(std::string_view name) {
-  auto it = tls_session_constants.find(AsciiToLower(name));
-  if (it != tls_session_constants.end()) {
+  const SessionConstantState& state = SessionConstantStateForThread();
+  auto bucket = state.constants.find(state.scope);
+  if (bucket == state.constants.end()) {
+    return "";
+  }
+  auto it = bucket->second.find(AsciiToLower(name));
+  if (it != bucket->second.end()) {
     return it->second;
   }
   return "";
 }
 
 bool HasSessionConstant(std::string_view name) {
-  return tls_session_constants.contains(AsciiToLower(name));
+  const SessionConstantState& state = SessionConstantStateForThread();
+  auto bucket = state.constants.find(state.scope);
+  return bucket != state.constants.end() &&
+         bucket->second.contains(AsciiToLower(name));
 }
 
-void ClearSessionConstants() { tls_session_constants.clear(); }
+void ClearSessionConstants() {
+  SessionConstantState& state = SessionConstantStateForThread();
+  state.constants.erase(state.scope);
+}
 
 StatusOr<IntervalValue> IntervalValue::TryJustifyHours() const {
   // GoogleSQL JUSTIFY_HOURS normalizes hours into [-23,23], carrying whole
@@ -268,8 +301,8 @@ StatusOr<std::string> IntervalValue::TryToString() const {
   return std::string(ym_buf.data()) + " " + d_buf.data() + " " + t_buf.data();
 }
 
-StatusOr<IntervalValue> IntervalValue::TryFromInteger(
-    int64_t amount, std::string_view unit) {
+StatusOr<IntervalValue> IntervalValue::TryFromInteger(int64_t amount,
+                                                      std::string_view unit) {
   if (auto scaled = ScaleIntegerInterval(amount, ToLower(Trim(unit)))) {
     return *scaled;
   }
@@ -399,9 +432,11 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       }
       double val = parsed * static_cast<double>(sign);
       // C++20 makes an out-of-range double-to-integral cast undefined; a
-      // literal like P9e300Y must be rejected, not cast to garbage.  from_
-      // chars also happily parses "nan"/"inf" spellings, which slip past
-      // plain range comparisons.
+      // literal like P9223372036854775808Y (2^63) reaches this check and must
+      // be rejected, not cast to garbage. The isfinite guard is
+      // defense-in-depth: the scanner above accepts only digits and '.', so
+      // exponent / "nan" / "inf" spellings (e.g. P9e300Y) are rejected earlier
+      // as "Unexpected 'e'".
       if (!std::isfinite(val) || val < kInt64MinAsDouble ||
           val >= kInt64MaxExclusive) {
         return fail_range();
@@ -467,10 +502,15 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           ++digits;
         }
       }
-      const auto [ptr, ec] = std::from_chars(begin, end, ival);
+      // std::from_chars accepts a leading '-' but rejects '+' (C++20), so a
+      // positive signed literal would fall into the lossy strtod path. Skip a
+      // leading '+' for the exact parse; the sign byte is still counted below.
+      const char* num_begin = *begin == '+' ? begin + 1 : begin;
+      const auto [ptr, ec] = std::from_chars(num_begin, end, ival);
       // Allow an optional leading sign: a negative integral literal must
       // take this exact path too, otherwise stod rounds beyond 2^53.
-      const size_t sign = (begin < end && (*begin == '-' || *begin == '+')) ? 1 : 0;
+      const size_t sign =
+          (begin < end && (*begin == '-' || *begin == '+')) ? 1 : 0;
       return ec == std::errc() && ptr == end &&
              std::cmp_equal(digits + sign, end - begin);
     }();
@@ -481,8 +521,8 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       char* parse_end = nullptr;
       errno = 0;
       const double dval = std::strtod(s.c_str(), &parse_end);
-      if (parse_end == s.c_str() ||
-          parse_end != s.c_str() + s.size() || errno == ERANGE) {
+      if (parse_end == s.c_str() || parse_end != s.c_str() + s.size() ||
+          errno == ERANGE) {
         return fail("invalid INTERVAL amount: " + s);
       }
       const auto to_int64 = [&](double v) -> int64_t {
@@ -565,14 +605,16 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
   // (H:M:S or Y-M fields) must not silently ignore it and be read with a
   // different meaning (e.g. '1:2:3' DAY becoming one day). Only a full unit
   // range ("hour to second") is valid for a composite shape.
-  // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
+  // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed
+  // concatenations
   if (!u.empty() && u.find(" to ") == std::string::npos) {
     for (const std::string& part : parts) {
       const bool time_shaped = part.find(':') != std::string::npos;
       const bool ym_shaped =
           part.find('-') != std::string::npos && !part.starts_with('-');
       if (time_shaped || ym_shaped) {
-        return fail("'" + s + "': Explicit unit '" + u +  // NOLINT(performance-inefficient-string-concatenation)
+        return fail("'" + s + "': Explicit unit '" +
+                    u +  // NOLINT(performance-inefficient-string-concatenation)
                     "' is not valid for a composite INTERVAL literal");
       }
     }
@@ -607,8 +649,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           // NOLINTNEXTLINE(cert-err34-c)
           const int converted =
               sscanf(magnitude.c_str(),  // NOLINT(cert-err34-c)
-                     "%" SCNd64 ":%" SCNd64 ":%lf%n", &th, &tm, &ts,
-                     &consumed);
+                     "%" SCNd64 ":%" SCNd64 ":%lf%n", &th, &tm, &ts, &consumed);
           if (converted != 3 || consumed <= 0 ||
               static_cast<size_t>(consumed) != magnitude.size()) {
             ok = false;
@@ -700,13 +741,17 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       iv = IntervalValue{};
     }
   }
-  // A two-field H:M time component is complete only when the unit context
-  // allows it: a bare composite literal, or a range ending at minutes
-  // ("HOUR TO MINUTE"). "HOUR TO SECOND" still owes its seconds field.
+  // A two-field time component (H:M or M:S) is complete only when the unit
+  // context spans exactly two adjacent time fields: HOUR TO MINUTE (3->4)
+  // or MINUTE TO SECOND (4->5).  A bare composite literal also permits it.
+  // "HOUR TO SECOND" still owes its seconds field.
   bool allow_two_field_time = u.empty();
+  const bool minute_to_second = u == "minute to second";
   if (!allow_two_field_time) {
     if (const size_t sp = u.find(" to "); sp != std::string::npos) {
-      allow_two_field_time = RangeUnitIndex(u.substr(sp + 4)) == 4;
+      const int lo = RangeUnitIndex(u.substr(0, sp));
+      const int hi = RangeUnitIndex(u.substr(sp + 4));
+      allow_two_field_time = (hi - lo == 1) && (lo >= 3) && (hi <= 5);
     }
   }
   for (size_t idx = 0; idx < parts.size(); ++idx) {
@@ -730,23 +775,25 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       int consumed = 0;
       const int converted =
           sscanf(time_part.c_str(),  // NOLINT(cert-err34-c)
-                 "%" SCNd64 ":%" SCNd64 ":%lf%n", &th, &tm, &ts,
-                 &consumed);
+                 "%" SCNd64 ":%" SCNd64 ":%lf%n", &th, &tm, &ts, &consumed);
       bool time_ok = converted == 3 && consumed > 0 &&
                      static_cast<size_t>(consumed) == time_part.size();
       if (!time_ok && allow_two_field_time) {
         int consumed_hm = 0;
         int64_t hm_th = 0;
         int64_t hm_tm = 0;
+        double ms_seconds = 0.0;
         const int converted_hm =
-            sscanf(time_part.c_str(),  // NOLINT(cert-err34-c)
-                   "%" SCNd64 ":%" SCNd64 "%n", &hm_th, &hm_tm,
-                   &consumed_hm);
+            minute_to_second
+                ? sscanf(time_part.c_str(), "%" SCNd64 ":%lf%n", &hm_tm,
+                         &ms_seconds, &consumed_hm)
+                : sscanf(time_part.c_str(), "%" SCNd64 ":%" SCNd64 "%n", &hm_th,
+                         &hm_tm, &consumed_hm);
         if (converted_hm == 2 && consumed_hm > 0 &&
             static_cast<size_t>(consumed_hm) == time_part.size()) {
           th = hm_th;
           tm = hm_tm;
-          ts = 0.0;
+          ts = ms_seconds;
           time_ok = true;
         }
       }
@@ -806,8 +853,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       if (dash == std::string::npos ||
           !parse_component(ym.substr(0, dash), &y) ||
           !parse_component(ym.substr(dash + 1), &m)) {
-        return fail("'" + s + "': malformed year-month component '" + p +
-                    "'");
+        return fail("'" + s + "': malformed year-month component '" + p + "'");
       }
       const int64_t signed_y_months = checked_mul(checked_mul(y, sign), 12);
       const int64_t signed_m = checked_mul(m, sign);

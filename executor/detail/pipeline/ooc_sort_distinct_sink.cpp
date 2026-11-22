@@ -414,33 +414,45 @@ Status OocSortSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
   direct_slots_.assign(keys_.size(), std::nullopt);
   computed_key_indices_.clear();
   seq_ = 0;
-  std::vector<OocSortKey> sorter_keys;
-  sorter_keys.reserve(keys_.size() + (limit_.has_value() ? 1U : 0U));
 
-  size_t extra_idx = 0;
   for (size_t i = 0; i < keys_.size(); ++i) {
-    slot_t sort_slot = 0;
     const auto column_slot = keys_[i].column_slot;
-    if (column_slot.has_value() &&
-        *column_slot < input_schema_.ColumnCount()) {
-      const auto slot = static_cast<slot_t>(*column_slot);
-      direct_slots_[i] = slot;
-      sort_slot = slot;
+    if (column_slot.has_value() && *column_slot < input_schema_.ColumnCount()) {
+      direct_slots_[i] = static_cast<slot_t>(*column_slot);
     } else if (keys_[i].expression &&
                keys_[i].expression->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           keys_[i].expression->AsColumnValue().GetColumnName());
       if (offset >= 0) {
         direct_slots_[i] = static_cast<slot_t>(offset);
-        sort_slot = static_cast<slot_t>(offset);
       } else {
         computed_key_indices_.push_back(i);
-        sort_slot = static_cast<slot_t>(payload_cols_ + extra_idx++);
       }
     } else {
       computed_key_indices_.push_back(i);
-      sort_slot = static_cast<slot_t>(payload_cols_ + extra_idx++);
     }
+  }
+  // sorter_ is built lazily by EnsureSorter on the first non-empty Consume:
+  // computed-key and seq column indices are payload_cols_-relative, and the
+  // payload width is only known once a chunk arrives (input_schema_ may be
+  // empty while chunks still carry columns).
+  return Status::kSuccess;
+}
+
+Status OocSortSink::EnsureSorter(PipelineContext* ctx, size_t payload_cols) {
+  if (sorter_ != nullptr) {
+    return Status::kSuccess;
+  }
+  payload_cols_ = payload_cols;
+  std::vector<OocSortKey> sorter_keys;
+  sorter_keys.reserve(keys_.size() + (limit_.has_value() ? 1U : 0U));
+
+  size_t extra_idx = 0;
+  for (size_t i = 0; i < keys_.size(); ++i) {
+    const slot_t sort_slot =
+        direct_slots_[i].has_value()
+            ? *direct_slots_[i]
+            : static_cast<slot_t>(payload_cols_ + extra_idx++);
     sorter_keys.push_back(OocSortKey{
         .column_index = sort_slot,
         .ascending = keys_[i].ascending,
@@ -478,15 +490,13 @@ Status OocSortSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
   return Status::kSuccess;
 }
 
-Status OocSortSink::Consume(PipelineContext* /*ctx*/, size_t /*worker_id*/,
+Status OocSortSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
                             const DataChunk& input) {
   if (input.Empty()) {
     return Status::kSuccess;
   }
+  RETURN_IF_FAIL(EnsureSorter(ctx, input.ColumnCount()));
   input_rows_ += input.Size();
-  if (payload_cols_ == 0) {
-    payload_cols_ = input.ColumnCount();
-  }
   if (computed_key_indices_.empty() && !limit_.has_value()) {
     return sorter_->AddChunk(input);
   }
@@ -523,8 +533,15 @@ Status OocSortSink::Consume(PipelineContext* /*ctx*/, size_t /*worker_id*/,
 
 StatusOr<std::shared_ptr<PipelineSource>> OocSortSink::Finalize(
     PipelineContext* /*ctx*/) {
-  RETURN_IF_FAIL(sorter_->Finish());
+  if (sorter_ != nullptr) {
+    RETURN_IF_FAIL(sorter_->Finish());
+  }
   finalized_ = true;
+  // The sorter is configured with an effective limit of limit_ + offset_, so
+  // it keeps enough sorted rows for the output source to skip offset_ and
+  // still emit limit_ rows. Trimming the Top-N heap to that many rows does not
+  // change the result, so this min() remains exact even when input_rows_ is
+  // larger than limit_ + offset_.
   const size_t after_offset =
       input_rows_ > offset_ ? (input_rows_ - offset_) : 0;
   output_rows_ =
@@ -632,6 +649,7 @@ Status OocDistinctSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
   index_map_.clear();
   mem_bytes_ = 0;
   partitioner_.reset();
+  partition_key_status_ = Status::kSuccess;
   const size_t refill =
       budget_bytes_ > 0
           ? std::min<size_t>(
@@ -654,6 +672,11 @@ Status OocDistinctSink::TransitionToSpill(PipelineContext* ctx) {
       opts, [this](const Row& r) -> uint64_t {
         StatusOr<Row> k = ExtractKey(r);
         if (!k.HasValue()) {
+          // The hash functor cannot return Status. Remember the first failure
+          // so Finalize surfaces it rather than bucketing every row to 0.
+          if (partition_key_status_.ok()) {
+            partition_key_status_ = k.GetStatus();
+          }
           return 0;
         }
         return HashCanonicalRow(k.Value());
@@ -701,8 +724,7 @@ Status OocDistinctSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
     }
     const size_t row_bytes = EstimateRowMemoryBytes(row);
     const size_t add_bytes = row_bytes + EstimateRowMemoryBytes(key) + 64;
-    if ((budget_bytes_ > 0 &&
-         mem_bytes_ + add_bytes > budget_bytes_) ||
+    if ((budget_bytes_ > 0 && mem_bytes_ + add_bytes > budget_bytes_) ||
         (grant_cache_.has_value() && !grant_cache_->Reserve(add_bytes))) {
       RETURN_IF_FAIL(TransitionToSpill(ctx));
       if (preserve_input_order_) {
@@ -737,6 +759,7 @@ StatusOr<std::shared_ptr<PipelineSource>> OocDistinctSink::Finalize(
   }
   PartitionLeafSet leaves;
   RETURN_IF_FAIL(partitioner_->Finalize(&leaves));
+  RETURN_IF_FAIL(partition_key_status_);
   partitioner_.reset();
   consumer_guard_.reset();
   return std::make_shared<DistinctOutputSource>(

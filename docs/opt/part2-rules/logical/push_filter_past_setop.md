@@ -21,8 +21,8 @@ graph TD
     U1 --> R1["Group R"]
   end
   subgraph after["変換後: UnionAll(Selection(L, p), Selection(R, p))"]
-    U2["UnionAll"] --> SL["派生 Group setop-filter:p<br>Selection p"] --> L2["Group L"]
-    U2 --> SR["派生 Group setop-filter:p<br>Selection p"] --> R2["Group R"]
+    U2["UnionAll"] --> SL["派生 Group setop-filter:L:p<br>Selection p"] --> L2["Group L"]
+    U2 --> SR["派生 Group setop-filter:R:p<br>Selection p"] --> R2["Group R"]
   end
 ```
 
@@ -60,9 +60,12 @@ guard の列挙は次のとおりです。
             // when the schemas are unavailable the push must refuse.
 ```
 
-- **サイクル gate**: 述語ごとの派生グループ
-  (`"setop-filter:" + 述語の ToString()`)が、分岐本人でも自グループでも
-  ないこと。衝突したら `cycle = true` で不発します。
+- **サイクル gate**: 分岐 ID と述語を組み合わせたタグ
+  (`"setop-filter:" + std::to_string(child) + ":" + 述語の ToString()`)で
+  確保した派生グループが、分岐本人でも自グループでもないこと。
+  衝突したら `cycle = true` で不発します。子 ID を入れるのは分岐間で
+  タグが衝突しないようにするためで、派生グループには `branch_local = true`
+  が設定されます。
 
 ## 意味論的根拠と多重度保存
 
@@ -123,7 +126,9 @@ D5 反例テストがこの 2 面を固定します。
             for (const GroupId child : setop.children) {
               const GroupId filtered = memo.EnsureDerivedGroup(
                   memo.Get(child).relations,
-                  "setop-filter:" + (*expression.predicate)->ToString());
+                  "setop-filter:" + std::to_string(child) + ":" +
+                      (*expression.predicate)->ToString());
+              memo.Get(filtered).branch_local = true;
               if (filtered == child || filtered == group) {
                 cycle = true;
                 break;

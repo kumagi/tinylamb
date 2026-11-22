@@ -73,7 +73,8 @@ struct JVal {
         }
         if (std::floor(num) == num && std::abs(num) < 1e15) {
           if (num == 0.0 && std::signbit(num)) {
-            return std::string("-0");  // NOLINT(modernize-return-braced-init-list)
+            return std::string(
+                "-0");  // NOLINT(modernize-return-braced-init-list)
           }
           return std::to_string(static_cast<int64_t>(num));
         }
@@ -187,8 +188,8 @@ inline std::string ParseJsonStringToken(std::string_view& s, char quote = '"') {
           res += esc;
           continue;
         }
-        if (code >= 0xD800 && code <= 0xDBFF && s.size() >= 6 &&
-            s[0] == '\\' && s[1] == 'u') {
+        if (code >= 0xD800 && code <= 0xDBFF && s.size() >= 6 && s[0] == '\\' &&
+            s[1] == 'u') {
           std::string_view saved = s;
           s.remove_prefix(2);
           uint32_t low = 0;
@@ -560,9 +561,8 @@ inline OpStatus ResolveMutationTarget(JVal& root,
         const bool next_is_index =
             (i + 1 < segments.size()) && segments[i + 1].is_index;
         cur->obj.emplace_back(
-            segment.key,
-            std::make_shared<JVal>(
-                JVal{.type = next_is_index ? JVal::kArr : JVal::kObj}));
+            segment.key, std::make_shared<JVal>(JVal{
+                             .type = next_is_index ? JVal::kArr : JVal::kObj}));
         cur = cur->obj.back().second.get();
         *parent = cur;
         *slot = nullptr;
@@ -1108,8 +1108,17 @@ inline StatusOr<Value> Evaluate(std::string_view func_name,
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const std::string text = TextOf(arguments[0]);
-    const std::optional<JVal> root = ParseDocument(text);
+    // A VARCHAR argument carries JSON *text* and must be parsed as a
+    // document.  Every other SQL value already has a typed representation:
+    // rendering it to text first would conflate e.g. INT64 42 with VARCHAR
+    // "42" (and could change the type of a quoted string value), so build its
+    // JSON form directly instead of round-tripping through TextOf.
+    std::optional<JVal> root;
+    if (arguments[0].type == ValueType::kVarChar) {
+      root = ParseDocument(TextOf(arguments[0]));
+    } else {
+      root = JValFromSqlValue(arguments[0]);
+    }
     if (!root) {
       return Value();  // the LAX family never errors on malformed input
     }

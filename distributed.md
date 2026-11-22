@@ -34,18 +34,22 @@
   - `recovery/recovery_manager.hpp` — `RecoverFrom(checkpoint_lsn, tm)` /
     `SinglePageRecovery`
     (CRC 不良ページのログ再構築)。page_lsn ガードで REDO 冪等
-    (recovery_manager.cpp:74)。
+    (2026-08 当時は recovery_manager.cpp:74、現行は
+    page/page_manager.cpp:5603 の `ReplayCommittedRecord`)。
   - `recovery/checkpoint_manager.hpp` — fuzzy checkpoint。master record の
     checkpoint LSN は `RecoverFrom` の起点として読まれる
     (page_storage.cpp:52)。WAL 切り詰めも存在しない(§8)。
-  - `transaction/transaction_manager.cpp:57` — `PreCommit` は
-    ①`CommitVersions`(MVCC 可視化、:59)→ ②kCommit 記録(:62)→ ③`WaitForDurable`
-    の順。**可視化がログ追記より前**である点は §5.4 で再構成する。
-    また `Abort` は終端に `kAbort` **型**のレコードを書く(transaction_manager.cpp:748、
-    wal_format.md:66)。undo は online CLR 完了済みのため物理的には無害だが、
+  - `transaction/transaction_manager.cpp:465` — `PreCommit` は
+    ①kCommit 記録(`AddLog`、:525)→ ②`CommitVersions`(MVCC 可視化、:586)
+    → ③`WaitForDurable`(:633) の順(D4、docs/commit_durability.md 参照)。
+    **可視化はログ追記の後**である点は §5.4 でも維持する。
+    また `Abort`(transaction_manager.cpp:732) は終端に `kAbort` **型**のレコードを
+    書く(記録は transaction_manager.cpp:806、wal_format.md:66)。
+    undo は online CLR 完了済みのため物理的には無害だが、
     複製・回復の意味論で明示的に扱う(§5.4)。
-  - `transaction/transaction_manager.cpp:184` — snapshot 取得(Begin)と
-    commit_timestamp 出版(CommitVersions)は同一 `transaction_table_lock` で
+  - `transaction/transaction_manager.cpp:429`(Begin、ロック取得は :446) —
+    snapshot 取得(Begin)と commit_timestamp 出版(CommitVersions)は同一
+    `transaction_table_lock` で
     原子化。この規律は §5.6 で保持する。
   - `database/page_storage.hpp:51` — PageStorage が Logger/Recovery/Transaction/
     Checkpoint 各 manager を所有。`EmulateCrash()` あり。
@@ -53,7 +57,7 @@
     コミットの durability 待ちは epoll スレッド上で同期(`WaitForDurable`)。
     seal 待ち化には callback 完了への改修が要る(§9)。
 - コンパイル規約・スタイルはリポジトリ従来通り(Apache 2.0 ヘッダ、clang-format、
-  コメント最小限)。CMake は `add_simple_test`(CMakeLists.txt:876)と
+  コメント最小限)。CMake は `add_simple_test`(CMakeLists.txt:903)と
   `tinylamb::*` エイリアスの慣例に従う。fuzzer ターゲットは
   `TINYLAMB_ENABLE_FUZZ=ON`(CMakeLists.txt:20)でビルドできる(§12)。
 
@@ -263,9 +267,10 @@ class EpochManager {
 
 ### 5.4 コミットプロトコル(最重要)
 
-現行 `PreCommit`(transaction_manager.cpp:57-73)は ①CommitVersions(MVCC 可視化)
-→ ②kCommit 記録 → ③durability 待ち の順である。**分散版は順序を入れ替え、
-3 段階に分割する**:
+現行 `PreCommit`(transaction_manager.cpp:465)は ①kCommit 記録(`AddLog`、:525)
+→ ②CommitVersions(MVCC 可視化、:586)→ ③durability 待ち(:633) の順である
+(D4、docs/commit_durability.md 参照)。**分散版はこの順序を変えず、
+ログ追記と可視化を 3 段階に分割する**:
 
 ```
 // Phase 0 で導入する分割 API(§9 変更表)
@@ -472,7 +477,8 @@ CMake: add_library(tinylamb_distributed ...) + tinylamb::distributed ALIAS、
 - WP-0d PreCommit 3 分割 + (stream,lsn) prev_lsn + ホームストリーム
   (最大の改修。単一ストリームでは挙動同一)
 - WP-0e postgres_server の commit callback 完了化
-- fuzzer harness の復活(CMakeLists.txt:472 のコメントイン)
+- fuzzer harness の復活(CMakeLists.txt:1322 の `add_fuzzer_test` と
+  :1344 以降のターゲット登録を参照)
 - **受け入れ**: 既存全テスト green。compat で TPC-C 単一ノード比 ±10%。
   epoch モードで kill -9 リカバリ成功(§7 拡張)。
 

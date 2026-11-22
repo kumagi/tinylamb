@@ -50,6 +50,11 @@ inline int64_t SaturatingDoubleToInt64(double d) {
   return static_cast<int64_t>(d);
 }
 
+inline int64_t SaturatingUnsignedToInt64(uint64_t value) {
+  return value > static_cast<uint64_t>(INT64_MAX) ? INT64_MAX
+                                                  : static_cast<int64_t>(value);
+}
+
 // ROUND / TRUNC of a FLOAT64 to `digits` decimal places. Shared by the AST
 // evaluator and the relational evaluator so both agree at the extremes:
 // - a positive precision finer than the value can represent (10^digits

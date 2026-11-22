@@ -16,6 +16,8 @@
 
 #include "table/workload/workload.hpp"
 
+#include <limits>
+
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -100,21 +102,29 @@ AccessHint WorkloadTracker::InferLocked(const ColumnWorkload& w) {
   const uint64_t a = w.aggregate.load(std::memory_order_relaxed);
   const uint64_t p = w.point_lookup.load(std::memory_order_relaxed);
   const uint64_t s = w.sort_key.load(std::memory_order_relaxed);
-  const uint64_t total = f + a + p + s;
+  // Saturating sum: counters only ever grow, so four near-UINT64_MAX values
+  // must not wrap `total` back below kMinSamples and flip a stable inference
+  // to kUnknown.
+  constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+  const auto sat_add = [](uint64_t x, uint64_t y) {
+    return x > kMax - y ? kMax : x + y;
+  };
+  const uint64_t total = sat_add(sat_add(f, a), sat_add(p, s));
   if (total < kMinSamples) {
     return AccessHint::kUnknown;
   }
-  // Strict majority (>50%); two-way ties above half are impossible.
-  if (f * 2 > total) {
+  // Strict majority (>50%), written as x > total - x so the comparison
+  // cannot overflow even when total has saturated. Ties stay kUnknown.
+  if (f > total - f) {
     return AccessHint::kFilter;
   }
-  if (a * 2 > total) {
+  if (a > total - a) {
     return AccessHint::kAggregate;
   }
-  if (p * 2 > total) {
+  if (p > total - p) {
     return AccessHint::kPointLookup;
   }
-  if (s * 2 > total) {
+  if (s > total - s) {
     return AccessHint::kSortKey;
   }
   return AccessHint::kUnknown;
@@ -144,6 +154,9 @@ size_t WorkloadTracker::ApplyTo(Schema& sc) {
     }
     const AccessHint current = sc.GetColumn(c).Hint();
     auto ap = applied_.find(name);
+    // Lineage is by value: a manual SetHint that happens to equal our last
+    // applied hint is indistinguishable from our own write and will follow
+    // later workload shifts (documented on WorkloadTracker::ApplyTo).
     const bool eligible = current == AccessHint::kUnknown ||
                           (ap != applied_.end() && ap->second == current);
     if (eligible && inferred != current) {
@@ -157,6 +170,8 @@ size_t WorkloadTracker::ApplyTo(Schema& sc) {
 
 void WorkloadTracker::Reset() {
   std::scoped_lock lock(mu_);
+  // Only the observation window is cleared: applied_ lineage deliberately
+  // survives so previously-inferred columns keep following workload shifts.
   counts_.clear();
 }
 

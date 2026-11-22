@@ -55,7 +55,6 @@ std::vector<EnumSchema> BuildEnums() {
   return enums;
 }
 
-
 bool NameMatches(std::string_view left, std::string_view right) {
   if (left.size() != right.size()) {
     return false;
@@ -296,7 +295,9 @@ bool EnumValueForMember(std::string_view enum_short_name, std::string_view name,
 std::optional<int64_t> OrdinalForEnumMemberName(std::string_view name) {
   for (const EnumSchema& schema : Enums()) {
     for (const auto& [member, ordinal] : schema.members) {
-      if (NameMatches(member, name)) {
+      // Enum member names are case sensitive (as in EnumValueForMember);
+      // only the enum *type* name matches case-insensitively via NameMatches.
+      if (member == name) {
         return ordinal;
       }
     }

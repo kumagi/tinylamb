@@ -21,20 +21,18 @@ namespace tinylamb {
 
 namespace {
 
-std::vector<ProtoTextEntry> ParseOrDie(std::string_view body) {
-  std::vector<ProtoTextEntry> entries;
-  const bool ok = ParseProtoTextEntries(body, &entries);
-  if (!ok) {
-    ADD_FAILURE() << "parse failed: " << body;
-    return {};
-  }
-  return entries;
+// Fatal on a parse failure so a single parser regression does not also
+// produce a confusing secondary "wrong entry count" failure at the caller.
+// ASSERT_TRUE is only legal in a void function, hence the out-parameter.
+void ParseOrDie(std::string_view body, std::vector<ProtoTextEntry>* entries) {
+  ASSERT_TRUE(ParseProtoTextEntries(body, entries)) << "parse failed: " << body;
 }
 
 }  // namespace
 
 TEST(ProtoTextParseTest, ScalarsMessagesAndSeparators) {
-  const auto entries = ParseOrDie("a: 1 b: \"x\", c: 2.5; d: true");
+  std::vector<ProtoTextEntry> entries;
+  ParseOrDie("a: 1 b: \"x\", c: 2.5; d: true", &entries);
   ASSERT_EQ(entries.size(), 4U);
   EXPECT_EQ(entries[0].name, "a");
   EXPECT_FALSE(entries[0].is_message);
@@ -46,15 +44,16 @@ TEST(ProtoTextParseTest, ScalarsMessagesAndSeparators) {
 }
 
 TEST(ProtoTextParseTest, CommentsAndWhitespaceAreSkipped) {
-  const auto entries =
-      ParseOrDie("# leading comment\n  a: 1,  # trailing\n  b: 2");
+  std::vector<ProtoTextEntry> entries;
+  ParseOrDie("# leading comment\n  a: 1,  # trailing\n  b: 2", &entries);
   ASSERT_EQ(entries.size(), 2U);
   EXPECT_EQ(entries[0].name, "a");
   EXPECT_EQ(entries[1].name, "b");
 }
 
 TEST(ProtoTextParseTest, ExtensionEntriesKeepBracketedName) {
-  const auto entries = ParseOrDie("[pkg.ext.field]: 7 a: 1");
+  std::vector<ProtoTextEntry> entries;
+  ParseOrDie("[pkg.ext.field]: 7 a: 1", &entries);
   ASSERT_EQ(entries.size(), 2U);
   EXPECT_EQ(entries[0].name, "[pkg.ext.field]");
   EXPECT_EQ(entries[0].text, "7");
@@ -62,25 +61,29 @@ TEST(ProtoTextParseTest, ExtensionEntriesKeepBracketedName) {
 }
 
 TEST(ProtoTextParseTest, MessageBodiesAcceptBracesAndAngleBrackets) {
-  const auto braced = ParseOrDie("m { a: 1 b \"x\" } c: 2");
+  std::vector<ProtoTextEntry> braced;
+  ParseOrDie("m { a: 1 b \"x\" } c: 2", &braced);
   ASSERT_EQ(braced.size(), 2U);
   EXPECT_TRUE(braced[0].is_message);
   EXPECT_EQ(braced[0].text, " a: 1 b \"x\" ");
-  const auto angled = ParseOrDie("m < a: 1 > c: 2");
+  std::vector<ProtoTextEntry> angled;
+  ParseOrDie("m < a: 1 > c: 2", &angled);
   ASSERT_EQ(angled.size(), 2U);
   EXPECT_TRUE(angled[0].is_message);
   EXPECT_EQ(angled[0].text, " a: 1 ");
 }
 
 TEST(ProtoTextParseTest, QuotedStringsMayContainBracesAndQuotes) {
-  const auto entries = ParseOrDie(R"(s: "a } b" t: 'it\'s' u: "{ x: 1 }")");
+  std::vector<ProtoTextEntry> entries;
+  ParseOrDie(R"(s: "a } b" t: 'it\'s' u: "{ x: 1 }")", &entries);
   ASSERT_EQ(entries.size(), 3U);
   EXPECT_EQ(entries[0].text, "\"a } b\"");
   EXPECT_EQ(entries[2].text, "\"{ x: 1 }\"");
 }
 
 TEST(ProtoTextParseTest, NumericFieldNamesAreReserved) {
-  const auto entries = ParseOrDie("2: 7 a: 1");
+  std::vector<ProtoTextEntry> entries;
+  ParseOrDie("2: 7 a: 1", &entries);
   ASSERT_EQ(entries.size(), 2U);
   EXPECT_EQ(entries[0].name, "2");
   EXPECT_EQ(entries[0].text, "7");
@@ -103,11 +106,12 @@ TEST(ProtoTextParseTest, MalformedBodiesAreRejected) {
 }
 
 TEST(ProtoTextParseTest, EmptyBodyParsesToNoEntries) {
-  std::vector<ProtoTextEntry> entries;
-  ASSERT_TRUE(ParseProtoTextEntries("", &entries));
-  EXPECT_TRUE(entries.empty());
-  ASSERT_TRUE(ParseProtoTextEntries("  \n\t ", &entries));
-  EXPECT_TRUE(entries.empty());
+  for (std::string_view input : {"", "  \n\t "}) {
+    SCOPED_TRACE(input);
+    std::vector<ProtoTextEntry> entries;
+    ASSERT_TRUE(ParseProtoTextEntries(input, &entries));
+    EXPECT_TRUE(entries.empty());
+  }
 }
 
 TEST(ProtoTextPlausibilityTest, LooksLikeProtoTextClassifiesBodies) {
@@ -141,6 +145,43 @@ TEST(ProtoTextNormalizeTest, CanonicalizesSpacingAndOrdersExtensions) {
   EXPECT_EQ(empty.value(), "");  // NOLINT(bugprone-unchecked-optional-access)
 
   EXPECT_FALSE(NormalizeProtoText("a:").has_value());
+}
+
+TEST(ProtoTextFormatTest, TimestampOffsetsAreAppliedBeforeEncodingFields) {
+  constexpr int64_t k125Millis = 125'000'000;
+  for (const char* text :
+       {"1970-01-01T05:30:00.125+0530", "1970-01-01 05:30:00.125+05:30",
+        "1969-12-31T21:00:00.125-03", "1970-01-01T00:00:00.125Z"}) {
+    const auto nanos = ParseTimestampTextNanos(text);
+    ASSERT_TRUE(nanos.has_value()) << text;
+    EXPECT_TRUE(nanos.value() == k125Millis) << text;
+  }
+
+  const auto updated = TryProtoTextSetField(
+      "seconds_default: 5", {"seconds_default"},
+      Value("1970-01-01 05:30:00+0530"), "test.TimestampPB");
+  ASSERT_TRUE(updated.HasValue()) << updated.GetStatus();
+  EXPECT_EQ(updated.Value(), std::optional<std::string>("seconds_default: 0"));
+
+  const auto constructed = TryConstructProtoText(
+      "test.TimestampPB",
+      {{"millis_default", Value("1970-01-01T02:00:00.125+02")}});
+  ASSERT_TRUE(constructed.HasValue()) << constructed.GetStatus();
+  EXPECT_NE(constructed.Value().find("millis_default: 125"), std::string::npos);
+
+  for (const char* bad :
+       {"1970-01-01T00:00:00+05:30:00", "1970-01-01T00:00:00+0560",
+        "1970-01-01T00:00:00Zextra"}) {
+    EXPECT_FALSE(ParseTimestampTextNanos(bad).has_value()) << bad;
+    EXPECT_EQ(TryProtoTextSetField("seconds_default: 5", {"seconds_default"},
+                                   Value(bad), "test.TimestampPB")
+                  .GetStatus(),
+              Status::kInvalidArgument);
+    EXPECT_EQ(TryConstructProtoText("test.TimestampPB",
+                                    {{"millis_default", Value(bad)}})
+                  .GetStatus(),
+              Status::kInvalidArgument);
+  }
 }
 
 TEST(ProtoTextFormatTest, FormatScalarRendersCanonicalTokens) {
@@ -186,11 +227,14 @@ TEST(ProtoTextExtractTest, AbsentFieldsUseDefaultsOrNulls) {
   EXPECT_TRUE(out.ArrayElements().empty());
 
   // Unknown scalar fields without a known format annotation still count as
-  // handled reads (true); the projected default depends on the name-based
-  // format annotations, so only the handling contract is pinned here.
+  // handled reads (true), and an unannotated absent scalar reads as the
+  // INT64 zero default (GoogleSQL proto semantics: message-typed reads NULL,
+  // scalar reads its type default). Pin the value too so a regression that
+  // flips it to NULL cannot pass silently.
   auto absent = TryProtoTextExtractField("a: 1", "no_such_field", &out);
   ASSERT_TRUE(absent.HasValue());
   EXPECT_TRUE(absent.MoveValue());
+  EXPECT_EQ(out, (Value(int64_t{0})));
 }
 
 TEST(ProtoTextExtractTest, HasPrefixReportsPresence) {
@@ -320,16 +364,19 @@ TEST(ProtoTextWriteTest, VarCharValuesQuotedEnumMembersStayBare) {
         << *updated;  // NOLINT(bugprone-unchecked-optional-access)
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
     // assumes success
-    EXPECT_EQ(out, Value(std::string(text))) << *updated;  // NOLINT(bugprone-unchecked-optional-access)
+    EXPECT_EQ(out, Value(std::string(text)))
+        << *updated;  // NOLINT(bugprone-unchecked-optional-access)
     // The rewritten payload stays writable.
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
     // assumes success
-    auto again =
-        TryProtoTextSetField(*updated, {"int64_key_1"}, Value(int64_t{7}), type)  // NOLINT(bugprone-unchecked-optional-access)
-            .MoveValue();
+    auto again = TryProtoTextSetField(
+                     *updated, {"int64_key_1"}, Value(int64_t{7}),
+                     type)  // NOLINT(bugprone-unchecked-optional-access)
+                     .MoveValue();
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
     // assumes success
-    ASSERT_TRUE(again.has_value()) << *updated;  // NOLINT(bugprone-unchecked-optional-access)
+    ASSERT_TRUE(again.has_value())
+        << *updated;  // NOLINT(bugprone-unchecked-optional-access)
   }
 
   // Known enum fields carry enum member names, which proto TEXT renders

@@ -43,6 +43,16 @@ namespace tinylamb {
 
 namespace {
 
+using relational_detail::CheckedDoubleSumAdd;
+
+StatusOr<double> CheckedDoubleSumOperand(double lhs, double rhs, double value) {
+  if (std::isinf(value) && std::isfinite(lhs) && std::isfinite(rhs)) {
+    return StatusError(StatusCode::kIsInfinity,
+                       "double overflow in SUM operand");
+  }
+  return value;
+}
+
 // Long-double conversion mirroring the ground-truth accumulator: numeric
 // values convert, anything else raises like the serial path's ToLongDouble.
 StatusOr<platform::ExtendedFloat> StatInputToLongDouble(const Value& value) {
@@ -215,6 +225,18 @@ ParallelAggregationExecutor::MakeState() const {
   return state;
 }
 
+bool ParallelAggregationExecutor::PartialState::InsertDistinct(
+    size_t index, const Value& value) {
+  QueryMemoryCharge reservation(EstimateValueBytes(value));
+  if (!distinct_values[index]
+           .insert(relational_detail::CanonicalDistinctValue(value))
+           .second) {
+    return false;
+  }
+  distinct_charge.Adopt(reservation.DetachBytes());
+  return true;
+}
+
 Status ParallelAggregationExecutor::AccumulateValue(PartialState* state,
                                                     size_t index,
                                                     const Value& value,
@@ -233,16 +255,9 @@ Status ParallelAggregationExecutor::AccumulateValue(PartialState* state,
                          "numeric value required");
     }
   }
-  if (apply_distinct && aggregate.Distinct()) {
-    const size_t bytes = EstimateValueBytes(value);
-    QueryMemoryBudget::Global().ReserveForced(bytes);
-    if (!state->distinct_values[index]
-             .insert(relational_detail::CanonicalDistinctValue(value))
-             .second) {
-      QueryMemoryBudget::Global().Release(bytes);
-      return Status::kSuccess;
-    }
-    state->distinct_charged_bytes += bytes;
+  if (apply_distinct && aggregate.Distinct() &&
+      !state->InsertDistinct(index, value)) {
+    return Status::kSuccess;
   }
   switch (aggregate.GetType()) {
     case AggregationType::kSum:
@@ -475,16 +490,8 @@ Status ParallelAggregationExecutor::AccumulateGeneric(
             trailing_values.push_back(std::move(trailing_value));
           }
         }
-        if (aggregate.Distinct()) {
-          const size_t bytes = EstimateValueBytes(value);
-          QueryMemoryBudget::Global().ReserveForced(bytes);
-          if (!state->distinct_values[index]
-                   .insert(relational_detail::CanonicalDistinctValue(value))
-                   .second) {
-            QueryMemoryBudget::Global().Release(bytes);
-            continue;
-          }
-          state->distinct_charged_bytes += bytes;
+        if (aggregate.Distinct() && !state->InsertDistinct(index, value)) {
+          continue;
         }
         RETURN_IF_FAIL(
             AccumulateStatValue(state, index, value, trailing_values));
@@ -644,21 +651,20 @@ Status ParallelAggregationExecutor::AccumulateDoubleColumn(
       break;
     }
     case AggregationType::kSum: {
-      double sum = 0.0;
+      Value& total = state->values[aggregate_index];
+      double sum = total.IsNull() ? 0.0 : total.value.double_value;
       bool any = false;
       for (size_t row = 0; row < column.Size(); ++row) {
         if (column.IsNull(row)) {
           continue;
         }
-        sum += data[row];
+        ASSIGN_OR_RETURN(double, next, CheckedDoubleSumAdd(sum, data[row]));
+        sum = next;
         any = true;
       }
-      if (!any) {
-        break;
+      if (any) {
+        total = Value(sum);
       }
-      Value& total = state->values[aggregate_index];
-      total =
-          total.IsNull() ? Value(sum) : Value(total.value.double_value + sum);
       break;
     }
     case AggregationType::kAvg: {
@@ -744,21 +750,24 @@ Status ParallelAggregationExecutor::AccumulateDoubleBinaryColumn(
       break;
     }
     case AggregationType::kSum: {
-      double sum = 0.0;
+      Value& total = state->values[aggregate_index];
+      double sum = total.IsNull() ? 0.0 : total.value.double_value;
       bool any = false;
       for (size_t row = 0; row < lhs.Size(); ++row) {
         if (lhs.IsNull(row) || rhs.IsNull(row)) {
           continue;
         }
-        sum += eval(lhs_data[row], rhs_data[row]);
+        const double a = lhs_data[row];
+        const double b = rhs_data[row];
+        ASSIGN_OR_RETURN(double, addend,
+                         CheckedDoubleSumOperand(a, b, eval(a, b)));
+        ASSIGN_OR_RETURN(double, next, CheckedDoubleSumAdd(sum, addend));
+        sum = next;
         any = true;
       }
-      if (!any) {
-        break;
+      if (any) {
+        total = Value(sum);
       }
-      Value& total = state->values[aggregate_index];
-      total =
-          total.IsNull() ? Value(sum) : Value(total.value.double_value + sum);
       break;
     }
     case AggregationType::kAvg: {
@@ -985,34 +994,23 @@ Status ParallelAggregationExecutor::AccumulateLSTableBlock(
         break;
       }
       case AggregationType::kSum: {
-        double sum = 0.0;
+        Value& total = state->values[index];
+        double sum = total.IsNull() ? 0.0 : total.value.double_value;
         bool any = false;
-        if (!col.has_null) {
-          any = count > 0;
-          if (rows == nullptr) {
-            for (size_t r = 0; r < count; ++r) {
-              sum += std::bit_cast<double>(data[r]);
-            }
-          } else {
-            for (size_t i = 0; i < count; ++i) {
-              sum += std::bit_cast<double>(data[rows[i]]);
-            }
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t row =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (col.has_null && col.IsNull(row)) {
+            continue;
           }
-        } else {
-          for (size_t i = 0; i < count; ++i) {
-            const uint32_t r =
-                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
-            if (col.IsNull(r)) {
-              continue;
-            }
-            sum += std::bit_cast<double>(data[r]);
-            any = true;
-          }
+          ASSIGN_OR_RETURN(
+              double, next,
+              CheckedDoubleSumAdd(sum, std::bit_cast<double>(data[row])));
+          sum = next;
+          any = true;
         }
         if (any) {
-          Value& total = state->values[index];
-          total = total.IsNull() ? Value(sum)
-                                 : Value(total.value.double_value + sum);
+          total = Value(sum);
         }
         break;
       }
@@ -1125,38 +1123,26 @@ Status ParallelAggregationExecutor::AccumulateLSTableBlock(
         break;
       }
       case AggregationType::kSum: {
-        double sum = 0.0;
+        Value& total = state->values[index];
+        double sum = total.IsNull() ? 0.0 : total.value.double_value;
         bool any = false;
-        if (!lhs_col.has_null && !rhs_col.has_null) {
-          any = count > 0;
-          if (rows == nullptr) {
-            for (size_t r = 0; r < count; ++r) {
-              sum += eval(std::bit_cast<double>(lhs_data[r]),
-                          std::bit_cast<double>(rhs_data[r]));
-            }
-          } else {
-            for (size_t i = 0; i < count; ++i) {
-              const uint32_t r = rows[i];
-              sum += eval(std::bit_cast<double>(lhs_data[r]),
-                          std::bit_cast<double>(rhs_data[r]));
-            }
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t row =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if ((lhs_col.has_null && lhs_col.IsNull(row)) ||
+              (rhs_col.has_null && rhs_col.IsNull(row))) {
+            continue;
           }
-        } else {
-          for (size_t i = 0; i < count; ++i) {
-            const uint32_t r =
-                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
-            if (lhs_col.IsNull(r) || rhs_col.IsNull(r)) {
-              continue;
-            }
-            sum += eval(std::bit_cast<double>(lhs_data[r]),
-                        std::bit_cast<double>(rhs_data[r]));
-            any = true;
-          }
+          const double a = std::bit_cast<double>(lhs_data[row]);
+          const double b = std::bit_cast<double>(rhs_data[row]);
+          ASSIGN_OR_RETURN(double, addend,
+                           CheckedDoubleSumOperand(a, b, eval(a, b)));
+          ASSIGN_OR_RETURN(double, next, CheckedDoubleSumAdd(sum, addend));
+          sum = next;
+          any = true;
         }
         if (any) {
-          Value& total = state->values[index];
-          total = total.IsNull() ? Value(sum)
-                                 : Value(total.value.double_value + sum);
+          total = Value(sum);
         }
         break;
       }
@@ -1589,7 +1575,7 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
   }
 }
 
-Row ParallelAggregationExecutor::Finalize(PartialState state) const {
+Row ParallelAggregationExecutor::Finalize(PartialState&& state) const {
   for (size_t index = 0; index < aggregates_.size(); ++index) {
     const auto& aggregate =
         aggregates_[index].expression->AsAggregateExpression();
@@ -1660,7 +1646,7 @@ bool ParallelAggregationExecutor::Execute(Row* destination) {
             return FailWith(st);
           }
         }
-        *destination = Finalize(merged);
+        *destination = Finalize(std::move(merged));
         executed_ = true;
         return true;
       }
@@ -1728,6 +1714,12 @@ bool ParallelAggregationExecutor::Execute(Row* destination) {
           }
         } catch (const std::exception& ex) {
           stop_under_lock(StatusError(StatusCode::kRuntimeError, ex.what()));
+        } catch (...) {
+          // An exception escaping a jthread's lambda terminates the process;
+          // latch a non-std exception as a Status for the joining thread,
+          // mirroring the parallel join workers.
+          stop_under_lock(StatusError(StatusCode::kRuntimeError,
+                                      "parallel aggregation worker failed"));
         }
       });
     } catch (const std::exception& ex) {
@@ -1759,7 +1751,7 @@ bool ParallelAggregationExecutor::Execute(Row* destination) {
       return FailWith(st);
     }
   }
-  *destination = Finalize(merged);
+  *destination = Finalize(std::move(merged));
   executed_ = true;
   return true;
 }

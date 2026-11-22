@@ -80,19 +80,32 @@ graph TD
   Plan left_plan = left.plan;
   Plan right_plan = right.plan;
   double local_cost = left.estimated_rows + right.estimated_rows;
+  constexpr double kOrderedMergeJoinRowsThreshold = 1024.0;
+  if (left_ordered && right_ordered &&
+      std::max(left.estimated_rows, right.estimated_rows) >=
+          kOrderedMergeJoinRowsThreshold) {
+    local_cost *= 0.8;
+  }
   if (!left_ordered) {
-    left_plan =
-        std::make_shared<SortPlan>(std::move(left_plan), std::move(keys));
+    std::vector<SortKey> keys;
+    keys.reserve(left_columns.size());
+    for (const ColumnName& column : left_columns) {
+      keys.push_back(SortKey{.expression = ColumnValueExp(column),
+                             .ascending = true,
+                             .nulls_first = std::nullopt});
+    }
+    left_plan = MakeSortPlan(std::move(left_plan), std::move(keys),
+                             left.estimated_rows);
     local_cost += sort_cost(left.estimated_rows);
   }
 ```
 
-右オペランドに対しても同様の判定とソート挿入を行います。内部結合ノードを構築した後、等値キー以外の残差述語が存在する場合は上位に `SelectionPlan` を配置します。
+両入力がすでにキー順で、かつ大きい方の推定行数が `kOrderedMergeJoinRowsThreshold`（1024.0）以上の場合は、追加ソートなしの 1 パス実行を評価して局所コストに 0.8 の係数を掛けます。ソート挿入には行数を受け取る `MakeSortPlan` ヘルパーを用い、2 引数の `SortPlan` コンストラクタを直接呼ぶことはありません（右オペランドに対しても同様の判定とソート挿入を行います）。内部結合ノードを構築した後、等値キー以外の残差述語が存在する場合は上位に `SelectionPlan` を配置します。
 
 ```cpp
   Plan merge = std::make_shared<MergeJoinPlan>(
       std::move(left_plan), left_columns, std::move(right_plan), right_columns,
-      physical_kind, std::move(merge_residual));
+      physical_kind, std::move(merge_residual), RowEstimate(equi_estimate));
 
   if (!residual_conjuncts.empty()) {
     const TableStatistics merge_stats = merge->GetStats();

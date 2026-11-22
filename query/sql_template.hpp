@@ -23,6 +23,10 @@ struct SqlTemplate {
 
 SqlTemplate ExtractSqlTemplate(std::string_view sql);
 
+// Rebinds literal slots without executing the statement.  Every failure,
+// including an invalid DATE parameter, is kept inside the returned StatusOr:
+// BindExpression uses Value::TryDate rather than letting Value::Date throw
+// across this boundary.  Callers need no try/catch.
 StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
     const Statement& statement, const std::vector<Value>& parameters);
 

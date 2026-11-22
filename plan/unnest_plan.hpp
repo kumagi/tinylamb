@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_PLAN_UNNEST_PLAN_HPP
 #define TINYLAMB_PLAN_UNNEST_PLAN_HPP
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -35,7 +36,12 @@ class UnnestPlan final : public PlanBase {
     return child_ ? child_->AccessRowCount() : 1;
   }
   [[nodiscard]] size_t EmitRowCount() const override {
-    return (child_ ? child_->EmitRowCount() : 1) * 10;
+    const size_t child_rows = child_ ? child_->EmitRowCount() : 1;
+    // Saturate exactly like the constructor's stats_ estimate, so cost and
+    // spill decisions never see a wrapped-around row count.
+    return child_rows > std::numeric_limits<size_t>::max() / 10
+               ? std::numeric_limits<size_t>::max()
+               : child_rows * 10;
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
   [[nodiscard]] const std::string& Alias() const { return alias_; }

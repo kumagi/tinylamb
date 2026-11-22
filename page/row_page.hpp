@@ -56,7 +56,9 @@ struct PackedSlots {
     if (end > blob.size() || start > blob.size() || end <= start) {
       return {};
     }
-    return std::string_view(blob.data() + start, end - start);  // NOLINT(modernize-return-braced-init-list)
+    return std::string_view(
+        blob.data() + start,
+        end - start);  // NOLINT(modernize-return-braced-init-list)
   }
 
   [[nodiscard]] bool EmptySlot(size_t slot) const noexcept {
@@ -344,6 +346,12 @@ class RowPage {
 
   [[nodiscard]] bin_size_t FreeSizeForTest() const { return FreeSize(); }
 
+  // Test-only: the undo reservation recorded for a slot after a delete or a
+  // shrink. An aborted INSERT must leave this at 0 (it had no previous image).
+  [[nodiscard]] size_t HoleReservationForTest(slot_t slot) const {
+    return slot < hole_sizes_.size() ? hole_sizes_[slot] : 0;
+  }
+
   // #1110 structural contract: hole reuse must attempt the write-intent
   // acquire at most once per Insert (first-fit), scanning the remaining
   // holes with read-only probes only.  Counts TryAddWriteSet calls made by
@@ -372,16 +380,14 @@ class RowPage {
 
   [[nodiscard]] slot_t RowCount() const {
     return IsColumnarStub()
-               ? static_cast<slot_t>(
-                     std::min<uint32_t>(columnar_row_count_,
-                                        std::numeric_limits<slot_t>::max()))
+               ? static_cast<slot_t>(std::min<uint32_t>(
+                     columnar_row_count_, std::numeric_limits<slot_t>::max()))
                : row_count_;
   }
   [[nodiscard]] slot_t RowMax() const {
     return IsColumnarStub()
-               ? static_cast<slot_t>(
-                     std::min<uint32_t>(columnar_row_count_,
-                                        std::numeric_limits<slot_t>::max()))
+               ? static_cast<slot_t>(std::min<uint32_t>(
+                     columnar_row_count_, std::numeric_limits<slot_t>::max()))
                : static_cast<slot_t>(LivePacked().size());
   }
   [[nodiscard]] bool IsSlotOccupied(slot_t slot) const {

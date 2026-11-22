@@ -1029,7 +1029,6 @@ TEST(PostgresServerTest, DropTableCommandTagOverTcp) {
     // Act -- drop the table; the command tag must be reported to the client
     ASSERT_TRUE(SendAll(client, QueryMessage("DROP TABLE drop_me;")));
     const std::string dropped = ReadUntilReady(client);
-    std::cerr << "DROP RESPONSE: [" << dropped << "]\n";
     EXPECT_NE(dropped.find("DROP TABLE"), std::string::npos);
     EXPECT_NE(dropped.find('Z'), std::string::npos);
 
@@ -1216,6 +1215,7 @@ TEST(PostgresServerTest, MalformedStartupPacketWithoutTerminator) {
 
 TEST(PostgresServerTest, ServerDestructorClosesLiveClients) {
   const std::string path = "postgres_server_dtor_test-" + RandomString();
+  int client = -1;
   {
     PostgresServerOptions options;
     options.port = 0;
@@ -1228,14 +1228,23 @@ TEST(PostgresServerTest, ServerDestructorClosesLiveClients) {
 
     // Act -- a client completes startup but is never closed by the test;
     // the server is stopped and destroyed while the client is still connected
-    const int client = ConnectClient(server.BoundPort());
+    client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
     server.RequestStop();
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
   // Assert -- the destructor closed the still-registered client socket
-  // (the server reaches the connection and the peer observes EOF)
+  // (the server reaches the connection and the peer observes EOF).
+  ASSERT_GE(client, 0);
+  pollfd descriptor{.fd = client, .events = POLLIN, .revents = 0};
+  const int readable = poll(&descriptor, 1, 5000);
+  std::array<char, 64> buffer{};
+  const ssize_t received =
+      readable > 0 ? recv(client, buffer.data(), buffer.size(), 0) : -1;
+  close(client);
+  ASSERT_GT(readable, 0);
+  EXPECT_EQ(received, 0);
   {
     auto database_holder = Database::Create(path).MoveValue();
     CHECK(database_holder != nullptr);
@@ -1364,13 +1373,6 @@ TEST(PostgresServerTest, ListenFailsOnUnresolvableListenAddress) {
   database.DeleteAll();
 }
 
-// DISABLED: every connected-client server test currently throws
-// "Resource deadlock avoided" (std::shared_mutex EDEADLK) from PageRef when a
-// transaction re-pins meta page 1 while the same thread already holds its
-// page lock (PageRef + the page manager). This is caused
-// by the concurrent production rework of page_pool/recovery_manager (see
-// the page-manager rework), NOT by this test; the original server tests
-// fail identically.
 TEST(PostgresServerTest, StartTransactionAndEndAliases) {
   const std::string path = "postgres_server_alias_test-" + RandomString();
   {
@@ -2346,16 +2348,20 @@ TEST(PostgresServerTest, DisconnectReleasesOpenDdlBlock) {
     ASSERT_GE(first, 0);
     ASSERT_TRUE(SendAll(first, QueryMessage("BEGIN")));
     ASSERT_NE(ReadUntilReady(first).find("BEGIN"), std::string::npos);
-    ASSERT_TRUE(SendAll(first, QueryMessage("CREATE TABLE abandoned (k INT64)")));
+    ASSERT_TRUE(
+        SendAll(first, QueryMessage("CREATE TABLE abandoned (k INT64)")));
     ASSERT_NE(ReadUntilReady(first).find("CREATE TABLE"), std::string::npos);
     close(first);
     const int next = ConnectClient(server.BoundPort());
     ASSERT_GE(next, 0);
     std::string reply;
     for (int attempt = 0; attempt < 50; ++attempt) {
-      ASSERT_TRUE(SendAll(next, QueryMessage("CREATE TABLE after_close (k INT64)")));
+      ASSERT_TRUE(
+          SendAll(next, QueryMessage("CREATE TABLE after_close (k INT64)")));
       reply = ReadUntilReady(next);
-      if (reply.find("55006") == std::string::npos) { break; }
+      if (reply.find("55006") == std::string::npos) {
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_NE(reply.find("CREATE TABLE"), std::string::npos);
@@ -2711,8 +2717,8 @@ TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorStopsBatch) {
                                              "(1, 'abc');")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
-    // Act -- a single message with two read-only statements sharing one
-    // read-only snapshot (§7.3): the first streams its rows, then the second
+    // Act -- a single message with three read-only statements sharing one
+    // read-only snapshot (§7.3): the first streams its rows, the second
     // throws at execution time. The worker aborts the shared snapshot,
     // stops at the failing statement, and still answers ReadyForQuery.
     ASSERT_TRUE(
@@ -2725,7 +2731,8 @@ TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorStopsBatch) {
     EXPECT_NE(response.find('E'), std::string::npos);
     EXPECT_NE(response.find("type mismatch"), std::string::npos);
     EXPECT_NE(response.find('Z'), std::string::npos);
-    // The failing third statement must never execute: exactly two DataRows.
+    // The second statement fails, so the third must never execute: no
+    // "SELECT 1" CommandComplete may follow the ErrorResponse.
     EXPECT_EQ(response.find("SELECT 1", response.find('E')), std::string::npos);
 
     // Assert -- the session is still usable.
@@ -3632,7 +3639,8 @@ TEST(PostgresServerTest, ProtocolViolationAbortsExplicitBlock) {
     ASSERT_TRUE(SendAll(client, QueryMessage("ROLLBACK;")));
     EXPECT_NE(ReadUntilReady(client).find("ROLLBACK"), std::string::npos);
     ASSERT_TRUE(SendAll(client, QueryMessage("SELECT 7;")));
-    EXPECT_NE(ReadUntilReady(client).find("7"), std::string::npos);  // NOLINT(performance-faster-string-find)
+    EXPECT_NE(ReadUntilReady(client).find("7"),
+              std::string::npos);  // NOLINT(performance-faster-string-find)
 
     close(client);
     server.RequestStop();

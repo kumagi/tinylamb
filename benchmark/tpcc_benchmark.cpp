@@ -584,7 +584,12 @@ int main(int argc, char** argv) {
   const uint64_t new_order_committed =
       totals[static_cast<size_t>(tinylamb::TpccTransactionType::kNewOrder)]
           .committed;
-  const uint64_t engine_aborts = attempted - committed - user_rollback;
+  // Saturate instead of underflowing if a future result shape reports both
+  // committed and user_rollback (a plain unsigned subtraction would wrap to a
+  // huge abort count and corrupt the CI exit decision).
+  const uint64_t engine_aborts = (committed + user_rollback >= attempted)
+                                     ? 0
+                                     : attempted - committed - user_rollback;
   sql_path_gate_ok = sql_path_gate_ok && attempted > 0 && statements > 0;
   std::cout << "warmup_engine_aborted_transactions=" << warmup_engine_aborts
             << '\n';

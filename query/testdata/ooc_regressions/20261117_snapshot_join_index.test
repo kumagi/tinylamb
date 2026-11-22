@@ -1,7 +1,8 @@
 -- sql_ooc_fuzzer regression
 -- seed: 310
 -- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
--- failure: budget-invariance mismatch [join+groupby+distinct] (same query, different memory knobs) :: op 7 `q ord=0 heavy=0 take=4 nv=2 vs=420030861 ex=0 snap=1 :: SELECT a.g AS c1, a.t AS c2, COUNT(DISTINCT a.v) AS c3, MIN(a.t) AS c4, MIN(a.k) AS c5 FROM t2 a JOIN t0...(189B)`: budget-invariance mismatch [join+groupby+distinct] (same query, different memory knobs): SELECT a.g AS c1, a.t AS c2, COUNT(DISTINCT a.v) AS c3, MIN(a.t) AS c4, MIN(a.k) AS c5 FROM t2 a JOIN t0 b ON a.k = b.k GROUP BY 1, 2 |   reference {opmem=0 spill=0 temp=0 route=0} vs {opmem=16384 spill=1 temp=0 route=0} reading only the firs
+-- failure: budget-invariance mismatch [join+groupby+distinct] (same query, different memory knobs) :: op 7 `q ord=0 heavy=0 take=4 nv=2 vs=420030861 ex=0 snap=1 :: SELECT a.g AS c1, a.t AS c2, COUNT(DISTINCT a.v) AS c3, MIN(a.t) AS c4, MIN(a.k) AS c5 FROM t2 a JOIN t0...(189B)`: budget-invariance mismatch [join+groupby+distinct] (same query, different memory knobs): SELECT a.g AS c1, a.t AS c2, COUNT(DISTINCT a.v) AS c3, MIN(a.t) AS c4, MIN(a.k) AS c5 FROM t2 a JOIN t0 b ON a.k = b.k GROUP BY 1, 2 |   reference {opmem=0 spill=0 temp=0 route=0} vs {opmem=16384 spill=1 temp=0 route=0} reading only the first rows |   expected and engine row counts differ
+-- note: join+groupby+distinct budget-invariance mismatch (summary truncated at capture time)
 create t0 1 0 2 1 2 1
 create t2 1 87 1450 1 1 0
 ins_bulk t0 1 1572 372

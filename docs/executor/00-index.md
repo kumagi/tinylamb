@@ -66,8 +66,7 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 | 演算子 | 役割 | 詳細 |
 |---|---|---|
 | `CrossJoin` | 直積を作る | [直積](50-join.md#2-crossjoin) |
-| `NestedLoopJoin` | 右入力を保持して全候補対を検査する | [入れ子ループ](50-join.md#3-nestedloopjoin) |
-| `BatchNestedLoopJoin` | 左入力をブロック化した入れ子ループを行う | [バッチ入れ子ループ](50-join.md#4-batchnestedloopjoin) |
+| `BatchNestedLoopJoin` | 左入力をブロック化した入れ子ループを行う（このリポジトリに `NestedLoopJoin` クラスは存在せず、EXPLAIN 文字列 `NestedLoopJoin` と本クラスが実体） | [バッチ入れ子ループ](50-join.md#4-batchnestedloopjoin) |
 | `LookupJoin` | 左行ごとに、索引キー順の probe 列で右索引を探索する（等値 prefix ＋ 範囲 bound 1 個） | [索引結合](50-join.md#5-lookupjoin) |
 | `LateMaterializationJoin` | equi/unique winner または rowid の候補だけを先にjoinし、payloadを上位段で読む | [遅延実体化結合](50-join.md#14-latematerializationjoin) |
 | `HashJoin` | ハッシュ表と必要時の分割スピルで結合する | [ハッシュ結合](50-join.md#6-hashjoin) |

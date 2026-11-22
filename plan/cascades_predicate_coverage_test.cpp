@@ -201,10 +201,15 @@ TEST_F(CascadesPredicateCoverageTest, IndexScanSelections) {
   EXPECT_EQ(Count("SELECT COUNT(*) FROM (SELECT a FROM t ORDER BY a "
                   "LIMIT 2) p"),
             2);
-  // The EXPLAIN of an equality on the indexed column renders a plan.
-  Explain("EXPLAIN SELECT a FROM t WHERE a = 2");
-  Explain("EXPLAIN SELECT a FROM t WHERE a > 1 AND a < 3");
-  Explain("EXPLAIN SELECT b FROM t WHERE a = 1 OR a = 3");
+  // Equality, range, and disjunctive predicates on the indexed column all
+  // select an index access path, not just a plan that renders.
+  for (const std::string sql :
+       {"EXPLAIN SELECT a FROM t WHERE a = 2",
+        "EXPLAIN SELECT a FROM t WHERE a > 1 AND a < 3",
+        "EXPLAIN SELECT b FROM t WHERE a = 1 OR a = 3"}) {
+    const std::string plan = Explain(sql);
+    EXPECT_NE(plan.find("Index"), std::string::npos) << sql << "\n" << plan;
+  }
 }
 
 TEST_F(CascadesPredicateCoverageTest, SubqueryAndSetOpShapes) {

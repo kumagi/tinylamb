@@ -27,12 +27,17 @@ namespace tinylamb {
 // Appends a self-describing, length-safe binary representation of `val` onto
 // `dst` (supports arbitrary string lengths > 64 KiB,
 // unsigned/interval/collation tags, NULLs, dates, doubles, and arrays).
-[[nodiscard]] Status EncodeSpillValue(const Value& val, std::string* dst,
-                                      int max_depth = 64);
+// The depth limit must match Value::kMaxArrayNestingDepth so a value that can
+// be spilled is also accepted by the row-page / memcomparable persist paths.
+[[nodiscard]] Status EncodeSpillValue(
+    const Value& val, std::string* dst,
+    int max_depth = static_cast<int>(Value::kMaxArrayNestingDepth));
 
 // Decodes one Value from `src`, advancing `src` past the consumed bytes.
-[[nodiscard]] StatusOr<Value> DecodeSpillValue(std::string_view* src,
-                                               int max_depth = 64);
+// Uses the same depth contract as EncodeSpillValue.
+[[nodiscard]] StatusOr<Value> DecodeSpillValue(
+    std::string_view* src,
+    int max_depth = static_cast<int>(Value::kMaxArrayNestingDepth));
 
 // Appends one self-describing Row onto `dst` (does not depend on 16-bit
 // VARCHAR prefixes or external Schema).
@@ -61,7 +66,9 @@ namespace tinylamb {
 // Reads the next framed Row block from `SpillSegmentReader`.
 // Returns `true` if a block was read (appended/assigned into `rows_out`), or
 // `false` cleanly on EOF when `reader->Eof()` is true before reading the block
-// header.
+// header. On any error the supplied `scratch_buffer` is left empty (cleared),
+// so a caller never observes bytes from a failed read; `rows_out` is unchanged
+// unless the block decoded fully.
 [[nodiscard]] StatusOr<bool> ReadRowBlock(
     SpillSegmentReader* reader, std::vector<Row>* rows_out,
     std::string* scratch_buffer = nullptr);

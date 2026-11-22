@@ -112,7 +112,9 @@ class ExactSetRuntimeFilter final : public RuntimeFilter {
   [[nodiscard]] const std::vector<int64_t>& Keys() const { return keys_; }
   // An empty set rejects every key (see Reject()), so it has no min/max.
   // Guard the accessors instead of calling front()/back() on an empty vector.
-  [[nodiscard]] int64_t Min() const { return keys_.empty() ? 0 : keys_.front(); }
+  [[nodiscard]] int64_t Min() const {
+    return keys_.empty() ? 0 : keys_.front();
+  }
   [[nodiscard]] int64_t Max() const { return keys_.empty() ? 0 : keys_.back(); }
 
  private:
@@ -220,6 +222,12 @@ class RuntimeFilterGroup final {
   static constexpr uint64_t kMaxDenseSpan = 134'217'728ULL;
 
   RuntimeFilterGroup() = default;
+  // `sorted_distinct_keys` is the sorted distinct build-key domain used to
+  // populate the dense bitmap when the [lo, hi] span fits kMaxDenseSpan. It
+  // must cover every key any part may accept: a key outside it keeps a clear
+  // bit and is rejected even if a part would have accepted it. Bits are only
+  // set for candidate keys that EVERY part accepts, so the bitmap never
+  // claims membership the conjunctive parts deny.
   explicit RuntimeFilterGroup(
       std::vector<std::unique_ptr<RuntimeFilter>> parts,
       const std::vector<int64_t>* sorted_distinct_keys = nullptr);
@@ -272,6 +280,14 @@ class RuntimeFilterGroup final {
           static_cast<uint64_t>(clamped_max) - static_cast<uint64_t>(lo_);
       const auto word_lo = static_cast<size_t>(off_lo >> 6);
       const auto word_hi = static_cast<size_t>(off_hi >> 6);
+      // Bounded bitmap walk: a ZoneMap range spanning at most 8 words is
+      // cheap enough to test bit-by-bit on the probe hot path. For a wider
+      // range we deliberately give up (report "may survive") rather than
+      // scanning an unbounded number of words -- a runtime filter may have
+      // false positives but never false negatives, so the wide case only
+      // loses pruning, not correctness. 8 is a heuristic cap on per-probe
+      // work, not a semantic boundary; no measurement backs a different
+      // value and the soundness argument is identical for every threshold.
       if (word_hi - word_lo <= 8) {
         const uint64_t low_mask = ~uint64_t{0} << (off_lo & 63);
         const uint64_t high_mask = (~uint64_t{0}) >> (63 - (off_hi & 63));

@@ -199,13 +199,31 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
   // AST reference and default projection path on every scalar expression.
   {
     SqlEngine setup_eng(db);
-    if (auto ddl =
-            setup_eng.Execute(ctx, "CREATE TABLE _one_row (dummy INT64);");
-        ddl.HasValue()) {
-      ddl.Value().Drain();
-      if (auto ins = setup_eng.Execute(ctx, "INSERT INTO _one_row VALUES (1);");
-          ins.HasValue()) {
-        ins.Value().Drain();
+    // Both the Execute StatusOr and the streamed Drain status must be checked:
+    // a mid-stream INSERT failure leaves _one_row empty, RunScalar then
+    // reports ran=false, and the whole relational differential oracle would
+    // silently skip forever without any diagnostic.
+    const auto setup_ok = [&](const char* sql) {
+      auto res = setup_eng.Execute(ctx, sql);
+      if (!res.HasValue()) {
+        if (verbose) {
+          std::cerr << "[expr_oracle][skip] setup failed: " << sql << "\n";
+        }
+        return false;
+      }
+      res.Value().Drain();
+      if (res.Value().GetStatus() != Status::kSuccess) {
+        if (verbose) {
+          std::cerr << "[expr_oracle][skip] setup stream failed: " << sql
+                    << ": " << res.Value().GetStatus().GetMessage() << "\n";
+        }
+        return false;
+      }
+      return true;
+    };
+    if (setup_ok("CREATE TABLE _one_row (dummy INT64);") &&
+        setup_ok("INSERT INTO _one_row VALUES (1);")) {
+      {
         const std::string rel_sql =
             "SELECT " + generated.sql + " FROM _one_row WHERE dummy = 1;";
         const EngineOutcome rel_engine =
@@ -241,9 +259,15 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
 }
 
 std::string ReplayExprOracleTrace(const ExprOracleTrace& trace, bool verbose) {
+  // The generator canonicalizes the 64-bit seed by packing the same uint32
+  // into both halves. Reject a trace whose halves disagree: editing only the
+  // high 32 bits would otherwise leave the regenerated SQL/S-expression
+  // unchanged (they come from the low bits) and slip past the check below.
+  if ((trace.seed >> 32) != (trace.seed & 0xffffffffULL)) {
+    return "tampered trace: seed halves disagree";
+  }
   // Regenerate from the seed: the generator is deterministic, so the
-  // recorded SQL/S-expression must match byte-identically. The canonical
-  // seed packs the uint32 generator seed into both halves.
+  // recorded SQL/S-expression must match byte-identically.
   const auto seed32 = static_cast<uint32_t>(trace.seed);
   std::mt19937 rng(seed32);
   ExprGenConfig config;
@@ -283,6 +307,22 @@ std::string ReplayExprOracleTrace(const ExprOracleTrace& trace, bool verbose) {
   return report;
 }
 
+// Quote an S-expression for the documented shell cross-check command. A bare
+// `'...'` wrapper breaks when the sexpr contains a string literal with an
+// apostrophe; close the quote, emit an escaped apostrophe, reopen it.
+static std::string ShellSingleQuote(std::string_view value) {
+  std::string out = "'";
+  for (char c : value) {
+    if (c == '\'') {
+      out += "'\\''";
+    } else {
+      out.push_back(c);
+    }
+  }
+  out.push_back('\'');
+  return out;
+}
+
 std::string SerializeExprOracleTest(const ExprOracleTrace& trace) {
   std::string out = std::string(kTestHeader) + "\n";
   out += "-- seed: " + std::to_string(trace.seed) + "\n";
@@ -297,8 +337,8 @@ std::string SerializeExprOracleTest(const ExprOracleTrace& trace) {
   if (!trace.failure.empty()) {
     out += "-- failure: " + trace.failure + "\n";
   }
-  out += "-- cross-check: printf '%s' '" + trace.sexpr +
-         "' | python3 scripts/expr_oracle.py\n";
+  out += "-- cross-check: printf '%s' " + ShellSingleQuote(trace.sexpr) +
+         " | python3 scripts/expr_oracle.py\n";
   return out;
 }
 
@@ -417,8 +457,15 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
                     "\n";
         const std::string row_path = "row_expr_oracle_fuzz-repro-" +
                                      std::to_string(row_trace.seed) + ".test";
+        // Prove the finding reproduces before emitting it: spill/parallel
+        // paths can produce a one-off mismatch, and EmitFuzzSkip treats an
+        // empty verify as a real finding (writes the file and aborts).
+        std::string row_verify = ReplayRowExprOracleTrace(row_trace, false);
+        if (row_verify.empty()) {
+          row_verify = "internal error: replay holds (flaky row mismatch)";
+        }
         EmitFuzzFinding("row_expr_oracle_fuzz", row_trace.seed, row_path,
-                        row_text, row_report, "");
+                        row_text, row_report, row_verify);
       }
     }
     return;
@@ -1240,6 +1287,11 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
 
 std::string ReplayRowExprOracleTrace(const RowExprOracleTrace& trace,
                                      bool verbose) {
+  // Same canonical-seed contract as ReplayExprOracleTrace: both halves must
+  // agree or a high-bit-only edit of the trace would go undetected.
+  if ((trace.seed >> 32) != (trace.seed & 0xffffffffULL)) {
+    return "tampered trace: seed halves disagree";
+  }
   const auto seed32 = static_cast<uint32_t>(trace.seed);
   std::mt19937 rng(seed32);
   ExprGenConfig config;

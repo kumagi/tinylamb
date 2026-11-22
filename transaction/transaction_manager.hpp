@@ -142,6 +142,7 @@ class TransactionManager {
       : page_manager_(pm), logger_(l), recovery_(r) {
     write_intent_wait_limit_ms_.store(WriteIntentWaitLimitMsFromEnv(),
                                       std::memory_order_release);
+    WireDurabilityWaiter();
     StartGcWorker();
   }
 
@@ -556,6 +557,11 @@ class TransactionManager {
   StatusOr<lsn_t> AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
 
+  // Connect the logger's durability frontier to the page manager so its
+  // WAL-before-data gates (eviction / fuzzy checkpoint) can actually wait.
+  // Whoever owns a logger must wire this; PageStorage also does so explicitly.
+  void WireDurabilityWaiter();
+
   PageManager* GetPageManager() { return page_manager_; }
 
   friend std::ostream& operator<<(std::ostream& o,
@@ -799,7 +805,8 @@ class TransactionManager {
     // keys being dropped are at most that old.
     void Disable(uint64_t forget_through_ts) noexcept {
       precise = false;
-      if (forget_through_ts > forgotten_through_ts) {  // NOLINT(readability-use-std-min-max)
+      if (forget_through_ts >
+          forgotten_through_ts) {  // NOLINT(readability-use-std-min-max)
         forgotten_through_ts = forget_through_ts;
       }
       pending.clear();
@@ -953,8 +960,8 @@ class TransactionManager {
 
   // ---- deadlock policy & wait-for graph ----
   // Default is kDeadlockDetect: the wait-for graph detector resolves a
-  // genuine deadlock in ~one detector backstop interval by wounding the youngest
-  // participant, while kLegacy leaves a cycle to the 5 s write-intent
+  // genuine deadlock in ~one detector backstop interval by wounding the
+  // youngest participant, while kLegacy leaves a cycle to the 5 s write-intent
   // escape hatch -- measured on TPC-C (W=2, 32 clients) that turns every
   // cycle into a 5-second stall plus a full undo walk, 12x more engine
   // aborts and ~30% less throughput than detection. The explicit kLegacy

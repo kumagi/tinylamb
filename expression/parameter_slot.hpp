@@ -42,12 +42,17 @@ namespace tinylamb {
 // Arguments that are operator names, field paths or interval units rather
 // than bindable SQL literals. Shared by template binding and parameter-slot
 // assignment so the two paths cannot drift.
-inline bool IsStructuralCallArg(std::string_view func, size_t index) {
+// `arg_count` (0 when unavailable) decides the STRUCT field encoding: fields
+// are (name, value) pairs, or (name, value, null_flag) triples when the call
+// has a multiple-of-three arity. Only value positions are bindable.
+inline bool IsStructuralCallArg(std::string_view func, size_t index,
+                                size_t arg_count = 0) {
   if (func == "__quantified__") {
     return index >= 2;
   }
   if (func == "__struct_json__") {
-    return index % 3 != 1;
+    const bool triple_form = arg_count >= 3 && arg_count % 3 == 0;
+    return triple_form ? index % 3 != 1 : index % 2 == 0;
   }
   if (func == "make_interval" || func == "get_field") {
     return index == 1;
@@ -147,6 +152,11 @@ class ParameterSlot final : public ConstantValue {
         return {TypeTag::kDate};
       case ValueType::kArray:
         return {TypeTag::kArray};
+      case ValueType::kNull:
+        // An untyped NULL can still be promoted to any SQL type. Reporting
+        // kInvalid here poisoned ResultType inference and got otherwise valid
+        // plans rejected; INT64 is the engine's default carrier for NULL.
+        return {TypeTag::kBigInt};
       default:
         return {TypeTag::kInvalid};
     }
@@ -602,7 +612,8 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
         // Structural arguments (operator names, field paths, interval units)
         // are not SQL literals. Numbering them would shift every later slot.
         const std::string& func = call.FuncName();
-        const bool structural = IsStructuralCallArg(func, i);
+        const bool structural =
+            IsStructuralCallArg(func, i, call.Args().size());
         if (structural) {
           args.push_back(call.Args()[i]);
           continue;

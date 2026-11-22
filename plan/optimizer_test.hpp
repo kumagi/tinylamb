@@ -75,8 +75,6 @@
 
 namespace tinylamb {
 
-inline constexpr const char* const kIndexName = "SampleIndex";
-
 // Builds `EXISTS (SELECT <inner_select> FROM <table> WHERE <where>)` shaped
 // subquery expressions for the decorrelation tests.
 inline Expression ExistsSubquery(const std::vector<NamedExpression>& select,
@@ -151,7 +149,6 @@ class OptimizerTest : public ::testing::Test {
                 .GetStatus());
       }
     }
-    IndexSchema idx_sc(kIndexName, {1, 2});
     ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc1", IndexSchema("KeyIdx", {1, 2})));
     ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc1", IndexSchema("Sc1PK", {0})));
     ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0})));
@@ -163,10 +160,10 @@ class OptimizerTest : public ::testing::Test {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
 
     auto stat_tx = rs_->BeginContext();
-    rs_->RefreshStatistics(stat_tx, "Sc1");
-    rs_->RefreshStatistics(stat_tx, "Sc2");
-    rs_->RefreshStatistics(stat_tx, "Sc3");
-    rs_->RefreshStatistics(stat_tx, "Sc4");
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stat_tx, "Sc1"));
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stat_tx, "Sc2"));
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stat_tx, "Sc3"));
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stat_tx, "Sc4"));
     ASSERT_SUCCESS(stat_tx.PreCommit());
   }
 
@@ -184,7 +181,14 @@ class OptimizerTest : public ::testing::Test {
       const {  // Arrange: open context + rewrite query for debugging
     TransactionContext ctx = rs_->BeginContext();
     QueryData qd_resolved = qd;
-    qd_resolved.Rewrite(ctx);
+    // DumpAll returns Status, so a gtest ASSERT_* is not usable here: propagate
+    // a rewrite failure explicitly. Otherwise an Optimizer that tolerates the
+    // un-rewritten QueryData would keep every DumpAll smoke test green even
+    // when name resolution regressed.
+    const Status rewrite_status = qd_resolved.Rewrite(ctx);
+    if (rewrite_status != Status::kSuccess) {
+      return rewrite_status;
+    }
     LOG(INFO) << qd << "\n";
 
     // Act: optimize plan + emit executor + execute query

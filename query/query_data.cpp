@@ -81,6 +81,17 @@ bool CaseInsensitiveEquals(std::string_view left, std::string_view right) {
   return true;
 }
 
+auto FindRelation(const std::unordered_set<std::string>& relations,
+                  const std::string& name) {
+  const auto exact = relations.find(name);
+  if (exact != relations.end()) {
+    return exact;
+  }
+  return std::ranges::find_if(relations, [&](const std::string& relation) {
+    return CaseInsensitiveEquals(relation, name);
+  });
+}
+
 bool CanBindFieldPathBase(
     std::string_view column,
     const std::unordered_set<std::string>& ambiguous_column_name,
@@ -116,7 +127,7 @@ Expression BindColumnQualifiedFieldReads(
     if (name.schema.empty() || name.name.empty() || name.name == "*") {
       return expr;
     }
-    if (relations.contains(name.schema)) {
+    if (FindRelation(relations, name.schema) != relations.end()) {
       // A proto value table has one physical TEXT column, while SQL exposes
       // its message fields through the relation alias (`p.int32_val1`).
       // Bind such qualified field references to that sole column when the
@@ -216,7 +227,8 @@ Expression BindFieldPaths(
   if (exp->Type() == TypeTag::kColumnValue) {
     const ColumnName& col_name = exp->AsColumnValue().GetColumnName();
     if (col_name.schema.empty() || col_name.name.empty() ||
-        col_name.name == "*" || relations.contains(col_name.schema) ||
+        col_name.name == "*" ||
+        FindRelation(relations, col_name.schema) != relations.end() ||
         !CanBindFieldPathBase(col_name.schema, ambiguous_column_name,
                               col_types)) {
       return nullptr;
@@ -310,11 +322,11 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     auto& cv = exp->AsColumnValue();
     const ColumnName& col_name = cv.GetColumnName();
     // Qualified references must name a FROM relation: its alias when one is
-    // given, else the table name. The qualifier is kept verbatim so scan
-    // implementations can rename their output schemas to match it
-    // (Phase 8 aliases/self-joins).
+    // given, else the table name. Use the FROM spelling for the binding so
+    // optimizer relation sets and scan schemas see the same identity.
     if (!col_name.schema.empty()) {
-      if (!relations.contains(col_name.schema)) {
+      const auto relation = FindRelation(relations, col_name.schema);
+      if (relation == relations.end()) {
         return Status::kNotExists;
       }
       if (!expand_proto_value_table && col_name.name != "*") {
@@ -340,6 +352,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
           return Status::kNotExists;
         }
       }
+      cv.SetSchemaName(*relation);
       return Status::kSuccess;
     }
     if (ambiguous_column_name.contains(ToLowerCopy(col_name.name))) {
@@ -352,7 +365,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     if (it == col_table_map.end()) {
       // A bare name that matches a FROM relation (its alias or table name)
       // denotes that relation's whole row as a struct ("SELECT s FROM t s").
-      if (relations.contains(ToLowerCopy(col_name.name))) {
+      if (FindRelation(relations, col_name.name) != relations.end()) {
         std::vector<Expression> args;
         for (const ColumnName& column : all_cols) {
           if (!CaseInsensitiveEquals(column.schema, col_name.name)) {
@@ -579,7 +592,7 @@ Status ResolveSelect(
         // A bare name matching a FROM relation denotes its whole row as a
         // struct ("SELECT s FROM t s"): encode every column of that relation
         // explicitly so projection keeps them alive.
-        if (relations.contains(ToLowerCopy(col_name.name))) {
+        if (FindRelation(relations, col_name.name) != relations.end()) {
           if (expand_proto_value_table && all_cols.size() == 1) {
             it->expression = FunctionCallExp(
                 "__struct_json__",
@@ -653,10 +666,8 @@ Status ResolveSelect(
 
 Status QueryData::Rewrite(TransactionContext& ctx) {
   // from_ entries are relation identities: the alias when one is given, else
-  // the table name (Phase 8). Column qualifiers are validated against these
-  // relations and kept verbatim; unqualified columns are attributed to their
-  // owning relation. Scan implementations rename their output schemas to the
-  // relation identity so every downstream lookup resolves uniformly.
+  // the table name (Phase 8). Column qualifiers are bound to these identities.
+  // Scan implementations rename their output schemas to match.
   const std::unordered_set<std::string> relations(from_.begin(), from_.end());
   std::unordered_map<std::string, std::string> col_table_map;
   std::unordered_map<std::string, ValueType> col_types;
@@ -753,8 +764,9 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   for (auto& [relation, sample] : samples_) {
     (void)relation;
     for (Expression& partition : sample.partition_by) {
-      Expression mapped = BindFieldPaths(
-          partition, col_table_map, ambiguous_column_name, col_types, relations);
+      Expression mapped =
+          BindFieldPaths(partition, col_table_map, ambiguous_column_name,
+                         col_types, relations);
       if (mapped) {
         partition = std::move(mapped);
       }

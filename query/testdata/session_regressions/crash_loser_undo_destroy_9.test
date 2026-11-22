@@ -26,7 +26,7 @@
 -- check: tbl0
 -- expect: [0, 3, -3]
 -- failure: post-crash state mismatch on tbl0 after step 15
-table tbl0: mirror has 1 rows, engine has 0
+table tbl0: mirror has 1 row, engine has 0
   expected:
     [0, 3, -3]
   actual:

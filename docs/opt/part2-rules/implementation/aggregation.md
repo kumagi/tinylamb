@@ -116,7 +116,7 @@ const double sort_cost = (rows * std::log2(std::max(2.0, rows))) + rows;
 - `distinct_and_group_by_interchange`: 集約関数を持たないグループ化集約を生成しますが、前述の guard によって本 Rule による誤実装が防がれ、`distinct` / `sort_distinct` / `skip_scan_distinct` に委ねられます。
 - `push_selection_through_aggregation` / `filter_aggregate_pushdown`: 集約の下位へと述語を押し込み、集約の入力行数を削減します。
 
-- 実行器側の並列化: `HashAggregateExecutor` は `kParallelAggregationMinRows`（8192）を超える入力でワーカー数を引き上げます。ただし位置的に（position 参照だけで）読めないペイロード（式引数、FILTER、HAVING 修飾子、ORDER BY、末尾引数）では `worker_count` を 1 に戻します（推論はせず、逐次 build を保ちます）。ワーカー build は private な group table を union するので group capacity では上限にならず、逐次 build の partition spill とは別の「テーブルが収まらない」回答です（`Spilled()` と `PeakResidentGroups()` で区別できます）。
+- 実行器側の並列化: `HashAggregateExecutor` は `kParallelAggregationMinRows`（32768）を超える入力でワーカー数を引き上げます。ただし位置的に（position 参照だけで）読めないペイロード（式引数、FILTER、HAVING 修飾子、ORDER BY、末尾引数）では `worker_count` を 1 に戻します（推論はせず、逐次 build を保ちます）。ワーカー build は private な group table を union するので group capacity では上限にならず、逐次 build の partition spill とは別の「テーブルが収まらない」回答です（`Spilled()` と `PeakResidentGroups()` で区別できます）。
 - 2 つの group 形の**状態**の差は `PeakResidentGroups()` で観測できます: HashAgg は「同時に持つ group table 1 個」（resident build なら distinct key 数、partition spill 後は最大 1 partition の group 数）、SortAgg は常に 1（畳み込み中の run だけ）。この peak は答えには影響せず、メモリ契約の議論の受け口にされているだけです。
 - factory（`executor/relational_factory.cpp`）は strategy ごとに設定を引き分けます: worker 数は HashAgg のみ、run threshold（`SpillThresholdRows()`）は SortAgg のみ、`require_ordered_input` は StreamAgg のみ。
 

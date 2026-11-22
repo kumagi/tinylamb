@@ -49,6 +49,10 @@ std::vector<std::string> RunOnBothRoutes(SqlEngine* engine,
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
       EXPECT_EQ(row.values_.size(), 1U);
+      if (row.values_.size() != 1) {
+        engine->SetForceRelationalFallback(false);
+        return {};
+      }
       route_result.push_back(row[0].AsString());
     }
     EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
@@ -225,31 +229,25 @@ class ArrayCompareTest : public ::testing::Test {
 TEST_F(ArrayCompareTest, LexicographicElementwiseComparison) {
   // First differing element decides.
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[1, 2] < ARRAY[1, 3]")
-                .front(),
-            "1");
+                            "SELECT ARRAY[1, 2] < ARRAY[1, 3]"),
+            (std::vector<std::string>{"1"}));
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[1, 2] > ARRAY[1, 1]")
-                .front(),
-            "1");
+                            "SELECT ARRAY[1, 2] > ARRAY[1, 1]"),
+            (std::vector<std::string>{"1"}));
   // A shared prefix makes the longer array greater.
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[1, 2] < ARRAY[1, 2, 0]")
-                .front(),
-            "1");
+                            "SELECT ARRAY[1, 2] < ARRAY[1, 2, 0]"),
+            (std::vector<std::string>{"1"}));
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[1, 2, 0] > ARRAY[1, 2]")
-                .front(),
-            "1");
+                            "SELECT ARRAY[1, 2, 0] > ARRAY[1, 2]"),
+            (std::vector<std::string>{"1"}));
   // Equal arrays compare false on both operators.
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[4, 5] < ARRAY[4, 5]")
-                .front(),
-            "0");
+                            "SELECT ARRAY[4, 5] < ARRAY[4, 5]"),
+            (std::vector<std::string>{"0"}));
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[4, 5] > ARRAY[4, 5]")
-                .front(),
-            "0");
+                            "SELECT ARRAY[4, 5] > ARRAY[4, 5]"),
+            (std::vector<std::string>{"0"}));
 }
 
 // A column-vs-array-literal predicate folds into a constant comparison. The
@@ -280,18 +278,15 @@ TEST_F(ArrayCompareTest, NullElementPropagationMatchesNullSemantics) {
   // (NULL == NULL) and the scan moves on, so a NULL prefix does not decide
   // the result by itself.
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[NULL] < ARRAY[NULL]")
-                .front(),
-            "0");
+                            "SELECT ARRAY[NULL] < ARRAY[NULL]"),
+            (std::vector<std::string>{"0"}));
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[NULL, 2] < ARRAY[NULL, 3]")
-                .front(),
-            "1");
+                            "SELECT ARRAY[NULL, 2] < ARRAY[NULL, 3]"),
+            (std::vector<std::string>{"1"}));
   // A shared prefix that includes NULLs still lets the longer array win.
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[1, NULL] < ARRAY[1, NULL, 0]")
-                .front(),
-            "1");
+                            "SELECT ARRAY[1, NULL] < ARRAY[1, NULL, 0]"),
+            (std::vector<std::string>{"1"}));
   // A NULL element compared against a non-NULL element is incomparable:
   // TryLess reports a type mismatch.  The error may surface at Prepare
   // (constant folding) or during execution; both routes must agree it is

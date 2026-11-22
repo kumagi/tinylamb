@@ -39,6 +39,27 @@ TEST(BytecodeTest, AuditBatchProjectionPreservesUnsignedValuesAfterNull) {
   EXPECT_TRUE(output.Value().ValueAt(0).IsNull());
   EXPECT_TRUE(output.Value().ValueAt(1).IsUnsigned());
   EXPECT_EQ(output.Value().ValueAt(1), Value(-1).WithUnsigned());
+
+  // The columnar fast path must decline unsigned operands (P668): FastSlot
+  // cannot carry the unsigned tag, so a regression that starts taking the
+  // fast path here would silently hand back signed INT64 bits. Mirror the
+  // batch above with a non-uniform column view (NULL followed by the
+  // unsigned value) and pin that it reports kUnsupported with an untouched
+  // sink instead of producing a lossy result.
+  const std::vector<Value> values{Value(), Value(-1).WithUnsigned()};
+  const BytecodeColumnView view{.type = ValueType::kInt64,
+                                .is_unsigned = true,
+                                .is_uniform = false,
+                                .fallback = values.data()};
+  const std::vector<BytecodeColumnView> cols{view};
+  std::vector<int64_t> ints;
+  BytecodeColumnSink sink;
+  sink.ints = &ints;
+  Status error;
+  EXPECT_EQ(program->TryEvaluateColumnarBatch(cols, nullptr, values.size(),
+                                              &sink, &error),
+            BytecodeProgram::FastEval::kUnsupported);
+  EXPECT_TRUE(ints.empty());
 }
 
 // T4800: FastSlot cannot carry Value's unsigned tag, so an unsigned input
@@ -61,7 +82,8 @@ TEST(BytecodeTest, UnsignedInputsNeverTakeSignedFastMath) {
     const auto program = BytecodeCompiler::Compile(expression, schema);
     ASSERT_TRUE(program.has_value()) << name;
     const auto expected = expression->TryEvaluate(row, schema);
-    const auto actual = program->TryEvaluateRow(row);  // NOLINT(bugprone-unchecked-optional-access)
+    const auto actual = program->TryEvaluateRow(
+        row);  // NOLINT(bugprone-unchecked-optional-access)
     ASSERT_EQ(actual.HasValue(), expected.HasValue()) << name;
     if (expected.HasValue()) {
       EXPECT_EQ(actual.Value().IsNull(), expected.Value().IsNull()) << name;
@@ -73,8 +95,9 @@ TEST(BytecodeTest, UnsignedInputsNeverTakeSignedFastMath) {
     }
     Value fast_value;
     Status fast_error;
-    const auto fast =
-        program->TryEvaluateRowFast(row, &fast_value, &fast_error);  // NOLINT(bugprone-unchecked-optional-access)
+    const auto fast = program->TryEvaluateRowFast(
+        row, &fast_value,
+        &fast_error);  // NOLINT(bugprone-unchecked-optional-access)
     if (fast == BytecodeProgram::FastEval::kDone && expected.HasValue()) {
       // A kDone result over an unsigned operand must still be unsigned;
       // signed bits without the tag is exactly the T4800 divergence.
@@ -84,6 +107,11 @@ TEST(BytecodeTest, UnsignedInputsNeverTakeSignedFastMath) {
 }
 
 TEST(BytecodeTest, ByteLengthMatchesAstForStringsAndDynamicDomains) {
+  // GoogleSQL: BYTE_LENGTH/OCTET_LENGTH count raw bytes (kByteLength) while
+  // LENGTH/CHAR_LENGTH/CHARACTER_LENGTH count Unicode code points
+  // (kCharLength) -- LENGTH is a CHAR_LENGTH synonym, not a byte count. The
+  // opcode pin below keeps the two families distinct; a multibyte value in
+  // `values` (e.g. "é東京") makes them disagree, so both are exercised here.
   const Schema schema("input", {Column("v", ValueType::kVarChar)});
   const std::vector<Value> values{Value(),
                                   Value(""),
@@ -95,15 +123,17 @@ TEST(BytecodeTest, ByteLengthMatchesAstForStringsAndDynamicDomains) {
                                   Value(1.25),
                                   Value::DateFromDays(-10),
                                   Value::Array({Value(1), Value()}, "INT64")};
-  for (const std::string name : {"byte_length", "octet_length", "length"}) {
+  for (const std::string name :
+       {"byte_length", "octet_length", "length", "char_length"}) {
     const auto expression = FunctionCallExp(name, {ColumnValueExp("v")});
     const auto program = BytecodeCompiler::CompileRowCached(expression, schema);
     ASSERT_TRUE(program);
     if (!program) {
       return;
     }
-    const BytecodeOp expected_opcode =
-        name == "length" ? BytecodeOp::kCharLength : BytecodeOp::kByteLength;
+    const BytecodeOp expected_opcode = name == "length" || name == "char_length"
+                                           ? BytecodeOp::kCharLength
+                                           : BytecodeOp::kByteLength;
     ASSERT_EQ(program->Instructions().back().opcode, expected_opcode);
     ASSERT_TRUE(ScalarExpressionCacheKey({expression}, schema));
     DataChunk batch(schema);
@@ -700,6 +730,26 @@ TEST(BytecodeTest, Int64PlusBool_UsesAstDoublePromotionNotIntKernel) {
                            schema);
 }
 
+TEST(BytecodeTest, StringSetRespectsRuntimeCollation) {
+  const Schema schema("input", {Column("s", ValueType::kVarChar)});
+  const auto expression = InExpressionExp(
+      ColumnValueExp("s"),
+      {ConstantValueExp(Value("ABC")), ConstantValueExp(Value())});
+  const auto program = BytecodeCompiler::Compile(expression, schema);
+  ASSERT_TRUE(program.has_value());
+  ASSERT_TRUE(std::ranges::any_of(program->Instructions(), [](const auto& op) {
+    return op.opcode == BytecodeOp::kInStringSet;
+  }));
+  for (const char* text : {"abc", "missing"}) {
+    const Row row({Value(text).WithCollation(2)});
+    const auto expected = expression->TryEvaluate(row, schema);
+    const auto actual = program->TryEvaluateRow(row);
+    ASSERT_TRUE(expected.HasValue());
+    ASSERT_TRUE(actual.HasValue());
+    EXPECT_EQ(actual.Value(), expected.Value());
+  }
+}
+
 TEST(BytecodeTest, InList_EvaluatesChildOnceAndMatchesAst) {
   // `x IN (a, b, ...)` must evaluate the child once like TryMembership:
   // the lowering keeps the child on the stack (kDup) instead of emitting an
@@ -716,15 +766,37 @@ TEST(BytecodeTest, InList_EvaluatesChildOnceAndMatchesAst) {
   const auto child_loads = static_cast<long>(std::ranges::count_if(
       // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
       // assumes success
-      program->Instructions(), [&](const BytecodeInstruction& instruction) {  // NOLINT(bugprone-unchecked-optional-access)
+      program->Instructions(),
+      [&](const BytecodeInstruction&
+              instruction) {  // NOLINT(bugprone-unchecked-optional-access)
         return instruction.opcode == BytecodeOp::kLoadColumn &&
                instruction.operand == schema.Offset(ColumnName("i"));
       }));
   EXPECT_EQ(child_loads, 1);
+  // Counting only kLoadColumn(i) would stay green if the rest of the child
+  // subtree (`+ 1`) were re-emitted once per candidate. Count the whole
+  // three-instruction child pattern: its column load, its constant, and its
+  // add must each appear exactly once in the whole instruction stream.
+  const auto& constants = program->Constants();
+  const auto child_adds = static_cast<long>(std::ranges::count_if(
+      program->Instructions(), [](const BytecodeInstruction& instruction) {
+        return instruction.opcode == BytecodeOp::kBinaryInt64 &&
+               instruction.binary == BinaryOperation::kAdd;
+      }));
+  EXPECT_EQ(child_adds, 1);
+  const auto child_constants = static_cast<long>(std::ranges::count_if(
+      program->Instructions(), [&](const BytecodeInstruction& instruction) {
+        return instruction.opcode == BytecodeOp::kLoadConstant &&
+               instruction.operand < constants.size() &&
+               constants[instruction.operand] == Value(int64_t{1});
+      }));
+  EXPECT_EQ(child_constants, 1);
   EXPECT_TRUE(std::ranges::any_of(
       // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
       // assumes success
-      program->Instructions(), [](const BytecodeInstruction& instruction) {  // NOLINT(bugprone-unchecked-optional-access)
+      program->Instructions(),
+      [](const BytecodeInstruction&
+             instruction) {  // NOLINT(bugprone-unchecked-optional-access)
         return instruction.opcode == BytecodeOp::kDup;
       }));
 
@@ -761,7 +833,8 @@ TEST(BytecodeTest, InList_ShortCircuitsLaterCandidates) {
     hit.Append(Row({Value(1), Value(0)}));  // 1 matches; 10/0 never runs
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
     // assumes success
-    const ColumnVector output = program->EvaluateBatch(hit);  // NOLINT(bugprone-unchecked-optional-access)
+    const ColumnVector output = program->EvaluateBatch(
+        hit);  // NOLINT(bugprone-unchecked-optional-access)
     EXPECT_EQ(output.ValueAt(0), Value(true));
   }
   {
@@ -769,7 +842,8 @@ TEST(BytecodeTest, InList_ShortCircuitsLaterCandidates) {
     miss.Append(Row({Value(2), Value(0)}));  // no match -> 10/0 raises
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
     // assumes success
-    EXPECT_THROW(static_cast<void>(program->EvaluateBatch(miss)),  // NOLINT(bugprone-unchecked-optional-access)
+    EXPECT_THROW(static_cast<void>(program->EvaluateBatch(
+                     miss)),  // NOLINT(bugprone-unchecked-optional-access)
                  std::exception);
   }
   ExpectAstMatchesBytecode(membership, Row({Value(5), Value(2)}), schema);
@@ -921,12 +995,15 @@ TEST(BytecodeTest, ColumnarInt64BinaryLoopMatchesRowInterpreter) {
   const BytecodeColumnView av{.type = ValueType::kInt64, .ints = a.data()};
   const BytecodeColumnView bv{.type = ValueType::kInt64, .ints = b.data()};
   const std::vector<BytecodeColumnView> cols{av, bv};
-  const std::vector<BinaryOperation> ops{
-      BinaryOperation::kAdd,           BinaryOperation::kSubtract,
-      BinaryOperation::kMultiply,      BinaryOperation::kEquals,
-      BinaryOperation::kNotEquals,     BinaryOperation::kLessThan,
-      BinaryOperation::kLessThanEquals, BinaryOperation::kGreaterThan,
-      BinaryOperation::kGreaterThanEquals};
+  const std::vector<BinaryOperation> ops{BinaryOperation::kAdd,
+                                         BinaryOperation::kSubtract,
+                                         BinaryOperation::kMultiply,
+                                         BinaryOperation::kEquals,
+                                         BinaryOperation::kNotEquals,
+                                         BinaryOperation::kLessThan,
+                                         BinaryOperation::kLessThanEquals,
+                                         BinaryOperation::kGreaterThan,
+                                         BinaryOperation::kGreaterThanEquals};
   for (const BinaryOperation op : ops) {
     const std::vector<Expression> shapes{
         BinaryExpressionExp(ColumnValueExp("a"), op, ColumnValueExp("b")),
@@ -981,6 +1058,84 @@ TEST(BytecodeTest, ColumnarInt64BinaryLoopMatchesRowInterpreter) {
   EXPECT_EQ(add->TryEvaluateColumnarBatch(big_cols, nullptr, 2, &sink, &error),
             BytecodeProgram::FastEval::kError);
   EXPECT_TRUE(ints.empty());
+
+  // Division writes DOUBLE results, while modulo writes INT64 results.
+  // Both columnar paths must agree with the row interpreter.
+  const std::vector<int64_t> da{100, -100, 7, -7, 123456789};
+  const std::vector<int64_t> db{3, 3, -2, -2, 42};
+  const BytecodeColumnView dav{.type = ValueType::kInt64, .ints = da.data()};
+  const BytecodeColumnView dbv{.type = ValueType::kInt64, .ints = db.data()};
+  const std::vector<BytecodeColumnView> div_cols{dav, dbv};
+  for (const BinaryOperation op :
+       {BinaryOperation::kDivide, BinaryOperation::kModulo}) {
+    const std::vector<Expression> shapes{
+        BinaryExpressionExp(ColumnValueExp("a"), op, ColumnValueExp("b")),
+        BinaryExpressionExp(ColumnValueExp("a"), op,
+                            ConstantValueExp(Value(int64_t{3}))),
+        BinaryExpressionExp(ConstantValueExp(Value(int64_t{100})), op,
+                            ColumnValueExp("b"))};
+    for (const Expression& expression : shapes) {
+      const auto program = BytecodeCompiler::Compile(expression, schema);
+      ASSERT_TRUE(program.has_value());
+      std::vector<int64_t> div_ints;
+      std::vector<double> div_doubles;
+      BytecodeColumnSink div_sink;
+      div_sink.ints = &div_ints;
+      div_sink.doubles = &div_doubles;
+      Status div_error;
+      ASSERT_EQ(program->TryEvaluateColumnarBatch(div_cols, nullptr, da.size(),
+                                                  &div_sink, &div_error),
+                BytecodeProgram::FastEval::kDone);
+      const bool floating = op == BinaryOperation::kDivide;
+      ASSERT_EQ(div_sink.type,
+                floating ? ValueType::kDouble : ValueType::kInt64);
+      ASSERT_EQ(floating ? div_doubles.size() : div_ints.size(), da.size());
+      for (size_t i = 0; i < da.size(); ++i) {
+        const auto expected =
+            program->TryEvaluateRow(Row({Value(da[i]), Value(db[i])}));
+        ASSERT_TRUE(expected.HasValue());
+        const Value actual =
+            floating ? Value(div_doubles[i]) : Value(div_ints[i]);
+        EXPECT_EQ(actual, expected.Value()) << "row " << i;
+      }
+    }
+  }
+
+  const auto expect_columnar_error = [&](BinaryOperation op, int64_t left,
+                                         int64_t right) {
+    const auto expression =
+        BinaryExpressionExp(ColumnValueExp("a"), op, ColumnValueExp("b"));
+    const auto program = BytecodeCompiler::Compile(expression, schema);
+    EXPECT_TRUE(program.has_value());
+    if (!program) {
+      return;
+    }
+    // Both paths must reject the same row.
+    EXPECT_FALSE(
+        program->TryEvaluateRow(Row({Value(left), Value(right)})).HasValue());
+    const int64_t lefts[] = {left, 5};
+    const int64_t rights[] = {right, 3};
+    const BytecodeColumnView left_view{.type = ValueType::kInt64,
+                                       .ints = lefts};
+    const BytecodeColumnView right_view{.type = ValueType::kInt64,
+                                        .ints = rights};
+    const std::vector<BytecodeColumnView> error_cols{left_view, right_view};
+    std::vector<int64_t> error_ints{11, 22};
+    std::vector<double> error_doubles{11.0, 22.0};
+    BytecodeColumnSink error_sink;
+    error_sink.ints = &error_ints;
+    error_sink.doubles = &error_doubles;
+    Status error_status;
+    EXPECT_EQ(program->TryEvaluateColumnarBatch(error_cols, nullptr, 2,
+                                                &error_sink, &error_status),
+              BytecodeProgram::FastEval::kError);
+    // The batch aborts and the sink is restored to its pre-batch state.
+    EXPECT_EQ(error_ints, (std::vector<int64_t>{11, 22}));
+    EXPECT_EQ(error_doubles, (std::vector<double>{11.0, 22.0}));
+  };
+  expect_columnar_error(BinaryOperation::kDivide, 7, 0);
+  expect_columnar_error(BinaryOperation::kModulo,
+                        std::numeric_limits<int64_t>::min(), -1);
 }
 
 // P1952: when a columnar batch demotes its uniform sink to the fallback

@@ -253,6 +253,59 @@ TEST(PipelineP3aTest, OocSortAndTopNSinkHandleSpilledExpressionKeys) {
   }
 }
 
+TEST(PipelineP3aTest, OocSortSinkSizesComputedKeysFromChunkNotEmptySchema) {
+  OpBudgetOverrideGuard guard(64ULL << 10);
+
+  // input_schema_ is empty while the source still emits two-column chunks:
+  // computed-key and Top-N seq column indices must be sized from the actual
+  // chunk width, not the declared (empty) schema.
+  Schema empty_schema("empty", {});
+  Schema out_schema("out", {Column("k", ValueType::kInt64),
+                            Column("pad", ValueType::kVarChar)});
+  std::vector<Row> input;
+  for (int64_t v : {9, 8, 7, 6, 5}) {
+    input.push_back(Row({Value(v), Value(std::string("p"))}));
+  }
+
+  // Constant computed key: every row ties on the primary key, so the
+  // appended seq column alone decides the bounded Top-N selection.
+  std::vector<OocSortSink::KeySpec> keys{OocSortSink::KeySpec{
+      .expression = ConstantValueExp(Value(int64_t{7})), .ascending = true}};
+  auto sort_sink =
+      std::make_shared<OocSortSink>(keys, empty_schema, /*limit=*/3,
+                                    /*offset=*/0, "TopN");
+
+  auto binding = std::make_shared<DeferredPipelineSource>("SortOut");
+  PipelineGraph g;
+  g.output_schema = out_schema;
+  g.stages.push_back(PipelineStage{
+      .id = 0,
+      .name = "SortStage",
+      .source = std::make_shared<RowVectorSource>(std::move(input)),
+      .operators = {},
+      .sink = sort_sink,
+      .output_binding = binding,
+  });
+  g.stages.push_back(PipelineStage{
+      .id = 1,
+      .name = "Root",
+      .source = binding,
+      .operators = {},
+      .sink = nullptr,
+      .output_binding = nullptr,
+  });
+
+  PipelineExecutor exec(nullptr, std::move(g));
+  const std::vector<Row> out = DrainExecutor(&exec);
+  ASSERT_EQ(exec.GetStatus().GetCode(), StatusCode::kSuccess);
+  ASSERT_EQ(out.size(), 3U);
+  // seq tiebreak keeps the first three arrival rows (k = 9,8,7); a sorter
+  // key mis-indexed at payload_cols_=0 would instead order by column 0.
+  EXPECT_EQ(out[0][0].AsInt64(), 9);
+  EXPECT_EQ(out[1][0].AsInt64(), 8);
+  EXPECT_EQ(out[2][0].AsInt64(), 7);
+}
+
 TEST(PipelineP3aTest, OocGroupAggSinkSpillsCombinableDistinctAndHandlesSkew) {
   OpBudgetOverrideGuard guard(64ULL << 10);
 
@@ -631,7 +684,8 @@ TEST(PipelineP3aTest, OocHashJoinCoversAllKindsSpillAndSkewFallback) {
 // RAII: points TINYLAMB_TEMP at a directory this test controls, so spill
 // segment files land (or must not land) where the test can count them
 // (T4131; mirrors executor/grouped_aggregate_test.cpp's ScopedTempDir).
-class ScopedSpillTempDir {  // NOLINT(cppcoreguidelines-special-member-functions)
+class
+    ScopedSpillTempDir {  // NOLINT(cppcoreguidelines-special-member-functions)
  public:
   explicit ScopedSpillTempDir(std::filesystem::path path)
       : path_(std::move(path)) {
@@ -884,6 +938,77 @@ TEST(PipelineP3aTest, GrantRequestFollowsTheConfiguredQueryBudget) {
     ~QueryMemGuard() { platform::UnsetEnv("TINYLAMB_QUERY_MEMORY_BYTES"); }
   } env_guard;
   EXPECT_EQ(PipelineGrantRequestBytes(est), size_t{16} << 20);
+}
+
+TEST(PipelineP3aTest, UnlimitedGrantOperatorBudgetUsesFullQueryPool) {
+  ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
+  struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
+    explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
+    ~ResetGuard() { budget->ResetForTest(0); }
+    ProcessMemoryBudget* budget;
+  } mb_guard(&mb);
+  OpBudgetOverrideGuard no_override(0);
+
+  mb.ResetForTest(size_t{1} << 30, 0, 0, false);
+  const size_t pool_max = mb.EffectivePoolMaxBytes(MemoryPoolKind::kQuery);
+  ASSERT_GT(pool_max, 0U);
+
+  // A default-constructed grant is Unlimited. The operator budget must not be
+  // silently reduced to a quarter of the pool (nor divided by consumers).
+  PipelineContext ctx(nullptr, QueryMemoryGrant{}, /*dop_in=*/4);
+  ASSERT_TRUE(ctx.grant.Unlimited());
+  EXPECT_EQ(ctx.OperatorBudgetBytes(), pool_max);
+  EXPECT_EQ(ctx.OperatorBudgetBytes(size_t{1} << 20),
+            std::max(pool_max, size_t{1} << 20));
+}
+
+TEST(PipelineP3aTest, ChunkVectorSourcePartialPathPreservesColumnMetadata) {
+  // A chunk wider than max_rows takes the row-wise Append path instead of the
+  // whole-chunk move; column metadata (collation, unsigned) must survive it
+  // the same way it does on the move path.
+  DataChunk chunk;
+  chunk.Append(Row({Value(std::string("Alpha")).WithCollation(2),
+                    Value(int64_t{7}).WithUnsigned()}),
+               RowPosition(1, 0));
+  chunk.Append(Row({Value(std::string("beta")).WithCollation(2),
+                    Value(int64_t{8}).WithUnsigned()}),
+               RowPosition(2, 0));
+  chunk.Append(Row({Value(std::string("Gamma")).WithCollation(2),
+                    Value(int64_t{9}).WithUnsigned()}),
+               RowPosition(3, 0));
+  ASSERT_EQ(chunk.ColumnAt(0).ColumnCollation(), Collation::kCaseInsensitive);
+  ASSERT_TRUE(chunk.ColumnAt(1).IsUnsigned());
+
+  ChunkVectorSource source(std::vector<DataChunk>{std::move(chunk)}, "Meta");
+  DataChunk out;
+  size_t total = 0;
+  for (;;) {
+    auto has = source.NextBatch(nullptr, &out, 2);
+    ASSERT_TRUE(has.HasValue()) << has.GetStatus();
+    if (!has.Value()) {
+      break;
+    }
+    ASSERT_FALSE(out.Empty());
+    EXPECT_EQ(out.ColumnAt(0).ColumnCollation(), Collation::kCaseInsensitive);
+    EXPECT_TRUE(out.ColumnAt(1).IsUnsigned());
+    for (size_t r = 0; r < out.Size(); ++r) {
+      EXPECT_EQ(out.ColumnAt(0).ValueAt(r).Collation(),
+                static_cast<uint8_t>(Collation::kCaseInsensitive));
+    }
+    total += out.Size();
+  }
+  EXPECT_EQ(total, 3U);
+}
+
+TEST(PipelineP3aTest, SpilledHashProbeRejectsMissingContext) {
+  auto join = std::make_shared<OocHashJoinContext>(OocHashJoinSpec{});
+  join->spilled = true;
+  OocAdaptiveHashProbeSource source(join, nullptr, {});
+  EXPECT_EQ(source.Open(nullptr).GetCode(), StatusCode::kInvalidArgument);
+  DataChunk out;
+  const auto next = source.NextBatch(nullptr, &out, 1);
+  ASSERT_FALSE(next.HasValue());
+  EXPECT_EQ(next.GetStatus().GetCode(), StatusCode::kInvalidArgument);
 }
 
 }  // namespace

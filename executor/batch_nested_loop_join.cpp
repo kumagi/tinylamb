@@ -50,7 +50,8 @@ bool BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
   // emit the outer row instead of erroring).  The error is recorded in the
   // sticky predicate_error_ and re-surfaced by Next().
   predicate_scratch_.values_.clear();
-  predicate_scratch_.values_.reserve(left.values_.size() + right.values_.size());
+  predicate_scratch_.values_.reserve(left.values_.size() +
+                                     right.values_.size());
   predicate_scratch_.values_.insert(predicate_scratch_.values_.end(),
                                     left.values_.begin(), left.values_.end());
   predicate_scratch_.values_.insert(predicate_scratch_.values_.end(),
@@ -94,7 +95,7 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
       right_rows.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }
   }
-  if (right_->GetStatus() != Status::kSuccess) {
+  if (right_ != nullptr && right_->GetStatus() != Status::kSuccess) {
     predicate_error_ = right_->GetStatus();
     return;
   }
@@ -122,7 +123,7 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
                               left_batch.PositionAt(left_batch_idx));
       ++left_batch_idx;
     }
-    if (left_->GetStatus() != Status::kSuccess) {
+    if (left_ != nullptr && left_->GetStatus() != Status::kSuccess) {
       predicate_error_ = left_->GetStatus();
       return;
     }
@@ -147,6 +148,12 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
                                  left_block[i].second);
             total_bytes += EstimateRowBytes(output_.back().first);
           }
+        }
+        if (!predicate_error_.ok()) {
+          // Stop as soon as a predicate fails: the sticky error will fail the
+          // whole operator in NextBatch(), so evaluating the remaining pairs
+          // only pays for useless Row concatenation/copies.
+          return;
         }
       }
     }

@@ -59,14 +59,27 @@ class EvaluationContext {
     std::vector<Value> values;
     std::string element_type_hint;
   };
+  // Declared element type of `statement`'s first output column, when the
+  // context can supply one.  RunSubquery alone returns only values, so the
+  // generic context has no schema to consult; fake contexts can override this
+  // hook to exercise ARRAY(SELECT ...) typing (notably the all-NULL case,
+  // where the declared type cannot be recovered from the values).  Production
+  // contexts override RunSubqueryDetailed and fill the hint from the result
+  // schema instead.
+  [[nodiscard]] virtual std::string SubqueryElementTypeHint(
+      const SelectStatement& /*statement*/) {
+    return {};
+  }
+
   [[nodiscard]] virtual StatusOr<SubqueryResult> RunSubqueryDetailed(
       const SelectStatement& statement, const Row* outer_row) {
     StatusOr<std::vector<Value>> values = RunSubquery(statement, outer_row);
     if (!values.HasValue()) {
       return values.GetStatus();
     }
-    return SubqueryResult{.values = values.MoveValue(),
-                          .element_type_hint = {}};
+    return SubqueryResult{
+        .values = values.MoveValue(),
+        .element_type_hint = SubqueryElementTypeHint(statement)};
   }
 
   // Aggregation results prepared for the group under evaluation, or nullptr

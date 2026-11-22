@@ -827,7 +827,7 @@ theorem eq_transitivity_and_redundancy_sound {α : Type} [DecidableEq α]
           simp [sqlEq, SqlBool.inWhere]
         · simp [sqlEq, SqlBool.inWhere, hak]
 
-/-- 🚨 **実在バグ証明 H6 (`in_list_to_semi_join` の `;` 区切り Fingerprint 衝突バグ)**:
+/-- 🚨 **実在バグ証明 H5 (`in_list_to_semi_join` の `;` 区切り Fingerprint 衝突バグ)**:
     旧 C++ は定数文字列をエスケープ・長さプレフィックス無しで `';'` 連結していたため、
     `x = 'a;b' OR x = 'c'` と `x = 'a' OR x = 'b;c'` が全く同じ Memo グループタグに衝突していた！ -/
 def cppBuggyInListFingerprint (vals : List String) : String :=

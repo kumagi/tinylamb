@@ -112,13 +112,17 @@ StatusOr<Value> ColumnValue::TryEvaluate(const Row* left,
                                          const Schema& left_schema,
                                          const Row* right,
                                          const Schema& right_schema) const {
-  const int left_offset = ResolveOffset(left_schema, col_name_);
-  if (left != nullptr && left_offset >= 0) {
-    return (*left)[static_cast<size_t>(left_offset)];
+  if (left != nullptr) {
+    const int left_offset = ResolveOffset(left_schema, col_name_);
+    if (left_offset >= 0) {
+      return (*left)[static_cast<size_t>(left_offset)];
+    }
   }
-  const int right_offset = ResolveOffset(right_schema, col_name_);
-  if (right != nullptr && right_offset >= 0) {
-    return (*right)[static_cast<size_t>(right_offset)];
+  if (right != nullptr) {
+    const int right_offset = ResolveOffset(right_schema, col_name_);
+    if (right_offset >= 0) {
+      return (*right)[static_cast<size_t>(right_offset)];
+    }
   }
   return StatusError(StatusCode::kInvalidArgument,
                      "column " + col_name_.ToString() + " not found");

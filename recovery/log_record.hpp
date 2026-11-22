@@ -51,8 +51,8 @@ enum class LogType : uint8_t {
 
 // T2115: symbolic name for dumps / DEBUG logs.  A raw uint8 left every
 // `type:13` in a WAL trace dependent on the enum ordering above; an
-// out-of-range value (corrupt record) renders "kInvalid(<n>)" instead of
-// silently aliasing some name.
+// out-of-range value (corrupt record) renders "kInvalid" instead of
+// silently aliasing some name (the numeric type value is not included).
 [[nodiscard]] const char* LogTypeName(LogType type);
 
 // Logical LSM & block mutation record for WAL persistence and fuzzy recovery.
@@ -117,7 +117,9 @@ struct LogRecord {
   bool operator==(const LogRecord& rhs) const = default;
   friend std::ostream& operator<<(std::ostream& o, const LogRecord& r);
 
-  lsn_t record_lsn{0};
+  // In-memory position. The first physical WAL record can be at offset 0.
+  static constexpr lsn_t kUnknownRecordLsn = std::numeric_limits<lsn_t>::max();
+  lsn_t record_lsn{kUnknownRecordLsn};
   lsn_t prev_lsn{0};
   txn_id_t owner{0};
   LogType type{LogType::kUnknown};

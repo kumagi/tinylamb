@@ -6,7 +6,8 @@
 #ifndef TINYLAMB_PLAN_CACHE_HPP
 #define TINYLAMB_PLAN_CACHE_HPP
 
-// Phase 2-1: compiled-plan cache ("prepared plans"), the compiled-plan cache design notes.
+// Phase 2-1: compiled-plan cache ("prepared plans"), the compiled-plan cache
+// design notes.
 //
 // Key:    SQL fingerprint + database schema/statistics epoch.
 // Value:  a CompiledPlan, one of
@@ -59,6 +60,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/string_util.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -177,6 +179,11 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
       for (const Expression& arg : call.Args()) {
         args.push_back(CloneWithPreparedValues(arg, values));
       }
+      // FunctionCallExpression is already fully desugared by the frontend:
+      // named arguments (`name => value`) are resolved to positional order
+      // and `SAFE.<fn>` becomes nulliferror(<fn>) at call-build time. It
+      // carries only the folded name and args, so rebuilding from those two
+      // fields is lossless -- there is no separate metadata to preserve.
       return FunctionCallExp(call.FuncName(), std::move(args));
     }
     case TypeTag::kArrayExp: {
@@ -190,9 +197,8 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kCastExp: {
       const auto& cast = expression->AsCastExpression();
-      return CastExpressionExp(
-          CloneWithPreparedValues(cast.Child(), values), cast.TargetTypeName(),
-          cast.ReturnNullOnError());
+      return CastExpressionExp(CloneWithPreparedValues(cast.Child(), values),
+                               cast.TargetTypeName(), cast.ReturnNullOnError());
     }
     default:
       return expression;
@@ -200,8 +206,7 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
 }
 
 // True when evaluating `expression` per row could yield different results
-// between executions of the same cached artifact (e.g. CURRENT_TIMESTAMP;
-// function names arrive lowercased from the frontend).
+// between executions of the same cached artifact (e.g. CURRENT_TIMESTAMP).
 inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
     const Expression& expression) {
   if (!expression) {
@@ -210,7 +215,10 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
   switch (expression->Type()) {
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
-      if (call.FuncName() == "current_timestamp") {
+      // The frontend lowercases function names, but hand-built expressions
+      // (and internal nodes) need not: compare case-insensitively so a
+      // non-deterministic call can never slip into the compiled-plan cache.
+      if (IdentifierEquals(call.FuncName(), "current_timestamp")) {
         return true;
       }
       return std::ranges::any_of(call.Args(), [](const Expression& arg) {

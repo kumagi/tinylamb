@@ -29,6 +29,7 @@
 #include "common/query_parallelism.hpp"
 #include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
+#include "executor/detail/charged_vector.hpp"
 #include "executor/detail/columnar_tlcs_fast_path.hpp"
 #include "executor/detail/columnar_tlcs_internal.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -332,7 +333,7 @@ class SlabChunkReader {
 };
 
 // Shared fast single-column ORDER BY classification + final Relation emission
-// helper for materialized materialized row survivors.
+// helper for materialized row survivors.
 enum class PartOrderKind : uint8_t { kNone, kInt, kDouble };
 
 PartOrderKind ClassifyPartOrderKind(
@@ -974,10 +975,14 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
       std::vector<WorkerShardWriter> writers(num_shards);
       for (size_t s = 0; s < num_shards; ++s) {
         shard_worker_charges[s][tid] = std::make_unique<QueryMemoryCharge>();
-        writers[s].Init(&shard_worker_chunks[s][tid],
-                        shard_worker_charges[s][tid].get(), init_chunk_bytes,
-                        spill_store, &shard_worker_segments[s][tid],
-                        writer_chunk_cap);
+        Status init_status = writers[s].Init(
+            &shard_worker_chunks[s][tid], shard_worker_charges[s][tid].get(),
+            init_chunk_bytes, spill_store, &shard_worker_segments[s][tid],
+            writer_chunk_cap);
+        if (!init_status.ok()) {
+          worker_status[tid] = std::move(init_status);
+          return;
+        }
       }
       WorkerGroupTable& wt = *worker_tables[tid];
       QueryMemoryCharge l1_charge;
@@ -1354,7 +1359,13 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
         RETURN_IF_FAIL(st);
       }
 
-      std::vector<uint64_t> global_distinct(total_groups, 0);
+      QueryMemoryCharge distinct_charge;
+      std::vector<uint64_t> global_distinct;
+      if (!ReserveChargedVector(global_distinct, distinct_charge,
+                                total_groups)) {
+        return std::optional<Relation>{};
+      }
+      global_distinct.resize(total_groups, 0);
       for (size_t tid = 0; tid < workers; ++tid) {
         for (const auto& [g, cnt] : thread_counts[tid]) {
           global_distinct[g] += cnt;
@@ -1514,10 +1525,14 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
     std::vector<WorkerShardWriter> writers(num_shards);
     for (size_t s = 0; s < num_shards; ++s) {
       shard_worker_charges[s][tid] = std::make_unique<QueryMemoryCharge>();
-      writers[s].Init(&shard_worker_chunks[s][tid],
-                      shard_worker_charges[s][tid].get(), init_chunk_bytes,
-                      spill_store, &shard_worker_segments[s][tid],
-                      writer_chunk_cap);
+      Status init_status = writers[s].Init(
+          &shard_worker_chunks[s][tid], shard_worker_charges[s][tid].get(),
+          init_chunk_bytes, spill_store, &shard_worker_segments[s][tid],
+          writer_chunk_cap);
+      if (!init_status.ok()) {
+        p1_status[tid] = std::move(init_status);
+        return;
+      }
     }
 
     BlockDecodeScratch dec_scratch;
@@ -1703,7 +1718,9 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
       uint32_t gid;
       int64_t val;
     };
+    QueryMemoryCharge pairs_charge;
     std::vector<TempPair> pairs;
+    QueryMemoryCharge counts_charge;
     std::vector<uint64_t> distinct_counts;
 
     while (true) {
@@ -1729,7 +1746,11 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
           return;
         }
         pairs.clear();
-        pairs.reserve(shard_bytes / 24);
+        if (!ReserveChargedVector(pairs, pairs_charge, shard_bytes / 24)) {
+          p2_status[tid] = StatusError(StatusCode::kMemoryLimitExceeded,
+                                       "distinct pairs exceeded budget");
+          return;
+        }
         // Records of one group arrive back to back when the scan is
         // clustered on the group key (lineitem by l_orderkey: ~4 per order,
         // all hashed to this shard in scan order), so the previous record's
@@ -1785,9 +1806,8 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
               uint32_t gid = 0;
               if (last_gid != std::numeric_limits<uint32_t>::max() &&
                   kh == last_kh &&
-                  GroupKeySliceHasher::Equals(wt.KeysAt(last_gid),
-                                              probe_keys.data(),
-                                              km.phys_specs)) {
+                  GroupKeySliceHasher::Equals(
+                      wt.KeysAt(last_gid), probe_keys.data(), km.phys_specs)) {
                 gid = last_gid;
               } else {
                 auto gid_or =
@@ -1802,6 +1822,17 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
                 last_kh = kh;
               }
               if (has_dist) {
+                if (pairs.size() == pairs.capacity()) {
+                  const size_t next =
+                      pairs.capacity() == 0 ? 1 : pairs.capacity() * 2;
+                  if (next <= pairs.capacity() ||
+                      !ReserveChargedVector(pairs, pairs_charge, next)) {
+                    p2_status[tid] =
+                        StatusError(StatusCode::kMemoryLimitExceeded,
+                                    "distinct pairs exceeded budget");
+                    return;
+                  }
+                }
                 pairs.push_back({.gid = gid, .val = dv});
               }
 
@@ -1909,6 +1940,11 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
 
         const size_t ng = wt.NumGroups();
         total_groups_out.fetch_add(ng, std::memory_order_relaxed);
+        if (!ReserveChargedVector(distinct_counts, counts_charge, ng)) {
+          p2_status[tid] = StatusError(StatusCode::kMemoryLimitExceeded,
+                                       "distinct counts exceeded budget");
+          return;
+        }
         distinct_counts.assign(ng, 0);
         if (!pairs.empty()) {
           Status prst =
@@ -2286,10 +2322,14 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
     std::vector<WorkerShardWriter> writers(num_shards);
     for (size_t s = 0; s < num_shards; ++s) {
       shard_worker_charges[s][tid] = std::make_unique<QueryMemoryCharge>();
-      writers[s].Init(&shard_worker_chunks[s][tid],
-                      shard_worker_charges[s][tid].get(), init_chunk_bytes,
-                      spill_store, &shard_worker_segments[s][tid],
-                      writer_chunk_cap);
+      Status init_status = writers[s].Init(
+          &shard_worker_chunks[s][tid], shard_worker_charges[s][tid].get(),
+          init_chunk_bytes, spill_store, &shard_worker_segments[s][tid],
+          writer_chunk_cap);
+      if (!init_status.ok()) {
+        p1_status[tid] = std::move(init_status);
+        return;
+      }
     }
 
     // Compact self-tuning L1 combiner for single-key COUNT(*) (`Q16, Q36`)
@@ -3329,10 +3369,14 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
         continue;
       }
       shard_worker_charges[s][tid] = std::make_unique<QueryMemoryCharge>();
-      writers[s].Init(&shard_worker_chunks[s][tid],
-                      shard_worker_charges[s][tid].get(), init_chunk_bytes,
-                      spill_store, &shard_worker_segments[s][tid],
-                      writer_chunk_cap);
+      Status init_status = writers[s].Init(
+          &shard_worker_chunks[s][tid], shard_worker_charges[s][tid].get(),
+          init_chunk_bytes, spill_store, &shard_worker_segments[s][tid],
+          writer_chunk_cap);
+      if (!init_status.ok()) {
+        p1_status[tid] = std::move(init_status);
+        return;
+      }
     }
 
     // Self-tuning L2-resident 2048-slot L1 combiner with 128 KB byte ring for
@@ -4691,9 +4735,9 @@ StatusOr<std::optional<Relation>> TryRunKeyFiberUnorderedLimitAggregate(
   for (size_t w = 0; w < workers; ++w) {
     WorkerGroupTable& src = *w_tables[w];
     for (size_t g = 0; g < src.NumGroups(); ++g) {
-      Status mst =
-          merged.MergeFromGroup(src.KeysAt(g), src.HashAt(g), src.AggsAt(g),
-                                /*borrow_strings=*/true);
+      Status mst = merged.MergeFromGroup(src.KeysAt(g), src.HashAt(g),
+                                         {src.AggsAt(g), req.agg_specs.size()},
+                                         /*borrow_strings=*/true);
       if (mst == StatusCode::kMemoryLimitExceeded) {
         return std::optional<Relation>{};
       }
@@ -5042,7 +5086,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
               for (uint32_t row : rows) {
                 if constexpr (Nullable) {
                   if (chunk.IsNull(row)) {
-                    RETURN_IF_FAIL(emit_row(&null_cell, null_hash, static_cast<uint32_t>(row)));
+                    RETURN_IF_FAIL(emit_row(&null_cell, null_hash,
+                                            static_cast<uint32_t>(row)));
                     continue;
                   }
                 }
@@ -5090,7 +5135,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
               for (uint32_t row : rows) {
                 if constexpr (Nullable) {
                   if (chunk.IsNull(row)) {
-                    RETURN_IF_FAIL(emit_row(&null_cell, null_hash, static_cast<uint32_t>(row)));
+                    RETURN_IF_FAIL(emit_row(&null_cell, null_hash,
+                                            static_cast<uint32_t>(row)));
                     continue;
                   }
                 }

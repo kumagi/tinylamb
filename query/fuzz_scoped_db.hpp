@@ -103,10 +103,71 @@ class ScopedDb {
 
   void RemoveDbFiles() {
     std::error_code ec;
-    for (const char* suffix : {".db", ".log", ".log.meta", ".log.meta.tmp",
-                              ".last_checkpoint"}) {
+    // Same artifact family as Database::DeleteAll() /
+    // RemoveCreatedDatabaseFiles(): a failed Create/CrashAndReopen leaves db_
+    // null while the page file, WAL segments and LSM/TLCS companions may
+    // already be on disk. Sweeping only the base suffixes strands them
+    // (multi-MiB WAL segments per iteration) and defeats this class' disk-quota
+    // purpose.
+    for (const char* suffix :
+         {".db", ".tmp", ".db.tmp", ".db.ckpt", ".db.ckpt.tmp", ".ckpt",
+          ".ckpt.tmp", ".log", ".log.meta", ".log.meta.tmp", ".last_checkpoint",
+          ".last_checkpoint.tmp"}) {
       std::filesystem::remove(name_ + suffix, ec);
     }
+
+    // WAL segment series `<name>.log.<index>` (RemoveWalSegmentFiles in
+    // database.cpp): contiguous digits from 0, recycled by trimming a prefix.
+    const std::filesystem::path wal_base(name_ + ".log");
+    const std::filesystem::path wal_dir = wal_base.has_parent_path()
+                                              ? wal_base.parent_path()
+                                              : std::filesystem::path(".");
+    const std::string wal_prefix = wal_base.filename().string() + ".";
+    std::error_code iter_ec;
+    for (std::filesystem::directory_iterator it(wal_dir, iter_ec), end;
+         !iter_ec && it != end; it.increment(iter_ec)) {
+      const std::string fname = it->path().filename().string();
+      if (!fname.starts_with(wal_prefix)) {
+        continue;
+      }
+      const std::string digits = fname.substr(wal_prefix.size());
+      bool all_digits = !digits.empty();
+      for (char c : digits) {
+        if (c < '0' || c > '9') {
+          all_digits = false;
+          break;
+        }
+      }
+      if (all_digits) {
+        std::filesystem::remove(it->path(), ec);
+      }
+    }
+
+    // LSM/block/TLCS companions (RemoveCompanionStorageFiles in database.cpp)
+    // for both the page file (<name>.db) and the bare base name.
+    const auto remove_companions = [](const std::string& file) {
+      const std::filesystem::path p(file);
+      const std::filesystem::path parent = p.parent_path().empty()
+                                               ? std::filesystem::path(".")
+                                               : p.parent_path();
+      const std::string base = p.filename().string();
+      std::error_code remove_ec;
+      std::filesystem::remove(file + ".blocks", remove_ec);
+      std::filesystem::remove(file + ".lsm", remove_ec);
+      std::error_code companion_iter_ec;
+      for (std::filesystem::directory_iterator it(parent, companion_iter_ec),
+           end;
+           !companion_iter_ec && it != end; it.increment(companion_iter_ec)) {
+        const std::string fname = it->path().filename().string();
+        if (fname.starts_with(base + ".blocks.") ||
+            fname.starts_with(base + ".lsm.") ||
+            fname.starts_with(base + ".tlcs")) {
+          std::filesystem::remove(it->path(), remove_ec);
+        }
+      }
+    };
+    remove_companions(name_ + ".db");
+    remove_companions(name_);
   }
 
   void Reset() { db_.reset(); }
@@ -115,15 +176,18 @@ class ScopedDb {
     if (db_ != nullptr) {
       db_->DeleteAll();
       db_.reset();
-      return;
-    }
-    StatusOr<std::unique_ptr<Database>> created = Database::Create(name_);
-    if (created.HasValue()) {
-      created.Value()->DeleteAll();
+    } else {
+      StatusOr<std::unique_ptr<Database>> created = Database::Create(name_);
+      if (created.HasValue()) {
+        created.Value()->DeleteAll();
+      }
     }
     // A partially failed Create can strand files even when the retry above
-    // returns an error; always sweep by name so the next iteration starts
-    // clean (same contract as the destructor).
+    // returns an error, and Database::DeleteAll does not manage every artifact
+    // family (.log.meta.tmp, WAL segments, ...). Always sweep by name so the
+    // next iteration starts clean (same contract as the destructor): an early
+    // return in the db_ != nullptr path used to skip this and strand files
+    // until a long sweep exhausted the disk.
     RemoveDbFiles();
   }
 
@@ -218,13 +282,28 @@ inline bool ApplyIndexSpec(Database& db, TransactionContext& ctx,
     return false;
   }
   const size_t on = ddl.find(" ON ");
-  const size_t open =
-      on == std::string_view::npos ? std::string_view::npos : ddl.find('(', on);
-  if (on == std::string_view::npos || open == std::string_view::npos) {
+  if (on == std::string_view::npos) {
+    return false;
+  }
+  // Search for the column-list '(' strictly after the " ON " separator so a
+  // malformed spec (e.g. "i ON(" with no table name) cannot make
+  // open - table_start underflow into a huge substr length.
+  const size_t table_start = on + 4;
+  const size_t open = ddl.find('(', table_start);
+  if (open == std::string_view::npos) {
     return false;
   }
   const std::string idx_name(ddl.substr(0, on));
-  const std::string table(ddl.substr(on + 4, open - (on + 4)));
+  const std::string_view table_raw =
+      ddl.substr(table_start, open - table_start);
+  // "CREATE INDEX i ON  t(a)" can carry extra whitespace between ON and the
+  // table name; trim it or GetTable sees " t" and silently loses the index
+  // coverage seed.
+  const size_t tstart = table_raw.find_first_not_of(" \t\r\n");
+  const size_t tend = table_raw.find_last_not_of(" \t\r\n");
+  const std::string table(tstart == std::string_view::npos
+                              ? std::string_view()
+                              : table_raw.substr(tstart, tend - tstart + 1));
   auto col_names = [](std::string_view list) {
     std::vector<std::string> cols;
     size_t p = 0;
@@ -314,6 +393,10 @@ inline std::string FormatFuzzFailureSummary(std::string_view prefix,
       prev_space = false;
     }
     if (out.size() >= 600) {
+      // Enforce the documented 600-character cap *including* the ellipsis.
+      // Checking after a full append could overshoot by the appended chars
+      // (up to 3 for " | ") plus the ellipsis itself.
+      out.resize(597);
       out += "...";
       break;
     }
@@ -328,6 +411,10 @@ inline std::string FormatFuzzFailureSummary(std::string_view prefix,
   return out;
 }
 
+// A verify string containing this marker means the serialized trace replayed
+// clean; such findings are flaky and must never be persisted or abort a worker.
+inline constexpr std::string_view kFlakyVerifyMarker = "flaky";
+
 // Persists a verified fuzz finding (.test + .report.txt) to the working
 // directory and optionally to `TINYLAMB_FUZZ_FINDINGS_DIR`.  When
 // `TINYLAMB_FUZZ_CONTINUE=1` is set, returns after persisting so continuous
@@ -339,9 +426,9 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
   // A finding whose serialized trace replays clean is most likely flaky;
   // do not persist it as a regression (it would be a permanently green test)
   // and do not abort the worker over a non-reproducing failure.
-  if (verify.find("flaky") != std::string_view::npos) {
-    std::cerr << "[" << tag << "] skipping flaky finding (replay holds): "
-              << filename << "\n"
+  if (verify.find(kFlakyVerifyMarker) != std::string_view::npos) {
+    std::cerr << "[" << tag
+              << "] skipping flaky finding (replay holds): " << filename << "\n"
               << std::flush;
     return;
   }

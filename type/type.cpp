@@ -65,6 +65,36 @@ std::string Type::ToString() const {
       return "DATE";
     case TypeTag::kArray:
       return "ARRAY";
+    // TypeTag also carries expression node kinds (see type.hpp). Render a
+    // valid node kind by name instead of lumping it into "INVALID".
+    case TypeTag::kBinaryExp:
+      return "BINARY_EXP";
+    case TypeTag::kColumnValue:
+      return "COLUMN_VALUE";
+    case TypeTag::kConstantValue:
+      return "CONSTANT_VALUE";
+    case TypeTag::kUnaryExp:
+      return "UNARY_EXP";
+    case TypeTag::kAggregateExp:
+      return "AGGREGATE_EXP";
+    case TypeTag::kCaseExp:
+      return "CASE_EXP";
+    case TypeTag::kInExp:
+      return "IN_EXP";
+    case TypeTag::kFunctionCallExp:
+      return "FUNCTION_CALL_EXP";
+    case TypeTag::kQueryExp:
+      return "QUERY_EXP";
+    case TypeTag::kIntervalExp:
+      return "INTERVAL_EXP";
+    case TypeTag::kArrayExp:
+      return "ARRAY_EXP";
+    case TypeTag::kCastExp:
+      return "CAST_EXP";
+    case TypeTag::kWindowFunctionExp:
+      return "WINDOW_FUNCTION_EXP";
+    case TypeTag::kLambdaExp:
+      return "LAMBDA_EXP";
     default:
       return "INVALID";
   }

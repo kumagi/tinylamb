@@ -128,7 +128,12 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
       if (sort_error_ == Status::kSuccess) {
         sort_error_ = va_or.HasValue() ? vb_or.GetStatus() : va_or.GetStatus();
       }
-      return false;
+      // Record the first error but keep evaluating the remaining keys: an
+      // error in a later key must not be hidden by an earlier key's failure,
+      // matching the AST's all-keys evaluation contract. unequal stays set so
+      // an errored key can never make the two rows look equal.
+      equal = false;
+      continue;
     }
     if (!EqualUnderCollation(va_or.Value(), vb_or.Value())) {
       equal = false;

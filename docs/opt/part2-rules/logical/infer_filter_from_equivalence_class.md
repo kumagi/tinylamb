@@ -30,21 +30,21 @@ graph TD
 1. 式が `kSelection` であり、子が 1 個、かつ有効な述語を保持していること。
 2. 入力 Group の `logical_properties.equivalence_classes` が空でないこと。
 3. 選択述語の連言要素のうち、二項比較演算子（`kEquals`, `kNotEquals`, `kGreaterThan`, `kGreaterThanEquals`, `kLessThan`, `kLessThanEquals`）かつ「列と定数」の組み合わせである項が存在すること。
-4. その列を含む等価クラス内の他のメンバ列（自分自身を除く）に対し、同一の演算子と定数を用いた推論述語を生成した結果、既存の連言や既に推論済みの式と重複しないこと（`ToString()` による一意性検証）。
+4. その列を含む等価クラス内の他のメンバ列（自分自身を除く）に対し、同一の演算子と定数を用いた推論述語を生成した結果、既存の連言や既に推論済みの式と重複しないこと（`ToString()` による一意性検証）。等価クラスは個別の結合述語から記録されたものを union-find で統合するため、`a = b, b = c` のような連鎖を跨ぐメンバ（同じ根を持つ列）も対象になります。
 5. 1 つ以上の新たな推論述語が生成されたこと（`!new_inferred.empty()`）。
 
 ```cpp
-              for (const auto& member : ec) {
-                if (member == col_str || ColumnName(member) == col_name) {
+              const size_t root = find_root(found->second);
+              for (const auto& [member, node] : member_node) {
+                if (member == col_str || find_root(node) != root) {
                   continue;
                 }
                 Expression inferred_bin =
-                    col_on_left ? BinaryExpressionExp(
-                                      ColumnValueExp(ColumnName(member)), op,
-                                      *const_expr)
-                                : BinaryExpressionExp(
-                                      *const_expr, op,
-                                      ColumnValueExp(ColumnName(member)));
+                    col_on_left
+                        ? BinaryExpressionExp(ColumnValueExp(ColumnName(member)),
+                                              op, *const_expr)
+                        : BinaryExpressionExp(*const_expr, op,
+                                              ColumnValueExp(ColumnName(member)));
 ```
 
 ## 意味論的根拠と代数的一致・三値論理
@@ -61,7 +61,7 @@ $$(T_1.c = T_2.d) \land (T_1.c\ \theta\ k) \implies (T_2.d\ \theta\ k)$$
 
 ## 実装の詳細
 
-入力 Group の論理プロパティ（`LogicalProperties`）に保持されている等価クラス集合を参照します。等価クラスは、結合演算子の述語に含まれる「列 = 列」等式からボトムアップに収集・伝播されたものです。
+入力 Group の論理プロパティ（`LogicalProperties`）に保持されている等価クラス集合を参照します。等価クラスは、個々の結合演算子の述語に含まれる「列 = 列」等式からボトムアップに収集・伝播されたもので、実装ではさらに union-find で統合されるため `a = b, b = c` のような連鎖を跨ぐ推論が可能です。
 
 推論述語を元の連言リストに結合し、新しい `kSelection` 式を親 Group へ追加します。
 

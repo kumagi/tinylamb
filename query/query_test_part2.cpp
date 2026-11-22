@@ -1534,6 +1534,53 @@ TEST_F(QueryTest, SqlEngineNonEquiAndAggregateLateralStayCorrect) {
   ctx.txn_.Abort();
 }
 
+// An UNCORRELATED LATERAL query yields the same element set for every
+// prefix row, so RIGHT/FULL unmatched element rows must be emitted once
+// globally — not once per prefix row (and not at all for an empty prefix).
+TEST_F(QueryTest, SqlEngineUncorrelatedLateralRightFullJoinEmitsOnce) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (id INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1), (2);");
+
+  std::vector<Row> right_rows =
+      RunSql(ctx, *db_,
+             "SELECT * FROM t RIGHT JOIN LATERAL "
+             "(SELECT 10 AS x UNION ALL SELECT 20 AS x) d ON t.id = d.x - 9 "
+             "ORDER BY 1 NULLS FIRST, 2 NULLS FIRST;");
+  ASSERT_EQ(right_rows.size(), 2U);
+  EXPECT_EQ(right_rows[0], Row({Value(), Value(20)}));
+  EXPECT_EQ(right_rows[1], Row({Value(1), Value(10)}));
+
+  std::vector<Row> full_rows =
+      RunSql(ctx, *db_,
+             "SELECT * FROM t FULL JOIN LATERAL "
+             "(SELECT 10 AS x UNION ALL SELECT 99 AS x) d ON t.id = d.x - 9 "
+             "ORDER BY 1 NULLS FIRST, 2 NULLS FIRST;");
+  ASSERT_EQ(full_rows.size(), 3U);
+  EXPECT_EQ(full_rows[0], Row({Value(), Value(99)}));
+  EXPECT_EQ(full_rows[1], Row({Value(1), Value(10)}));
+  EXPECT_EQ(full_rows[2], Row({Value(2), Value()}));
+
+  // Empty prefix still preserves the right side.
+  std::vector<Row> empty_rows =
+      RunSql(ctx, *db_,
+             "SELECT * FROM (SELECT 1 AS id WHERE false) e RIGHT JOIN "
+             "LATERAL (SELECT 10 AS x) d ON e.id = d.x;");
+  ASSERT_EQ(empty_rows.size(), 1U);
+  EXPECT_EQ(empty_rows[0], Row({Value(), Value(10)}));
+
+  // A CORRELATED lateral keeps per-expansion unmatched emission.
+  std::vector<Row> corr_rows =
+      RunSql(ctx, *db_,
+             "SELECT * FROM t RIGHT JOIN LATERAL (SELECT t.id * 10 AS x) d "
+             "ON t.id = d.x ORDER BY 2;");
+  ASSERT_EQ(corr_rows.size(), 2U);
+  EXPECT_EQ(corr_rows[0], Row({Value(), Value(10)}));
+  EXPECT_EQ(corr_rows[1], Row({Value(), Value(20)}));
+
+  ctx.txn_.Abort();
+}
+
 // M4 materialization boundary: an over-budget CTE keeps the map-scoped
 // rescan path (CteScan) with identical rows.
 TEST_F(QueryTest, SqlEngineOverBudgetCteKeepsRescanPath) {

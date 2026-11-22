@@ -27,7 +27,14 @@ def main() -> None:
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     stdout, _ = proc.communicate()
     if proc.returncode not in (0, 1):
-        print(f"Error: {binary} exited with {proc.returncode}", file=sys.stderr)
+        if proc.returncode < 0:
+            import signal
+
+            sig = -proc.returncode
+            name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else str(sig)
+            print(f"Error: {binary} terminated by signal {name}", file=sys.stderr)
+        else:
+            print(f"Error: {binary} exited with {proc.returncode}", file=sys.stderr)
         print(stdout, file=sys.stderr)
         sys.exit(1)
 
@@ -48,9 +55,13 @@ def main() -> None:
             continue
         m_fail = re.search(r'\[  FAILED  \] GoogleSqlCompliance/GoogleSqlComplianceFileTest\.RunsFile/([^,\s]+)', line)
         if m_fail:
-            # GTest repeats failures in the final summary.
-            if current_test is not None:
-                failed.append(m_fail.group(1))
+            # GTest prints FAILED both inline and in the final summary; the
+            # summary line has no preceding RUN (current_test is None) and
+            # must still be counted, or a crash before all RUN lines hides the
+            # failure and the conformance run looks like 0 tests / success.
+            name = m_fail.group(1)
+            if name not in failed:
+                failed.append(name)
             current_test = None
             continue
         if line.startswith("[  SKIPPED ]"):
@@ -65,7 +76,7 @@ def main() -> None:
     print("=" * 60)
     print(f"Total Test Files Ran: {total}")
     print(f"Passed:               {len(passed)} ({len(passed) / total * 100:.2f}%)" if total else "No tests ran")
-    print(f"Failed:               {len(failed)} ({len(failed) / total * 100:.2f}%)" if total else "")
+    print(f"Failed:               {len(failed)} ({len(failed) / total * 100:.2f}%)" if total else "Failed:               0 (0.00%)")
     print("=" * 60)
 
     if passed:

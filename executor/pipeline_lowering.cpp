@@ -115,6 +115,9 @@ void AttachJoinDynamicFilter(const ProductPlan& prod,
     return;
   }
 
+  // The size() != 1 guard above is what makes this index safe: probe_cols is
+  // exactly one element here, including when a dynamically built Join node
+  // passes an empty list (that case returns before reaching this line).
   const slot_t pslot = probe_cols[0];
   const LoweredStream::ScanOrigin& origin = *probe_stream.scan_origin;
   if (pslot >= origin.output_to_leaf_col.size()) {
@@ -312,7 +315,7 @@ class LazyAdaptedPipelineSource final : public PipelineSource {
   StatusOr<bool> NextBatch(PipelineContext* /*ctx*/, DataChunk* out,
                            size_t max_rows) override {
     if (!exec_) {
-      // Open() must run first; an uninitialised source is not an empty one.
+      // Open() must run first; an uninitialized source is not an empty one.
       return StatusError(StatusCode::kRuntimeError,
                          "LazyAdaptedPipelineSource read before Open");
     }
@@ -845,7 +848,8 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
         !ProcessMemoryBudget::Global().AlwaysSpillEnabled() &&
         ProcessMemoryBudget::Global().OpMemoryOverrideBytes() == 0 &&
         std::ranges::all_of(agg->Aggregates(), [](const NamedExpression& ne) {
-          if (!ne.expression || ne.expression->Type() != TypeTag::kAggregateExp) {
+          if (!ne.expression ||
+              ne.expression->Type() != TypeTag::kAggregateExp) {
             return false;
           }
           const auto& ae = ne.expression->AsAggregateExpression();
@@ -943,7 +947,8 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
               .expression = ColumnValueExp(agg_schema.GetColumn(i).Name()),
               .ascending = true,
               .nulls_first = true,
-              .collation = Collation::kNone,  // group keys use the default binary order
+              .collation =
+                  Collation::kNone,  // group keys use the default binary order
               // Slot-based resolution: aggregate output names can collide
               // with group-key names, so never re-resolve by name here.
               .column_slot = i,
@@ -1597,7 +1602,8 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
       std::vector<slot_t> lcols;
       std::vector<slot_t> rcols;
       if (lm->Identity() != LateMaterializationIdentity::kRowId &&
-          (!ResolveKeyOffsets(lm->Left()->GetSchema(), lm->LeftKeys(), &lcols) ||
+          (!ResolveKeyOffsets(lm->Left()->GetSchema(), lm->LeftKeys(),
+                              &lcols) ||
            !ResolveKeyOffsets(rtbl->GetSchema(), lm->RightKeys(), &rcols) ||
            lcols.empty() || lcols.size() != rcols.size())) {
         return StatusError(StatusCode::kInvalidArgument,

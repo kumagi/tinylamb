@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/literal_like_pattern.hpp"
 #include "common/platform/time_format.hpp"
 #include "common/string_util.hpp"
 #include "expression/expression.hpp"
@@ -297,7 +298,7 @@ StatusOr<Value> TryDateArithmetic(BinaryOperation op, const Value& left,
     return apply(left.DateDays(), 0, neg_delta);
   }
   if (left.type == ValueType::kInt64 && right.type == ValueType::kDate) {
-    return add ? apply(right.DateDays(), 0, left.value.int_value)
+    return add ? TryDateArithmetic(op, right, left)
                : StatusError(StatusCode::kInvalidArgument, "type mismatch");
   }
   // INT64 - DATE is not a DATE (and not a GoogleSQL signature at all).
@@ -355,6 +356,9 @@ std::string FoldCase(std::string_view s) {
 namespace {
 
 bool Like(std::string_view value, std::string_view pattern) {
+  if (pattern.find('\\') != std::string_view::npos) {
+    return EscapedLikeMatch(value, pattern);
+  }
   // Fast path: with no '_' in the pattern, '%' is a plain segment
   // separator.  The match is then: optional value prefix, middle segments
   // occurring in order (first occurrence is optimal — the earliest match
@@ -721,8 +725,10 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         return std::nullopt;
       }
       // Mirror the CAST-side ParseCivilTime bounds: an out-of-range or
-      // nonexistent calendar value is not a timestamp spelling (second == 60
-      // is a leap second and TimeGm carries it like CAST does).
+      // nonexistent calendar value is not a timestamp spelling. second == 60
+      // is a leap second: both CAST (which normalizes it to the next
+      // minute/hour/day) and TimeGm here carry it into the following instant,
+      // so the same literal has the same value on either path.
       if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 ||
           day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
           second < 0 || second > 60 ||
@@ -795,14 +801,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
       const std::string_view lhs(left.value.varchar_value);
       const std::string_view rhs(right.value.varchar_value);
-      const auto looks_like_timestamp = [](std::string_view text) {
-        return text.size() >= 19 && text[4] == '-' && text[7] == '-' &&
-               (text[10] == ' ' || text[10] == 'T') && text[13] == ':' &&
-               text[16] == ':';
-      };
-      const bool lhs_timestamp = looks_like_timestamp(lhs);
-      const bool rhs_timestamp = looks_like_timestamp(rhs);
-      if (lhs_timestamp && rhs_timestamp) {
+      if (LooksLikeTimestampText(lhs) && LooksLikeTimestampText(rhs)) {
         const auto a = timestamp_instant(lhs);
         const auto b = timestamp_instant(rhs);
         if (a && b) {
@@ -1195,7 +1194,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       // errors ("DATE computation out of range", the checked-negation error)
       // from callers.  Propagate the actual status; combinations that are
       // truly unsupported already carry the identical "type mismatch" text
-      // out of TryDateArithmetic, so nothing else re-times its wording.
+      // out of TryDateArithmetic, so nothing else rephrases it.
       return date_arith;
     }
     return StatusError(StatusCode::kInvalidArgument, "type mismatch");
@@ -1396,8 +1395,9 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
           folded_right->type == ValueType::kVarChar &&
           IsStructJson(folded_left->value.varchar_value) &&
           IsStructJson(folded_right->value.varchar_value)) {
-        const Value equal = StructJsonCompare(folded_left->value.varchar_value,
-                                              folded_right->value.varchar_value);
+        const Value equal =
+            StructJsonCompare(folded_left->value.varchar_value,
+                              folded_right->value.varchar_value);
         if (equal.IsNull() || equal.Truthy()) {
           return equal.IsNull() ? Value() : Value(true);
         }
@@ -1486,6 +1486,10 @@ StatusOr<Value> BinaryExpression::TryEvaluate(
 // context threaded into both children (A1 stage 2).
 StatusOr<Value> BinaryExpression::TryEvaluate(
     const Row& row, const Schema& schema, EvaluationContext& context) const {
+  if (!left_ || !right_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "binary expression with missing operand");
+  }
   return EvaluateMaybeShortCircuited(op_, *left_, *right_, row, schema,
                                      context);
 }

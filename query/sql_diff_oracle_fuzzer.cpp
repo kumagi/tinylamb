@@ -205,7 +205,9 @@ bool Setup(Database& db, TransactionContext* ctx,
     }
   }
   if (ctx->txn_.PreCommit() != Status::kSuccess) {
-    *error = "setup commit failed";
+    if (error != nullptr) {
+      *error = "setup commit failed";
+    }
     return false;
   }
   *ctx = db.BeginContext();
@@ -441,10 +443,22 @@ std::string CheckRadar(const DiffOracleTrace& trace, DiffOracleStats* stats,
     const size_t begin = std::string("CREATE TABLE ").size();
     const size_t end = table.find(' ', begin);
     if (end != std::string::npos && end > begin) {
-      RunStmt(*indexed, indexed_ctx,
-              "ANALYZE " + table.substr(begin, end - begin) + ";", &error);
+      if (!RunStmt(*indexed, indexed_ctx,
+                   "ANALYZE " + table.substr(begin, end - begin) + ";",
+                   &error)) {
+        return "radar analyze failed: " + error;
+      }
     }
   }
+  // ApplyIndexSpec and ANALYZE write into indexed_ctx. Commit them and begin a
+  // fresh read-only context before running the traced queries: the lazy
+  // LSTable bridge refuses to build when the transaction has a non-empty
+  // write set, which would otherwise exclude the indexed side from the
+  // index+statistics vs. plain comparison on every iteration.
+  if (indexed_ctx.txn_.PreCommit() != Status::kSuccess) {
+    return "radar index commit failed";
+  }
+  indexed_ctx = indexed->BeginContext();
   for (const std::string& sql : trace.queries) {
     auto left = RunRows(*plain, plain_ctx, sql, false, &error);
     auto right = RunRows(*indexed, indexed_ctx, sql, false, &error);
@@ -585,7 +599,8 @@ std::string RunTqsIteration(std::mt19937& rng, bool /*verbose*/,
   if (report.empty()) {
     out->tqs_queries += static_cast<int>(t.queries.size());
   }
-  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this
+  // type
   return report;
 }
 
@@ -652,7 +667,8 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
         t.subset_and.size() + t.subset_or.size() + t.subset_dis.size() +
         t.subset_eq.size() + t.subset_card.size());
   }
-  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this
+  // type
   return report;
 }
 
@@ -710,7 +726,8 @@ std::string RunDqpIteration(std::mt19937& rng, bool /*verbose*/,
       }
     }
   }
-  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this
+  // type
   return report;
 }
 
@@ -760,7 +777,8 @@ std::string RunRadarIteration(std::mt19937& rng, bool /*verbose*/,
   if (report.empty()) {
     out->radar_queries += static_cast<int>(t.queries.size());
   }
-  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
+  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this
+  // type
   return report;
 }
 
@@ -904,8 +922,15 @@ void DiffOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   if (!ParseDiffOracleTest(text, &parsed_seed, &parsed, &summary)) {
     verify = "internal error: serialized diff-oracle trace does not parse";
   } else {
-    verify = ReplayDiffOracleTrace(parsed, false);
-    if (verify.empty()) {
+    bool skipped = false;
+    verify = ReplayDiffOracleTrace(parsed, false, &skipped);
+    if (skipped) {
+      // No database could be created during verification (quota pressure),
+      // so no query actually ran. An empty report there is NOT a clean
+      // replay: labelling it "flaky" would silently discard a real finding.
+      verify =
+          "internal error: replay skipped (no database; resource pressure)";
+    } else if (verify.empty()) {
       verify = "internal error: serialized diff-oracle replay holds (flaky)";
     }
   }

@@ -57,7 +57,8 @@ class RecoveryManager {
                                                 std::memory_order_relaxed);
   }
   [[nodiscard]] static bool TornTailTruncationAllowed() {
-    return default_torn_tail_truncation_allowed_.load(std::memory_order_relaxed);
+    return default_torn_tail_truncation_allowed_.load(
+        std::memory_order_relaxed);
   }
   void SetTornTailTruncationAllowedForInstance(bool allowed) {
     torn_tail_truncation_allowed_ = allowed;
@@ -70,7 +71,7 @@ class RecoveryManager {
                   size_t segment_size = size_t{16} << 20);
   ~RecoveryManager();
 
-  void SetLogger(const Logger* logger) { logger_ = logger; }
+  void SetLogger(Logger* logger) { logger_ = logger; }
 
   Status RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm);
 
@@ -89,10 +90,8 @@ class RecoveryManager {
   [[nodiscard]] uint8_t DebugReadStatusFor(lsn_t lsn) const;
 
   [[nodiscard]] lsn_t LogStart() const;
-  [[nodiscard]] lsn_t LogEnd() const;
-  // Status-preserving variant: `LogEnd()` folds a scan/IO failure into 0,
-  // so callers that must tell "WAL empty" from "WAL unreadable" (e.g. the
-  // open-time kCorrupt guard) need this one.
+  // An unreadable WAL is distinct from an empty WAL.
+  [[nodiscard]] StatusOr<lsn_t> LogEnd() const;
   [[nodiscard]] StatusOr<lsn_t> LogEndStatus() const;
   [[nodiscard]] lsn_t ValidLogEnd(lsn_t from) const;
   // Set by RecoverFrom: the LSN from which WAL was replayed, and whether a
@@ -166,7 +165,7 @@ class RecoveryManager {
   static constexpr size_t kMaxCachedReadFds = 8;
   mutable std::unordered_map<size_t, std::shared_ptr<ReadFd>> segment_fds_;
   mutable std::mutex read_fd_mutex_;
-  const Logger* logger_{nullptr};
+  Logger* logger_{nullptr};
   PageManager* pm_{nullptr};
   lsn_t recovery_anchor_lsn_{0};
   bool recovery_torn_tail_truncated_{false};

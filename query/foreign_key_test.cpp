@@ -170,6 +170,33 @@ TEST_F(ForeignKeyTest, DeleteReferencedParentRejected) {
   ExpectOk(engine_.get(), context_.get(), "DELETE FROM fk_parent WHERE id = 2");
 }
 
+TEST_F(ForeignKeyTest, DeleteKeepsReferencesToSurvivingDuplicateParentKeys) {
+  // The referenced column need not be unique: deleting one of several
+  // parent rows that share a key leaves the key supplied by a surviving
+  // row, so the child reference must not reject. The NO ACTION check used
+  // to emit every pending row's key without subtracting the keys that
+  // remain in the parent (the UPDATE side already applies the equivalent
+  // supplied_keys correction).
+  ExpectOk(engine_.get(), context_.get(),
+           "CREATE TABLE fk_repeat_parent (a INT64, tag INT64)");
+  ExpectOk(
+      engine_.get(), context_.get(),
+      "CREATE TABLE fk_repeat_child (a INT64 REFERENCES fk_repeat_parent(a))");
+  ExpectOk(engine_.get(), context_.get(),
+           "INSERT INTO fk_repeat_parent VALUES (1, 10), (1, 20), (1, 30)");
+  ExpectOk(engine_.get(), context_.get(),
+           "INSERT INTO fk_repeat_child VALUES (1)");
+  // Two of the three a=1 rows go away; (1, 30) keeps the key alive.
+  ExpectOk(engine_.get(), context_.get(),
+           "DELETE FROM fk_repeat_parent WHERE tag < 30");
+  // Vacating the last row that supplies a=1 still rejects.
+  ExpectViolation(engine_.get(), context_.get(),
+                  "DELETE FROM fk_repeat_parent WHERE tag = 30");
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(), "SELECT a FROM fk_repeat_parent"),
+      (std::vector<Row>{Row({Value(1)})}));
+}
+
 TEST_F(ForeignKeyTest, UpdateReferencedParentKeyRejected) {
   ASSERT_NO_THROW(MakeParentChild());
   ExpectOk(engine_.get(), context_.get(),
@@ -198,6 +225,38 @@ TEST_F(ForeignKeyTest, UpdateKeySwapKeepsReferencedKeysAlive) {
   // Vacating a key the statement does not re-supply still rejects.
   ExpectViolation(engine_.get(), context_.get(),
                   "UPDATE fk_parent SET id = 9 WHERE id = 1");
+}
+
+TEST_F(ForeignKeyTest, UpdateKeepsReferencesToUntouchedDuplicateParentKeys) {
+  ExpectOk(engine_.get(), context_.get(),
+           "CREATE TABLE fk_repeat_parent (a INT64, tag INT64)");
+  ExpectOk(
+      engine_.get(), context_.get(),
+      "CREATE TABLE fk_repeat_child (a INT64 REFERENCES fk_repeat_parent(a))");
+  ExpectOk(engine_.get(), context_.get(),
+           "INSERT INTO fk_repeat_parent VALUES (1, 10), (1, 20), (1, 30)");
+  ExpectOk(engine_.get(), context_.get(),
+           "INSERT INTO fk_repeat_child VALUES (1)");
+  ExpectOk(engine_.get(), context_.get(),
+           "UPDATE fk_repeat_parent SET a = 99 WHERE tag < 30");
+  ExpectViolation(engine_.get(), context_.get(),
+                  "UPDATE fk_repeat_parent SET a = 99 WHERE tag = 30");
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(),
+             "SELECT a FROM fk_repeat_parent ORDER BY tag"),
+      (std::vector<Row>{Row({Value(99)}), Row({Value(99)}), Row({Value(1)})}));
+}
+
+TEST_F(ForeignKeyTest, UpdateSelfReferenceCanSupplyNewParentKey) {
+  ExpectOk(engine_.get(), context_.get(),
+           "CREATE TABLE self_rekey (id INT64, parent INT64, "
+           "FOREIGN KEY (parent) REFERENCES self_rekey(id))");
+  ExpectOk(engine_.get(), context_.get(),
+           "INSERT INTO self_rekey VALUES (1, NULL)");
+  ExpectOk(engine_.get(), context_.get(),
+           "UPDATE self_rekey SET id = 5, parent = 5 WHERE id = 1");
+  ExpectViolation(engine_.get(), context_.get(),
+                  "UPDATE self_rekey SET id = 6, parent = 5 WHERE id = 5");
 }
 
 TEST_F(ForeignKeyTest, UpdateSelfReferenceUsesPostImages) {
@@ -321,6 +380,24 @@ TEST_F(ForeignKeyTest,
                   "CREATE TABLE fk_bad_pk ("
                   "pid BIGINT PRIMARY KEY REFERENCES fk_base(id))");
   EXPECT_FALSE(err_pk.empty());
+}
+
+TEST_F(ForeignKeyTest, RejectsCombiningForeignKeyWithNotNullOnSameColumn) {
+  ExpectOk(engine_.get(), context_.get(),
+           "CREATE TABLE fk_base (id BIGINT PRIMARY KEY)");
+  // NOT NULL cannot share the single Column::constraint_ slot with FOREIGN
+  // KEY.  Rejecting the combination explicitly prevents the NOT NULL slot
+  // from being silently overwritten by kForeign (which would let NULL rows
+  // through Table::CheckRowConstraints).
+  for (const std::string& sql :
+       {"CREATE TABLE fk_nn_col (pid BIGINT NOT NULL REFERENCES fk_base(id))",
+        "CREATE TABLE fk_nn_tbl (pid BIGINT NOT NULL, "
+        "FOREIGN KEY (pid) REFERENCES fk_base(id))"}) {
+    const std::string err = ExpectThrow(engine_.get(), context_.get(), sql);
+    EXPECT_FALSE(err.empty()) << sql;
+    EXPECT_NE(err.find("cannot combine"), std::string::npos)
+        << sql << " :: " << err;
+  }
 }
 
 TEST_F(ForeignKeyTest,

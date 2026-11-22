@@ -97,7 +97,6 @@ UNION DISTINCT に対しては、重複排除が分岐をまたいで行われ�
 
 ## 関連 Rule との相互作用
 
-- `union_all_push_limit`: 同種の Limit 押し込みを行う兄弟 Rule であり、枝側に既存の Limit がある場合の処理など一部のガードが異なります。
 - `merge_limits`: 押し込まれた Limit と枝内に既存の Limit が合成されます。
 - `union_all_merge`: UNION ALL を平坦化し、本 Rule がすべての枝を一括してキャップできるように下地を整える。
 

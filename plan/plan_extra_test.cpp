@@ -118,8 +118,13 @@ TEST(DistinctPlanExtraTest, DumpToStringAndDelegation) {
   EXPECT_TRUE(keyed.HasDistinctOn());
   ASSERT_EQ(keyed.DistinctOn().size(), 1U);
   dump = DumpToString(keyed);
-  EXPECT_NE(dump.find("on=["), std::string::npos);
-  EXPECT_NE(dump.find('a'), std::string::npos);
+  // 'a' also occurs in the "HashDistinct" header, so a bare find('a') is a
+  // tautology. Look for the key column inside the "(on=[...])" region only.
+  const size_t on_pos = dump.find("on=[");
+  ASSERT_NE(on_pos, std::string::npos);
+  const size_t close_pos = dump.find(']', on_pos);
+  ASSERT_NE(close_pos, std::string::npos);
+  EXPECT_LT(dump.find('a', on_pos), close_pos);
 }
 
 TEST(SortDistinctPlanExtraTest, DumpToStringAndDelegation) {
@@ -252,19 +257,17 @@ TEST(IncrementalSortPlanExtraTest, IsOrderedByNullsFirstAndDump) {
                                {true, false}, {true}));
 
   // ToString lists both key groups with their directions.
-  const std::string expected = "IncrementalSort presorted=" +
-                               ColumnValueExp("a")->ToString() +
-                               " ASC sorting=" +
-                               ColumnValueExp("b")->ToString() + " DESC";
+  const std::string expected =
+      "IncrementalSort presorted=" + ColumnValueExp("a")->ToString() +
+      " ASC sorting=" + ColumnValueExp("b")->ToString() + " DESC";
   EXPECT_EQ(plan.ToString(), expected);
   std::string dump = DumpToString(plan);
   EXPECT_NE(dump.find(expected), std::string::npos);
 
   // No prefix keys: only the sorting group is listed.
   IncrementalSortPlan bare(child, {}, suffix);
-  EXPECT_EQ(bare.ToString(),
-            "IncrementalSort sorting=" + ColumnValueExp("b")->ToString() +
-                " DESC");
+  EXPECT_EQ(bare.ToString(), "IncrementalSort sorting=" +
+                                 ColumnValueExp("b")->ToString() + " DESC");
 }
 
 TEST(GroupByPlanExtraTest, DumpAndCardinalityCaps) {
@@ -326,6 +329,21 @@ class SkipScanDistinctPlanExtraTest : public ::testing::Test {
   std::unique_ptr<Table> table_;
   std::unique_ptr<Index> index_;
 };
+
+TEST_F(SkipScanDistinctPlanExtraTest, NanGuardUsesProjectedKeyStatistics) {
+  Index second_key("second_key", std::vector<slot_t>{1}, 0);
+  const Schema projected("out", {Column("b", ValueType::kDouble)});
+  TableStatistics stats(projected);
+  auto column = ColumnStats::FromRawParts(
+      ValueType::kDouble, 1, 0, 1, {},
+      {{.value = Value(std::numeric_limits<double>::quiet_NaN()), .count = 1}},
+      {}, {}, 0.0);
+  stats.Assign(1, {column});
+  SkipScanDistinctPlan plan(*table_, second_key, stats, true,
+                            {NamedExpression("b", ColumnValueExp("b"))},
+                            projected);
+  EXPECT_FALSE(plan.IsOrderedBy({ColumnValueExp("b")}, {true}));
+}
 
 TEST_F(SkipScanDistinctPlanExtraTest, StatsDrivenRowCountsAndOrdering) {
   const Schema out("out", {Column("a", ValueType::kInt64)});

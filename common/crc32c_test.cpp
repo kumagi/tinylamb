@@ -91,8 +91,8 @@ TEST(Crc32CTest, Crc32CExtend_ComposesAcrossSlices) {
   for (auto& byte : buf) {
     byte = static_cast<uint8_t>(rng());
   }
-  constexpr std::array<size_t, 12> cuts = {
-      0, 1, 7, 63, 255, 256, 257, 2047, 2048, 2049, 16384, 32768};
+  constexpr std::array<size_t, 12> cuts = {0,   1,    7,    63,   255,   256,
+                                           257, 2047, 2048, 2049, 16384, 32768};
   const uint32_t one_shot = detail::Crc32CRawHardware(0xffffffffU, buf);
   for (const size_t cut : cuts) {
     uint32_t piecewise = 0xffffffffU;
@@ -113,6 +113,11 @@ TEST(Crc32CTest, AuditPaxChecksumUsesRawRegisterConvention) {
   checksum.Update(text + 4, 5);
   EXPECT_EQ(checksum.Finalize(), 0x1cf96d7cU);
   EXPECT_EQ(Crc32cOf(text, 9), Crc32C(text, 9) ^ 0xffffffffU);
+  // An empty payload must leave the raw register at its seed value: an empty
+  // vector's data() is nullptr, and folding the empty span must not turn it
+  // into 0 (Crc32C's finalized convention).
+  EXPECT_EQ(Crc32cOf(std::vector<char>{}), 0xffffffffU);
+  EXPECT_EQ(Crc32cOf(static_cast<const void*>(nullptr), 0), 0xffffffffU);
 }
 
 }  // namespace tinylamb

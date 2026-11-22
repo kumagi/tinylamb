@@ -65,10 +65,6 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     int generic_column{-1};
   };
 
-  // Partial states are default-built, moved between shards, and merged by
-  // copy; the conditional-release destructor must keep its implicit
-  // copy/move semantics, so the rule-of-five check is silenced here.
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
   struct PartialState {
     std::vector<Value> values;
     std::vector<int64_t> counts;
@@ -82,16 +78,11 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     std::vector<platform::ExtendedFloat> stat_syy;  // Σ of its square
     std::vector<platform::ExtendedFloat>
         stat_sxy;  // Σ of the pairwise products
+    // The reservation has one owner and outlives the stored values.
+    QueryMemoryCharge distinct_charge;
     std::vector<relational_detail::DistinctValueSet> distinct_values;
-    // Every retained distinct value holds a forced global-budget reservation;
-    // release the retained total when the state dies so the process-wide
-    // budget cannot ratchet up across repeated aggregations.
-    size_t distinct_charged_bytes{0};
-    ~PartialState() {
-      if (distinct_charged_bytes != 0) {
-        QueryMemoryBudget::Global().Release(distinct_charged_bytes);
-      }
-    }
+
+    bool InsertDistinct(size_t index, const Value& value);
   };
 
   [[nodiscard]] PartialState MakeState() const;
@@ -132,7 +123,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   [[nodiscard]] Value FinalizeStat(const PartialState& state,
                                    size_t index) const;
   Status Merge(PartialState* destination, const PartialState& source) const;
-  [[nodiscard]] Row Finalize(PartialState state) const;
+  [[nodiscard]] Row Finalize(PartialState&& state) const;
 
   std::shared_ptr<ExecutorBase> child_;
   Schema input_schema_;

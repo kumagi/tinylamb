@@ -14,10 +14,10 @@
 #include "common/status_or.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
-#include "transaction/transaction.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
+#include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -36,10 +36,6 @@ bool IsOrderedComparison(BinaryOperation operation) {
     default:
       return false;
   }
-}
-
-bool IsProbeOnly(JoinKind kind) {
-  return kind == JoinKind::kSemi || kind == JoinKind::kAnti;
 }
 
 bool IsOuter(JoinKind kind) {
@@ -77,8 +73,12 @@ BandJoin::BandJoin(Executor left, std::vector<slot_t> left_columns,
   const bool unsupported_kind =
       kind_ == JoinKind::kMark || kind_ == JoinKind::kNullAwareAnti;
   CHECK_MSG(!unsupported_kind, "BandJoin does not support this join kind");
-  if (residual_schema_.ColumnCount() == 0 && !IsProbeOnly(kind_) &&
-      output_schema_.ColumnCount() > 0) {
+  // PairPasses evaluates `predicate_` against the combined left+right row for
+  // every join kind (not just kInner). A hand-built join that omits the
+  // residual schema must get the same fallback as every other kind; leaving
+  // it empty makes column references in the predicate unresolvable for
+  // semi/anti joins.
+  if (residual_schema_.ColumnCount() == 0 && output_schema_.ColumnCount() > 0) {
     residual_schema_ = output_schema_;
   }
 }
@@ -161,9 +161,10 @@ Status BandJoin::Materialize() {
   auto append = [&](std::vector<PositionedRow>& target, Row row,
                     RowPosition pos, size_t metadata = 0) -> Status {
     if (!materialized_charge_.TryAdd(EstimateRowBytesFast(row) +
-                                    sizeof(RowPosition) + metadata)) {
-      return StatusError(StatusCode::kMemoryLimitExceeded,
-                         "BandJoin materialization exceeds query memory budget");
+                                     sizeof(RowPosition) + metadata)) {
+      return StatusError(
+          StatusCode::kMemoryLimitExceeded,
+          "BandJoin materialization exceeds query memory budget");
     }
     target.emplace_back(std::move(row), pos);
     return Status::kSuccess;
@@ -189,7 +190,13 @@ Status BandJoin::Materialize() {
       return st;
     }
     for (size_t i = 0; i < batch.Size(); ++i) {
-      RETURN_IF_FAIL(append(right_rows_, batch.RowAt(i), batch.PositionAt(i), sizeof(RightKey) + 1));
+      // EstimateRowBytesFast(row) already includes the join key's Value. The
+      // metadata pays for the *separate* right_keys_ entry (key copy plus row
+      // index) and the one-byte right_matched flag; those allocations live in
+      // their own vectors and are not otherwise charged. Dropping this charge
+      // would undercount them, not remove a duplicate.
+      RETURN_IF_FAIL(append(right_rows_, batch.RowAt(i), batch.PositionAt(i),
+                            sizeof(RightKey) + 1));
     }
   }
   if (right_->GetStatus() != Status::kSuccess) {
@@ -258,7 +265,8 @@ Status BandJoin::Materialize() {
   const Row null_right{std::vector<Value>(right_width_)};
   const auto emit_combined = [&](const PositionedRow& left_item,
                                  const PositionedRow& right_item) {
-    return append(output_, left_item.first + right_item.first, left_item.second);
+    return append(output_, left_item.first + right_item.first,
+                  left_item.second);
   };
   const auto emit_left_only = [&](const PositionedRow& left_item) {
     return append(output_, left_item.first, left_item.second);

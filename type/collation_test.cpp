@@ -51,7 +51,7 @@ TEST(CollationTest, NamesRoundTripAndSpecResolution) {
   EXPECT_EQ(CollationFromName("binary"), Collation::kBinary);
   EXPECT_EQ(CollationFromName("BINARY"), Collation::kBinary);
   // Every non-binary spec folds: the engine has no locale collation, so an
-  // unrecognised language name behaves as case-insensitive rather than
+  // unrecognized language name behaves as case-insensitive rather than
   // silently reordering text under a rule it does not implement.
   EXPECT_EQ(CollationFromName("und:ci"), Collation::kCaseInsensitive);
   EXPECT_EQ(CollationFromName("en_US"), Collation::kCaseInsensitive);
@@ -60,10 +60,14 @@ TEST(CollationTest, NamesRoundTripAndSpecResolution) {
 
 TEST(CollationTest, CollationOfSpecRejectsUnsupportedSpecs) {
   // Only 'binary' and 'und:ci' are valid collation spec names.
-  EXPECT_EQ(CollationOfSpec("binary"), std::optional<Collation>(Collation::kBinary));
-  EXPECT_EQ(CollationOfSpec("BINARY"), std::optional<Collation>(Collation::kBinary));
-  EXPECT_EQ(CollationOfSpec("und:ci"), std::optional<Collation>(Collation::kCaseInsensitive));
-  EXPECT_EQ(CollationOfSpec("UND:CI"), std::optional<Collation>(Collation::kCaseInsensitive));
+  EXPECT_EQ(CollationOfSpec("binary"),
+            std::optional<Collation>(Collation::kBinary));
+  EXPECT_EQ(CollationOfSpec("BINARY"),
+            std::optional<Collation>(Collation::kBinary));
+  EXPECT_EQ(CollationOfSpec("und:ci"),
+            std::optional<Collation>(Collation::kCaseInsensitive));
+  EXPECT_EQ(CollationOfSpec("UND:CI"),
+            std::optional<Collation>(Collation::kCaseInsensitive));
   // Unknown names, typos and the empty string are unsupported.
   EXPECT_EQ(CollationOfSpec("und"), std::optional<Collation>());
   EXPECT_EQ(CollationOfSpec("und:cs"), std::optional<Collation>());
@@ -219,11 +223,13 @@ TEST(CollationTest, CompareWithCollationIsATotalOrder) {
   }
   for (const Value& a : binary_values) {
     for (const Value& b : binary_values) {
-      if (CompareWithCollation(a, b) > 0) { continue;
-}
+      if (CompareWithCollation(a, b) > 0) {
+        continue;
+      }
       for (const Value& c : binary_values) {
-        if (CompareWithCollation(b, c) > 0) { continue;
-}
+        if (CompareWithCollation(b, c) > 0) {
+          continue;
+        }
         EXPECT_LE(CompareWithCollation(a, c), 0);
       }
     }

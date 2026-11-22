@@ -1,7 +1,7 @@
 -- sql_ooc_fuzzer regression
 -- seed: 19
 -- profile: pool=16384 columnar=0 opmem=0 spill=0 temp=0 route=0
--- failure: sweep io / budget-invariance mismatch [groupby+arrayagg+orderby] (same query, different memory knobs) :: op 2 `sweep io 25 :: q ord=0 heavy=1 take=-1 nv=1 vs=134661780 ex=0 snap=0 :: SELECT k AS c1, LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(k AS STRING) ORDER BY k), ',')) AS...(214B)`: sweep io `q ord=0 heavy=1 take=-1 nv=1 vs=134661780 ex=0 snap=0 :: SELECT k AS c1, LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(k AS STRI...(199B)` with failure #3: budget-invariance mismatch [groupby+arrayagg+orderby] (same query, different memory knobs): SELECT k AS c1, LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(k AS STRING) 
+-- failure: sweep io / budget-invariance mismatch [groupby+arrayagg+orderby] (same query, different memory knobs) :: op 2 `sweep io 25 :: q ord=0 heavy=1 take=-1 nv=1 vs=134661780 ex=0 snap=0 :: SELECT k AS c1, LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(k AS STRING) ORDER BY k), ',')) AS...(214B)`: sweep io `q ord=0 heavy=1 take=-1 nv=1 vs=134661780 ex=0 snap=0 :: SELECT k AS c1, LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(k AS STRI...(199B)` with failure #3: budget-invariance mismatch [groupby+arrayagg+orderby] (same query, different memory knobs): SELECT k AS c1, LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(k AS STRING) ORDER BY k), ',')) AS c2, BIT_XOR(k) AS c3, MIN(t) AS c4 FROM t0 GROUP BY 1
 create t0 21 5084 1745
 ins_bulk t0 595 977 304
 sweep io 25 :: q ord=0 heavy=1 take=-1 nv=1 vs=134661780 ex=0 snap=0 :: SELECT k AS c1, LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(k AS STRING) ORDER BY k), ',')) AS c2, BIT_XOR(k) AS c3, MIN(t) AS c4 FROM t0 GROUP BY 1

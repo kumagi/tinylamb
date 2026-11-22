@@ -95,10 +95,13 @@ class MemTable final {
               std::vector<uint8_t>* deleted_out = nullptr);
 
   // Crash-recovery semantics: Sync() serializes pending entries into the
-  // output vectors. Durability is the CALLER's responsibility -- write the
-  // returned blob to stable storage and fsync(2) it before acknowledging.
-  // After Sync returns, the memtable is empty; the drained data lives only
-  // in the returned bytes until the caller persists them.
+  // output vectors. Durability is the CALLER's responsibility: either set a
+  // durability callback (below), or write the returned blob to stable
+  // storage and fsync(2) it before acknowledging. After Sync returns the
+  // memtable is empty. With a callback installed the sync sites DISCARD the
+  // output vectors, so the drained data lives only where that callback
+  // persisted it; otherwise it lives only in the returned bytes until the
+  // caller persists them.
   //
   // deleted_out (optional) receives one byte per entry, parallel to the
   // key/row offset runs: 1 = tombstone, 0 = live row. Without it callers
@@ -125,10 +128,10 @@ class MemTable final {
   // MVCC read-version alignment (see common/version.hpp). When enabled, every
   // Put/Delete stamps the RowEntry with a process-wide monotonically
   // increasing version, and each Sync assigns the flush generation from the
-  // same counter. Generations then become COMPARABLE ACROSS all memtables
-  // participating memtables. Direct callers opt in before writing, pin V,
-  // and call Snapshot(V). SQL execution uses its own MVCC snapshot path.
-  // The default mode retains per-instance generations.
+  // same counter. Generations then become COMPARABLE ACROSS all participating
+  // memtables. Direct callers opt in before writing, pin V, and call
+  // Snapshot(V). SQL execution uses its own MVCC snapshot path. The default
+  // mode retains per-instance generations.
   void SetGlobalVersionMode(bool on) {
     // Atomic: toggling while writers are calling Put/Delete on other threads
     // was a plain-bool data race (TSan).
@@ -140,9 +143,10 @@ class MemTable final {
 
   // Drain byte budget for Sync()'s serialized blob (offsets are uint32, so
   // the production ceiling is UINT32_MAX; Sync clamps any larger value to
-  // that ceiling so the run can never wrap its offsets). Exposed for tests:
-  // the kNoSpace recovery path (leftover sealed data must stay at the HEAD
-  // of the next drain, newest-wins intact) is otherwise only reachable with
+  // that ceiling so the run can never wrap its offsets). The value is fixed
+  // at UINT32_MAX: there is no setter or friend, so the kNoSpace branch in
+  // Sync() is a defensive guard for future injection, not a path the current
+  // tests exercise.
 
  private:
   // (Sync() is the single drain entry point; the former private Drain()

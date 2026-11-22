@@ -33,8 +33,11 @@ graph TD
 1. Selection 演算子に述語（`expression.predicate`）が存在すること。
 
 ```cpp
-    // cross_to_inner_with_predicate: Selection(CrossJoin(L, R), p) -> Join(L,
-    // R, p) when predicate p references both left and right relations.
+    // cross_to_inner_with_predicate: Selection(CrossJoin(L, R), p) ->
+    // Join(L, R, p).  Sound for ANY p: sigma_p(L x R) is definitionally the
+    // inner join on p, whether or not p references both sides (a one-sided
+    // or constant p just makes a trivial join condition; pushdown rules
+    // handle it from there).  No both-sides inspection is needed.
     built.Add(Rule(
         "cross_to_inner_with_predicate",
         Selection(CrossJoin(Any("left"), Any("right"))),
@@ -54,7 +57,7 @@ graph TD
 
 `expression.predicate` が `std::nullopt` である場合のみ早期 return します。
 
-登録コメントには「述語 p が左右両方の関係を参照するとき（when predicate p references both left and right relations）」と記述されていますが、実際の実装コードでは参照リレーションの検証は行っておらず、片側リレーションのみを参照する述語であっても発火します。
+登録コメントは「述語 p が左右どちらを参照するかに関わらず（whether or not p references both sides）」成り立つと明記しており、参照リレーションの検証は不要です。`sigma_p(L x R)` は定義により `p` を条件とする内部結合なので、片側のみを参照する述語や定数述語でも発火します。
 
 ## 意味論的根拠と代数的一致
 

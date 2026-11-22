@@ -163,13 +163,21 @@ RuleSnapshot CaptureRuleSnapshot(const cascades::Memo& memo,
                    ? "none"
                    : child_properties.front().ordering.front().ToString();
   }
+  // Read the filter the optimizer actually holds. Before exploration the
+  // selection predicate lives on the expression and the group filter is empty,
+  // so the caller's predicate is the authority; after a rule moves it into the
+  // group filter that filter is what must preserve the row set and estimate.
+  // Using the caller's predicate unconditionally would make the before/after
+  // comparisons tautologies that never touch optimizer state.
+  const Expression& effective_filter =
+      memo.Get(root).filter ? memo.Get(root).filter : predicate;
   return RuleSnapshot{
       .schema = expression.output_schema.ColumnCount() == 0
                     ? SchemaFingerprint(schema)
                     : SchemaFingerprint(expression.output_schema),
       .ordering = ordering,
-      .rows = EvaluateSet(schema, predicate, input),
-      .estimated_rows = statistics.Filter(schema, predicate).Rows(),
+      .rows = EvaluateSet(schema, effective_filter, input),
+      .estimated_rows = statistics.Filter(schema, effective_filter).Rows(),
   };
 }
 
@@ -344,7 +352,8 @@ TEST_F(Phase0ContractTest, SqlCascadesAndDirectExecutorShareExpectedRows) {
 // something the test may invent.  Read it and make the executed matrix answer
 // to the document, so dropping a todo or a semantic class from either side is
 // a real failure instead of a tautology.
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
 static std::string_view SemanticDocName(Semantic semantic) {
   switch (semantic) {
     case Semantic::kSuccess:
@@ -363,16 +372,25 @@ static std::string_view SemanticDocName(Semantic semantic) {
   return {};
 }
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
 static std::string LoadPhase0ManifestDoc() {
   std::error_code ec;
   // The source tree is authoritative: this file lives in <root>/plan/, so
   // look there first (an out-of-tree build directory need not sit under the
   // source root), then fall back to walking up from the working directory.
   {
+    // Make __FILE__ absolute: some build systems hand the compiler a relative
+    // source path, in which case the two parent_path() calls below would
+    // produce a cwd-relative "docs/..." and make the test depend on where
+    // ctest launched it.
+    std::error_code abs_ec;
+    std::filesystem::path source = std::filesystem::absolute(__FILE__, abs_ec);
+    if (abs_ec) {
+      source = std::filesystem::path(__FILE__);
+    }
     const std::filesystem::path doc =
-        std::filesystem::path(__FILE__).parent_path().parent_path() / "docs" /
-        "cascades_optimizer.md";
+        source.parent_path().parent_path() / "docs" / "cascades_optimizer.md";
     if (std::filesystem::is_regular_file(doc, ec)) {
       std::ifstream in(doc);
       std::ostringstream contents;
@@ -398,16 +416,18 @@ static std::string LoadPhase0ManifestDoc() {
   return {};
 }
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
-static std::optional<size_t> ParseTodoNumber(const std::string& text, size_t& pos,
-                                      size_t limit) {
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
+static std::optional<size_t> ParseTodoNumber(const std::string& text,
+                                             size_t& pos, size_t limit) {
   while (pos < limit &&
          (std::isdigit(static_cast<unsigned char>(text[pos])) == 0)) {
     ++pos;
   }
   size_t value = 0;
   bool found = false;
-  while (pos < limit && (std::isdigit(static_cast<unsigned char>(text[pos])) != 0)) {
+  while (pos < limit &&
+         (std::isdigit(static_cast<unsigned char>(text[pos])) != 0)) {
     value = (value * 10) + static_cast<size_t>(text[pos] - '0');
     ++pos;
     found = true;
@@ -421,7 +441,8 @@ struct ManifestClaim {
   std::optional<size_t> last_todo;
 };
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
 static ManifestClaim ParsePhase0Manifest(const std::string& doc) {
   constexpr std::string_view kIntro = "manifest repeats the ";
   constexpr std::string_view kRange = "cases for Phase 0 items ";
@@ -456,9 +477,11 @@ TEST_F(Phase0ContractTest, ManifestCoversEveryTodoAndSemanticClass) {
       << "Phase 0 manifest sentence not found in docs/cascades_optimizer.md";
   ASSERT_TRUE(claim.first_todo.has_value());
   ASSERT_TRUE(claim.last_todo.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes
+  // success
   EXPECT_EQ(claim.first_todo.value(), kFirstTodo);
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes success
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes
+  // success
   EXPECT_EQ(claim.last_todo.value(), kLastTodo);
   // Six classes => five separators in the documented comma-separated list.
   EXPECT_EQ(std::count(claim.semantic_classes.begin(),
@@ -542,8 +565,6 @@ TEST_F(Phase0ContractTest, RuleRewritePreservesSchemaOrderSetAndEstimate) {
   EXPECT_EQ(after.estimated_rows, before.estimated_rows);
   EXPECT_FALSE(explored.Get(base).filter);
   ASSERT_TRUE(explored.Get(root).filter);
-  EXPECT_EQ(after.estimated_rows,
-            statistics_->Filter(schema, explored.Get(root).filter).Rows());
   EXPECT_EQ(explored.Get(root).filter->ToString(), predicate->ToString());
 }
 

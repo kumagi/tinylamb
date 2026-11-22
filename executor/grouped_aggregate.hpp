@@ -115,8 +115,8 @@ class AggregateGroupTable {
   template <typename... Args>
   void EmplaceState(Args&&... args) {
     if (states_.empty() || states_.back()->size() == kStateBlockElements) {
-      auto block =
-          std::make_unique<std::vector<relational_detail::AggregateAccumulator>>();
+      auto block = std::make_unique<
+          std::vector<relational_detail::AggregateAccumulator>>();
       block->reserve(kStateBlockElements);
       states_.push_back(std::move(block));
     }
@@ -131,8 +131,8 @@ class AggregateGroupTable {
   // key -- vector<Value> plus per-VARCHAR payloads -- is not retained twice.
   std::vector<const Row*> keys_;
   static constexpr size_t kStateBlockElements = 512;
-  std::vector<std::unique_ptr<
-      std::vector<relational_detail::AggregateAccumulator>>>
+  std::vector<
+      std::unique_ptr<std::vector<relational_detail::AggregateAccumulator>>>
       states_;
 };
 
@@ -250,7 +250,6 @@ class HashAggregateExecutor final : public GroupedAggregateBase {
   std::vector<bool> aggregate_count_star_;
   AggregateGroupTable table_{&input_schema_, &aggregate_nodes_};
   std::vector<Row> buffer_;
-  std::vector<Value> serial_key_scratch_;
   std::vector<SpillFile> partitions_;
   bool parallel_capable_{false};
   bool spilled_{false};

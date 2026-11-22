@@ -23,7 +23,8 @@ Baseline extraction (BenchmarkHistory.md):
 
 New results file:
   - *.json: flat object {"query_sum_q1_q22": 85.2, ...}
-  - anything else: TSV, one "key<TAB>value" pair per line ("#" comments OK).
+  - anything else: one "key<TAB>value" pair per line ("#" comments OK);
+    whitespace-delimited lines are also accepted, with the value last.
 
 Direction: keys containing tps/qps/tpm/rps/ops are higher-is-better;
 everything else is treated as time (lower-is-better).
@@ -34,6 +35,7 @@ Exit codes: 0 pass, 1 regression / no comparable metric (unless
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -56,9 +58,12 @@ def normalize_key(name: str) -> str:
 
 def parse_number(text: str):
     try:
-        return float(text.replace(",", ""))
+        value = float(text.replace(",", ""))
     except ValueError:
         return None
+    # NaN compares false against everything and Inf silently passes ratio
+    # gates; treat both as a missing measurement so the gate fails loudly.
+    return value if math.isfinite(value) else None
 
 
 def extract_baseline(history_path: Path) -> dict:
@@ -125,7 +130,7 @@ def parse_results(path: Path) -> dict:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        fields = line.split("\t") if "\t" in line else line.split()
+        fields = line.split("\t") if "\t" in line else line.rsplit(None, 1)
         if len(fields) < 2:
             continue
         value = parse_number(fields[1])

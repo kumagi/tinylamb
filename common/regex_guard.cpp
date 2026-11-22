@@ -26,7 +26,13 @@ std::string Utf8RegexPattern(std::string_view pattern) {
   constexpr std::string_view dot =
       R"((?:[\x00-\x09\x0B\x0C\x0E-\x7F]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}))";
   std::string converted;
-  converted.reserve(pattern.size() * dot.size());
+  // Only unescaped, out-of-class '.' expands to `dot` (~74 bytes). Reserving
+  // dot.size() for every character over-allocates 74x for literal patterns.
+  // Counting '.' occurrences is a cheap upper bound; geometric growth then
+  // handles the rest.
+  const size_t dots =
+      static_cast<size_t>(std::count(pattern.begin(), pattern.end(), '.'));
+  converted.reserve(pattern.size() + (dots * dot.size()));
   bool in_class = false;
   for (size_t i = 0; i < pattern.size(); ++i) {
     const char ch = pattern[i];
@@ -1047,7 +1053,7 @@ StatusOr<std::string> ReplaceCheckedRegex(std::string_view input,
 
 // P464 test hook: number of full replacement-program compiles (cache misses)
 // executed on this thread.  Used by the regex_guard tests to pin the
-// budgeted cache behaviour for >4096-byte replacement templates.
+// budgeted cache behavior for >4096-byte replacement templates.
 size_t ReplacementProgramFullCompilesForTest() {
   return g_replacement_full_compiles;
 }

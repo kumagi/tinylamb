@@ -24,6 +24,9 @@ SKIP = (
 )
 
 LOCAL_PREFIXES = ("optimizer_",)
+# Local documentation lives alongside the vendored testdata and is not part of
+# the upstream listing; keep it when pruning stale upstream files.
+LOCAL_FILES = ("README.md",)
 
 
 def main() -> None:
@@ -81,9 +84,15 @@ def main() -> None:
         # Keep the existing testdata intact on any transient failure: deleting
         # first would leave neither old nor new files on a partial download.
         raise SystemExit(f"failed {len(errors)} files: {errors[:5]}")
-    for existing in out.glob("*.test"):
+    # Delete every stale upstream file, not just *.test: upstream may drop a
+    # .json (or other) fixture, and leaving the old copy behind silently runs
+    # compliance against outdated data.
+    for existing in out.iterdir():
+        if not existing.is_file():
+            continue
         if (existing.name not in wanted and
-                not existing.name.startswith(LOCAL_PREFIXES)):
+                not existing.name.startswith(LOCAL_PREFIXES) and
+                existing.name not in LOCAL_FILES):
             existing.unlink()
     print(f"wrote {len(names)} files to {out}")
 

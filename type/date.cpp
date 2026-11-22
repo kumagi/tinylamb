@@ -161,16 +161,20 @@ StatusOr<int64_t> TryParseDateDays(std::string_view date) {
   // sscanf this rejects surrounding whitespace and trailing garbage
   // ("2024-01-01xyz"), while still accepting single-digit fields ("2024-1-1").
   size_t pos = 0;
-  const auto read_field = [&](int64_t* out) -> Status {
+  const auto read_field = [&](int64_t* out, size_t max_digits) -> Status {
     if (pos >= date.size() || date[pos] < '0' || '9' < date[pos]) {
       return InvalidDate();
     }
     int64_t value = 0;
+    size_t digits = 0;
     while (pos < date.size() && '0' <= date[pos] && date[pos] <= '9') {
-      if (value > 99999999) {  // Cap digits so `value` cannot overflow.
+      // Bound the field width: a value check alone cannot reject unlimited
+      // leading zeros, and would let a 9-digit intermediate value through.
+      if (digits >= max_digits) {
         return InvalidDate();
       }
       value = (value * 10) + (date[pos++] - '0');
+      ++digits;
     }
     *out = value;
     return Status::kSuccess;
@@ -185,15 +189,19 @@ StatusOr<int64_t> TryParseDateDays(std::string_view date) {
   int64_t y = 0;
   int64_t m = 0;
   int64_t d = 0;
-  RETURN_IF_FAIL(read_field(&y));
+  // A year can use 5 digits (GoogleSQL accepts e.g. 10000-03-15); month and
+  // day are at most 2 digits. Single-digit fields are still allowed.
+  RETURN_IF_FAIL(read_field(&y, 5));
   RETURN_IF_FAIL(expect('-'));
-  RETURN_IF_FAIL(read_field(&m));
+  RETURN_IF_FAIL(read_field(&m, 2));
   RETURN_IF_FAIL(expect('-'));
-  RETURN_IF_FAIL(read_field(&d));
+  RETURN_IF_FAIL(read_field(&d, 2));
   if (pos != date.size()) {
     return InvalidDate();
   }
-  if (y < static_cast<int>(year::min()) || static_cast<int>(year::max()) < y) {
+  // The formatter rejects non-positive years, so reject year 0 here as well
+  // to keep parse -> format -> parse round-trips from failing downstream.
+  if (y <= 0 || static_cast<int>(year::max()) < y) {
     return InvalidDate();
   }
   // Range-check before constructing month/day: their constructors truncate to
@@ -218,8 +226,8 @@ StatusOr<std::string> TryFormatDateDays(int64_t days) {
   std::array<char, 16> buffer{};
   ASSIGN_OR_RETURN(sys_days, sd, ToSysDays(days));
   const year_month_day ymd{sd};
-  // The strict parser rejects negative years; fail here rather than emit a
-  // string that the same engine cannot read back.
+  // The strict parser rejects non-positive years; fail here rather than emit
+  // a string that the same engine cannot read back.
   if (static_cast<int>(ymd.year()) <= 0) {
     return StatusError(StatusCode::kInvalidArgument,
                        "DATE year out of representable range");

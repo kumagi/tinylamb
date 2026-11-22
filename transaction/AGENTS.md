@@ -76,7 +76,8 @@ Strict-2PL + MVCC version chains + write intents. Normative doc:
     dropped and abort/commit replay re-reads its WAL chain via `Logger::TryCopyBuffered`
     and `RecoveryManager::ReadLog`.
   - Write-set spill (`kDefaultWriteSetSpillEntries = 4096`): excess write-set
-    entries spill via `SpillStore` using `RowBlockCodec`.
+    entries spill to `SpillStore` as raw `RowPosition` bytes via
+    `SpillSegmentWriter::Write` (no `RowBlockCodec` framing).
   - MVCC version payload spill (`kDefaultVersionSpillThresholdBytes = 4 MiB`,
     `kVersionSpillSegmentBytes = 256 KiB`): cold MVCC version payloads spill
     via `SpillStore` while active snapshot reads reload transparently.

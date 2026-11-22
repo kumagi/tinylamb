@@ -158,7 +158,8 @@ TEST(PostgresProtocolTest, EncodesDoubleAndDateValues) {
   // emitted (PostgreSQL behavior); max_digits10 printed 17 digits and turned
   // 0.1 into "0.10000000000000001".
   const std::string short_row = DataRow(Row({Value(0.1), Value(1e20)}));
-  EXPECT_NE(short_row.find("0.1\x00", 0), std::string::npos) << short_row;
+  EXPECT_NE(short_row.find(std::string("0.1\x00", 4), 0), std::string::npos)
+      << short_row;
   EXPECT_EQ(short_row.find("0.10000000000000001"), std::string::npos);
 
   // float8 OID 701 then date OID 1082 in the row description
@@ -182,6 +183,16 @@ TEST(PostgresProtocolTest, EmptyQueryAndNegotiateProtocolVersion) {
   EXPECT_EQ(ReadUint32(negotiated, 9).Value(), 2U);
   EXPECT_NE(negotiated.find("_pq_.foo"), std::string::npos);
   EXPECT_NE(negotiated.find("_pq_.bar"), std::string::npos);
+}
+
+TEST(PostgresProtocolTest, ErrorResponseCarriesGoogleSqlLineAndColumn) {
+  const std::string response = ErrorResponse("syntax error [at 3:17]", "42601");
+  EXPECT_NE(response.find(std::string("L3\0", 3)), std::string::npos);
+  EXPECT_NE(response.find(std::string("P17\0", 4)), std::string::npos);
+  // Non-numeric positions must not produce bogus fields.
+  const std::string malformed = ErrorResponse("syntax error [at x:y]", "42601");
+  EXPECT_EQ(malformed.find("Lx"), std::string::npos);
+  EXPECT_EQ(malformed.find("Py"), std::string::npos);
 }
 
 TEST(PostgresProtocolTest, ErrorResponseSanitizesFields) {
@@ -305,7 +316,9 @@ TEST(PostgresProtocolTest, RowDescriptionDefaultNameAndTypes) {
                                                   {"d", ValueType::kDouble},
                                                   {"t", ValueType::kDate},
                                                   {"n", ValueType::kNull}});
-  // Assert -- anonymous columns are labelled ?column?
+  ASSERT_TRUE(ReadUint16(description, 5).HasValue());
+  EXPECT_EQ(ReadUint16(description, 5).Value(), 5);
+  // Assert -- anonymous columns are labeled ?column?
   EXPECT_NE(description.find("?column?"), std::string::npos);
   // int8 OID 20
   EXPECT_NE(description.find(std::string("\x00\x00\x00\x14", 4)),

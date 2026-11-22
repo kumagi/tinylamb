@@ -11,6 +11,7 @@
 #include <string>
 #include <utility>
 
+#include "executor/detail/charged_vector.hpp"
 #include "executor/detail/relation.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
@@ -22,6 +23,25 @@ class QueryMemoryTest : public ::testing::Test {
  protected:
   void TearDown() override { QueryMemoryBudget::Global().ResetForTest(0); }
 };
+
+TEST_F(QueryMemoryTest, ChargedVectorReservesPeakAndRefunds) {
+  auto& budget = QueryMemoryBudget::Global();
+  budget.ResetForTest(100, /*isolate_from_process=*/true);
+  {
+    QueryMemoryCharge charge;
+    std::vector<uint64_t> values;
+    ASSERT_TRUE(relational_detail::ReserveChargedVector(values, charge, 5));
+    values.push_back(42);
+    EXPECT_EQ(budget.Used(), 40U);
+    // The old 40 bytes and the new 48 bytes exceed the 80-byte soft limit.
+    EXPECT_FALSE(relational_detail::ReserveChargedVector(values, charge, 6));
+    EXPECT_EQ(values[0], 42U);
+    EXPECT_EQ(budget.Used(), 40U);
+    values.clear();
+    EXPECT_EQ(budget.Used(), 40U);
+  }
+  EXPECT_EQ(budget.Used(), 0U);
+}
 
 TEST_F(QueryMemoryTest, QueryMemoryBudget_ReserveAndRelease_TracksUsage) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
@@ -52,7 +72,7 @@ TEST_F(QueryMemoryTest, CanReserve_PastSoftLimit_RejectsReservation) {
 }
 
 TEST_F(QueryMemoryTest,
-     EstimateRowBytes_SampleRowAndValues_ReturnsExpectedEstimates) {
+       EstimateRowBytes_SampleRowAndValues_ReturnsExpectedEstimates) {
   Row row({Value(1), Value("hello")});
   EXPECT_GT(EstimateRowBytes(row), 0U);
   EXPECT_GE(EstimateValueBytes(Value("hello")), 5U);
@@ -133,7 +153,7 @@ TEST_F(QueryMemoryTest, CanReserve_AtBoundaries_ReturnsExpectedBoolean) {
 }
 
 TEST_F(QueryMemoryTest,
-     ReserveForcedAndRelease_VariousAmounts_ClampsUsageCorrectly) {
+       ReserveForcedAndRelease_VariousAmounts_ClampsUsageCorrectly) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   budget.ReserveForced(0);
@@ -178,6 +198,23 @@ TEST_F(QueryMemoryTest, QueryMemoryCharge_RaiiScope_AcquiresAndReleasesMemory) {
   EXPECT_EQ(budget.Used(), 0U);
   QueryMemoryCharge default_ctor;
   EXPECT_EQ(default_ctor.Bytes(), 0U);
+}
+
+TEST_F(QueryMemoryTest, QueryMemoryCharge_Adopt_OverflowSaturates) {
+  QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+  budget.ResetForTest(0, /*isolate_from_process=*/true);
+  constexpr size_t kMax = static_cast<size_t>(-1);
+  {
+    // kAlreadyReserved bytes are not re-reserved; adopting a value that would
+    // wrap bytes_ must not turn the charge into a tiny one that under-releases.
+    QueryMemoryCharge charge(QueryMemoryCharge::kAlreadyReserved{}, kMax - 1);
+    charge.Adopt(10);
+    EXPECT_EQ(charge.Bytes(), kMax);
+    charge.Adopt(1);
+    EXPECT_EQ(charge.Bytes(), kMax);
+  }
+  EXPECT_EQ(budget.Used(), 0U);
+  budget.ResetForTest(0);
 }
 
 TEST_F(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {

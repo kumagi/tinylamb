@@ -43,6 +43,11 @@ void LsmIndexIterator::Clear() {
   idx_ = 0;
   status_ = Status::kSuccess;
   stable_leaf_cache_ = false;
+  // A cleared iterator must return to the same state as a default-constructed
+  // one; leaving the tree/txn bound would let a later misuse read through a
+  // stale transaction after the cursor was reset.
+  tree_ = nullptr;
+  txn_ = nullptr;
 }
 
 LsmIndexIterator::~LsmIndexIterator() = default;
@@ -109,6 +114,13 @@ bool LsmIndexIterator::PullNext() {
 }
 
 std::string LsmIndexIterator::Key() const {
+  // A lazy cursor may have failed while previous entries are still buffered
+  // (e.g. after operator--). Never hand back one of those stale keys as if it
+  // were current -- Key() must agree with GetStatus()/Value(), so report no
+  // key once the cursor has recorded an error.
+  if (status_ != Status::kSuccess) {
+    return {};
+  }
   const auto* e = valid_ ? EntryAt(idx_) : nullptr;
   return e != nullptr ? e->first : std::string{};
 }
@@ -121,11 +133,17 @@ std::string LsmIndexIterator::Value() const {
   if (!stable_leaf_cache_ && txn_ != nullptr && tree_ != nullptr &&
       txn_->GetPageManager() != nullptr) {
     StatusOr<std::string> live =
-        txn_->GetPageManager()->LsmRead(tree_->Root(), e->first);
+        txn_->GetPageManager()->LsmRead(tree_->Root(), e->first, txn_);
     if (live.HasValue()) {
       return live.MoveValue();
     }
     if (live.GetStatus() == Status::kNotExists) {
+      // The key vanished between cursor creation and this live re-read. The
+      // 8 all-zero bytes are the canonical encoding of an *empty* value list
+      // (a u64 count of zero), not a tombstone with an opaque payload -- this
+      // is exactly what a deleted entry's index image looks like. Consumers
+      // (IndexScanIterator::UpdateIteratorState) recognise this encoding and
+      // skip the stale entry instead of decoding it as a RowPosition.
       return {sizeof(uint64_t), '\0'};
     }
   }
@@ -139,7 +157,16 @@ LsmIndexIterator& LsmIndexIterator::operator++() {
   ++idx_;
   if (idx_ < EntryCount()) {
     // Eager mode always lands here inside entries_; lazy mode may also be
-    // revisiting an already-pulled entry after operator--.
+    // revisiting an already-pulled entry after operator--. The cursor can
+    // fail while such buffered entries remain (PullNext has not been called
+    // again yet), so surface that error now instead of letting GetStatus()
+    // keep reporting a clean exhaustion.
+    if (scan_cursor_ != nullptr && status_ == Status::kSuccess) {
+      const Status cursor_status = scan_cursor_->status();
+      if (cursor_status != Status::kSuccess) {
+        status_ = cursor_status;
+      }
+    }
     return *this;
   }
   if (scan_cursor_ != nullptr && PullNext()) {
@@ -206,7 +233,7 @@ StatusOr<std::string> LsmIndex::Read(Transaction& txn, std::string_view key,
   if (hint_leaf != nullptr) {
     *hint_leaf = root_;
   }
-  return txn.GetPageManager()->LsmRead(root_, key);
+  return txn.GetPageManager()->LsmRead(root_, key, &txn);
 }
 
 StatusOr<std::string> LsmIndex::ReadVisible(Transaction& txn,
@@ -215,8 +242,9 @@ StatusOr<std::string> LsmIndex::ReadVisible(Transaction& txn,
   auto entries =
       txn.GetPageManager()->LsmScanRange(root_, key, key, true, &txn, &status);
   RETURN_IF_FAIL(status);
-  if (entries.empty()) { return Status::kNotExists;
-}
+  if (entries.empty()) {
+    return Status::kNotExists;
+  }
   return std::move(entries.front().second);
 }
 
@@ -228,8 +256,11 @@ LsmIndexIterator LsmIndex::Begin(Transaction& txn, std::string_view begin,
 StatusOr<std::vector<std::string>> LsmIndex::ScanPartitionBoundaries(
     Transaction& txn, std::string_view begin, std::string_view end,
     size_t leaves_per_partition) const {
+  Status status;
   const std::vector<std::pair<std::string, std::string>> entries =
-      txn.GetPageManager()->LsmScanRange(root_, begin, end, true, &txn);
+      txn.GetPageManager()->LsmScanRange(root_, begin, end, true, &txn,
+                                         &status);
+  RETURN_IF_FAIL(status);
   constexpr size_t kKeysPerVirtualLeaf = 128;
   const size_t step =
       std::max<size_t>(1, leaves_per_partition) * kKeysPerVirtualLeaf;

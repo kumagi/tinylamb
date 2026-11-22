@@ -41,7 +41,16 @@ std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
       throw std::runtime_error(engine->LastError());
     }
   }
-  return result.MoveValue().Collect();
+  QueryResult query = result.MoveValue();
+  std::vector<Row> rows = query.Collect();
+  // Collect() only drains rows; an execution failure can still leave `rows`
+  // empty, which an `empty()` expectation would silently accept.
+  if (query.GetStatus() != Status::kSuccess) {
+    throw std::runtime_error(query.GetStatus().GetMessage().empty()
+                                 ? "query execution failed"
+                                 : query.GetStatus().GetMessage());
+  }
+  return rows;
 }
 }  // namespace
 
@@ -265,7 +274,8 @@ TEST_F(SqlFeatureCoverageTest, WindowFrameAggregation) {
   EXPECT_EQ(ranks[0], Value(int64_t{1}));
   EXPECT_EQ(ranks[1], Value(int64_t{2}));
   EXPECT_EQ(ranks[3], Value(int64_t{4}));
-  const auto lags = Column("SELECT LAG(v) OVER (ORDER BY k) FROM f WHERE k = 1");
+  const auto lags =
+      Column("SELECT LAG(v) OVER (ORDER BY k) FROM f WHERE k = 1");
   ASSERT_EQ(lags.size(), 1U);
   EXPECT_TRUE(lags[0].IsNull());
 }

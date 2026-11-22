@@ -17,6 +17,7 @@
 #include "recovery/recovery_manager.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -64,6 +65,28 @@ TEST(LogRecordTest, RoundTripSerialization) {
     ASSERT_GT(decoded.Deserialize(bytes.data()), 0U);
     EXPECT_EQ(decoded, orig);
   }
+}
+
+TEST(LogRecordTest, FailedDeserializeLeavesFullyInvalidRecord) {
+  // A 0 return means "no bytes consumed": callers may reuse the same
+  // LogRecord afterwards, so a failure must never leave half-decoded fields.
+  const std::string valid =
+      LogRecord::UpdatingLogRecord(0, 10, 5, 2, "new_val", "old_val")
+          .Serialize();
+  LogRecord decoded;
+  ASSERT_GT(decoded.Deserialize(valid.data(), valid.size()), 0U);
+  ASSERT_NE(decoded, LogRecord{});
+
+  // Fails after the field reset (total exceeds the available bytes).
+  const std::string truncated = valid.substr(0, valid.size() - 4);
+  EXPECT_EQ(decoded.Deserialize(truncated.data(), truncated.size()), 0U);
+  EXPECT_EQ(decoded, LogRecord{});
+
+  // Fails before the field reset (bad magic) -- must also clear stale state.
+  std::string bad_magic = valid;
+  bad_magic[0] = static_cast<char>(bad_magic[0] ^ 0xFF);
+  EXPECT_EQ(decoded.Deserialize(bad_magic.data(), bad_magic.size()), 0U);
+  EXPECT_EQ(decoded, LogRecord{});
 }
 
 class RecoveryManagerTest : public ::testing::Test {
@@ -119,6 +142,12 @@ class RecoveryManagerTest : public ::testing::Test {
       ADD_FAILURE() << "TearDown directory iteration error: " << ec.message();
     }
     RemoveLogAndSegments(prefix_ + ".log");
+    // Direct Logger::Create / ofstream WALs use these alias paths instead of
+    // the fixture's primary log. Clean them here too so a failed ASSERT before
+    // a test's own remove() cannot leave debris behind.
+    RemoveLogAndSegments(prefix_ + "-size-limit.log");
+    RemoveLogAndSegments(prefix_ + "-inflated-length.log");
+    RemoveLogAndSegments(prefix_ + "-small-ring.log");
   }
 
   std::string prefix_;
@@ -128,10 +157,8 @@ class RecoveryManagerTest : public ::testing::Test {
   std::unique_ptr<TransactionManager> tm_;
 };
 
-// P642: `LogEnd()` folds a scan/IO failure into 0.  Callers that tell
-// "WAL is empty" apart from "WAL is unreadable" must use `LogEndStatus()`
-// so a transient I/O failure is not misdiagnosed as kCorrupt.
-TEST(RecoveryManagerLogEndStatus, PropagatesIoFailureWhereLogEndFoldsToZero) {
+// Both end queries distinguish a missing directory from an empty WAL.
+TEST(RecoveryManagerLogEndStatus, PropagatesIoFailure) {
   const std::string dir = "recovery_logend_" + RandomString();
   const std::string missing = dir + "/nested/nope.log";
   {
@@ -139,7 +166,7 @@ TEST(RecoveryManagerLogEndStatus, PropagatesIoFailureWhereLogEndFoldsToZero) {
     const StatusOr<lsn_t> end = rm.LogEndStatus();
     ASSERT_FALSE(end.HasValue());
     EXPECT_EQ(end.GetStatus().GetCode(), StatusCode::kIOError);
-    EXPECT_EQ(rm.LogEnd(), 0U);
+    EXPECT_EQ(rm.LogEnd().GetStatus(), Status::kIOError);
   }
   std::filesystem::create_directories(dir);
   {
@@ -166,6 +193,96 @@ TEST(RecoveryManagerLogEndStatus, PropagatesIoFailureWhereLogEndFoldsToZero) {
   std::filesystem::remove_all(dir, ec);
 }
 
+TEST_F(RecoveryManagerTest, TornTailWithoutLoggerIsNotReportedRepaired) {
+  const std::string path = prefix_ + "-torn-no-logger.log";
+  const std::string valid = LogRecord::BeginLogRecord(0, 10).Serialize();
+  const std::string tail = LogRecord::CommitLogRecord(0, 10).Serialize();
+  {
+    std::ofstream output(path, std::ios::binary);
+    output << valid << tail.substr(0, tail.size() / 2);
+  }
+  RecoveryManager reader(path, nullptr, size_t{64} << 20);
+  EXPECT_EQ(reader.RecoverFrom(0, nullptr), Status::kCorrupt);
+  EXPECT_EQ(std::filesystem::file_size(path), valid.size() + tail.size() / 2);
+  std::filesystem::remove(path);
+}
+
+TEST_F(RecoveryManagerTest, ReadsRecordLargerThanLoggerRing) {
+  const std::string path = prefix_ + "-small-ring.log";
+  auto logger = Logger::Create(path, 4096, 1).MoveValue();
+  ASSERT_NE(logger, nullptr);
+  RecoveryManager reader(path, pm_->GetPool(), logger->SegmentSize());
+  reader.SetLogger(logger.get());
+  const auto original = LogRecord::LsmPutLogRecord(
+      0, 10, 3, "key", std::string(128 * 1024, 'x'), "", false);
+  const auto position = logger->AddLog(original.Serialize());
+  ASSERT_TRUE(position.HasValue());
+  LogRecord decoded;
+  ASSERT_TRUE(reader.ReadLog(position.Value(), &decoded));
+  EXPECT_EQ(decoded, original);
+  ASSERT_SUCCESS(logger->Finish());
+}
+
+// #10844: the current (live) segment's logical-end footer must be validated
+// before a read fd is handed out. Otherwise a single corrupted end slot after
+// a crash reopen lets ReadAtDetailed compute record boundaries from a broken
+// end and read garbage.
+TEST_F(RecoveryManagerTest, RejectsCorruptFooterOnCurrentSegment) {
+  const std::string path = prefix_ + "-current-footer.log";
+  constexpr size_t kSegment = size_t{256} << 10;
+  auto created = Logger::Create(path, /*buffer_size=*/4096, /*every_ms=*/1,
+                                kSegment, /*preallocate_new_series=*/true);
+  ASSERT_SUCCESS(created.GetStatus());
+  auto logger = created.MoveValue();
+  ASSERT_NE(logger, nullptr);
+  ASSERT_TRUE(logger->FixedSizeSegments());
+
+  const std::string payload(128 * 1024, 'x');
+  const auto record =
+      LogRecord::LsmPutLogRecord(0, 10, 3, "key", payload, "", false);
+  const auto pos = logger->AddLog(record.Serialize());
+  ASSERT_TRUE(pos.HasValue());
+  ASSERT_SUCCESS(logger->WaitForDurable(pos.Value() + record.Size()));
+
+  // Sanity: with a healthy footer the record is readable from disk through a
+  // reader that has the live logger attached (so SegmentFdFor takes the
+  // logger-present path). It is larger than the ring, so this really reads
+  // the segment file rather than the in-memory buffer.
+  {
+    RecoveryManager reader(path, nullptr, kSegment);
+    reader.SetLogger(logger.get());
+    LogRecord decoded;
+    EXPECT_TRUE(reader.ReadLog(pos.Value(), &decoded));
+  }
+
+  // Damage one end slot's CRC of segment 0 while the logger stays attached.
+  const auto seg_path = Logger::SegmentPath(path, 0);
+  {
+    std::fstream footer(seg_path,
+                        std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(footer.good());
+    footer.seekg(static_cast<std::streamoff>(kSegment + 28));
+    char crc_byte = 0;
+    footer.read(&crc_byte, 1);
+    ASSERT_TRUE(footer.good());
+    crc_byte = static_cast<char>(crc_byte ^ 0xFFU);
+    footer.seekp(static_cast<std::streamoff>(kSegment + 28));
+    footer.write(&crc_byte, 1);
+    footer.flush();
+    ASSERT_TRUE(footer.good());
+  }
+
+  // A fresh reader must now reject the fd for the damaged current segment.
+  {
+    RecoveryManager reader(path, nullptr, kSegment);
+    reader.SetLogger(logger.get());
+    LogRecord decoded;
+    EXPECT_FALSE(reader.ReadLog(pos.Value(), &decoded));
+  }
+
+  ASSERT_SUCCESS(logger->Finish());
+}
+
 TEST_F(RecoveryManagerTest, RejectsRecordsLargerThanTheLoggerLimit) {
   // Serialize records directly: AddLog already refuses the second one.
   const size_t overhead = LogRecord::InsertingLogRecord(0, 10, 5, 2, "").Size();
@@ -189,6 +306,44 @@ TEST_F(RecoveryManagerTest, RejectsRecordsLargerThanTheLoggerLimit) {
     EXPECT_TRUE(reader.ReadLog(0, &recovered));
     EXPECT_EQ(recovered.Size(), Logger::kMaxRecordSize);
     EXPECT_FALSE(reader.ReadLog(Logger::kMaxRecordSize, &recovered));
+  }
+  std::filesystem::remove(path);
+}
+
+// T10517: an inflated total_len on a non-final record reads short just like a
+// genuinely torn final record. Recovery must not auto-truncate that as a torn
+// tail: committed records follow it, so without --force it must report
+// kCorrupt instead of silently discarding them.
+TEST_F(RecoveryManagerTest, InflatedLengthOnNonFinalRecordNeedsForce) {
+  const std::string path = prefix_ + "-inflated-length.log";
+  std::string first = LogRecord::BeginLogRecord(0, 1).Serialize();
+  std::string damaged = LogRecord::BeginLogRecord(first.size(), 2).Serialize();
+  std::string committed =
+      LogRecord::CommitLogRecord(first.size() + damaged.size(), 2).Serialize();
+
+  // Inflate damaged's total_len past the end of the file so ReadLogDetailed
+  // reports kShort at its offset even though `committed` follows it.
+  const uint32_t inflated = static_cast<uint32_t>(
+      first.size() + damaged.size() + committed.size() + 4096);
+  ASSERT_GE(inflated, 30U);
+  ASSERT_LE(inflated, Logger::kMaxRecordSize);
+  std::memcpy(damaged.data() + 4, &inflated, sizeof(inflated));
+  {
+    std::ofstream log(path, std::ios::binary);
+    log << first << damaged << committed;
+    ASSERT_TRUE(log.good());
+  }
+
+  {
+    RecoveryManager rm(path, nullptr, size_t{64} << 20);
+    rm.SetTornTailTruncationAllowedForInstance(false);
+    EXPECT_EQ(rm.RecoverFrom(0, nullptr), Status::kCorrupt);
+  }
+  {
+    // Force permits truncation but cannot repair without a logger.
+    RecoveryManager forced(path, nullptr, size_t{64} << 20);
+    forced.SetTornTailTruncationAllowedForInstance(true);
+    EXPECT_EQ(forced.RecoverFrom(0, nullptr), Status::kCorrupt);
   }
   std::filesystem::remove(path);
 }
@@ -252,6 +407,8 @@ TEST_F(RecoveryManagerTest,
   committed_pids.reserve(64);
   std::vector<slot_t> committed_slots;
   committed_slots.reserve(64);
+  std::vector<std::string> committed_values;
+  committed_values.reserve(64);
   std::vector<page_id_t> aborted_pids;
   aborted_pids.reserve(64);
 
@@ -266,10 +423,11 @@ TEST_F(RecoveryManagerTest,
       ASSERT_SUCCESS(txn.Abort());
       continue;
     }
-    ASSIGN_OR_ASSERT_FAIL(slot_t, slot,
-                          p->Insert(txn, "txn_val_" + std::to_string(i)));
+    const std::string value = "txn_val_" + std::to_string(i);
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, p->Insert(txn, value));
     committed_pids.push_back(pid);
     committed_slots.push_back(slot);
+    committed_values.push_back(value);
     p.PageUnlock();
     ASSERT_SUCCESS(txn.PreCommit());
     if (i == 31) {
@@ -286,7 +444,7 @@ TEST_F(RecoveryManagerTest,
     ASSIGN_OR_ASSERT_FAIL(PageRef, p, pm_->GetPage(committed_pids[i]));
     ASSIGN_OR_ASSERT_FAIL(std::string_view, got,
                           p->Read(verify, committed_slots[i]));
-    EXPECT_FALSE(got.empty());
+    EXPECT_EQ(std::string(got), committed_values[i]);
     p.PageUnlock();
   }
   ASSERT_SUCCESS(verify.PreCommit());
@@ -309,7 +467,11 @@ TEST(LogRecordDumpTest, RendersTypeNameAndSuppressesSentinelLocation) {
   EXPECT_EQ(oss.str(), "{prev:3 txn:4 type:kInsertRow pid:7 slot:2}");
 
   oss.str("");
-  oss << LogRecord(5, 6, static_cast<LogType>(200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): exercise unknown log type
+  oss << LogRecord(
+      5, 6,
+      static_cast<LogType>(
+          200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange):
+                  // exercise unknown log type
   EXPECT_EQ(oss.str(), "{prev:5 txn:6 type:kInvalid}");
 }
 

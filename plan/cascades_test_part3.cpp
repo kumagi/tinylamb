@@ -3,6 +3,51 @@
 
 namespace tinylamb::cascades {
 
+TEST(CascadesTest, TopNProjectionVariantsUseDistinctGroups) {
+  Memo memo;
+  const GroupId scan = memo.Build({"t"});
+  const GroupId projection = memo.EnsureDerivedGroup({"t"}, "projection");
+  ASSERT_TRUE(memo.AddExpression(
+      projection, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                    .children = {scan},
+                                    .target_list = {NamedExpression(
+                                        "a", ColumnValueExp("t.a"))}}));
+  std::vector<GroupId> tops;
+  for (int i = 0; i < 4; ++i) {
+    const GroupId top =
+        memo.EnsureDerivedGroup({"t"}, "top-" + std::to_string(i));
+    ASSERT_TRUE(memo.AddExpression(
+        top, LogicalExpression{
+                 .operation = LogicalOperator::kTopN,
+                 .children = {projection},
+                 .target_list = {NamedExpression("a", ColumnValueExp("a"))},
+                 .sort_ascending = {i != 1},
+                 .sort_nulls_first = {i != 2},
+                 .limit_count = 5,
+                 .with_ties = i == 3}));
+    tops.push_back(top);
+  }
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  for (const auto top : tops) {
+    search.Explore(top);
+  }
+  std::vector<GroupId> pushed;
+  for (const auto top : tops) {
+    for (const auto& expr : search.GetMemo().Get(top).expressions) {
+      if (expr.operation == LogicalOperator::kProjection &&
+          !expr.children.empty()) {
+        pushed.push_back(expr.children[0]);
+      }
+    }
+  }
+  ASSERT_EQ(pushed.size(), 4U);
+  for (size_t i = 0; i < pushed.size(); ++i) {
+    for (size_t j = i + 1; j < pushed.size(); ++j) {
+      EXPECT_NE(pushed[i], pushed[j]);
+    }
+  }
+}
+
 TEST(CascadesTest, EliminateDoubleSortRequiresSameKeyExpressions) {
   // D5 counterexample: eliminate_double_sort must NOT eliminate the outer
   // sort when the inner sort uses different key expressions, even if the
@@ -191,9 +236,11 @@ TEST(CascadesTest, InListToSemiJoinRejectsUncollectableBranch) {
 }
 
 TEST(CascadesTest, DerivedGroupFingerprintSeparatesDifferentInLists) {
-  // D5 (docs/design.md) acceptance 2: two IN-lists over the same column
-  // with the same SIZE but different values must not share one derived
-  // constant group (a count-only tag would collide and mix both value sets).
+  // D5 (docs/design.md, "ルールゲートの必須検証" / derived group): two
+  // IN-lists over the same column with the same SIZE but different values
+  // must not share one derived constant group (a count-only tag would
+  // collide and mix both value sets). The gate requires a fingerprint over
+  // semantic content, not a fixed string or a mere count.
   Memo memo;
   const GroupId scan = memo.Build({"t"});
   const GroupId sel_a = memo.EnsureDerivedGroup({"t"}, "sel_a");
@@ -1956,7 +2003,7 @@ TEST(CascadesTest, SpillCostIsMonotone) {
       1.5,   2.0,   5.0,    10.0,   20.0,    50.0,    100.0,
       250.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0};
 
-  // 3. Memory spill cost monotonicity.
+  // Memory spill cost monotonicity.
   MemoryBudget budget{.max_memory_bytes = 64.0 * 1024.0,
                       .row_size_bytes = 64.0,
                       .io_spill_cost_multiplier = 3.5};
@@ -2437,6 +2484,47 @@ TEST(CascadesTest, TopNPushThroughUnionAllSkipsWithTies) {
   search.Explore(topn);
   EXPECT_FALSE(
       search.AppliedRuleNames().contains("topn_push_through_union_all"));
+}
+
+TEST(CascadesTest, EliminateTrueSelectionPreservesInputScanFilter) {
+  // Selection(true, X) copies X's alternatives into its own group so costing
+  // can skip the residual filter. The input group's pushed-down scan filter
+  // must travel with them (the same contract
+  // pk_unique_distinct_elimination follows): without the merge the copied
+  // bare scan implements with an empty filter and the WHERE conditions are
+  // dropped. Run the rule in isolation so push_selection_into_scan cannot
+  // mask the missing merge.
+  Memo memo;
+  (void)memo.Build({"t"});
+  const GroupId filtered = memo.EnsureDerivedGroup({"t"}, "filtered_input");
+  memo.AddExpression(
+      filtered,
+      LogicalExpression{.operation = LogicalOperator::kScan, .table = "t"});
+  memo.MergeScanFilter(
+      filtered, BinaryExpressionExp(ColumnValueExp(ColumnName("t", "v")),
+                                    BinaryOperation::kGreaterThan,
+                                    ConstantValueExp(Value(int64_t{5}))));
+  const GroupId root = memo.EnsureDerivedGroup({"t"}, "true_selection");
+  memo.AddExpression(
+      root, LogicalExpression{.operation = LogicalOperator::kSelection,
+                              .children = {filtered},
+                              .predicate = ConstantValueExp(Value(true))});
+  RuleSet rules = RuleSet::Default();
+  for (const std::string& name : rules.Names()) {
+    if (name != "eliminate_true_selection") {
+      rules.Remove(name);
+    }
+  }
+  SearchEngine search(std::move(memo), rules);
+  search.Explore(root);
+  const Group& after = search.GetMemo().Get(root);
+  ASSERT_TRUE(after.filter);
+  EXPECT_NE(after.filter->ToString().find("t.v"), std::string::npos);
+  bool copied_scan = false;
+  for (const auto& expr : after.expressions) {
+    copied_scan |= expr.operation == LogicalOperator::kScan;
+  }
+  EXPECT_TRUE(copied_scan);
 }
 
 }  // namespace tinylamb::cascades

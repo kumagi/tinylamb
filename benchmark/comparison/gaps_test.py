@@ -109,5 +109,16 @@ class GapTest(unittest.TestCase):
         self.assertEqual(metrics['reader_p50_ms']['loss_factor'],20)
         self.assertEqual(metrics['reader_p99_ms']['domain'],'tail')
 
+    def test_htap_role_latency_on_one_side_only_is_skipped(self):
+        rows=[trial(e,0,10,1) for e in ('tinylamb','postgresql')]
+        for r in rows:
+            r.update(workload='htap',clients=4,
+                     role_tps={'reader':1,'transaction':9})
+        rows[0]['role_latency']={'reader':{'p50_ms':20,'p95_ms':30,'p99_ms':40},
+                                 'transaction':{'p50_ms':1,'p95_ms':2,'p99_ms':3}}
+        metrics={r['metric'] for r in collect(rows,'unindexed')}
+        self.assertIn('reader_tps',metrics)
+        self.assertNotIn('reader_p50_ms',metrics)
+
 
 if __name__=='__main__':unittest.main()

@@ -20,12 +20,15 @@
 #include <utility>
 
 #include "expression/expression.hpp"
+#include "type/column.hpp"
 
 namespace tinylamb {
 
 class ConstantValue : public ExpressionBase {
  public:
-  explicit ConstantValue(Value v) : val_(std::move(v)) {}
+  explicit ConstantValue(Value v,
+                         TextDomain text_domain = TextDomain::kUnspecified)
+      : val_(std::move(v)), text_domain_(text_domain) {}
   [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kConstantValue;
   }
@@ -40,6 +43,7 @@ class ConstantValue : public ExpressionBase {
     return val_;
   }
   [[nodiscard]] const Value& GetValue() const { return val_; }
+  [[nodiscard]] TextDomain GetTextDomain() const { return text_domain_; }
   [[nodiscard]] tinylamb::Type ResultType(
       const Schema& /*unused*/) const override {
     return TypeForValue();
@@ -88,6 +92,7 @@ class ConstantValue : public ExpressionBase {
     return {TypeTag::kInvalid};
   }
   Value val_;
+  TextDomain text_domain_;
 };
 
 }  // namespace tinylamb

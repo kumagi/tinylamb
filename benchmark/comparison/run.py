@@ -129,30 +129,53 @@ class Stack:
         if getattr(args, "include_oracle", False):
             self.ports['oracle'] = args.oracle_port
         self.log = None
+        self.port_reservations = {}
+
+    def reserve_port(self, name):
+        """Hold a port bound until the matching server is about to start.
+
+        A bind-and-close probe reserves nothing: with parallel comparison runs
+        another process can claim the port before the server finally binds
+        it. Keep the probe socket open and release it only when the matching
+        server is launched (close() drops any leftovers).
+        """
+        port = self.ports[name]
+        probe = socket.socket()
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            probe.close()
+            raise RuntimeError(f"port {port} for {name} is already in use")
+        self.port_reservations[name] = probe
+
+    def release_port(self, name):
+        probe = self.port_reservations.pop(name, None)
+        if probe is not None:
+            probe.close()
 
     def start(self):
         a = self.args
         cache_mib = getattr(a, 'data_cache_mib', 512)
-        for port in self.ports.values():
-            with socket.socket() as probe:
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                probe.bind(("127.0.0.1", port))
+        for name in self.ports:
+            self.reserve_port(name)
         common = ["--network", "host", "--cpuset-cpus", a.server_cpus]
         pg_name = f"tinylamb-comparison-pg-{os.getpid()}"
         mysql_name = f"tinylamb-comparison-mysql-{os.getpid()}"
-        for name, image, env, settings in [
-            (pg_name, a.postgres_image,
+        for engine, name, image, env, settings in [
+            ('postgresql', pg_name, a.postgres_image,
              ["-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_USER=bench", "-e", "POSTGRES_DB=bench"],
              ["-p", str(a.pg_port), "-c", "listen_addresses=127.0.0.1", "-c", f"shared_buffers={cache_mib}MB",
               "-c", "work_mem=64MB", "-c", "max_parallel_workers_per_gather=4", "-c", "jit=on",
               "-c", "fsync=on", "-c", "synchronous_commit=on"]),
-            (mysql_name, a.mysql_image,
+            ('mysql', mysql_name, a.mysql_image,
              ["-e", "MYSQL_ALLOW_EMPTY_PASSWORD=yes", "-e", "MYSQL_ROOT_HOST=%", "-e", "MYSQL_DATABASE=bench"],
              [f"--port={a.mysql_port}", "--bind-address=127.0.0.1", "--mysqlx=OFF",
               f"--innodb-buffer-pool-size={cache_mib * 1024 * 1024}", "--innodb-flush-log-at-trx-commit=1",
               "--skip-log-bin", "--max-connections=128"]),
         ]:
             self.names.append(name)
+            self.release_port(engine)
             invocation = ["docker", "run", "-d", "--name", name, *common, *env, image, *settings]
             append_json(self.output / "commands.jsonl", {"argv": invocation})
             command(invocation)
@@ -166,6 +189,7 @@ class Stack:
         env.update(TINYLAMB_PAGE_POOL_BYTES=str(cache_mib * 1024 * 1024), TINYLAMB_QUERY_MEMORY_BYTES=str(a.tiny_query_memory_mib * 1024 * 1024))
         invocation = ["taskset", "-c", a.server_cpus, str(Path(a.server).resolve()), str(self.work / "database"),
                       "--port", str(a.tiny_port), "--read-workers", str(a.read_workers)]
+        self.release_port('tinylamb')
         self.log = (self.output / "tinylamb-server.log").open("w")
         append_json(self.output / "commands.jsonl", {"argv": invocation, "env": {k: v for k, v in env.items() if k.startswith("TINYLAMB_")}})
         self.process = subprocess.Popen(invocation, env=env, cwd=ROOT, stdout=self.log, stderr=subprocess.STDOUT)
@@ -173,10 +197,12 @@ class Stack:
             from oracle_support import Container
             self.oracle = Container(a, self.work, lambda argv: append_json(self.output / "commands.jsonl", {"argv": argv}))
             self.names.append(self.oracle.name)
+            self.release_port('oracle')
             self.oracle.start()
         if getattr(a, 'include_duckdb', False):
             from duckdb_support import Server
             self.duckdb = Server(a, self.work, self.output, lambda argv: append_json(self.output / 'commands.jsonl', {'argv': argv}))
+            self.release_port('duckdb')
             self.duckdb.start()
         for engine in ENGINES:
             deadline = time.monotonic() + 120
@@ -276,14 +302,22 @@ class Stack:
         return data
 
     def close(self):
+        for name in list(self.port_reservations):
+            self.release_port(name)
         if self.duckdb:
             self.duckdb.close()
         if self.process is not None:
-            self.process.terminate()
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                pass  # the server already exited on its own
             try:
                 self.process.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                try:
+                    self.process.kill()
+                except ProcessLookupError:
+                    pass
                 self.process.wait()
         if self.log:
             self.log.close()

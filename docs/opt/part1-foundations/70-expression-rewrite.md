@@ -3,8 +3,8 @@
 - 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
 
 `ExpressionRuleSet` は、スカラー式を直接書き換える最下層の Rule セットです。
-この章ではフレームワークと基本的な 35 本を説明し、適用条件の複雑な 36 本は
-第 2 部の個別章へ分けます（合計 71 本）。
+この章ではフレームワークと基本的な 34 本を説明し、適用条件の複雑な 36 本は
+第 2 部の個別章へ分けます（合計 70 本）。
 
 ## 70-1. スカラー式を直接変換する Rule
 
@@ -14,9 +14,10 @@
 したがって、メモ、同値 Group、コスト計算のいずれにも依存しません。
 
 定義は `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` にあります。
-現行コードでは `built.Add` により 71 本を登録します（かつて重複していた
-`abs_of_abs` の二重登録等は 2026-10-02 の監査で整理済み）。本章で 35 本、
-第 2 部で 36 本を扱い、合計 71 本が `00-index.md` の一覧と一致します。
+現行コードでは `built.Add` により 70 本を登録します（かつて重複していた
+`abs_of_abs` の二重登録等は 2026-10-02 の監査で整理済み、`if_to_case` は
+スキーマ依存の分岐型昇格を CASE では保てないため削除済み）。本章で 34 本、
+第 2 部で 36 本を扱い、合計 70 本が `00-index.md` の一覧と一致します。
 
 式書き換えは、オプティマイザの初期処理以外でも実行されます。実行経路は次の
 3 箇所です。
@@ -195,9 +196,9 @@ const ExpressionRuleSet& NotComparisonFreeRules();
 あるかを判定できます。該当する構造があれば、`Default()` から
 `not_comparison` を除外した `NotComparisonFreeRules()` で書き換えます。
 
-## 70-4. 自明な Rule 35 本の一括解説
+## 70-4. 自明な Rule 34 本の一括解説
 
-`Default()` に含まれる基本的な 35 本の Rule を、意味に基づいて 6 つの
+`Default()` に含まれる基本的な 34 本の Rule を、意味に基づいて 6 つの
 グループに分類します。表の「guard」列は、変換関数が適用を拒否して
 `Expression{}`（空の式）を返す条件です。
 
@@ -231,7 +232,7 @@ const ExpressionRuleSet& NotComparisonFreeRules();
 | `fold_in` | すべてのオペランドが定数の `IN` 式 → 評価した定数 | 非定数のオペランドが 1 つでも存在する場合 |
 | `fold_function` | 引数がすべてリテラル（定数または INTERVAL）の関数呼出し → 評価した定数 | 関数の揮発性分類（`GetFunctionVolatility`）が `kImmutable` 以外（`RAND` や `NOW` など） |
 
-### IN と CASE の正規化（6 本）
+### IN と CASE の正規化（5 本）
 
 単一要素の `IN` 式を等値比較に変換する `singleton_in` では、NULL 定数の扱いに
 注意が必要です（`expression/rewrite.cpp`）。
@@ -254,7 +255,6 @@ const ExpressionRuleSet& NotComparisonFreeRules();
 | `empty_in_list` | リストが空の `IN` 式 → FALSE 定数 | 左辺の子式が非 NULL の静的定数でない場合（左辺が NULL のときは三値論理により NULL を返す必要があるため） |
 | `simplify_case` | CASE 式から定数 WHEN 条件を整理（定数 TRUE に達した時点で ELSE に繰り上げ、後続を枝刈り） | 定数の WHEN 条件が 1 つも存在しない場合 |
 | `uniform_case_result` | すべての WHEN 分岐および ELSE の結果が同一値の CASE 式 → その共通結果 | 各 WHEN 条件が `ExpressionCannotThrow`（評価時に例外を発生させない安全判定）かつ `SafeToReduceEvaluationCount`（副作用を含まない）を満たさない場合 |
-| `if_to_case` | 3 引数の `IF(c, t, e)` → `CASE WHEN c THEN t ELSE e END` | なし（構文の正規化） |
 
 ### 比較とブール論理の正規化（6 本）
 
@@ -338,7 +338,7 @@ Rule はインデックス照合を維持するため、整数型の列にも適
 | `pow_identities` | `POW(x, 1)` → `CAST(x AS FLOAT64)` | 指数が定数 1 でない場合（戻り値を FLOAT64 型に固定するため CAST を付与） |
 | `greatest_least_fold` | `GREATEST(GREATEST(a, b), c)` → `GREATEST(a, b, c)` | 引数が空、または結果の引数が 2 個未満 |
 
-これら 35 本の自明な Rule に共通する原則は、「式を消去または変形する際、その式が本来発生させるはずだった実行時例外や副作用を消失させてはならない」という点です。`ExpressionCannotThrow` や `SafeToReduceEvaluationCount` による事後条件判定は、この意味論的整合性を保証するために設けられています。
+これら 34 本の自明な Rule に共通する原則は、「式を消去または変形する際、その式が本来発生させるはずだった実行時例外や副作用を消失させてはならない」という点です。`ExpressionCannotThrow` や `SafeToReduceEvaluationCount` による事後条件判定は、この意味論的整合性を保証するために設けられています。
 
 ## 70-5. 個別に解説する 36 本の Rule
 

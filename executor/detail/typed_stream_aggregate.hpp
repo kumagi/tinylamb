@@ -37,7 +37,13 @@ namespace tinylamb::relational_detail {
 struct AggregateAccumulator;
 
 struct TypedFilterCompare {
-  enum class StringMatchKind : uint8_t { kExact, kPrefix, kSuffix, kContains };
+  enum class StringMatchKind : uint8_t {
+    kExact,
+    kPrefix,
+    kSuffix,
+    kContains,
+    kContainsTwo,
+  };
   slot_t left{0};
   slot_t right{0};
   BinaryOperation op{BinaryOperation::kEquals};
@@ -47,12 +53,15 @@ struct TypedFilterCompare {
   double double_constant{0.0};
   bool string_payload{false};
   std::string string_constant{};
+  std::string string_constant2{};
   StringMatchKind string_match{StringMatchKind::kExact};
 };
 
 // The compiler admits only literal LIKE segments with optional edge '%'.
 // These byte comparisons match the AST's no-'_' LIKE path, without creating
 // owned Values. NULL rejection remains the caller's responsibility.
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (two_segment_like_greedy_earliest_iff, two_segment_like_no_first_literal)
 inline bool MatchTypedStringCompare(
     std::string_view value, const TypedFilterCompare& compare) noexcept {
   const std::string_view literal = compare.string_constant;
@@ -70,6 +79,13 @@ inline bool MatchTypedStringCompare(
     case TypedFilterCompare::StringMatchKind::kContains:
       matched = value.find(literal) != std::string_view::npos;
       break;
+    case TypedFilterCompare::StringMatchKind::kContainsTwo: {
+      const size_t pos = value.find(literal);
+      matched = pos != std::string_view::npos &&
+                value.find(compare.string_constant2, pos + literal.size()) !=
+                    std::string_view::npos;
+      break;
+    }
   }
   return compare.op == BinaryOperation::kNotEquals ||
                  compare.op == BinaryOperation::kNotLike
@@ -455,8 +471,8 @@ inline bool EvaluateTypedIntExprCells(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kAdd: {
         int64_t v = 0;
         if (__builtin_add_overflow(stack[sp - 2], stack[sp - 1], &v)) {
-          *error =
-              StatusError(StatusCode::kIsInfinity, "integer overflow on '+'");
+          *error = StatusError(StatusCode::kInvalidArgument,
+                               "integer overflow on '+'");
           return false;
         }
         stack[sp - 2] = v;
@@ -466,8 +482,8 @@ inline bool EvaluateTypedIntExprCells(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kSub: {
         int64_t v = 0;
         if (__builtin_sub_overflow(stack[sp - 2], stack[sp - 1], &v)) {
-          *error =
-              StatusError(StatusCode::kIsInfinity, "integer overflow on '-'");
+          *error = StatusError(StatusCode::kInvalidArgument,
+                               "integer overflow on '-'");
           return false;
         }
         stack[sp - 2] = v;
@@ -477,8 +493,8 @@ inline bool EvaluateTypedIntExprCells(const TypedIntExprInput& expr,
       case TypedIntExprOp::Kind::kMul: {
         int64_t v = 0;
         if (__builtin_mul_overflow(stack[sp - 2], stack[sp - 1], &v)) {
-          *error =
-              StatusError(StatusCode::kIsInfinity, "integer overflow on '*'");
+          *error = StatusError(StatusCode::kInvalidArgument,
+                               "integer overflow on '*'");
           return false;
         }
         stack[sp - 2] = v;

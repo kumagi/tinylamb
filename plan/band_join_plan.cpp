@@ -49,6 +49,13 @@ bool IsOrderedComparison(BinaryOperation operation) {
   }
 }
 
+// Validate in the member initializer, before schema_/stats_ dereference the
+// child: a CHECK in the constructor body would be unreachable on a null child.
+Plan RequireChild(Plan child) {
+  CHECK_MSG(child != nullptr, "BandJoinPlan requires non-null children");
+  return child;
+}
+
 }  // namespace
 
 BandJoinPlan::BandJoinPlan(Plan left, std::vector<ColumnName> left_keys,
@@ -56,8 +63,8 @@ BandJoinPlan::BandJoinPlan(Plan left, std::vector<ColumnName> left_keys,
                            JoinKind kind, BinaryOperation comparison,
                            Expression predicate,
                            std::optional<size_t> estimated_rows)
-    : left_(std::move(left)),
-      right_(std::move(right)),
+    : left_(RequireChild(std::move(left))),
+      right_(RequireChild(std::move(right))),
       left_keys_(std::move(left_keys)),
       right_keys_(std::move(right_keys)),
       kind_(kind),
@@ -70,8 +77,6 @@ BandJoinPlan::BandJoinPlan(Plan left, std::vector<ColumnName> left_keys,
               kind_, left_->GetStats().Rows(), right_->GetStats().Rows(),
               SaturatingProduct(left_->GetStats().Rows(),
                                 right_->GetStats().Rows()))))) {
-  CHECK_MSG(left_ != nullptr && right_ != nullptr,
-            "BandJoinPlan requires non-null children");
   CHECK_MSG(left_keys_.size() == 1,
             "BandJoinPlan requires one key column per input");
   CHECK_MSG(right_keys_.size() == 1,

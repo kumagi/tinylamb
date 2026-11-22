@@ -32,8 +32,9 @@ graph TD
 1. 対象 Join Group のタグに `bloom` が含まれていないこと（無限再帰および多重適用の防止）。かつリレーション数が厳密に 2 であること。
 2. 結合式に有効な述語（`expression.predicate`）が存在すること。
 3. プローブ側 Group ID が現在の Join Group 自身と一致しないこと（循環参照防止）。
-4. プローブ側 Group のリレーション数が 1 であること（単一テーブルスキャンに対するプルーニングに限定）。
-5. 結合述語の等値連言（`kEquals`）から、プローブ側リレーションに属するキー列（`bloom_keys`）が 1 つ以上抽出できること。
+4. プローブ側 Group のタグが `bloom_probe:` で始まらないこと（再適用防止）。
+5. プローブ側 Group のリレーション数が 1 で、`sample_barrier` がなく、そのリレーションに対応する `kScan` 式が Group に含まれること。
+6. 結合述語の等値連言（`kEquals`）から、プローブ側リレーションに属するキー列（`bloom_keys`）が 1 つ以上抽出できること。
 
 ```cpp
           if (memo.Get(group).tag.find("bloom") != std::string::npos ||
@@ -47,9 +48,18 @@ graph TD
           if (probe_id == group) {
             return;
           }
+          if (memo.Get(probe_id).tag.starts_with("bloom_probe:")) {
+            return;
+          }
           const std::vector<std::string> probe_rels =
               memo.Get(probe_id).relations;
-          if (probe_rels.size() != 1) {
+          if (probe_rels.size() != 1 || memo.Get(probe_id).sample_barrier ||
+              !std::ranges::any_of(
+                  memo.Get(probe_id).expressions,
+                  [&](const LogicalExpression& candidate) {
+                    return candidate.operation == LogicalOperator::kScan &&
+                           candidate.table == probe_rels.front();
+                  })) {
             return;
           }
 ```
@@ -61,7 +71,7 @@ graph TD
 - **残差フィルタの保持（No Filter Loss）**:
   `memo.EnsureDerivedGroup` はデフォルトでフィルタを持たない空の Group を生成します。もし元のプローブ側 Group が既にスキャンフィルタ（例: `t2.val > 10`）を保持していた場合、フィルタを引き継がずに派生 Group へ置き換えると、元の選択条件が消失して出力多重度が増大します。したがって、派生 Group 生成直後に元のプローブ Group の `filter` を明示的にコピーし、述語的同値性を保証します。
 - **キー集合のフィンガープリント化**:
-  派生 Group はリレーション名とタグ文字列の組で一意化されます。キー集合が異なる結合条件が同一テーブルの派生 Group を誤って共有・衝突することを防ぐため、タグにはキー列名一覧を直列化したフィンガープリント（`bloom_probe:col1,col2,...`）を付与します。
+  派生 Group はリレーション名とタグ文字列の組で一意化されます。元のプローブ Group ID とキー列名一覧をタグに含め、異なる入力やキー集合が派生 Group を誤って共有しないようにします。
 - **多重度と三値論理の保全**:
   動的フィルタは擬陽性（False Positive）を許容する Bloom フィルタ等として物理層で機能しますが、ハッシュ結合本体の等値評価が最終フィルタとして残存するため、タプルの過剰出力や欠落は生じず、多重集合意味論および NULL セマンティクスは厳密に保たれます。
 
@@ -77,9 +87,11 @@ graph TD
             key_fingerprint.push_back(',');
           }
           const GroupId filtered_probe = memo.EnsureDerivedGroup(
-              probe_rels, "bloom_probe:" + key_fingerprint);
+              probe_rels,
+              "bloom_probe:" + GroupIdsTag({probe_id}) + key_fingerprint);
           if (filtered_probe != probe_id && filtered_probe != group) {
             memo.Get(filtered_probe).filter = probe_filter;
+            memo.Get(filtered_probe).dynamic_filter_keys = bloom_keys;
             memo.AddExpression(
                 filtered_probe,
                 LogicalExpression{.operation = LogicalOperator::kScan,
@@ -92,7 +104,7 @@ graph TD
 
 1. 元のプローブ側 Group から `probe_filter` を取得。
 2. キー列一覧からフィンガープリント文字列を構築し、`EnsureDerivedGroup` で派生 Group を確保。
-3. 派生 Group へ `probe_filter` を転送し、同テーブルに対する `kScan` 式を登録。
+3. 派生 Group へ `probe_filter` と動的フィルタのキーを設定し、同テーブルに対する `kScan` 式を登録。
 4. 元の結合式のプローブ側子 ID（`children[1]`）を派生 Group ID に差し替えた `rewritten` を作成し、元の Group に追加。
 
 ## 最適化効果

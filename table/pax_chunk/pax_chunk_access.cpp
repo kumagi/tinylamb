@@ -5001,7 +5001,13 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
     // value order does not exist (the same reason kSortDict/kTileDict
     // stay out of the order-preserving group).
     case Scheme::kPostings:
-    case Scheme::kHuffDict: {
+    case Scheme::kHuffDict:
+    // kChimp128 decodes to int64 values through Int64AtFast's block-table
+    // arm, so the generic bisect over the decoder is exact whenever the
+    // caller's key column is row-sorted. It used to fall into the
+    // "not found" group below, which hid existing keys from PointLookup /
+    // LowerBoundIndex on hand-built key cells declared kChimp128.
+    case Scheme::kChimp128: {
       // Random-accessible: plain binary search over the decoder. The hot
       // schemes go through the compact compare-chain dispatch (Int64AtFast):
       // the generic 40-way switch's cold arms cost an I-cache stall per
@@ -5693,11 +5699,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
     case Scheme::kFrontCode:
     case Scheme::kTemplate:
     case Scheme::kDStream:
-    case Scheme::kChimp128:
-      // NOTE: kChimp128 has a scalar decoder (Int64AtFast), but unlike the
-      // other numeric schemes it has no random-access bracket here; falling
-      // through to "not found" would disagree with full decode. Callers must
-      // validate the region (ValidateWalk) before relying on this bound.
+      // Varchar/non-numeric schemes: no int64 lower bound to speak of.
       break;
     case Scheme::kSimple8b: {
       // No random-access structure for a bisect, and the callers

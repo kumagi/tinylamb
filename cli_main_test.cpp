@@ -4,8 +4,10 @@
 // arrives on standard input, runs as one implicit transaction, and buffered
 // rows print only after the durability barrier.
 
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <cstdlib>
@@ -23,7 +25,7 @@ class CliMainTest : public ::testing::Test {
  public:
   void SetUp() override {
     dir_ = std::filesystem::temp_directory_path() /
-           ("cli_main_test-" + std::to_string(::getpid())) /
+           ("cli_main_test-" + std::to_string(tinylamb::platform::GetPid())) /
            ::testing::UnitTest::GetInstance()->current_test_info()->name();
     // T2805: a failed SetUp used to surface as a mysterious "CLI errored"
     // three steps later; state the environment failure at its source.
@@ -58,6 +60,10 @@ class CliMainTest : public ::testing::Test {
                 const std::filesystem::path& stdout_path, std::string* out,
                 std::string* err) {
     const std::filesystem::path exe = BinaryPath("tinylamb");
+    if (exe.empty()) {
+      *err = "cannot locate the test executable to find sibling tinylamb";
+      return -1;
+    }
     if (!std::filesystem::exists(exe)) {
       *err = "tinylamb executable not found next to the test binary";
       return -1;
@@ -83,6 +89,10 @@ class CliMainTest : public ::testing::Test {
       out += "'";
       return out;
     };
+    // This harness drives the CLI through a POSIX shell so that stdin and the
+    // two output streams are redirected exactly as in the installation. A
+    // Windows port needs an equivalent launcher; the WEXITSTATUS decode above
+    // is already guarded so the test target at least compiles there.
     const std::string command =
         "/bin/sh -c " +
         shell_quote(exe.string() + " " + args + " < " + input.string() + " > " +
@@ -97,10 +107,16 @@ class CliMainTest : public ::testing::Test {
       out->clear();
     }
     ReadFile(stderr_path, err);
+#ifndef _WIN32
     if (WIFEXITED(status)) {
       return WEXITSTATUS(status);
     }
     return -1;
+#else
+    // std::system() on Windows reports the child's exit code directly; there
+    // is no wait(2) status word to decode with WIFEXITED/WEXITSTATUS.
+    return status;
+#endif
   }
 
  protected:  // NOLINT(readability-redundant-access-specifiers)
@@ -111,17 +127,23 @@ class CliMainTest : public ::testing::Test {
     const std::filesystem::path self =
         tinylamb::platform::CurrentExecutablePath();
     if (self.empty()) {
-      return {name};
+      return {};
     }
     return self.parent_path() / name;
   }
 
   static void ReadFile(const std::filesystem::path& path, std::string* out) {
     std::ifstream in(path, std::ios::binary);
+    // An unreadable artifact must be reported here; otherwise callers see an
+    // empty message and blame the CLI instead of the missing output file.
+    if (!in.is_open()) {
+      ADD_FAILURE() << "cannot open " << path;
+      out->clear();
+      return;
+    }
     out->assign(std::istreambuf_iterator<char>(in),
                 std::istreambuf_iterator<char>());
   }
-
 };
 
 TEST_F(CliMainTest, ScriptExecutesAndPrintsRowsAfterCommit) {
@@ -216,10 +238,10 @@ TEST_F(CliMainTest, ForceFlagAcceptedAndScriptRuns) {
 }
 
 TEST_F(CliMainTest, QuotedSemicolonsStayOneStatement) {
-  // A split that ignored quotes would execute `INSERT INTO q VALUES (42` as
-  // its own (failing) statement and the whole script would abort; exit 0
-  // plus the intact literal proves the splitter walked the quoted ';' and,
-  // for "it's", the escaped quote.
+  // A split that ignored quotes would cut at the ';' inside the literal
+  // `'a;b'`, leaving `INSERT INTO q VALUES ('a` and `b');` as two malformed
+  // statements that abort the whole script. Exit 0 plus the intact literal
+  // proves the splitter walked the quoted ';'.
   std::string out;
   std::string err;
   const int code = RunCliRaw(
@@ -231,10 +253,34 @@ TEST_F(CliMainTest, QuotedSemicolonsStayOneStatement) {
   EXPECT_NE(out.find("\"a;b\""), std::string::npos) << out;
 }
 
+TEST_F(CliMainTest, OversizedStdinFailsInsteadOfOOM) {
+  std::string out;
+  std::string err;
+  // SplitSqlStatements caps the statement COUNT but not input BYTES; without
+  // a bounded read a huge redirect used to exhaust memory before the
+  // splitter ever ran. Exactly 16 MiB (the server's default max_message_bytes
+  // envelope) still runs; one byte more fails fast with a clean error.
+  const std::string fits = "SELECT 1" + std::string(16 * 1024 * 1024 - 8, ' ');
+  EXPECT_EQ(RunCli(fits, &out, &err), 0) << err;
+  EXPECT_NE(out.find("[1]"), std::string::npos) << out;
+
+  out.clear();
+  err.clear();
+  const std::string too_big = fits + " ";
+  EXPECT_EQ(RunCli(too_big, &out, &err), 1);
+  EXPECT_TRUE(out.empty()) << out;
+  EXPECT_NE(err.find("TooBigData"), std::string::npos) << err;
+  EXPECT_NE(err.find("input limit"), std::string::npos) << err;
+}
+
 TEST_F(CliMainTest, StdoutWriteFailureExitsNonZero) {
+#ifndef _WIN32
   if (::access("/dev/full", W_OK) != 0) {
     GTEST_SKIP() << "/dev/full unavailable";
   }
+#else
+  GTEST_SKIP() << "/dev/full is a POSIX device and unavailable on Windows";
+#endif
   std::string out;
   std::string err;
   // Same script the happy-path test runs, stdout aimed at /dev/full: the

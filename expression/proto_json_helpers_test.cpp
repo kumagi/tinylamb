@@ -53,6 +53,16 @@ TEST(JsonStructHelpersTest, JsonTextToValueParsesScalars) {
   EXPECT_EQ(parsed, Value(std::string("text")));
   EXPECT_TRUE(JsonTextToValue("{\"a\": 1}", &parsed));
   EXPECT_FALSE(JsonTextToValue("not json", &parsed));
+  EXPECT_FALSE(JsonTextToValue("", &parsed));
+  EXPECT_FALSE(JsonTextToValue("  \t\n", &parsed));
+  // Rejection needs more than one unrelated token: truncated JSON, trailing
+  // garbage after an otherwise valid number, and a bad numeric spelling are
+  // the cases that actually break struct-JSON round trips.
+  for (const char* invalid :
+       {"{\"a\": 1", "[1, 2", "42abc", "1.2.3", "\"unterminated"}) {
+    SCOPED_TRACE(invalid);
+    EXPECT_FALSE(JsonTextToValue(invalid, &parsed));
+  }
 }
 
 TEST(JsonStructHelpersTest, AuditArrayStringsRoundTripInsideStructMembers) {
@@ -93,6 +103,7 @@ TEST(JsonStructHelpersTest, EncodeStructMemberJsonCoversValueTypes) {
   EXPECT_EQ(quoted.MoveValue(), "\"a\\\"b\"");
   auto null_encoded = TryEncodeStructMemberJson(Value());
   ASSERT_TRUE(null_encoded.HasValue());
+  EXPECT_EQ(null_encoded.Value(), "null");
   auto nested =
       TryEncodeStructMemberJson(Value::Array({Value(int64_t{1})}, "INT64"));
   ASSERT_TRUE(nested.HasValue());
@@ -115,10 +126,21 @@ TEST(JsonStructHelpersTest, TryStructSetFieldCreatesAndUpdates) {
   ASSERT_TRUE(updated.HasValue());
   const std::string rewritten =
       std::string(updated.MoveValue().value.varchar_value);
-  // The rewrite carries both the original member and the new one.
-  EXPECT_NE(rewritten.find('a'), std::string::npos);
-  EXPECT_NE(rewritten.find("\"b\""), std::string::npos);
-  EXPECT_NE(rewritten.find('2'), std::string::npos);
+  // Substring checks would pass even if the value landed in the wrong slot
+  // or stray text were appended. Pin the complete object text and read it
+  // back structurally: exactly two members, a=1 and b=2.
+  EXPECT_EQ(rewritten, R"({"a":1,"b":2})");
+  Value reread;
+  ASSERT_TRUE(JsonTextToValue(rewritten, &reread));
+  const std::string object(reread.value.varchar_value);
+  ASSERT_GE(object.size(), 2U);
+  const auto members =
+      SplitJsonObjectMembers(object.substr(1, object.size() - 2));
+  ASSERT_EQ(members.size(), 2U);
+  EXPECT_EQ(members[0].first, "a");
+  EXPECT_EQ(members[0].second, "1");
+  EXPECT_EQ(members[1].first, "b");
+  EXPECT_EQ(members[1].second, "2");
 
   // A NULL base stays NULL.
   Value null_base;

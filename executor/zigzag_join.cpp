@@ -168,8 +168,7 @@ bool ZigZagJoin::LoadRight() {
                                     "ZigZagJoin right input is not ordered"));
       }
       right_order_.previous = key;
-      right_charge_.Add(EstimateRowBytes(candidate.row) +
-                        sizeof(RowPosition));
+      right_charge_.Add(EstimateRowBytes(candidate.row) + sizeof(RowPosition));
       right_rows_.push_back(std::move(candidate));
     }
   }
@@ -276,7 +275,17 @@ size_t ZigZagJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
-  destination->Reset(output_schema_, max_rows);
+  // An unspecified output schema means the join emits no projected columns;
+  // Reset(schema, n) would build a width-0 chunk that downstream width checks
+  // reject. Mirror BandJoin's empty-schema path.
+  if (output_schema_.ColumnCount() == 0) {
+    destination->Reset();
+    if (max_rows > kDefaultVectorSize) {
+      destination->Reserve(max_rows);
+    }
+  } else {
+    destination->Reset(output_schema_, max_rows);
+  }
   Row row;
   while (destination->Size() < max_rows) {
     RowPosition position;

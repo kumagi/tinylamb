@@ -20,4 +20,4 @@
 -- stmt: SELECT id, DATE_DIFF(DATE_ADD(dt, INTERVAL v DAY), dt, DAY) AS dd, STRPOS(COALESCE(name, ''), '-') AS sp, EXTRACT(MONTH FROM DATE '10000-03-15') AS m5, JSON_EXTRACT('[10,20,30]', '$[4294967297]') AS j_oob FROM gf_json;
 -- stmt: SELECT AS STRUCT s.* FROM gf_json s;
 -- ran_select: true
--- failure: evaluation-path mismatch (statements regenerated after SubstituteIdentifiers became per-identifier consistent)
+-- failure: evaluation-path mismatch (statements regenerated after SubstituteIdentifiers became per-identifier consistent; guards the ARRAY/UNNEST/STRUCT/JSON/date scalar paths on gf_json and the o.x / la.y / ARRAY_FILTER x->x identifier substitutions)

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <optional>
@@ -88,6 +89,12 @@ StatusOr<SqlUdfBinding> BindSqlUdfArguments(const SqlScalarFunction& function,
                        .schema = Schema("", std::move(columns))};
 }
 
+// CheckAvailable() runs before construction (see the UDF path in
+// function_call_expression.cpp), so tls_udf_depth counts the active *ancestor*
+// invocations at check time and the Nth nested call sees N - 1.  `>=` thus
+// rejects only the (kMaxUdfInvocationDepth + 1)-th call: exactly
+// kMaxUdfInvocationDepth invocations are permitted.  Keep the check-before-
+// increment order in mind before adjusting this comparison.
 SqlUdfDepthGuard::SqlUdfDepthGuard() { ++tls_udf_depth; }
 
 Status SqlUdfDepthGuard::CheckAvailable() {
@@ -126,6 +133,9 @@ std::string EncodeStructJson(
   };
 
   std::string json_out = "{";
+  // This runs per row for UDF STRUCT binding / equality: pre-size the buffer
+  // from the field count so the += chain does not reallocate once per field.
+  json_out.reserve(2 + (fields.size() * 32));
   bool first = true;
   for (const auto& [name, value] : fields) {
     if (!first) {
@@ -163,14 +173,26 @@ std::string EncodeStructJson(
         // Shortest round-trip representation so whole numbers render as "3"
         // rather than "3.000000" (matching the compliance goldens).
         {
-          std::array<char, 32> buffer{};
-          auto [end, ec] =
-              std::to_chars(buffer.data(), buffer.data() + buffer.size(),
-                            value.value.double_value);
-          if (ec == std::errc()) {
-            text = std::string(buffer.data(), end);
+          const double d = value.value.double_value;
+          // JSON has no NaN/Infinity literals and std::to_chars emits bare
+          // "nan"/"inf"/"-inf". Quote the canonical spellings instead, the
+          // same way json_text::ToJsonText and TryEncodeStructMemberJson do,
+          // so a STRUCT's canonical text stays parseable JSON.
+          if (std::isnan(d)) {
+            text = "NaN";
+            is_string = true;
+          } else if (std::isinf(d)) {
+            text = d > 0 ? "Infinity" : "-Infinity";
+            is_string = true;
           } else {
-            text = std::to_string(value.value.double_value);
+            std::array<char, 32> buffer{};
+            auto [end, ec] =
+                std::to_chars(buffer.data(), buffer.data() + buffer.size(), d);
+            if (ec == std::errc()) {
+              text = std::string(buffer.data(), end);
+            } else {
+              text = std::to_string(d);
+            }
           }
         }
         break;

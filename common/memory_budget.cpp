@@ -21,9 +21,9 @@ namespace {
 
 // floor(x * pct / 100) without premature truncation or size_t overflow.
 constexpr size_t PercentOf(size_t x, size_t pct) {
-  return (x / 100) * pct +  // NOLINT(readability-math-missing-parentheses)
+  return (x / 100) * pct +    // NOLINT(readability-math-missing-parentheses)
          ((x % 100) * pct) /  // NOLINT(readability-math-missing-parentheses)
-             100;  // NOLINT(readability-math-missing-parentheses)
+             100;             // NOLINT(readability-math-missing-parentheses)
 }
 
 thread_local bool tl_in_reclaim_hook = false;
@@ -300,15 +300,17 @@ size_t ProcessMemoryBudget::PoolFloorBytes(MemoryPoolKind pool) const noexcept {
       const size_t base = tx_floor_.load(std::memory_order_acquire);
       const size_t srv = server_tx_floor_.load(std::memory_order_acquire);
       const size_t lim = limit_.load(std::memory_order_acquire);
+      const size_t wanted = srv > std::numeric_limits<size_t>::max() - base
+                                ? std::numeric_limits<size_t>::max()
+                                : base + srv;
       if (lim == 0) {
-        return base + srv;
+        return wanted;
       }
       const size_t soft = ComputeSoftLimit(lim);
       const size_t other = storage_floor_.load(std::memory_order_acquire) +
                            columnar_floor_.load(std::memory_order_acquire) +
                            query_floor_.load(std::memory_order_acquire);
       const size_t max_tx = soft > other ? soft - other : base;
-      const size_t wanted = base + srv;
       const size_t granted = std::min(wanted, std::max(base, max_tx));
       // T1845: with a limit set, other pools' floors can clamp the server
       // tx floor (max_connections x per-connection send floor) away --
@@ -811,8 +813,8 @@ bool ProcessMemoryBudget::TryReserveWithReclaim(MemoryPoolKind pool,
     // RSS-gated refusals count memory the allocator still retains after
     // free().  Hand it back to the OS and re-sample before giving up, or a
     // retaining allocator can starve every later reservation indefinitely.
-    if (check_rss_pressure_.load(std::memory_order_acquire) &&
-        platform::ReleaseFreeHeapToOs()) {
+    if (check_rss_pressure_.load(std::memory_order_acquire)) {
+      (void)platform::ReleaseFreeHeapToOs();
       (void)SampledRssBytes(/*force_refresh=*/true);
     }
     if (TryReserve(pool, bytes, /*respect_soft_limit=*/true)) {
@@ -938,10 +940,10 @@ void ProcessMemoryBudget::ResetForTest(size_t limit_bytes,
   query_floor_.store(0, std::memory_order_release);
   tx_floor_.store(0, std::memory_order_release);
   server_tx_floor_.store(0, std::memory_order_release);
-  emergency_limit_.store(limit_bytes == 0
-                             ? (size_t{64} << 20)
-                             : std::min<size_t>(size_t{64} << 20, limit_bytes / 20),
-                         std::memory_order_release);
+  emergency_limit_.store(
+      limit_bytes == 0 ? (size_t{64} << 20)
+                       : std::min<size_t>(size_t{64} << 20, limit_bytes / 20),
+      std::memory_order_release);
   tx_floor_clamp_warned_.store(false, std::memory_order_release);
   emergency_used_.store(0, std::memory_order_release);
   storage_used_.store(0, std::memory_order_release);
@@ -1077,6 +1079,8 @@ bool ProcessMemoryCharge::TryAdd(size_t bytes,
     return false;
   }
   bytes_ += bytes;
+  // Recovering from a transient failure must restore Ok() (T1838).
+  valid_ = true;
   return true;
 }
 
@@ -1089,6 +1093,7 @@ bool ProcessMemoryCharge::TryAddWithReclaim(size_t bytes) {
     return false;
   }
   bytes_ += bytes;
+  valid_ = true;  // T1838: a later success clears a transient failure.
   return true;
 }
 

@@ -421,8 +421,8 @@ int64_t StreamVByteValueAt(const StreamVByteRegion& v, uint32_t i) {
 }
 
 // Bounds-checked header parse. Mirrors ValidateWalk's case 50 and the WASM
-// the WASM stream-vbyte decoder field for field: the header must echo the footer's
-// stream_len, nblk must equal ceil(n/16), the control plane is exactly
+// the WASM stream-vbyte decoder field for field: the header must echo the
+// footer's stream_len, nblk must equal ceil(n/16), the control plane is exactly
 // ceil(n/4) bytes, every block_off must equal the walked prefix sum at its
 // block boundary, and the total must land on stream_len. `end` is the cell's
 // successor offset, so a region that only *looks* big enough fails here rather
@@ -1134,7 +1134,7 @@ int64_t D2PforValueAt(const D2PforRegion& p, uint32_t idx) {
   // signed `+=` here is undefined behaviour, not merely a slow path. The
   // decoder held int64_t and a column of large-magnitude values overflowed the
   // signed add on every row -- reported by the default UBSan build, and
-  // liable to be "optimised" on the strength of no-overflow. This is the same
+  // liable to be "optimized" on the strength of no-overflow. This is the same
   // unsigned walk kDdRice and kDeltaFor already use; only the store back is a
   // reinterpretation, which is what the wraparound is for.
   if (r != 0) {
@@ -1163,7 +1163,7 @@ void DecodeD2PforAll(const D2PforRegion& p, int64_t* out) {
   // on -fsanitize=undefined, and UBSan reported it here while the round-trip
   // test still printed PASSED, because UBSan is non-fatal. Beyond the
   // diagnostic, the loop-carried `val += sd` chain is precisely the shape an
-  // optimiser may rewrite on an assumed no-overflow premise. Matches the
+  // optimizer may rewrite on an assumed no-overflow premise. Matches the
   // existing unsigned walk in the kDdRice and kDeltaFor decoders.
   uint64_t val = ReadBE64(p.ckpt);
   uint64_t sd = ReadBE64(p.ckpt + 8);

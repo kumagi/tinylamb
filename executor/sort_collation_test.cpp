@@ -46,9 +46,8 @@ const Schema& TextSchema() {
 }
 
 const Schema& TwoTextSchema() {
-  static const Schema schema("synthetic",
-                             {Column("a", ValueType::kVarChar),
-                              Column("b", ValueType::kVarChar)});
+  static const Schema schema("synthetic", {Column("a", ValueType::kVarChar),
+                                           Column("b", ValueType::kVarChar)});
   return schema;
 }
 
@@ -448,9 +447,9 @@ TEST(SortCollationTest, MixedBinaryAndCiCompositeKeysKeepGroupOrder) {
                         .nulls_first = std::nullopt,
                         .collation = Collation::kBinary},
       CiSortKey(Collate(ColumnValueExp("b"), "und:ci"))};
-  auto sort = std::make_shared<SortExecutor>(
-      std::make_shared<ConstantExecutor>(rows), TwoTextSchema(),
-      std::move(keys));
+  auto sort =
+      std::make_shared<SortExecutor>(std::make_shared<ConstantExecutor>(rows),
+                                     TwoTextSchema(), std::move(keys));
   std::vector<std::string> texts;
   texts.reserve(rows.size());
   Row row;
@@ -591,6 +590,21 @@ TEST(SortCollationTest, TopNWithTiesGroupsFoldedPeersAtTheBoundary) {
   // "A"/"a" are peers under the fold, so FETCH FIRST WITH TIES returns both
   // instead of stopping at the first one.
   EXPECT_EQ(DrainNames(topn), (std::vector<std::string>{"A", "a"}));
+}
+
+// The key carries und:ci statically while its expression yields plain
+// (untagged) VARCHARs. Peer detection must use the same SortKeyOrder the sort
+// used; raw EqualUnderCollation would read only operand tags, treat B/b as
+// unequal and stop at the first DESC boundary row.
+TEST(SortCollationTest, TopNWithTiesUsesKeyCollationForDescendingPeers) {
+  const std::vector<Row> rows{Row({Value("a")}), Row({Value("b")}),
+                              Row({Value("A")}), Row({Value("B")})};
+  auto topn = std::make_shared<TopNExecutor>(
+      std::make_shared<ConstantExecutor>(rows), NameSchema(),
+      std::vector<TopNExecutor::Key>{CiTopNKey(Name(), /*ascending=*/false)}, 1,
+      0, /*with_ties=*/true);
+  // DESC CI order: B == b (peers) > A == a, so LIMIT 1 WITH TIES keeps both.
+  EXPECT_EQ(DrainNames(topn), (std::vector<std::string>{"b", "B"}));
 }
 
 TEST(SortCollationTest, TopNWithTiesKeepsBinaryPeersSeparate) {

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/digest.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -65,16 +66,20 @@ TEST(FunctionCallAstEdges, HashAndEncodingFunctions) {
   auto md5 = Eval("md5", {Str("abc")});
   ASSERT_TRUE(md5.HasValue());
   // The digest returns as a raw binary string (AsString() would JSON-escape
-  // the non-printable digest bytes, so measure the payload itself).
-  EXPECT_EQ(md5.Value().AsStringView().size(), 16);
+  // the non-printable digest bytes, so measure the payload itself). Pin the
+  // classic RFC 1321/3174/4634 vectors for "abc", not just their lengths.
+  EXPECT_EQ(digest::ToHex(md5.Value().AsStringView()),
+            "900150983cd24fb0d6963f7d28e17f72");
 
   auto sha1 = Eval("sha1", {Str("abc")});
   ASSERT_TRUE(sha1.HasValue());
-  EXPECT_EQ(sha1.Value().AsStringView().size(), 20);
+  EXPECT_EQ(digest::ToHex(sha1.Value().AsStringView()),
+            "a9993e364706816aba3e25717850c26c9cd0d89d");
 
   auto sha256 = Eval("sha256", {Str("abc")});
   ASSERT_TRUE(sha256.HasValue());
-  EXPECT_EQ(sha256.Value().AsStringView().size(), 32);
+  EXPECT_EQ(digest::ToHex(sha256.Value().AsStringView()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 
   EXPECT_FALSE(Eval("md5", {}).HasValue());
   EXPECT_FALSE(Eval("sha256", {Str("a"), Str("b")}).HasValue());
@@ -87,9 +92,12 @@ TEST(FunctionCallAstEdges, RegexpFamilyBranches) {
 
   auto no_match = Eval("regexp_extract", {Str("hello"), Str("[0-9]+")});
   ASSERT_TRUE(no_match.HasValue());
+  // No digit in "hello": GoogleSQL REGEXP_EXTRACT returns NULL, not "".
+  EXPECT_TRUE(no_match.Value().IsNull());
 
   auto contains = Eval("regexp_contains", {Str("hello"), Str("l+")});
   ASSERT_TRUE(contains.HasValue());
+  EXPECT_EQ(contains.Value(), Value(true));
 
   auto replace = Eval("regexp_replace", {Str("a1b2"), Str("[0-9]"), Str("_")});
   ASSERT_TRUE(replace.HasValue());
@@ -153,8 +161,11 @@ TEST(FunctionCallAstEdges, GreatestLeastNullAndTypeRules) {
   ASSERT_TRUE(least.HasValue());
   EXPECT_EQ(least.Value().value.int_value, 1);
 
-  auto null_skip = Eval("greatest", {Value(), Value(int64_t{3})});
-  ASSERT_TRUE(null_skip.HasValue());
+  // GoogleSQL GREATEST/LEAST propagate NULL: any NULL argument makes the
+  // result NULL (they do not skip NULLs like aggregate MIN/MAX do).
+  auto null_arg = Eval("greatest", {Value(), Value(int64_t{3})});
+  ASSERT_TRUE(null_arg.HasValue());
+  EXPECT_TRUE(null_arg.Value().IsNull());
 }
 
 TEST(FunctionCallAstEdges, SafeArithmeticRejectsBadArity) {
@@ -171,9 +182,15 @@ TEST(FunctionCallAstEdges, StructJsonRoundTrip) {
   ASSERT_TRUE(json.HasValue());
   EXPECT_EQ(json.Value().AsStringView(), R"({"a":1,"b":"x"})");
 
+  // Round-trip the emitted struct text through the JSON reader.
+  Value decoded;
+  ASSERT_TRUE(JsonTextToValue(json.Value().AsStringView(), &decoded));
+  EXPECT_EQ(decoded, json.Value());
+
   // NULL field values flow through as an explicit JSON null.
   auto null_field = Eval("__struct_json__", {Str("a"), Value()});
   ASSERT_TRUE(null_field.HasValue());
+  EXPECT_EQ(null_field.Value().AsStringView(), R"({"a":null})");
 }
 
 TEST(FunctionCallSqlEdges, ScalarBatteryOverTable) {
@@ -240,7 +257,8 @@ TEST(FunctionCallSqlEdges, ScalarBatteryOverTable) {
   const std::vector<Expectation> battery = {
       {"SELECT array_to_string([1, 2, 3], '-') FROM t WHERE x = 9", true},
       {"SELECT byte_left('abcdef', 2) FROM t WHERE x = 9", true},
-      {"SELECT code_points_to_bytes(72) FROM t WHERE x = 9", true},
+      {"SELECT code_points_to_bytes([72]) FROM t WHERE x = 9", true},
+      {"SELECT code_points_to_bytes(72) FROM t WHERE x = 9", false},
       {"SELECT generate_array(1, 5, 2) FROM t WHERE x = 9", true},
       {"SELECT generate_date_array(DATE '2026-01-01', DATE '2026-01-03') "
        "FROM t WHERE x = 9",
@@ -273,6 +291,31 @@ TEST(FunctionCallSqlEdges, ScalarBatteryOverTable) {
     }
   }
   ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+}
+
+// __row_struct must be implemented by every AST evaluation overload; the
+// same expression used to return struct JSON on the 1-row path and fail with
+// "unknown function" on the join/context paths.
+TEST(FunctionCallAstEdges, RowStructMatchesAcrossAllTryEvaluateOverloads) {
+  const Schema left_schema(
+      "s", {Column(ColumnName{"s", "a"}, ValueType::kInt64),
+            Column(ColumnName{"other", "b"}, ValueType::kInt64)});
+  const Row left_row({Value(int64_t{1}), Value(int64_t{2})});
+  const Expression expr = std::make_shared<FunctionCallExpression>(
+      "__row_struct", std::vector<Expression>{ConstantValueExp(Value("s"))});
+
+  const auto one_row = expr->TryEvaluate(left_row, left_schema);
+  ASSERT_TRUE(one_row.HasValue());
+
+  const auto two_row =
+      expr->TryEvaluate(&left_row, left_schema, nullptr, Schema());
+  ASSERT_TRUE(two_row.HasValue()) << ToString(two_row.GetStatus());
+  EXPECT_EQ(two_row.Value(), one_row.Value());
+
+  NoSubqueryContext ctx;
+  const auto with_context = expr->TryEvaluate(left_row, left_schema, ctx);
+  ASSERT_TRUE(with_context.HasValue()) << ToString(with_context.GetStatus());
+  EXPECT_EQ(with_context.Value(), one_row.Value());
 }
 
 }  // namespace tinylamb

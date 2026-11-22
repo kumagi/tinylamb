@@ -202,7 +202,8 @@ GroupingSetKeyTexts::GroupingSetKeyTexts(
 
 GroupingSetBranchContext GroupingSetKeyTexts::ForBranch(
     const std::vector<Expression>& active) const {
-  GroupingSetBranchContext context{.all_key_texts = all_, .active_key_texts = {}};
+  GroupingSetBranchContext context{.all_key_texts = all_,
+                                   .active_key_texts = {}};
   context.active_key_texts.reserve(active.size());
   for (const Expression& key : active) {
     context.active_key_texts.insert(TextOf(key));
@@ -223,7 +224,13 @@ StatusOr<Expression> RewriteGroupingSetBranch(
           is_grouping_id ? "GROUPING_ID requires at least one argument"
                          : "GROUPING requires at least one argument");
     }
-    int64_t mask = 0;
+    // GROUPING_ID packs one flag bit per argument; an int64_t can hold at
+    // most 64 of them, and bit 63 is set via an unsigned shift to avoid the
+    // undefined signed left shift at the 64th argument.
+    if (grouping_args.size() > 64) {
+      return AstError<Expression>("GROUPING_ID accepts at most 64 arguments");
+    }
+    uint64_t mask = 0;
     for (size_t i = 0; i < grouping_args.size(); ++i) {
       if (!grouping_args[i]) {
         return AstError<Expression>(is_grouping_id
@@ -243,10 +250,10 @@ StatusOr<Expression> RewriteGroupingSetBranch(
         // with the leftmost argument as the most significant bit
         // (GoogleSQL bit-vector order: GROUPING_ID(a, b) ==
         //  2*GROUPING(a) + GROUPING(b)).
-        mask |= static_cast<int64_t>(1) << (grouping_args.size() - 1 - i);
+        mask |= uint64_t{1} << (grouping_args.size() - 1 - i);
       }
     }
-    return ConstantValueExp(Value(mask));
+    return ConstantValueExp(Value(static_cast<int64_t>(mask)));
   }
   switch (expression->Type()) {
     case TypeTag::kAggregateExp:
@@ -877,7 +884,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
     // calling Path() on them fails with "empty path expression".
     if (agg.arg_node != nullptr && agg.arg_node->kind == "PathExpression") {
       ASSIGN_OR_RETURN(std::string, hv157400_0, (Path(*agg.arg_node)));
-      agg_column_names.insert(Lower(hv157400_0));
+      agg_column_names.insert(Lower(std::move(hv157400_0)));
     }
   }
 
@@ -894,6 +901,13 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
     }
   }
 
+  // PIVOT output names must be unique (GoogleSQL rejects duplicates). Track
+  // every projection name, including the implicit GROUP BY ones, so a repeated
+  // IN-list alias cannot silently produce two same-named output columns.
+  std::unordered_set<std::string> pivot_output_names;
+  for (const auto& named : projections) {
+    pivot_output_names.insert(Lower(named.name));
+  }
   for (const GoogleSqlAstNode* pv : value_list->Children("PivotValue")) {
     const GoogleSqlAstNode* val_node = nullptr;
     for (const auto& c : pv->children) {
@@ -927,6 +941,10 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
         col_name = agg.agg_alias;
       } else {
         col_name = agg.agg_alias + "_" + val_alias;
+      }
+      if (!pivot_output_names.insert(Lower(col_name)).second) {
+        return AstError<SelectSource>(
+            "GoogleSQL AST: duplicate PIVOT output column name: " + col_name);
       }
 
       // A NULL in the PIVOT IN list matches rows whose pivot column is NULL,
@@ -1173,6 +1191,7 @@ struct ColumnTypeInfo {
   bool is_unsigned{false};
   uint8_t integer_bits{64};
   bool is_interval{false};
+  TextDomain text_domain{TextDomain::kUnspecified};
 };
 
 StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
@@ -1198,7 +1217,7 @@ StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
       cleaned.push_back(c);
     }
   }
-  const std::string lower = Lower(cleaned);
+  const std::string lower = Lower(std::move(cleaned));
   if (lower.starts_with("proto<") || lower.find('.') != std::string::npos) {
     return ColumnTypeInfo{.type = ValueType::kVarChar, .is_unsigned = false};
   }
@@ -1238,9 +1257,16 @@ StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
   if (type == "interval") {
     return ColumnTypeInfo{.type = ValueType::kVarChar, .is_interval = true};
   }
-  if (type == "string" || type == "varchar" || type == "char" ||
-      type == "timestamp" || type == "datetime" || type == "time" ||
-      type == "bytes" || type == "json") {
+  if (type == "string" || type == "varchar" || type == "char") {
+    return ColumnTypeInfo{.type = ValueType::kVarChar,
+                          .text_domain = TextDomain::kString};
+  }
+  if (type == "timestamp") {
+    return ColumnTypeInfo{.type = ValueType::kVarChar,
+                          .text_domain = TextDomain::kTimestamp};
+  }
+  if (type == "datetime" || type == "time" || type == "bytes" ||
+      type == "json") {
     return ColumnTypeInfo{.type = ValueType::kVarChar, .is_unsigned = false};
   }
   if (type == "array" || type.starts_with("array<")) {
@@ -1562,6 +1588,7 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
         columns.back().SetIntegerBits(integer_bits);
         columns.back().SetInterval(col_info.is_interval);
       }
+      columns.back().SetTextDomain(col_info.text_domain);
     }
     // Table-level PRIMARY KEY (k): a single-column key rides the same
     // column constraint slot as the column-level `k INT64 PRIMARY KEY`
@@ -1610,15 +1637,17 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       const bool was_unsigned = target->IsUnsigned();
       const uint8_t integer_bits = target->IntegerBits();
       const bool is_interval = target->IsInterval();
+      const TextDomain text_domain = target->GetTextDomain();
       *target = Column(target->Name().name, target->Type(),
                        Constraint(Constraint::kPrimaryKey));
       target->SetUnsigned(was_unsigned);
       target->SetIntegerBits(integer_bits);
       target->SetInterval(is_interval);
+      target->SetTextDomain(text_domain);
     }
     for (const GoogleSqlAstNode* fk : elements->Children("ForeignKey")) {
       if (fk->detail.find("NOT ENFORCED") != std::string::npos) {
-        continue;  // declarative only; matching table-level PK behaviour
+        continue;  // declarative only; matching table-level PK behavior
       }
       const GoogleSqlAstNode* child_list = fk->Child("ColumnList");
       const GoogleSqlAstNode* reference = fk->Child("ForeignKeyReference");
@@ -1655,14 +1684,19 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
           return AstError<std::unique_ptr<Statement>>(
               "GoogleSQL AST: column has two FOREIGN KEY constraints");
         }
-        if (col.GetConstraint().ctype != Constraint::kNothing &&
-            col.GetConstraint().ctype != Constraint::kNotNull) {
+        // The single constraint slot cannot also carry NOT NULL. Reject the
+        // combination explicitly instead of silently replacing kNotNull with
+        // kForeign (which would let NULL rows through CheckRowConstraints).
+        // PRIMARY KEY is subsumed into kPrimaryKey by the loop above and is
+        // rejected here as well.
+        if (col.GetConstraint().ctype != Constraint::kNothing) {
           return AstError<std::unique_ptr<Statement>>(
               "column " + col.Name().name +
               " cannot combine FOREIGN KEY with its existing constraint");
         }
         const bool was_unsigned = col.IsUnsigned();
         const bool was_interval = col.IsInterval();
+        const TextDomain text_domain = col.GetTextDomain();
         const uint8_t integer_bits = col.IntegerBits();
         col = Column(col.Name().name, col.Type(),
                      Constraint(Constraint::kForeign,
@@ -1671,6 +1705,7 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
         col.SetUnsigned(was_unsigned);
         col.SetIntegerBits(integer_bits);
         col.SetInterval(was_interval);
+        col.SetTextDomain(text_domain);
         found = true;
         break;
       }
@@ -1909,6 +1944,10 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
       continue;
     }
     if (const GoogleSqlAstNode* nested = item->Child("InsertStatement")) {
+      if (nested->Child("ReturningClause") != nullptr) {
+        return AstStatus(
+            "GoogleSQL AST: nested DML RETURNING is not supported");
+      }
       const GoogleSqlAstNode* target = nested->Child("PathExpression");
       if (target == nullptr) {
         return AstError<std::unique_ptr<Statement>>(

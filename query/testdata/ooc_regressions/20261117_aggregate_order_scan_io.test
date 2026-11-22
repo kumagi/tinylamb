@@ -1,7 +1,8 @@
 -- sql_ooc_fuzzer regression
 -- seed: 991
 -- profile: pool=16384 columnar=0 opmem=0 spill=0 temp=0 route=0
--- failure: sweep io / budget-invariance mismatch [groupby+orderby] (same query, different memory knobs) :: op 2 `sweep io 75 :: q ord=1 heavy=0 take=31 nv=2 vs=599231664 ex=0 snap=0 :: SELECT SUBSTR(pad, 1, 2) AS c1, COUNT(*) AS c2 FROM t1 GROUP BY 1 ORDER BY 1`: sweep io `q ord=1 heavy=0 take=31 nv=2 vs=599231664 ex=0 snap=0 :: SELECT SUBSTR(pad, 1, 2) AS c1, COUNT(*) AS c2 FROM t1 GROUP BY...(133B)` with failure #3: budget-invariance mismatch [groupby+orderby] (same query, different memory knobs): SELECT SUBSTR(pad, 1, 2) AS c1, COUNT(*) AS c2 FROM t1 GROUP BY 1 ORDER BY 1 |   reference {opmem=0 spill=
+-- failure: sweep io / budget-invariance mismatch [groupby+orderby] (same query, different memory knobs) :: op 2 `sweep io 75 :: q ord=1 heavy=0 take=31 nv=2 vs=599231664 ex=0 snap=0 :: SELECT SUBSTR(pad, 1, 2) AS c1, COUNT(*) AS c2 FROM t1 GROUP BY 1 ORDER BY 1`: sweep io `q ord=1 heavy=0 take=31 nv=2 vs=599231664 ex=0 snap=0 :: SELECT SUBSTR(pad, 1, 2) AS c1, COUNT(*) AS c2 FROM t1 GROUP BY...(133B)` with failure #3: budget-invariance mismatch [groupby+orderby] (same query, different memory knobs): SELECT SUBSTR(pad, 1, 2) AS c1, COUNT(*) AS c2 FROM t1 GROUP BY 1 ORDER BY 1 |   reference {opmem=0 spill=0 temp=0 route=0} vs {tighter memory knobs} |   expected and engine row counts differ
+-- note: groupby+orderby budget-invariance mismatch (summary truncated at capture time)
 create t1 33 93 226
 ins_bulk t1 1 430 685
 sweep io 75 :: q ord=1 heavy=0 take=31 nv=2 vs=599231664 ex=0 snap=0 :: SELECT SUBSTR(pad, 1, 2) AS c1, COUNT(*) AS c2 FROM t1 GROUP BY 1 ORDER BY 1

@@ -181,6 +181,29 @@ constexpr const char* kDimDdl = "CREATE TABLE dim (k INT64, tag VARCHAR(8));";
 
 }  // namespace
 
+// Setup failures must be findings in both generation and replay.
+static std::string RunJoinSetup(SqlEngine& engine, TransactionContext& ctx,
+                                const std::vector<std::string>& setup) {
+  for (const std::string& sql : setup) {
+    auto result = engine.Execute(ctx, sql);
+    if (!result.HasValue()) {
+      return "[JOIN FUZZ SETUP ERROR] " + sql + ": " +
+             result.GetStatus().GetMessage();
+    }
+    result.Value().Drain();
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      return "[JOIN FUZZ SETUP ERROR] " + sql + ": " +
+             result.Value().GetStatus().GetMessage();
+    }
+  }
+  const Status status = ctx.txn_.PreCommit();
+  if (status != Status::kSuccess) {
+    return "[JOIN FUZZ SETUP ERROR] PreCommit: " +
+           std::string(status.GetMessage());
+  }
+  return "";
+}
+
 std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
                              JoinTrace* trace) {
   Gen g(rng);
@@ -251,28 +274,8 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
-  for (const std::string& sql : t.setup) {
-    StatusOr<QueryResult> result = engine.Execute(ctx, sql);
-    if (!result.HasValue()) {
-      if (verbose) {
-        std::cerr << "[join_fuzz][skip-setup] " << sql << "\n";
-      }
-      return "";
-    }
-    // QueryResults are lazy: drain or the INSERT never happens.
-    result.Value().Drain();
-    if (result.Value().GetStatus() != Status::kSuccess) {
-      if (verbose) {
-        std::cerr << "[join_fuzz][skip-setup-status] " << sql << "\n";
-      }
-      return "";
-    }
-  }
-  // Commit setup so read-only queries can trigger lazy LSTableStore creation
-  // (`GetOrBuildLSTableStore` requires an empty uncommitted WriteSet).
-  if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    return "";
-  }
+  const std::string setup_error = RunJoinSetup(engine, ctx, t.setup);
+  if (!setup_error.empty()) return setup_error;
   ctx = db.BeginContext();
 
   const int query_count = large ? g.Pick(1, 2) : g.Pick(2, 5);
@@ -479,7 +482,10 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       actual.reserve(got->size());
       for (const EngineRow& r : *got) {
         std::string row;
-        for (size_t i = 0; i < r.cells.size() && i < proj.size(); ++i) {
+        // Compare every engine cell: truncating at proj.size() would hide a
+        // regression that emits extra projection columns (the expected row
+        // always has exactly proj.size() cells).
+        for (size_t i = 0; i < r.cells.size(); ++i) {
           row += FormatEngineValue(r.At(i)) + ",";
         }
         actual.push_back(row);
@@ -1363,19 +1369,31 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   // plain scans and mislabel the finding.  Fail loudly instead.
   if (!ApplyIndexSpec(db, ctx,
                       "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);") ||
-      (!large &&
-       !ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);")) ||
+      (!large && !ApplyIndexSpec(
+                     db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);")) ||
       !ApplyIndexSpec(db, ctx,
                       "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);")) {
-    return std::string("[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n");  // NOLINT(modernize-return-braced-init-list)
+    return std::string(
+        "[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n");  // NOLINT(modernize-return-braced-init-list)
   }
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
-    if (auto res = engine.Execute(ctx, analyze_sql); res.HasValue()) {
-      res.Value().Drain();
+    // Statistics collection is part of the indexed-mode setup: a silent
+    // failure would run the "indexed" verification with no statistics and
+    // mislabel any resulting plan difference.
+    auto analyze = engine.Execute(ctx, analyze_sql);
+    if (!analyze.HasValue()) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE failed: " +
+             std::string(analyze.GetStatus().GetMessage()) + "\n";
+    }
+    analyze.Value().Drain();
+    if (analyze.Value().GetStatus() != Status::kSuccess) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream failed: " +
+             std::string(analyze.Value().GetStatus().GetMessage()) + "\n";
     }
   }
-  if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    return "";
+  if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+    return std::string("[JOIN-INDEXED SETUP FAILED] PreCommit: ") +
+           pre.GetMessage() + "\n";
   }
   ctx = db.BeginContext();
   const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
@@ -1459,21 +1477,8 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
-  for (const std::string& sql : trace.setup) {
-    StatusOr<QueryResult> result = engine.Execute(ctx, sql);
-    // QueryResults are lazy: drain or the INSERT never happens.
-    if (!result.HasValue()) {
-      return "setup failed: " + sql;
-    }
-    result.Value().Drain();
-  }
-  // T4619: surface a setup-commit failure as a replay error (the caller
-  // buckets reports by signature) instead of silently probing an
-  // uncommitted setup.
-  const Status committed = ctx.txn_.PreCommit();
-  if (committed != Status::kSuccess) {
-    return "setup commit failed: " + ToString(committed);
-  }
+  const std::string setup_error = RunJoinSetup(engine, ctx, trace.setup);
+  if (!setup_error.empty()) return setup_error;
   ctx = db.BeginContext();
   auto check_queries = [&](bool force_relational,
                            const char* tag) -> std::string {
@@ -1524,8 +1529,18 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
   }
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);");
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
-    if (auto res = engine.Execute(ctx, analyze_sql); res.HasValue()) {
-      res.Value().Drain();
+    // Statistics collection is part of the indexed-mode setup: a silent
+    // failure would run the "indexed" verification with no statistics and
+    // mislabel any resulting plan difference.
+    auto analyze = engine.Execute(ctx, analyze_sql);
+    if (!analyze.HasValue()) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE failed: " +
+             std::string(analyze.GetStatus().GetMessage()) + "\n";
+    }
+    analyze.Value().Drain();
+    if (analyze.Value().GetStatus() != Status::kSuccess) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream failed: " +
+             std::string(analyze.Value().GetStatus().GetMessage()) + "\n";
     }
   }
   if (ctx.txn_.PreCommit() != Status::kSuccess) {

@@ -176,9 +176,8 @@ TEST(TypedStreamAggregateTest, DependentIntegerKernelsAndFallbackMatchAst) {
       if (expected.HasValue()) {
         EXPECT_EQ(Value(actual), expected.Value());
       } else {
-        // The primitive reports failure internally; Bytecode below supplies
-        // the public error classification, which must match the AST exactly.
-        EXPECT_NE(error, Status::kSuccess);
+        EXPECT_EQ(error, expected.GetStatus());
+        EXPECT_EQ(ToString(error), ToString(expected.GetStatus()));
       }
       const auto fallback =
           TryEvaluateRowAuto(plan.dependent_key_programs[0], row);
@@ -257,17 +256,9 @@ TEST(TypedStreamAggregateTest, TryCompileAndDecideTypedFilterCompare) {
 
 TEST(TypedStreamAggregateTest, LiteralLikeMatchesAstAndRejectsOtherDomains) {
   const Schema schema("input", {Column("s", ValueType::kVarChar)});
-  const std::vector<std::string> patterns{"",
-                                          "%",
-                                          "%%",
-                                          "alpha",
-                                          "alpha%",
-                                          "%alpha",
-                                          "%alpha%",
-                                          "尾%",
-                                          "%尾",
-                                          "%a\\b%",
-                                          std::string("%a\0b%", 5)};
+  const std::vector<std::string> patterns{
+      "",       "%",       "%%",  "alpha", "alpha%",
+      "%alpha", "%alpha%", "尾%", "%尾",   std::string("%a\0b%", 5)};
   const std::vector<Value> values{Value(),
                                   Value(""),
                                   Value("alpha"),
@@ -306,8 +297,8 @@ TEST(TypedStreamAggregateTest, LiteralLikeMatchesAstAndRejectsOtherDomains) {
     }
   }
   for (const auto& pattern :
-       {Value("a_b"), Value("a%b"), Value("%a%b%"), Value("%%%"), Value(),
-        Value(1), Value("alpha%").WithCollation(2)}) {
+       {Value("a_b"), Value("a%b"), Value("%a%b%"), Value("%a\\b%"),
+        Value("%%%"), Value(), Value(1), Value("alpha%").WithCollation(2)}) {
     EXPECT_FALSE(TryCompileTypedFilterCompare(
         BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kLike,
                             ConstantValueExp(pattern)),
@@ -597,7 +588,8 @@ TEST(TypedStreamAggregateTest, AccumulatorChunksCommitsStorageInSegments) {
     chunks.AppendGroup(aggregates, nullptr);
   }
   EXPECT_EQ(chunks.CommittedBytes(),
-            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+            // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
+            // is unambiguous
             relational_detail::AccumulatorChunks::kSlotsPerChunk *
                     sizeof(AggregateAccumulator) +
                 relational_detail::AccumulatorChunks::kSegmentBytes);
@@ -622,13 +614,13 @@ void TypedStreamColumnarKvFixture::Build(Database* db, const std::string& name,
                                          const std::vector<int64_t>& ks,
                                          const std::vector<int64_t>& vs) {
   TransactionContext ctx = db->BeginContext();
-  Schema schema(name, {Column("k", ValueType::kInt64),
-                       Column("v", ValueType::kInt64)});
+  Schema schema(
+      name, {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
   ASSERT_EQ(db->CreateTable(ctx, schema).GetStatus(), Status::kSuccess);
   Table tbl = db->GetTable(ctx, name).MoveValue();
   for (size_t i = 0; i < vs.size(); ++i) {
-    ASSERT_TRUE(tbl.Insert(ctx.txn_, Row({Value(ks[i]), Value(vs[i])}))
-                    .HasValue());
+    ASSERT_TRUE(
+        tbl.Insert(ctx.txn_, Row({Value(ks[i]), Value(vs[i])})).HasValue());
   }
   ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
   TransactionContext compact_ctx = db->BeginContext();
@@ -709,9 +701,8 @@ TEST(TypedStreamAggregateTest, SkewedGroupedSumInt64KeepsCanonicalOverflow) {
   const std::string sql_b = "SELECT k, SUM(v) FROM tb GROUP BY k";
 
   for (int attempt = 0; attempt < 4; ++attempt) {
-    auto rows_a = RunGroupedQuery(&engine, &ctx,
-                                  "SELECT k, SUM(v) FROM ta GROUP BY k",
-                                  &status);
+    auto rows_a = RunGroupedQuery(
+        &engine, &ctx, "SELECT k, SUM(v) FROM ta GROUP BY k", &status);
     EXPECT_EQ(status, Status::kIsInfinity)
         << "attempt " << attempt << ": block-boundary fold must report the "
         << "canonical SUM overflow";
@@ -781,8 +772,7 @@ TEST(TypedStreamAggregateTest, ScalarDictAvgMatchesRowOrderedFold) {
   ASSERT_EQ(status, Status::kSuccess);
   ASSERT_EQ(canonical.size(), 1U);
 
-  EXPECT_EQ(typed[0][0].value.double_value,
-            canonical[0][0].value.double_value)
+  EXPECT_EQ(typed[0][0].value.double_value, canonical[0][0].value.double_value)
       << "AVG must not depend on fold order (P596 re-association)";
   db->DeleteAll();
 }

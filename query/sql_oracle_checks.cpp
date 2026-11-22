@@ -417,7 +417,9 @@ std::optional<std::vector<Row>> RunRowsMode(Database& db,
   engine.SetForceRelationalFallback(force_relational);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
-    *error = engine.LastError();
+    if (error != nullptr) {
+      *error = engine.LastError();
+    }
     return std::nullopt;
   }
   std::vector<Row> rows;
@@ -426,7 +428,10 @@ std::optional<std::vector<Row>> RunRowsMode(Database& db,
     rows.push_back(row);
   }
   if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
-    *error = st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    if (error != nullptr) {
+      *error =
+          st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    }
     return std::nullopt;
   }
   return rows;
@@ -660,7 +665,9 @@ bool CheckTlpAgg(Database& db, TransactionContext& ctx,
     }
     parts.push_back(std::move(*rows));
     for (const Row& r : parts.back()) {
-      if (r.Size() < 3 || r[1].IsNull() || r[1].type != ValueType::kInt64 ||
+      // Count() is the cell count; Size() is the serialized byte length and
+      // would let 1-2 cell rows through into the out-of-bounds r[1]/r[2] reads.
+      if (r.Count() < 3 || r[1].IsNull() || r[1].type != ValueType::kInt64 ||
           (!r[2].IsNull() && r[2].type != ValueType::kInt64)) {
         return false;  // unexpected aggregate output shape: skip
       }
@@ -954,6 +961,12 @@ bool CheckPqs(Database& db, TransactionContext& ctx, const OracleTrace& t,
   }
   bool pivot_found = false;
   for (const Row& r : *us) {
+    // A schema/EXPLAIN regression can yield rows with no cells; r[0] would
+    // be an out-of-bounds access. Count() is the cell count (Size() is the
+    // serialized byte length).
+    if (r.Count() < 1) {
+      continue;
+    }
     if (r[0] == Value(t.pqs_pivot_u)) {
       pivot_found = true;
       break;
@@ -1103,12 +1116,15 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
       break;
     }
   }
-  // T4569: a failed setup commit leaves the shadow table invisible to the
-  // fresh context below; treat it exactly like the RunUpdate failures above
-  // and skip the LST probe family instead of probing an uncommitted setup.
-  if (lst_ready && ctx.txn_.PreCommit() == Status::kSuccess) {
-    ctx = db.BeginContext();
+  // T4569: a failed setup (or failed commit) must not leave the partially
+  // built LST shadows in `ctx`. Otherwise a later, unrelated setup commit
+  // (e.g. the suffixed table below) publishes them as well and the oracle
+  // probes an inconsistent catalog. Roll back the partial work first, then
+  // continue from a fresh context.
+  if (!lst_ready || ctx.txn_.PreCommit() != Status::kSuccess) {
+    static_cast<void>(ctx.txn_.Abort());
   }
+  ctx = db.BeginContext();
 
   for (const std::string& sql : t.xmode_probes) {
     std::string error;
@@ -1435,18 +1451,54 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
     rendered.reserve(rows->size());
     const std::map<int64_t, int64_t> expected =
         WindowModel(mirror, kind, p1, p2, arg, part, flags, def);
+    std::set<int64_t> seen_u;
     for (const Row& r : *rows) {
+      if (r.Count() < 2) {
+        // Generated probes return (u, value); a shorter row is a shape
+        // regression, not a model value. Report it without reading past the
+        // end of the row.
+        *report += "[WINDOW ROW SHAPE MISMATCH]\n";
+        *report += "  sql: " + sql + "\n";
+        *report +=
+            "  expected 2 cells, got " + std::to_string(r.Count()) + "\n";
+        continue;
+      }
       const int64_t u = CellInt(r[0]);
       const int64_t got = CellInt(r[1]);
       rendered.push_back(std::to_string(u) + "=" + std::to_string(got));
+      if (!seen_u.insert(u).second) {
+        *report += "[WINDOW DUPLICATE ROW]\n";
+        *report += "  sql: " + sql + "\n";
+        *report += "  u=" + std::to_string(u) + " returned more than once\n";
+      }
       auto it = expected.find(u);
-      if (it != expected.end() && got != kAnyValue && it->second != got) {
+      if (it == expected.end()) {
+        // Shape-only kinds have an empty model; for pinned kinds an extra
+        // u is just as wrong as a changed value.
+        if (!expected.empty()) {
+          *report += "[WINDOW EXTRA ROW]\n";
+          *report += "  sql: " + sql + "\n";
+          *report += "  u=" + std::to_string(u) + " not in the model\n";
+        }
+      } else if (got != kAnyValue && it->second != got) {
         *report += "[WINDOW MODEL MISMATCH]\n";
         *report += "  sql: " + sql + "\n";
         *report += "  u=" + std::to_string(u) + " expected " +
                    (it->second == kNull ? "NULL" : std::to_string(it->second)) +
                    " got " + (got == kNull ? "NULL" : std::to_string(got)) +
                    "\n";
+      }
+    }
+    // Checking only the returned rows lets a deterministic row drop escape:
+    // the permutation/index passes would compare against the same truncated
+    // baseline. The model knows every u that must be present, so pin the
+    // full key set here.
+    for (const auto& entry : expected) {
+      if (!seen_u.contains(entry.first)) {
+        *report += "[WINDOW MISSING ROW]\n";
+        *report += "  sql: " + sql + "\n";
+        *report +=
+            "  u=" + std::to_string(entry.first) + " missing from result\n";
       }
     }
     baseline.emplace_back(sql, std::move(rendered));
@@ -1464,13 +1516,13 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
       inserts.push_back(substitute(sql));
     } else if (sql.starts_with("CREATE TABLE")) {
       if (!RunUpdate(db, ctx2, substitute(sql))) {
-        return true;
+        return false;  // setup failed: skip, do not report a false green
       }
     }
   }
   for (auto& insert : std::ranges::reverse_view(inserts)) {
     if (!RunUpdate(db, ctx2, insert)) {
-      return true;
+      return false;  // setup failed: skip, do not report a false green
     }
   }
   std::vector<std::string> idx_ddl;
@@ -1499,6 +1551,13 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
       std::vector<std::string> got;
       got.reserve(rows->size());
       for (const Row& r : *rows) {
+        if (r.Count() < 2) {
+          *report += "[WINDOW ROW SHAPE MISMATCH]\n";
+          *report += "  sql: " + sql + "\n";
+          *report +=
+              "  expected 2 cells, got " + std::to_string(r.Count()) + "\n";
+          continue;
+        }
         got.push_back(std::to_string(CellInt(r[0])) + "=" +
                       std::to_string(CellInt(r[1])));
       }
@@ -1553,14 +1612,14 @@ bool CheckSkip(Database& db, TransactionContext& ctx, const OracleTrace& t,
   if (!RunUpdate(db, ctx, substitute(t.setup[0])) ||
       !RunUpdate(db, ctx,
                  "INSERT INTO " + tab2 + " SELECT * FROM " + t.table + ";")) {
-    return true;
+    return false;  // oracle skipped: skip-scan setup could not run
   }
   std::vector<std::pair<std::string, std::string>> before;
   before.reserve(t.skip_probes.size());
   for (const std::string& probe : t.skip_probes) {
     auto out = render(ctx, substitute(probe));
     if (!out.has_value()) {
-      return true;
+      return false;  // oracle skipped: probe could not be rendered
     }
     before.emplace_back(probe, *out);
   }
@@ -1568,13 +1627,13 @@ bool CheckSkip(Database& db, TransactionContext& ctx, const OracleTrace& t,
     if (!ApplyIndexSpec(db, ctx,
                         "CREATE INDEX idx_skip_" + std::string(col) + " ON " +
                             tab2 + "(" + col + ");")) {
-      return true;
+      return false;  // oracle skipped: index could not be applied
     }
   }
   for (const auto& [probe, expected] : before) {
     auto out = render(ctx, substitute(probe));
     if (!out.has_value()) {
-      return true;
+      return false;  // oracle skipped: probe could not be rendered
     }
     if (*out != expected) {
       *report += "[SKIP-SCAN MISMATCH]\n";
@@ -1628,7 +1687,7 @@ bool CheckTopTies(Database& db, TransactionContext& ctx, const OracleTrace& t,
     if (verbose) {
       std::cerr << "[sql_oracle][topties-error] " << error << "\n";
     }
-    return true;
+    return false;  // oracle skipped: topties query could not run
   }
   std::set<int64_t> got;
   for (const Row& r : *rows) {
@@ -1727,7 +1786,15 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
       return false;
     }
   }
-  ctx_b.txn_.PreCommit();
+  // Mirror branch A: a failed setup commit means the autocommit branch
+  // never saw the setup rows, so comparing its final state would report a
+  // false TRANSACTION MISMATCH instead of skipping the oracle.
+  if (ctx_b.txn_.PreCommit() != Status::kSuccess) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][troc-setup-commit-error-b]\n";
+    }
+    return false;
+  }
   for (const std::string& sql : t.troc) {
     TransactionContext ctx = db.BeginContext();
     if (!RunUpdate(db, ctx, substitute(sql))) {
@@ -1736,7 +1803,12 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
       }
       return false;
     }
-    ctx.txn_.PreCommit();
+    if (ctx.txn_.PreCommit() != Status::kSuccess) {
+      if (verbose) {
+        std::cerr << "[sql_oracle][troc-stmt-commit-error-b] " << sql << "\n";
+      }
+      return false;
+    }
   }
   TransactionContext ctx_b2 = db.BeginContext();
   auto after_b = RunRows(db, ctx_b2, substitute(t.troc_probe), &error);

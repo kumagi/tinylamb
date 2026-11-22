@@ -397,14 +397,17 @@ struct SurvivingRow {
   uint32_t value_count = 0;
 };
 
-// The columns the fragment has to read for its KERNELS (the filter, the
-// aggregate, the GROUP BY and the Top-K). The projection is NOT in this
-// list: a projection over a non-int64 column is left to the executor, so
-// the fragment never needs a string kernel.
+// The columns the fragment has to read into the flat int64 decode buffer for
+// its INTEGER kernels (key dedup, int64 filter, aggregate, GROUP BY, Top-K).
+// This is only the int64 decode buffer, not the fragment's whole set of
+// kernels: native varchar conjuncts use the chunk's VarcharFilterSelection /
+// VarcharRangeSelection, which read the string cell directly (see
+// varchar_eval in ScanArtifacts) and so never enter this buffer. A non-int64
+// projection column is likewise left to the executor.
 //
-// Every column here must be an int64 column: the v1 kernels (zone-map
-// pruning, the compressed-domain counts, the group accumulation) all work
-// on the integer domain.
+// Every column in this list must be an int64 column: the v1 kernels that use
+// it (zone-map pruning, the compressed-domain counts, the group accumulation)
+// all work on the integer domain.
 std::vector<slot_t> NeededColumns(const Schema& sc, const Fragment& frag) {
   std::vector<slot_t> cols;
   const auto add = [&cols, &sc](slot_t c) {
@@ -697,6 +700,14 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
       // prunes the row groups that cannot hold a key in the range, so the
       // surviving groups still have to be filtered row by row.
       if (frag.access == AccessMode::kKeyRange && key_idx >= 0) {
+        // NULL key cells decode as raw 0, but a NULL key never satisfies a
+        // range: PointLookup skips NULL cells and the run/memtable paths
+        // exclude the kNull-tagged key blob from the range window. Reject
+        // it on the null bitmap before comparing the decoded value.
+        if (column_nulls[static_cast<size_t>(key_idx)][r] != 0) {
+          state->rows_proved_fail += 1;
+          continue;
+        }
         const int64_t key_value =
             column_values[static_cast<size_t>(key_idx)][r];
         if (frag.range_lo.has_value() && key_value < *frag.range_lo) {
@@ -1072,6 +1083,10 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
 std::vector<SurvivingRow> ResolveDuplicates(std::vector<SurvivingRow> rows,
                                             bool dedup_possible) {
   if (!dedup_possible) {
+    // Without an int64 key we cannot tell which older live rows a tombstone
+    // hides (callers reject the fragment in that case), but the tombstone is
+    // never a surviving row in its own right.
+    std::erase_if(rows, [](const SurvivingRow& r) { return r.deleted; });
     return rows;
   }
   // The rows arrive artifact by artifact; the artifacts are not ordered by
@@ -1138,8 +1153,8 @@ struct RowReader {
   std::vector<int32_t> index_of;
 
   RowReader(const std::vector<int64_t>* values,
-            const std::vector<uint8_t>* nulls,
-            const std::vector<slot_t>* cols, uint32_t column_count)
+            const std::vector<uint8_t>* nulls, const std::vector<slot_t>* cols,
+            uint32_t column_count)
       : flat_values(values), flat_nulls(nulls), index_of(column_count, -1) {
     for (size_t i = 0; i < cols->size(); ++i) {
       const slot_t col = (*cols)[i];
@@ -1170,7 +1185,7 @@ struct RowReader {
 };
 
 Status AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
-                   const RowReader& reader, Accumulator* acc) {
+                     const RowReader& reader, Accumulator* acc) {
   const auto value_of = [&](slot_t col) -> int64_t {
     return reader.Value(row, col);
   };
@@ -1194,7 +1209,8 @@ Status AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
         int64_t product = 0;
         if (__builtin_mul_overflow(agg.coeff, value_of(agg.col), &product) ||
             __builtin_add_overflow(acc->sum, product, &acc->sum)) {
-          return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in SUM");
         }
         acc->count += 1;
         break;
@@ -1207,11 +1223,13 @@ Status AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
         int64_t product = term.coeff;
         for (slot_t col : term.cols) {
           if (__builtin_mul_overflow(product, value_of(col), &product)) {
-            return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+            return StatusError(StatusCode::kIsInfinity,
+                               "integer overflow in SUM");
           }
         }
         if (__builtin_add_overflow(acc->sum, product, &acc->sum)) {
-          return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in SUM");
         }
         any_term = true;
       }
@@ -1340,14 +1358,16 @@ Status ValidateFragment(const Schema& sc, const Fragment& frag) {
     const Aggregate& agg = *frag.aggregate;
     // kSum reads agg.col only in its single-column form (terms empty); the
     // monomial columns of the terms form are checked below.
-    const bool reads_col = agg.kind == AggregateKind::kCountCol ||
-                           agg.kind == AggregateKind::kMin ||
-                           agg.kind == AggregateKind::kMax ||
-                           agg.kind == AggregateKind::kApproxCountDistinct ||
-                           (agg.kind == AggregateKind::kSum &&
-                            agg.terms.empty());
+    const bool reads_col =
+        agg.kind == AggregateKind::kCountCol ||
+        agg.kind == AggregateKind::kMin || agg.kind == AggregateKind::kMax ||
+        agg.kind == AggregateKind::kApproxCountDistinct ||
+        (agg.kind == AggregateKind::kSum && agg.terms.empty());
     if (reads_col && agg.col >= sc.ColumnCount()) {
       return Status::kCorruption;
+    }
+    if (reads_col && !IsInt64Column(sc, agg.col)) {
+      return Status::kNotImplemented;
     }
     for (const AggTerm& t : agg.terms) {
       for (slot_t c : t.cols) {
@@ -1747,8 +1767,8 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
           const size_t idx =
               (static_cast<size_t>(g) * footer.column_count) + col;
           if (idx < footer.encodings.size()) {
-            per_row += PaxChunk::SchemeDecodeCost(
-                           static_cast<PaxChunk::Scheme>(footer.encodings[idx])) -
+            per_row += PaxChunk::SchemeDecodeCost(static_cast<PaxChunk::Scheme>(
+                           footer.encodings[idx])) -
                        1.0;
           }
         }
@@ -1781,8 +1801,8 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
       }
       report.rows_in += visible;
       report.rows_unknown += visible;
-      report.cpu_units += static_cast<double>(visible) *
-                          static_cast<double>(eval.size());
+      report.cpu_units +=
+          static_cast<double>(visible) * static_cast<double>(eval.size());
     }
   }
   if (!any_artifact) {
@@ -1804,16 +1824,23 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
     report.coverage = Coverage::kFull;
     // Execute folds duplicates only when the key column decodes as int64
     // (ScanState::key_dedup_possible); mirror that gate here.
-    report.duplicate_elimination =
-        IsInt64Column(sc, sc.KeyColumnIndex())
-            ? DuplicateElimination::kApplied
-            : DuplicateElimination::kNotAccounted;
+    report.duplicate_elimination = IsInt64Column(sc, sc.KeyColumnIndex())
+                                       ? DuplicateElimination::kApplied
+                                       : DuplicateElimination::kNotAccounted;
   } else {
     report.coverage = Coverage::kPartial;
     report.duplicate_elimination = DuplicateElimination::kNotAccounted;
   }
   // Rows reaching the output are exactly the ones not proved fail.
   report.output_rows = report.rows_proved_pass + report.rows_unknown;
+  // Execute applies limit_rows to the OUTPUT rows (surviving rows for a
+  // selection/projection, output groups for GROUP BY). Mirror the cap here:
+  // Estimate and Execute receive the same fragment description and must not
+  // disagree about its output width.
+  if (fragment.limit_rows.has_value() &&
+      report.output_rows > *fragment.limit_rows) {
+    report.output_rows = *fragment.limit_rows;
+  }
   report.cardinality = Cardinality::kNotAccounted;
   report.output_bytes = report.output_rows * 8;
   (void)caps;
@@ -1894,6 +1921,21 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
   state.key_dedup_possible = IsInt64Column(schema, schema.KeyColumnIndex());
   ScanArtifacts(artifacts, fragment, schema, eval, varchar_eval, needed,
                 &state);
+  // A tombstone hides its whole key group. Without an int64 key the scan
+  // state carries no comparable key for those rows, so we cannot know which
+  // older live rows it shadows. Serving them (or the tombstone itself) as a
+  // proved full-coverage result would count deleted rows as live; reject the
+  // fragment so the executor runs the whole thing on the residual path.
+  if (!state.key_dedup_possible &&
+      std::any_of(state.rows.begin(), state.rows.end(),
+                  [](const SurvivingRow& r) { return r.deleted; })) {
+    result.rejected = true;
+    result.coverage = Coverage::kNone;
+    result.status = StatusError(
+        StatusCode::kNotImplemented,
+        "fragment tombstone resolution requires an int64 key column");
+    return result;
+  }
 
   // The LSM resolution: the newest generation wins, a tombstone hides the
   // key group. The rows the resolution removes are counted as proved-fail:
@@ -1915,10 +1957,13 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
   }
   result.coverage = residual.empty() ? Coverage::kFull : Coverage::kPartial;
 
-  // LIMIT applies after the filter (and to the groups when there is a
-  // GROUP BY).
+  // LIMIT applies to the OUTPUT rows: the surviving rows for a
+  // selection/projection, and the output groups for a GROUP BY (below). It
+  // must NOT truncate the rows feeding a scalar aggregate -- that would turn
+  // COUNT(*) over the filter result into COUNT(first N rows) and disagree
+  // with both the GROUP BY path and Estimate().
   if (fragment.limit_rows.has_value() && fragment.group_cols.empty() &&
-      rows.size() > *fragment.limit_rows) {
+      !fragment.aggregate.has_value() && rows.size() > *fragment.limit_rows) {
     rows.resize(*fragment.limit_rows);
   }
 
@@ -2129,6 +2174,13 @@ StatusOr<KeyValueRows> MaterializeKeyValue(Runtime runtime,
   state.key_dedup_possible = IsInt64Column(schema, key_col);
   ScanArtifacts(artifacts, fragment, schema, eval, varchar_eval, needed,
                 &state);
+  if (!state.key_dedup_possible &&
+      std::any_of(state.rows.begin(), state.rows.end(),
+                  [](const SurvivingRow& r) { return r.deleted; })) {
+    return StatusError(
+        StatusCode::kNotImplemented,
+        "fragment tombstone resolution requires an int64 key column");
+  }
   std::vector<SurvivingRow> rows =
       ResolveDuplicates(std::move(state.rows), state.key_dedup_possible);
 

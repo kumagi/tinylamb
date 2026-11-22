@@ -33,8 +33,8 @@ graph TD
 適用判定（guard）は以下の 3 条件から成ります。
 
 1. **非循環性**: 子グループ内の集約式が現在の `group` 自身を参照していないこと（自己参照ループの防止）。
-2. **グループ化キーの存在**: 集約演算子にグループ化キー集合 `grouping_sets` が指定されていること（スカラー集約などの空キーは対象外）。
-3. **グループ化キーの射影被覆性**: `grouping_sets` 内のすべての列参照が、集約ノードの出力ターゲットリスト（`target_list`）に含まれていること。
+2. **グループ化キーの存在**: 集約演算子のキー集合が非空であること。`grouping_sets` が空なら `partition_by` へフォールバックします（スカラー集約などの空キーは対象外）。計算キー（`t.b + 1`）も対象に含まれます。
+3. **グループ化キーの射影被覆性**: すべてのキーが `matches_key` で集約ノードの出力ターゲット（`target_list`）と照合され、かつ各ターゲットが高々 1 つのキーに対応すること（一致回数がキー数と一致）。
 
 ```cpp
             // DISTINCT is redundant over GROUP BY ONLY when the projected
@@ -64,20 +64,29 @@ SQL における `GROUP BY K` は、入力タプル集合をキー属性集合 $
 
 ## 実装の詳細
 
-キー属性の包含判定は、修飾名（`ToString()`）および単純列名（`name`）の双方をハッシュセットへ登録して照合します。
+キーの選択は `grouping_sets` を優先し、空なら `partition_by` を使います。`matches_key` は列参照同士を修飾名（`ToString()`）または単純名（`name`）で照合し、それ以外の計算キーはポインタ同一性または `ToString()` で照合します。各キーごとにマッチしたターゲット数を数え、`seen != keys.size()` なら 1 ターゲットが複数キーに一致したケースとして弾きます。
 
 ```cpp
-            std::unordered_set<std::string> grouping_cols;
-            for (const auto& g : agg.grouping_sets) {
-              if (g && g->Type() == TypeTag::kColumnValue) {
-                grouping_cols.insert(
-                    g->AsColumnValue().GetColumnName().ToString());
-                grouping_cols.insert(g->AsColumnValue().GetColumnName().name);
+            const auto& keys = agg.grouping_sets.empty() ? agg.partition_by
+                                                         : agg.grouping_sets;
+            if (keys.empty()) {
+              continue;
+            }
+            size_t seen = 0;
+            for (const auto& g : keys) {
+              if (!g) continue;
+              for (const auto& t : agg.target_list) {
+                if (matches_key(g, t.expression)) {
+                  ++seen;
+                }
               }
+            }
+            if (seen != keys.size()) {
+              continue;
             }
 ```
 
-ターゲットリスト側の属性集合 `proj_cols` に対して `grouping_cols` の全要素が存在することを検証し、完全一致を確認した時点で `memo.AddExpression(group, agg)` を実行して探索を終了します。
+全キーが丁度 1 回ずつ照合された時点で `memo.AddExpression(group, agg)` を実行して探索を終了します。
 
 ## 最適化効果
 

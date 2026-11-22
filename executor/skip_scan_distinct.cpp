@@ -170,7 +170,16 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
     ++iter_;
     while (iter_.IsValid()) {
       Row next_key;
-      next_key.DecodeMemcomparableFormat(iter_.Key());
+      const Status decoded = next_key.TryDecodeMemcomparableFormat(iter_.Key());
+      if (decoded != Status::kSuccess) {
+        // A truncated/corrupt key image cannot define the next prefix
+        // boundary. Stop instead of seeking on a half-decoded key, which
+        // would skip or duplicate whole DISTINCT groups.
+        status_ = decoded;
+        finished_ = true;
+        FailWith(decoded);
+        return;
+      }
       bool prefix_equal = true;
       for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count() &&
                            col < next_key.Count();
@@ -200,7 +209,15 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
     --iter_;
     while (iter_.IsValid()) {
       Row next_key;
-      next_key.DecodeMemcomparableFormat(iter_.Key());
+      const Status decoded = next_key.TryDecodeMemcomparableFormat(iter_.Key());
+      if (decoded != Status::kSuccess) {
+        // Same contract as the ascending branch: an undecodable key cannot
+        // bound the previous DISTINCT group in reverse scan order either.
+        status_ = decoded;
+        finished_ = true;
+        FailWith(decoded);
+        return;
+      }
       bool prefix_equal = true;
       for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count() &&
                            col < next_key.Count();
@@ -237,7 +254,16 @@ size_t SkipScanDistinct::NextBatch(DataChunk* destination, size_t max_rows) {
       continue;
     }
     current_index_key_.Clear();
-    current_index_key_.DecodeMemcomparableFormat(iter_.Key());
+    const Status decoded =
+        current_index_key_.TryDecodeMemcomparableFormat(iter_.Key());
+    if (decoded != Status::kSuccess) {
+      // Same contract as the seek sites above: an undecodable key image
+      // cannot define the current position or the next seek boundary.
+      status_ = decoded;
+      finished_ = true;
+      FailWith(decoded);
+      return destination->Size();
+    }
 
     bool found_visible = false;
     auto check_candidate = [&](const RowPosition& pos) -> StatusOr<bool> {

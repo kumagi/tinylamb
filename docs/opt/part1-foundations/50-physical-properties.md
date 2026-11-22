@@ -86,7 +86,7 @@ struct PhysicalProperties {
 ## 50-3. `RequiredChildProperties` — 親ノードから子ノードへの要求変換
 
 親ノードの物理要求を、そのまま子ノードへ渡せるとは限りません。演算子の性質に
-応じて要求を変換します（`plan/cascades.cpp` の
+応じて要求を変換します（`plan/cascades_search.cpp` の
 `SearchEngine::RequiredChildProperties`）。
 
 **1. データソース演算子**:
@@ -176,17 +176,20 @@ Top-N 演算子は、自身の整列キーを子ノードに対する順序要�
 下位ノードから得た物理プランが親ノードの要求順序を満たさない場合、オプティマイザは不足分を候補の比較スコアに反映します（D6 規律）。
 
 ```cpp
-      double score = cost;
-      if (needs_ordering &&
-          !alternative.plan->IsOrderedBy(context.query->order_expressions_,
-                                         context.query->order_ascending_,
-                                         context.query->order_nulls_first_)) {
-        const double rows = std::max(alternative.estimated_rows, child_rows);
-        score += rows * std::log2(std::max(2.0, rows));
-      }
+        double score = cost;
+        // Property-driven ordering decision (D6): alternatives that cannot
+        // deliver the required ordering carry the sort the engine would have
+        // to insert; the engine-side SortExecutor remains the safety net.
+        if (needs_ordering &&
+            (!alternative.plan->IsOrderedBy(required_order, required_ascending,
+                                            properties.sort_nulls_first) ||
+             !SatisfiesOrderingCollation(alternative.plan, properties))) {
+          const double rows = std::max(alternative.estimated_rows, child_rows);
+          score += rows * std::log2(std::max(2.0, rows));
+        }
 ```
 
-- 各物理プランは自身が保証する順序を `IsOrderedBy` で判定します。要求を満たさない場合、実行エンジン側でソート演算子を補完することを想定し、ソートコスト $N \log_2 N$ を候補の比較スコアに加算します。`BestPlan::cost` には加算前の推定コストを保存します。
+- 各物理プランは自身が保証する順序を `IsOrderedBy` で判定します。要求は `properties.ordering` から組み立てた `required_order` / `required_ascending` と `properties.sort_nulls_first` で表し、クエリの `order_expressions_` を直接参照しません。順序が足りない場合に加えて、照合順序が要求を満たさない場合（例: `COLLATE 'und:ci'` の順序をバイナリ順序で代用できない場合）も `SatisfiesOrderingCollation` が偽となり罰則が入ります。いずれの場合も実行エンジン側でソート演算子を補完することを想定し、ソートコスト $N \log_2 N$ を候補の比較スコアに加算します。`BestPlan::cost` には加算前の推定コストを保存します。
 - 実行エンジンは必要なソートを最後に補うため、コスト見積もりに誤差があっても出力順序は保たれます。
 
 このスコア計算により、要求順序を自然に満たす計画と、後からソートが必要な

@@ -233,9 +233,11 @@ int BenchmarkFusion() {
         const double sparse_ms = Measure(
             [&] { return fused(*sparse).Checksum(); }, repeats, checksum);
         std::cout << (clustered ? "clustered" : "shuffled") << ',' << size
-                  << ',' << static_cast<double>(expected.selected) / size << ','
-                  << dense_ms << ',' << compact_ms << ',' << tiled_ms << ','
-                  << masked_ms << ',' << sparse_ms << '\n';
+                  << ','
+                  << static_cast<double>(expected.selected) /
+                         static_cast<double>(size)
+                  << ',' << dense_ms << ',' << compact_ms << ',' << tiled_ms
+                  << ',' << masked_ms << ',' << sparse_ms << '\n';
       }
     }
   }
@@ -259,7 +261,8 @@ int BenchmarkHashProbe() {
             << " compact=" << filter->CompileMilliseconds() << '\n';
   constexpr size_t kRows = 1 << 20;
   constexpr size_t kBatch = 1024;
-  std::mt19937_64 random(0x99ab);  // NOLINT(cert-msc32-c,cert-msc51-cpp): reproducible benchmark input
+  std::mt19937_64 random(0x99ab);  // NOLINT(cert-msc32-c,cert-msc51-cpp):
+                                   // reproducible benchmark input
   std::vector<int64_t> keys(kRows);
   std::vector<int64_t> predicates(kRows);
   uint64_t checksum = 0;
@@ -354,8 +357,8 @@ int BenchmarkHashProbe() {
                   << (clustered ? "clustered" : "shuffled") << ',' << pct << ','
                   << expected_matches << ',' << scalar_ms << ',' << direct_ms
                   << ',' << compact_ms << ',' << adaptive_ms << ','
-                  << direct_batches << ',' << ((kRows / kBatch) - direct_batches)
-                  << '\n';
+                  << direct_batches << ','
+                  << ((kRows / kBatch) - direct_batches) << '\n';
       }
     }
   }
@@ -461,15 +464,15 @@ int main(int argc, char** argv) {
         },
         repetitions, checksum);
     uint64_t selected = 0;
-    if (fused_sum->FilterProjectSum(input.data(), input.data(), size, 12345,
-                                    3, 7, 0, &selected) != pipeline_expected) {
+    if (fused_sum->FilterProjectSum(input.data(), input.data(), size, 12345, 3,
+                                    7, 0, &selected) != pipeline_expected) {
       std::cerr << "fused pipeline result mismatch\n";
       return 3;
     }
     const double jit_fused = Measure(
         [&] {
           return fused_sum->FilterProjectSum(input.data(), input.data(), size,
-                                              12345, 3, 7, 0, &selected);
+                                             12345, 3, 7, 0, &selected);
         },
         repetitions, checksum);
     std::cout << "pipeline_split," << size << ',' << native_split << ','
@@ -582,9 +585,9 @@ int main(int argc, char** argv) {
       c_disc[i] = static_cast<int64_t>((rng >> 20) % 30) - 5;
       c_brand[i] = static_cast<int64_t>((rng >> 32) % 40);
       n_disc[i] = ((i % 8) == 0) ? 1 : 0;
-      chunk.Append(
-          Row({Value(c_qty[i]), Value(c_price[i]),
-               (n_disc[i] != 0U) ? Value() : Value(c_disc[i]), Value(c_brand[i])}));
+      chunk.Append(Row({Value(c_qty[i]), Value(c_price[i]),
+                        (n_disc[i] != 0U) ? Value() : Value(c_disc[i]),
+                        Value(c_brand[i])}));
     }
 
     auto make_inputs = [&](const JitBranchlessProgram& prog, bool with_bounds) {

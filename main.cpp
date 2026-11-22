@@ -19,7 +19,6 @@
 #include <csignal>
 #include <exception>
 #include <iostream>
-#include <iterator>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -42,13 +41,50 @@ namespace {
 // abort must run) and a SECOND interrupt restores the default disposition
 // and re-raises, so an unresponsive run can always be killed outright.
 std::atomic<bool> g_interrupted{false};
+std::atomic<int> g_interrupt_signal{SIGINT};
 
 void HandleInterrupt(int signo) {
+  g_interrupt_signal.store(signo, std::memory_order_relaxed);
   if (g_interrupted.exchange(true)) {
-    std::signal(SIGINT, SIG_DFL);  // NOLINT(cert-err33-c)
+    std::signal(SIGINT, SIG_DFL);   // NOLINT(cert-err33-c)
     std::signal(SIGTERM, SIG_DFL);  // NOLINT(cert-err33-c)
-    std::raise(signo);  // NOLINT(cert-err33-c)
+    std::raise(signo);              // NOLINT(cert-err33-c)
   }
+}
+
+// SplitSqlStatements bounds the statement COUNT but not input BYTES, so an
+// unbounded istreambuf_iterator read let a huge redirect (or an endless
+// stream) exhaust memory before the splitter ever ran. Read in bounded
+// chunks and cap the total at the same 16 MiB the server's default
+// max_message_bytes gives a single Q message -- the envelope the splitter
+// was designed around.
+constexpr size_t kMaxSqlInputBytes = static_cast<size_t>(16U * 1024U * 1024U);
+
+tinylamb::StatusOr<std::string> ReadStandardInput() {
+  std::string sql;
+  char buffer[64 * 1024];
+  for (;;) {
+    std::cin.read(buffer, sizeof(buffer));
+    const std::streamsize got = std::cin.gcount();
+    if (got > 0) {
+      if (sql.size() + static_cast<size_t>(got) > kMaxSqlInputBytes) {
+        return tinylamb::StatusError(
+            tinylamb::StatusCode::kTooBigData,
+            "standard input exceeds the " + std::to_string(kMaxSqlInputBytes) +
+                "-byte SQL input limit; split the script into smaller "
+                "inputs");
+      }
+      sql.append(buffer, static_cast<size_t>(got));
+    }
+    if (!std::cin) {
+      break;
+    }
+  }
+  if (std::cin.bad()) {
+    return tinylamb::StatusError(tinylamb::StatusCode::kIOError,
+                                 "failed to read standard input");
+  }
+  return sql;
 }
 }  // namespace
 
@@ -83,17 +119,33 @@ int main(int argc, char** argv) {
     std::cerr << "usage: tinylamb [--force] <database-file> < input.sql\n";
     return 2;
   }
-  if (std::signal(SIGINT, HandleInterrupt) == SIG_ERR ||
-      std::signal(SIGTERM, HandleInterrupt) == SIG_ERR) {
-    std::cerr << "failed to install signal handlers; Ctrl-C will not abort "
-                 "the transaction cleanly\n";
+  // Install both handlers independently: the old `||` short-circuited, so a
+  // failed SIGINT registration skipped SIGTERM entirely. Name whichever
+  // signal(s) actually failed -- the diagnostic must not always blame Ctrl-C.
+  const bool sigint_ok = std::signal(SIGINT, HandleInterrupt) != SIG_ERR;
+  const bool sigterm_ok = std::signal(SIGTERM, HandleInterrupt) != SIG_ERR;
+  if (!sigint_ok || !sigterm_ok) {
+    std::cerr << "failed to install signal handler(s): ";
+    if (!sigint_ok) {
+      std::cerr << "SIGINT";
+    }
+    if (!sigint_ok && !sigterm_ok) {
+      std::cerr << " and ";
+    }
+    if (!sigterm_ok) {
+      std::cerr << "SIGTERM";
+    }
+    std::cerr << "; a clean abort on that signal is not available\n";
   }
   tinylamb::RecoveryManager::SetTornTailTruncationAllowed(force);
 
-  std::string sql((std::istreambuf_iterator<char>(std::cin)),
-                  std::istreambuf_iterator<char>());
+  tinylamb::StatusOr<std::string> sql_input = ReadStandardInput();
+  if (!sql_input.HasValue()) {
+    std::cerr << sql_input.GetStatus() << '\n';
+    return 1;
+  }
   tinylamb::StatusOr<std::vector<std::string>> split =
-      tinylamb::pgwire::SplitSqlStatements(sql);
+      tinylamb::pgwire::SplitSqlStatements(sql_input.Value());
   if (!split.HasValue()) {
     std::cerr << split.GetStatus() << '\n';
     return 1;
@@ -123,6 +175,16 @@ int main(int argc, char** argv) {
   // commits it observed are durable.
   std::vector<std::string> pending_output;
   pending_output.reserve(statements.size());
+  // TransactionContext::Abort() reports rollback failures (undo replay or the
+  // kAbort WAL append) as a Status. Check it at every failure exit so a failed
+  // rollback is not silently misreported as just the original SQL error.
+  const auto abort_with_diagnostic = [](tinylamb::TransactionContext& txn,
+                                        const char* phase) {
+    const tinylamb::Status status = txn.Abort();
+    if (status != tinylamb::Status::kSuccess) {
+      std::cerr << "rollback after " << phase << " failed: " << status << '\n';
+    }
+  };
   const auto interrupted = [&context](const char* phase) {
     std::cerr << "interrupted " << phase
               << "; rolling back implicit "
@@ -131,7 +193,8 @@ int main(int argc, char** argv) {
     if (abort_status != tinylamb::Status::kSuccess) {
       std::cerr << "rollback after interrupt failed: " << abort_status << '\n';
     }
-    return 130;  // 128 + SIGINT, the shell convention.
+    // Shell convention: 128 + the signal that interrupted the run.
+    return 128 + g_interrupt_signal.load(std::memory_order_relaxed);
   };
   for (const std::string& statement : statements) {
     if (g_interrupted.load()) {
@@ -140,10 +203,13 @@ int main(int argc, char** argv) {
     try {
       tinylamb::StatusOr<tinylamb::QueryResult> executed =
           engine.Execute(context, statement);
-      // An empty diagnostic means the external parse child was transiently
-      // unavailable (fork throttling under load, test runner in parallel).
-      // One retry keeps long scripts from dying on a scheduler hiccup.
-      if (!executed.HasValue() && engine.LastError().empty()) {
+      // Only the external parser child's transient start-up failures are
+      // retryable. LastError() is cleared at the start of Execute and is not
+      // necessarily filled by every failure path (e.g. a status-only failure
+      // after a write was published), so an empty diagnostic must never be
+      // taken as "transient parse fork failure" -- replaying such a statement
+      // can double-apply DML.
+      if (!executed.HasValue() && engine.LastErrorIsTransientParseFailure()) {
         executed = engine.Execute(context, statement);
       }
       if (!executed.HasValue()) {
@@ -153,7 +219,7 @@ int main(int argc, char** argv) {
           std::cerr << executed.GetStatus();
         }
         std::cerr << '\n';
-        context.Abort();
+        abort_with_diagnostic(context, "SQL error");
         return 1;
       }
       std::string buffer;
@@ -168,13 +234,13 @@ int main(int argc, char** argv) {
       if (const tinylamb::Status drain_status = executed.Value().GetStatus();
           drain_status != tinylamb::Status::kSuccess) {
         std::cerr << "SQL error: " << drain_status << '\n';
-        context.Abort();
+        abort_with_diagnostic(context, "drain error");
         return 1;
       }
       pending_output.push_back(std::move(buffer));
     } catch (const std::exception& error) {
       std::cerr << "error executing statement: " << error.what() << '\n';
-      context.Abort();
+      abort_with_diagnostic(context, "exception");
       return 1;
     }
   }
@@ -195,8 +261,9 @@ int main(int argc, char** argv) {
     // is a no-op and re-running the script would double-apply. We still
     // report failure here (the caller must inspect the scripts' effects).
     std::cerr << "transaction commit failed (check whether writes were "
-                 "already published): " << commit_status << "\n";
-    context.Abort();
+                 "already published): "
+              << commit_status << "\n";
+    abort_with_diagnostic(context, "commit failure");
     return 1;
   }
   // Durability barrier passed; the buffered rows may now reach the user.
@@ -211,6 +278,17 @@ int main(int argc, char** argv) {
   if (!std::cout.good()) {
     std::cerr << "failed to write result output to standard output\n";
     return 1;
+  }
+  // A SIGINT delivered while PreCommit was blocked on the durability barrier
+  // (or while the buffered result was being written) cannot undo the commit
+  // -- Abort() is a no-op once versions are published -- but reporting a
+  // clean exit would claim the script finished uninterrupted. Keep the
+  // committed output (it belongs to the caller) and surface the interrupt
+  // through the shell-standard 128+SIGINT status.
+  if (g_interrupted.load()) {
+    std::cerr << "interrupted during commit/output (transaction was "
+                 "committed)\n";
+    return 128 + g_interrupt_signal.load(std::memory_order_relaxed);
   }
   return 0;
 }

@@ -78,7 +78,9 @@ class SortedRun final {
     [[nodiscard]] std::string Key() const;
     [[nodiscard]] Row Value() const;
     [[nodiscard]] Entry GetEntry() const { return parent_->GetEntry(offset_); }
-    [[nodiscard]] bool IsValid() const { return offset_ < parent_->Size(); }
+    [[nodiscard]] bool IsValid() const {
+      return parent_ != nullptr && offset_ < parent_->Size();
+    }
     Iterator& operator++() {
       ++offset_;
       return *this;
@@ -88,7 +90,12 @@ class SortedRun final {
              schema_ == rhs.schema_;
     }
     bool operator!=(const Iterator& rhs) const { return !operator==(rhs); }
-    [[nodiscard]] size_t Generation() const { return parent_->generation_; }
+    [[nodiscard]] size_t Generation() const {
+      // An invalid iterator (no parent, or past the end) has no run to
+      // report a generation for; use the same sentinel as the other
+      // guarded accessors instead of dereferencing parent_.
+      return IsValid() ? parent_->generation_ : 0;
+    }
     [[nodiscard]] bool IsDeleted() const {
       // An exhausted iterator has no entry; treat it as a non-deleted
       // sentinel instead of throwing from GetEntry's bounds check.
@@ -135,9 +142,7 @@ class SortedRun final {
   [[nodiscard]] size_t LowerBound(std::string_view key) const;
   [[nodiscard]] size_t Size() const { return index_.size(); }
   [[nodiscard]] size_t Generation() const { return generation_; }
-  [[nodiscard]] Iterator Begin(const Schema& sc) const {
-    return {this, sc, 0};
-  }
+  [[nodiscard]] Iterator Begin(const Schema& sc) const { return {this, sc, 0}; }
   [[nodiscard]] Entry GetEntry(size_t offset) const {
     if (offset >= index_.size()) {
       throw std::out_of_range("SortedRun::GetEntry offset out of range");

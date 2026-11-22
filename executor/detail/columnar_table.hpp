@@ -42,7 +42,8 @@ inline constexpr size_t kColumnarChunkRows = 2048;
 struct ChunkStringArena {
   static constexpr size_t kDefaultSlabBytes = 16384;
   struct Slab {
-    std::unique_ptr<char[]> data;  // NOLINT(modernize-avoid-c-arrays) dynamic slab size
+    std::unique_ptr<char[]>
+        data;  // NOLINT(modernize-avoid-c-arrays) dynamic slab size
     size_t capacity{0};
   };
   std::deque<Slab> slabs;
@@ -271,6 +272,16 @@ struct ColumnarColumn {
     return dict_codes[row_idx];
   }
 
+  [[nodiscard]] uint32_t CheckedDictCodeAt(size_t row_idx) const noexcept {
+    const size_t rows =
+        borrowed_dict_u8 != nullptr ? borrowed_count : dict_codes.size();
+    if (row_idx >= rows || dict == nullptr) {
+      return kNullDictCode;
+    }
+    const uint32_t code = DictCodeAt(row_idx);
+    return code < DictEntryCount() ? code : kNullDictCode;
+  }
+
   [[nodiscard]] int64_t ForIntAt(size_t row_idx) const noexcept {
     switch (for_width) {
       case 0:
@@ -312,13 +323,8 @@ struct ColumnarColumn {
         return has_null && nulls[row_idx] != 0;
       case Encoding::kConstant:
         return const_is_null || type == ValueType::kNull;
-      case Encoding::kDictionary: {
-        if (!has_null) {
-          return false;
-        }
-        const uint32_t code = DictCodeAt(row_idx);
-        return code == kNullDictCode || code >= DictEntryCount();
-      }
+      case Encoding::kDictionary:
+        return CheckedDictCodeAt(row_idx) == kNullDictCode;
       case Encoding::kFrameOfReference:
         return has_null && borrowed_nulls != nullptr &&
                borrowed_nulls[row_idx] != 0;
@@ -406,8 +412,10 @@ struct ColumnarColumn {
                                : cur->fallback[r].value.int_value;
       case Encoding::kConstant:
         return cur->const_int;
-      case Encoding::kDictionary:
-        return cur->dict->IntEntryAt(cur->DictCodeAt(r));
+      case Encoding::kDictionary: {
+        const uint32_t code = cur->CheckedDictCodeAt(r);
+        return code == kNullDictCode ? 0 : cur->dict->IntEntryAt(code);
+      }
       case Encoding::kFrameOfReference:
         return cur->ForIntAt(r);
       case Encoding::kGathered:
@@ -430,8 +438,10 @@ struct ColumnarColumn {
                                : cur->fallback[r].value.double_value;
       case Encoding::kConstant:
         return cur->const_double;
-      case Encoding::kDictionary:
-        return cur->dict->DoubleEntries()[cur->DictCodeAt(r)];
+      case Encoding::kDictionary: {
+        const uint32_t code = cur->CheckedDictCodeAt(r);
+        return code == kNullDictCode ? 0.0 : cur->dict->DoubleEntries()[code];
+      }
       case Encoding::kFrameOfReference:
         return static_cast<double>(cur->ForIntAt(r));
       case Encoding::kGathered:
@@ -454,10 +464,14 @@ struct ColumnarColumn {
                                : cur->fallback[r].AsStringView();
       case Encoding::kConstant:
         return cur->const_string;
-      case Encoding::kDictionary:
-        return cur->dict != nullptr
-                   ? cur->dict->StringEntryAt(cur->DictCodeAt(r))
-                   : std::string_view{};
+      case Encoding::kDictionary: {
+        if (cur->dict == nullptr) {
+          return {};
+        }
+        const uint32_t code = cur->CheckedDictCodeAt(r);
+        return code == kNullDictCode ? std::string_view{}
+                                     : cur->dict->StringEntryAt(code);
+      }
       case Encoding::kFrameOfReference:
       case Encoding::kGathered:
         return {};
@@ -859,9 +873,8 @@ struct ColumnarColumn {
       return;
     }
     if (encoding == Encoding::kDictionary) {
-      const uint32_t code = DictCodeAt(r);
-      if (code == kNullDictCode || dict == nullptr ||
-          code >= DictEntryCount()) {
+      const uint32_t code = CheckedDictCodeAt(r);
+      if (code == kNullDictCode) {
         dst->SetNull();
         return;
       }
@@ -1260,7 +1273,8 @@ inline bool ColumnarColumn::ResolveLeaf(size_t row_idx,
   while (cur->encoding == Encoding::kGathered) {
     const ChunkGatherIndex* gi = cur->gather_index.get();
     if (gi == nullptr || r >= gi->src_rows.size() ||
-        r >= gi->src_chunks.size() || gi->source_table == nullptr) [[unlikely]] {
+        r >= gi->src_chunks.size() || gi->source_table == nullptr)
+        [[unlikely]] {
       return false;
     }
     const uint32_t sr = gi->src_rows[r];
@@ -1338,8 +1352,9 @@ struct CompiledColumnarProjection {
 // std::nullopt if any chunk requires contextual AST fallback (`kUnsupported`)
 // or setting `*error` on SQL evaluation error.
 [[nodiscard]] StatusOr<std::optional<std::shared_ptr<ColumnarTable>>>
-TryProjectColumnarTable(const CompiledColumnarProjection& plan,
-                        const ColumnarTable& input);
+TryProjectColumnarTable(
+    const CompiledColumnarProjection& plan, const ColumnarTable& input,
+    std::shared_ptr<const ColumnarTable>* mutable_input = nullptr);
 
 // Slices `[begin, begin + count)` from `input` preserving zero-copy chunk
 // references and string lifetimes.

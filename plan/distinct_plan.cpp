@@ -31,8 +31,14 @@ TableStatistics EstimateDistinctPlanStats(const Plan& child) {
   for (size_t i = 0; i < child->GetSchema().ColumnCount(); ++i) {
     columns.push_back(i);
   }
-  const auto output_rows =
-      static_cast<size_t>(std::ceil(stats.EstimateDistinctRows(columns)));
+  const double distinct_rows = stats.EstimateDistinctRows(columns);
+  // A NaN/negative/infinite estimate cannot be rounded to a row count: the
+  // cast would be undefined. Fall back to an empty estimate, like the other
+  // cardinality estimators do when their input is not a positive number.
+  if (!std::isfinite(distinct_rows) || distinct_rows <= 0.0) {
+    return stats.ScaleToRows(0);
+  }
+  const auto output_rows = static_cast<size_t>(std::ceil(distinct_rows));
   return stats.ScaleToRows(std::min(output_rows, stats.Rows()));
 }
 
@@ -82,8 +88,7 @@ size_t SkipScanDistinctPlan::EmitRowCount() const {
   for (size_t i = 0; i < select_items_.size(); ++i) {
     columns.push_back(i);
   }
-  return static_cast<size_t>(
-      std::ceil(stats_.EstimateDistinctRows(columns)));
+  return static_cast<size_t>(std::ceil(stats_.EstimateDistinctRows(columns)));
 }
 
 bool SkipScanDistinctPlan::IsOrderedBy(
@@ -104,9 +109,10 @@ bool SkipScanDistinctPlan::IsOrderedBy(
   // first. If the key column contains NaN, the skip-scan byte order cannot
   // prove the requested ascending order (mirrors DoubleKeyOrderIsSound).
   if (!index_.sc_.key_.empty()) {
-    const slot_t key_col = index_.sc_.key_.front();
-    if (key_col < stats_.Columns()) {
-      for (const ValueFrequency& freq : stats_.Column(key_col).LowestValues()) {
+    // Statistics are projected into index output order; the key is slot 0,
+    // regardless of its original position in the base table.
+    if (stats_.Columns() > 0) {
+      for (const ValueFrequency& freq : stats_.Column(0).LowestValues()) {
         const Value& v = freq.value;
         if (v.type == ValueType::kDouble && std::isnan(v.value.double_value)) {
           return false;

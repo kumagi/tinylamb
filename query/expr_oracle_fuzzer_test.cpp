@@ -40,18 +40,31 @@ std::string RunSingleCellSql(const std::string& sql) {
     }
   }
   StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
-  EXPECT_TRUE(prepared.HasValue()) << engine.LastError() << "\n" << sql;
+  // These checks must return early: Value() on a failed StatusOr aborts the
+  // whole test binary, and row[0] on an empty Row is out of bounds. A bare
+  // EXPECT_* would turn a diagnosable regression into an abort that skips the
+  // rest of the suite. (ASSERT_* cannot be used in this std::string helper.)
+  if (!prepared.HasValue()) {
+    ADD_FAILURE() << engine.LastError() << "\n" << sql;
+    return "";
+  }
   Row row;
   const bool got_row = prepared.Value()->Next(&row, nullptr);
   const Status st = prepared.Value()->GetStatus();
   if (st != Status::kSuccess) {
     throw std::runtime_error(st.GetMessage());
   }
-  EXPECT_TRUE(got_row);
+  if (!got_row) {
+    ADD_FAILURE() << "no row returned: " << sql;
+    return "";
+  }
   // Scalar SELECTs yield one row; only the first cell carries the projected
   // value (repo convention, cf. sql_oracle_fuzzer RunScalar and query_test
   // RunScalar, which both read [0][0]).
-  EXPECT_GE(row.Size(), 1U);
+  if (row.Size() < 1) {
+    ADD_FAILURE() << "empty row returned: " << sql;
+    return "";
+  }
   return row[0].IsNull() ? "NULL" : row[0].AsString();
 }
 
@@ -398,10 +411,11 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
     ExprOracleTrace trace;
     trace.seed = packed;
     std::string report = RunExprOracleIteration(rng, false, &trace);
-    ASSERT_EQ(report, "") << (seed != 0U) << report;
+    ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
     EXPECT_EQ(trace.seed, packed);
     EXPECT_TRUE(trace.sql.rfind("SELECT ", 0) == 0)
-        << (seed != 0U) << trace.sql;
+        << "failing seed=" << seed << "\n"
+        << trace.sql;
     ASSERT_FALSE(trace.sexpr.empty());
     EXPECT_EQ(trace.sexpr.front(), '(');
     EXPECT_TRUE(trace.reference.empty() == false);
@@ -416,7 +430,10 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
   EXPECT_GT(engine_ran, kIterations / 2);
 }
 
-TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
+class ExprOracleExtendedTest : public ::testing::TestWithParam<uint32_t> {};
+constexpr uint32_t kExtendedOpsShards = 4;
+
+TEST_P(ExprOracleExtendedTest, SeededExtendedOpsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
@@ -432,7 +449,9 @@ TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
   }
   ExprGenConfig config;
   config.extended_ops = true;
-  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
+  const uint32_t shard = GetParam();
+  for (uint32_t seed = shard; std::cmp_less(seed, kIterations);
+       seed += kExtendedOpsShards) {
     const auto seed32 = seed + 3000;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
     std::mt19937 rng(seed32);
@@ -450,10 +469,17 @@ TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
     }
     ++ran;
   }
-  EXPECT_EQ(ran, kIterations);
-  EXPECT_GT(engine_ran, kIterations / 2)
-      << "extended-op sweep must execute the engine oracle";
+  const auto iterations = static_cast<uint32_t>(kIterations);
+  EXPECT_EQ(ran,
+            (iterations + kExtendedOpsShards - 1 - shard) / kExtendedOpsShards);
+  if (ran > 0) {
+    EXPECT_GT(engine_ran, ran / 2)
+        << "extended-op sweep must execute the engine oracle";
+  }
 }
+
+INSTANTIATE_TEST_SUITE_P(SeedShards, ExprOracleExtendedTest,
+                         ::testing::Range(uint32_t{0}, kExtendedOpsShards));
 
 // Failure->file->replay pipeline: serialize/parse round-trips, replay of a
 // healthy trace holds, and a tampered trace is reported, not replayed clean.

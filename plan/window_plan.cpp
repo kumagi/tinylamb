@@ -54,6 +54,12 @@ Schema BuildWindowSchema(const Schema& input,
 }
 
 TableStatistics MakeWindowStats(const Schema& schema, size_t rows) {
+  // Window preserves the child's cardinality exactly: EmitRowCount() returns
+  // the same value, so there is no multiplier here to overflow. Estimates from
+  // Apply/RecursiveCte already saturate at SIZE_MAX before they reach this
+  // constructor; Assign only stores the count and TableStatistics::ScaleCount
+  // clamps every derived per-column count, so the saturated value propagates
+  // intact to the cost model rather than being rounded through a smaller type.
   std::vector<ColumnStats> columns;
   columns.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {

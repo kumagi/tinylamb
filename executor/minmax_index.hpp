@@ -10,6 +10,12 @@ namespace tinylamb {
 
 class MinMaxIndexExecutor final : public ExecutorBase {
  public:
+  // `source` must deliver rows already ordered on `value_slot`: ascending for
+  // MIN, descending for MAX. OptimizeMinMaxIndex supplies an IndexOnlyScanPlan
+  // with exactly that direction (and its leading key on the aggregate
+  // column), so the first non-NULL value pulled by NextBatch is the extremum.
+  // A generic/unordered child would only yield an arbitrary non-NULL row, so
+  // do not wire this executor to one.
   MinMaxIndexExecutor(Executor source, size_t value_slot)
       : source_(std::move(source)), value_slot_(value_slot) {}
 

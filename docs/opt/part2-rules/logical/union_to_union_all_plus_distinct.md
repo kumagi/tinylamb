@@ -80,7 +80,7 @@ Append 処理をパイプラインストリーミングで行いつつ、子の�
 - `union_all_merge`: 派生グループ内に生成された `UnionAll` が入れ子を含む場合に平坦化を行います。
 
 - `values_fold_into_union`: 分岐が VALUES のみで構成される場合に単一ノードへ畳み込む。
-- `union_all_push_limit` / `union_all_push_limit`: 分解後の `UnionAll` に対する Limit 押し込みを行います。
+- `union_all_push_limit`: 分解後の `UnionAll` に対する Limit 押し込みを行います。
 
 ## 検証テスト
 

@@ -46,14 +46,17 @@ return JoinAlternatives(memo, logical.children[1], std::nullopt,
 
 本 Rule の意味論的根拠は、直積の厳密な定義（$|L| \times |R|$ の全組列挙）と行数推定の整合性にあります。
 
-共有ヘルパー `JoinAlternatives` において、推定行数は次のように算出されます。
+共有ヘルパー `JoinAlternatives` の `cross = true` 分岐では、生成した `ProductPlan` の `EmitRowCount()` を推定行数として採用します。
 
 ```cpp
-const double cross_estimate =
-    equi_conjuncts.empty() ? l_rows * r_rows : equi_estimate;
+const double local_cost = (l_rows * r_rows) + l_rows + r_rows;
+const auto product_rows = static_cast<double>(product->EmitRowCount());
+candidates.push_back(PlanAlternative{.plan = std::move(product),
+                                     .local_cost = local_cost,
+                                     .estimated_rows = product_rows});
 ```
 
-本 Rule では `condition = std::nullopt` で呼び出されるため、等値結合節（`equi_conjuncts`）は常に空となり、推定行数は常に厳密な交差サイズ $l\_rows \times r\_rows$ となります。もし本 Rule が誤って結合述語を受け取って選択率を反映した推定値を返してしまうと、上位の最適化フェーズに対して「直積演算子であるにもかかわらず等値結合の行数を申告する」という矛盾を生じさせ、誤ったプラン選択を招きます。
+本 Rule では `condition = std::nullopt` で呼び出されるため結合述語はなく、`ProductPlan` の推定行数は厳密な交差サイズ $l\_rows \times r\_rows$ となります。もし本 Rule が誤って結合述語を受け取って選択率を反映した推定値を返してしまうと、上位の最適化フェーズに対して「直積演算子であるにもかかわらず等値結合の行数を申告する」という矛盾を生じさせ、誤ったプラン選択を招きます。
 
 結合述語を伴うクエリは、論理最適化層の `cross_to_inner_with_predicate` によってあらかじめ `kJoin` へと書き換えられ、`nested_loop_join` や `hash_join` などの内部結合実装 Rule へ委ねられる設計になっています。
 
@@ -66,15 +69,16 @@ if (cross) {
   auto product_plan = std::make_shared<ProductPlan>(left.plan, right.plan);
   Plan product = std::move(product_plan);
   const double local_cost = (l_rows * r_rows) + l_rows + r_rows;
+  const auto product_rows = static_cast<double>(product->EmitRowCount());
   candidates.push_back(PlanAlternative{.plan = std::move(product),
                                        .local_cost = local_cost,
-                                       .estimated_rows = cross_estimate});
+                                       .estimated_rows = product_rows});
 }
 ```
 
 - `ProductPlan`: 左右の子プランのみを受け取る 2 引数コンストラクタで生成され、結合キー列や特殊な `JoinKind` を持ちません。
 - `local_cost`: 出力組数 $l\_rows \times r\_rows$ に加え、左右リレーションの読み込みコスト $l\_rows + r\_rows$ を合算した値です。述語評価を行わないため、これが直積実行における理論的下限コストとなります。
-- `estimated_rows`: $l\_rows \times r\_rows$。
+- `estimated_rows`: `product->EmitRowCount()`。本 Rule では述語が無いため、その値は $l\_rows \times r\_rows$ です。
 
 ## 最適化効果
 

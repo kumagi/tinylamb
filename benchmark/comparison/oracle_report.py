@@ -69,7 +69,9 @@ def main():
     cache_end = dict(env['oracle_sga_end'])['Buffer Cache Size'] / 2**20
     allocated = sum(row[1] for row in env['oracle_schema_segments_bytes']) / 2**20
     mysql_cache = int(dict(env['settings']['mysql'])['innodb_buffer_pool_size']) / 2**20
-    data_cache = float(dict(env['args'])['data_cache_mib']) / 2**20 if 'data_cache_mib' in dict(env.get('args', {})) else 1088.0
+    # data_cache_mib is already in MiB (run.py records the CLI value); the
+    # report below prints it as MiB too, so no byte-to-MiB conversion here.
+    data_cache = float(dict(env['args'])['data_cache_mib']) if 'data_cache_mib' in dict(env.get('args', {})) else 1088.0
     version = oracle['version'][0][0].replace('\n', ' / ')
     report = f'''# Oracle Freeを追加した4製品比較（2026-10-31）
 

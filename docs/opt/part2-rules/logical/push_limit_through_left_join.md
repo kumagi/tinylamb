@@ -37,10 +37,18 @@ LIMIT の押し込みは ON 述語の評価回数を減らします。揮発性�
 次のとおりです。
 
 (1) 式が `kLimit` で子を 1 個持ち、`total_limit = count + offset > 0`。
+さらに順序要件のゲートがあり、順序付き Limit(`sort_ascending` /
+`sort_nulls_first` が非空)と `WITH TIES` は弾かれる。これは本 Rule が
+生成する Limit が順序情報を引き継がないためで、順序付き Limit を
+ JOIN 下へ押し込むと上位で復元される順序が失われる(D5 監査表)。
 
 ```cpp
           if (expression.operation != LogicalOperator::kLimit ||
               expression.children.size() != 1) {
+            return;
+          }
+          if (expression.with_ties || !expression.sort_ascending.empty() ||
+              !expression.sort_nulls_first.empty()) {
             return;
           }
           const GroupId input_id = bindings.at("input");

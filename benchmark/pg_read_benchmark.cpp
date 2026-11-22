@@ -20,9 +20,15 @@
 
 namespace {
 
+// One thread plus one barrier slot per client; an unbounded value turns
+// clients.reserve() and the barrier into a multi-GiB allocation (or a
+// ptrdiff_t overflow) before the load generator can do any useful work.
+constexpr size_t kMaxClients = 65536;
+
 struct Options {
   std::string host{"127.0.0.1"};
   uint16_t port{54321};
+  bool help{false};
   size_t clients{1};
   size_t warmup_seconds{2};
   size_t measurement_seconds{10};
@@ -170,6 +176,12 @@ bool ParsePositive(std::string_view input, size_t* result) {
 bool ParseOptions(int argc, char** argv, Options* options) {
   for (int i = 1; i < argc; ++i) {
     const std::string_view argument(argv[i]);
+    if (argument == "--help") {
+      // A standalone flag carries no value: consume it and let main() exit
+      // successfully after printing usage, like the other benchmarks do.
+      options->help = true;
+      continue;
+    }
     if (i + 1 >= argc) {
       return false;
     }
@@ -184,9 +196,11 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       }
       options->port = static_cast<uint16_t>(port);
     } else if (argument == "--clients") {
-      if (!ParsePositive(value, &options->clients)) {
+      size_t clients = 0;
+      if (!ParsePositive(value, &clients) || clients > kMaxClients) {
         return false;
       }
+      options->clients = clients;
     } else if (argument == "--warmup") {
       if (!ParsePositive(value, &options->warmup_seconds)) {
         return false;
@@ -212,7 +226,8 @@ void Usage() {
   std::cerr << "usage: tinylamb_pg_read_benchmark [--host ADDRESS] "
                "[--port PORT] [--clients COUNT] [--warmup SECONDS] "
                "[--seconds SECONDS] [--user USER] [--database DATABASE] "
-               "[--query SQL]\n";
+               "[--query SQL] [--help]\n"
+               "clients must be in [1, 65536].\n";
 }
 
 }  // namespace
@@ -222,6 +237,10 @@ int main(int argc, char** argv) {
   if (!ParseOptions(argc, argv, &options)) {
     Usage();
     return 2;
+  }
+  if (options.help) {
+    Usage();
+    return 0;
   }
 
   std::barrier ready(static_cast<std::ptrdiff_t>(options.clients + 1));

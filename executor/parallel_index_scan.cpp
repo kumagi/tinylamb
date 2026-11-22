@@ -102,24 +102,30 @@ void ParallelIndexScan::Start(size_t batch_size) {
   }
   started_ = true;
   workers_.reserve(worker_count_);
-  size_t launched = 0;
   for (size_t worker = 0; worker < worker_count_; ++worker) {
     try {
       workers_.emplace_back(
           [this, batch_size, worker] { RunWorker(batch_size, worker); });
-      ++launched;
+      // Publish the worker while still holding mutex_: RunWorker decrements
+      // this counter on exit, so setting it once after the loop leaves a
+      // window in which a fast worker can underflow it.
+      ++active_workers_;
     } catch (...) {
-      // Thread creation can fail (e.g. resource_unavailable).  Account only
-      // for the workers that actually started and wake the consumer via
-      // worker_error_ instead of blocking on active_workers_ forever.
+      // Thread creation can fail (e.g. resource_unavailable).  Static
+      // rotation gives worker w sole ownership of morsels w, w+W, ...; a
+      // worker that never started leaves those morsels unread. Stop the
+      // launched workers as well and surface the sticky error before any
+      // row is handed out, so a caller cannot mistake a partial scan for a
+      // complete (empty) result.
       if (worker_error_ == Status::kSuccess) {
         worker_error_ =
             StatusFromCurrentException("parallel index scan worker failed");
       }
+      cancelled_.store(true, std::memory_order_release);
+      space_cv_.notify_all();
       break;
     }
   }
-  active_workers_ = launched;
   ready_cv_.notify_all();
 }
 

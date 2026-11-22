@@ -23,12 +23,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <ranges>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -81,6 +84,8 @@ std::map<std::string, std::vector<char>> DatabaseArtifacts(
                                         std::istreambuf_iterator<char>()));
   };
   capture(prefix + ".db");
+  capture(prefix + ".db.blocks");
+  capture(prefix + ".db.lsm");
   capture(prefix + ".log");
   capture(prefix + ".log.meta");
   capture(prefix + ".log.meta.tmp");
@@ -92,10 +97,19 @@ std::map<std::string, std::vector<char>> DatabaseArtifacts(
   if (error) {
     return artifacts;
   }
-  const std::string segment_prefix = prefix + ".log.";
+  // DeleteAll()/RemoveCreatedDatabaseFiles() also remove the companion
+  // block, LSM and TLCS families; the verification set must cover them or
+  // a leak there would go unnoticed.
+  const std::vector<std::string> family_prefixes = {
+      prefix + ".log.",    prefix + ".db.blocks.", prefix + ".db.lsm.",
+      prefix + ".db.tlcs", prefix + ".blocks.",    prefix + ".lsm.",
+      prefix + ".tlcs",
+  };
   for (const std::filesystem::directory_entry& entry : iterator) {
     const std::string filename = entry.path().filename().string();
-    if (filename.starts_with(segment_prefix)) {
+    if (std::ranges::any_of(family_prefixes, [&](const std::string& p) {
+          return filename.starts_with(p);
+        })) {
       capture(entry.path());
     }
   }
@@ -296,7 +310,9 @@ TEST_F(DatabaseExtraTest, CommittedRowsSurviveCrashDuringCheckpointStorm) {
   for (std::thread& w : writers) {
     w.join();
   }
-  ASSERT_GT(acknowledged.load(std::memory_order_relaxed), 0);
+  // The checkpoint storm must actually overlap the target number of commits;
+  // otherwise the ATT classification race this test targets was never stressed.
+  ASSERT_GE(acknowledged.load(std::memory_order_relaxed), 50);
 
   // Simulated crash + reopen: every acknowledged commit must be visible,
   // with exactly the acknowledged value.
@@ -313,7 +329,7 @@ TEST_F(DatabaseExtraTest, CommittedRowsSurviveCrashDuringCheckpointStorm) {
     ASSERT_EQ(rows.size(), 1U) << "key " << key;
     ASSERT_EQ(rows[0][0], Value(static_cast<int64_t>(value)))
         << "key " << key << " lost or rolled back its committed value";
-    ctx.PreCommit();
+    ASSERT_SUCCESS(ctx.PreCommit());
   }
 }
 
@@ -331,12 +347,17 @@ TEST_F(DatabaseExtraTest, MissingWalFailsClosed) {
   std::error_code ec;
   RemoveLogAndSegments(prefix_ + ".log");
   std::filesystem::remove(prefix_ + ".last_checkpoint", ec);
+  ASSERT_FALSE(ec) << ec.message();
   const auto reopened = Database::Create(prefix_);
   EXPECT_EQ(reopened.GetStatus(), Status::kCorrupt);
   std::filesystem::remove(prefix_ + ".db", ec);
+  ASSERT_FALSE(ec) << ec.message();
   std::filesystem::remove(prefix_ + ".log", ec);
+  ASSERT_FALSE(ec) << ec.message();
   std::filesystem::remove(prefix_ + ".log.meta", ec);
+  ASSERT_FALSE(ec) << ec.message();
   std::filesystem::remove(prefix_ + ".last_checkpoint", ec);
+  ASSERT_FALSE(ec) << ec.message();
 }
 TEST_F(DatabaseExtraTest, CleanReopenSkipsNoOpEndOfRecoveryCheckpoint) {
   SqlEngine engine(*db_);
@@ -414,4 +435,99 @@ TEST_F(DatabaseExtraTest, IsCurrentIncarnationTracksDdlLifecycle) {
   EXPECT_TRUE(db_->IsCurrentIncarnation("probe_t", t3.IncarnationState()));
   ASSERT_SUCCESS(again.PreCommit());
 }
+
+TEST_F(DatabaseExtraTest,
+       AnalyzeAutoCompactsCommittedTablesAndSkipsUncommittedTxn) {
+  struct AnalyzeTlcsEnvGuard {
+    std::optional<std::string> prev;
+    explicit AnalyzeTlcsEnvGuard(const char* value) {
+      if (const char* cur = std::getenv("TINYLAMB_ANALYZE_AUTO_TLCS")) {
+        prev = cur;
+      }
+      if (value != nullptr) {
+        setenv("TINYLAMB_ANALYZE_AUTO_TLCS", value, 1);
+      } else {
+        unsetenv("TINYLAMB_ANALYZE_AUTO_TLCS");
+      }
+    }
+    AnalyzeTlcsEnvGuard(const AnalyzeTlcsEnvGuard&) = delete;
+    AnalyzeTlcsEnvGuard& operator=(const AnalyzeTlcsEnvGuard&) = delete;
+    AnalyzeTlcsEnvGuard(AnalyzeTlcsEnvGuard&&) = delete;
+    AnalyzeTlcsEnvGuard& operator=(AnalyzeTlcsEnvGuard&&) = delete;
+    ~AnalyzeTlcsEnvGuard() {
+      if (prev.has_value()) {
+        setenv("TINYLAMB_ANALYZE_AUTO_TLCS", prev->c_str(), 1);
+      } else {
+        unsetenv("TINYLAMB_ANALYZE_AUTO_TLCS");
+      }
+    }
+  };
+
+  SqlEngine engine(*db_);
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_TRUE(
+        RunStatement(&engine, &ctx, "CREATE TABLE analyze_auto (k INT64);"));
+    ASSERT_TRUE(RunStatement(&engine, &ctx,
+                             "INSERT INTO analyze_auto VALUES (10), (20);"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    AnalyzeTlcsEnvGuard off_guard(nullptr);
+    {
+      TransactionContext ctx = db_->BeginContext();
+      ASSERT_TRUE(RunStatement(&engine, &ctx, "ANALYZE analyze_auto;"));
+      ASSERT_SUCCESS(ctx.PreCommit());
+    }
+    {
+      TransactionContext check = db_->BeginReadOnlyContext();
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(check, "analyze_auto"));
+      EXPECT_EQ(tbl.GetBackingTlcsStore(), nullptr);
+      ASSERT_SUCCESS(check.PreCommit());
+    }
+  }
+
+  AnalyzeTlcsEnvGuard on_guard("1");
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_TRUE(RunStatement(&engine, &ctx, "ANALYZE analyze_auto;"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext check = db_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(check, "analyze_auto"));
+    EXPECT_NE(tbl.GetBackingTlcsStore(), nullptr);
+    EXPECT_TRUE(std::filesystem::exists(prefix_ + ".db.tlcs." +
+                                        std::to_string(tbl.FirstPageId())));
+    ASSERT_SUCCESS(check.PreCommit());
+  }
+
+  // Open transaction with uncommitted INSERT: ANALYZE must not bake dirty
+  // rows into a backing TLCS file, and Abort() must roll back cleanly.
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_TRUE(
+        RunStatement(&engine, &ctx, "CREATE TABLE analyze_dirty (k INT64);"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext dirty = db_->BeginContext();
+    ASSERT_TRUE(RunStatement(&engine, &dirty,
+                             "INSERT INTO analyze_dirty VALUES (99);"));
+    ASSERT_TRUE(RunStatement(&engine, &dirty, "ANALYZE analyze_dirty;"));
+    ASSERT_SUCCESS(dirty.Abort());
+  }
+  {
+    TransactionContext verify = db_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(verify, "analyze_dirty"));
+    EXPECT_EQ(tbl.GetBackingTlcsStore(), nullptr);
+    std::vector<Row> rows;
+    ASSERT_TRUE(RunStatement(&engine, &verify,
+                             "SELECT COUNT(*) FROM analyze_dirty;", &rows));
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(rows[0][0], Value(int64_t{0}));
+    ASSERT_SUCCESS(verify.PreCommit());
+  }
+}
+
 }  // namespace tinylamb

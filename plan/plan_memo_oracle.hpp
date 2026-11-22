@@ -17,7 +17,8 @@ namespace tinylamb {
 // Cascades optimizer (plan layer PBT entry point).
 //
 // Pipeline: GenerateJoinGraph(rng) builds a small relation set together with
-// single-relation filter conjuncts (`tN.c0 = <const>`) and two-relation join
+// single-relation filter conjuncts (`tN.c0 = <const>` / `tN.c1 = <const>`,
+// alternating by conjunct index) and two-relation join
 // conjuncts (`tA.c0 = tB.c0`). CheckExploreEquivalence(graph) then verifies
 // the memo properties every transformation rule must preserve:
 //
@@ -67,19 +68,29 @@ std::string CheckMemoInvariants(const cascades::Memo& memo,
 // rule-subset monotonicity. Returns "" when all properties hold.
 std::string CheckExploreEquivalence(const GeneratedJoinGraph& graph);
 
-// Bounded delta-shrinker: drops conjuncts one by one, then drops relations
+// Bounded delta-shrinker: greedily drops conjuncts one by one, then relations
 // (with their touching conjuncts) while the mismatch is preserved. Always
-// terminates; returns the smallest mismatch-preserving graph found (or the
-// input when nothing shrinks).
+// terminates; returns a locally reduced mismatch-preserving graph (not a
+// proven minimum — the result depends on removal order), or the input when
+// nothing shrinks.
 GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph);
+
+// Same delta-shrinking algorithm with an injectable mismatch predicate.
+// The default overload uses CheckExploreEquivalence(); tests exercise the
+// shrink loop with a synthetic predicate because a sound engine leaves no
+// naturally failing graph to shrink.
+using GraphMismatchPredicate = std::function<bool(const GeneratedJoinGraph&)>;
+GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph,
+                                   const GraphMismatchPredicate& is_mismatch);
 
 // ---------------------------------------------------------------------------
 // Complex Multi-Operator Memo Oracle
 //
-// Synthesizes rich Cascades Memos with schemas,
-// candidate-key/not-null/foreign-key constraints, and multi-operator pipelines
-// (Selection, Projection, Aggregation, Distinct, Sort, Limit, Window,
-// OuterJoin, SemiJoin, AntiJoin) to exercise the applicable default
+// Synthesizes rich Cascades Memos with per-relation schemas and column
+// constraints (PRIMARY KEY / UNIQUE / NOT NULL / none; no foreign keys), plus
+// multi-operator pipelines (Selection, Projection, Aggregation, Distinct, Sort,
+// Limit, Window, TopN, Unnest, and a conditional OuterJoin root). SemiJoin /
+// AntiJoin are not generated. This exercises the applicable default
 // transformation rules during exploration; generator coverage is not proof that
 // every rule fires.
 // ---------------------------------------------------------------------------

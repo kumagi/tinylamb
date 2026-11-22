@@ -217,12 +217,19 @@ StatusOr<size_t> Row::TryDeserializeProjected(
     const char* src, const Schema& sc, const std::vector<slot_t>& columns) {
   const size_t kept_count = columns.size();
   // The slot-reuse decode below presumes the caller contract (ascending,
-  // in-range projection). A malformed projection keeps reproducing the legacy
+  // in-range projection). An out-of-range column is rejected up front, just
+  // like Row::TryExtract: otherwise a {100}-style projection on a 2-column
+  // schema never matches a stored slot and silently yields all-NULL values.
+  // A non-ascending but in-range projection keeps reproducing the legacy
   // clear()+emplace decode, which yields a row narrower than the chunk layout
   // so downstream width checks still catch the violation
   // (ParallelScanReorderedProjectionThrows).
-  for (size_t k = 1; k < kept_count; ++k) {
-    if (columns[k - 1] >= columns[k]) {
+  for (size_t k = 0; k < kept_count; ++k) {
+    if (columns[k] >= sc.ColumnCount()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "row projection column is out of range");
+    }
+    if (k != 0 && columns[k - 1] >= columns[k]) {
       return DeserializeProjectedUnchecked(src, sc, columns, values_);
     }
   }
@@ -580,8 +587,10 @@ StatusOr<std::optional<int64_t>> Row::TryPeekInteger(const char* src,
       int64_t key = 0;
       DeserializeInteger(src, &key);
       // UINT64 images are stored as raw int64 bits; a 2^63+ value must peek
-      // as a large positive magnitude, not a negative number.
-      if (sc.GetColumn(i).IsUnsigned()) {
+      // as a large positive magnitude, not a negative number. DATE is a
+      // day-count domain and never takes part in unsigned key comparison,
+      // so ignore a stray unsigned flag on a DATE column.
+      if (type == ValueType::kInt64 && sc.GetColumn(i).IsUnsigned()) {
         return static_cast<int64_t>(static_cast<uint64_t>(key));
       }
       return key;
@@ -662,7 +671,10 @@ namespace {
 size_t PeekValueSerializedSize(  // NOLINT(misc-no-recursion)
     const char* src, size_t max_len, size_t need, ValueType vt,
     size_t depth = 0) {
-  if (depth > 32) {
+  // Use the same limit (and the same >= boundary) as the other decode paths
+  // in value.cpp; `> 32` would accept a depth-33 array that the real decoder
+  // rejects as corrupt, so Peek and Deserialize would disagree.
+  if (depth >= Value::kMaxArrayNestingDepth) {
     throw std::runtime_error("array nesting depth exceeded");
   }
   switch (vt) {
@@ -760,6 +772,11 @@ size_t Row::PeekSerializedSize(const char* src, size_t max_len,
 
 size_t Row::DeserializeBounded(const char* src, size_t max_len,
                                const Schema& sc) {
+  // Two passes are intentional: PeekSerializedSize validates every length
+  // and nesting bound against `max_len` before any read, because
+  // TryDeserialize is deliberately bounds-agnostic and trusts its input.
+  // Folding the checks into the decode would let a corrupt image read past
+  // the buffer; Peek's result is the validated decoded byte count we return.
   const size_t need = PeekSerializedSize(src, max_len, sc);
   const auto decoded = TryDeserialize(src, sc);
   if (!decoded.HasValue()) {

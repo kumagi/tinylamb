@@ -180,21 +180,31 @@ class Worker:
         self.command, self.stderr, self.timeout = command, stderr, timeout
         self.process = None
         self.selector = selectors.DefaultSelector()
+        # Raw-byte accumulator: reading the FD directly under select() avoids
+        # the text-layer buffer, which could hold a complete line while the
+        # kernel side looked idle and select() waited until timeout.
+        self._line_buffer = b''
 
     def receive(self):
-        if not self.selector.select(self.timeout):
-            self.close()
-            raise TimeoutError(f'query exceeded {self.timeout}s')
-        line = self.process.stdout.readline()
-        if not line:
-            code = self.process.poll()
-            self.close()
-            raise RuntimeError(f'worker exited ({code})')
+        deadline = time.monotonic() + self.timeout
+        while b'\n' not in self._line_buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.selector.select(remaining):
+                self.close()
+                raise TimeoutError(f'query exceeded {self.timeout}s')
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                code = self.process.poll()
+                self.close()
+                raise RuntimeError(f'worker exited ({code})')
+            self._line_buffer += chunk
+        line, self._line_buffer = self._line_buffer.split(b'\n', 1)
         return json.loads(line)
 
     def query(self, name):
         try:
             if self.process is None:
+                self._line_buffer = b''
                 self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE,
                                                 stdout=subprocess.PIPE, stderr=self.stderr,
                                                 text=True, start_new_session=True)
@@ -210,6 +220,7 @@ class Worker:
 
     def close(self):
         process, self.process = self.process, None
+        self._line_buffer = b''
         if process is None:
             return
         self.selector.unregister(process.stdout)
@@ -288,30 +299,46 @@ def report(out):
     fig.savefig(out / 'latency.png', dpi=170)
     fig.savefig(out / 'latency.svg')
     plt.close(fig)
-    ratios = [statistics.median(r['tinylamb']['samples_ms']) / statistics.median(r['duckdb']['samples_ms']) for r in good]
+    medians = [(statistics.median(r['tinylamb']['samples_ms']),
+                statistics.median(r['duckdb']['samples_ms'])) for r in good]
+    # A sub-resolution 0 ms median makes a ratio undefined (0/0) or
+    # infinite (x/0): wins compare medians directly, and the log-space
+    # stats (geomean, speedup chart) use only strictly-positive pairs.
+    ratios = [tiny / duck if tiny > 0 and duck > 0 else None
+              for tiny, duck in medians]
+    finite_ratios = [ratio for ratio in ratios if ratio is not None]
+    zero_median_queries = [r['query'] for r, (tiny, duck)
+                           in zip(good, medians) if tiny <= 0 or duck <= 0]
     summary = {'matched': len(good), 'attempted': len(records),
-               'tinylamb_wins': sum(ratio < 1 for ratio in ratios),
-               'duckdb_wins': sum(ratio > 1 for ratio in ratios),
+               'tinylamb_wins': sum(tiny < duck for tiny, duck in medians),
+               'duckdb_wins': sum(duck < tiny for tiny, duck in medians),
                'tinylamb_nonoverlapping_wins': sum(max(r['tinylamb']['samples_ms']) < min(r['duckdb']['samples_ms']) for r in good),
                'empty_answers': [r['query'] for r in good if not r['tinylamb']['rows']],
                'nonempty_queries': sum(bool(r['tinylamb']['rows']) for r in good),
-               'tinylamb_nonempty_wins': sum(bool(r['tinylamb']['rows']) and ratio < 1 for r, ratio in zip(good, ratios)),
+               'tinylamb_nonempty_wins': sum(bool(r['tinylamb']['rows']) and tiny < duck
+                                             for r, (tiny, duck) in zip(good, medians)),
                'comparison': 'multiset (duplicate-sensitive), exact integers/nulls, float rel_tol=1e-9 abs_tol=1e-7; output order not checked',
-               'geomean_tinylamb_over_duckdb': math.exp(statistics.mean(map(math.log, ratios))) if ratios else None,
+               'geomean_tinylamb_over_duckdb': (math.exp(statistics.mean(map(math.log, finite_ratios)))
+                                                if finite_ratios else None),
+               'zero_median_queries': zero_median_queries,
                'sum_median_ms': {e: sum(statistics.median(r[e]['samples_ms']) for r in good) for e in ('tinylamb', 'duckdb')},
                'failures': [{'query': r['query'], 'status': r['status'], 'detail': r.get('detail')} for r in records if r['status'] != 'ok']}
     summary['performance_failures'] = [r['query'] for r in records if not r.get('performance_pass', True)]
     summary['unattempted_queries'] = [q for q in meta['args']['queries'] if q not in {r['query'] for r in records}]
     dump(out / 'summary.json', summary)
     fig, ax = plt.subplots(figsize=(19, 5), constrained_layout=True)
-    speedups = [1 / ratio for ratio in ratios]
-    ax.bar(range(len(good)), [x - 1 for x in speedups], bottom=1,
+    # Bars stay aligned with their query labels: only pairs with a defined
+    # (positive/positive) ratio are plotted.
+    plotted = [(r, ratio) for r, ratio in zip(good, ratios) if ratio is not None]
+    speedups = [1 / ratio for _, ratio in plotted]
+    positions = list(range(len(plotted)))
+    ax.bar(positions, [x - 1 for x in speedups], bottom=1,
            color=['#2678b2' if x > 1 else '#ec9b24' for x in speedups])
     ax.axhline(1, color='black', linewidth=1)
     ax.set_yscale('log')
     if speedups:
         ax.set_ylim(min(speedups) * .7, max(speedups) * 1.3)
-    ax.set_xticks(range(len(good)), [str(r['query']) for r in good], fontsize=6)
+    ax.set_xticks(positions, [str(r['query']) for r, _ in plotted], fontsize=6)
     ax.set_xlabel(f'{label} query')
     ax.set_ylabel('DuckDB / tinylamb median time (log)')
     ax.grid(axis='y', alpha=.2)

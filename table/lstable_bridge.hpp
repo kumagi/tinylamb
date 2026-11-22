@@ -447,8 +447,9 @@ struct LSTableIntegerRuns {
   [[nodiscard]] std::pair<uint32_t, uint32_t> Find(int64_t key) const {
     const uint64_t off =
         static_cast<uint64_t>(key) - static_cast<uint64_t>(minimum);
-    if (offsets.empty() || off >= offsets.size() - 1) { return {0, 0};
-}
+    if (offsets.empty() || off >= offsets.size() - 1) {
+      return {0, 0};
+    }
     return {offsets[off], offsets[off + 1]};
   }
 };
@@ -474,7 +475,7 @@ struct LSTableIntegerRunBounds {
     if (coarse.empty()) {
       return {value_minimum + static_cast<int64_t>(packed[offset] & 65535),
               value_minimum + static_cast<int64_t>(packed[offset] >> 16)};
-}
+    }
     const uint32_t bins = coarse[offset];
     const uint64_t low = (bins & 255) << coarse_shift;
     const uint64_t high = std::min<uint64_t>(
@@ -493,15 +494,18 @@ struct LSTableIntegerRunBounds {
     const uint64_t off =
         static_cast<uint64_t>(key) - static_cast<uint64_t>(key_minimum);
     const size_t count = BoundsCount();
-    if (key_bits.empty()) { return off < count ? off : count;
-}
+    if (key_bits.empty()) {
+      return off < count ? off : count;
+    }
     const uint64_t word = off >> 6;
-    if (word >= key_bits.size()) { return count;
-}
+    if (word >= key_bits.size()) {
+      return count;
+    }
     const uint64_t bit = uint64_t{1} << (off & 63);
     const uint64_t bits = key_bits[word];
-    if ((bits & bit) == 0U) { return count;
-}
+    if ((bits & bit) == 0U) {
+      return count;
+    }
     return key_prefix[word] + std::popcount(bits & (bit - 1));
   }
   std::shared_ptr<ProcessMemoryCharge> memory_charge;
@@ -509,8 +513,9 @@ struct LSTableIntegerRunBounds {
   [[nodiscard]] bool MayOverlap(int64_t key, int64_t lower,
                                 int64_t upper) const {
     const size_t off = BoundsOffset(key);
-    if (off >= BoundsCount() || lower > upper) { return false;
-}
+    if (off >= BoundsCount() || lower > upper) {
+      return false;
+    }
     const auto [lo, hi] = ValueBounds(off);
     return lo <= upper && hi >= lower;
   }
@@ -519,6 +524,48 @@ struct LSTableIntegerRunBounds {
     const size_t off = BoundsOffset(key);
     return off < BoundsCount() && ValueBounds(off).second > threshold;
   }
+};
+
+struct LSTableBlockLayout {
+  uint64_t generation{0};
+  page_id_t first_pid{0};
+  txn_id_t uncommitted_owner_txn{0};
+  uint64_t total_rows{0};
+  std::optional<Schema> lstable_schema;
+  bool has_unsigned_column{false};
+  bool is_persistent_tlcs{false};
+  std::vector<uint32_t> block_row_counts;
+  std::vector<lsn_t> block_page_lsns;
+  std::vector<uint8_t> block_identity_slots;
+  std::vector<std::vector<slot_t>> block_slots;
+  std::vector<page_id_t> page_ids;
+  std::vector<uint32_t> flat_page_to_block;
+  std::unordered_map<page_id_t, size_t> page_to_block;
+  std::shared_ptr<const PaxChunk> pax_chunk;
+  std::shared_ptr<const platform::MemoryMap> backing_mmap;
+  std::string owned_column_stats;
+  std::string_view serialized_column_stats;
+  std::shared_ptr<ProcessMemoryCharge> memory_charge;
+};
+
+struct LSTableColumnCacheEntry {
+  uint64_t generation{0};
+  slot_t col_index{0};
+  size_t estimated_bytes{0};
+  ValueType type{ValueType::kNull};
+  bool is_unsigned{false};
+  bool has_null{false};
+  bool is_monotonic{false};
+  bool is_unique_nonnull{false};
+  bool is_identity_1_to_n{false};
+  int64_t min_int{std::numeric_limits<int64_t>::max()};
+  int64_t max_int{std::numeric_limits<int64_t>::min()};
+  std::vector<int64_t> integer_column;
+  LSTableColumnDictionary dictionary;
+  std::shared_ptr<const BloomRuntimeFilter> integer_membership;
+  std::vector<LSTableColumnBlock> blocks;
+  std::shared_ptr<const platform::MemoryMap> backing_mmap;
+  std::shared_ptr<ProcessMemoryCharge> memory_charge;
 };
 
 struct LSTableStore {
@@ -538,6 +585,21 @@ struct LSTableStore {
   // blocks borrow slices only after construction has finished growing these
   // buffers. VARCHAR columns have empty entries here.
   std::vector<std::vector<int64_t>> integer_columns;
+  std::vector<std::span<const int64_t>> integer_columns_view;
+  std::shared_ptr<const LSTableBlockLayout> layout_owner;
+  std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> column_owners;
+
+  [[nodiscard]] std::span<const int64_t> IntegerColumn(
+      slot_t col) const noexcept {
+    if (col < integer_columns_view.size() &&
+        !integer_columns_view[col].empty()) {
+      return integer_columns_view[col];
+    }
+    if (col < integer_columns.size()) {
+      return integer_columns[col];
+    }
+    return {};
+  }
   // Empty means every column. Partial stores retain original column indexes
   // and are published only in the separate, single-entry projection cache.
   std::vector<uint8_t> loaded_columns;
@@ -617,6 +679,12 @@ struct LSTableStore {
 
 [[nodiscard]] std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
     Transaction& txn, const Table& table, bool allow_lazy_build,
+    const std::vector<slot_t>* projection = nullptr);
+
+[[nodiscard]] std::shared_ptr<const LSTableStore> AssembleLSTableStoreView(
+    uint64_t generation, size_t col_count,
+    const std::shared_ptr<const LSTableBlockLayout>& layout,
+    const std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>& columns,
     const std::vector<slot_t>* projection = nullptr);
 
 }  // namespace tinylamb

@@ -23,7 +23,28 @@
 #include <thread>
 #include <vector>
 
+namespace {
+// TINYLAMB_LOG_LEVEL may raise the process threshold above TRACE and filter
+// severities these tests assert are emitted. Pin the level for the test's
+// duration and restore it afterwards so the ambient environment cannot turn
+// the assertions red.
+class ScopedTraceLogLevel {
+ public:
+  ScopedTraceLogLevel() : previous_(::tinylamb::detail::MinLogLevel()) {
+    ::tinylamb::detail::SetMinLogLevel(TRACE);
+  }
+  ~ScopedTraceLogLevel() { ::tinylamb::detail::SetMinLogLevel(previous_); }
+
+  ScopedTraceLogLevel(const ScopedTraceLogLevel&) = delete;
+  ScopedTraceLogLevel& operator=(const ScopedTraceLogLevel&) = delete;
+
+ private:
+  ::LogLevel previous_;
+};
+}  // namespace
+
 TEST(LogMessageTest, Log_WithSurvivableSeverities_StreamsWithoutError) {
+  const ScopedTraceLogLevel trace_level;
   ::testing::internal::CaptureStderr();
   LOG(ERROR) << "sev-ERROR";
   LOG(ALERT) << "sev-ALERT";
@@ -46,6 +67,7 @@ TEST(LogMessageTest, Log_WithFatalSeverity_AbortsProcess) {
 }
 
 TEST(LogMessageTest, AuditConcurrentMessagesStayOnOneLine) {
+  const ScopedTraceLogLevel trace_level;
   ::testing::internal::CaptureStderr();
   std::vector<std::thread> workers;
   workers.reserve(8);

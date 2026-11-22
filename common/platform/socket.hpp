@@ -65,8 +65,23 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 
 namespace tinylamb::platform {
+
+// Platform-neutral socket descriptor used by every socket API below.
+//
+// On POSIX this is the usual small, non-negative `int` file descriptor (-1 on
+// error). On Windows a Winsock `SOCKET` is a `UINT_PTR` (64 bits on Win64), so
+// it cannot be narrowed to `int` without losing the upper bits. Use a *signed*
+// pointer-sized type there: it holds the full handle bit-for-bit, keeps the
+// `fd < 0` error checks working (INVALID_SOCKET is all-ones == -1), and avoids
+// collisions/truncation. Callers should store this type rather than `int`.
+#ifdef TINYLAMB_OS_WINDOWS
+using SocketFd = std::intptr_t;
+#else
+using SocketFd = int;
+#endif
 
 // Descriptor flags applied at creation time. Linux sets them atomically
 // (SOCK_NONBLOCK/SOCK_CLOEXEC, accept4, pipe2). macOS has no such flags and
@@ -89,48 +104,49 @@ void EnsureSocketSubsystemInitialized();
 // raise SIGPIPE on a write to a closed peer where the platform supports a
 // per-socket option (SO_NOSIGPIPE on macOS); combine with kSendNoSignal.
 // Returns the descriptor, or -1 with errno set.
-int OpenSocket(int domain, int type, int protocol, FdFlags flags);
+SocketFd OpenSocket(int domain, int type, int protocol, FdFlags flags);
 
 // accept(2) with `flags` applied to the new connection (accept4 on Linux).
 // Returns the descriptor, or -1 with errno set (EAGAIN/EWOULDBLOCK/EINTR
 // pass through unchanged).
-int AcceptSocket(int listener, FdFlags flags);
+SocketFd AcceptSocket(SocketFd listener, FdFlags flags);
 
 // pipe(2) with `flags` applied to both ends (pipe2 on Linux; loopback TCP
 // socket pair on Windows). Returns 0, or -1 with errno set.
-int OpenPipe(std::array<int, 2>& fds, FdFlags flags);
+int OpenPipe(std::array<SocketFd, 2>& fds, FdFlags flags);
 
 // Closes a socket descriptor (or pipe end created by OpenPipe).
-int CloseSocket(int fd);
+int CloseSocket(SocketFd fd);
 
 // recv(2) wrapper that normalizes platform socket errors into errno.
-ssize_t RecvSocket(int fd, void* data, size_t size, int flags = 0);
+ssize_t RecvSocket(SocketFd fd, void* data, size_t size, int flags = 0);
 
 // shutdown(2) wrapper that normalizes platform socket errors into errno.
-int ShutdownSocket(int fd, int how);
+int ShutdownSocket(SocketFd fd, int how);
 
 // poll(2) / WSAPoll wrapper over socket descriptors.
 int PollSockets(pollfd* fds, size_t nfds, int timeout_ms);
 
 // Sets an integer socket option (e.g. SO_REUSEADDR, TCP_NODELAY).
-int SetSocketOptInt(int fd, int level, int optname, int value);
+int SetSocketOptInt(SocketFd fd, int level, int optname, int value);
 
 // Sets SO_RCVTIMEO or SO_SNDTIMEO in milliseconds.
-int SetSocketTimeout(int fd, int optname, int timeout_ms);
+int SetSocketTimeout(SocketFd fd, int optname, int timeout_ms);
 
 // Queries descriptor flags (used by platform contract tests).
-bool IsCloseOnExec(int fd);
-bool IsNonBlocking(int fd);
+bool IsCloseOnExec(SocketFd fd);
+bool IsNonBlocking(SocketFd fd);
 
 // send(2)/sendmsg(2) flag suppressing SIGPIPE for this call.
 inline constexpr int kSendNoSignal = MSG_NOSIGNAL;
 
 // Wrappers that add kSendNoSignal to `extra_flags`.
-ssize_t SendNoSignal(int fd, const void* data, size_t size,
+ssize_t SendNoSignal(SocketFd fd, const void* data, size_t size,
                      int extra_flags = 0);
 
 #ifdef TINYLAMB_OS_POSIX
-ssize_t SendMsgNoSignal(int fd, const msghdr* message, int extra_flags = 0);
+ssize_t SendMsgNoSignal(SocketFd fd, const msghdr* message,
+                        int extra_flags = 0);
 
 // posix_spawnattr_init plus the platform's "do not leak descriptors into the
 // child" flag (POSIX_SPAWN_CLOEXEC_DEFAULT on macOS; Linux relies on the

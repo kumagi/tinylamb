@@ -40,6 +40,7 @@ class SqlEngineTpccTest : public ::testing::Test {
     while (result.Value()->Next(&row, nullptr)) {
       rows.push_back(row);
     }
+    EXPECT_EQ(result.Value()->GetStatus(), Status::kSuccess) << sql;
     return rows;
   }
 
@@ -113,8 +114,8 @@ TEST_F(SqlEngineTpccTest, ExecutesAllTransactionQueryShapes) {
       "(100, 1, 1, 2, 2, 5, 25.0, NULL);");
 
   // New-Order: reads, district sequence update, stock CASE update and inserts.
-  const auto w_tax = Run(*database_, context,
-                         "SELECT w_tax FROM warehouse WHERE w_id = 1;");
+  const auto w_tax =
+      Run(*database_, context, "SELECT w_tax FROM warehouse WHERE w_id = 1;");
   ASSERT_EQ(w_tax.size(), 1U);
   EXPECT_EQ(w_tax[0][0], Value(0.1));
   Run(*database_, context,

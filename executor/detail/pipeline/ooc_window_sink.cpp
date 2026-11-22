@@ -395,7 +395,7 @@ bool IsStaticScalarExpr(const Expression& expr) {
       // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is clearer
       // here
       for (const Expression& arg :  // NOLINT(readability-use-anyofallof)
-           fn.Args()) {  // NOLINT(readability-use-anyofallof)
+           fn.Args()) {             // NOLINT(readability-use-anyofallof)
         if (!IsStaticScalarExpr(arg)) {
           return false;
         }
@@ -1131,17 +1131,9 @@ class StreamingWindowAggState {
       return false;
     }
     const std::string& fn = window.function;
-    // NOTE: SUM/AVG are excluded entirely. DOUBLE SUM/AVG is not invertible
-    // under subtraction (cancellation loses bits later frames need), and a
-    // sticky `any_double_` would keep a double lane even for int-only frames;
-    // these functions use the generic frame-recompute path instead. IGNORE
-    // NULLS is a no-op for the listed functions (all skip NULLs natively).
-    // BIT_AND/BIT_OR subtract through 64 per-bit counters and LOGICAL_AND/OR
-    // through true/false counts, so those are O(1) removable too.
-    // SUM/AVG are excluded: DOUBLE addition is not invertible under
-    // subtraction (cancellation loses bits that later frames would need), so
-    // suffix/sliding frames with these functions must use the generic
-    // frame-recompute path instead of blind `double_sum_ -= value`.
+    // SUM/AVG recompute each sliding or suffix frame because subtracting
+    // departing doubles cannot restore low bits lost during addition. The
+    // other aggregates below can remove a row through their counters.
     return fn == "COUNT" || fn == "COUNTIF" || fn == "BIT_XOR" ||
            fn == "BIT_AND" || fn == "BIT_OR" || fn == "LOGICAL_AND" ||
            fn == "LOGICAL_OR";
@@ -1444,31 +1436,6 @@ class StreamingWindowAggState {
       const auto bits = static_cast<uint64_t>(v.value.int_value);
       for (size_t b = 0; b < bit_ones_.size(); ++b) {
         bit_ones_[b] -= static_cast<int32_t>((bits >> b) & 1U);
-      }
-      return Status::kSuccess;
-    }
-    if (fn_ == "SUM" || fn_ == "AVG") {
-      if (fn_ == "SUM" && v.type == ValueType::kInt64 &&
-          (sum_is_uint64_ || v.IsUnsigned())) {
-        // Invert the exact uint64-domain SUM accumulation.
-        const platform::Int128 input =
-            v.IsUnsigned() ? static_cast<platform::Int128>(
-                                 static_cast<uint64_t>(v.value.int_value))
-                           : static_cast<platform::Int128>(v.value.int_value);
-        const platform::Int128 next =
-            static_cast<platform::Int128>(uint_sum_) - input;
-        constexpr platform::Int128 max_uint64 =
-            std::numeric_limits<uint64_t>::max();
-        if (next < 0 || next > max_uint64) {
-          return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
-        }
-        uint_sum_ = static_cast<uint64_t>(next);
-        return Status::kSuccess;
-      }
-      if (v.type == ValueType::kDouble || any_double_) {
-        double_sum_ -= NumericValueOf(v);
-      } else {
-        int_sum_ -= v.value.int_value;
       }
       return Status::kSuccess;
     }
@@ -3433,6 +3400,11 @@ class WindowBufferedSource final : public PipelineSource {
     size_t freed_bytes = 0;
     for (size_t i = 0; i < count; ++i) {
       freed_bytes += EstimateRowMemoryBytes(rows_[cursor_ + i]);
+      // Rows captured by RowAt() carry the source column's collation as a
+      // per-value tag (ColumnVector::ValueAt stamps it from ColumnCollation()),
+      // and Append() observes that tag back into the output ColumnVector. The
+      // buffered path therefore keeps column collation just like the OOC path
+      // that applies ApplyKeyCollation explicitly.
       out->Append(rows_[cursor_ + i], RowPosition());
       rows_[cursor_ + i].values_.clear();
     }
@@ -4102,7 +4074,8 @@ Status OocWindowSink::BuildGroups() {
             CollationOfExpression(key) == Collation::kNone) {
           const int slot =
               input_schema_.Offset(key->AsColumnValue().GetColumnName());
-          if (slot >= 0 && std::cmp_less_equal(slot, std::numeric_limits<slot_t>::max())) {
+          if (slot >= 0 &&
+              std::cmp_less_equal(slot, std::numeric_limits<slot_t>::max())) {
             slots.push_back(static_cast<slot_t>(slot));
             return Status::kSuccess;
           }

@@ -19,9 +19,9 @@
 namespace tinylamb::relational_detail {
 
 // Retained numeric build tuples, populated directly by grouped-output pushes.
-// Group indices are published incrementally as rows are pushed. Payloads own no Row/Value heap
-// objects. Signed INT64 equality keys only; all other key domains decline the
-// enclosing fast path rather than approximate SQL equality.
+// Group indices are published incrementally as rows are pushed. Payloads own no
+// Row/Value heap objects. Signed INT64 equality keys only; all other key
+// domains decline the enclosing fast path rather than approximate SQL equality.
 class GroupedNumericHash {
  public:
   struct Cell {
@@ -77,7 +77,7 @@ class GroupedNumericHash {
   [[nodiscard]] bool IsMatched(size_t row_index) const {
     return !matched_.empty() &&
            std::atomic_ref<const uint8_t>(matched_[row_index])
-                   .load(std::memory_order_relaxed) != 0;
+                   .load(std::memory_order_acquire) != 0;
   }
   [[nodiscard]] std::span<const Cell> RowCells(size_t row_index) const {
     return {cells_.data() + (row_index * width_), width_};
@@ -128,10 +128,12 @@ class GroupedNumericHash {
       }
       if (equal) {
         if (track_matches_) {
+          // One atomic RMW: another matcher may set the same bit between our
+          // load and store, and a plain overwrite would lose that update.
+          // acq_rel also publishes the build-side writes to a reader that
+          // observes the flag (IsMatched loads with acquire).
           std::atomic_ref<uint8_t> matched_ref(matched_[at]);
-          if (matched_ref.load(std::memory_order_relaxed) == 0) {
-            matched_ref.store(1, std::memory_order_relaxed);
-          }
+          matched_ref.fetch_or(1, std::memory_order_acq_rel);
         }
         consume(std::span<const Cell>(row, width_));
       }

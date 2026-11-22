@@ -221,10 +221,69 @@ bool DecorrelateCorrelatedSumComparisons(SelectStatement* select,
 // rewrites top-level WHERE `(SELECT COUNT(*) FROM S WHERE inner_k = outer_k
 // AND P) > 0` (and `>= 1`) into `outer_k IN (SELECT inner_k FROM S WHERE P AND
 // inner_k IS NOT NULL)` (Lean: TpcdsExecCodegen.lean
-// kleene_and_or_distrib_left_sound, correlated_count_gt_zero_to_in_subquery_sound,
+// kleene_and_or_distrib_left_sound,
+// correlated_count_gt_zero_to_in_subquery_sound,
 // trap_correlated_count_eq_zero_not_in_null_outer_unsound).
 bool RewriteCorrelatedPositiveCountToInSubquery(SelectStatement* select,
                                                 TransactionContext& ctx);
+
+// Rewrites `HAVING COUNT(DISTINCT x) > 1` (or `>= 2`) to `MIN(x) < MAX(x)` and
+// `HAVING COUNT(DISTINCT x) = 1` to `MIN(x) = MAX(x)` for non-NaN totally
+// ordered columns (`INT64`, `DATE`, binary `VARCHAR`).
+// Lean: TpchSf10VectorizedExec.lean
+//   (count_distinct_gt_one_iff_min_lt_max,
+//    count_distinct_eq_one_iff_min_eq_max).
+bool RewriteHavingCountDistinctToMinMax(SelectStatement* select,
+                                        TransactionContext& ctx);
+
+// Rewrites `GROUP BY k HAVING SUM(v) op <expr(SELECT SUM(v) FROM same_join)>`
+// into a single-pass CTE using Fubini's theorem (`SUM(group_sum) = SUM(v)`).
+// Rejects `SUM(DISTINCT v)` and filtered sums.
+// Lean: TpchSf10Discovery.lean
+//   (grouped_having_global_sum_fubini_sound,
+//    grouped_having_distinct_sum_fubini_bug).
+bool RewriteHavingGlobalSumFubini(SelectStatement* select,
+                                  TransactionContext& ctx);
+
+// Rewrites `FROM F, D WHERE D.pk = F.fk AND <D preds> AND F.c op (SELECT
+// <expr(AGG(F2.c2))> FROM F F2 WHERE F2.fk = D.pk)` (when `D.pk` is certified
+// UNIQUE NOT NULL) into a single-scan shared CTE over `F ⋈ D`.
+// Lean: TpchSf10VectorizedExec.lean
+//   (self_join_unique_dim_cte_decorrelate_sound).
+bool RewriteSelfJoinUniqueDimCorrelatedAgg(SelectStatement* select,
+                                           TransactionContext& ctx);
+
+// Pushes the filtered outer key domain into a heavy `k IN (SELECT r_k FROM
+// ...)` subquery (and transitively into any correlated subquery equated with
+// `r_k`), materializing the filtered outer domain once as a CTE. Lean:
+// TpchSf10VectorizedExec.lean
+//   (semijoin_domain_pushdown_in_subquery_sound).
+bool RewritePushOuterSemiJoinDomainIntoInSubquery(SelectStatement* select,
+                                                  TransactionContext& ctx);
+
+// Pushes the intersected key domain `(L_keys) ∩ (R1_keys ∪ R2_keys)` into
+// grouped CTEs `L`, `R1`, `R2` when `L LEFT JOIN R1 LEFT JOIN R2` has a
+// disjunctive filter that rejects double-unmatched rows (e.g.
+// `COALESCE(r1.qty, 0) > 0 OR COALESCE(r2.qty, 0) > 0`, TPC-DS Q78).
+// Lean: TpchSf10VectorizedExec.lean
+//   (disjunctive_left_join_semijoin_pushdown_sound).
+bool RewriteDisjunctiveLeftJoinCteKeyDomain(SelectStatement* select,
+                                            TransactionContext& ctx);
+bool RewriteDistributeJoinOverUnionAll(SelectStatement* select,
+                                       TransactionContext& ctx);
+bool RewriteDistributeGroupedSumOverUnionAll(SelectStatement* select,
+                                             TransactionContext& ctx);
+bool PushTransitiveGroupedSubqueryDimSemiFilter(SelectStatement* select,
+                                                TransactionContext& ctx);
+bool RewriteCorrelatedSelfAvgToWindow(SelectStatement* select,
+                                      TransactionContext& ctx);
+
+// Merges a cross-join of two ungrouped scalar-aggregate derived tables over
+// the same base join (either with differing local predicates, or where one
+// side adds a single certified-unique-PK dimension table) into a single-pass
+// conditional-aggregate derived table.
+bool RewriteScalarAggCrossJoinMerge(SelectStatement* select,
+                                    TransactionContext& ctx);
 
 // Decomposes `SUM(col ± c)` into `SUM(col) + (±c * COUNT(col))` when signed
 // INT64 column bounds certify zero per-row or cumulative overflow, preserving

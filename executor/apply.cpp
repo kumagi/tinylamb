@@ -107,12 +107,19 @@ bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
           }
           static_inner_cached_ = true;
         }
-        inner_rows_ = static_inner_rows_;
+        // The static inner side is materialized once and shared by reference;
+        // copying it into inner_rows_ for every outer row would deep-copy all
+        // its Row/VARCHAR payloads N times.
       }
     }
 
-    while (inner_idx_ < inner_rows_.size()) {
-      const Row& inner_row = inner_rows_[inner_idx_++];
+    // inner_query_ is fixed for the executor's lifetime and inner_idx_
+    // persists across the yield below, so this view stays valid until the
+    // outer row is replaced.
+    const std::vector<Row>& active_inner =
+        inner_query_ != nullptr ? inner_rows_ : static_inner_rows_;
+    while (inner_idx_ < active_inner.size()) {
+      const Row& inner_row = active_inner[inner_idx_++];
       Row combined = current_outer_row_ + inner_row;
       bool match = true;
       if (predicate_) {
@@ -145,7 +152,7 @@ bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
       }
     }
 
-    if (has_outer_row_ && inner_idx_ >= inner_rows_.size()) {
+    if (has_outer_row_ && inner_idx_ >= active_inner.size()) {
       has_outer_row_ = false;
       if (!matched_any_) {
         if (kind_ == JoinKind::kLeftOuter) {

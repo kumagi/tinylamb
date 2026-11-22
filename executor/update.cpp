@@ -44,7 +44,7 @@ std::string UpdateKeyString(const Value& value) {
 // (the apply loop hands it to the before-image-taking Table::Update
 // overload).  When the query-pool budget refuses an entry, Get falls back to
 // the caller's scratch row and the apply loop transparently lets
-// Table::Update read the image itself -- exactly the old behaviour.
+// Table::Update read the image itself -- exactly the old behavior.
 class UpdatePreimageCache {
  public:
   UpdatePreimageCache() = default;
@@ -211,12 +211,41 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
       }
       fk_counts.push_back(counts.MoveValue());
     }
+    // For self-references, validate children against the statement's final
+    // parent multiset, including keys supplied by other updated rows.
+    for (size_t c = 0; c < fk_checks_.size(); ++c) {
+      const ForeignKeyCheck& check = fk_checks_[c];
+      if (check.parent != target_) {
+        continue;
+      }
+      size_t adjust_steps = 0;
+      const Status adjust_st = pending.ForEach(
+          [&](const Row& updated, const RowPosition& pos) -> Status {
+            if ((++adjust_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
+              RETURN_IF_FAIL(txn_->CheckStatementTimeout());
+            }
+            Row scratch;
+            ASSIGN_OR_RETURN(const Row*, old,
+                             preimages.Get(*target_, *txn_, pos, &scratch));
+            if (check.parent_offset >= old->Count() ||
+                check.parent_offset >= updated.Count()) {
+              return Status::kSuccess;
+            }
+            RETURN_IF_FAIL(
+                fk_counts[c].DecrementKey((*old)[check.parent_offset]));
+            return fk_counts[c].IncrementKey(updated[check.parent_offset]);
+          });
+      if (!adjust_st.ok()) {
+        return FailWith(adjust_st);
+      }
+    }
     if (!fk_checks_.empty()) {
       size_t fk_action_steps = 0;
       const Status child_fk_st =
           pending.ForEach([&](const Row& updated_row,
                               const RowPosition& row_position) -> Status {
-            if ((++fk_action_steps & 255U) == 0 && txn_->HasStatementTimeout()) {
+            if ((++fk_action_steps & 255U) == 0 &&
+                txn_->HasStatementTimeout()) {
               RETURN_IF_FAIL(txn_->CheckStatementTimeout());
             }
             Row scratch;
@@ -262,10 +291,10 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
         // A key the statement itself re-supplies is not vacated: a swap
         // (row1 A->B, row2 B->A) and a row that keeps its key both leave
         // the value present at statement end, so children referencing it
-        // must not reject the statement. Collect the post-image parent keys
-        // and the changed rows' old keys in one pass, then subtract.
+        // must not reject the statement. Count the changed rows' old keys
+        // and remove keys supplied by the post-images.
         std::unordered_set<std::string> supplied_keys;
-        std::unordered_set<std::string> vacated_keys;
+        std::unordered_map<std::string, size_t> vacated_keys;
         const Status scan_st = pending.ForEach(
             [&](const Row& updated_row, const RowPosition& pos) -> Status {
               if (check.parent_offset < updated_row.values_.size() &&
@@ -289,17 +318,56 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
               if (new_key == old_key || old_key.IsNull()) {
                 return Status::kSuccess;
               }
-              vacated_keys.insert(ForeignKeyString(old_key));
+              ++vacated_keys[ForeignKeyString(old_key)];
               return Status::kSuccess;
             });
         if (scan_st != Status::kSuccess) {
           return FailWith(scan_st);
         }
         for (auto it = vacated_keys.begin(); it != vacated_keys.end();) {
-          if (supplied_keys.contains(*it)) {
+          if (supplied_keys.contains(it->first)) {
             it = vacated_keys.erase(it);
           } else {
             ++it;
+          }
+        }
+        // A non-unique referenced column can have untouched rows for the
+        // same key. A snapshot occurrence beyond the number being changed
+        // proves the key still exists after the update.
+        if (!vacated_keys.empty() && !target_->GetSchema()
+                                          .GetColumn(check.parent_offset)
+                                          .GetConstraint()
+                                          .IsUnique()) {
+          const std::vector<slot_t> projection{
+              static_cast<slot_t>(check.parent_offset)};
+          auto current = target_->BeginFullScan(*txn_, projection);
+          size_t steps = 0;
+          for (; current.IsValid(); ++current) {
+            if ((++steps & 255U) == 0 && txn_->HasStatementTimeout()) {
+              const Status timeout = txn_->CheckStatementTimeout();
+              if (timeout != Status::kSuccess) {
+                return FailWith(timeout);
+              }
+            }
+            const Row& parent = *current;
+            if (parent.values_.empty() || parent[0].IsNull()) {
+              continue;
+            }
+            auto found = vacated_keys.find(ForeignKeyString(parent[0]));
+            if (found == vacated_keys.end()) {
+              continue;
+            }
+            if (found->second > 0) {
+              --found->second;
+              continue;
+            }
+            vacated_keys.erase(found);
+            if (vacated_keys.empty()) {
+              break;
+            }
+          }
+          if (current.GetStatus() != Status::kSuccess) {
+            return FailWith(current.GetStatus());
           }
         }
         if (vacated_keys.empty()) {

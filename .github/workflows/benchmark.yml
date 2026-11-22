@@ -32,6 +32,7 @@ jobs:
       - name: Run TPC-H SF=1 (load + Q1-Q22)
         working-directory: build-rel
         run: |
+          set -o pipefail
           ./tinylamb_tpch_benchmark ./tpch-run/sf1 \
             --scale-factor 1 --force | tee tpch-sf1.log
 

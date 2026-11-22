@@ -133,7 +133,7 @@ void RunPlanFeedbackRange(uint32_t begin_seed, uint32_t end_seed) {
     std::mt19937 rng(seed + 1000);
     std::string report =
         RunOracleIteration(rng, false, nullptr, nullptr, &session);
-    ASSERT_EQ(report, "") << ((seed + 1000) != 0U) << report;
+    ASSERT_EQ(report, "") << "failing seed=" << (seed + 1000) << "\n" << report;
   }
   EXPECT_GT(session.PlansSeen(), 1U);
 }
@@ -560,6 +560,71 @@ TEST(SqlOracleFuzzer, ReplayReportsAllArmsSkipped) {
   EXPECT_NE(report.find("skipped recorded oracle arm"), std::string::npos)
       << report;
   EXPECT_NE(report.find("TLP"), std::string::npos) << report;
+}
+
+// Execution-failure paths of CheckSkip/CheckTopTies must report "oracle
+// skipped", and CheckTlpAgg's row-shape guard must use the cell count (not the
+// serialized byte length) so a short aggregate row cannot reach r[1]/r[2].
+TEST(SqlOracleFuzzer, ReplayReportsSkippedSkipToptiesAndShortAggRows) {
+  OracleTrace trace;
+  trace.table = "t9";
+  trace.setup = {"CREATE TABLE t9 (u INT64, a INT64);",
+                 "INSERT INTO t9 VALUES (1, 2), (3, 4);"};
+  // Valid setup, but every recorded probe/query references a missing table.
+  trace.skip_probes = {"SELECT COUNT(DISTINCT a) FROM missing_table;"};
+  trace.topties =
+      "SELECT u, a FROM missing_table ORDER BY a LIMIT 2 WITH TIES;";
+  trace.topties_limit = 2;
+  // Four valid one-cell result sets: the old Size()-based guard let them
+  // through into out-of-bounds r[1]/r[2] reads.
+  trace.tlp_agg = {"SELECT u FROM t9;", "SELECT u FROM t9;",
+                   "SELECT u FROM t9;", "SELECT u FROM t9;"};
+  const std::string report = ReplayOracleTrace(trace, false);
+  EXPECT_NE(report.find("skipped recorded oracle arm"), std::string::npos)
+      << report;
+  EXPECT_NE(report.find("TLP_AGG"), std::string::npos) << report;
+  EXPECT_NE(report.find("SKIP"), std::string::npos) << report;
+  EXPECT_NE(report.find("TOP_TIES"), std::string::npos) << report;
+}
+
+// A failed Create/CrashAndReopen leaves db_ null while WAL segments,
+// checkpoint temps and LSM/TLCS companions may already be on disk. The sweep
+// must cover the whole Database::DeleteAll() family, not just five suffixes.
+TEST(SqlOracleFuzzer, ScopedDbRemovesFullArtifactFamily) {
+  ScopedDb sdb("scoped_db_family");
+  ASSERT_TRUE(static_cast<bool>(sdb));
+  const std::string name = sdb.name();
+  sdb.Reset();  // close the live database before laying down its artifact set
+  const std::vector<std::string> files = {name + ".db",
+                                          name + ".tmp",
+                                          name + ".db.tmp",
+                                          name + ".db.ckpt",
+                                          name + ".db.ckpt.tmp",
+                                          name + ".ckpt",
+                                          name + ".ckpt.tmp",
+                                          name + ".log",
+                                          name + ".log.meta",
+                                          name + ".log.meta.tmp",
+                                          name + ".log.0",
+                                          name + ".log.12",
+                                          name + ".last_checkpoint",
+                                          name + ".last_checkpoint.tmp",
+                                          name + ".db.blocks",
+                                          name + ".db.blocks.3",
+                                          name + ".db.lsm",
+                                          name + ".db.lsm.2",
+                                          name + ".db.tlcs.7",
+                                          name + ".blocks.1",
+                                          name + ".lsm.4",
+                                          name + ".tlcs.9"};
+  for (const std::string& f : files) {
+    std::ofstream out(f);
+    out << "x";
+  }
+  sdb.RemoveDbFiles();
+  for (const std::string& f : files) {
+    EXPECT_FALSE(std::filesystem::exists(f)) << f;
+  }
 }
 
 // Any committed sql_oracle_fuzz-*.test file replays as a permanent

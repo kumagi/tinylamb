@@ -68,6 +68,10 @@ size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
         }
         left_pos_ = 0;
       }
+      // Ownership transfer, not a copy: left_pos_ only ever increases until
+      // the whole left batch is consumed and left_rows_ is rebuilt, so this
+      // slot is read exactly once. The moved-from shell left behind is never
+      // observed by the join itself (and is cleared on the next refill).
       hold_left_ = std::move(left_rows_[left_pos_++]);
       right_iter_ = right_table_.begin();
     }

@@ -79,7 +79,10 @@ struct TypedCellBatch {
   std::vector<int64_t> cells;                       // rows * stride payloads
   std::vector<uint8_t> nulls;                       // rows * stride bytes
   std::vector<std::vector<uint8_t>> varchar_bytes;  // per VARCHAR slot
-  std::vector<std::vector<uint32_t>> varchar_ends;  // per VARCHAR slot, rows+1
+  // Per VARCHAR slot, exactly one cumulative end offset per decoded row
+  // (no extra sentinel): Varchar(row) uses ends[row-1] as the begin offset,
+  // and ends[row] holds the final row's end. Do not index ends[rows].
+  std::vector<std::vector<uint32_t>> varchar_ends;
   size_t rows{0};
   // Opt-in tuple identity for consumers such as TopN; plain folds pay no
   // position-buffer allocation or writes.
@@ -157,8 +160,10 @@ class FullScanIterator : public IteratorBase {
     rhs.EnsureLSTableRowMaterialized();
     EnsureStubRowMaterialized();
     rhs.EnsureStubRowMaterialized();
-    return table_ == rhs.table_ && txn_ == rhs.txn_ &&
-           current_row_ == rhs.current_row_;
+    return table_ == rhs.table_ && txn_ == rhs.txn_ && pos_ == rhs.pos_ &&
+           current_row_ == rhs.current_row_ && projection_ == rhs.projection_ &&
+           status_ == rhs.status_ && lock_rows_ == rhs.lock_rows_ &&
+           wait_for_write_intent_ == rhs.wait_for_write_intent_;
   }
 
   bool operator!=(const FullScanIterator& rhs) const {
@@ -172,6 +177,8 @@ class FullScanIterator : public IteratorBase {
   // produced its first row (IteratorBase::SetRuntimeFilter).
   void SetRuntimeFilter(const RuntimeFilterGroup* group, slot_t column,
                         ValueType type) override;
+  void AddExtraRuntimeFilter(const RuntimeFilterGroup* group, slot_t column,
+                             ValueType type) override;
   IteratorBase& operator++() override;
   IteratorBase& operator--() override;
   void DropPageLatch() override;
@@ -225,10 +232,11 @@ class FullScanIterator : public IteratorBase {
     std::vector<VariableSkip> variable_skips;
   };
   [[nodiscard]] PlannedPeek BuildPeek(slot_t column) const;
-  // Direct planned peek; nullopt = NULL or corrupt count (same contract as
-  // Row::TryPeekInteger). kFallback signals a bitmap row: caller retries via
-  // Row::TryPeekInteger. kError carries the decode failure as a Status —
-  // the same channel Row::TryPeekInteger reports corruption through, so a
+  // Direct planned peek; kNull = NULL value, kError = corrupt image (same
+  // contract as Row::TryPeekInteger). kFallback signals a bitmap row: caller
+  // retries via Row::TryPeekInteger. A corrupt column count is reported as
+  // kError, not kNull, so filtered and unfiltered scans share the same
+  // kCorrupt channel. kError carries the decode failure as a Status so a
   // corrupt image never escapes as a C++ exception across a StatusOr
   // boundary.
   struct PeekOutcome {
@@ -263,6 +271,7 @@ class FullScanIterator : public IteratorBase {
   [[nodiscard]] const std::shared_ptr<const TlcsFile>& EnsureBackingTlcs()
       const;
   void ClearStubBlockState();
+  void ComputeStubBlockMatches() noexcept;
   [[nodiscard]] bool TryEnterStubPage();
   [[nodiscard]] bool AdvanceFromStubPage();
   [[nodiscard]] bool StubBlockAllRowsMatch(const TlcsFile& tlcs,
@@ -307,6 +316,11 @@ class FullScanIterator : public IteratorBase {
   const RuntimeFilterGroup* runtime_filter_{nullptr};
   std::optional<slot_t> runtime_filter_column_;
   ValueType runtime_filter_type_{ValueType::kNull};
+  struct ExtraRuntimeFilter {
+    const RuntimeFilterGroup* group{nullptr};
+    slot_t column{0};
+  };
+  std::vector<ExtraRuntimeFilter> extra_runtime_filters_;
   bool lock_rows_{false};
   bool wait_for_write_intent_{true};
   // Positions whose write intent this scan acquired and still holds; used to
@@ -351,6 +365,9 @@ class FullScanIterator : public IteratorBase {
   page_id_t stub_current_pid_{0};
   page_id_t stub_next_page_id_{0};
   uint32_t stub_block_row_count_{0};
+  bool stub_matches_computed_{false};
+  size_t stub_match_cursor_{0};
+  std::vector<uint32_t> stub_match_rows_;
   // Per-block memo of the block-level checks SeekVisibleRow used to repeat
   // for every row (each one takes TlcsFile's directory-cache mutex, which
   // serialized parallel scans).  Reset whenever stub_block_idx_ changes.

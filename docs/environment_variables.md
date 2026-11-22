@@ -26,6 +26,7 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 | Variable | Meaning |
 | --- | --- |
 | `TINYLAMB_WRITE_INTENT_WAIT_MS` | Write-intent wait bound override. |
+| `TINYLAMB_DDL_QUIESCENCE_TIMEOUT_MS` | Max milliseconds a DDL drop waits for table-lease quiescence before retrying as a conflict (`common/incarnation.hpp`, default `60000`; non-numeric values fall back to the default). |
 | `TINYLAMB_STATEMENT_TIMEOUT_MS` | Default per-statement timeout in milliseconds (default `0` = disabled; also configurable via `Transaction::SetStatementTimeout`). |
 | `TINYLAMB_DEADLOCK_POLICY` | Benchmark/test deadlock policy: `wait_die`, `wound_wait`, `deadlock_detect`/`detect`, or unset for engine default. |
 | `TINYLAMB_DISABLE_INDEX_RESERVATION` | Index undo-space diagnostic modes: `0`=on (default), `1`=off, `2`=no shared map, `3`=no per-transaction vector, `4`=registration on with admission discount off, `5`=discount on with tree drain retry off. |
@@ -154,7 +155,7 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 
 | Variable | Meaning |
 | --- | --- |
-| `TINYLAMB_KEEP_TEST_DATABASES` | Keep the run's database artifacts for post-mortem when the value is non-empty (only the first character is checked; see `AGENTS.md`). |
+| `TINYLAMB_KEEP_TEST_DATABASES` | Keep the run's database artifacts for post-mortem only when the value is exactly `1`, `true`, `yes`, or `on` (case-sensitive; see `database/test_workspace_cleanup_env.cpp`). Other values, including `0`/`false`, keep cleanup enabled. |
 | `TINYLAMB_ORACLE_REGRESSION_DIR` | Directory of `*.test` files replayed by `SqlOracleFuzzer.ReplayCommittedRegressionFiles`. |
 | `TINYLAMB_SESSION_REGRESSION_DIR` | Session-trace regression directory (wired to `query/testdata/session_regressions/`). |
 | `TINYLAMB_OOC_REGRESSION_DIR` | OOC fuzzer regression directory (wired to `query/testdata/ooc_regressions/`). |
@@ -256,7 +257,8 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 | `TINYLAMB_SMALL_HASH_IDX` | Use two hash slots per PAX row instead of four, rounded up to a power of two. |
 | `TINYLAMB_VALDBG` | PAX validation diagnostics. |
 
-`TINYLAMB_DBG_CNT` is read by `plan/optimizer.cpp` but has an empty body: it
-is a retired no-op probe, not an active control.
+`TINYLAMB_DBG_CNT` was a retired no-op probe (formerly an empty conditional in
+`plan/optimizer.cpp`); the reader was removed in #1701, so it now has no C++
+reader at all and should be treated as a fully removed name.
 
 Retired names removed from the active inventory: `TINYLAMB_BPT_CONC_FUZZ_SEED`, `TINYLAMB_CHECKPOINT_FLUSH_MS`, `TINYLAMB_CORRUPT_TAIL_PROBE`, `TINYLAMB_CRC_BITFLIP_PROBE`, `TINYLAMB_DISABLE_ANCHOR_VOID`, `TINYLAMB_DISABLE_READBUF_NOINIT`, `TINYLAMB_DISABLE_REDO_REINSERT_FLOOR`, `TINYLAMB_DISABLE_SEPARATOR_SWEEP`, `TINYLAMB_RECOVERY_TRACE`, `TINYLAMB_RECOVERY_WORKERS`, `TINYLAMB_TEST_UNDO_STOP_AFTER`, `TINYLAMB_WAL_FREE_WARN_BYTES`. They have no current C++ readers. `TINYLAMB_PAGE_POOL_BYTES` is listed above as retired-but-tolerated: no C++ code reads it.

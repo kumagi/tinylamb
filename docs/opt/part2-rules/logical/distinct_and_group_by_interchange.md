@@ -31,7 +31,7 @@ graph TD
 
 ## 適用条件
 
-本 Rule の pattern は `Pattern::Any()`、target ヒントは `std::nullopt` です。マクロ構造として入力演算子の種類に応じて 2 系統の分岐を持ちます。
+本 Rule の pattern は `Pattern::Any()`、target ヒントは `{LogicalOperator::kDistinct, LogicalOperator::kAggregation}` の 2 要素リストです（第 4 引数）。これにより入力演算子の種類に応じた 2 系統の分岐が target 指定でも表現されます。
 
 - **方向 1 (`kDistinct`)**:
   1. 演算子が `kDistinct` であり、子が 1 個であること。
@@ -41,16 +41,18 @@ graph TD
 - **方向 2 (`kAggregation`)**:
   1. 演算子が `kAggregation` であり、子が 1 個であること。
   2. `grouping_sets` および `target_list` が空でないこと。
-  3. `target_list` 内に集約関数（`ContainsAggregate`）が 1 つも含まれていないこと。
-  4. `grouping_sets` に含まれる列参照キーのすべてが、`target_list` に射影されていること（キー脱落がないこと）。
+  3. HAVING 述語（`predicate`）がないこと。
+  4. `target_list` 内に集約関数（`ContainsAggregate`）が 1 つも含まれていないこと。
+  5. `grouping_sets` のすべてのキーが `target_list` に射影され、かつすべての射影ターゲットがグループ化キーと一致すること。
 
 ```cpp
-              // Only interchange back to Distinct(Projection(X)) when all
-              // grouping keys survive the projection; otherwise the Distinct
-              // would not deduplicate rows that differ on a dropped key.
+              // Only interchange back to Distinct(Projection(X)) when EVERY
+              // grouping key (including computed keys) survives the projection
+              // AND every projected target is a grouping key; otherwise
+              // Distinct(Projection(X)) groups at a different granularity.
 ```
 
-方向 2 において列参照キーが 1 つでも出力から脱落している場合、または `grouping_sets` に列参照が一切存在しない場合は発火しません。
+方向 2 では計算式もグループ化キーとして扱えます。列参照は修飾名の一致、または片方が無修飾の場合は列名の一致で照合し、それ以外の式は同一オブジェクトまたは文字列表現の一致で照合します。キーの脱落やキー以外の射影がある場合は変換しません。
 
 ## 意味論的根拠と多重度保存
 
@@ -58,7 +60,7 @@ graph TD
 
 三値論理における NULL の等値比較に関しても、SQL 規格および tinylamb の実装において双方の演算子は「NULL 同士を同一グループとして重複排除する」同一の振る舞いを取るため、代数的等価性が保証されます。
 
-方向 2 で「すべてのグループ化キーが射影出力に残ること」を要求するのは、行数を保つためです。集約では、GROUP BY キーを出力しない射影も許されます（例: `SELECT 1 FROM t GROUP BY k`）。この状態で `Distinct(Projection)` へ変換すると、異なるキーのグループが出力上では同じ値となり、1 行にまとめられます。そのため、すべてのキーが射影に残ることを前提とします。
+方向 2 で「すべてのグループ化キーが射影出力に残ること」を要求するのは、行数を保つためです。集約では、GROUP BY キーを出力しない射影も許されます（例: `SELECT 1 FROM t GROUP BY k`）。この状態で `Distinct(Projection)` へ変換すると、異なるキーのグループが出力上では同じ値となり、1 行にまとめられます。また、キー以外の射影は重複排除の粒度を変え得るため拒否します。HAVING 述語も、変換先に引き継がれないため拒否します。
 
 ## 実装の詳細
 

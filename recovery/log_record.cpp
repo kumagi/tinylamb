@@ -315,50 +315,48 @@ std::string LogRecord::Serialize() const {
 }
 
 size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
+  // A 0 return means "no bytes consumed" and callers may reuse this LogRecord
+  // for the next record. Never leave a half-decoded record behind on failure:
+  // reset to a fully invalid state on every path so stale type/pid/key data
+  // from a previous decode cannot be mistaken for the skipped record.
+  const auto fail = [this]() -> size_t {
+    *this = LogRecord{};
+    return size_t{0};
+  };
+  *this = LogRecord{};
+
   constexpr size_t kMinRecordBytes = kHeaderBytes + kTrailerBytes;
   if (src == nullptr || max_bytes < kMinRecordBytes) {
-    return 0;
+    return fail();
   }
   uint16_t magic = 0;
   uint16_t version = 0;
   std::memcpy(&magic, src, sizeof(uint16_t));
   std::memcpy(&version, src + sizeof(uint16_t), sizeof(uint16_t));
   if (magic != kLogRecordMagic || version != kCurrentVersion) {
-    return 0;
+    return fail();
   }
   const uint32_t total = ReadU32(src + 4);
   if (total < kMinRecordBytes || total > max_bytes) {
-    return 0;
+    return fail();
   }
   const uint32_t stored_crc = ReadU32(src + total - sizeof(uint32_t));
   const uint32_t computed_crc = Crc32C(src, total - sizeof(uint32_t));
   if (stored_crc != computed_crc) {
-    return 0;
+    return fail();
   }
-
-  prev_lsn = 0;
-  owner = 0;
-  pid = std::numeric_limits<page_id_t>::max();
-  slot = std::numeric_limits<slot_t>::max();
-  lsm_had_prev = false;
-  key.clear();
-  redo_data.clear();
-  undo_data.clear();
-  redo_pid = std::numeric_limits<page_id_t>::max();
-  undo_pid = std::numeric_limits<page_id_t>::max();
-  allocated_page_type = PageType::kUnknown;
 
   size_t off = 8;
   const size_t body_end = total - sizeof(uint32_t);
   if (body_end < off + sizeof(uint32_t) + sizeof(uint64_t) + 2) {
-    return 0;  // too short to hold type/flags before the CRC trailer
+    return fail();  // too short to hold type/flags before the CRC trailer
   }
   off += DeserializePID(src + off, &prev_lsn);
   off += DeserializeU64(src + off, &owner);
   const auto raw_type = static_cast<uint8_t>(src[off++]);
   if (raw_type == 0 ||
       raw_type > static_cast<uint8_t>(LogType::kEndCheckpoint)) {
-    return 0;
+    return fail();
   }
   type = static_cast<LogType>(raw_type);
   const auto flags = static_cast<uint8_t>(src[off++]);
@@ -367,13 +365,13 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
   // Writers only ever store kUnknown(0)/kRowPage(1); a hostile or torn flags
   // byte must not manufacture an undefined PageType enum value.
   if (raw_page_type > static_cast<uint8_t>(PageType::kRowPage)) {
-    return 0;
+    return fail();
   }
   allocated_page_type = static_cast<PageType>(raw_page_type);
 
   switch (type) {
     case LogType::kUnknown:
-      return 0;
+      return fail();
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kAbort:
@@ -384,14 +382,14 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
     case LogType::kSystemDestroyPage:
     case LogType::kLsmDestroy:
       if (off + sizeof(page_id_t) > body_end) {
-        return 0;
+        return fail();
       }
       off += DeserializePID(src + off, &pid);
       break;
     case LogType::kSetRowPageNext:
     case LogType::kSetRowPagePrev:
       if (off + (sizeof(page_id_t) * 3) > body_end) {
-        return 0;
+        return fail();
       }
       off += DeserializePID(src + off, &pid);
       off += DeserializePID(src + off, &redo_pid);
@@ -400,60 +398,60 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
     case LogType::kInsertRow:
     case LogType::kCompensateUpdate:
       if (off + sizeof(page_id_t) + sizeof(slot_t) > body_end) {
-        return 0;
+        return fail();
       }
       off += DeserializePID(src + off, &pid);
       off += DeserializeSlot(src + off, &slot);
       if (!ReadString32(src, body_end, &off, &redo_data)) {
-        return 0;
+        return fail();
       }
       break;
     case LogType::kDeleteRow:
       if (off + sizeof(page_id_t) + sizeof(slot_t) > body_end) {
-        return 0;
+        return fail();
       }
       off += DeserializePID(src + off, &pid);
       off += DeserializeSlot(src + off, &slot);
       if (!ReadString32(src, body_end, &off, &undo_data)) {
-        return 0;
+        return fail();
       }
       break;
     case LogType::kUpdateRow:
       if (off + sizeof(page_id_t) + sizeof(slot_t) > body_end) {
-        return 0;
+        return fail();
       }
       off += DeserializePID(src + off, &pid);
       off += DeserializeSlot(src + off, &slot);
       if (!ReadString32(src, body_end, &off, &redo_data) ||
           !ReadString32(src, body_end, &off, &undo_data)) {
-        return 0;
+        return fail();
       }
       break;
     case LogType::kLsmPut:
       if (off + sizeof(page_id_t) > body_end) {
-        return 0;
+        return fail();
       }
       off += DeserializePID(src + off, &pid);
       if (!ReadString32(src, body_end, &off, &key) ||
           !ReadString32(src, body_end, &off, &redo_data) ||
           !ReadString32(src, body_end, &off, &undo_data)) {
-        return 0;
+        return fail();
       }
       break;
     case LogType::kLsmDelete:
       if (off + sizeof(page_id_t) > body_end) {
-        return 0;
+        return fail();
       }
       off += DeserializePID(src + off, &pid);
       if (!ReadString32(src, body_end, &off, &key) ||
           !ReadString32(src, body_end, &off, &undo_data)) {
-        return 0;
+        return fail();
       }
       break;
   }
 
   if (off != body_end) {
-    return 0;
+    return fail();
   }
   return total;
 }

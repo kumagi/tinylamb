@@ -484,11 +484,13 @@ TEST_F(AnalyticalFeaturesTest, PipeSyntaxComposesOperators) {
                                "SELECT k, v FROM p |> WHERE v > 9");
   ASSERT_EQ(filtered.size(), 3U);
 
-  // FROM-first queries are the idiomatic pipe entry point.
+  // FROM-first queries are the idiomatic pipe entry point.  s=30 is shared by
+  // k=1 and k=2, so ORDER BY needs an explicit ", k" tie-break before LIMIT 1;
+  // otherwise which group survives is implementation-defined.
   const auto from_first =
       RunSql(engine_.get(), context_.get(),
              "FROM p |> AGGREGATE k, SUM(v) AS s GROUP BY k |> ORDER BY s "
-             "DESC |> LIMIT 1");
+             "DESC, k |> LIMIT 1");
   ASSERT_EQ(from_first.size(), 1U);
   EXPECT_EQ(from_first[0][0].value.int_value, 1);
   EXPECT_EQ(from_first[0][1].value.int_value, 30);
@@ -545,6 +547,27 @@ TEST_F(AnalyticalFeaturesTest, PipeSyntaxComposesOperators) {
                  std::runtime_error)
         << unsupported;
   }
+}
+
+// Pipe OFFSET operands that cannot fold to a non-negative integer must fail
+// at prepare time, matching the non-pipe LIMIT/OFFSET path, instead of being
+// silently dropped so the result window quietly starts at row 0.
+TEST_F(AnalyticalFeaturesTest, PipeOffsetRejectsInvalidOperands) {
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE po (k INT64);");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO po VALUES (1), (2), (3);");
+  EXPECT_THROW((void)RunSql(engine_.get(), context_.get(),
+                            "FROM po |> LIMIT 5 OFFSET NULL"),
+               std::runtime_error);
+  EXPECT_THROW((void)RunSql(engine_.get(), context_.get(),
+                            "FROM po |> LIMIT 5 OFFSET -1"),
+               std::runtime_error);
+  EXPECT_THROW((void)RunSql(engine_.get(), context_.get(),
+                            "FROM po |> LIMIT 5 OFFSET k"),
+               std::runtime_error);
+  // A valid literal still applies the offset.
+  EXPECT_EQ(RunSql(engine_.get(), context_.get(), "FROM po |> LIMIT 5 OFFSET 1")
+                .size(),
+            2U);
 }
 
 // Window functions over GROUPING SETS / ROLLUP see the combined result of

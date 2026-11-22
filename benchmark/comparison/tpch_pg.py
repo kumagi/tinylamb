@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Matched TCP TPC-H snapshot using a private Tiny fixture and private PG."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -124,8 +123,8 @@ def main():
             meta = dict(args={k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()},
                         ports=ports, counts=counts, pg_settings=settings, load_start=os.getloadavg(),
                         image=call(['docker', 'image', 'inspect', image]),
-                        source_sha256={str(f.relative_to(ROOT)): hashlib.file_digest(f.open('rb'), 'sha256').hexdigest() for f in ROOT.rglob('*.cpp') if not any(x.startswith('build') or x=='.git' for x in f.relative_to(ROOT).parts)},
-                        server_sha256=hashlib.file_digest(a.server.open('rb'), 'sha256').hexdigest())
+                        source_sha256={str(f.relative_to(ROOT)): run.file_sha256(f) for f in ROOT.rglob('*.cpp') if not any(x.startswith('build') or x=='.git' for x in f.relative_to(ROOT).parts)},
+                        server_sha256=run.file_sha256(a.server))
             (out / 'environment.json').write_text(json.dumps(meta, indent=2))
             pg.close()
             (out / 'prepared.json').write_text(json.dumps(dict(prepared=True, timestamp=time.time())))

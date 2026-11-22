@@ -87,7 +87,6 @@ TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirrorShard0) {
 
 TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirrorShard1) {
   // Keep the fixed 24..48 range even when shard0's env override is set;
-
   // skipping it silently used to drop those regression seeds entirely.
   RunSeededAggregateRange(24, 48);
 }

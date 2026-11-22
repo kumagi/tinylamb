@@ -252,6 +252,29 @@ TEST(ParallelMergeJoinTest, EmptySidesAndBatchPath) {
   }
 }
 
+namespace {
+// A residual that throws out of TryEvaluate, modeling the bad_alloc / logic
+// exception that used to escape the synchronous single-partition worker path.
+class ThrowingResidual final : public ExpressionBase {
+ public:
+  [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInvalid; }
+  [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override {
+    throw std::runtime_error("residual exploded");
+  }
+  [[nodiscard]] std::string ToString() const override { return "THROWING()"; }
+  void Dump(std::ostream& o) const override { o << ToString(); }
+};
+}  // namespace
+
+TEST(ParallelMergeJoinTest, SinglePartitionWorkerExceptionBecomesStatus) {
+  ParallelMergeJoin join(Src({IRow(1)}), {0}, Src({IRow(1)}), {0},
+                         /*worker_count=*/1, JoinKind::kInner,
+                         Expression(std::make_shared<ThrowingResidual>()),
+                         Schema(), /*right_width=*/1);
+  EXPECT_TRUE(Drain(&join).empty());
+  EXPECT_NE(join.GetStatus(), Status::kSuccess);
+}
+
 TEST(ParallelMergeJoinTest, FailedChildLatchesStatusWithoutPartialResult) {
   ParallelMergeJoin join(std::make_shared<FailingSource>(), {0}, Src({IRow(1)}),
                          {0}, 2, JoinKind::kInner, Expression(), Schema(), 1);
@@ -827,8 +850,9 @@ TEST(SimdComparisonKernelTest, DoubleScalarCoversAllOperators) {
 
 TEST(SimdComparisonKernelTest, StringPrefixCoversAllOperators) {
   const std::vector<std::string_view> data = {
-      "apple", "banana", "cherry", "banana", "date",
-      "bananabananabanana", "bananabananab"};  // NOLINT(clang-diagnostic-error)
+      "apple",        "banana", "cherry",
+      "banana",       "date",   "bananabananabanana",
+      "bananabananab"};  // NOLINT(clang-diagnostic-error)
   struct Case {
     BinaryOperation op;
     size_t expected;

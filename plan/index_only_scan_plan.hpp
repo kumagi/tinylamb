@@ -21,7 +21,6 @@
 #include <ostream>
 #include <vector>
 
-#include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column_name.hpp"
@@ -58,9 +57,6 @@ class IndexOnlyScanPlan : public PlanBase {
   }
   [[nodiscard]] const std::vector<Value>& EndKey() const { return end_key_; }
   [[nodiscard]] bool IsAscending() const { return ascending_; }
-  [[nodiscard]] const std::vector<NamedExpression>& SelectItems() const {
-    return select_;
-  }
   [[nodiscard]] const Schema& GetSchema() const override {
     return output_schema_;
   }
@@ -89,7 +85,6 @@ class IndexOnlyScanPlan : public PlanBase {
   std::vector<Value> end_key_;
   bool ascending_;
   Expression where_;
-  std::vector<NamedExpression> select_;
   Schema output_schema_;
   std::vector<ColumnName> provided_order_;
 };

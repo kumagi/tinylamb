@@ -1,5 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 #include "common/log_message.hpp"
 #include "query/googlesql_ast_fuzzer.hpp"
@@ -44,6 +46,13 @@ int main(int argc, char** argv) {
     const auto& path = file.path();
     const std::string name = path.filename().string();
     if (!file.is_regular_file(iter_ec)) {
+      if (iter_ec) {
+        // A failed stat() would silently shrink the replay set and make
+        // "all regressions replayed" a false claim -- fail loudly instead.
+        LOG(ERROR) << "cannot stat directory entry " << path << ": "
+                   << iter_ec.message();
+        return 1;
+      }
       continue;
     }
     if (name.ends_with(".report.txt") || name.ends_with(".test") ||

@@ -1,13 +1,12 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/detail/ooc/chunk_codec.hpp"
 
-
-#include <new>
-#include <stdexcept>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 #include "type/row_block_codec.hpp"
@@ -38,6 +37,8 @@ constexpr uint8_t kFlagUnsigned = 1U << 0;
 constexpr uint8_t kFlagHeterogeneous = 1U << 1;
 constexpr uint8_t kFlagFallbackValues = 1U << 2;
 constexpr uint8_t kFlagHasNulls = 1U << 3;
+constexpr unsigned kCollationShift = 5;
+constexpr uint8_t kCollationMask = 0x03U;
 
 }  // namespace
 
@@ -129,8 +130,10 @@ Status EncodeDataChunk(const DataChunk& chunk, std::string* dst) {
       }
     }
 
-    auto flags =
-        static_cast<uint8_t>((static_cast<uint8_t>(coll) & 0x03U) << 5);
+    // NULL values carry no collation tag, so preserve the column collation
+    // even when this frame contains no non-NULL values.
+    auto flags = static_cast<uint8_t>(
+        (static_cast<uint8_t>(coll) & kCollationMask) << kCollationShift);
     if (col.IsUnsigned()) {
       flags |= kFlagUnsigned;
     }
@@ -218,7 +221,7 @@ Status EncodeDataChunk(const DataChunk& chunk, std::string* dst) {
   return Status::kSuccess;
 }
 
-Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
+Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) try {
   if (src == nullptr || chunk_out == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
                        "null argument in DecodeDataChunk");
@@ -238,7 +241,8 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
   // Initialize calls whose std::bad_alloc / std::length_error escapes the
   // Status boundary (project invariant 1).
   constexpr uint32_t kMaxFrameRows = 1U << 22;
-  if (static_cast<size_t>(col_count) * 2 > src->size()) {
+  constexpr size_t kColumnHeaderBytes = 2;
+  if (col_count > src->size() / kColumnHeaderBytes) {
     return StatusError(StatusCode::kCorrupt,
                        "col_count exceeds DataChunk frame payload");
   }
@@ -246,12 +250,18 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
     return StatusError(StatusCode::kCorrupt,
                        "row_count exceeds DataChunk frame limit");
   }
+  if (has_positions > 1) {
+    return StatusError(StatusCode::kCorrupt,
+                       "invalid RowPositions flag in DataChunk frame");
+  }
 
   std::vector<RowPosition> positions;
   if (has_positions != 0 && row_count > 0) {
     const size_t pos_bytes =
         static_cast<size_t>(row_count) * RowPosition::Size();
-    if (src->size() < pos_bytes) {
+    const size_t header_bytes =
+        static_cast<size_t>(col_count) * kColumnHeaderBytes;
+    if (src->size() - header_bytes < pos_bytes) {
       return StatusError(StatusCode::kCorrupt,
                          "truncated RowPositions in DataChunk frame");
     }
@@ -265,7 +275,9 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
 
   chunk_out->Reset();
   std::vector<ValueType> initial_types(col_count, ValueType::kNull);
-  chunk_out->Initialize(initial_types, std::max<size_t>(row_count, 1));
+  // The per-column decoders check payload extents before growing their
+  // buffers. Avoid reserving row-sized storage from the header alone.
+  chunk_out->Initialize(initial_types, 0);
 
   std::vector<uint8_t> nulls_scratch;
   std::vector<int64_t> ints_scratch;
@@ -292,7 +304,13 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
     if (is_hetero) {
       col.SetAllowHeterogeneous(true);
     } else {
-      col.RebindEmptyType(vt, is_unsigned);
+      const auto collation =
+          static_cast<Collation>((flags >> kCollationShift) & kCollationMask);
+      if (collation > Collation::kCaseInsensitive) {
+        return StatusError(StatusCode::kCorrupt,
+                           "invalid collation in DataChunk frame");
+      }
+      col.RebindEmptyType(vt, is_unsigned, collation);
     }
 
     if (row_count == 0) {
@@ -389,6 +407,10 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
     }
   }
   return Status::kSuccess;
+} catch (const std::length_error&) {
+  return Status::kTooBigData;
+} catch (const std::bad_alloc&) {
+  return Status::kMemoryLimitExceeded;
 }
 
 namespace {
@@ -520,6 +542,14 @@ StatusOr<bool> ReadDataChunk(SpillSegmentReader* reader, DataChunk* chunk_out,
   }
   uint32_t frame_bytes = 0;
   RETURN_IF_FAIL(reader->ReadPod(&frame_bytes));
+  if (frame_bytes == 0) {
+    // The writer always emits at least the 4-byte frame header plus an
+    // encoded chunk, so a zero length means a corrupt spill image. Report it
+    // here instead of letting DecodeDataChunk fail with a generic corrupt
+    // error on an empty view.
+    return StatusError(StatusCode::kCorrupt,
+                       "invalid zero-length DataChunk spill frame");
+  }
   std::string local;
   std::string* buf = (scratch_buffer != nullptr) ? scratch_buffer : &local;
   if (frame_bytes > reader->Remaining()) {

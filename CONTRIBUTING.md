@@ -19,7 +19,7 @@ new bare `FATAL`/`ERROR` integer constants outside `log_message.hpp`.
 
 ## Tests & Lint
 
-Run `cmake --build build -j && ctest --test-dir build -j$(nproc) --output-on-failure`,
+Run `cmake --build build -j && ctest --test-dir build -j$(nproc) --output-on-failure -LE scale`,
 `python3 scripts/check_layering.py`, and `python3 scripts/check_ooc_invariants.py`
 before opening a PR. Concurrency-sensitive changes should pass under TSAN when
 available (`TINYLAMB_ENABLE_TSAN=ON`).

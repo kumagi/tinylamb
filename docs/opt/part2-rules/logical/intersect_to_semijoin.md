@@ -71,8 +71,9 @@ INTERSECT 演算は、集合論的に両入力の共通部分を抽出します�
     // No equatable columns are known. A previous revision invented an `id`
     // equality here without checking that such a column exists; that
     // fabricated predicate silently joined on the wrong key (or failed
-    // downstream). Return null so callers skip the rewrite instead.
-    return memo.JoinConditionFor(left_group, right_group);
+    // downstream). Return an empty Expression so callers skip the rewrite
+    // instead of inventing a condition.
+    return Expression{};
   }
 ```
 
@@ -104,8 +105,7 @@ INTERSECT 演算は、集合論的に両入力の共通部分を抽出します�
 
 ## 関連 Rule との相互作用
 
-- `except_to_antijoin`: EXCEPT 演算を AntiJoin へ変換する対照的な Rule です。同一の判定基盤および述語構築ロジックを共有します。
-- `intersect_to_semijoin / except_to_antijoin`: `Pattern::Any()` を用いて INTERSECT と EXCEPT の双方を一括処理する Rule です。本 Rule と同一の論理代替を導出しますが、`Memo::AddExpression` により重複は排除されます。
+- `except_to_antijoin`: EXCEPT 演算を AntiJoin へ変換する対照的な Rule です。同一の判定基盤（`set_intersection` / `UnionRelations` による関係集合チェック）および述語構築ロジック（`BuildEqualityOnAllColumns`）を共有します。ただし本 Rule と異なり、`Pattern::Op(LogicalOperator::kExcept, {})` で EXCEPT のみを対象とし、独立した Rule として登録されています。
 - `semi_hash_join` / `semi_merge_join`（実装 Rule）: 本 Rule が生成した `kSemiJoin` 式を物理プランへ具体化します。
 
 ## 検証テスト

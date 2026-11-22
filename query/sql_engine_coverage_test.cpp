@@ -354,6 +354,8 @@ TEST_F(SqlEngineCoverageTest, ExplainRejectsNonSelectStatements) {
 // ------------------------------------------------------------- plan cache ---
 
 TEST_F(SqlEngineCoverageTest, PlanCacheReusesTemplateAndStaysCorrect) {
+  ASSERT_SUCCESS(context_->PreCommit());
+  *context_ = database_->BeginContext();
   // T4447: the test name promises reuse, so assert it with the
   // process-global PlanCacheStats counters (query/AGENTS.md). Row values
   // alone stay green even if the cache is disabled outright. On the
@@ -379,6 +381,8 @@ TEST_F(SqlEngineCoverageTest, PlanCacheReusesTemplateAndStaysCorrect) {
          "CREATE TABLE t2 (a INT64, b VARCHAR(10));");
   RunSql(engine_.get(), context_.get(),
          "INSERT INTO t2 (a, b) VALUES (1, 'p'), (2, 'r')");
+  ASSERT_SUCCESS(context_->PreCommit());
+  *context_ = database_->BeginContext();
   const uint64_t replays_before_t2 = PlanCacheStats().replays.load();
   const uint64_t invalidations_before =
       PlanCacheStats().epoch_invalidations.load();

@@ -247,8 +247,8 @@ TEST_F(FullScanMvccFastPathTest,
 
   TransactionContext contender = db_->BeginContext();
   EXPECT_FALSE(contender.txn_.TryAddWriteSet(target));
-  contender.Abort();
-  owner.Abort();
+  ASSERT_SUCCESS(contender.Abort());
+  ASSERT_SUCCESS(owner.Abort());
 }
 
 TEST_F(FullScanMvccFastPathTest,

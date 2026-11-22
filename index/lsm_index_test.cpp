@@ -17,10 +17,15 @@
 #include "index/lsm_index.hpp"
 
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
 
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -65,6 +70,16 @@ class LsmIndexTest : public ::testing::Test {
     std::ignore = std::remove((prefix_ + ".db").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt.tmp").c_str());
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+      const std::string fname = entry.path().filename().string();
+      // Compaction/eviction create <db>.lsm.<gen> and <db>.blocks.<gen>
+      // files; remove them so parallel ctest runs do not accumulate debris.
+      if (fname.starts_with(prefix_ + ".db.lsm.") ||
+          fname.starts_with(prefix_ + ".db.blocks.")) {
+        std::filesystem::remove(entry.path(), ec);
+      }
+    }
     RemoveLogAndSegments(prefix_ + ".log");
   }
 
@@ -179,6 +194,31 @@ TEST_F(LsmIndexTest, MemTableFlushAndCompactionWithPartitionBoundaries) {
 
   ASSERT_SUCCESS(txn.PreCommit());
 }
+
+#if defined(__unix__) || defined(__APPLE__)
+TEST_F(LsmIndexTest, PartitionBoundariesPropagateScanFailure) {
+  pm_->SetBufferPoolLimitBytesForTest(1U << 20);
+  auto writer = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(LsmIndex, idx, LsmIndex::Open(writer));
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_SUCCESS(
+        idx.Insert(writer, "key" + std::to_string(i), std::string(256, 'x')));
+  }
+  ASSERT_SUCCESS(writer.PreCommit());
+  pm_->FlushLsmBuffersForTest(idx.Root());
+  auto reader = tm_->Begin();
+  struct rlimit original{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  struct rlimit limited = original;
+  limited.rlim_cur = 0;
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &limited), 0);
+  auto boundaries = idx.ScanPartitionBoundaries(reader, "", "", 1);
+  const int restore_result = setrlimit(RLIMIT_NOFILE, &original);
+  ASSERT_EQ(restore_result, 0);
+  EXPECT_EQ(boundaries.GetStatus(), Status::kIOError);
+  ASSERT_SUCCESS(reader.Abort());
+}
+#endif
 
 TEST_F(LsmIndexTest, AbortRevertsUncommittedMutations) {
   page_id_t root = 0;

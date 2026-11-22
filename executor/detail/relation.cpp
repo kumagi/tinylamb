@@ -205,9 +205,12 @@ void Relation::FlushPendingCharge() {
 }
 
 void Relation::ReleaseCharge() {
-  // Charges never applied to the global counter simply evaporate.
+  // Charges never applied to the global counter simply evaporate. Clamp the
+  // subtraction: if the pending portion ever exceeds the recorded charge, an
+  // unguarded size_t subtraction would wrap and release a huge value into the
+  // query pool instead of just dropping the pending bookkeeping.
   if (pending_charge_ != 0) {
-    charged_bytes_ -= pending_charge_;
+    charged_bytes_ -= std::min(charged_bytes_, pending_charge_);
     pending_charge_ = 0;
   }
   if (charged_bytes_ != 0) {
@@ -223,37 +226,34 @@ void Relation::EnsureSpill() {
     }
     columnar.reset();
   }
-  if ((spill || !extra_spills.empty()) && !rows.empty()) {
+  if (HasSpill() && !rows.empty()) {
+    if (SealSpillTail() != Status::kSuccess) {
+      return;
+    }
     NoteRelationSpill(runtime_);
-    auto front = std::make_shared<SpillFile>();
+    auto generation = std::make_shared<SpillFile>();
     Status st = Status::kSuccess;
     for (const Row& row : rows) {
-      st = front->Append(row);
+      st = generation->Append(row);
       if (st != Status::kSuccess) {
         break;
       }
     }
     if (st == Status::kSuccess) {
-      st = front->FinishWriting();
+      st = generation->FinishWriting();
     }
     if (st != Status::kSuccess) {
       if (spill_error_ == Status::kSuccess) {
         spill_error_ = st;
       }
-    } else {
-      // `rows` are a NEW spill generation: they were kept in memory after the
-      // earlier generations had already gone to `spill` / `extra_spills`
-      // (e.g. the in-memory fallback when a spill write failed). ForEachRow()
-      // reads `spill -> extra_spills -> spill_tail_`, oldest first, so the new
-      // generation must be appended after the existing ones. Promoting it to
-      // the head (and demoting the old head into extra_spills.begin()) reverses
-      // the order on every repeated spill.
-      spilled_rows_ += rows.size();
-      extra_spills.push_back(std::move(front));
-      ClearRelationRows(rows);
-      rows.shrink_to_fit();
-      ReleaseCharge();
+      return;
     }
+    // These rows follow the earlier files and the tail just sealed above.
+    extra_spills.push_back(std::move(generation));
+    spilled_rows_ += rows.size();
+    ClearRelationRows(rows);
+    rows.shrink_to_fit();
+    ReleaseCharge();
   }
   if (spill && spill_tail_) {
     return;
@@ -555,44 +555,23 @@ Status Relation::AdoptSpilledShard(Relation&& shard) {
     return first;
   }
   uniform_cell_types = false;
-  if (!HasSpill() && !rows.empty() && !HasAmpleMemoryBudget()) {
+  // Existing buffered rows precede the incoming shard. Persist that prefix
+  // before linking the shard's files into the append sequence.
+  if (!rows.empty()) {
     EnsureSpill();
+    if (!rows.empty()) {
+      return spill_error_;
+    }
   }
-  auto flush_active_tail = [&]() {
-    if (!spill_tail_) {
-      return;
-    }
-    const Status tail_status = spill_tail_->FinishWriting();
-    if (tail_status != Status::kSuccess) {
-      if (spill_error_ == Status::kSuccess) {
-        spill_error_ = tail_status;
-      }
-      if (first == Status::kSuccess) {
-        first = tail_status;
-      }
-    }
-    if (spill_tail_->Count() > 0) {
-      if (!spill) {
-        spill = std::move(spill_tail_);
-      } else {
-        extra_spills.push_back(std::move(spill_tail_));
-      }
-    } else {
-      spill_tail_.reset();
-    }
-  };
-  flush_active_tail();
-  for (Row& row : shard.rows) {
-    AddRow(std::move(row));
+  if (const Status sealed = SealSpillTail(); sealed != Status::kSuccess) {
+    return first == Status::kSuccess ? sealed : first;
   }
-  shard.rows.clear();
-  flush_active_tail();
   auto adopt_file = [&](std::shared_ptr<SpillFile> f) {
     if (!f || f->Count() == 0) {
       return;
     }
     spilled_rows_ += f->Count();
-    if (!spill) {
+    if (!spill && extra_spills.empty()) {
       spill = std::move(f);
     } else {
       extra_spills.push_back(std::move(f));
@@ -603,6 +582,9 @@ Status Relation::AdoptSpilledShard(Relation&& shard) {
     adopt_file(std::move(extra));
   }
   adopt_file(std::move(shard.spill_tail_));
+  for (Row& row : shard.rows) {
+    AddRow(std::move(row));
+  }
   peak_intermediate_rows = std::max(peak_intermediate_rows, TotalRows());
   shard.ResetContents();
   if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
@@ -653,6 +635,27 @@ void Relation::MergeInMemoryShard(Relation&& shard) {
   shard.ReleaseCharge();
 }
 
+Status Relation::SealSpillTail() {
+  if (!spill_tail_) {
+    return Status::kSuccess;
+  }
+  const Status status = spill_tail_->FinishWriting();
+  if (status != Status::kSuccess) {
+    if (spill_error_ == Status::kSuccess) {
+      spill_error_ = status;
+    }
+    return status;
+  }
+  if (spill_tail_->Count() == 0) {
+    spill_tail_.reset();
+  } else if (!spill && extra_spills.empty()) {
+    spill = std::move(spill_tail_);
+  } else {
+    extra_spills.push_back(std::move(spill_tail_));
+  }
+  return Status::kSuccess;
+}
+
 Status Relation::FinishSpill() {
   if (spill_tail_) {
     const Status status = spill_tail_->FinishWriting();
@@ -667,6 +670,9 @@ Status Relation::FinishSpill() {
 Status Relation::TakeRowAndSpillBacking(
     std::vector<Row>* out_rows,
     std::vector<std::shared_ptr<SpillFile>>* out_spills) {
+  if (HasSpill() && !rows.empty()) {
+    EnsureSpill();
+  }
   RETURN_IF_FAIL(FinishSpill());
   out_rows->swap(rows);
   ClearRelationRows(rows);

@@ -185,6 +185,12 @@ bool UnnestExecutor::NextRow(Row* dst, RowPosition* rp) {
     if (current_unnested_rows_.empty() && left_outer_) {
       // OUTER unnest: an empty (or NULL) array emits one row of NULLs so the
       // driving row survives with NULL-extended unnest columns.
+      // Width is size_t, not slot_t (a u16): the output schema may be wider
+      // than 65535 columns, and narrowing here would truncate a wide row
+      // into a short NULL vector. Only LEFT OUTER UNNEST is implemented:
+      // an unnested array has no independent "right side" rows to preserve,
+      // so FULL OUTER UNNEST has no path through the planner (the left outer
+      // flag below is the only outer mode this operator understands).
       const size_t width = output_schema_.ColumnCount() > 0
                                ? output_schema_.ColumnCount()
                                : rel.schema.ColumnCount();

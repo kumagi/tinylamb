@@ -545,11 +545,15 @@ OocHashJoinContext::~OocHashJoinContext() {
   reduced_probe_store.reset();
   semi_probe_domain.reset();
   semi_kept_ordinals.clear();
-  for (const OocBuildSpillBucket& b : build_buckets) {
+  // Empty the member before dropping any segment: if one release were to
+  // throw, the remaining buckets are no longer reachable from this context
+  // and cannot be released a second time by a later cleanup path.
+  std::vector<OocBuildSpillBucket> buckets;
+  buckets.swap(build_buckets);
+  for (const OocBuildSpillBucket& b : buckets) {
     SpillStore::DropSegmentIfAlive(spill_store, spill_store_alive,
                                    b.segment_id);
   }
-  build_buckets.clear();
   ReleaseResidentMemory();
 }
 
@@ -999,8 +1003,12 @@ StatusOr<std::shared_ptr<PipelineSource>> OocHashBuildSink::Finalize(
         &key_scratch_, ns, join_ctx_->any_null_safe);
     if (k.valid) {
       join_ctx_->hash_index.Insert(k.hash, k.int_key, key_scratch_, idx);
-      if (collect_rf && (row[build_cols[0]].type == ValueType::kInt64 ||
-                         row[build_cols[0]].type == ValueType::kDate)) {
+      // Mirror ExtractJoinKey's guard: a build row may be narrower than the
+      // schema (partial projection), so the key slot must be range-checked
+      // before reading it for the runtime filter as well.
+      if (collect_rf && build_cols[0] < row.Count() &&
+          (row[build_cols[0]].type == ValueType::kInt64 ||
+           row[build_cols[0]].type == ValueType::kDate)) {
         rf_builder.Observe(row[build_cols[0]].value.int_value);
       }
     } else if (collect_rf) {
@@ -1789,12 +1797,15 @@ bool OocAdaptiveHashProbeSource::StartFilteredProbe(const DataChunk& batch) {
 
 Status OocAdaptiveHashProbeSource::PrepareGracePartitions(
     PipelineContext* ctx) {
+  if (ctx == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spilled hash join requires a pipeline context");
+  }
   const OocHashJoinSpec& spec = join_ctx_->spec;
   if (spec.kind == JoinKind::kNullAwareAnti && join_ctx_->build_has_null_key) {
     // Drop all build buckets immediately: NOT IN with NULL returns 0 rows.
     for (OocBuildSpillBucket& b : join_ctx_->build_buckets) {
       if (b.segment_id != kInvalidSpillSegmentId) {
-        // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage) intentional pattern in this code
         ctx->spill_store.DropSegment(b.segment_id);
         b.segment_id = kInvalidSpillSegmentId;
       }
@@ -1804,7 +1815,7 @@ Status OocAdaptiveHashProbeSource::PrepareGracePartitions(
   }
 
   const size_t fanout = join_ctx_->build_buckets.size();
-  const size_t active_budget = ctx != nullptr ? ctx->OperatorBudgetBytes() : 0;
+  const size_t active_budget = ctx->OperatorBudgetBytes();
   const size_t wbuf =
       GraceWriterBufferBytesFor(active_budget, fanout, join_ctx_->io_buf_bytes);
   const size_t batch_cap = GraceWriteBatchBytesFor(active_budget, fanout);
@@ -2119,6 +2130,10 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
 }
 
 Status OocAdaptiveHashProbeSource::Open(PipelineContext* ctx) {
+  if (join_ctx_->spilled && ctx == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spilled hash join requires a pipeline context");
+  }
   if (opened_) {
     return Status::kSuccess;
   }
@@ -2178,6 +2193,10 @@ StatusOr<bool> OocAdaptiveHashProbeSource::NextBatch(PipelineContext* ctx,
   out->Reset();
   if (max_rows == 0) {
     return false;
+  }
+  if (join_ctx_->spilled && ctx == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spilled hash join requires a pipeline context");
   }
   if (!opened_) {
     RETURN_IF_FAIL(Open(ctx));
@@ -2446,9 +2465,9 @@ void OocAdaptiveHashProbeSource::RenderTree(std::ostream& out, int indent,
   }
   if (is_dump && join_ctx_->finalized && spec.kind == JoinKind::kInner) {
     if (direct_probe_batches_ != 0 || compact_probe_batches_ != 0) {
-      out << child_pad << "FilteredHashProbe direct_batches="
-          << direct_probe_batches_ << " compact_batches="
-          << compact_probe_batches_ << '\n';
+      out << child_pad
+          << "FilteredHashProbe direct_batches=" << direct_probe_batches_
+          << " compact_batches=" << compact_probe_batches_ << '\n';
     }
     out << child_pad
         << "HashJoin actual_build_rows=" << join_ctx_->build_total_rows

@@ -13,6 +13,13 @@
 
 namespace tinylamb {
 
+// Verify marker for a finding whose serialized trace replays clean. It must
+// contain the "flaky" substring recognized by EmitFuzzFinding
+// (fuzz_scoped_db.hpp), otherwise a non-reproducing failure is persisted as a
+// permanently green regression and aborts the fuzzer worker.
+inline constexpr std::string_view kOocNonReproducingVerify =
+    "note: replay of the serialized trace held (flaky / nondeterministic)";
+
 // Larger-than-memory session fuzzing (ooca-v2.md G2/G3/G4/G6 as a fuzzer).
 //
 // Each session shrinks the process memory knobs (storage pool, columnar pool,
@@ -119,6 +126,10 @@ struct OocRunOptions {
   double budget_seconds{0};
   // Data-volume multiplier (0 = TINYLAMB_OOC_FUZZ_SCALE or 1).
   int scale{0};
+  // Bound generated table sizes for short test sessions (0 = flavor default).
+  int64_t max_rows_per_table{0};
+  // Bound the cap written into generated sweeps (0 = flavor default).
+  int64_t max_sweep_points{0};
   // Session flavour: -1 draws one from the seed; see OocFlavorNames().
   int flavor{-1};
   // Replay only: ops that no longer apply (their table, key or snapshot is
@@ -128,8 +139,8 @@ struct OocRunOptions {
   // Called once with the profile before the database opens, and with every
   // op right before it executes.  A driver that appends them to a file keeps
   // a reproducible trace even when the process crashes or hangs.
-  std::function<void(const OocProfile&)> on_profile;
-  std::function<void(const std::string&)> on_op;
+  std::function<void(const OocProfile&)> on_profile{};
+  std::function<void(const std::string&)> on_op{};
 };
 
 // Runs one session drawn from `data` (bytes steer the decisions; once they

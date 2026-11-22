@@ -174,10 +174,12 @@ enum class AggregateKind {
 // The aggregate to push down, if any.
 struct Aggregate {
   AggregateKind kind = AggregateKind::kNone;
-  slot_t col = 0;              // kCountCol / kMin / kMax / kApproxDistinct
-  int64_t coeff = 1;           // kSum scalar multiplier
-  std::vector<AggTerm> terms;  // kSum monomials
-  int out_scale = 0;           // decimal scale of the reported value
+  // kCountCol / kMin / kMax / kApproxCountDistinct, and kSum when terms is
+  // empty (the single-column SUM form).
+  slot_t col = 0;
+  int64_t coeff = 1;             // kSum scalar multiplier
+  std::vector<AggTerm> terms{};  // kSum monomials
+  int out_scale = 0;             // decimal scale of the reported value
 };
 
 // ORDER BY <single column> LIMIT k.
@@ -287,8 +289,8 @@ struct CostReport {
   std::vector<size_t> residual_conjuncts;
 };
 
-// The classification of one conjunct, used by the optimizer's search
-//. The labels are stable: adding a scheme classifies it
+// The classification of one conjunct, used by the optimizer's search.
+// The labels are stable: adding a scheme classifies it
 // under an existing label instead of inventing one.
 enum class QuoteClass {
   kMetadata,        // zone maps, constant cells, closed forms, footer sums
@@ -308,7 +310,7 @@ struct ConjunctQuote {
 };
 
 // Prices one conjunct as if it were the only conjunct (an upper bound:
-// interactions between conjuncts are not modelled).
+// interactions between conjuncts are not modeled).
 [[nodiscard]] std::vector<ConjunctQuote> Quote(
     Runtime runtime, const ArtifactSet& artifacts,
     const std::vector<Conjunct>& conjuncts);

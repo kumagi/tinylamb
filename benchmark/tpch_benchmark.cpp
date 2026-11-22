@@ -316,6 +316,12 @@ void WriteManifestRowCounts(const Options& options,
   for (size_t i = 0; i < Tables().size(); ++i) {
     manifest << "rows " << Tables()[i].name << ' ' << row_counts[i] << '\n';
   }
+  // Mirror GenerateData(): a short write (e.g. ENOSPC) must not leave a
+  // truncated manifest that looks like a valid one on the next load.
+  if (!manifest) {
+    std::cerr << "failed to write " << ManifestPath(options) << '\n';
+    std::abort();
+  }
 }
 
 bool ExistingDataMatches(const Options& options) {

@@ -166,8 +166,9 @@ class TableStatistics {
   TableStatistics& operator=(const TableStatistics&) = default;
   TableStatistics& operator=(TableStatistics&&) = default;
   bool operator==(const TableStatistics& other) const {
-    return row_count_ == other.row_count_ && layout_generation_ == other.layout_generation_ &&
-           *stats_ == *other.stats_;
+    // layout_generation_ is only a freshness handle, not statistical content:
+    // the same ANALYZE result read in another incarnation must compare equal.
+    return row_count_ == other.row_count_ && *stats_ == *other.stats_;
   }
   ~TableStatistics() = default;
 
@@ -253,6 +254,11 @@ class StreamingStatsCollector {
   StreamingStatsCollector& operator=(StreamingStatsCollector&&) noexcept;
 
   void AddRow(const Row& row);
+  void BeginRow();
+  void AddNull(slot_t col);
+  void AddInt(slot_t col, int64_t val, bool is_unsigned = false);
+  void AddDouble(slot_t col, double val);
+  void AddVarChar(slot_t col, std::string_view val);
   [[nodiscard]] uint64_t RowCount() const noexcept;
   [[nodiscard]] std::vector<ColumnStats> FinishStats() const;
   [[nodiscard]] std::string FinishEncoded() const;

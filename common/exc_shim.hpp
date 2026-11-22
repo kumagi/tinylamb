@@ -3,7 +3,7 @@
 // Deprecated exception shims: the one sanctioned place where library code
 // may still throw.  Layers converted to Status/StatusOr keep their old
 // throwing entry points as thin wrappers around this helper so engine layers
-// that have not been converted yet preserve their current behaviour
+// that have not been converted yet preserve their current behavior
 // (throw -> boundary catch).  Prefer the Try* APIs for new code.
 //
 #ifndef TINYLAMB_EXC_SHIM_HPP

@@ -95,7 +95,8 @@ ConcurrentJoinHashTable::ConcurrentJoinHashTable(size_t expected_entries) {
   }
 }
 
-void ConcurrentJoinHashTable::GrowShard(Shard& shard) {  // NOLINT(readability-convert-member-functions-to-static)
+void ConcurrentJoinHashTable::GrowShard(
+    Shard& shard) {  // NOLINT(readability-convert-member-functions-to-static)
   // The initial capacity is derived from a fixed guess (the shared build
   // passes 2048 => 64 slots/shard). Without growth, every extra built row
   // lengthens the probe chains and large joins degrade to O(build*probe/
@@ -692,6 +693,13 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
   for (const auto& out : thread_outputs) {
     total_out += out.size();
   }
+  // Account for the materialized output *before* reserving it. Add() is the
+  // point that reserves against the global budget (and may trigger spill /
+  // eviction): with the charge after reserve(), a build*probe blow-up could
+  // allocate the whole contiguous buffer before the budget ever sees it.
+  const size_t bytes = total_out * (sizeof(RowPosition) + sizeof(Row)) +
+                       shared_hash_table_.EstimatedBytes();
+  charge_.Add(bytes);
   output_.reserve(total_out);
   for (auto& out : thread_outputs) {
     for (auto& item : out) {
@@ -699,9 +707,6 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
     }
   }
 
-  size_t bytes = (output_.size() * (sizeof(RowPosition) + sizeof(Row))) +
-                 shared_hash_table_.EstimatedBytes();
-  charge_.Add(bytes);
   if (left_ && left_->GetStatus() != Status::kSuccess) {
     return left_->GetStatus();
   }

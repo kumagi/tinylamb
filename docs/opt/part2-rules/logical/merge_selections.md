@@ -81,7 +81,6 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `merge_selections`: 本 Rule と同一のパターンにマッチしますが、子ノードの参照を内側 Group の子（`inner.children`）に直接繋ぎ替えるフラット化変形を行います。
 - `eliminate_false_selection`: 統合述語が矛盾により `false` 定数へ縮退した際、部分木全体を空集合ノード（`kEmpty`）へ置換します。
 - `push_selection_into_scan`: 内側ノードの下位がスキャンである場合、統合された述語をスキャンフィルタへと押し込みます。
 

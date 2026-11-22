@@ -515,7 +515,13 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
       if (active_workers == 1) {
         worker_fn(0);
       } else {
-        RunParallelTasks(active_workers, worker_fn);
+        const Status parallel_status =
+            RunParallelTasks(active_workers, worker_fn);
+        if (!parallel_status.ok()) {
+          FailWith(parallel_status);
+          finished_ = true;
+          return 0;
+        }
       }
       for (const Status& st : worker_status) {
         if (st != Status::kSuccess) {
@@ -1128,7 +1134,10 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     if (workers == 1) {
       worker_fn(0);
     } else {
-      RunParallelTasks(workers, worker_fn);
+      const Status parallel_status = RunParallelTasks(workers, worker_fn);
+      if (!parallel_status.ok()) {
+        return parallel_status;
+      }
     }
     for (const Status& st : worker_status) {
       if (st != Status::kSuccess) {
@@ -1398,7 +1407,9 @@ bool TryBuildDirectColumnarScanSpec(
   for (size_t idx = chain.size(); idx > 0; --idx) {
     if (chain[idx - 1].kind == Frame::Kind::kRename) {
       cur_qualifier =
-          static_cast<const RelationRenamePlan*>(chain[idx - 1].node)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+          static_cast<const RelationRenamePlan*>(
+              chain[idx - 1]
+                  .node)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               ->RelationName();
       break;
     }
@@ -1417,18 +1428,28 @@ bool TryBuildDirectColumnarScanSpec(
     };
     for (const Frame& f : chain) {
       if (f.kind == Frame::Kind::kSelection) {
-        probe_expr(static_cast<const SelectionPlan*>(f.node)->Predicate());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+        probe_expr(
+            static_cast<const SelectionPlan*>(f.node)
+                ->Predicate());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       } else if (f.kind == Frame::Kind::kProjection) {
-        for (const auto& item :
-             static_cast<const ProjectionPlan*>(f.node)->Columns()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+        for (
+            const auto& item :
+            static_cast<const ProjectionPlan*>(f.node)
+                ->Columns()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(item.expression);
         }
       } else if (f.kind == Frame::Kind::kTopN) {
-        for (const auto& k : static_cast<const TopNPlan*>(f.node)->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+        for (
+            const auto& k :
+            static_cast<const TopNPlan*>(f.node)
+                ->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(k.expression);
         }
       } else if (f.kind == Frame::Kind::kSort) {
-        for (const auto& k : static_cast<const SortPlan*>(f.node)->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+        for (
+            const auto& k :
+            static_cast<const SortPlan*>(f.node)
+                ->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(k.expression);
         }
       }
@@ -1442,9 +1463,12 @@ bool TryBuildDirectColumnarScanSpec(
     const Frame& frame = chain[idx - 1];
     if (frame.kind == Frame::Kind::kRename) {
       cur_qualifier =
-          static_cast<const RelationRenamePlan*>(frame.node)->RelationName();  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+          static_cast<const RelationRenamePlan*>(frame.node)
+              ->RelationName();  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     } else if (frame.kind == Frame::Kind::kSelection) {
-      const auto* sel = static_cast<const SelectionPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      const auto* sel = static_cast<const SelectionPlan*>(
+          frame
+              .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       std::vector<Expression> conjuncts = SplitConjuncts(sel->Predicate());
       relational_detail::ColumnarPredicateSet sub;
       const Schema sel_schema =
@@ -1474,7 +1498,9 @@ bool TryBuildDirectColumnarScanSpec(
                            sub.inlists.end());
       preds.nulls.insert(preds.nulls.end(), sub.nulls.begin(), sub.nulls.end());
     } else if (frame.kind == Frame::Kind::kProjection) {
-      const auto* proj = static_cast<const ProjectionPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      const auto* proj = static_cast<const ProjectionPlan*>(
+          frame
+              .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       const Schema child_schema =
           EnsureQualified(proj->GetSource()->GetSchema(), cur_qualifier);
       std::vector<slot_t> next_to_full;
@@ -1493,12 +1519,16 @@ bool TryBuildDirectColumnarScanSpec(
       }
       cur_to_full = std::move(next_to_full);
     } else if (frame.kind == Frame::Kind::kTopN) {
-      embedded_topn = static_cast<const TopNPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      embedded_topn = static_cast<const TopNPlan*>(
+          frame
+              .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       topn_to_full = cur_to_full;
       topn_schema =
           EnsureQualified(embedded_topn->Child()->GetSchema(), cur_qualifier);
     } else if (frame.kind == Frame::Kind::kSort) {
-      embedded_sort = static_cast<const SortPlan*>(frame.node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      embedded_sort = static_cast<const SortPlan*>(
+          frame
+              .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       sort_to_full = cur_to_full;
       sort_schema =
           EnsureQualified(embedded_sort->Child()->GetSchema(), cur_qualifier);
@@ -1524,8 +1554,11 @@ bool TryBuildDirectColumnarScanSpec(
   }
 
   const bool effective_has_sort = !order_expressions.empty();
-  if (!effective_has_sort && preds.Empty() && !has_limit) {
-    return dbg_bail("plain unfiltered scan");
+  // An unbounded filtered scan buffers an entire multi-block window before
+  // yielding. Route it through the streaming pipeline until that buffer is
+  // governed by the query memory budget.
+  if (!effective_has_sort && !has_limit) {
+    return dbg_bail("unbounded scan requires streaming");
   }
   if (effective_has_sort && !has_limit) {
     return dbg_bail("unbounded sort");

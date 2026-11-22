@@ -71,7 +71,7 @@ NextBatch(列指向バッチの出力先, 最大行数) -> 返した行数
 | 完全ストリーミング | `Selection`、`Projection`、`Limit` | 最初の入力行またはバッチ |
 | 片側をブロック | `HashJoin`、`NestedLoopJoin` | ハッシュ表の構築側または右側の実体化後 |
 | 全体をブロック | `Sort`、`Window`、グルーピング集合 | 全入力の読み終わり後 |
-| OOC シンク境界 | `OocHashBuildSink`／`OocAdaptiveHashProbeSource`、`OocSortSink`、`OocGroupAggSink`、`OocWindowSink`、`OocSetOpInputSink`、`Relation` | `PipelineGraph` の上流ステージ完了・Finalize 後 |
+| OOC シンク境界 | `OocHashBuildSink`／`OocAdaptiveHashProbeSource`、`OocSortSink`、`OocGroupAggSink`、`OocWindowSink`、`OocSetOpInputSink` | `PipelineGraph` の上流ステージ完了・Finalize 後 |
 
 パイプライン化には三つの利点がある。
 

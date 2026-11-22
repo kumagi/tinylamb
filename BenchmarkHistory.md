@@ -1,5 +1,11 @@
 # Benchmark history
 
+> The verification numbers in each dated section are point-in-time snapshots
+> of that revision, not today's baseline. In particular the
+> `check_ooc_invariants.py` allowlist count changes as categories are added or
+> paid down, so run the script directly before quoting a current number; a
+> difference from an older section is expected, not a regression.
+
 ## 2026-11-18 — TPC-H SF=1 full 22-query suite baseline (value-corrected)
 
 - This section is the current `query_sum_q1_q22` regression-gate baseline.
@@ -26,7 +32,7 @@
   - P2 OOC primitives (`executor/detail/ooc/`): `SpillableStore`, `ExternalSorter` (in-memory fast path, bounded Top-N max-heap, multi-pass K-way merge), and `RecursivePartitioner` (MSB radix partitioning, dynamic budget-bounded fanout `4 <= F <= 64`, `< 20%` shrink / `max_depth` skew detection -> `skew_fallback`).
 - **Verification (`RelWithDebInfo`):**
   - `python3 scripts/check_layering.py`: exit 0 (`allowlisted=99`).
-  - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`).
+  - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`; snapshot at this revision, not the current baseline).
   - P2 unit tests (`PlatformUnlinkedTempFileTest`, `SpillStoreTest`, `RowBlockCodecTest`, `ChunkCodecTest`, `SpillableStoreTest`, `ExternalSorterTest`, `RecursivePartitionerTest`): `20/20` passed (`0.12 sec`).
   - `OocScaleBaselineTest.G2ExternalSortOneGiBUnderOneMiBBudget`: `1,048,576` rows (> 1 GiB spilled) sorted under strict `1 MiB` working budget with multi-pass merge (`>= 2` passes) and `<= 64 MiB` RSS delta: passed (`5.11 sec`).
 
@@ -39,7 +45,7 @@
   - `QueryMemoryCoordinator` + `QueryMemoryGrant` + `ActiveConsumerGuard` + `LocalBatchCache` + `ComputeEffectiveDop` (`common/query_grant.*`).
 - **Verification (`RelWithDebInfo`):**
   - `python3 scripts/check_layering.py`: exit 0 (`95 upward edge(s)... allowlisted=95`).
-  - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`).
+  - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`; snapshot at this revision, not the current baseline).
   - Full `ctest --test-dir build --output-on-failure -j$(nproc)`: `100% tests passed out of 4045` (3 skipped pre-existing tests; `40.56 sec` wall time), including `QueryGrantTest.*` (4/4).
   - `OocScaleBaselineTest` (`ctest -L scale` & `TINYLAMB_MEMORY_LIMIT_BYTES=1073741824 ./build/ooc_scale_baseline_test`): 3/3 passed (`0.28s`), verifying `(RSS - tracked) <= 0.075 M` under both `M = 16 GiB` and `M = 1 GiB`.
   - `./build/tinylamb_ooc_baseline_measure` (50k-row self-join): `After 50k load: RSS=78.33 MiB, tracked_total=14.80 MiB (storage=6.80 MiB, tx=8.00 MiB), unaccounted=63.53 MiB`; `Peak after query: RSS=92.89 MiB, total_peak=24.26 MiB, unaccounted=75.24 MiB <= 76.8 MiB (0.075 * 1 GiB)`; `Memory: tracked=19670096B peak_tracked=25437264B rss=97406976B unaccounted_rss=77736880B pools(storage=7133000B, columnar=2989000B, query=1159488B, tx=8388608B)`.
@@ -60,7 +66,7 @@
   - After `SELECT a.g, SUM(a.v1), COUNT(*) FROM t a JOIN t b ON a.k = b.k GROUP BY a.g ORDER BY a.g`: `peak_tracked = 13.41 MiB`, `RSS = 92.07 MiB`, `unaccounted_rss = 85.27 MiB` (exceeds `0.075 * 1 GiB = 76.8 MiB`, identifying untracked runtime/child allocations to close in P1).
   - Uncommitted eviction check (`PreCommit`前の `EvictColdPagesForTest(0)`): `ResidentBytes 6.80 -> 6.80 MiB`, `EvictedPageCount = 0` (**cannot evict uncommitted dirty pages**, confirming P6b ADR 0007 target).
   - Post-commit eviction check: `ResidentBytes 6.80 -> 0.04 MiB`, `EvictedPageCount = 101`, `RSS = 92.08 MiB`.
-- **OOC lint baseline (`scripts/check_ooc_invariants.py`):** 44 allowlisted legacy/infra calls across 18 entries (`ReserveForced`/`AddForced`: 17 across 10 files; `Collect()`: 3; `ReadAllRows`/`ReadAllPositioned`: 24 across 5 files).
+- **OOC lint baseline (`scripts/check_ooc_invariants.py`):** 45 allowlisted legacy/infra calls across 17 entries (`forced_reserve` = 16 across 8 files; `grant_blind_rows` = 3; `read_all_rows` = 23).
 - **Scale test suite (`ctest -L scale`):** `OocScaleBaselineTest` (2/2 pass). P3–P6 scale-invariance tests (multi-pass sort, skewed join/agg, large window, 10x DB scan, 10x bulk Tx) remain gated behind P1–P6 implementation per `ooca-v2.md` §6.
 
 ## 2026-11-06 — TPC-C-derived W=1: Tinylamb / PostgreSQL / MySQL

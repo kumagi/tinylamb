@@ -89,6 +89,20 @@ constexpr auto kWriteIntentPollInterval = std::chrono::milliseconds(10);
 constexpr auto kHolderAbortGiveupDelay = std::chrono::milliseconds(250);
 }  // namespace
 
+void TransactionManager::WireDurabilityWaiter() {
+  // The page manager's WAL-before-data gates (EvictBatch,
+  // WriteFuzzyCheckpoint) need a way to observe the logger's durable LSN.
+  // The transaction manager is always constructed with the logger that
+  // writes this database's WAL, so connect it here as well as in PageStorage:
+  // an embedded/test setup that owns a logger but forgets to call
+  // PageManager::SetDurableWaiter must never silently skip the durability
+  // barrier. A manager without a logger has no WAL to wait for.
+  if (page_manager_ != nullptr && logger_ != nullptr) {
+    page_manager_->SetDurableWaiter(
+        [logger = logger_](lsn_t lsn) { return logger->WaitForDurable(lsn); });
+  }
+}
+
 int64_t TransactionManager::WriteIntentWaitLimitMsFromEnv() {
   constexpr int64_t kDefaultMs = 5'000;
   const char* env = std::getenv("TINYLAMB_WRITE_INTENT_WAIT_MS");
@@ -414,6 +428,15 @@ void TransactionManager::GcWorkerLoop() {
 
 Transaction TransactionManager::Begin(bool read_only) {
   txn_id_t new_txn_id = next_txn_id_.fetch_add(1);
+  if (new_txn_id == 0) {
+    // The counter wrapped after 2^64 begins. emplace() below would fail on the
+    // stale active_transactions_/active_snapshots_ entries still carrying this
+    // id, silently pinning an ancient snapshot in GC forever. SeedNextId only
+    // moves the counter forward, so recovery cannot rescue a live process past
+    // this point: fail closed instead of reusing ids.
+    fail_stop_.store(true, std::memory_order_release);
+    LOG(FATAL) << "Transaction id space exhausted: refusing to wrap around";
+  }
   Transaction new_txn(new_txn_id, this, read_only);
   // No kBegin record: the undo walk follows prev_lsn_ chains rooted at each
   // write, and recovery classifies losers as "transactions whose newest LSN
@@ -503,9 +526,11 @@ Status TransactionManager::PreCommit(Transaction& txn,
       if (appended.HasValue()) {
         commit_start = appended.MoveValue();
         txn.prev_lsn_ = commit_start;
-        // AddLog returns the LSN *before* the payload; durable point is end
-        // of the buffered commit record.
-        commit_end = logger_->BufferedLSN();
+        // Record this transaction's own COMMIT end, without including bytes
+        // a concurrent producer may append before a BufferedLSN() lookup.
+        commit_end = commit_start +
+                     static_cast<lsn_t>(txn.serialization_scratch_.size());
+        txn.prev_end_lsn_ = commit_end;
         txn.SetStatus(TransactionStatus::kCommitted);
         append_failed = false;
       } else {
@@ -558,8 +583,8 @@ Status TransactionManager::PreCommit(Transaction& txn,
       const Status applied =
           ApplyTransactionCommitRecords(txn, commit_start, commit_end);
       Status published = applied == Status::kSuccess
-                                   ? CommitVersions(txn, commit_end)
-                                   : applied;
+                             ? CommitVersions(txn, commit_end)
+                             : applied;
       if (published != Status::kSuccess) {
         // Publication could not finish (memory exhaustion).  The versions
         // may already be visible, so the commit stays kCommitted -- but the
@@ -1713,12 +1738,18 @@ TransactionRuntimeStats TransactionManager::RuntimeStats() const {
       }
     }
   }
-  const auto sync = logger_->GetSyncStats();
+  // A TransactionManager can run without a logger (e.g. WAL-less setups or
+  // partially initialized instances), so metric reads must not dereference a
+  // null logger_. Report zero WAL stats in that case.
+  const Logger::SyncStats sync =
+      logger_ == nullptr ? Logger::SyncStats{0, 0} : logger_->GetSyncStats();
+  const lsn_t buffered_lsn = logger_ == nullptr ? 0 : logger_->BufferedLSN();
+  const lsn_t durable_lsn = logger_ == nullptr ? 0 : logger_->DurableLSN();
   return {
       .wal_sync_count = sync.count,
       .wal_sync_ns = sync.nanoseconds,
-      .wal_buffered_bytes = logger_->BufferedLSN(),
-      .wal_durable_bytes = logger_->DurableLSN(),
+      .wal_buffered_bytes = buffered_lsn,
+      .wal_durable_bytes = durable_lsn,
       .wal_wait_count = wal_wait_count_.load(std::memory_order_relaxed),
       .wal_wait_ns = wal_wait_ns_.load(std::memory_order_relaxed),
       .write_intent_attempts =
@@ -2539,6 +2570,43 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
         }
       });
   if (iter_status != Status::kSuccess) {
+    // Undo the entries this commit already appended before failing. Dropping
+    // commit_ts via PublishCommit makes later snapshots use timestamps
+    // GREATER than commit_ts, so any committed version left behind with
+    // begin_ts == commit_ts would become visible even though the commit was
+    // never acknowledged (Begin still serves snapshots under fail-stop).
+    for (VersionShard& shard : version_shards_) {
+      std::vector<RowPosition> empty_chains;
+      {
+        std::scoped_lock lock(shard.mutex);
+        for (auto& [rp, chain] : shard.versions) {
+          bool changed = false;
+          for (auto it = chain.committed.begin();
+               it != chain.committed.end();) {
+            if (it->begin_ts == commit_ts && it->commit_lsn == commit_lsn) {
+              ReleaseVersionPayloadBytes(it->payload.InlineBytes());
+              it = chain.committed.erase(it);
+              changed = true;
+            } else {
+              ++it;
+            }
+          }
+          if (changed && !chain.committed.empty()) {
+            // Restore the predecessor's visibility (CommitVersions had
+            // closed it at commit_ts).
+            chain.committed.back().end_ts =
+                std::numeric_limits<uint64_t>::max();
+          }
+          if (changed && chain.committed.empty() && !chain.pending) {
+            empty_chains.push_back(rp);
+          }
+        }
+        for (const RowPosition& rp : empty_chains) {
+          ForgetVersionChain(rp);
+          shard.versions.erase(rp);
+        }
+      }
+    }
     // Drop the timestamp reserved by AllocatePendingCommit. Otherwise it
     // stays the smallest entry in unpublished_commits_ and permanently caps
     // every later PublishCommit at commit_ts-1 via the min()-1 rule. The
@@ -2546,7 +2614,14 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
     // recovery re-applies the WAL COMMIT record; no live reader may be served
     // a snapshot pinned to this abandoned timestamp.
     PublishCommit(commit_ts);
-    // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
+    // CommitIndexMutations is deliberately not called on this path: the row
+    // versions above were erased, so publishing index keys for them would
+    // expose keys no snapshot can resolve. The caller fail-stops and runs
+    // AbortVersions, whose ClearPendingIndexMutations resolves every pending
+    // index mutation as discarded; recovery re-applies the durable kCommit to
+    // rebuild both row versions and index keys.
+    // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for
+    // this type
     return iter_status;
   }
   uint64_t observed_commit_ts =
@@ -3105,7 +3180,7 @@ void TransactionManager::ApplyTransactionAbortRecords(Transaction& txn) {
   lsn_t cur = txn.PrevLSN();
   const lsn_t first = txn.FirstLSN();
   LogRecord record;
-  while (txn.HasLogRecord() && cur != 0 && cur >= first) {
+  while (txn.HasLogRecord() && cur >= first) {
     size_t bytes_read = 0;
     if (!ReadWalRecordAt(cur, &record, &bytes_read)) {
       LOG(ERROR) << "WAL re-read abort failed reading record at LSN " << cur
@@ -3120,7 +3195,9 @@ void TransactionManager::ApplyTransactionAbortRecords(Transaction& txn) {
         record.type != LogType::kEndCheckpoint) {
       page_manager_->ApplyTransactionAbortRecord(txn.ID(), record);
     }
-    if (record.prev_lsn == 0 || record.prev_lsn >= cur) {
+    // LSN 0 is a valid first record. The transaction's explicit first LSN,
+    // not a zero predecessor, identifies the end of its chain.
+    if (cur == first || record.prev_lsn >= cur || record.prev_lsn < first) {
       break;
     }
     cur = record.prev_lsn;
@@ -3201,6 +3278,7 @@ Status TransactionManager::ApplyTransactionCommitRecords(Transaction& txn,
   page_manager_->BeginTransactionCommit(txn.ID());
   PageManager::TransactionCommitState state;
   Status applied = Status::kSuccess;
+  Status scan_status = Status::kSuccess;
   if (txn.HasLogRecord() &&
       !WalkWalRecordsForward(
           txn.ID(), txn.FirstLSN(), commit_start,
@@ -3218,10 +3296,17 @@ Status TransactionManager::ApplyTransactionCommitRecords(Transaction& txn,
             }
           },
           "WAL re-read commit scan")) {
-    return StatusError(StatusCode::kIOError, "WAL re-read commit scan failed");
+    scan_status =
+        StatusError(StatusCode::kIOError, "WAL re-read commit scan failed");
   }
-  RETURN_IF_FAIL(applied);
+  // BeginTransactionCommit must always be paired with FinishTransactionCommit,
+  // including on a corrupt/short WAL scan or a failed apply: otherwise pending
+  // destroyed pages never return to free_ids_ and the applied-op count never
+  // reaches the compaction callback (the abort path above finishes even after
+  // a read failure).
   page_manager_->FinishTransactionCommit(txn.ID(), state);
+  RETURN_IF_FAIL(scan_status);
+  RETURN_IF_FAIL(applied);
   txn.staged_records_.clear();
   txn.staged_charge_.ReleaseAll();
   txn.staged_bytes_ = 0;
@@ -3244,7 +3329,7 @@ bool TransactionManager::FindPendingLsmWriteViaWal(const Transaction& txn,
     has_log = txn.HasLogRecord();
   }
   LogRecord record;
-  while (has_log && cur != 0 && cur >= first) {
+  while (has_log && cur >= first) {
     size_t bytes_read = 0;
     if (!ReadWalRecordAt(cur, &record, &bytes_read)) {
       return false;
@@ -3257,7 +3342,9 @@ bool TransactionManager::FindPendingLsmWriteViaWal(const Transaction& txn,
       *value = *deleted ? std::string() : record.redo_data;
       return true;
     }
-    if (record.prev_lsn == 0 || record.prev_lsn >= cur) {
+    // LSN 0 is a valid first record. The transaction's explicit first LSN,
+    // not a zero predecessor, identifies the end of its chain.
+    if (cur == first || record.prev_lsn >= cur || record.prev_lsn < first) {
       break;
     }
     cur = record.prev_lsn;
@@ -3321,8 +3408,8 @@ int TransactionManager::ReservationBisectMode() {
   char* parsed_end = nullptr;
   errno = 0;
   const long parsed = std::strtol(env, &parsed_end, 10);
-  if (errno != 0 || parsed_end == env || *parsed_end != '\0' ||
-      parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+  if (errno != 0 || parsed_end == env || *parsed_end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
     return 0;
   }
   return static_cast<int>(parsed);

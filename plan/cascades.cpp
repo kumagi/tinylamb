@@ -604,9 +604,9 @@ void InheritBranchLocal(Memo& memo, GroupId derived, GroupId source) {
 // group's filter. Returns the conjuncts that have no single-relation home and
 // therefore must stay in the Selection. Guard rail (Phase 2): nothing here
 // reasons about null-rejection, so the rule must never be used to push
-// predicates through outer joins once those exist.
-// Extract per-table local conditions from an OR predicate that touches
-// multiple tables.  For each table involved, collect the conjuncts from
+// predicates through outer joins (kOuterJoin rules handle null-rejection
+// separately). Extract per-table local conditions from an OR predicate that
+// touches multiple tables.  For each table involved, collect the conjuncts from
 // every OR branch that reference only that table.  If every branch has
 // at least one local conjunct for a given table, the local disjunction
 // is pushed to that table's scan filter as a selective pre-filter.
@@ -677,7 +677,8 @@ void PushOrLocalConditions(
 // group's filter. Returns the conjuncts that have no single-relation home and
 // therefore must stay in the Selection. Guard rail (Phase 2): nothing here
 // reasons about null-rejection, so the rule must never be used to push
-// predicates through outer joins once those exist.
+// predicates through outer joins (kOuterJoin rules handle null-rejection
+// separately).
 std::vector<Expression> PushSingleRelationConjuncts(
     Memo& memo, const Expression& predicate,
     const std::function<bool(const std::string&)>& relation_enabled) {
@@ -1510,11 +1511,77 @@ std::string ExpressionIdentity(const Expression& expression) {
   return std::move(out).Take();
 }
 
+// Stable, value-independent name for a logical operator. Embedding the raw
+// enum integer would rewrite every fingerprint (and every derived-group tag
+// that embeds one) as soon as a new LogicalOperator value is inserted, so the
+// identity stays textual like the JoinKind ledger in common/join_kind.hpp.
+const char* LogicalOperatorName(LogicalOperator op) {
+  switch (op) {
+    case LogicalOperator::kScan:
+      return "scan";
+    case LogicalOperator::kJoin:
+      return "join";
+    case LogicalOperator::kOuterJoin:
+      return "outer_join";
+    case LogicalOperator::kCrossJoin:
+      return "cross_join";
+    case LogicalOperator::kSemiJoin:
+      return "semi_join";
+    case LogicalOperator::kAntiJoin:
+      return "anti_join";
+    case LogicalOperator::kSelection:
+      return "selection";
+    case LogicalOperator::kProjection:
+      return "projection";
+    case LogicalOperator::kAggregation:
+      return "aggregation";
+    case LogicalOperator::kSort:
+      return "sort";
+    case LogicalOperator::kTopN:
+      return "topn";
+    case LogicalOperator::kDistinct:
+      return "distinct";
+    case LogicalOperator::kUnion:
+      return "union";
+    case LogicalOperator::kUnionAll:
+      return "union_all";
+    case LogicalOperator::kIntersect:
+      return "intersect";
+    case LogicalOperator::kIntersectAll:
+      return "intersect_all";
+    case LogicalOperator::kExcept:
+      return "except";
+    case LogicalOperator::kExceptAll:
+      return "except_all";
+    case LogicalOperator::kLimit:
+      return "limit";
+    case LogicalOperator::kEmpty:
+      return "empty";
+    case LogicalOperator::kValues:
+      return "values";
+    case LogicalOperator::kDummyScan:
+      return "dummy_scan";
+    case LogicalOperator::kWindow:
+      return "window";
+    case LogicalOperator::kUnnest:
+      return "unnest";
+    case LogicalOperator::kRecursiveCte:
+      return "recursive_cte";
+    case LogicalOperator::kApply:
+      return "apply";
+    case LogicalOperator::kSample:
+      return "sample";
+    case LogicalOperator::kRelational:
+      return "relational";
+  }
+  return "unknown";
+}
+
 }  // namespace
 
 std::string LogicalExpression::Fingerprint() const {
   std::ostringstream out;
-  out << static_cast<int>(operation) << ':' << table;
+  out << LogicalOperatorName(operation) << ':' << table;
   for (GroupId child : children) {
     out << ':' << child;
   }
@@ -1545,6 +1612,11 @@ std::string LogicalExpression::Fingerprint() const {
   }
   if (operation == LogicalOperator::kLimit) {
     out << "#l:" << limit_offset << ',' << limit_count;
+    // WITH TIES exists on kLimit too (limit_push_through_sort forwards it);
+    // without this the tied and untied variants collapse into one fingerprint.
+    if (with_ties) {
+      out << ",ties";
+    }
   }
   if (operation == LogicalOperator::kTopN) {
     out << "#l:" << limit_offset << ',' << limit_count;
@@ -1651,10 +1723,25 @@ StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
     return StatusError(StatusCode::kInvalidArgument,
                        "join graph is too large for enumeration");
   }
-  relation_index_.clear();
   const std::vector<std::string> normalized = Normalize(relations);
-  for (size_t i = 0; i < normalized.size(); ++i) {
-    relation_index_.emplace(normalized[i], i);
+  if (relation_index_.empty()) {
+    for (size_t i = 0; i < normalized.size(); ++i) {
+      relation_index_.emplace(normalized[i], i);
+    }
+  } else {
+    // Every existing group carries a relation_mask expressed in the bit
+    // positions assigned by the first TryBuild. Reassigning those positions
+    // would silently reinterpret all of them, so a repeated build must reuse
+    // the established mapping and only accept the identical relation set.
+    bool same_relations = relation_index_.size() == normalized.size();
+    for (size_t i = 0; same_relations && i < normalized.size(); ++i) {
+      const auto found = relation_index_.find(normalized[i]);
+      same_relations = found != relation_index_.end() && found->second == i;
+    }
+    if (!same_relations) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "join graph relations differ from the existing memo");
+    }
   }
   conjuncts_.clear();
   conjunct_masks_.clear();
@@ -1732,6 +1819,12 @@ Expression Memo::JoinConditionFor(const Group& left, const Group& right) const {
     if (mask == 0) {
       continue;
     }
+    // A conjunct whose relations sit entirely on one side belongs to that
+    // side's scan filter, not to the join condition. This deliberately
+    // includes one-relation self-equalities such as `t.a = t.a`: they keep
+    // their NULL/NaN-rejecting semantics on the scan group, while claiming
+    // them here would only assert a degenerate (single-name) equivalence
+    // that logical-property inference ignores anyway.
     if ((mask & ~left.relation_mask) == 0) {
       continue;
     }
@@ -1816,8 +1909,15 @@ void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
     return;
   }
   target.filter = next;
+  // Adding a predicate to the scan filter changes what this group proves
+  // (IS NOT NULL / equality conjuncts); stale logical properties would keep
+  // an older uniqueness or not-null verdict. Mirror AddExpression's
+  // invalidation so DeriveLogicalProperties rebuilds and notifies dependents.
+  target.logical_properties_expression_count.reset();
+  target.logical_properties_stale = true;
   ++revision_;
   touched_groups_.push_back(group);
+  DeriveLogicalProperties(group);
 }
 
 bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
@@ -2012,12 +2112,13 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
   // Physical aggregation accepts the legacy partition_by spelling as a
   // grouping-key list. Canonicalize it before properties, fingerprints and
   // logical rewrites inspect the node; otherwise they mistake it for a scalar
-  // aggregate (and may manufacture an invalid empty projection).
-  if (expression.operation == LogicalOperator::kAggregation) {
-    if (expression.grouping_sets.empty()) {
-      expression.grouping_sets = std::move(expression.partition_by);
-    }
-    expression.partition_by.clear();
+  // aggregate (and may manufacture an invalid empty projection). When both
+  // spellings are supplied, grouping_sets is authoritative for grouping but
+  // partition_by is kept as the supplied partitioning metadata instead of
+  // being silently discarded.
+  if (expression.operation == LogicalOperator::kAggregation &&
+      expression.grouping_sets.empty() && !expression.partition_by.empty()) {
+    expression.grouping_sets = std::move(expression.partition_by);
   }
   switch (expression.operation) {
     case LogicalOperator::kScan: {
@@ -2182,7 +2283,7 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     }
   }
   // Duplicate rejection runs BEFORE the cap check counts against it, but a
-  // rejected duplicate must not trip the degradation flag either :
+  // rejected duplicate must not trip the degradation flag either:
   // mirrored associativity rotations re-derive existing expressions by
   // design and those retries have to stay free.
   // The fingerprint starts with the operator, table and child groups. Most
@@ -2349,8 +2450,45 @@ void EnumerateJoinGroup(Memo& memo, GroupId group,
   for (size_t i = 0; i < relations.size(); ++i) {
     global_bit[i] = memo.RelationMask({relations[i]});
   }
+  // A 16-relation group walks 2^15 bipartitions. Precompute the join graph's
+  // adjacency in the *local* bit space once so a disconnected side can be
+  // rejected with a handful of bit tests before building vectors or calling
+  // the memo's connectivity walkers. The authoritative checks below stay in
+  // place, so the candidate set is unchanged -- only the wasted work per
+  // rejected mask goes away.
+  std::vector<uint64_t> adjacent(relations.size(), 0);
+  for (size_t a = 0; a < relations.size(); ++a) {
+    for (size_t b = a + 1; b < relations.size(); ++b) {
+      // Restricting `within` to the pair makes a conjunct with the mask
+      // exactly {a,b} count as an edge too.
+      if (memo.CutConnected(global_bit[a], global_bit[a] | global_bit[b])) {
+        adjacent[a] |= uint64_t{1} << b;
+        adjacent[b] |= uint64_t{1} << a;
+      }
+    }
+  }
+  const auto locally_connected = [&adjacent](uint64_t mask) {
+    uint64_t seen = mask & (~mask + 1);  // lowest set bit
+    uint64_t frontier = seen;
+    while (frontier != 0) {
+      uint64_t next = 0;
+      uint64_t bits = frontier;
+      while (bits != 0) {
+        const size_t i = static_cast<size_t>(std::countr_zero(bits));
+        next |= adjacent[i];
+        bits &= bits - 1;
+      }
+      frontier = next & mask & ~seen;
+      seen |= frontier;
+    }
+    return seen == mask;
+  };
   for (uint64_t local = 1; local + 1 < limit; ++local) {
     if ((local & 1U) == 0) {
+      continue;
+    }
+    if (connected && (!locally_connected(local) ||
+                      !locally_connected((limit - 1) & ~local))) {
       continue;
     }
     uint64_t left_global = 0;
@@ -2395,6 +2533,12 @@ void EnumerateJoinGroup(Memo& memo, GroupId group,
 // Length-prefixed ordering signature of one window call (raw separators
 // collide when a key's own text contains them, mirroring the window-layer
 // grouping in optimizer.cpp).
+//
+// The frame is part of the spec. The limit-prefix rules feed this signature
+// into derived-group tags; two calls sharing PARTITION BY / ORDER BY but with
+// different ROWS/RANGE bounds would otherwise share one tag, landing
+// semantically different windows in the same memo group ("one group, one
+// meaning") even though the gate describes mixed specs as unsupported.
 std::string WindowSpecSignature(const WindowFunctionCallExpression& call) {
   std::string signature = std::to_string(call.partition_by.size()) + ":";
   for (const Expression& key : call.partition_by) {
@@ -2413,6 +2557,23 @@ std::string WindowSpecSignature(const WindowFunctionCallExpression& call) {
                      : (term.nulls_first.value() ? "1" : "0");
     signature += ";";
   }
+  // Frame specification: presence, unit, both bounds (kind + length-prefixed
+  // offset text), exclusion and the NULLS modifiers all change a window's
+  // meaning even when its partition/order keys are identical.
+  signature += "frame:";
+  signature += call.has_frame ? "1:" : "0:";
+  signature += std::to_string(static_cast<int>(call.frame_unit)) + ":";
+  const auto append_bound = [&signature](const WindowFrameBound& bound) {
+    signature += std::to_string(static_cast<int>(bound.type)) + "/";
+    const std::string text =
+        bound.offset ? bound.offset->ToString() : std::string("<null>");
+    signature += std::to_string(text.size()) + "/" + text + ";";
+  };
+  append_bound(call.frame_start);
+  append_bound(call.frame_end);
+  signature += std::to_string(static_cast<int>(call.exclusion)) + ":";
+  signature += call.respect_nulls ? "R" : "r";
+  signature += call.ignore_nulls ? "I" : "i";
   return signature;
 }
 
@@ -2422,17 +2583,18 @@ bool WindowValueStableUnderTruncation(
     const WindowFunctionCallExpression& call) {
   // Ranking values are prefix counts in partition order: ROW_NUMBER numbers
   // the rows 1..m, RANK counts strictly smaller keys (+1), DENSE_RANK counts
-  // key groups.  Removing a row strictly after a survivor in partition order
-  // cannot change any of them for rows the truncation keeps.
+  // key groups.  LAG likewise reads only rows at or before the current row,
+  // so removing a row strictly after a survivor in partition order cannot
+  // change any of them for rows the truncation keeps.
   if (call.function == "ROW_NUMBER" || call.function == "RANK" ||
-      call.function == "DENSE_RANK") {
+      call.function == "DENSE_RANK" || call.function == "LAG") {
     return true;
   }
   // These functions ignore ROWS bounds. Even an explicitly backward frame
   // cannot make their partition-size / positional result prefix-stable.
   if (call.function == "NTILE" || call.function == "PERCENT_RANK" ||
       call.function == "CUME_DIST" || call.function == "LEAD" ||
-      call.function == "LAG" || call.function == "PERCENTILE_CONT" ||
+      call.function == "PERCENTILE_CONT" ||
       call.function == "PERCENTILE_DISC") {
     return false;
   }
@@ -2461,6 +2623,11 @@ bool WindowValueStableUnderTruncation(
 // values under truncation.
 struct WindowPrefixGateResult {
   std::string spec;
+  // Identity of the window *outputs* (function names, args and target
+  // names).  `spec` only captures PARTITION/ORDER, so two different window
+  // calls sharing a spec would otherwise collide on the same derived group
+  // and the parent Limit could pick the wrong window output.
+  std::string identity;
   size_t order_terms{0};
   bool stable{true};
 };
@@ -2483,6 +2650,10 @@ std::optional<WindowPrefixGateResult> WindowPrefixGate(
     } else if (gate.spec != spec) {
       return std::nullopt;
     }
+    // Length-prefix each component so distinct target sets cannot collide.
+    gate.identity += std::to_string(target.name.size()) + "/" + target.name;
+    const std::string expr = target.expression->ToString();
+    gate.identity += "/" + std::to_string(expr.size()) + "/" + expr + ";";
     if (!WindowValueStableUnderTruncation(call)) {
       gate.stable = false;
     }
@@ -2822,7 +2993,7 @@ const RuleSet& RuleSet::Default() {
                   expression.predicate ? *expression.predicate : Expression{}));
         },
         LogicalOperator::kJoin));
-    // Two complementary associativity rotations . They look redundant,
+    // Two complementary associativity rotations. They look redundant,
     // but the worklist applies each rule once per expression occurrence, so
     // neither direction alone sees every child-group state in time; together
     // they derive every join shape. Their overlapping OUTPUTS are duplicates
@@ -3028,9 +3199,11 @@ const RuleSet& RuleSet::Default() {
             // Gate: every column in the predicate must resolve in every
             // branch; otherwise pushing would filter on a non-existent or
             // wrong relation.  Qualified columns resolve through the branch
-            // relation lists; an unqualified column is only pushable when it
-            // resolves by name in EVERY branch's catalog-published schema —
-            // when the schemas are unavailable the push must refuse.
+            // relation lists; an unqualified column is pushable only when it
+            // resolves *unambiguously* by name in that branch — exactly one
+            // of its relations publishes it (a JOIN branch need not have the
+            // column in all of its relations).  When the schemas are
+            // unavailable the push must refuse.
             const auto touched = (*expression.predicate)->TouchedColumns();
             const auto& schemas = memo.GetTableSchemas();
             auto resolves_in_branch = [&](const Group& branch,
@@ -3042,13 +3215,19 @@ const RuleSet& RuleSet::Default() {
               if (schemas.empty()) {
                 return false;
               }
-              return std::ranges::all_of(
-                  branch.relations, [&](const auto& rel) {
-                    const auto found = schemas.find(rel);
-                    return found != schemas.end() &&
-                           found->second.Offset(ColumnName("", column.name)) >=
-                               0;
-                  });
+              // Count publishing relations rather than requiring all_of:
+              // in a two-relation branch {a,b} a predicate touching only a.x
+              // must still be pushable when b has no x. Accepting more than
+              // one match would be ambiguous, so refuse that case.
+              size_t matches = 0;
+              for (const auto& rel : branch.relations) {
+                const auto found = schemas.find(rel);
+                if (found != schemas.end() &&
+                    found->second.Offset(ColumnName("", column.name)) >= 0) {
+                  ++matches;
+                }
+              }
+              return matches == 1;
             };
             bool pushable = true;
             for (const GroupId child : setop.children) {
@@ -3427,7 +3606,8 @@ const RuleSet& RuleSet::Default() {
                 group,
                 LogicalExpression{.operation = LogicalOperator::kProjection,
                                   .children = {limited},
-                                  .target_list = projection.target_list});
+                                  .target_list = projection.target_list,
+                                  .output_schema = projection.output_schema});
           }
         },
         LogicalOperator::kLimit));
@@ -3470,9 +3650,22 @@ const RuleSet& RuleSet::Default() {
                 std::to_string(expression.limit_count) + ":" +
                 std::to_string(expression.limit_offset);
             for (const NamedExpression& key : translated_keys) {
+              const std::string text = key.expression->ToString();
               signature.push_back('|');
-              signature.append(key.expression->ToString());
+              AppendInteger(signature, text.size());
+              signature.push_back(':');
+              signature.append(text);
             }
+            signature += "|direction:";
+            for (bool ascending : expression.sort_ascending) {
+              signature.push_back(ascending ? '1' : '0');
+            }
+            signature += "|nulls:";
+            for (const auto nulls_first : expression.sort_nulls_first) {
+              signature.push_back(nulls_first ? (*nulls_first ? '1' : '0')
+                                              : '?');
+            }
+            signature += expression.with_ties ? "|ties:1" : "|ties:0";
             const GroupId pushed =
                 memo.EnsureDerivedGroup(input_relations, signature);
             if (pushed == group || pushed == projection.children[0]) {
@@ -3492,7 +3685,8 @@ const RuleSet& RuleSet::Default() {
                 group,
                 LogicalExpression{.operation = LogicalOperator::kProjection,
                                   .children = {pushed},
-                                  .target_list = projection.target_list});
+                                  .target_list = projection.target_list,
+                                  .output_schema = projection.output_schema});
           }
         },
         LogicalOperator::kTopN));
@@ -3806,8 +4000,20 @@ const RuleSet& RuleSet::Default() {
           if (value.IsNull() || !value.Truthy()) {
             return;
           }
-          for (const LogicalExpression& child :
-               memo.Get(bindings.at("input")).expressions) {
+          const GroupId input = bindings.at("input");
+          const Group& input_group = memo.Get(input);
+          // The copied alternatives implement against this group's filter
+          // (implementation_rules reads memo.Get(group).filter), so a scan
+          // filter that lived only on the input group must move with them —
+          // the same contract push_selection_into_scan and
+          // pk_unique_distinct_elimination follow. A non-null filter implies
+          // a single-relation input, and this unary Selection preserves the
+          // relation set, so the destination is single-relation as well.
+          if (input != group && input_group.filter &&
+              memo.Get(group).relations.size() == 1) {
+            memo.MergeScanFilter(group, input_group.filter);
+          }
+          for (const LogicalExpression& child : input_group.expressions) {
             bool refs_group = false;
             for (GroupId c : child.children) {
               if (c == group) {
@@ -4409,7 +4615,7 @@ const RuleSet& RuleSet::Default() {
             // each target may stand for only one key. Counting matches avoids
             // the case where one projected column happens to satisfy two
             // different keys (expression keys compared by printed form), which
-            // would incorrectly claim DISTINCT is redundant.  //
+            // would incorrectly claim DISTINCT is redundant.
             // NOLINT(readability-braces-around-statements)
             size_t seen = 0;
             for (const auto& g : keys) {
@@ -4610,9 +4816,9 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kLimit));
 
     // limit_prefix_{unordered,ordered}_window: the safe exception for
-    // pushing a Limit below a Window, which the general push cannot do
-    // (push_limit_through_window - a window is row-preserving, so a
-    // truncated input changes partition-relative computations).
+    // pushing a Limit below a Window: in general, truncating the input
+    // changes partition-relative computations even though a window preserves
+    // rows.
     //
     // The engine's window emits rows in child order and scatters per-row
     // values back to their original positions, and a Limit truncates the
@@ -4655,7 +4861,8 @@ const RuleSet& RuleSet::Default() {
                 ReachableChildHasWindow(memo, input_id)) {
               continue;
             }
-            std::string signature = GroupIdsTag({input_id}) + gate->spec;
+            std::string signature =
+                GroupIdsTag({input_id}) + gate->spec + gate->identity;
             AppendInteger(signature, expression.limit_count);
             signature += ':';
             AppendInteger(signature, expression.limit_offset);
@@ -4759,7 +4966,8 @@ const RuleSet& RuleSet::Default() {
               continue;
             }
             std::string signature =
-                GroupIdsTag({window_group_id, sort_group_id}) + gate->spec;
+                GroupIdsTag({window_group_id, sort_group_id}) + gate->spec +
+                gate->identity;
             AppendInteger(signature, expression.limit_count);
             signature += ':';
             AppendInteger(signature, expression.limit_offset);
@@ -6406,6 +6614,15 @@ const RuleSet& RuleSet::Default() {
               expression.children.size() != 1) {
             return;
           }
+          // D5: this equivalence is only sound for an unordered LIMIT -- any
+          // subset of the join output is acceptable then. An ordered LIMIT
+          // (or WITH TIES, which needs the order to define peers) must keep
+          // its position above the join so the restored order picks the same
+          // rows; the rewrite below drops every ordering field.
+          if (expression.with_ties || !expression.sort_ascending.empty() ||
+              !expression.sort_nulls_first.empty()) {
+            return;
+          }
           const GroupId input_id = bindings.at("input");
           const Group& input_group = memo.Get(input_id);
           if (expression.limit_offset >
@@ -6746,8 +6963,18 @@ const RuleSet& RuleSet::Default() {
             const GroupId child = expression.children[0];
             if (child != group) {
               if (expression.target_list.empty()) {
+                // Same filter contract as eliminate_true_selection: the
+                // copied alternatives implement against this group's filter,
+                // so a scan filter living only on the child group must move
+                // with them (kWindow is unary and preserves the relation
+                // set, so a non-null child filter implies single-relation).
+                const Group& child_group = memo.Get(child);
+                if (child_group.filter &&
+                    memo.Get(group).relations.size() == 1) {
+                  memo.MergeScanFilter(group, child_group.filter);
+                }
                 for (const LogicalExpression& child_expr :
-                     memo.Get(child).expressions) {
+                     child_group.expressions) {
                   bool refs_group = false;
                   for (GroupId c : child_expr.children) {
                     if (c == group) {
@@ -8328,11 +8555,21 @@ const RuleSet& RuleSet::Default() {
             return;
           }
           const GroupId survivor = left_dummy ? right_id : left_id;
-          if (memo.Get(survivor).relations != memo.Get(group).relations) {
+          const Group& survivor_group = memo.Get(survivor);
+          if (survivor_group.relations != memo.Get(group).relations) {
             return;
           }
+          // The copied alternatives implement against this group's filter,
+          // so a scan filter living only on the survivor must move with them
+          // (same contract as eliminate_true_selection). A non-null filter
+          // implies a single-relation survivor and this unary reduction
+          // preserves the relation set, so the destination is single too.
+          if (survivor != group && survivor_group.filter &&
+              memo.Get(group).relations.size() == 1) {
+            memo.MergeScanFilter(group, survivor_group.filter);
+          }
           for (const LogicalExpression& alternative :
-               memo.Get(survivor).expressions) {
+               survivor_group.expressions) {
             bool cycle = false;
             for (GroupId child : alternative.children) {
               if (child == group) {
@@ -8424,7 +8661,7 @@ const RuleSet& RuleSet::Default() {
     // plan drops rows the original plan keeps. Proving ">= 1 match" needs
     // referential-integrity metadata the memo does not model.
 
-    // topn_push_through_proven_one_to_one_join :
+    // topn_push_through_proven_one_to_one_join:
     // TopN(keys, limit, offset) over an inner Join(L, R) gains an alternative
     // Join(TopN(keys, limit+offset), R) when the join is proven 1:1 from the
     // pushed side S (every S row matches exactly one other-side row) and the
@@ -11311,7 +11548,8 @@ const RuleSet& RuleSet::Default() {
                   Expression part_key =
                       ColumnValueExp(ColumnName(s_rel, gk_col.name));
                   Expression win_call = WindowFunctionCallExp(
-                      fn_name, {std::move(rebound_arg)}, {part_key}, {});
+                      std::move(fn_name), {std::move(rebound_arg)}, {part_key},
+                      {});
 
                   const std::vector<std::string> s_rels_vec{s_rel};
                   const GroupId win_group = memo.EnsureDerivedGroup(

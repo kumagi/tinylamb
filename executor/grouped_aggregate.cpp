@@ -375,8 +375,8 @@ Status AggregateGroupTable::Merge(const AggregateGroupTable& other) {
       if ((*aggregates_)[i] == nullptr) {
         continue;
       }
-      RETURN_IF_FAIL(StateFor(target, i).Merge(other.StateAt(
-          (group * other.aggregates_->size()) + i)));
+      RETURN_IF_FAIL(StateFor(target, i).Merge(
+          other.StateAt((group * other.aggregates_->size()) + i)));
     }
   }
   return Status::kSuccess;
@@ -486,23 +486,30 @@ HashAggregateExecutor::HashAggregateExecutor(
   }
   if (!parallel_capable_) {
     // Guessing would silently change the answer, so the operator keeps the
-    // serial build and the plan's worker count is simply not honoured.
+    // serial build and the plan's worker count is simply not honored.
     options_.worker_count = 1;
   }
 }
 
 Status HashAggregateExecutor::AccumulateRow(AggregateGroupTable* table,
                                             const Row& row) {
+  // Own the scratch per call: the partition replay callback calls this
+  // function, and a shared member would leave a half-built key behind if a
+  // nested call threw before EvaluateKeys finished.
+  std::vector<Value> scratch;
+  scratch.reserve(key_offsets_.size());
   RETURN_IF_FAIL(
-      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &serial_key_scratch_));
-  ASSIGN_OR_RETURN(size_t, group, table->FindOrCreate(serial_key_scratch_));
+      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &scratch));
+  ASSIGN_OR_RETURN(size_t, group, table->FindOrCreate(scratch));
   return table->Accumulate(group, row);
 }
 
 Status HashAggregateExecutor::AppendToPartition(const Row& row) {
+  std::vector<Value> scratch;
+  scratch.reserve(key_offsets_.size());
   RETURN_IF_FAIL(
-      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &serial_key_scratch_));
-  return partitions_[PartitionOf(serial_key_scratch_, partitions_.size())].Append(row);
+      EvaluateKeys(group_keys_, input_schema_, key_offsets_, row, &scratch));
+  return partitions_[PartitionOf(scratch, partitions_.size())].Append(row);
 }
 
 Status HashAggregateExecutor::StartPartitioning(const std::vector<Row>& rows) {
@@ -562,10 +569,12 @@ Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
         return StatusError(StatusCode::kInvalidArgument,
                            "aggregate argument has no positional offset");
       }
-      const Value value = aggregate_count_star_[i]
-                              ? Value(1)
-                              // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes success
-                              : image[*value_offset];
+      const Value value =
+          aggregate_count_star_[i]
+              ? Value(1)
+              // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+              // harness assumes success
+              : image[*value_offset];
       RETURN_IF_FAIL(table->StateFor(group, i).Add(value));
     }
   }
@@ -677,6 +686,10 @@ Status HashAggregateExecutor::BuildParallel() {
   bool stopped = false;
   std::mutex error_mutex;
   Status error = Status::kSuccess;
+  // Each worker owns its slot. The owner folds these into peak_groups_ after
+  // join, so the lock-free public PeakResidentGroups() accessor can never
+  // race with a worker writing the shared peak.
+  std::vector<size_t> worker_peaks(workers, 0);
   std::vector<std::jthread> threads;
   threads.reserve(workers);
   const auto stop_under_lock = [&](Status failure) {
@@ -723,8 +736,7 @@ Status HashAggregateExecutor::BuildParallel() {
               stop_under_lock(st);
               return;
             }
-            std::scoped_lock error_guard(error_mutex);
-            NoteResidentGroups(*locals[w]);
+            worker_peaks[w] = std::max(worker_peaks[w], locals[w]->size());
           }
         } catch (const std::exception& ex) {
           stop_under_lock(StatusError(StatusCode::kRuntimeError, ex.what()));
@@ -738,6 +750,9 @@ Status HashAggregateExecutor::BuildParallel() {
     }
   }
   threads.clear();
+  for (size_t peak : worker_peaks) {
+    peak_groups_ = std::max(peak_groups_, peak);
+  }
   if (error == Status::kSuccess && child_->GetStatus() != Status::kSuccess) {
     error = child_->GetStatus();
   }

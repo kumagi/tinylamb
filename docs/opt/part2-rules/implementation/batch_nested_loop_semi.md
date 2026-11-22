@@ -102,7 +102,7 @@ const double r_rows = right.estimated_rows;
 auto estimated_rows = static_cast<double>(join->EmitRowCount());
 
 return {PlanAlternative{.plan = std::move(join),
-                        .local_cost = (l_rows * r_rows) + l_rows + r_rows,
+                        .local_cost = (l_rows * r_rows * 0.8) + l_rows + r_rows,
                         .estimated_rows = estimated_rows}};
 ```
 

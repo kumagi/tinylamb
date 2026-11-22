@@ -70,22 +70,24 @@ graph TD
       if (!memo.ContainsRelation({from.schema, to.schema})) {
         return;
       }
-      const std::optional<Value> constant = EqualityConstantExpr(
+      const Expression constant = EqualityConstantExpr(
           memo.Get(memo.EnsureGroup({from.schema})).filter, from);
       if (!constant) {
         return;
       }
+      // Share the original constant node. A ParameterSlot copied via
+      // GetValue() would freeze the fill-time literal on the other side.
       memo.MergeScanFilter(
           memo.EnsureGroup({to.schema}),
           BinaryExpressionExp(ColumnValueExp(to), BinaryOperation::kEquals,
-                              ConstantValueExp(*constant)));
+                              constant));
     };
     push(left, right);
     push(right, left);
 ```
 
-1. **定数の抽出**: `PropagateEqualityConstants` は `from` 側の単一表グループの `filter` を走査し、`from = 定数` または `定数 = from` の形式を持つ連言から定数値を取り出します。
-2. **述語の合成と合流**: 抽出された定数を用いて `to = 定数` の二項式を構築し、`memo.MergeScanFilter` を呼び出して `to` 側グループのフィルタへ合併します。
+1. **定数の抽出**: `EqualityConstantExpr` は `from` 側の単一表グループの `filter` を走査し、`from = 定数` または `定数 = from` の形式を持つ連言から定数式（`Expression`）を取り出します。
+2. **述語の合成と合流**: 取り出した定数ノードをそのまま共有して `to = 定数` の二項式を構築し、`memo.MergeScanFilter` を呼び出して `to` 側グループのフィルタへ合併します。新しい `ConstantValueExp` を作らず元のノードを共有するのは、`ParameterSlot` を `GetValue()` でコピーすると埋め込み時点のリテラルがもう一方の側に固定されてしまうためです（コードコメント "A ParameterSlot copied via GetValue() would freeze the fill-time literal on the other side"）。
 3. **冪等性の保証**: `MergeScanFilter` 内部で `CanonicalizeConjuncts` を経由するため、連言のソートと重複排除が行われ、複数回の同一推論によってフィルタ式が無制限に肥大化することはありません。
 
 ## 最適化効果

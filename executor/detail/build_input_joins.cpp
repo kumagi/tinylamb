@@ -80,11 +80,11 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
   // USING(name) equalities bind positionally: both operands share one bare
   // name, so combined-scope evaluation would be ambiguous (and after
   // coalescing, trivially true).  Each such conjunct resolves to a
-  // prefix-side and an element-side column up front and compares them
-  // directly; remaining conjuncts keep combined-scope evaluation.
+  // prefix-side column and an element-side name. Bind that name against the
+  // actual expansion schema, which includes STRUCT and subquery columns.
   struct UsingEquality {
     size_t prefix_column;
-    size_t element_column;
+    ColumnName element_name;
   };
   std::vector<UsingEquality> using_equalities;
   std::vector<Expression> residual_condition =
@@ -105,14 +105,6 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
                        });
           });
     };
-    // The element relation's column names are stable across expansions:
-    // [alias] plus the offset alias when declared.
-    std::vector<Column> probe{Column(
-        source.alias.empty() ? "unnest" : source.alias, ValueType::kNull)};
-    if (!source.offset_alias.empty()) {
-      probe.emplace_back(source.offset_alias, ValueType::kInt64);
-    }
-    const Schema element_names("", std::move(probe));
     for (size_t conjunct_index = 0;
          conjunct_index < residual_condition.size();) {
       const Expression& conjunct = residual_condition[conjunct_index];
@@ -122,21 +114,13 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
         const ColumnName& ln = binary.Left()->AsColumnValue().GetColumnName();
         const ColumnName& rn = binary.Right()->AsColumnValue().GetColumnName();
         if (declared(ln) && declared(rn)) {
-          // Hoisted out of the range-for: iterating a temporary vector here
-          // trips a spurious -Wfree-nonheap-object diagnostic in GCC 15.
-          const std::vector<std::pair<ColumnName, ColumnName>> both_orders{
-              {ln, rn}, {rn, ln}};
-          for (const auto& [outer_name, inner_name] : both_orders) {
-            const auto prefix_offset =
-                LocalColumnOffset(prefix.schema, outer_name);
-            const auto element_offset =
-                LocalColumnOffset(element_names, inner_name);
-            if (prefix_offset && element_offset) {
-              using_equalities.push_back({*prefix_offset, *element_offset});
-              handled = true;
-              break;
-            }
+          const auto prefix_offset = LocalColumnOffset(prefix.schema, ln);
+          if (!prefix_offset) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "unresolved LATERAL USING column: " + ln.name);
           }
+          using_equalities.push_back({*prefix_offset, rn});
+          handled = true;
         }
       }
       if (handled) {
@@ -158,6 +142,30 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
   const bool left_outer = want_left_nulls;
   bool any_prefix_row = false;
   bool schema_initialized = false;
+  // A LATERAL query that never references the prefix row yields the same
+  // element set for every prefix row. For RIGHT/FULL joins the unmatched
+  // element rows must then be emitted once globally: replaying them inside
+  // each prefix row's expansion would duplicate them by the prefix
+  // cardinality (and emit nothing at all for an empty prefix). The
+  // uncorrelated-result cache both proves independence — it refuses
+  // correlated, volatile, and CTE-scoped statements — and supplies the
+  // shared element relation.
+  const Relation* shared_elements = nullptr;
+  Schema shared_elements_schema;
+  std::vector<char> shared_element_matched;
+  if (want_right_nulls && source.query && !source.unnest &&
+      source.query->WithQueries().empty() &&
+      context.execution_runtime() != nullptr) {
+    shared_elements = ExecuteCachedUncorrelated(context, *source.query, ctes);
+    if (shared_elements != nullptr) {
+      shared_elements_schema = shared_elements->schema;
+      if (!source.alias.empty()) {
+        shared_elements_schema =
+            QualifySchema(shared_elements_schema, source.alias);
+      }
+      shared_element_matched.assign(shared_elements->TotalRows(), 0);
+    }
+  }
   RETURN_IF_FAIL(prefix.FinishSpill());
   Status elements_status = Status::kSuccess;
   const Status prefix_status = prefix.ForEachRow([&](const Row& row) -> void {
@@ -167,6 +175,8 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
     any_prefix_row = true;
     Scope scope{.row = &row, .schema = &prefix.schema, .outer = outer};
     Relation elements(context.execution_runtime());
+    const Relation* elements_view = nullptr;
+    const Schema* elements_schema = nullptr;
     if (source.unnest) {
       StatusOr<Value> array_or =
           TryEvaluate(source.unnest, scope, nullptr, context, ctes);
@@ -178,20 +188,33 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
       }
       const Value array_val = array_or.MoveValue();
       elements = element_schema_of(array_val);
+      elements_view = &elements;
+      elements_schema = &elements.schema;
     } else if (source.query) {
-      StatusOr<Relation> elements_query =
-          ExecuteQuery(context, *source.query, &scope, ctes);
-      if (!elements_query.HasValue()) {
-        elements_status = elements_query.GetStatus();
-        return;
-      }
-      elements = elements_query.MoveValue();
-      if (!source.alias.empty()) {
-        elements.schema = QualifySchema(elements.schema, source.alias);
+      if (shared_elements != nullptr) {
+        elements_view = shared_elements;
+        elements_schema = &shared_elements_schema;
+      } else {
+        StatusOr<Relation> elements_query =
+            ExecuteQuery(context, *source.query, &scope, ctes);
+        if (!elements_query.HasValue()) {
+          elements_status = elements_query.GetStatus();
+          return;
+        }
+        elements = elements_query.MoveValue();
+        if (!source.alias.empty()) {
+          elements.schema = QualifySchema(elements.schema, source.alias);
+        }
+        elements_view = &elements;
+        elements_schema = &elements.schema;
       }
     }
+    if (elements_view == nullptr) {
+      elements_view = &elements;
+      elements_schema = &elements.schema;
+    }
     if (!schema_initialized) {
-      output.schema = prefix.schema + elements.schema;
+      output.schema = prefix.schema + *elements_schema;
       schema_initialized = true;
     }
     // The element relation's shape is derived from the array value at hand,
@@ -199,70 +222,101 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
     // the row that initialized output.schema.  NULL-fill (or trim) back to
     // the initialized arity so every emitted row matches output.schema
     // exactly; Lookup and projection index rows by schema offsets.
-    elements_status = elements.FinishSpill();
+    elements_status = const_cast<Relation*>(elements_view)->FinishSpill();
     if (elements_status != Status::kSuccess) {
       return;
     }
-    const size_t prefix_width = row.values_.size();
-    std::vector<char> element_matched(
-        want_right_nulls ? elements.TotalRows() : 0, 0);
-    size_t element_index = 0;
-    bool matched = false;
-    const Status iteration = elements.ForEachRow([&](const Row& element_row) {
-      const size_t this_element = element_index++;
-      Row combined = row + element_row;
-      if (combined.values_.size() > output.schema.ColumnCount()) {
-        // A later element row expanded to more columns than the schema
-        // initialized from the first row; truncating would silently drop data.
-        elements_status =
-            StatusError(StatusCode::kInvalidArgument,
-                        "LATERAL element row is wider than output schema");
-        return;
-      }
-      combined.values_.resize(output.schema.ColumnCount());
-      if (condition) {
-        Scope combined_scope{
-            .row = &combined, .schema = &output.schema, .outer = outer};
-        if (!source.using_columns.empty()) {
-          combined_scope.using_columns = &source.using_columns;
-        }
-        bool all_match = true;
-        for (const UsingEquality& key : using_equalities) {
-          const Value& left_value = combined.values_[key.prefix_column];
-          const Value& right_value =
-              combined.values_[prefix_width + key.element_column];
-          if (!Truthy(EvaluateBinary(BinaryOperation::kEquals, left_value,
-                                     right_value))) {
-            all_match = false;
-            break;
-          }
-        }
-        if (all_match) {
-          for (const Expression& conjunct : residual_condition) {
-            StatusOr<Value> conjunct_value =
-                TryEvaluate(conjunct, combined_scope, nullptr, context, ctes);
-            if (!conjunct_value.HasValue()) {
-              if (elements_status == Status::kSuccess) {
-                elements_status = conjunct_value.GetStatus();
-              }
-              return;
-            }
-            if (!Truthy(conjunct_value.Value())) {
-              all_match = false;
-              break;
-            }
-          }
-        }
-        if (!all_match) {
+    std::vector<size_t> element_columns;
+    if (elements_view->TotalRows() != 0) {
+      element_columns.reserve(using_equalities.size());
+      for (const auto& key : using_equalities) {
+        const auto column =
+            LocalColumnOffset(*elements_schema, key.element_name);
+        if (!column) {
+          elements_status = StatusError(
+              StatusCode::kInvalidArgument,
+              "unresolved LATERAL USING column: " + key.element_name.name);
           return;
         }
+        element_columns.push_back(*column);
       }
-      if (want_right_nulls && this_element < element_matched.size()) {
-        element_matched[this_element] = 1;
-      }
-      matched = true;
-      output.AddRow(std::move(combined));
-    });
+    }
+    // For a shared (uncorrelated) element relation the matched flags
+    // accumulate across every prefix row: an element row is preserved by
+    // RIGHT/FULL only when no prefix row matched it.
+    std::vector<char> row_element_matched(
+        want_right_nulls && elements_view != shared_elements
+            ? elements_view->TotalRows()
+            : 0,
+        0);
+    std::vector<char>& element_matched = elements_view == shared_elements
+                                             ? shared_element_matched
+                                             : row_element_matched;
+    size_t element_index = 0;
+    bool matched = false;
+    const Status iteration =
+        elements_view->ForEachRow([&](const Row& element_row) {
+          const size_t this_element = element_index++;
+          Row combined = row + element_row;
+          if (combined.values_.size() > output.schema.ColumnCount()) {
+            // A later element row expanded to more columns than the schema
+            // initialized from the first row; truncating would silently drop
+            // data.
+            elements_status =
+                StatusError(StatusCode::kInvalidArgument,
+                            "LATERAL element row is wider than output schema");
+            return;
+          }
+          combined.values_.resize(output.schema.ColumnCount());
+          if (condition) {
+            Scope combined_scope{
+                .row = &combined, .schema = &output.schema, .outer = outer};
+            if (!source.using_columns.empty()) {
+              combined_scope.using_columns = &source.using_columns;
+            }
+            bool all_match = true;
+            for (size_t k = 0; k < element_columns.size(); ++k) {
+              const size_t left = using_equalities[k].prefix_column;
+              const size_t right = element_columns[k];
+              if (left >= row.values_.size() ||
+                  right >= element_row.values_.size()) {
+                all_match = false;
+                break;
+              }
+              const Value& left_value = row[left];
+              const Value& right_value = element_row[right];
+              if (!Truthy(EvaluateBinary(BinaryOperation::kEquals, left_value,
+                                         right_value))) {
+                all_match = false;
+                break;
+              }
+            }
+            if (all_match) {
+              for (const Expression& conjunct : residual_condition) {
+                StatusOr<Value> conjunct_value = TryEvaluate(
+                    conjunct, combined_scope, nullptr, context, ctes);
+                if (!conjunct_value.HasValue()) {
+                  if (elements_status == Status::kSuccess) {
+                    elements_status = conjunct_value.GetStatus();
+                  }
+                  return;
+                }
+                if (!Truthy(conjunct_value.Value())) {
+                  all_match = false;
+                  break;
+                }
+              }
+            }
+            if (!all_match) {
+              return;
+            }
+          }
+          if (want_right_nulls && this_element < element_matched.size()) {
+            element_matched[this_element] = 1;
+          }
+          matched = true;
+          output.AddRow(std::move(combined));
+        });
     if (iteration != Status::kSuccess) {
       elements_status = iteration;
     }
@@ -270,16 +324,19 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
       return;
     }
     if (!matched && left_outer &&
-        (condition != nullptr || elements.TotalRows() == 0)) {
+        (condition != nullptr || elements_view->TotalRows() == 0)) {
       std::vector<Value> nulls(output.schema.ColumnCount() - row.values_.size(),
                                Value());
       output.AddRow(ConcatRows(row, Row(std::move(nulls))));
     }
     // RIGHT / FULL OUTER: within this prefix row's expansion, element rows
-    // that matched nothing emit once, null-extended on the prefix side.
-    if (want_right_nulls && !element_matched.empty()) {
+    // that matched nothing emit once, null-extended on the prefix side. A
+    // shared (uncorrelated) element set is replayed once after the prefix
+    // loop instead — see shared_element_matched above.
+    if (want_right_nulls && elements_view != shared_elements &&
+        !element_matched.empty()) {
       size_t replay_index = 0;
-      elements_status = elements.ForEachRow([&](const Row& element_row) {
+      elements_status = elements_view->ForEachRow([&](const Row& element_row) {
         const size_t index = replay_index++;
         if (index < element_matched.size() && element_matched[index] == 0) {
           std::vector<Value> nulls(prefix.schema.ColumnCount(), Value());
@@ -295,6 +352,29 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
   });
   RETURN_IF_FAIL(prefix_status);
   RETURN_IF_FAIL(elements_status);
+  if (shared_elements != nullptr) {
+    if (!schema_initialized) {
+      output.schema = prefix.schema + shared_elements_schema;
+      schema_initialized = true;
+    }
+    if (want_right_nulls && !shared_element_matched.empty()) {
+      size_t replay_index = 0;
+      const Status replay_status =
+          shared_elements->ForEachRow([&](const Row& element_row) {
+            const size_t index = replay_index++;
+            if (index < shared_element_matched.size() &&
+                shared_element_matched[index] == 0) {
+              std::vector<Value> nulls(prefix.schema.ColumnCount(), Value());
+              Row unmatched = Row(std::move(nulls)) + element_row;
+              unmatched.values_.resize(output.schema.ColumnCount(), Value());
+              output.AddRow(std::move(unmatched));
+            }
+          });
+      if (replay_status != Status::kSuccess) {
+        return replay_status;
+      }
+    }
+  }
   if (!any_prefix_row || !schema_initialized) {
     // Empty prefix (or every prefix row skipped before initialization):
     // still derive the output schema so downstream projection sees the

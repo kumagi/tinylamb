@@ -14,19 +14,19 @@
  * limitations under the License.
  */
 
-#include "common/string_util.hpp"
 #include "common/platform/time_format.hpp"
 
 #include <array>
 #include <cctype>
 #include <climits>
-#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 #include "common/platform/os.hpp"
+#include "common/string_util.hpp"
 
 namespace tinylamb::platform {
 
@@ -186,17 +186,37 @@ const char* ParseOffset(const char* rp, struct tm* tm) {
   if (*rp != '+' && *rp != '-') return nullptr;
   const bool negative = *rp++ == '-';
   int value = 0;
-  int digits = 0;
-  while (digits < 4 && IsDigit(*rp)) {
+  int hour_digits = 0;
+  while (hour_digits < 2 && IsDigit(*rp)) {
     value = value * 10 + (*rp++ - '0');
-    ++digits;
-    if (*rp == ':' && digits >= 1 && IsDigit(rp[1])) ++rp;
+    ++hour_digits;
   }
-  if (digits == 2) {
-    value *= 100;
-  } else if (digits != 4 || value % 100 >= 60) {
-    return nullptr;
+  if (hour_digits == 0) return nullptr;
+  int minute_digits = 0;
+  if (*rp == ':') {
+    ++rp;
+    // A colon needs a fully spelled minute field: "+1:30" is valid, but
+    // "+1:2" is not. Accumulating hours and minutes into one counter used
+    // to reinterpret the latter as "+12:00".
+    while (minute_digits < 2 && IsDigit(*rp)) {
+      value = value * 10 + (*rp++ - '0');
+      ++minute_digits;
+    }
+    if (minute_digits != 2) return nullptr;
+  } else {
+    while (minute_digits < 2 && IsDigit(*rp)) {
+      value = value * 10 + (*rp++ - '0');
+      ++minute_digits;
+    }
+    if (minute_digits == 0) {
+      // Hour-only form ("+05") needs both hour digits.
+      if (hour_digits != 2) return nullptr;
+      value *= 100;
+    } else if (minute_digits != 2) {
+      return nullptr;
+    }
   }
+  if (value % 100 >= 60) return nullptr;
   long offset = (value / 100) * 3600L + (value % 100) * 60L;
   SetTmGmtoff(tm, negative ? -offset : offset);
   return rp;
@@ -300,15 +320,18 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
         int y = 0;
         rp = ParseIntField(rp, 2, 0, 99, &y);
         if (rp == nullptr) return nullptr;
-        // GoogleSQL interprets a two-digit year as 2000 + yy.
-        tm->tm_year = y + 100;
+        // POSIX/glibc pivot: 00..68 are 2000..2068, 69..99 are
+        // 1969..1999. tm_year is relative to 1900.
+        tm->tm_year = y <= 68 ? y + 100 : y;
         break;
       }
       case 'C': {
         int c = 0;
         rp = ParseIntField(rp, 2, 0, 99, &c);
         if (rp == nullptr) return nullptr;
-        tm->tm_year = (c * 100) - 1900 + (tm->tm_year % 100);
+        // glibc's %C overwrites the year with the century (discarding any
+        // lower digits already in tm_year): tm_year = (century - 19) * 100.
+        tm->tm_year = (c - 19) * 100;
         break;
       }
       case 'm': {

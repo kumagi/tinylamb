@@ -20,10 +20,13 @@
 
 #include "index_schema.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <ostream>
+#include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
@@ -46,13 +49,35 @@ std::ostream& operator<<(std::ostream& o, const IndexMode& mode) {
   // T2116 (same site as P938): a mode decoded from a corrupt record falls
   // outside the enum; the old switch emitted NOTHING and the dump read
   // "... ]" with the mode silently gone.  Label the numeric value instead.
-  o << "kInvalid(" << static_cast<int>(mode) << ")";
+  o << "Invalid(" << static_cast<int>(mode) << ")";
   return o;
 }
 
 std::string IndexSchema::GenerateKey(const Row& row) const {
   std::string key;
-  key.reserve(key_.size());
+  size_t estimate = 0;
+  for (const auto k : key_) {
+    const Value& value = row[k];
+    size_t bytes = value.IsNull() ? 1 : 9;
+    if (value.type == ValueType::kVarChar) {
+      if (value.IsInterval()) {
+        bytes = 25;
+      } else {
+        const size_t length = value.AsStringView().size();
+        const size_t groups =
+            std::max<size_t>(1, length / 8 + (length % 8 != 0));
+        if (groups > (key.max_size() - 1) / 9) {
+          throw std::length_error("index key too large");
+        }
+        bytes = 1 + groups * 9;
+      }
+    }
+    if (bytes > key.max_size() - estimate) {
+      throw std::length_error("index key too large");
+    }
+    estimate += bytes;
+  }
+  key.reserve(estimate);
   for (const auto& k : key_) {
     key += row[k].EncodeMemcomparableFormat();
   }
@@ -64,10 +89,24 @@ Encoder& operator<<(Encoder& a, const IndexSchema& idx) {
   return a;
 }
 
+void IndexSchema::NormalizeInclude() {
+  std::vector<slot_t> unique_include;
+  unique_include.reserve(include_.size());
+  for (const slot_t slot : include_) {
+    if (std::find(key_.begin(), key_.end(), slot) == key_.end() &&
+        std::find(unique_include.begin(), unique_include.end(), slot) ==
+            unique_include.end()) {
+      unique_include.push_back(slot);
+    }
+  }
+  include_ = std::move(unique_include);
+}
+
 Decoder& operator>>(Decoder& e, IndexSchema& idx) {
   uint8_t mode = 0;
   e >> idx.name_ >> idx.key_ >> idx.include_ >> mode;
   idx.mode_ = static_cast<IndexMode>(mode);
+  idx.NormalizeInclude();
   return e;
 }
 

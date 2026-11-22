@@ -16,14 +16,26 @@ bool HasTopLevelClause(std::string_view sql, std::string_view clause) {
     const char c = sql[i];
     if (in_string) {
       if (c == '\'') {
-        if (i + 1 < sql.size() && sql[i + 1] == '\'') { ++i; }
-        else { in_string = false; }
+        if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+          ++i;
+        } else {
+          in_string = false;
+        }
       }
       continue;
     }
-    if (c == '\'') { in_string = true; continue; }
-    if (c == '(') { ++depth; continue; }
-    if (c == ')') { --depth; continue; }
+    if (c == '\'') {
+      in_string = true;
+      continue;
+    }
+    if (c == '(') {
+      ++depth;
+      continue;
+    }
+    if (c == ')') {
+      --depth;
+      continue;
+    }
     if (depth == 0 && sql.substr(i, clause.size()) == clause) {
       return true;
     }
@@ -31,7 +43,6 @@ bool HasTopLevelClause(std::string_view sql, std::string_view clause) {
   return false;
 }
 }  // namespace
-
 
 TEST(TpcdsManifestTest, RegisteredSubsetIsUniqueAndStable) {
   std::vector<std::string> expected{
@@ -62,7 +73,26 @@ TEST(TpcdsManifestTest, RegisteredSubsetIsUniqueAndStable) {
 // as a multiset.  q67 / q65 rank on DOUBLE sums: their first (cold) run
 // differs from later ones because plan feedback changes the plan, so they
 // compare two warm runs byte-exactly instead of first-vs-second.
-TEST_F(TpcdsQueryTest, AllQueriesExecuteDeterministically) {
+constexpr size_t kTpcdsDeterminismShards = 4;
+
+class TpcdsDeterminismTest : public TpcdsQueryTest,
+                             public ::testing::WithParamInterface<size_t> {
+ protected:
+  void SetUp() override {
+    if (GetParam() != kTpcdsDeterminismShards) {
+      TpcdsQueryTest::SetUp();
+      return;
+    }
+    // q95 replays a self-join over orders with five sale rows each. Retain
+    // whole orders and their returns so two runs fit the unit-test budget.
+    auto fixture = tpcds::Generate(1);
+    fixture.web_sales.resize(10000);
+    fixture.web_returns.resize(1000);
+    SetUpWithFixture(std::move(fixture));
+  }
+};
+
+TEST_P(TpcdsDeterminismTest, AllQueriesExecuteDeterministically) {
   auto rows_equal = [](const Row& left, const Row& right) {
     if (left.values_.size() != right.values_.size()) {
       return false;
@@ -81,10 +111,23 @@ TEST_F(TpcdsQueryTest, AllQueriesExecuteDeterministically) {
     }
     return true;
   };
-  for (const tpcds::TpcdsQuery& query : tpcds::kQueries) {
+  const bool returns_shard = GetParam() == kTpcdsDeterminismShards;
+  for (size_t i = 0; i < std::size(tpcds::kQueries); ++i) {
+    const tpcds::TpcdsQuery& query = tpcds::kQueries[i];
+    if (query.name == "q95"
+            ? !returns_shard
+            : returns_shard || i % kTpcdsDeterminismShards != GetParam()) {
+      continue;
+    }
+    SCOPED_TRACE(query.name);
     const bool content_jitter = query.name == "q67" || query.name == "q65";
     const std::vector<Row> first = RunSql(query.sql);
     ASSERT_FALSE(first.empty()) << query.name << " returned no rows";
+    if (returns_shard) {
+      ASSERT_EQ(first.size(), 1U);
+      ASSERT_EQ(first.front().values_.size(), 3U);
+      EXPECT_EQ(first.front()[0], Value(int64_t{2}));
+    }
     const std::vector<Row> second = RunSql(query.sql);
     ASSERT_EQ(first.size(), second.size())
         << query.name << " returned different row counts";
@@ -168,6 +211,10 @@ TEST_F(TpcdsQueryTest, AllQueriesExecuteDeterministically) {
     }
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(QueryShards, TpcdsDeterminismTest,
+                         ::testing::Range(size_t{0},
+                                          kTpcdsDeterminismShards + 1));
 
 TEST_F(TpcdsQueryTest, QueryPipelineStagesAreBitDeterministic) {
   // q65's rank boundary reads DOUBLE sums whose last ulp depends on the row
@@ -333,7 +380,13 @@ TEST_F(TpcdsQueryTest, AllQueriesAvoidCrossProducts) {
       const size_t estimate = plan.find("estimated rows:", position);
       ASSERT_NE(estimate, std::string::npos) << plan;
       ASSERT_LT(estimate, line_end) << plan;
-      const std::string estimate_text = plan.substr(estimate + 15, line_end);
+      const size_t number_start =
+          estimate + std::string_view("estimated rows:").size();
+      const size_t close = plan.find(')', number_start);
+      ASSERT_NE(close, std::string::npos) << plan;
+      ASSERT_LT(close, line_end) << plan;
+      const std::string estimate_text =
+          plan.substr(number_start, close - number_start);
       char* end = nullptr;
       errno = 0;
       const long long rows = std::strtoll(estimate_text.c_str(), &end, 10);

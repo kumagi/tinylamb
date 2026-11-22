@@ -80,6 +80,8 @@ class OocSortSink final : public PipelineSink {
   }
 
  private:
+  [[nodiscard]] Status EnsureSorter(PipelineContext* ctx, size_t payload_cols);
+
   std::vector<KeySpec> keys_;
   Schema input_schema_;
   std::optional<size_t> limit_;
@@ -140,6 +142,10 @@ class OocDistinctSink final : public PipelineSink {
   bool spilled_{false};
   uint64_t next_seq_{0};
   std::unique_ptr<RecursivePartitioner> partitioner_;
+  // Sticky error from the partitioner's hash functor: its uint64_t-only
+  // signature cannot return Status, so ExtractKey failures are recorded here
+  // and surfaced at Finalize instead of silently bucketing every row to 0.
+  Status partition_key_status_{Status::kSuccess};
 };
 
 // --- 3. OOC Grouped Aggregation Sink ---
@@ -192,6 +198,9 @@ class OocGroupAggSink final : public PipelineSink {
   bool all_combinable_{false};
   bool has_collection_agg_{false};
   std::optional<slot_t> single_distinct_child_slot_;
+  // Owned DISTINCT-stripped clone for the O(1) sorted skew fallback when
+  // the aggregate list is one plain COUNT/SUM/AVG(DISTINCT expr).
+  std::shared_ptr<AggregateExpression> skew_strip_aggregate_;
 
   std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard_;
   std::optional<QueryMemoryGrant::LocalBatchCache> grant_cache_;
@@ -205,6 +214,10 @@ class OocGroupAggSink final : public PipelineSink {
   std::vector<Row> raw_rows_;
   size_t mem_bytes_{0};
   std::unique_ptr<RecursivePartitioner> partitioner_;
+  // Sticky error from the partitioner's hash functor (uint64_t-only signature):
+  // ExtractCanonicalGroupKeys failures must reach Finalize instead of being
+  // swallowed into bucket 0 and producing a wrong grouping.
+  Status partition_key_status_{Status::kSuccess};
 };
 
 // --- 4. OOC Adaptive Grace Hash Join (`OocHashBuildSink` + the OOC hash-join

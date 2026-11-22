@@ -213,6 +213,17 @@ std::string CheckMemoInvariants(const cascades::Memo& memo,
           }
           const uint64_t left = memo.Get(expression.children[0]).relation_mask;
           const uint64_t right = memo.Get(expression.children[1]).relation_mask;
+          // A semi/anti join's right side only supplies existence, so its
+          // relations are not necessarily part of the parent group's relation
+          // set: e.g. semi_join_commutativity builds (R semi T) semi S where
+          // the parent covers R|T and the right side S is outside it. Hence
+          // MasksPartition cannot be required when `left` covers the whole
+          // parent. An empty right relation set, however, is never meaningful
+          // and must be reported even in that case.
+          if (right == 0) {
+            return "semi/anti join in group " + std::to_string(group_id) +
+                   " has an empty right relation set";
+          }
           if (left != group.relation_mask &&
               !MasksPartition(group.relation_mask, {left, right})) {
             return "semi/anti join in group " + std::to_string(group_id) +
@@ -299,23 +310,32 @@ std::string CheckExploreEquivalence(const GeneratedJoinGraph& graph) {
       return "re-explore diverged for " + where;
     }
   }
-  // 4. Monotonicity: fewer rules must not enumerate more alternatives.
+  // 4. Reduced-rule-set sanity: removing the two associativity rules must not
+  // break exploration. We deliberately do NOT assert that a subset enumerates
+  // fewer root alternatives than the full set: rule interactions can change
+  // derived-group tags/reachability, and the expression cap can trip during
+  // one exploration but not the other, so a subset may legitimately yield
+  // more alternatives. Comparing counts here would be a false positive.
   {
     cascades::RuleSet reduced = cascades::RuleSet::Default();
     reduced.Remove("join_associativity_left");
     reduced.Remove("join_associativity_right");
-    const size_t reduced_count = ExploreRootCount(graph, reduced);
-    if (reduced_count > explored_root_count) {
-      return "rule-subset monotonicity failed for " + where +
-             ": reduced=" + std::to_string(reduced_count) +
-             " full=" + std::to_string(explored_root_count);
+    if (ExploreRootCount(graph, reduced) == 0) {
+      return "reduced rule set left root empty for " + where;
     }
   }
   return "";
 }
 
 GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph) {
-  if (CheckExploreEquivalence(graph).empty()) {
+  return ShrinkJoinGraph(graph, [](const GeneratedJoinGraph& candidate) {
+    return !CheckExploreEquivalence(candidate).empty();
+  });
+}
+
+GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph,
+                                   const GraphMismatchPredicate& is_mismatch) {
+  if (!is_mismatch(graph)) {
     return graph;
   }
   GeneratedJoinGraph current = graph;
@@ -324,7 +344,7 @@ GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph) {
     GeneratedJoinGraph candidate = current;
     candidate.conjuncts.erase(candidate.conjuncts.begin() +
                               static_cast<ptrdiff_t>(i));
-    if (!CheckExploreEquivalence(candidate).empty()) {
+    if (is_mismatch(candidate)) {
       current = std::move(candidate);
     } else {
       ++i;
@@ -348,7 +368,7 @@ GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph) {
                                           dropped) != info.relations.end();
                        }),
         candidate.conjuncts.end());
-    if (!CheckExploreEquivalence(candidate).empty()) {
+    if (is_mismatch(candidate)) {
       current = std::move(candidate);
     } else {
       ++i;

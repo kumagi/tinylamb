@@ -3,12 +3,12 @@
 #include "query/sql_template.hpp"
 
 #include <algorithm>
-#include <cctype>
-#include <cstddef>
-#include <cstdint>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -173,7 +173,8 @@ StatusOr<Expression> BindExpression(
                       "SQL template literal type mismatch: date "
                       "literal bound into a string slot");
       }
-      return ConstantValueExp(parameter);
+      return std::make_shared<ConstantValue>(
+          std::move(parameter), expression->AsConstantValue().GetTextDomain());
     }
     case TypeTag::kColumnValue:
       return ColumnValueExp(expression->AsColumnValue().GetColumnName());
@@ -307,7 +308,7 @@ StatusOr<Expression> BindExpression(
       std::vector<Expression> args;
       args.reserve(call.Args().size());
       for (size_t i = 0; i < call.Args().size(); ++i) {
-        if (IsStructuralCallArg(func, i)) {
+        if (IsStructuralCallArg(func, i, call.Args().size())) {
           args.push_back(call.Args()[i]);
         } else {
           ASSIGN_OR_RETURN(Expression, h_arg,
@@ -458,8 +459,7 @@ StatusOr<Expression> BindExpression(
 // ExtractSqlTemplate emits them: WITH -> DISTINCT ON keys -> SELECT list ->
 // FROM/JOIN conditions -> WHERE -> GROUP BY -> HAVING -> QUALIFY -> ORDER BY
 // -> UNION ALL branches.  Binding clauses in any other order silently swaps
-// parameters between clauses of same-fingerprint statements
-//.
+// parameters between clauses of same-fingerprint statements.
 bool ContainsBindableConstant(const Expression& expression);
 
 bool SelectHasBindableConstant(
@@ -568,11 +568,10 @@ bool ContainsBindableConstant(
           ContainsBindableConstant(aggregate.HavingCondition())) {
         return true;
       }
-      if (std::ranges::any_of(aggregate.InnerOrderBy(),
-                              [](const WindowOrderTerm& term) {
-                                return ContainsBindableConstant(
-                                    term.expression);
-                              })) {
+      if (std::ranges::any_of(
+              aggregate.InnerOrderBy(), [](const WindowOrderTerm& term) {
+                return ContainsBindableConstant(term.expression);
+              })) {
         return true;
       }
       return aggregate.HasInnerGroupBy() &&
@@ -599,7 +598,7 @@ bool ContainsBindableConstant(
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
       for (size_t i = 0; i < call.Args().size(); ++i) {
-        if (IsStructuralCallArg(call.FuncName(), i)) {
+        if (IsStructuralCallArg(call.FuncName(), i, call.Args().size())) {
           continue;
         }
         if (ContainsBindableConstant(call.Args()[i])) {
@@ -618,6 +617,12 @@ bool ContainsBindableConstant(
       return false;
     case TypeTag::kQueryExp: {
       const auto& query = expression->AsQueryExpression();
+      // Hand-built / partially constructed trees may carry no subquery.  A
+      // nullptr dereference here would escape through Prepare's StatusOr
+      // contract instead of being reported as "not bindable".
+      if (query.Query() == nullptr) {
+        return false;
+      }
       return ContainsBindableConstant(query.Test()) ||
              SelectHasBindableConstant(*query.Query());
     }
@@ -696,11 +701,13 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
         names.push_back(name);
       }
     }
+    // Bind the declaration order once: copying the vector inside the
+    // comparator would allocate O(n log n) times for templates with many CTEs.
+    const std::vector<std::string>& order = select.WithQueryOrder();
     std::stable_sort(
         names.begin(), names.end(),
         [&](const std::string& left, const std::string& right) {
           // keep ordered-prefix stable, sort the tail only
-          const auto order = select.WithQueryOrder();  // NOLINT(performance-unnecessary-copy-initialization)
           const auto li = std::find(order.begin(), order.end(), left);
           const auto ri = std::find(order.begin(), order.end(), right);
           if (li == order.end() && ri == order.end()) {
@@ -976,7 +983,7 @@ size_t DollarQuoteDelimiterEnd(std::string_view sql, size_t pos) {
   return pos;
 }
 
-// Copies a "..." or `...` identifier verbatim into the fingerprint, honouring
+// Copies a "..." or `...` identifier verbatim into the fingerprint, honoring
 // doubled quote escapes.  Contents never reach the literal scanner, so an
 // apostrophe inside an identifier cannot start a string parameter.
 void AppendQuotedIdentifier(std::string_view sql, size_t& i,
@@ -1036,8 +1043,18 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
     }
     const bool is_triple_single = (c == '\'' && i + 2 < sql.size() &&
                                    sql[i + 1] == '\'' && sql[i + 2] == '\'');
-    const bool is_triple_double = (c == '"' && i + 2 < sql.size() &&
-                                   sql[i + 1] == '"' && sql[i + 2] == '"');
+    // Look at the whole run of double quotes.  A run of 4 or 5 is an empty
+    // quoted token next to a `"""` boundary, not a triple-quoted literal;
+    // 6+ is a genuine triple literal whose content begins with quotes.  A
+    // b/r prefix is resolved by the backward scan below, which starts at the
+    // first quote of the run (`quote_pos`).
+    size_t double_run = 0;
+    if (c == '"') {
+      while (i + double_run < sql.size() && sql[i + double_run] == '"') {
+        ++double_run;
+      }
+    }
+    const bool is_triple_double = double_run == 3 || double_run >= 6;
     if (c == '\'' || is_triple_double) {
       const bool is_triple = is_triple_single || is_triple_double;
       const char quote = is_triple_double ? '"' : '\'';
@@ -1046,14 +1063,15 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       // backslash is a plain character; treating it as an escape made the
       // closing quote of `r'...\'` look escaped, dropping the statement to
       // a permanent verbatim parse (closed=false → templatable=false).
-      // A b/B prefix (up to two r/B letters, like the visitor's own
-      // DecodeSingleComponent) marks a bytes literal: decoding it as text
-      // would UTF-8-encode its high bytes, so a cache replay bound a
-      // different constant than the first parse evaluated.
+      // A b/B prefix (up to three r/B letters, matching the visitor's own
+      // DecodeSingleComponent: r?, b?, r?) marks a bytes literal: decoding it
+      // as text would UTF-8-encode its high bytes, so a cache replay bound a
+      // different constant than the first parse evaluated.  Stopping at two
+      // letters mis-scanned a composite prefix such as `rbr'...'`.
       bool is_raw_prefix = false;
       bool is_bytes_prefix = false;
       size_t prefix_end = quote_pos;
-      for (int taken = 0; taken < 2 && 0 < prefix_end; ++taken) {
+      for (int taken = 0; taken < 3 && 0 < prefix_end; ++taken) {
         const char p = sql[prefix_end - 1];
         if (p == 'b' || p == 'B') {
           is_bytes_prefix = true;
@@ -1146,21 +1164,12 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         --kw_end;
       }
       // Case-insensitive: the visitor normalizes typed literals regardless
-      // of keyword case (`timestamp '...'` included).
-      bool is_timestamp_kw = 9 <= kw_end;
+      // of keyword case (`timestamp '...'` included).  KeywordAt checks both
+      // token boundaries, so `MY_TIMESTAMP '...'` / `1TIMESTAMP '...'` are not
+      // mistaken for the bare keyword.
+      const bool is_timestamp_kw =
+          9 <= kw_end && KeywordAt(sql, kw_end - 9, "TIMESTAMP");
       if (is_timestamp_kw) {
-        const std::string_view kw(sql.data() + kw_end - 9, 9);
-        for (size_t k = 0; k < 9; ++k) {
-          if (std::toupper(static_cast<unsigned char>(kw[k])) !=
-              "TIMESTAMP"[k]) {
-            is_timestamp_kw = false;
-            break;
-          }
-        }
-      }
-      if (is_timestamp_kw &&
-          (kw_end == 9 ||
-           !IsIdentChar(static_cast<unsigned char>(sql[kw_end - 10])))) {
         std::optional<std::string> normalized = NormalizeTimestampText(literal);
         if (!normalized.has_value()) {
           // An invalid TIMESTAMP literal must not enter the template cache:

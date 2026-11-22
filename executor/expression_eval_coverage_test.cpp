@@ -215,6 +215,32 @@ TEST_F(ExpressionEvalSqlTest, EvaluateMatchesAstGroundTruth) {
       Value(6));
 }
 
+// A date-part token used as DATE_TRUNC's unit argument is turned into a
+// string literal by TryEvaluateFunction itself. The old generic fallback in
+// TryEvaluate also accepted *any* unresolved column whose bare name happened
+// to be a date-part keyword ("d.second", "day"), silently returning "SECOND"
+// / "DAY" instead of the AST evaluator's "column not found" error.
+TEST_F(ExpressionEvalSqlTest, UnresolvedDatePartKeywordColumnIsAnError) {
+  const Schema schema(
+      "d", {Column("x", ValueType::kInt64), Column("y", ValueType::kInt64)});
+  const Row row({Value(int64_t{1}), Value(int64_t{2})});
+  // no_row_alias keeps the whole-row STRUCT fallback out of the way so the
+  // assertion isolates the removed date-part keyword fallback.
+  const relational_detail::Scope scope{
+      .row = &row, .schema = &schema, .no_row_alias = true};
+  relational_detail::CteMap ctes;
+  for (const ColumnName& name :
+       {ColumnName("d", "second"), ColumnName("d", "day")}) {
+    SCOPED_TRACE(name.name);
+    const auto result = relational_detail::TryEvaluate(
+        ColumnValueExp(name), scope, nullptr, *context_, ctes);
+    EXPECT_FALSE(result.HasValue());
+    if (!result.HasValue()) {
+      EXPECT_EQ(result.GetStatus(), Status::kInvalidArgument);
+    }
+  }
+}
+
 TEST_F(ExpressionEvalSqlTest, JsonPathNavigation) {
   ExpectScalar("SELECT JSON_EXTRACT(doc, '$.a') FROM j WHERE id = 1",
                Value("1"));

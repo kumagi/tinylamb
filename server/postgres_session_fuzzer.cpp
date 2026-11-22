@@ -72,7 +72,8 @@ class Conn {
   }
 
   // Read backend messages until the deadline. `stop_on_ready` returns after
-  // the first ReadyForQuery.  Returns false on EOF/timeout.
+  // the first ReadyForQuery. Returns false on EOF/protocol violation; on a
+  // timeout or read error it returns whether any message was parsed.
   bool ReadMessages(int timeout_ms, bool stop_on_ready,
                     std::vector<std::pair<char, std::string>>* out) {
     std::string buf;
@@ -625,7 +626,7 @@ void TryWriteRace(ByteStream& stream) {
   int committed0 = 0;
   int committed1 = 0;
   for (int k = 0; k < rounds; ++k) {
-    const int base = k == 0 ? 0 : 1;  // vary the writer order
+    const int base = k % 2;  // vary the writer order each round
     Conn* first = base == 0 ? &w0 : &w1;
     Conn* second = base == 0 ? &w1 : &w0;
     int& committed_first = base == 0 ? committed0 : committed1;
@@ -641,7 +642,13 @@ void TryWriteRace(ByteStream& stream) {
         Writer{.conn = first, .id = first_id, .committed = &committed_first},
         Writer{
             .conn = second, .id = second_id, .committed = &committed_second}};
-    for (const Writer& wr : writers) {
+    // Prepare both statements, then send BOTH before reading either reply:
+    // a write race requires the two UPDATEs to be in flight concurrently.
+    // Reading after each Send would serialize them and defeat the conflict
+    // oracle this test is meant to exercise.
+    std::array<std::string, 2> sqls;
+    for (size_t wi = 0; wi < writers.size(); ++wi) {
+      const Writer& wr = writers[wi];
       const int64_t value = (wr.id * 1000) + k;
       // Half the rounds carry a prepare-time-foldable predicate, racing
       // two concurrent folds of the same fingerprint (Bugs 48/57/60).
@@ -657,12 +664,17 @@ void TryWriteRace(ByteStream& stream) {
         sql += ".u)";
       }
       sql += ";";
-      if (!wr.conn->Send(QueryMessage(sql))) {
+      sqls[wi] = std::move(sql);
+    }
+    for (size_t wi = 0; wi < writers.size(); ++wi) {
+      if (!writers[wi].conn->Send(QueryMessage(sqls[wi]))) {
         abort();
       }
+    }
+    for (const Writer& wr : writers) {
       std::vector<std::pair<char, std::string>> exchange;
       if (!wr.conn->ReadMessages(5000, true, &exchange)) {
-        (void)fprintf(stderr, "writer %d stalled on %s\n", wr.id, sql.c_str());
+        (void)fprintf(stderr, "writer %d stalled on its UPDATE\n", wr.id);
         __builtin_trap();
       }
       bool wrote_error = false;
@@ -687,7 +699,8 @@ void TryWriteRace(ByteStream& stream) {
   w0.Close();
   w1.Close();
 
-  // The committed value must be exactly one writer's last legal store.
+  // The committed value must be exactly one writer's last legal store: a
+  // writer with id `w` writes (w * 1000) + k for some k < rounds.
   const int read_fd = Connect(env->port);
   if (read_fd < 0) {
     abort();
@@ -738,7 +751,11 @@ void TryWriteRace(ByteStream& stream) {
       value = parsed;
     }
   }
-  if (rows != 1 || value < 0 || value >= 2000) {
+  const int64_t writer_id = value / 1000;
+  const int64_t store_round = value % 1000;
+  const bool legal_value = value >= 0 && (writer_id == 0 || writer_id == 1) &&
+                           store_round < static_cast<int64_t>(rounds);
+  if (rows != 1 || !legal_value) {
     (void)fprintf(stderr, "post-race row corrupt: rows=%d value=%lld\n", rows,
                   static_cast<long long>(value));
     __builtin_trap();

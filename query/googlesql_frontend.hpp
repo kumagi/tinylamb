@@ -32,6 +32,9 @@ struct GoogleSqlParseResult {
 
 // Runs the pinned GoogleSQL parser and returns its parser AST dump. Tinylamb
 // consumes this tree directly and never parses the SQL text a second time.
+// Parses are memoised in a sharded cache whose total capacity is configured at
+// runtime by TINYLAMB_PARSE_CACHE_SIZE; the shard count and capacity are not
+// fixed constants of this API.
 class GoogleSqlFrontend {
  public:
   [[nodiscard]] static GoogleSqlParseResult Parse(std::string_view sql);

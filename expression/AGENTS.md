@@ -5,6 +5,13 @@ JIT are fast paths only — never introduce divergent behavior.
 `differential_test.cpp` pins parity over operators × NULL combinations ×
 edge cases (div-by-zero, `INT64_MIN/-1`, overflow, type mismatch).
 
+Value-context nuance: `bytecode.cpp` deliberately drops `MakeValueRules`
+(boolean-identity and other truthiness simplifications, ~14 rules) from the
+bytecode rewrite set. Those rules are sound only in predicate context; applying
+them to a value-producing expression would return a normalized boolean where
+the AST returns the original value. Excluding them is what keeps bytecode
+values identical to AST values — it is not a divergence from the reference.
+
 ## Key files
 
 - `expression.hpp` (`ExpressionBase` + `Expression = shared_ptr` +
@@ -44,4 +51,6 @@ AST first, then Bytecode, then (only if INT64-narrow) JIT. Run
 `expression_test`, `function_call_test`.
 
 Note: `expression/bytecode.* -> executor/data_chunk.hpp` is an allowlisted
-edge (separation candidate) — do not add more.
+edge. `BytecodeColumnView`/`BytecodeSink` are currently coupled to `DataChunk`'s
+types, so this is a live dependency rather than a merely hypothetical one; it
+remains a separation candidate for a future refactor. Do not add more.

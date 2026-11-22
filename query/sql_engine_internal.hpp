@@ -83,6 +83,10 @@ void RememberSpecializedPlan(const std::string& fingerprint, uint64_t epoch,
                              std::vector<Expression> slots);
 
 // --- EXPLAIN Support ---
+// EXPLAIN has no StatementType: it is a Prepare-level string prefix recognised
+// by ParseExplain for SELECT/WITH only.  Besides `EXPLAIN [ANALYZE]` the parser
+// accepts `EXPLAIN [ANALYZE] PIPELINE` and the reversed `EXPLAIN PIPELINE
+// ANALYZE`; `pipeline` records that extension.
 struct ExplainRequest {
   bool analyze{false};
   bool pipeline{false};

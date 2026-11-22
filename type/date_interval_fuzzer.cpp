@@ -170,7 +170,7 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
       }
     }
   } else {
-    // Malformed text must be rejected, not crash: synthesise a valid value
+    // Malformed text must be rejected, not crash: synthesize a valid value
     // from the byte stream so the algebra below still runs.
     base = IntervalValue{.months = c.Signed() % 5000,
                          .days = c.Signed() % 5000,

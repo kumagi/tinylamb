@@ -99,12 +99,12 @@ class TableStatisticsTest : public ::testing::Test {
             tbl.Insert(ctx.txn_, Row({Value(i), Value(i + 53.4)})).GetStatus());
       }
     }
-    ctx.txn_.PreCommit();
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
     {
       TransactionContext stat_tx = db_->BeginContext();
-      db_->RefreshStatistics(stat_tx, "Sc1");
-      db_->RefreshStatistics(stat_tx, "Sc2");
-      db_->RefreshStatistics(stat_tx, "Sc3");
+      ASSERT_SUCCESS(db_->RefreshStatistics(stat_tx, "Sc1"));
+      ASSERT_SUCCESS(db_->RefreshStatistics(stat_tx, "Sc2"));
+      ASSERT_SUCCESS(db_->RefreshStatistics(stat_tx, "Sc3"));
       ASSERT_SUCCESS(stat_tx.PreCommit());
     }
   }
@@ -132,6 +132,21 @@ TEST_F(TableStatisticsTest, Update_FromTable_ComputesStatistics) {
 
   ts.Update(ctx.txn_, tbl);
   LOG(TRACE) << ts;
+}
+
+TEST_F(TableStatisticsTest, UpdateRejectsRowWithDifferentColumnCount) {
+  auto ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, stats, db_->GetStatistics(ctx, "Sc1"));
+  const size_t previous_rows = stats.Rows();
+  Table mismatched(Schema("Sc1", {Column("c1", ValueType::kInt64),
+                                  Column("c2", ValueType::kVarChar),
+                                  Column("c3", ValueType::kDouble),
+                                  Column("extra", ValueType::kInt64)}),
+                   table.FirstPageId());
+  EXPECT_EQ(stats.Update(ctx.txn_, mismatched), Status::kCorrupt);
+  EXPECT_EQ(stats.Rows(), previous_rows);
+  ASSERT_SUCCESS(ctx.Abort());
 }
 
 TEST_F(TableStatisticsTest, UpdateStatistics_WhenCalled_StoresStatistics) {

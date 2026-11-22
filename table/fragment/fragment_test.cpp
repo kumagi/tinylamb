@@ -82,6 +82,49 @@ TEST(FragmentDomainAuditTest, UnsignedArtifactsDeclineSignedOnlyPushdown) {
   }
 }
 
+TEST(FragmentTombstoneAuditTest, NonInt64KeyTombstoneIsRejectedNotEmitted) {
+  Schema sc("varchar_key",
+            {Column(ColumnName{"", "k"}, ValueType::kVarChar,
+                    Constraint{Constraint::kPrimaryKey}),
+             Column(ColumnName{"", "v"}, ValueType::kInt64)},
+            0, 0);
+  MemTable mt(sc);
+  const Row live({Value("a"), Value(int64_t{1})});
+  ASSERT_EQ(mt.Put(live), Status::kSuccess);
+  ASSERT_EQ(mt.Delete(live.EncodeKeyMemcomparableFormat(sc)), Status::kSuccess);
+  const auto snap = mt.Snapshot();
+  const ArtifactRef ref{.kind = ArtifactRef::Kind::kMemSnapshot,
+                        .mem_rows = &snap,
+                        .schema = &sc};
+  Fragment fragment;
+
+  // A non-int64 key cannot tell which older live rows the tombstone hides, so
+  // the fragment must be rejected (executor runs the residual path) instead
+  // of returning the tombstone or a garbage value as a proved live row.
+  auto result = Execute(Runtime::kNative, {ref}, fragment, sc);
+  ASSERT_TRUE(result.HasValue());
+  EXPECT_TRUE(result.Value().rejected);
+  EXPECT_EQ(result.Value().status, Status::kNotImplemented);
+  EXPECT_EQ(result.Value().coverage, Coverage::kNone);
+  EXPECT_FALSE(
+      MaterializeKeyValue(Runtime::kNative, {ref}, fragment, sc, 1).HasValue());
+}
+
+TEST_F(FragmentAuditTest, NonIntegerAggregateColumnDeclinesPushdown) {
+  for (const auto& artifact : Artifacts()) {
+    for (const auto kind :
+         {AggregateKind::kCountCol, AggregateKind::kSum, AggregateKind::kMin,
+          AggregateKind::kMax, AggregateKind::kApproxCountDistinct}) {
+      Fragment fragment;
+      fragment.aggregate = Aggregate{.kind = kind, .col = 2};
+      auto result = Execute(Runtime::kNative, {artifact}, fragment, schema_);
+      ASSERT_TRUE(result.HasValue());
+      EXPECT_EQ(result.Value().status, Status::kNotImplemented);
+      EXPECT_EQ(result.Value().coverage, Coverage::kNone);
+    }
+  }
+}
+
 TEST_F(FragmentAuditTest, NullComparisonsAgreeAcrossArtifacts) {
   for (const auto& artifact : Artifacts()) {
     for (bool in : {false, true}) {
@@ -134,6 +177,53 @@ TEST_F(FragmentAuditTest, ClosedRangesIncludeUpperBoundAndUnboundedMaximum) {
     result = Execute(Runtime::kNative, {artifact}, fragment, schema_);
     ASSERT_TRUE(result.HasValue());
     EXPECT_EQ(result.Value().rows_proved_pass, 3U);
+  }
+}
+
+TEST_F(FragmentAuditTest, NullKeyNeverSatisfiesKeyRange) {
+  // A NULL key cell decodes as raw 0 inside the chunk kernels, but a NULL
+  // key never satisfies a range: the run path drops the kNull-tagged key
+  // blob before its range window and the memtable path fails
+  // MemcomparableInt64Key on it. The chunk path must agree.
+  const Schema schema("null_keys",
+                      {Column(ColumnName{"", "k"}, ValueType::kInt64),
+                       Column(ColumnName{"", "v"}, ValueType::kInt64)});
+  // Sorted order puts the NULL key (the bare kNull tag) ahead of every
+  // memcomparable int64 key.
+  const std::vector<Row> rows{Row({Value(), Value(99)}),
+                              Row({Value(3), Value(1)}),
+                              Row({Value(10), Value(2)})};
+  const SortedRun run = fuzz::MakeRun(rows, schema);
+  const PaxChunk chunk = PaxChunk::BuildFromSortedRun(run, schema).MoveValue();
+  // MemTable::Put rejects NULL keys, so the snapshot pairs are built by
+  // hand: the key blob is the bare kNull tag and the entry holds the row.
+  std::vector<std::pair<std::string, RowEntry>> mem;
+  for (const Row& row : rows) {
+    mem.emplace_back(row.EncodeKeyMemcomparableFormat(schema), RowEntry(row));
+  }
+  const std::vector<ArtifactRef> artifacts{
+      {.kind = ArtifactRef::Kind::kChunk, .chunk = &chunk, .schema = &schema},
+      {.kind = ArtifactRef::Kind::kRun, .run = &run, .schema = &schema},
+      {.kind = ArtifactRef::Kind::kMemSnapshot,
+       .mem_rows = &mem,
+       .schema = &schema}};
+  for (const auto& artifact : artifacts) {
+    Fragment fragment;
+    fragment.access = AccessMode::kKeyRange;
+    // The decoded-0 NULL cell falls inside this interval; only key 3 does.
+    fragment.range_lo = -5;
+    fragment.range_hi = 5;
+    auto result = Execute(Runtime::kNative, {artifact}, fragment, schema);
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_EQ(result.Value().rows_proved_pass, 1U)
+        << "artifact kind " << static_cast<int>(artifact.kind);
+    // An interval that excludes 0 agrees on every artifact as well.
+    fragment.range_lo = 4;
+    fragment.range_hi = 8;
+    result = Execute(Runtime::kNative, {artifact}, fragment, schema);
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_EQ(result.Value().rows_proved_pass, 0U)
+        << "artifact kind " << static_cast<int>(artifact.kind);
   }
 }
 
@@ -190,19 +280,24 @@ TEST_F(FragmentAuditTest, SumRejectsSignedOverflow) {
   }
   const auto snapshot = table.Snapshot();
   const std::vector<ArtifactRef> artifacts{
-      {.kind = ArtifactRef::Kind::kChunk, .chunk = &chunk.Value(), .schema = &schema},
+      {.kind = ArtifactRef::Kind::kChunk,
+       .chunk = &chunk.Value(),
+       .schema = &schema},
       {.kind = ArtifactRef::Kind::kRun, .run = &run, .schema = &schema},
-      {.kind = ArtifactRef::Kind::kMemSnapshot, .mem_rows = &snapshot,
+      {.kind = ArtifactRef::Kind::kMemSnapshot,
+       .mem_rows = &snapshot,
        .schema = &schema}};
   for (const auto& artifact : artifacts) {
     Fragment fragment;
-    fragment.aggregate =
-        Aggregate{.kind = AggregateKind::kSum, .col = 1, .coeff = 2, .terms = {}};
-    EXPECT_EQ(Execute(Runtime::kNative, {artifact}, fragment, schema).GetStatus(),
-              Status::kIsInfinity);
+    fragment.aggregate = Aggregate{
+        .kind = AggregateKind::kSum, .col = 1, .coeff = 2, .terms = {}};
+    EXPECT_EQ(
+        Execute(Runtime::kNative, {artifact}, fragment, schema).GetStatus(),
+        Status::kIsInfinity);
     fragment.aggregate->terms = {{.coeff = 2, .cols = {1, 1, 1, 1}}};
-    EXPECT_EQ(Execute(Runtime::kNative, {artifact}, fragment, schema).GetStatus(),
-              Status::kIsInfinity);
+    EXPECT_EQ(
+        Execute(Runtime::kNative, {artifact}, fragment, schema).GetStatus(),
+        Status::kIsInfinity);
   }
 }
 

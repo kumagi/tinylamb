@@ -1,8 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
 #include "query/sql_ooc_fuzzer.hpp"
-#include "query/sql_ooc_query_gen.hpp"
-#include <stdexcept>
 
 #include <algorithm>
 #include <atomic>
@@ -11,19 +9,40 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <limits>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "common/random_string.hpp"
 #include "gtest/gtest.h"
+#include "query/fuzz_scoped_db.hpp"
+#include "query/sql_ooc_query_gen.hpp"
 
 namespace tinylamb {
 namespace {
+
+TEST(SqlOocFuzzer, NonReproducingVerifyMarkerIsFiltered) {
+  // OocFuzzTry's "replay held" marker used to lack the "flaky" substring, so
+  // a non-reproducing finding was persisted as a green regression and aborted
+  // the worker instead of being skipped.
+  EXPECT_NE(kOocNonReproducingVerify.find(kFlakyVerifyMarker),
+            std::string_view::npos);
+  const std::string fname =
+      "sql_ooc_fuzz-repro-nondet-" + RandomString(6) + ".test";
+  const std::string stem = fname.substr(0, fname.size() - 5);
+  std::filesystem::remove(fname);
+  std::filesystem::remove(stem + ".report.txt");
+  EmitFuzzFinding("sql_ooc_fuzz", 42, fname, "-- tinylamb-ooc-test v1\n",
+                  "non-reproducing failure", kOocNonReproducingVerify);
+  EXPECT_FALSE(std::filesystem::exists(fname));
+  EXPECT_FALSE(std::filesystem::exists(stem + ".report.txt"));
+}
 
 TEST(OocRngTest, PickHandlesFullWidthAndHighestInt64Intervals) {
   constexpr int64_t low = std::numeric_limits<int64_t>::min();
@@ -32,6 +51,27 @@ TEST(OocRngTest, PickHandlesFullWidthAndHighestInt64Intervals) {
   OocRng rng(nullptr, 0, 42);
   EXPECT_EQ(rng.Pick(low, high), low + baseline.Next32());
   EXPECT_EQ(rng.Pick(high - 1, high), high - 1 + baseline.Next32() % 2);
+}
+
+TEST(OocRngTest, PadJoinsBoundBothInputsEvenForOneDistinctValue) {
+  const std::vector<OocGenTable> tables{{.name = "t",
+                                         .rows = 6000,
+                                         .key_lo = 1,
+                                         .key_hi = 6000,
+                                         .groups = 1,
+                                         .v_mod = 1}};
+  OocRng rng(nullptr, 0, 98123);
+  int found = 0;
+  for (int i = 0; i < 10000 && found < 20; ++i) {
+    const auto query = GenerateOocQuery(rng, tables, 2000);
+    if (!query.shape.starts_with("join_pad")) continue;
+    ++found;
+    const auto first = query.sql.find(" BETWEEN ");
+    ASSERT_NE(first, std::string::npos) << query.sql;
+    EXPECT_NE(query.sql.find(" BETWEEN ", first + 1), std::string::npos)
+        << query.sql;
+  }
+  EXPECT_EQ(found, 20);
 }
 
 TEST(OocRngTest, EmptyChoicesRaiseAndSingletonReturnsMember) {
@@ -67,6 +107,8 @@ int FlavorIndex(const std::string& name) {
 // even if one expensive query overshoots the nominal per-session budget.
 constexpr uint64_t kSeedsPerShard = 1;
 constexpr double kSecondsPerSession = 7.0;
+// A sweep runs all of its failure points before the session clock is checked.
+constexpr int64_t kUnitSweepPoints = 16;
 
 // `-- failure:` header in the form scripts/ooc_fuzz.py files findings under
 // ("<signature> :: <report on one line>"), so `ooc_fuzz.py replay` can tell
@@ -100,6 +142,11 @@ class OpWatchdog {
       }
     }
     if (timeout_ > 0) {
+      // Poll well below the deadline; a fixed 100 ms tick is coarser than a
+      // short configured timeout and mis-measures the hang boundary.
+      const double poll_ms = std::min(100.0, timeout_ * 1000.0 / 4.0);
+      poll_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::duration<double, std::milli>(std::max(1.0, poll_ms)));
       thread_ = std::thread([this]() { Run(); });
     }
   }
@@ -128,7 +175,7 @@ class OpWatchdog {
  private:
   void Run() {
     while (!stop_.load(std::memory_order_acquire)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::this_thread::sleep_for(poll_);
       std::scoped_lock lock(mu_);
       if (!armed_ || std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - started_)
@@ -158,6 +205,7 @@ class OpWatchdog {
 
   uint64_t seed_;
   double timeout_{0};
+  std::chrono::milliseconds poll_{std::chrono::milliseconds(100)};
   std::mutex mu_;
   OocTrace trace_;
   std::chrono::steady_clock::time_point started_;
@@ -168,17 +216,16 @@ class OpWatchdog {
 
 // Runs `count` seeded sessions of one flavour (-1 = drawn from the seed) and
 // returns the merged statistics; a failing seed leaves its trace behind.
-OocStats RunSeeds(uint64_t first, uint64_t count, int flavor,
-                  double budget_seconds = kSecondsPerSession,
+OocStats RunSeeds(uint64_t first, uint64_t count, OocRunOptions options,
                   bool* any_pool_capped = nullptr) {
+  options.verbose = Verbose();
+  if (options.budget_seconds <= 0) {
+    options.budget_seconds = kSecondsPerSession;
+  }
   OocStats total;
   for (uint64_t seed = first; seed < first + count; ++seed) {
     OocStats stats;
     OocTrace trace;
-    OocRunOptions options;
-    options.verbose = Verbose();
-    options.budget_seconds = budget_seconds;
-    options.flavor = flavor;
     OpWatchdog watchdog(seed);
     options.on_profile = [&](const OocProfile& p) {
       if (any_pool_capped != nullptr && p.pool_bytes > 0) {
@@ -220,12 +267,16 @@ void RunShard(uint64_t shard) {
     if (errno != 0 || end == only || *end != '\0') {
       GTEST_SKIP() << "invalid TINYLAMB_OOC_FUZZ_ONLY_SEED";
     }
-    RunSeeds(parsed, 1, -1);
+    RunSeeds(parsed, 1, {});
     return;
   }
   bool any_pool_capped = false;
-  const OocStats total = RunSeeds(shard * kSeedsPerShard, kSeedsPerShard, -1,
-                                  kSecondsPerSession, &any_pool_capped);
+  // The session clock is checked between operations. Bound the input so
+  // a single generated window query also fits the unit-test budget.
+  const OocStats total = RunSeeds(
+      shard * kSeedsPerShard, kSeedsPerShard,
+      {.max_rows_per_table = 3000, .max_sweep_points = kUnitSweepPoints},
+      &any_pool_capped);
   if (::testing::Test::HasFailure()) {
     return;
   }
@@ -271,7 +322,10 @@ TEST(SqlOocFuzzer, SeededSessionsShard23) { RunShard(23); }
 // per-session wall budget so concurrent `-j` Debug runs reach pipeline sinks
 // reliably while staying well under ctest's 60 s cap.
 TEST(SqlOocFuzzer, QueryFlavorReachesTheSpillPaths) {
-  const OocStats total = RunSeeds(1000, 2, FlavorIndex("query"), 12.0);
+  const OocStats total = RunSeeds(1000, 2,
+                                  {.budget_seconds = 12.0,
+                                   .max_sweep_points = kUnitSweepPoints,
+                                   .flavor = FlavorIndex("query")});
   if (::testing::Test::HasFailure()) {
     return;
   }
@@ -286,7 +340,9 @@ TEST(SqlOocFuzzer, QueryFlavorReachesTheSpillPaths) {
 
 // The inject flavour must reach failure points and see them fire.
 TEST(SqlOocFuzzer, InjectFlavorSweepsFailurePoints) {
-  const OocStats total = RunSeeds(2000, 2, FlavorIndex("inject"));
+  const OocStats total = RunSeeds(
+      2000, 2,
+      {.max_sweep_points = kUnitSweepPoints, .flavor = FlavorIndex("inject")});
   if (::testing::Test::HasFailure()) {
     return;
   }
@@ -295,14 +351,22 @@ TEST(SqlOocFuzzer, InjectFlavorSweepsFailurePoints) {
 }
 
 // The huge-transaction flavour must push uncommitted pages out of the pool.
-TEST(SqlOocFuzzer, BigTxnFlavorSpillsUncommittedPages) {
-  const OocStats total = RunSeeds(3000, 2, FlavorIndex("bigtxn"));
+class OocBigTxnTest : public ::testing::TestWithParam<uint64_t> {};
+
+TEST_P(OocBigTxnTest, BigTxnFlavorSpillsUncommittedPages) {
+  const OocStats total = RunSeeds(GetParam(), 1,
+                                  {.max_rows_per_table = 3000,
+                                   .max_sweep_points = kUnitSweepPoints,
+                                   .flavor = FlavorIndex("bigtxn")});
   if (::testing::Test::HasFailure()) {
     return;
   }
   EXPECT_GT(total.uncommitted_spill_evictions, 0U)
       << "no uncommitted page was ever evicted to the private spill area";
 }
+
+INSTANTIATE_TEST_SUITE_P(SeedShards, OocBigTxnTest,
+                         ::testing::Values(uint64_t{3000}, uint64_t{3001}));
 
 // The textual trace is the replay contract: it must round-trip exactly.
 TEST(SqlOocFuzzer, TraceRoundTrips) {

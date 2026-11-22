@@ -91,7 +91,7 @@ Plan RemoveIdentityProjection(Plan child,
 ## 関連 Rule との相互作用
 
 - 恒等射影の除去は物理実装の `RemoveIdentityProjection` がスキーマを確認して行います。
-- `merge_projections` / `merge_projections`: 連続する射影を 1 つに合成し、物理層での `ProjectionPlan` 重複生成を未然に防止します。
+- `merge_projections`: 連続する射影を 1 つに合成し、物理層での `ProjectionPlan` 重複生成を未然に防止します。
 - `push_projection_through_join`: 射影を走査ノード近傍へ押し下げ、スキャン時の要求列指定（`context.scan_projections`）を縮小させます。
 
 ## 検証テスト

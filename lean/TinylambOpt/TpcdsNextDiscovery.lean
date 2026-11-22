@@ -10,7 +10,7 @@ import TinylambOpt.TpcdsExecCodegen
 - A: ROLLUP 階層の状態再利用（Q67, aggregate_input_rows 4.87M → ~1M）
 - B: outer / USING 配下の内側 inner プレフィックス並べ替え（Q72）
 - C: 等価キーを介する動的フィルタ移送（Q72 / Q78 / Q23）
-- D: 共有 CTE の selektion 述語和押し込みと実体化判断（Q23 / Q39）
+- D: 共有 CTE の selection 述語和押し込みと実体化判断（Q23 / Q39）
 - E: 外部結合前のチャネル別事前集約（Q78）
 
 `lake build` が通れば、すべて `sorry` ゼロである。

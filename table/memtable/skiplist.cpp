@@ -16,11 +16,12 @@
 
 #include "table/memtable/skiplist.hpp"
 
-#include "common/platform/endian.hpp"
 #include <algorithm>
 #include <cassert>
 #include <limits>
 #include <stdexcept>
+
+#include "common/platform/endian.hpp"
 
 namespace tinylamb {
 
@@ -172,6 +173,13 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
   const size_t bytes =
       sizeof(Node) + (static_cast<size_t>(height) * sizeof(void*)) + key.size();
   auto* mem = static_cast<char*>(arena_.Allocate(bytes));
+  if (mem == nullptr) {
+    // Allocate reports an unserviceable size by returning nullptr; placement-
+    // new-ing a Node there would crash outside any Status boundary. Upsert's
+    // API has no Status, so surface the same allocation failure as the other
+    // oversized-key guard above.
+    throw std::bad_alloc();
+  }
   auto* n = reinterpret_cast<Node*>(mem);
   new (&n->entry) RowEntry(std::move(entry));
   n->key_len = static_cast<uint32_t>(key.size());

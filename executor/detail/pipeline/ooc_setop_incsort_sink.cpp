@@ -421,6 +421,13 @@ class OocSetOpOutputSource final : public PipelineSource {
     const uint64_t left = counts.empty() ? 0 : counts[0];
     uint64_t sub = 0;
     for (size_t s = 1; s < counts.size(); ++s) {
+      // Saturate instead of wrapping: once the subtractants reach left,
+      // EXCEPT ALL emits nothing, and a wrap could make `left > sub` flip
+      // back to true and resurrect rows that must have been subtracted.
+      if (counts[s] > std::numeric_limits<uint64_t>::max() - sub) {
+        sub = std::numeric_limits<uint64_t>::max();
+        break;
+      }
       sub += counts[s];
     }
     if (op_ == SetOperationKind::kExcept) {
@@ -532,8 +539,7 @@ class OocSetOpOutputSource final : public PipelineSource {
           if (it == counts.end()) {
             const size_t add_bytes =
                 (EstimateRowMemoryBytes(tagged) * 2) + (num_sources_ * 8) + 64;
-            if (grant_cache_.has_value() && !ordered_keys.empty() &&
-                !grant_cache_->Reserve(add_bytes)) {
+            if (grant_cache_.has_value() && !grant_cache_->Reserve(add_bytes)) {
               grant_exhausted = true;
               return StatusError(StatusCode::kMemoryLimitExceeded,
                                  "set operation leaf grant exhausted");
@@ -568,6 +574,11 @@ class OocSetOpOutputSource final : public PipelineSource {
     ready_rows_.clear();
     ready_cursor_ = 0;
     size_t ready_bytes = 0;
+    // leaf_reserved already covers the distinct keys. Charge only the exact
+    // deficit when duplicate output rows push the resident bytes past it, so
+    // the grant ledger tracks the real resident size instead of adding
+    // key_bytes per row on top of the leaf reservation.
+    size_t charged_bytes = leaf_reserved;
     for (Row& key : ordered_keys) {
       auto it = counts.find(key);
       if (it == counts.end()) {
@@ -576,24 +587,26 @@ class OocSetOpOutputSource final : public PipelineSource {
       const uint64_t emit_n = ComputeEmitCount(it->second);
       const size_t key_bytes = EstimateRowMemoryBytes(key) + 16;
       for (uint64_t i = 0; i < emit_n; ++i) {
-        if (ready_bytes + key_bytes > leaf_reserved &&
-            grant_cache_.has_value() && !grant_cache_->Reserve(key_bytes)) {
-          ready_rows_.clear();
-          ready_rows_.shrink_to_fit();
-          counts.clear();
-          ordered_keys.clear();
-          grant_cache_->ReleaseAll();
-          *fell_back_to_skew = true;
-          return Status::kSuccess;
+        if (ready_bytes + key_bytes > charged_bytes &&
+            grant_cache_.has_value()) {
+          const size_t deficit = ready_bytes + key_bytes - charged_bytes;
+          if (!grant_cache_->Reserve(deficit)) {
+            ready_rows_.clear();
+            ready_rows_.shrink_to_fit();
+            counts.clear();
+            ordered_keys.clear();
+            grant_cache_->ReleaseAll();
+            *fell_back_to_skew = true;
+            return Status::kSuccess;
+          }
+          charged_bytes += deficit;
         }
         ready_bytes += key_bytes;
         ready_rows_.push_back(key);
       }
     }
-    if (grant_cache_.has_value()) {
-      if (leaf_reserved > ready_bytes) {
-        grant_cache_->Release(leaf_reserved - ready_bytes);
-      }
+    if (grant_cache_.has_value() && charged_bytes > ready_bytes) {
+      grant_cache_->Release(charged_bytes - ready_bytes);
     }
     return Status::kSuccess;
   }

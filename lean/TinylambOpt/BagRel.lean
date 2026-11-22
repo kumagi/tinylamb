@@ -113,7 +113,7 @@ theorem or_to_union_preserves_bag {Row : Type}
     cases p0 row <;> cases p1 row <;> rfl
 
 /-!
-## 2-2. `outer_to_inner_join_on_null_rejecting_filter` の完全証明
+## 2-2. `outer_to_inner_join_sound` の完全証明
 
 直上の `WHERE q` が右テーブルの NULL 補完行 `(x, none)` を必ず落とす（Null-Rejecting: `∀ x, (q x none).inWhere = false`）とき、
 `Selection(q, LeftOuterJoin(L, R, onPred))` は `Selection(q, InnerJoin(L, R, onPred))` と**並び順まで含めて完全一致**します！
@@ -124,7 +124,7 @@ theorem or_to_union_preserves_bag {Row : Type}
 def NullRejectingOnRight {L R : Type} (q : L → Option R → SqlBool) : Prop :=
   ∀ x : L, (q x none).inWhere = false
 
-/-- **定理 (`outer_to_inner_join_on_null_rejecting_filter` 正当性)**:
+/-- **定理 (`outer_to_inner_join_sound` 正当性)**:
     `q` が `NullRejectingOnRight` を満たすなら、LEFT OUTER JOIN を INNER JOIN に降格しても出力行リストは完全一致する。 -/
 theorem outer_to_inner_join_sound {L R : Type}
     (onPred : L → R → SqlBool)

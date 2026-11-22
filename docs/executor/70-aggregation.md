@@ -122,7 +122,7 @@
 
 汎用処理も JIT `SUM` も、子の停止後に状態を確認する。子が失敗した場合は失敗状態を保持して `false` を返し、部分合計を成功行として組み立てない。式評価・最終化の失敗も状態として伝播する。
 
-計画に `HashAggregation`、`SortAggregation`、`StreamAggregation` と表示されていても、グループなしの場合は同じスカラー集約器を使う。表示名だけでは、ハッシュ表の利用や入力順の利用を判断できない。
+計画に `HashAggregate`、`SortAggregate`、`StreamAggregate` と表示されていても、グループなしの場合は同じスカラー集約器を使う。表示名だけでは、ハッシュ表の利用や入力順の利用を判断できない。
 
 ## 4. `ParallelAggregationExecutor`
 
@@ -158,7 +158,7 @@ SUM の状態併合は共通集約器の検査を通し、整数範囲や有限�
 
 ## 9. `DictionaryBatchAggregation`
 
-`DictionaryBatchAggregation` というクラスは現行コードに存在しない。辞書符号を使う型付き集約は `executor/detail/typed_stream_aggregate.cpp` の関数群が実装する。
+`DictionaryBatchAggregation` というクラスは現行コードに存在しない。辞書符号を使う型付き集約は `executor/detail/typed_stream_aggregate_dict.cpp` の `TryDictionaryAggregate` / `TryCompositeDictionaryAggregate` / `TryFoldDictionaryAggregateRows` が実装する（汎用の型付き集約本体は `executor/detail/typed_stream_aggregate.cpp`）。
 
 ## 10. `GroupedAggregate` の三方式
 

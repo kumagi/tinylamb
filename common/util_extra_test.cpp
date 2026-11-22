@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "common/digest.hpp"
+#include "common/json_string.hpp"
 
 namespace tinylamb {
 
@@ -118,6 +119,17 @@ TEST(DigestExtraTest, ToHexEncodesNibblesAndFixedOutputSize) {
   const std::string raw = digest::Md5Digest("abc");
   EXPECT_EQ(raw.size(), 16U);
   EXPECT_EQ(digest::ToHex(raw).size(), 32U);
+}
+
+TEST(JsonStringTest, EscapedNulIsPreservedAndRawNulIsRejected) {
+  const std::string value({'a', '\0', 'b'});
+  const auto decoded = json_text::DecodeJsonString("\"a\\u0000b\"");
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(*decoded, value);
+  EXPECT_EQ(digest::ToHex(*decoded), "610062");
+  EXPECT_EQ(json_text::EncodeJsonString(*decoded), "\"a\\u0000b\"");
+  const std::string raw({'"', 'a', '\0', 'b', '"'});
+  EXPECT_FALSE(json_text::DecodeJsonString(raw).has_value());
 }
 
 }  // namespace tinylamb

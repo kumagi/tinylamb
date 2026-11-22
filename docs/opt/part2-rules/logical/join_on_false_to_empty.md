@@ -36,6 +36,8 @@ graph TD
     // The empty alternative preserves the group's relation set (a Limit over
     // the left child alone would fail relation validation and drop the right
     // side's schema).
+    // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+    //   (core_join_identity_and_empty_sound)
     built.Add(Rule(
         "join_on_false_to_empty", Join(Any("left"), Any("right")),
         [](const Bindings&, Memo& memo, GroupId group,
@@ -44,7 +46,8 @@ graph TD
             return;
           }
           const Expression pred = *expression.predicate;
-          if (pred->Type() != TypeTag::kConstantValue) {
+          if (!pred || pred->Type() != TypeTag::kConstantValue ||
+              ContainsParameterSlot(pred)) {
             return;
           }
           const Value val = pred->AsConstantValue().GetValue();
@@ -66,7 +69,7 @@ graph TD
 発火条件および非発火のガード条件は以下の通りです。
 
 1. **述語の存在**: 有効な結合述語を持つこと。
-2. **定数式の要求**: 述語が単一の定数リテラル（`TypeTag::kConstantValue`）であること。
+2. **定数式の要求**: 述語が単一の定数リテラル（`TypeTag::kConstantValue`）であり、かつパラメータスロットを含まないこと（`ContainsParameterSlot(pred)` が偽）。
 3. **三値論理における非真条件**: 定数値が NULL であるか、または偽（`!val.Truthy()`）であること。真（TRUE）の定数は除外されます。
 4. **非循環性**: `EnsureGroup` で取得した `base` グループが親グループ自身でないこと（`base != group`）。
 

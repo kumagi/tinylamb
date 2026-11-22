@@ -65,6 +65,14 @@ class IteratorBase {
     (void)column;
     (void)type;
   }
+  // Optional secondary dynamic join filter applied in the tight read-only
+  // RowPage decode loop before materializing TypedCellBatch columns.
+  virtual void AddExtraRuntimeFilter(const RuntimeFilterGroup* group,
+                                     slot_t column, ValueType type) {
+    (void)group;
+    (void)column;
+    (void)type;
+  }
   // Typed batch decode (see TypedCellBatch): decodes up to max_rows visible
   // rows into schema-typed cell buffers and returns the row count (0 at
   // exhaustion or when the concrete iterator cannot produce typed batches —

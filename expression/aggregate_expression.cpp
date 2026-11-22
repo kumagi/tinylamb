@@ -16,6 +16,7 @@
 
 #include "expression/aggregate_expression.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <ostream>
 #include <stdexcept>
@@ -141,7 +142,9 @@ std::string AggregateExpression::ToString() const {
       std::string quoted = "\"";
       quoted.reserve(delim.size() * 2 + 2);
       for (char c : delim) {
-        if (c == '"' || c == '\\') quoted += '\\';  // NOLINT(readability-braces-around-statements)
+        if (c == '"' || c == '\\') {
+          quoted += '\\';  // NOLINT(readability-braces-around-statements)
+        }
         quoted += c;
       }
       quoted += '"';
@@ -155,6 +158,10 @@ std::string AggregateExpression::ToString() const {
   if (where_filter_) {
     out += " WHERE " + where_filter_->ToString();
   }
+  // Both checks are required: a kNone modifier renders nothing, and a
+  // hand-built tree can carry a non-kNone modifier with a null condition.
+  // Without the having_cond_ guard we would emit an incomplete " HAVING MAX "
+  // (TouchedColumns already treats the condition as optional).
   if (having_ != AggregateHavingModifier::kNone && having_cond_) {
     out += having_ == AggregateHavingModifier::kMax ? " HAVING MAX "
                                                     : " HAVING MIN ";
@@ -167,29 +174,53 @@ std::string AggregateExpression::ToString() const {
   // differing only by GROUP BY rendered identically -- the ToString-based
   // dedup/rewrite keys the reader contract (round 155 CLEAN) promises to
   // include it. Rendered before ORDER BY, matching GoogleSQL syntax.
-  if (!inner_group_by_.empty()) {
+  // TouchedColumns treats a null inner GROUP BY / ORDER BY expression as a
+  // valid (optional) state (#2484). ToString walks the same vectors, so it
+  // must guard the deref too -- otherwise hand-built trees (or EXPLAIN /
+  // rewrite-key rendering of them) crash here while TouchedColumns succeeds.
+  const bool has_group_by =
+      std::any_of(inner_group_by_.begin(), inner_group_by_.end(),
+                  [](const Expression& key) { return static_cast<bool>(key); });
+  if (has_group_by) {
     out += " GROUP BY ";
-    for (size_t i = 0; i < inner_group_by_.size(); ++i) {
-      if (i != 0U) {
+    bool first = true;
+    for (const Expression& key : inner_group_by_) {
+      if (!key) {
+        continue;
+      }
+      if (!first) {
         out += ", ";
       }
-      out += inner_group_by_[i]->ToString();
+      out += key->ToString();
+      first = false;
     }
   }
-  if (!inner_order_by_.empty()) {
+  const bool has_order_by =
+      std::any_of(inner_order_by_.begin(), inner_order_by_.end(),
+                  [](const WindowOrderTerm& term) {
+                    return static_cast<bool>(term.expression);
+                  });
+  if (has_order_by) {
     out += " ORDER BY ";
-    for (size_t i = 0; i < inner_order_by_.size(); ++i) {
-      if (i != 0U) {
+    bool first = true;
+    for (const WindowOrderTerm& term : inner_order_by_) {
+      if (!term.expression) {
+        continue;
+      }
+      if (!first) {
         out += ", ";
       }
-      out += inner_order_by_[i].expression->ToString();
-      if (!inner_order_by_[i].ascending) {
+      out += term.expression->ToString();
+      if (!term.ascending) {
         out += " DESC";
       }
-      if (inner_order_by_[i].nulls_first.has_value()) {
-        out += inner_order_by_[i].nulls_first.value() ? " NULLS FIRST"  // NOLINT(bugprone-unchecked-optional-access)
-                                                    : " NULLS LAST";
+      if (term.nulls_first.has_value()) {
+        out +=
+            term.nulls_first.value()
+                ? " NULLS FIRST"  // NOLINT(bugprone-unchecked-optional-access)
+                : " NULLS LAST";
       }
+      first = false;
     }
   }
   return out + ")";

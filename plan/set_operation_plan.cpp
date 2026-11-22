@@ -56,15 +56,13 @@ Schema SetOperationPlan::GenerateSchema() const {
     ValueType type = first.GetColumn(column).Type();
     for (size_t child = 1; child < children_.size(); ++child) {
       const Schema& schema = children_[child]->GetSchema();
-      if (column >= schema.ColumnCount()) {
+      if (schema.ColumnCount() != first.ColumnCount()) {
         // Width mismatch is validated by the executor at execution time.
-        break;
-      }
-      if (column + 1 == first.ColumnCount() &&
-          schema.ColumnCount() > first.ColumnCount()) {
-        // The first child's width defines the output; a wider later operand
-        // must not be silently truncated when deriving types.
-        return {};
+        // The first child's width defines the output schema; keep publishing
+        // it (unifying types over the shared columns only) instead of
+        // returning an empty schema, which would discard every column name
+        // and type for column resolution / EXPLAIN / costing upstream.
+        continue;
       }
       type = CommonSetValueType(type, schema.GetColumn(column).Type());
     }
@@ -76,7 +74,11 @@ Schema SetOperationPlan::GenerateSchema() const {
 size_t SetOperationPlan::AccessRowCount() const {
   size_t rows = 0;
   for (const Plan& child : children_) {
-    rows += child->AccessRowCount();
+    const size_t child_rows = child->AccessRowCount();
+    if (child_rows > std::numeric_limits<size_t>::max() - rows) {
+      return std::numeric_limits<size_t>::max();
+    }
+    rows += child_rows;
   }
   return rows;
 }
@@ -138,8 +140,7 @@ bool SetOperationPlan::IsOrderedBy(
   for (size_t i = 0; i < expressions.size(); ++i) {
     if (!order_keys_[i].expression || !expressions[i] ||
         order_keys_[i].ascending != ascending[i] ||
-        order_keys_[i].collation !=
-            CollationOfExpression(expressions[i]) ||
+        order_keys_[i].collation != CollationOfExpression(expressions[i]) ||
         order_keys_[i].expression->ToString() != expressions[i]->ToString()) {
       return false;
     }

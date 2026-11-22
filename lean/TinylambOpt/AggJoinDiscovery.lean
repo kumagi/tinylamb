@@ -952,7 +952,7 @@ private theorem groupBy_filter_fst_key {Row K1 K2 M : Type}
         simp [hEq, hpx]
       · simp [hEq]
 
-/-- **主定理 4 (`star_cascade_two_hop_agg_sound` — 2 ホップ Join を跨ぐ 3 段カスケード集約の完全証明)**:
+/-- **主定理 4-1 (`star_cascade_two_hop_agg_sound` — 2 ホップ Join を跨ぐ 3 段カスケード集約の完全証明)**:
     `Fact ⋈ Dim1 ⋈ Dim2` 上の `GROUP BY (attr1(d1), attr2(d2))` に対し、
     Join の段ごとに不要になった外部キー（`fk1` → `fk2`）を順次潰しながら集約する 3 段カスケード計画は、
     `Dim1`・`Dim2` の Unique 制約の有無にかかわらず、任意の可換モノイド集約で **Bag 等価 (`BagEq`)** である！ -/

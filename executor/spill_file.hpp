@@ -88,6 +88,7 @@ class SpillFile {
       Row row;
       dec >> row;
       if (!stream_) {
+        stream_.close();
         return StatusError(
             StatusCode::kCorrupt,
             "truncated spill file: " + path_.string());  // NOLINT(readability)
@@ -95,7 +96,14 @@ class SpillFile {
       if constexpr (std::is_same_v<
                         std::remove_cvref_t<std::invoke_result_t<Fn&, Row&>>,
                         Status>) {
-        RETURN_IF_FAIL(fn(row));
+        const Status status = fn(row);
+        if (status != Status::kSuccess) {
+          // A Status callback can stop iteration early; release the fd now
+          // instead of leaving it open until SpillFile is destroyed or the
+          // next ForEachRow reopens it in EnsureReader().
+          stream_.close();
+          return status;
+        }
       } else {
         fn(row);
       }
@@ -120,11 +128,22 @@ class SpillFile {
       RowPosition position;
       dec >> row >> position;
       if (!stream_) {
+        stream_.close();
         return StatusError(
             StatusCode::kCorrupt,
             "truncated spill file: " + path_.string());  // NOLINT(readability)
       }
-      fn(row, position);
+      if constexpr (std::is_same_v<std::remove_cvref_t<std::invoke_result_t<
+                                       Fn&, Row&, RowPosition&>>,
+                                   Status>) {
+        const Status status = fn(row, position);
+        if (status != Status::kSuccess) {
+          stream_.close();
+          return status;
+        }
+      } else {
+        fn(row, position);
+      }
     }
     return Status::kSuccess;
   }

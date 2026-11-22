@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-//  Created by kumagi on 2022/02/21.
-//
-
 #include "executor/full_scan.hpp"
 
 #include <algorithm>
@@ -170,7 +167,7 @@ StatusOr<bool> FullScan::TryFoldTypedBatches(
 
 // NOTE: this is currently a test-only path. It delegates to the store
 // without re-applying max_rows_/projection/lock_rows_/MVCC gates; do not wire
-// it into production statement execution until those contracts are honoured
+// it into production statement execution until those contracts are honored
 // (see TryExactUnfilteredRowCount below for the full gate list).
 StatusOr<ExecResult> FullScan::ExecuteLSTableFragment(const Fragment& fragment,
                                                       Runtime runtime) const {

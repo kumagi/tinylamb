@@ -2,13 +2,16 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "executor/constant_executor.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/parallel_aggregation.hpp"
+#include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -31,9 +34,9 @@ class NumberSource final : public ExecutorBase {
   size_t NextBatch(DataChunk* destination, size_t max_rows) override {
     destination->Reset();
     while (idx_ < rows_ && destination->Size() < max_rows) {
-      destination->Append(Row(std::vector<Value>{
-          Value(static_cast<int64_t>(idx_ % 7)),
-          Value(static_cast<double>(idx_ % 64))}));
+      destination->Append(
+          Row(std::vector<Value>{Value(static_cast<int64_t>(idx_ % 7)),
+                                 Value(static_cast<double>(idx_ % 64))}));
       ++idx_;
     }
     return destination->Size();
@@ -74,9 +77,11 @@ TEST(ParallelExecCoverageTest, DistinctAndSumMergesAreTeamSizeInvariant) {
     expected_sum_distinct_v += static_cast<double>(d);
   }
 
+  QueryMemoryCharge unrelated_reservation(1024 * 1024);
+  const size_t expected_charge = QueryMemoryBudget::Global().Used();
   for (const size_t workers : {size_t{1}, size_t{4}, size_t{16}}) {
-    ParallelAggregationExecutor executor(
-        std::make_shared<NumberSource>(kRows), schema, Aggregates(), workers);
+    ParallelAggregationExecutor executor(std::make_shared<NumberSource>(kRows),
+                                         schema, Aggregates(), workers);
     Row out;
     ASSERT_TRUE(executor.Next(&out, nullptr)) << "workers=" << workers;
     ASSERT_EQ(out.values_.size(), 4U);
@@ -88,6 +93,36 @@ TEST(ParallelExecCoverageTest, DistinctAndSumMergesAreTeamSizeInvariant) {
         << "workers=" << workers;
     EXPECT_FALSE(executor.Next(&out, nullptr));
     EXPECT_EQ(executor.GetStatus(), Status::kSuccess);
+    EXPECT_EQ(QueryMemoryBudget::Global().Used(), expected_charge)
+        << "workers=" << workers;
+  }
+}
+
+TEST(ParallelExecCoverageTest, DoubleSumDetectsOverflowAndKeepsRealInfinity) {
+  const Schema schema("numbers", {Column("v", ValueType::kDouble)});
+  const auto aggregates = [] {
+    return std::vector<NamedExpression>{
+        {"sum",
+         AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("v"))}};
+  };
+  for (size_t workers : {1, 4}) {
+    const double maximum = std::numeric_limits<double>::max();
+    ParallelAggregationExecutor overflowing(
+        std::make_shared<ConstantExecutor>(
+            std::vector<Row>{Row({Value(maximum)}), Row({Value(maximum)})}),
+        schema, aggregates(), workers);
+    Row out;
+    EXPECT_FALSE(overflowing.Next(&out, nullptr));
+    EXPECT_EQ(overflowing.GetStatus().GetCode(), StatusCode::kIsInfinity);
+
+    const double infinity = std::numeric_limits<double>::infinity();
+    ParallelAggregationExecutor already_infinite(
+        std::make_shared<ConstantExecutor>(
+            std::vector<Row>{Row({Value(infinity)}), Row({Value(1.0)})}),
+        schema, aggregates(), workers);
+    ASSERT_TRUE(already_infinite.Next(&out, nullptr));
+    ASSERT_EQ(out.Count(), 1U);
+    EXPECT_EQ(out[0], Value(infinity));
   }
 }
 
@@ -101,6 +136,30 @@ TEST(ParallelExecCoverageTest, EmptyInputStillEmitsOneRow) {
   ASSERT_EQ(out.values_.size(), 4U);
   EXPECT_EQ(out.values_[0], Value(int64_t{0}));
   EXPECT_FALSE(executor.Next(&out, nullptr));
+}
+
+// A child that throws a value which is not a std::exception: without a
+// catch-all inside the worker lambda this escapes the jthread and calls
+// std::terminate, aborting the whole process instead of surfacing a Status.
+class NonStdThrowingSource final : public ExecutorBase {
+ public:
+  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override {
+    throw 12345;  // deliberately not derived from std::exception
+  }
+  void Dump(std::ostream& o, int /*indent*/) const override { o << "throwing"; }
+};
+
+TEST(ParallelExecCoverageTest, NonStdChildExceptionBecomesStatus) {
+  const Schema schema("nums", {Column("v", ValueType::kInt64)});
+  const auto aggregates = [] {
+    return std::vector<NamedExpression>{
+        {"total", AggregateExpressionExp(AggregationType::kCount, nullptr)}};
+  };
+  ParallelAggregationExecutor executor(std::make_shared<NonStdThrowingSource>(),
+                                       schema, aggregates(), 4);
+  Row out;
+  EXPECT_FALSE(executor.Next(&out, nullptr));
+  EXPECT_EQ(executor.GetStatus().GetCode(), StatusCode::kRuntimeError);
 }
 
 }  // namespace

@@ -207,10 +207,10 @@ TEST_F(SqlAuditRegressionTest, FailedViewRegistrationRetriesSameEpoch) {
     auto ctx = database_->BeginContext();
     // The broken definition is still stored, so the retry replaces it
     // (CREATE OR REPLACE VIEW); a plain re-create now reports a conflict.
-    ASSERT_EQ(database_->PutViewDefinition(ctx, "audit_retry_view",
-                                           "SELECT 42 AS x",
-                                           /*replace_existing=*/true),
-              Status::kSuccess);
+    ASSERT_EQ(
+        database_->PutViewDefinition(ctx, "audit_retry_view", "SELECT 42 AS x",
+                                     /*replace_existing=*/true),
+        Status::kSuccess);
     ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
   }
   ASSERT_EQ(database_->CatalogEpoch(), epoch);
@@ -625,12 +625,14 @@ TEST_F(SqlAuditRegressionTest, UnionAllNullConstantVarcharPartialSlice) {
              "SELECT '" +
              payload +
              "' AS c "
-             // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
+             // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
+             // short fixed concatenations
              "UNION ALL SELECT '" +
              payload +
              "' "
              "UNION ALL SELECT CAST(NULL AS STRING) "
-             // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed concatenations
+             // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
+             // short fixed concatenations
              "UNION ALL SELECT '" +
              payload +
              "' "
@@ -735,7 +737,8 @@ TEST_F(SqlAuditRegressionTest,
     Rows(sql);
   }
   const size_t prev_limit = QueryMemoryBudget::Global().Limit();
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
   struct Restore {
     size_t limit;
     ~Restore() { QueryMemoryBudget::Global().ResetForTest(limit); }
@@ -788,7 +791,8 @@ TEST_F(SqlAuditRegressionTest, WindowPartitionCollationAndSpillParity) {
   EXPECT_EQ(expected.second[0][1], Value(int64_t{0}));
   EXPECT_EQ(expected.second[0][2], Value(int64_t{0}));
 
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // non-copyable by design
   struct KnobRestore {
     ~KnobRestore() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
   } restore;
@@ -889,10 +893,12 @@ TEST_F(SqlAuditRegressionTest, NullSafeJoinFoldsSignedZero) {
 // pipeline lowering routes keyless scalar aggregates through
 // EmitScalarAggregation, whose COUNT(*) rule narrows the scan to one cell.
 TEST_F(SqlAuditRegressionTest, CountStarOnWideTableScansOneColumn) {
-  Rows("CREATE TABLE audit_wide (a INT64, b STRING, c INT64, d DOUBLE, "
-       "e STRING, f INT64)");
-  Rows("INSERT INTO audit_wide SELECT x, CAST(x AS STRING), x * 2, x / 3.0, "
-       "'payload', x FROM UNNEST(GENERATE_ARRAY(1, 10000)) AS x");
+  Rows(
+      "CREATE TABLE audit_wide (a INT64, b STRING, c INT64, d DOUBLE, "
+      "e STRING, f INT64)");
+  Rows(
+      "INSERT INTO audit_wide SELECT x, CAST(x AS STRING), x * 2, x / 3.0, "
+      "'payload', x FROM UNNEST(GENERATE_ARRAY(1, 10000)) AS x");
   // The narrowing is gated on the planner knowing the table is big enough
   // for a parallel scan, so give it statistics like a loaded fixture has.
   Rows("ANALYZE");
@@ -944,13 +950,50 @@ TEST_F(SqlAuditRegressionTest, DerivedFlattenKeepsSubqueryAliasReferences) {
                                 Row({Value(int64_t{2}), Value(int64_t{1})})}));
     // EXISTS carries the same correlated reference through the kQueryExp
     // boundary.
-    EXPECT_EQ(Rows(R"sql(
+    EXPECT_EQ(
+        Rows(R"sql(
       SELECT d.k FROM (SELECT k, m * 100 AS m FROM audit_flat_t) d
       WHERE EXISTS (SELECT 1 FROM audit_flat_s s WHERE s.m2 = d.m)
       ORDER BY d.k
     )sql"),
-              (std::vector<Row>{Row({Value(int64_t{1})}),
-                                Row({Value(int64_t{2})})}));
+        (std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})}));
+  }
+}
+
+TEST_F(SqlAuditRegressionTest,
+       DeferredRightLeftJoinInFusedGroupedJoinLoadsRightSide) {
+  // Regression for TPC-DS Q40: a numeric-only LEFT OUTER JOIN target deferred
+  // via `deferred_order_rows` was passed unloaded (empty) into
+  // TryFusedGroupedJoin when `can_fuse_anti_left` was false, silently dropping
+  // all right-side matches and null-padding every left row.
+  Rows("CREATE TABLE q40_cs (ord INT64, item INT64, wh INT64, price DOUBLE)");
+  Rows("CREATE TABLE q40_cr (ord INT64, item INT64, refund DOUBLE)");
+  Rows("CREATE TABLE q40_wh (wh INT64, state VARCHAR)");
+  Rows("INSERT INTO q40_wh VALUES (1, 'AL'), (2, 'CA')");
+  Rows(
+      "INSERT INTO q40_cs VALUES (10, 100, 1, 50.0), (11, 100, 1, 20.0), "
+      "(12, 200, 2, 30.0)");
+  Rows("INSERT INTO q40_cr VALUES (10, 100, 40.0), (12, 200, 5.0)");
+  Rows("ANALYZE TABLE q40_cs");
+  Rows("ANALYZE TABLE q40_cr");
+  Rows("ANALYZE TABLE q40_wh");
+  for (bool force_relational : {false, true}) {
+    SCOPED_TRACE(force_relational);
+    engine_->SetForceRelationalFallback(force_relational);
+    EXPECT_EQ(Rows(R"sql(
+          SELECT w.state, cs.item,
+                 SUM(cs.price - COALESCE(cr.refund, 0.0)) AS net_sales
+          FROM q40_cs cs
+          LEFT OUTER JOIN q40_cr cr
+            ON (cs.ord = cr.ord AND cs.item = cr.item),
+            q40_wh w
+          WHERE cs.wh = w.wh
+          GROUP BY w.state, cs.item
+          ORDER BY w.state, cs.item
+        )sql"),
+              (std::vector<Row>{
+                  Row({Value("AL"), Value(int64_t{100}), Value(30.0)}),
+                  Row({Value("CA"), Value(int64_t{200}), Value(25.0)})}));
   }
 }
 

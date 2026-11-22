@@ -656,7 +656,7 @@ SELECT
       "abc" as string_val,
       true as bool_val,
       [1,2,3] as repeated_int64_val,
-      STRUCT(321 as nested_structed_field) as nested_struct
+      STRUCT(321 as nested_struct_field) as nested_struct
   )
 --
 ARRAY<STRUCT<STRUCT<

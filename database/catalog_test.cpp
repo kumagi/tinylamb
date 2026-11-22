@@ -203,7 +203,7 @@ TEST_F(CatalogTest, Recover) {
                                     Column("col3", ValueType::kVarChar)});
   {
     TransactionContext ctx = rs_->BeginContext();
-    rs_->CreateTable(ctx, new_schema);
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, new_schema).GetStatus());
     {
       std::ostringstream oss;
       rs_->DebugDump(ctx.txn_, oss);
@@ -491,12 +491,13 @@ TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
     // D3 (docs/design.md): the destroy redo initializes the page as a free
     // page and recovery rebuilds the free list, so a crash after this commit
     // no longer breaks startup.
-    pm->DestroyPage(txn, first.get());
+    ASSERT_SUCCESS(pm->DestroyPage(txn, first.get()));
   }
 
   // The freed id is withheld while its destroyer is still active (an abort
   // could still restore the page), so commit before expecting reuse.
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  EXPECT_EQ(pm->GetPage(first_pid).GetStatus(), Status::kNotExists);
   TransactionContext ctx2 = rs_->BeginContext();
 
   // Assert -- the next allocation reuses the freed page id
@@ -586,7 +587,7 @@ TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
         tbl->Insert(ctx.txn_, Row({Value(1), Value("bob")})).GetStatus();
 
     // Assert -- the colliding insert is rejected by the unique index
-    EXPECT_NE(duplicate, Status::kSuccess);
+    EXPECT_EQ(duplicate, Status::kDuplicates);
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 }
@@ -772,6 +773,29 @@ TEST_F(CatalogTest, CreateIndexRefreshesContextCache) {
 
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
+}
+
+TEST_F(CatalogTest, AbortedColumnRenameInvalidatesCatalogEpoch) {
+  {
+    auto setup = rs_->BeginContext();
+    ASSERT_SUCCESS(
+        rs_->CreateTable(setup, Schema("rename_abort",
+                                       {Column("old_name", ValueType::kInt64)}))
+            .GetStatus());
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  auto rename = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->RenameColumn(rename, "rename_abort", "old_name", "new_name"));
+  const auto renamed_epoch = rs_->SchemaEpoch();
+  ASSERT_SUCCESS(rename.Abort());
+  EXPECT_GT(rs_->SchemaEpoch(), renamed_epoch);
+  auto check = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        check.GetTable("rename_abort"));
+  EXPECT_EQ(table->GetSchema().Offset(ColumnName("old_name")), 0);
+  EXPECT_LT(table->GetSchema().Offset(ColumnName("new_name")), 0);
+  ASSERT_SUCCESS(check.PreCommit());
 }
 
 TEST_F(CatalogTest, DdlInvalidatesEveryCaseVariantInTheContextCache) {
@@ -1064,10 +1088,9 @@ TEST_F(CatalogTest, DropTableCrashRecoveryReclaimsPages) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
-TEST_F(CatalogTest, CreateIndexOnRecoveredTableFails) {
-  // Documents bug: CreateIndex must succeed on a recovered database, but
-  // currently returns kNotExists there while GetTable resolves the same
-  // name just fine.
+TEST_F(CatalogTest, CreateIndexOnRecoveredTableSucceeds) {
+  // CreateIndex must succeed on a recovered database; GetTable resolves the
+  // same name. This is a regression pin for the old kNotExists failure.
   Schema schema("recovered_idx", {Column("id", ValueType::kInt64),
                                   Column("name", ValueType::kVarChar)});
   {

@@ -646,8 +646,8 @@ TEST(CascadesTest, StructuralFingerprintKeepsExactScalarEncoding) {
 TEST(CascadesTest, MemoAddExpressionValidatesSingleChildOperators) {
   // Arrange: a scan group, its derived group, and a two-relation group.
   Memo memo;
-  const GroupId scan = memo.Build({"a"});
   const GroupId join_root = memo.Build({"a", "b"});
+  const GroupId scan = memo.EnsureGroup({"a"});
   const GroupId derived = memo.EnsureDerivedGroup({"a"}, "selection");
 
   // Act + Assert: a Selection must carry a predicate...
@@ -933,8 +933,8 @@ TEST(CascadesTest, BushyBipartitionsAppearWithAndWithoutEnumeration) {
 }
 
 TEST(CascadesTest, ExploreConvergesOnWideJoinGraphsWithoutPassCap) {
-  // Arrange: an eight-relation join graph exercises the Phase 7 worklist
-  // (the old implementation capped exploration at 64 passes).
+  // Arrange: an eight-relation join graph exercises worklist-based exploration
+  // (DrainTouchedGroups, with no pass cap), which must still converge.
   Memo memo;
   std::vector<std::string> relations;
   relations.reserve(8);
@@ -1481,7 +1481,7 @@ TEST(CascadesTest, UnionAllLimitCapsEveryChildAndKeepsGlobalLimit) {
 }
 
 TEST(CascadesTest, PropertyKeysIncludeAccessMethodLimitHintAndDistribution) {
-  // Arrange: properties that differ only in the reserved Phase 5 fields.
+  // Arrange: properties that differ only in the scheduling/hint fields.
   PhysicalProperties base;
   PhysicalProperties hinted = base;
   hinted.limit_hint = 10;

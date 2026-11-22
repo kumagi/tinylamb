@@ -233,8 +233,7 @@ TEST(TlcsFileTest, ForcedPagedModeCheckpointReopenAndMvccMutations) {
     const std::array<slot_t, 2> projection = {2, 0};
     TlcsFile::DecodedBlock coalesced;
     TlcsFile::DecodedBlock projected;
-    ASSERT_SUCCESS(
-        tlcs->DecodeBlockColumns(0, projection, schema, &coalesced));
+    ASSERT_SUCCESS(tlcs->DecodeBlockColumns(0, projection, schema, &coalesced));
     ASSERT_SUCCESS(tlcs->DecodeBlockColumnsWithOptions(
         0, projection, schema, &projected, true, nullptr, {},
         /*read_projected_streams_directly=*/true));
@@ -481,8 +480,7 @@ TEST(TlcsFileTest, StubRecompactionSkipsEncodedImageCache) {
             EXPECT_TRUE(row[1].IsNull());
           } else {
             const std::string expected =
-                (seen < kCompactedRows ? "t_" : "tail_") +
-                std::to_string(seen);
+                (seen < kCompactedRows ? "t_" : "tail_") + std::to_string(seen);
             EXPECT_EQ(row[1].value.varchar_value, expected);
           }
           ++seen;
@@ -493,6 +491,62 @@ TEST(TlcsFileTest, StubRecompactionSkipsEncodedImageCache) {
 
   first_tlcs.reset();
   db->DeleteAll();
+}
+
+TEST(TlcsFileTest, ResidentBatchDecodesShortDictionaryStrings) {
+  const std::string prefix = "tlcs_resident_tags_" + RandomString();
+  const Schema schema("tags", {Column("id", ValueType::kInt64),
+                               Column("tag", ValueType::kVarChar)});
+  auto db = Database::Create(prefix).MoveValue();
+  {
+    auto context = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, db->CreateTable(context, schema));
+    for (int64_t id = 0; id < 300; ++id) {
+      ASSERT_TRUE(
+          table
+              .Insert(context.txn_, Row({Value(id), Value(id % 2 ? "Y" : "N")}))
+              .HasValue());
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  {
+    auto context = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(context, "tags"));
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  auto context = db->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db->GetTable(context, "tags"));
+  const auto tlcs = table.GetBackingTlcsStore();
+  ASSERT_NE(tlcs, nullptr);
+  const auto resident = tlcs->ResidentStore();
+  ASSERT_NE(resident, nullptr);
+  ASSERT_FALSE(resident->blocks.empty());
+  const auto& tags = resident->blocks[0].columns[1];
+  ASSERT_TRUE(tags.all_single_byte_varchar);
+  ASSERT_NE(tags.dict, nullptr);
+  EXPECT_TRUE(tags.VarcharBytes().empty());
+
+  const std::vector<IntegerPeekCompare> filtered{
+      {.column = 0, .op = BinaryOperation::kGreaterThanEquals, .constant = 3}};
+  for (const bool use_filter : {false, true}) {
+    TableScanOptions options;
+    options.peek_compares = use_filter ? &filtered : nullptr;
+    auto scan = table.BeginFullScan(context.txn_, options);
+    TypedCellBatch batch;
+    batch.Configure(2, {ValueType::kInt64, ValueType::kVarChar},
+                    {false, false});
+    int64_t id = use_filter ? 3 : 0;
+    for (size_t rows = scan.DecodeNextTypedBatch(&batch, 17); rows != 0;
+         rows = scan.DecodeNextTypedBatch(&batch, 17)) {
+      for (size_t row = 0; row < rows; ++row, ++id) {
+        EXPECT_EQ(batch.cells[row * 2], id);
+        EXPECT_EQ(batch.Varchar(row, 0), id % 2 ? "Y" : "N");
+      }
+    }
+    ASSERT_SUCCESS(scan.GetStatus());
+    EXPECT_EQ(id, 300);
+  }
+  ASSERT_SUCCESS(context.PreCommit());
 }
 
 TEST(TlcsFileTest, PagedStubBatchDecodeZoneMapsProjectionRuntimeFilterAndTail) {
@@ -892,7 +946,7 @@ void WriteMinimalTlcsFile(const std::string& path, bool out_of_bounds,
 
   std::vector<uint8_t> pids;
   pids.reserve(8);
-for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < 8; ++i) {
     pids.push_back(static_cast<uint8_t>(1ULL >> (i * 8)));
   }
   const uint32_t pid_crc = Crc32C(pids.data(), pids.size());
@@ -1049,9 +1103,11 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
   bu64(0);        // aux_size
   const uint32_t body_crc = Crc32C(body.data(), body.size());
 
-  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer,
+  // std::array not applicable
   const uint64_t group_offsets[2] = {72, 72 + 8 + body.size()};
-  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer, std::array not applicable
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer,
+  // std::array not applicable
   const uint64_t pids[2] = {50000, 10000};
   std::vector<uint8_t> dir;
   const auto du8 = [&](uint8_t v) { dir.push_back(v); };
@@ -1078,7 +1134,7 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
   for (uint32_t g = 0; g < 2; ++g) {
     std::vector<uint8_t> pid_span;
     pid_span.reserve(8);
-for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 8; ++i) {
       pid_span.push_back(static_cast<uint8_t>(pids[g] >> (i * 8)));
     }
     const uint32_t pid_crc = Crc32C(pid_span.data(), pid_span.size());
@@ -1133,6 +1189,27 @@ for (int i = 0; i < 8; ++i) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   ASSERT_TRUE(out.is_open());
   out.write(reinterpret_cast<const char*>(f.data()), f.size());
+}
+
+TEST(TlcsFileTest, StoredSchemaRejectsColumnCountExceedingDirectory) {
+  const std::string path = "tlcs_bad_columns_" + RandomString() + ".tlcs";
+  WriteOverlappingPidTlcsFile(path);
+  {
+    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    std::array<uint8_t, 72> header{};
+    file.read(reinterpret_cast<char*>(header.data()), header.size());
+    ASSERT_EQ(file.gcount(), static_cast<std::streamsize>(header.size()));
+    WriteLe32(header.data() + 44, UINT32_MAX);
+    WriteLe32(header.data() + 68, Crc32C(header.data(), 68));
+    file.seekp(0);
+    file.write(reinterpret_cast<const char*>(header.data()), header.size());
+  }
+  Schema schema;
+  const auto opened = TlcsFile::OpenWithStoredSchema(path, &schema);
+  ASSERT_FALSE(opened.HasValue());
+  EXPECT_EQ(opened.GetStatus(), Status::kCorrupt);
+  std::filesystem::remove(path);
 }
 
 TEST(TlcsFileTest, FindBlockIndexWithOverlappingPidRanges) {
@@ -1267,17 +1344,18 @@ TEST(TlcsFileTest, PagedDirectoryModeAndReclaimDropResidentAndEagerCaches) {
 TEST(TlcsFileTest, BuildLSTableStoreRespectsEffectiveColumnarPoolCap) {
   TlcsBudgetResetGuard budget_guard;
   auto& budget = ProcessMemoryBudget::Global();
-  // 16 MiB total -> 12.8 MiB soft cap -> 6 MiB storage floor + 5 MiB query
-  // floor leaves ~1.8 MiB effective kColumnar cap (below the 2 GiB default pool
-  // limit).
-  budget.ResetForTest(size_t{16} << 20, size_t{6} << 20, size_t{5} << 20,
+  // The storage, query and transaction floors leave ~1.6 MiB for columnar
+  // data while allowing the database to reserve its 8 MiB WAL buffer.
+  budget.ResetForTest(size_t{32} << 20, size_t{6} << 20, size_t{5} << 20,
                       /*check_rss_pressure=*/false);
-  budget.SetPoolFloorsForTest(size_t{6} << 20, 0, size_t{5} << 20, 0);
+  budget.SetPoolFloorsForTest(size_t{6} << 20, 0, size_t{10} << 20,
+                              size_t{8} << 20);
 
   const std::string prefix = "tlcs_lstable_cap_" + RandomString();
   Schema schema("cap_tbl", {Column("k", ValueType::kInt64),
                             Column("v", ValueType::kVarChar)});
-  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Database>, db,
+                        Database::Create(prefix));
   {
     TransactionContext ctx = db->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
@@ -1655,11 +1733,11 @@ TEST(TlcsFileTest,
 }
 
 // P356/426: TLCS compaction must not flatten MVCC version chains a pinned
-// snapshot still needs.  Old behaviour: ReplaceTableChainWithColumnarStubs
+// snapshot still needs.  Old behavior: ReplaceTableChainWithColumnarStubs
 // demoted the chain regardless of registered version chains (an idle
 // multi-statement reader holds no lease and does not block quiescence), so
 // the pinned reader's next read served the CURRENT TLCS image -- rows
-// "became newer" behind the snapshot.  New behaviour: compaction declines
+// "became newer" behind the snapshot.  New behavior: compaction declines
 // with kConflicts while any chain is registered, and the pinned reader keeps
 // answering from the heap.
 TEST(TlcsFileTest, CompactionYieldsToPinnedVersionChains) {
@@ -1773,6 +1851,298 @@ TEST(TlcsFileTest, IndexScanOnStubHydratesForNonReadTransaction) {
     EXPECT_EQ(seen.back(), 60);
   }
   db->DeleteAll();
+}
+
+TEST(TlcsFileTest, EvictReclaimDropsResidentMmapAndSkipsOversizedMap) {
+  TlcsBudgetResetGuard budget_guard;
+  auto& budget = ProcessMemoryBudget::Global();
+  const std::string prefix = "tlcs_mmap_evict_" + RandomString();
+  Schema schema("mmap_tbl", {Column("k", ValueType::kInt64),
+                             Column("v", ValueType::kInt64)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  page_id_t first_pid = 0;
+  constexpr int64_t kRows = 10000;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    first_pid = tbl.FirstPageId();
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_TRUE(tbl.Insert(ctx.txn_, Row({Value(i), Value((i * 7) ^ 0x5555)}))
+                      .HasValue());
+    }
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "mmap_tbl"));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  db.reset();
+
+  const std::string tlcs_path =
+      prefix + ".db.tlcs." + std::to_string(first_pid);
+  const auto fsize = static_cast<size_t>(std::filesystem::file_size(tlcs_path));
+  ASSERT_GT(fsize, 0U);
+
+  const std::array<slot_t, 2> proj = {0, 1};
+  const std::array<uint32_t, 3> sample_rows = {0, 17, 500};
+
+  // When fsize <= budget.Limit() / 2, Open opens resident_mmap_; Evict clears
+  // both resident_store_ and resident_mmap_, leaving Pread intact.
+  budget.ResetForTest(std::max<size_t>(fsize * 4, size_t{32} << 20),
+                      size_t{8} << 20, size_t{16} << 20,
+                      /*check_rss_pressure=*/false);
+  {
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
+                          TlcsFile::Open(tlcs_path, schema));
+    TlcsFile::DecodedBlock gather_blk;
+    EXPECT_TRUE(tlcs->TryGatherMmapFixedColumns(0, proj, sample_rows, schema,
+                                                &gather_blk));
+    EXPECT_EQ(gather_blk.columns[0].int_cells[1], 17);
+    EXPECT_EQ(gather_blk.columns[1].int_cells[1], (17 * 7) ^ 0x5555);
+
+    EXPECT_GT(tlcs->EvictDecodedCacheForTest(size_t{1} << 40), 0U);
+    EXPECT_FALSE(tlcs->TryGatherMmapFixedColumns(0, proj, sample_rows, schema,
+                                                 &gather_blk));
+
+    TlcsFile::DecodedBlock pread_blk;
+    ASSERT_SUCCESS(tlcs->DecodeBlockColumns(0, proj, schema, &pread_blk));
+    EXPECT_EQ(pread_blk.columns[0].int_cells[17], 17);
+    EXPECT_EQ(pread_blk.columns[1].int_cells[500], (500 * 7) ^ 0x5555);
+  }
+
+  // When fsize exceeds budget.Limit() / 2, Open skips resident_mmap_ and reads
+  // via bounded Pread.
+  const size_t small_limit = std::max<size_t>(fsize / 2, 1024);
+  ASSERT_GT(fsize, small_limit / 2);
+  budget.ResetForTest(small_limit, std::max<size_t>(small_limit / 4, 256),
+                      std::max<size_t>(small_limit / 2, 512),
+                      /*check_rss_pressure=*/false);
+  {
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
+                          TlcsFile::Open(tlcs_path, schema));
+    TlcsFile::DecodedBlock gather_blk;
+    EXPECT_FALSE(tlcs->TryGatherMmapFixedColumns(0, proj, sample_rows, schema,
+                                                 &gather_blk));
+    TlcsFile::DecodedBlock pread_blk;
+    ASSERT_SUCCESS(tlcs->DecodeBlockColumns(0, proj, schema, &pread_blk));
+    EXPECT_EQ(pread_blk.columns[0].int_cells[500], 500);
+    EXPECT_EQ(pread_blk.columns[1].int_cells[500], (500 * 7) ^ 0x5555);
+  }
+
+  // Explicit TINYLAMB_TLCS_MMAP_LIMIT_BYTES=0 also skips resident_mmap_.
+  {
+    ScopedEnvVar no_mmap("TINYLAMB_TLCS_MMAP_LIMIT_BYTES", "0");
+    budget.ResetForTest(size_t{1} << 30, size_t{256} << 20, size_t{512} << 20,
+                        /*check_rss_pressure=*/false);
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
+                          TlcsFile::Open(tlcs_path, schema));
+    TlcsFile::DecodedBlock gather_blk;
+    EXPECT_FALSE(tlcs->TryGatherMmapFixedColumns(0, proj, sample_rows, schema,
+                                                 &gather_blk));
+    TlcsFile::DecodedBlock pread_blk;
+    ASSERT_SUCCESS(tlcs->DecodeBlockColumns(0, proj, schema, &pread_blk));
+    EXPECT_EQ(pread_blk.columns[0].int_cells[17], 17);
+  }
+
+  std::unique_ptr<Database> cleanup_db = Database::Create(prefix).MoveValue();
+  cleanup_db->DeleteAll();
+}
+
+TEST(TlcsFileTest, TlcsV3PersistsColumnSynopsesAndLoadsInO1) {
+  const std::string prefix = "tlcs_v3_syn_" + RandomString();
+  Schema schema("v3_syn", {Column("id", ValueType::kInt64),
+                           Column("unsorted", ValueType::kInt64),
+                           Column("nullable_k", ValueType::kInt64)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  page_id_t first_pid = 0;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    first_pid = tbl.FirstPageId();
+    for (int64_t i = 0; i < 200; ++i) {
+      const Value nullable = (i % 10 == 0) ? Value() : Value(i * 2);
+      ASSERT_TRUE(
+          tbl.Insert(ctx.txn_, Row({Value(i + 1), Value(200 - i), nullable}))
+              .HasValue());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "v3_syn"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db->EmulateCrash();
+  db.reset();
+
+  const std::string tlcs_path =
+      prefix + ".db.tlcs." + std::to_string(first_pid);
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
+                        TlcsFile::Open(tlcs_path, schema));
+  EXPECT_EQ(tlcs->FormatVersion(), 3U);
+
+  const std::vector<slot_t> cols = {0, 1, 2};
+  auto entries = tlcs->BuildColumnCacheEntries(
+      schema, tlcs->LayoutGeneration(), cols, LSTableStore::kBuildByteLimit);
+  ASSERT_EQ(entries.size(), 3U);
+  ASSERT_NE(entries[0], nullptr);
+  ASSERT_NE(entries[1], nullptr);
+  ASSERT_NE(entries[2], nullptr);
+
+  EXPECT_FALSE(entries[0]->has_null);
+  EXPECT_TRUE(entries[0]->is_monotonic);
+  EXPECT_TRUE(entries[0]->is_unique_nonnull);
+  EXPECT_TRUE(entries[0]->is_identity_1_to_n);
+  EXPECT_EQ(entries[0]->min_int, 1);
+  EXPECT_EQ(entries[0]->max_int, 200);
+
+  EXPECT_FALSE(entries[1]->has_null);
+  EXPECT_FALSE(entries[1]->is_monotonic);
+  EXPECT_FALSE(entries[1]->is_unique_nonnull);
+  EXPECT_FALSE(entries[1]->is_identity_1_to_n);
+  EXPECT_EQ(entries[1]->min_int, 1);
+  EXPECT_EQ(entries[1]->max_int, 200);
+
+  EXPECT_TRUE(entries[2]->has_null);
+  EXPECT_FALSE(entries[2]->is_monotonic);
+  EXPECT_FALSE(entries[2]->is_unique_nonnull);
+  EXPECT_EQ(entries[2]->min_int, 2);
+  EXPECT_EQ(entries[2]->max_int, 398);
+
+  tlcs.reset();
+  std::unique_ptr<Database> cleanup_db = Database::Create(prefix).MoveValue();
+  cleanup_db->DeleteAll();
+}
+
+TEST(TlcsFileTest, WriteCheckpointAutoCompactsUnlessDisabled) {
+  const std::string prefix = "tlcs_autockpt_" + RandomString();
+  Schema non_empty_schema("non_empty_tbl", {Column("k", ValueType::kInt64)});
+  Schema empty_schema("empty_tbl", {Column("k", ValueType::kInt64)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  page_id_t pid_non_empty = 0;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, t1, db->CreateTable(ctx, non_empty_schema));
+    ASSIGN_OR_ASSERT_FAIL(Table, t2, db->CreateTable(ctx, empty_schema));
+    (void)t2;
+    pid_non_empty = t1.FirstPageId();
+    for (int64_t i = 0; i < 64; ++i) {
+      ASSERT_TRUE(t1.Insert(ctx.txn_, Row({Value(i)})).HasValue());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+
+  {
+    ScopedEnvVar disabled("TINYLAMB_AUTO_TLCS", "0");
+    ASSERT_SUCCESS(db->WriteCheckpoint().GetStatus());
+    auto reader = db->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, t1, db->GetTable(reader, "non_empty_tbl"));
+    EXPECT_EQ(t1.GetBackingTlcsStore(), nullptr);
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+
+  ASSERT_SUCCESS(db->WriteCheckpoint().GetStatus());
+  {
+    auto reader = db->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, t1, db->GetTable(reader, "non_empty_tbl"));
+    ASSIGN_OR_ASSERT_FAIL(Table, t2, db->GetTable(reader, "empty_tbl"));
+    EXPECT_NE(t1.GetBackingTlcsStore(), nullptr);
+    EXPECT_EQ(t2.GetBackingTlcsStore(), nullptr);
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+  const std::string tlcs_path =
+      prefix + ".db.tlcs." + std::to_string(pid_non_empty);
+  EXPECT_TRUE(std::filesystem::exists(tlcs_path));
+
+  db->EmulateCrash();
+  db.reset();
+  std::unique_ptr<Database> reopened = Database::Create(prefix).MoveValue();
+  {
+    auto reader = reopened->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, t1,
+                          reopened->GetTable(reader, "non_empty_tbl"));
+    EXPECT_NE(t1.GetBackingTlcsStore(), nullptr);
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+  reopened->DeleteAll();
+}
+
+TEST(TlcsFileTest,
+     StubDecodeNextTypedBatchWithPeekDoesNotDropRowsAcrossBatches) {
+  ScopedEnvVar force_paged("TINYLAMB_TLCS_MMAP_LIMIT_BYTES", "1");
+  const std::string prefix = "tlcs_stub_peek_batch_" + RandomString();
+  Schema schema("peek_stub", {Column("id", ValueType::kInt64),
+                              Column("k", ValueType::kInt64)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  constexpr int64_t kRows = 200;
+  std::vector<int64_t> expected;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    for (int64_t i = 0; i < kRows; ++i) {
+      const int64_t k = i % 10;
+      ASSERT_SUCCESS(
+          tbl.Insert(ctx.txn_, Row({Value(i), Value(k)})).GetStatus());
+      if (k >= 3 && k < 7) {
+        expected.push_back(i);
+      }
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "peek_stub"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  ASSERT_SUCCESS(db->WriteCheckpoint().GetStatus());
+  db.reset();
+
+  // Reopen cleanly so BeginFullScan reads TLCS stub blocks without any resident
+  // LSTableStore shortcut.
+  std::unique_ptr<Database> reopened = Database::Create(prefix).MoveValue();
+  {
+    TransactionContext ctx = reopened->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, reopened->GetTable(ctx, "peek_stub"));
+    ASSERT_NE(tbl.GetBackingTlcsStore(), nullptr);
+    ASSERT_EQ(tbl.GetLSTableStore(), nullptr);
+
+    const std::vector<IntegerPeekCompare> preds{
+        {.column = 1, .op = BinaryOperation::kGreaterThanEquals, .constant = 3},
+        {.column = 1, .op = BinaryOperation::kLessThan, .constant = 7}};
+    TableScanOptions options;
+    options.peek_compares = &preds;
+
+    std::vector<int64_t> batched_ids;
+    {
+      auto scan = tbl.BeginFullScan(ctx.txn_, options);
+      TypedCellBatch batch;
+      batch.Configure(2, {ValueType::kInt64, ValueType::kInt64},
+                      {false, false});
+      for (size_t rows = scan.DecodeNextTypedBatch(&batch, 7); rows != 0;
+           rows = scan.DecodeNextTypedBatch(&batch, 7)) {
+        for (size_t r = 0; r < rows; ++r) {
+          batched_ids.push_back(batch.cells[r * 2]);
+          EXPECT_GE(batch.cells[(r * 2) + 1], 3);
+          EXPECT_LT(batch.cells[(r * 2) + 1], 7);
+        }
+      }
+      ASSERT_SUCCESS(scan.GetStatus());
+    }
+    EXPECT_EQ(batched_ids, expected);
+
+    std::vector<int64_t> iter_ids;
+    {
+      auto scan = tbl.BeginFullScan(ctx.txn_, options);
+      for (; scan.IsValid(); ++scan) {
+        iter_ids.push_back((*scan)[0].value.int_value);
+      }
+      ASSERT_SUCCESS(scan.GetStatus());
+    }
+    EXPECT_EQ(iter_ids, expected);
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  reopened->DeleteAll();
 }
 
 }  // namespace

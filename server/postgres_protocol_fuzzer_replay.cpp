@@ -46,7 +46,6 @@ int main(int argc, char** argv) {
     // binary and must be replayed verbatim.
     std::string file_content((std::istreambuf_iterator<char>(case_data)),
                              std::istreambuf_iterator<char>());
-    LOG(ERROR) << "test: " << file.path();
     TestCase(file_content);
   }
   return 0;

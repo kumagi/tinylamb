@@ -26,7 +26,7 @@ class IntervalExpression : public ExpressionBase {
       value_ = IntervalValue::Parse(raw_amount_, unit_);
     } else {
       value_ = ExcShimUnwrap(IntervalValue::TryFromInteger(amount_, unit_),
-                             "IntervalValue::Parse");
+                             "IntervalValue::TryFromInteger");
     }
     text_ = value_.ToString();
   }

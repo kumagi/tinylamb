@@ -127,10 +127,31 @@ Value MakeValue(Stream& s, bool biased) {
       return MakeDouble(s, biased);
     case 4:
       return MakeString(s, biased);
-    case 5:
+    case 5: {
       // DATE: Value::Date parses; invalid strings throw, so go through the
-      // day-based constructor which is total.
-      return Value::DateFromDays(((static_cast<int64_t>(s.Next()) * 7)) - 700);
+      // day-based constructor which is total. Use several RNG draws so the
+      // full day domain (including both boundaries and negative years) is
+      // reachable; a 1-byte draw covered only seven consecutive days.
+      int64_t bits = 0;
+      for (int i = 0; i < 4; ++i) {
+        bits = (bits << 16) ^ static_cast<int64_t>(s.Next());
+      }
+      constexpr int64_t kSpan =
+          tinylamb::kDateMaxDays - tinylamb::kDateMinDays + 1;
+      const int64_t day =
+          tinylamb::kDateMinDays + (bits % kSpan + kSpan) % kSpan;
+      // Bias a fraction of inputs to the exact boundaries.
+      switch (s.Next() % 5) {
+        case 0:
+          return Value::DateFromDays(tinylamb::kDateMinDays);
+        case 1:
+          return Value::DateFromDays(tinylamb::kDateMaxDays);
+        case 2:
+          return Value::DateFromDays(0);
+        default:
+          return Value::DateFromDays(day);
+      }
+    }
     default: {
       const size_t n = s.Next() % 3;
       std::vector<Value> elems;

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,9 +35,20 @@ namespace {
 bool DoubleKeyOrderIsSound(const Table& table, const Index& index,
                            const TableStatistics& stats,
                            const std::vector<Value>& end_key,
-                           const std::vector<ColumnName>& provided_order) {
+                           std::span<const ColumnName> provided_order) {
   if (provided_order.empty() || index.sc_.key_.empty()) {
     return true;
+  }
+  // A lexicographic upper bound does not exclude NaN from a later
+  // component for every earlier component. Keep the sort in that case.
+  for (const ColumnName& name : provided_order.subspan(1)) {
+    const auto key = std::ranges::find_if(index.sc_.key_, [&](slot_t column) {
+      return table.GetSchema().GetColumn(column).Name() == name;
+    });
+    if (key == index.sc_.key_.end() ||
+        table.GetSchema().GetColumn(*key).Type() == ValueType::kDouble) {
+      return false;
+    }
   }
   size_t key_pos = index.sc_.key_.size();
   for (size_t k = 0; k < index.sc_.key_.size(); ++k) {
@@ -123,11 +135,19 @@ TableStatistics IndexRangeStats(const TableStatistics& source,
       ++equality_keys;
     }
   }
-  // Correlation damping applies only after an equality prefix.
-  if (equality_keys != 0 && result.Rows() < equality_rows) {
-    const size_t difference = equality_rows - result.Rows();
-    const size_t estimate = equality_rows - (difference / 2) - (difference % 2);
-    result = result.ScaleCardinality(estimate);
+  // Correlation damping applies only after an equality prefix. Mirror
+  // IndexRangeStats: a deeper range key may round above the equality anchor,
+  // in which case cap it at the anchor so the estimate stays monotone in
+  // transform order (and the damping subtraction can never underflow).
+  if (equality_keys != 0) {
+    if (result.Rows() < equality_rows) {
+      const size_t difference = equality_rows - result.Rows();
+      const size_t estimate =
+          equality_rows - (difference / 2) - (difference % 2);
+      result = result.ScaleCardinality(estimate);
+    } else if (result.Rows() > equality_rows) {
+      result = result.ScaleCardinality(equality_rows);
+    }
   }
   return result;
 }
@@ -201,7 +221,7 @@ Schema IndexOnlyScanPlan::OutputSchema() const {
       cols.push_back(table_.GetSchema().GetColumn(included));
     }
   }
-  return {"", cols};
+  return {"", std::move(cols)};
 }
 
 // EmitExecutor lives in the relational factory
@@ -220,8 +240,9 @@ size_t IndexOnlyScanPlan::EmitRowCount() const {
 bool IndexOnlyScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                     const std::vector<bool>& ascending) const {
   return OrderMatches(provided_order_, ascending_, expressions, ascending) &&
-         DoubleKeyOrderIsSound(table_, index_, stats_, end_key_,
-                               provided_order_);
+         DoubleKeyOrderIsSound(
+             table_, index_, stats_, end_key_,
+             std::span{provided_order_}.first(expressions.size()));
 }
 
 bool IndexOnlyScanPlan::IsOrderedBy(
@@ -230,8 +251,9 @@ bool IndexOnlyScanPlan::IsOrderedBy(
     const std::vector<std::optional<bool>>& nulls_first) const {
   return OrderMatches(provided_order_, ascending_, expressions, ascending,
                       nulls_first) &&
-         DoubleKeyOrderIsSound(table_, index_, stats_, end_key_,
-                               provided_order_);
+         DoubleKeyOrderIsSound(
+             table_, index_, stats_, end_key_,
+             std::span{provided_order_}.first(expressions.size()));
 }
 
 void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {
@@ -246,22 +268,12 @@ std::string IndexOnlyScanPlan::ToString() const {
 }
 
 bool IndexOnlyScanPlan::ContainsParameterSlots() const {
-  if (ContainsParameterSlot(where_)) {
-    return true;
-  }
-  return std::ranges::any_of(select_, [](const NamedExpression& column) {
-    return ContainsParameterSlot(column.expression);
-  });
+  return ContainsParameterSlot(where_);
 }
 
 bool IndexOnlyScanPlan::InstallParameterSlots(
     const std::vector<Value>& /*parameters*/, size_t* /*cursor*/,
     std::vector<Expression>* slots) {
-  for (NamedExpression& column : select_) {
-    if (!CollectParameterSlots(&column.expression, slots)) {
-      return false;
-    }
-  }
   return CollectParameterSlots(&where_, slots);
 }
 

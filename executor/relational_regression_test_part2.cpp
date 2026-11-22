@@ -2106,6 +2106,74 @@ TEST_F(RelationalRegressionTest, GroupingSetUniqueFinestKeysKeepSumsAndOrder) {
   }
 }
 
+TEST_F(RelationalRegressionTest, RankedRollupFitsPackedGroupingBudget) {
+  struct RestoreBudget {
+    RestoreBudget() = default;
+    RestoreBudget(const RestoreBudget&) = delete;
+    RestoreBudget& operator=(const RestoreBudget&) = delete;
+    RestoreBudget(RestoreBudget&&) = delete;
+    RestoreBudget& operator=(RestoreBudget&&) = delete;
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+    const size_t limit = QueryMemoryBudget::Global().Limit();
+  } restore;
+  QueryMemoryBudget::Global().ResetForTest(size_t{5} << 20);
+
+  relational_detail::ExecutionRuntime runtime;
+  runtime.grouping_rank_limit = {
+      .partition_name = "a", .order_name = "s", .limit = 2};
+  auto context = rs_->BeginReadOnlyContext();
+  context.set_execution_runtime(&runtime);
+  relational_detail::Relation input;
+  input.schema = Schema(
+      "", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
+           Column("v", ValueType::kDouble)});
+  constexpr int64_t kRows = 8192;
+  std::vector<Row> rows;
+  rows.reserve(static_cast<size_t>(kRows));
+  for (int64_t i = 0; i < kRows; ++i) {
+    const int64_t sum_value = i / 4;
+    rows.emplace_back(
+        Row({Value(i % 2), Value(i), Value(static_cast<double>(sum_value))}));
+  }
+  ASSIGN_OR_ASSERT_FAIL(
+      std::shared_ptr<relational_detail::ColumnarTable>, columnar,
+      relational_detail::BuildColumnarTableFromRows(input.schema, rows));
+  input.SetColumnarTable(std::move(columnar), false);
+  auto statements = MakeGroupingSetStatements(
+      {{"a", "b"}, {"a"}, {}},
+      {{"s",
+        AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("v"))}});
+  auto& total = statements.back();
+  auto projection = total.SelectList();
+  projection.emplace_back("a", ConstantValueExp(Value()));
+  total.SetSelectList(std::move(projection));
+  const std::vector<const SelectStatement*> sets{
+      statements.data(), &statements[1], &statements[2]};
+
+  std::atomic<size_t> active{0};
+  ScopedQueryParallelismBudget budget(&active, 4);
+  ASSIGN_OR_ASSERT_FAIL(
+      std::optional<std::vector<relational_detail::Relation>>, grouped,
+      relational_detail::TryCompactGroupingSets(context, sets, input,
+                                                /*finest_keys_unique=*/true));
+  if (!grouped) {
+    FAIL() << "ranked rollup declined the packed grouping budget";
+  }
+  ASSERT_EQ(grouped->size(), 3U);
+  std::vector<Row> finest;
+  for (int64_t i = kRows - 4; i < kRows; ++i) {
+    finest.emplace_back(Row({Value(i % 2), Value(i), Value(2047.0)}));
+  }
+  constexpr double kPartitionTotal = 4192256.0;
+  EXPECT_EQ(grouped->at(0).rows, finest);
+  EXPECT_EQ(grouped->at(1).rows,
+            (std::vector<Row>{Row({Value(0), Value(kPartitionTotal)}),
+                              Row({Value(1), Value(kPartitionTotal)})}));
+  EXPECT_EQ(grouped->at(2).rows,
+            (std::vector<Row>{Row({Value(2 * kPartitionTotal), Value()})}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(RelationalRegressionTest, GroupingSetBorrowedKeysBecomeOwnedOutputs) {
   auto context = rs_->BeginContext();
   const auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,

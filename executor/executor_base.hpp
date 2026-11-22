@@ -82,8 +82,7 @@ class ExecutorBase {
 
   // Sticky execution error. Next()/NextBatch() return false/0 both at EOF
   // and on failure; callers must inspect GetStatus() after exhaustion to
-  // tell the two apart. The first recorded error wins (ARIES-style
-  // fail-fast cursor semantics).
+  // tell the two apart. The first recorded error wins (sticky error).
   // Virtual: transparent decorators (RetainedExecutor, IndexSkipScanExecutor)
   // forward to the wrapped executor so a child's error is not reported as a
   // successful exhaustion by the outermost cursor.

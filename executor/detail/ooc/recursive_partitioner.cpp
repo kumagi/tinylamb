@@ -2,7 +2,9 @@
 #include "executor/detail/ooc/recursive_partitioner.hpp"
 
 #include <algorithm>
+#include <new>
 #include <ranges>
+#include <stdexcept>
 #include <utility>
 
 #include "common/memory_budget.hpp"
@@ -100,9 +102,10 @@ uint32_t RecursivePartitioner::RadixBucket(uint64_t hash, uint32_t depth,
 }
 
 RecursivePartitioner::RecursivePartitioner(Options options, RowHashFn hash_fn)
-    : options_(options), hash_fn_(std::move(hash_fn)) {
-  root_fanout_bits_ =
-      ComputeFanoutBits(EffectiveBudgetBytes(), &root_writer_buf_);
+    : options_(options),
+      store_alive_(options.spill_store ? options.spill_store->LifetimeToken()
+                                       : std::weak_ptr<const bool>{}),
+      hash_fn_(std::move(hash_fn)) {
   if (options_.grant != nullptr) {
     const size_t refill =
         options_.memory_budget_bytes > 0
@@ -176,44 +179,48 @@ Status RecursivePartitioner::WriteRowToBucket(BucketWriter* bucket, Row&& row,
   return Status::kSuccess;
 }
 
-Status RecursivePartitioner::InitRootSpillWriters() {
+Status RecursivePartitioner::TransitionToSpill() try {
+  if (spilled_) {
+    return Status::kSuccess;
+  }
   if (options_.spill_store == nullptr) {
     return StatusError(
         StatusCode::kMemoryLimitExceeded,
         "RecursivePartitioner exceeded budget with no SpillStore configured");
   }
-  root_fanout_bits_ =
-      ComputeFanoutBits(EffectiveBudgetBytes(), &root_writer_buf_);
-  const size_t fanout = size_t{1} << root_fanout_bits_;
-  root_writers_.clear();
-  root_writers_.resize(fanout);
-  for (size_t i = 0; i < fanout; ++i) {
-    root_writers_[i].writer = std::make_unique<SpillSegmentWriter>(
-        options_.spill_store, root_writer_buf_);
+  size_t writer_buffer = 0;
+  const uint32_t fanout_bits =
+      ComputeFanoutBits(EffectiveBudgetBytes(), &writer_buffer);
+  std::vector<BucketWriter> pending(size_t{1} << fanout_bits);
+  for (BucketWriter& bucket : pending) {
+    bucket.writer = std::make_unique<SpillSegmentWriter>(options_.spill_store,
+                                                         writer_buffer);
   }
-  return Status::kSuccess;
-}
+  // Keep the original rows until every pending writer has flushed. A failed
+  // transition destroys its private segments and leaves the rows retryable.
+  for (const Row& row : mem_rows_) {
+    const uint32_t bucket = RadixBucket(hash_fn_(row), 0, fanout_bits);
+    RETURN_IF_FAIL(WriteRowToBucket(&pending[bucket], Row(row),
+                                    EstimateRowMemoryBytes(row)));
+  }
+  for (BucketWriter& bucket : pending) {
+    RETURN_IF_FAIL(FlushBucket(&bucket));
+    RETURN_IF_FAIL(bucket.writer->Flush());
+  }
 
-Status RecursivePartitioner::TransitionToSpill() {
-  if (spilled_) {
-    return Status::kSuccess;
-  }
-  RETURN_IF_FAIL(InitRootSpillWriters());
-  for (Row& r : mem_rows_) {
-    const uint64_t h = hash_fn_(r);
-    const uint32_t bucket = RadixBucket(h, /*depth=*/0, root_fanout_bits_);
-    const size_t bytes = EstimateRowMemoryBytes(r);
-    RETURN_IF_FAIL(
-        WriteRowToBucket(&root_writers_[bucket], std::move(r), bytes));
-  }
-  mem_rows_.clear();
-  mem_rows_.shrink_to_fit();
+  root_writers_ = std::move(pending);
+  root_fanout_bits_ = fanout_bits;
+  std::vector<Row>().swap(mem_rows_);
   mem_bytes_ = 0;
   if (grant_cache_.has_value()) {
     grant_cache_->ReleaseAll();
   }
   spilled_ = true;
   return Status::kSuccess;
+} catch (const std::length_error&) {
+  return Status::kTooBigData;
+} catch (const std::bad_alloc&) {
+  return Status::kMemoryLimitExceeded;
 }
 
 Status RecursivePartitioner::AddRow(const Row& row) {
@@ -222,48 +229,40 @@ Status RecursivePartitioner::AddRow(const Row& row) {
 }
 
 Status RecursivePartitioner::AddRow(Row&& row) {
+  if (options_.spill_store != nullptr && store_alive_.expired()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spill store is no longer alive");
+  }
   if (finalized_) {
     return StatusError(StatusCode::kInvalidArgument,
                        "cannot AddRow to finalized RecursivePartitioner");
   }
-  ++total_rows_;
   const size_t row_bytes = EstimateRowMemoryBytes(row);
-  const size_t budget = EffectiveBudgetBytes();
-  const bool always_spill = options_.force_spill ||
-                            ProcessMemoryBudget::Global().AlwaysSpillEnabled();
-
-  if (spilled_) {
-    const uint64_t h = hash_fn_(row);
-    const uint32_t bucket = RadixBucket(h, /*depth=*/0, root_fanout_bits_);
-    return WriteRowToBucket(&root_writers_[bucket], std::move(row), row_bytes);
-  }
-
-  bool need_spill = always_spill;
-  if (!need_spill && budget > 0 && !mem_rows_.empty() &&
-      mem_bytes_ + row_bytes > budget) {
-    need_spill = true;
-  }
-  if (!need_spill && budget > 0 && row_bytes > budget) {
-    need_spill = true;
-  }
-  if (!need_spill && grant_cache_.has_value() &&
-      !grant_cache_->Reserve(row_bytes)) {
-    need_spill = true;
-  }
-
-  if (need_spill) {
+  if (!spilled_) {
+    const size_t budget = EffectiveBudgetBytes();
+    const bool need_spill =
+        options_.force_spill ||
+        ProcessMemoryBudget::Global().AlwaysSpillEnabled() ||
+        (budget > 0 &&
+         (row_bytes > budget || mem_bytes_ > budget - row_bytes)) ||
+        (grant_cache_.has_value() && !grant_cache_->Reserve(row_bytes));
+    if (!need_spill) {
+      mem_rows_.push_back(std::move(row));
+      ++total_rows_;
+      mem_bytes_ += row_bytes;
+      if (mem_bytes_ > peak_mem_bytes_) {
+        peak_mem_bytes_ = mem_bytes_;
+        ProcessMemoryBudget::Global().RecordOperatorPeakBytes(peak_mem_bytes_);
+      }
+      return Status::kSuccess;
+    }
     RETURN_IF_FAIL(TransitionToSpill());
-    const uint64_t h = hash_fn_(row);
-    const uint32_t bucket = RadixBucket(h, /*depth=*/0, root_fanout_bits_);
-    return WriteRowToBucket(&root_writers_[bucket], std::move(row), row_bytes);
   }
 
-  mem_rows_.push_back(std::move(row));
-  mem_bytes_ += row_bytes;
-  if (mem_bytes_ > peak_mem_bytes_) {
-    peak_mem_bytes_ = mem_bytes_;
-    ProcessMemoryBudget::Global().RecordOperatorPeakBytes(peak_mem_bytes_);
-  }
+  const uint32_t bucket = RadixBucket(hash_fn_(row), 0, root_fanout_bits_);
+  RETURN_IF_FAIL(
+      WriteRowToBucket(&root_writers_[bucket], std::move(row), row_bytes));
+  ++total_rows_;
   return Status::kSuccess;
 }
 
@@ -312,7 +311,9 @@ Status RecursivePartitioner::SplitOversizedPartition(
     RETURN_IF_FAIL(FlushBucket(&bw));
     ASSIGN_OR_RETURN(SpillSegmentId, id, bw.writer->Finish(false));
     bw.scratch.clear();
-    bw.scratch.shrink_to_fit();
+    // T3462: shrink_to_fit can throw bad_alloc across the Status boundary;
+    // swap-with-empty frees the capacity without allocating (T2060 idiom).
+    std::string().swap(bw.scratch);
     children_out->push_back(PendingPartition{
         .segment_id = id,
         .row_count = bw.row_count,
@@ -334,11 +335,13 @@ Status RecursivePartitioner::Finalize(PartitionLeafSet* result_out) {
     return StatusError(StatusCode::kInvalidArgument,
                        "RecursivePartitioner already finalized");
   }
+  if (options_.spill_store != nullptr && store_alive_.expired()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spill store is no longer alive");
+  }
   result_out->DropAll();
   result_out->store_ = options_.spill_store;
-  result_out->store_alive_ = options_.spill_store != nullptr
-                                 ? options_.spill_store->LifetimeToken()
-                                 : std::weak_ptr<const bool>{};
+  result_out->store_alive_ = store_alive_;
   finalized_ = true;
 
   if (!spilled_) {
@@ -369,10 +372,8 @@ Status RecursivePartitioner::Finalize(PartitionLeafSet* result_out) {
   // Own pending segments in a local RAII guard so any error returns clean up
   // all remaining segments without leaks.
   struct PendingGuard {
-    explicit PendingGuard(SpillStore* s)
-        : store(s),
-          store_alive(s != nullptr ? s->LifetimeToken()
-                                   : std::weak_ptr<const bool>{}) {}
+    PendingGuard(SpillStore* s, std::weak_ptr<const bool> alive)
+        : store(s), store_alive(std::move(alive)) {}
     PendingGuard(const PendingGuard&) = delete;
     PendingGuard& operator=(const PendingGuard&) = delete;
     PendingGuard(PendingGuard&&) = delete;
@@ -385,7 +386,7 @@ Status RecursivePartitioner::Finalize(PartitionLeafSet* result_out) {
     SpillStore* store;
     std::weak_ptr<const bool> store_alive;
     std::vector<PendingPartition> items;
-  } pending_guard(options_.spill_store);
+  } pending_guard(options_.spill_store, store_alive_);
 
   for (BucketWriter& bw : root_writers_) {
     if (bw.row_count == 0) {
@@ -469,11 +470,13 @@ Status RecursivePartitioner::Finalize(PartitionLeafSet* result_out) {
     const Status split_st = SplitOversizedPartition(
         part, child_fanout_bits, child_writer_buf, &children);
     // Drop consumed parent segment immediately (blocks return to free_blocks_).
-    options_.spill_store->DropSegment(part.segment_id);
+    SpillStore::DropSegmentIfAlive(options_.spill_store, store_alive_,
+                                   part.segment_id);
     part.segment_id = kInvalidSpillSegmentId;
     if (split_st != Status::kSuccess) {
       for (const PendingPartition& c : children) {
-        options_.spill_store->DropSegment(c.segment_id);
+        SpillStore::DropSegmentIfAlive(options_.spill_store, store_alive_,
+                                       c.segment_id);
       }
       return split_st;
     }

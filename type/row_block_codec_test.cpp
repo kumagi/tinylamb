@@ -20,8 +20,11 @@ namespace {
 TEST(RowBlockCodecTest, RoundTripsAllValueVariantsIncludingLargeStrings) {
   const std::string huge(80000, 'Z');  // > 64 KiB (exceeds Encoder 16-bit max)
   std::vector<Row> rows;
-  rows.push_back(Row({Value().WithCollation(2), Value(int64_t{-42}), Value(std::string(huge)),
-                      Value(std::numbers::pi), Value::DateFromDays(19724)}));
+  Value tagged_null;
+  ASSERT_TRUE(tagged_null.SetCollation(2));
+  rows.push_back(
+      Row({tagged_null, Value(int64_t{-42}), Value(std::string(huge)),
+           Value(std::numbers::pi), Value::DateFromDays(19724)}));
   rows.push_back(
       Row({Value(int64_t{7}).WithUnsigned(), Value("AbC").WithCollation(2),
            Value("1 day").WithInterval(),

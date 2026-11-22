@@ -132,9 +132,6 @@ bool ColumnarColumn::AnyNonNull(size_t row_count) const noexcept {
     case Encoding::kConstant:
       return !const_is_null && type != ValueType::kNull;
     case Encoding::kDictionary: {
-      if (!has_null) {
-        return dict != nullptr && DictEntryCount() > 0;
-      }
       const size_t n = borrowed_dict_u8 != nullptr
                            ? std::min(row_count, borrowed_count)
                            : std::min(row_count, dict_codes.size());
@@ -1257,10 +1254,9 @@ std::string_view SliceUtf8SubstringView(std::string_view s, int64_t start,
     }
     // total_cps (>= 0) + start is UB only when start == INT64_MIN; in that
     // case the effective start is before the string, so clamp to the head.
-    const int64_t signed_start =
-        start == std::numeric_limits<int64_t>::min()
-            ? std::numeric_limits<int64_t>::min()
-            : static_cast<int64_t>(total_cps) + start;
+    const int64_t signed_start = start == std::numeric_limits<int64_t>::min()
+                                     ? std::numeric_limits<int64_t>::min()
+                                     : static_cast<int64_t>(total_cps) + start;
     actual_start = signed_start > 0 ? static_cast<size_t>(signed_start) : 0;
   }
   if (actual_start >= s.size()) {
@@ -1335,11 +1331,13 @@ bool ColumnarColumn::AppendSubstringFrom(const ColumnarColumn& src,
         if (has_null) {
           nulls[prev_rows + i] = 0;
         }
-        strings[prev_rows + i] = SliceUtf8SubstringView(
-            v.value.varchar_value, start, length, has_length);
+        // Fallback Value payloads are owned by the source's rows. Copy only
+        // the substring so the destination owns its bytes.
+        strings[prev_rows + i] =
+            EnsureLocalArena()->Store(SliceUtf8SubstringView(
+                v.AsStringView(), start, length, has_length));
       }
     }
-    RetainOwnersFrom(src);
     return true;
   }
   if (src.type == ValueType::kNull) {
@@ -1499,8 +1497,9 @@ CompiledColumnarProjection CompiledColumnarProjection::Compile(
       plan.items.push_back(std::move(item));
       continue;
     }
-    auto try_compile_null_coalesce = [&](const Expression& primary,
-                                         const Expression& fallback_expr) -> bool {
+    auto try_compile_null_coalesce =
+        [&](const Expression& primary,
+            const Expression& fallback_expr) -> bool {
       if (!primary || !fallback_expr ||
           primary->Type() != TypeTag::kColumnValue ||
           fallback_expr->Type() != TypeTag::kColumnValue) {
@@ -1548,16 +1547,16 @@ CompiledColumnarProjection CompiledColumnarProjection::Compile(
             if (u.Op() == UnaryOperation::kIsNotNull &&
                 ce.when_clauses_[0].second &&
                 ce.when_clauses_[0].second->Type() == TypeTag::kColumnValue &&
-                ResolveScalarColumnOffset(
-                    input_schema,
-                    ce.when_clauses_[0].second->AsColumnValue().GetColumnName()) ==
-                    cond_off &&
+                ResolveScalarColumnOffset(input_schema,
+                                          ce.when_clauses_[0]
+                                              .second->AsColumnValue()
+                                              .GetColumnName()) == cond_off &&
                 try_compile_null_coalesce(ce.when_clauses_[0].second,
                                           ce.else_clause_)) {
               continue;
             }
-            if (u.Op() == UnaryOperation::kIsNull && ce.else_clause_->Type() ==
-                                                         TypeTag::kColumnValue &&
+            if (u.Op() == UnaryOperation::kIsNull &&
+                ce.else_clause_->Type() == TypeTag::kColumnValue &&
                 ResolveScalarColumnOffset(
                     input_schema,
                     ce.else_clause_->AsColumnValue().GetColumnName()) ==
@@ -1640,9 +1639,63 @@ CompiledColumnarProjection CompiledColumnarProjection::Compile(
 }
 
 StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
-    const CompiledColumnarProjection& plan, const ColumnarTable& input) {
+    const CompiledColumnarProjection& plan, const ColumnarTable& input,
+    std::shared_ptr<const ColumnarTable>* mutable_input) {
   if (!plan.all_fast) {
     return std::optional<std::shared_ptr<ColumnarTable>>(std::nullopt);
+  }
+  if (mutable_input != nullptr && *mutable_input != nullptr &&
+      mutable_input->get() == &input && mutable_input->use_count() == 1 &&
+      !input.chunks.empty()) {
+    bool all_pass_through = true;
+    for (const auto& item : plan.items) {
+      if (item.kind != CompiledColumnarProjection::Kind::kPassThrough) {
+        all_pass_through = false;
+        break;
+      }
+    }
+    if (all_pass_through) {
+      auto& mut_in = *const_cast<ColumnarTable*>(mutable_input->get());
+      auto out = std::make_shared<ColumnarTable>();
+      out->keepalives = std::move(mut_in.keepalives);
+      out->chunks.reserve(mut_in.chunks.size());
+      const size_t nitems = plan.items.size();
+      std::vector<size_t> ref_counts;
+      for (ColumnarChunk& src : mut_in.chunks) {
+        if (src.rows == 0) {
+          continue;
+        }
+        ref_counts.assign(src.columns.size(), 0);
+        for (const auto& item : plan.items) {
+          if (item.src_col < ref_counts.size()) {
+            ++ref_counts[item.src_col];
+          }
+        }
+        ColumnarChunk dst;
+        dst.columns.resize(nitems);
+        dst.string_arena = std::move(src.string_arena);
+        dst.keepalives = std::move(src.keepalives);
+        dst.rows = src.rows;
+        for (size_t k = 0; k < nitems; ++k) {
+          const auto& item = plan.items[k];
+          if (item.src_col < src.columns.size()) {
+            ColumnarColumn& sc = src.columns[item.src_col];
+            dst.RetainColumnOwners(sc);
+            if (--ref_counts[item.src_col] == 0) {
+              dst.columns[k] = std::move(sc);
+            } else {
+              dst.columns[k] = sc;
+            }
+          } else {
+            dst.columns[k].AppendConstant(Value(), src.rows, nullptr, 0);
+          }
+        }
+        out->total_rows += dst.rows;
+        out->chunks.push_back(std::move(dst));
+      }
+      mutable_input->reset();
+      return std::optional<std::shared_ptr<ColumnarTable>>(std::move(out));
+    }
   }
   auto out = std::make_shared<ColumnarTable>();
   out->keepalives = input.keepalives;
@@ -1688,7 +1741,8 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
       }
     }
   }
-  const size_t out_chunk_count = slice_single_flat_chunk ? max_workers : nchunks;
+  const size_t out_chunk_count =
+      slice_single_flat_chunk ? max_workers : nchunks;
   std::vector<ColumnarChunk> out_chunks(out_chunk_count);
   std::atomic<bool> abort_flag{false};
   std::atomic<uint8_t> unsupported_flag{0};
@@ -1865,7 +1919,8 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
           if (c1.has_null) {
             out_nulls.resize(row_cnt, 0);
           }
-          if (both_flat && (vt == ValueType::kInt64 || vt == ValueType::kDate)) {
+          if (both_flat &&
+              (vt == ValueType::kInt64 || vt == ValueType::kDate)) {
             col.ints.resize(row_cnt);
             const uint8_t* n0 =
                 c0.nulls.empty() ? nullptr : (c0.nulls.data() + row_off);
@@ -2004,11 +2059,21 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
                       sc.ToBytecodeView(src.rows, &view_scratches[c], nullptr);
                 } else if (sc.IsFlat()) {
                   BytecodeColumnView v = sc.AsBytecodeView();
-                  if (v.nulls != nullptr) v.nulls += row_off;  // NOLINT(readability-braces-around-statements)
-                  if (v.ints != nullptr) v.ints += row_off;  // NOLINT(readability-braces-around-statements)
-                  if (v.doubles != nullptr) v.doubles += row_off;  // NOLINT(readability-braces-around-statements)
-                  if (v.strings != nullptr) v.strings += row_off;  // NOLINT(readability-braces-around-statements)
-                  if (v.fallback != nullptr) v.fallback += row_off;  // NOLINT(readability-braces-around-statements)
+                  if (v.nulls != nullptr) {
+                    v.nulls += row_off;
+                  }
+                  if (v.ints != nullptr) {
+                    v.ints += row_off;
+                  }
+                  if (v.doubles != nullptr) {
+                    v.doubles += row_off;
+                  }
+                  if (v.strings != nullptr) {
+                    v.strings += row_off;
+                  }
+                  if (v.fallback != nullptr) {
+                    v.fallback += row_off;
+                  }
                   views[c] = v;
                 } else {
                   copy_flat_subrange(view_scratches[c], sc, row_off, row_cnt);
@@ -2199,10 +2264,10 @@ std::shared_ptr<ColumnarTable> SliceColumnarTable(const ColumnarTable& input,
         if (scol.gather_index != nullptr &&
             hi <= scol.gather_index->src_rows.size() &&
             hi <= scol.gather_index->src_chunks.size()) {
-          sub.columns[c].SetGathered(
-              slice_gather(scol.gather_index), scol.gather_col, scol.type,
-              scol.is_unsigned, scol.is_interval, scol.is_uniform,
-              scol.has_null);
+          sub.columns[c].SetGathered(slice_gather(scol.gather_index),
+                                     scol.gather_col, scol.type,
+                                     scol.is_unsigned, scol.is_interval,
+                                     scol.is_uniform, scol.has_null);
         } else {
           // Missing mappings are read as NULL. AppendValue builds a null
           // bitmap even when the input advertised an all-non-null slice.
@@ -2282,7 +2347,7 @@ Status MaterializeColumnarTableToRows(const ColumnarTable& table,
     }
     return Status::kSuccess;
   }
-  const Status st = RunParallelTasks(workers, [&](size_t worker) {
+  Status st = RunParallelTasks(workers, [&](size_t worker) {
     const size_t lo = (table.chunks.size() * worker) / workers;
     const size_t hi = (table.chunks.size() * (worker + 1)) / workers;
     for (size_t ci = lo; ci < hi; ++ci) {
@@ -2294,7 +2359,8 @@ Status MaterializeColumnarTableToRows(const ColumnarTable& table,
     if (uniform_ok != nullptr) {
       *uniform_ok = false;
     }
-    // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this type
+    // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for
+    // this type
     return st;
   }
   return Status::kSuccess;

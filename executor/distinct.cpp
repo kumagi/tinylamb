@@ -114,8 +114,15 @@ size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
       } else {
         current_keys.values_.reserve(key_cols_.size());
         for (slot_t c : key_cols_) {
-          current_keys.values_.push_back(
-              c < row.Count() ? row[static_cast<size_t>(c)] : Value());
+          // A positional key outside the input row is a plan error, not a
+          // NULL key: substituting Value() would fold unrelated rows together
+          // and silently lose DISTINCT results.
+          if (static_cast<size_t>(c) >= row.Count()) {
+            FailWith(StatusError(StatusCode::kInvalidArgument,
+                                 "DISTINCT key column out of range"));
+            return 0;  // do not emit a partial DISTINCT batch on error
+          }
+          current_keys.values_.push_back(row[static_cast<size_t>(c)]);
         }
       }
       if (seen_keys_.insert(std::move(current_keys)).second) {

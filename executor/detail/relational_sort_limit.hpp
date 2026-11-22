@@ -30,6 +30,7 @@ struct TopNOutputSlot {
   size_t col{0};
   bool is_coalesce{false};
   size_t fallback_col{0};
+  const BytecodeProgram* program{nullptr};
 };
 
 struct ColumnarTopNKey {
@@ -202,13 +203,17 @@ Status MergeKeyedSpillRuns(const std::vector<SortKeyOrder>& order_specs,
 
 class ExternalKeyedSorter {
  public:
+  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  //   (single_pass_argmax_eq_filterMaxRows)
   ExternalKeyedSorter(std::vector<SortKeyOrder> order_specs,
-                      bool bounded_requested, size_t topn_capacity)
+                      bool bounded_requested, size_t topn_capacity,
+                      bool top1_with_ties = false)
       : order_specs_(std::move(order_specs)),
         bounded_requested_(bounded_requested),
+        top1_with_ties_(top1_with_ties && !order_specs_.empty()),
         topn_capacity_(topn_capacity) {
     use_bounded_heap_ =
-        bounded_requested && topn_capacity <= 1000000 &&
+        !top1_with_ties_ && bounded_requested && topn_capacity <= 1000000 &&
         (topn_capacity <= 4096 ||
          QueryMemoryBudget::Global().CanReserve(topn_capacity * 160));
   }
@@ -217,6 +222,36 @@ class ExternalKeyedSorter {
     keyed.sequence = next_sequence_++;
     const size_t entry_bytes = EstimateKeyedRowBytes(keyed);
     auto& budget = QueryMemoryBudget::Global();
+    if (top1_with_ties_) {
+      if (!sortable_.empty()) {
+        int cmp = 0;
+        for (size_t i = 0; i < order_specs_.size(); ++i) {
+          cmp =
+              order_specs_[i].Compare(keyed.keys[i], sortable_.front().keys[i]);
+          if (cmp != 0) {
+            break;
+          }
+        }
+        if (cmp > 0) {
+          return Status::kSuccess;
+        }
+        if (cmp < 0) {
+          charge_.Release(buffered_bytes_);
+          buffered_bytes_ = 0;
+          sortable_.clear();
+        }
+      }
+      if (!budget.Unlimited() && !sortable_.empty() &&
+          !budget.CanReserve(entry_bytes)) {
+        top1_with_ties_ = false;
+        RETURN_IF_FAIL(FlushRun());
+      } else {
+        charge_.Add(entry_bytes);
+        buffered_bytes_ += entry_bytes;
+        sortable_.push_back(std::move(keyed));
+        return Status::kSuccess;
+      }
+    }
     if (use_bounded_heap_) {
       const auto precedes = [&](const KeyedRow& a, const KeyedRow& b) {
         return KeyedRowPrecedes(order_specs_, a, b);
@@ -298,10 +333,12 @@ class ExternalKeyedSorter {
         bounded_requested_ ? std::optional<size_t>(topn_capacity_)
                            : std::nullopt;
     if (sorted_runs_.empty()) {
-      if (use_bounded_heap_) {
-        std::ranges::sort(sortable_, precedes);
-      } else {
-        std::ranges::stable_sort(sortable_, precedes);
+      if (!top1_with_ties_) {
+        if (use_bounded_heap_) {
+          std::ranges::sort(sortable_, precedes);
+        } else {
+          std::ranges::stable_sort(sortable_, precedes);
+        }
       }
       const size_t count = limit.has_value()
                                ? std::min(sortable_.size(), *limit)
@@ -350,6 +387,7 @@ class ExternalKeyedSorter {
   std::vector<SortKeyOrder> order_specs_;
   bool bounded_requested_{false};
   bool use_bounded_heap_{false};
+  bool top1_with_ties_{false};
   size_t topn_capacity_{0};
   size_t next_sequence_{0};
   std::vector<KeyedRow> sortable_;

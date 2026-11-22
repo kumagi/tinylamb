@@ -258,70 +258,66 @@ SimpleCivilTime NanosToCivil(platform::Int128 nanos) {
 // Parses GoogleSQL-style timestamp text ("YYYY-MM-DD[ T]HH:MM:SS[.fff][±tz]").
 // Returns nanos since epoch UTC, or nullopt when unparsable.
 std::optional<platform::Int128> ParseTimestampText(std::string_view s) {
-  SimpleCivilTime ct;
-  int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
-  const std::string_view date_part =
-      s.substr(0, std::min<size_t>(10, s.size()));
-  if (date_part.find('\0') != std::string_view::npos) {
-    return std::nullopt;  // c_str() would truncate at the embedded NUL
-  }
-  // NOLINTNEXTLINE(cert-err34-c)
-  if (std::sscanf(std::string(date_part).c_str(), "%d-%d-%d", &Y, &M, &D) !=
-      3) {
+  s = TrimAsciiWhitespace(s);
+  if (s.find('\0') != std::string_view::npos) {
     return std::nullopt;
   }
-  ct.year = Y;
-  ct.month = static_cast<unsigned>(M);
-  ct.day = static_cast<unsigned>(D);
-  size_t pos = 10;
-  while (pos < s.size() && (s[pos] == ' ' || s[pos] == 'T' || s[pos] == 't')) {
-    ++pos;
+  const size_t separator = s.find_first_of(" Tt");
+  const auto days = TryParseDateDays(s.substr(0, separator));
+  if (!days.HasValue()) {
+    return std::nullopt;
   }
-  if (pos < s.size()) {
-    // NOLINTNEXTLINE(cert-err34-c)
-    int consumed = 0;
-    // NOLINTNEXTLINE(cert-err34-c)
-    if (std::sscanf(std::string(s.substr(pos)).c_str(), "%d:%d:%d%n", &h, &m,
-                    &sec, &consumed) == 3 &&
-        (h >= 0 && h <= 23 && m >= 0 && m <= 59 && sec >= 0 && sec <= 60)) {
-      ct.hour = h;
-      ct.minute = m;
-      ct.second = sec;
-      while (pos < s.size() && s[pos] != '.' && s[pos] != '+' &&
-             s[pos] != '-') {
-        ++pos;
+  const std::chrono::year_month_day date{
+      std::chrono::sys_days{std::chrono::days{days.Value()}}};
+  SimpleCivilTime ct{.year = static_cast<int>(date.year()),
+                     .month = static_cast<unsigned>(date.month()),
+                     .day = static_cast<unsigned>(date.day())};
+  if (separator == std::string_view::npos) {
+    return CivilToNanos(ct);
+  }
+
+  s = TrimAsciiWhitespace(s.substr(separator + 1));
+  int consumed = 0;
+  // Limit each field before parsing and start the zone at the actual end
+  // of the time, so trailing junk cannot be skipped.
+  // NOLINTNEXTLINE(cert-err34-c)
+  if (std::sscanf(std::string(s).c_str(), "%2d:%2d:%2d%n", &ct.hour, &ct.minute,
+                  &ct.second, &consumed) != 3 ||
+      ct.hour < 0 || ct.hour > 23 || ct.minute < 0 || ct.minute > 59 ||
+      ct.second < 0 || ct.second > 60) {
+    return std::nullopt;
+  }
+  s.remove_prefix(static_cast<size_t>(consumed));
+  if (s.starts_with('.')) {
+    s.remove_prefix(1);
+    size_t digits = 0;
+    while (!s.empty() && '0' <= s.front() && s.front() <= '9') {
+      if (digits < 9) {
+        ct.nanos = (ct.nanos * 10) + (s.front() - '0');
+        ++digits;
       }
-      if (pos < s.size() && s[pos] == '.') {
-        const size_t begin = ++pos;
-        while (pos < s.size() &&
-               (std::isdigit(static_cast<unsigned char>(s[pos])) != 0)) {
-          ++pos;
-        }
-        std::string frac(s.substr(begin, pos - begin));
-        while (frac.size() < 9) {
-          frac.push_back('0');
-        }
-        if (frac.size() > 9) {
-          frac.resize(9);
-        }
-        ct.nanos = std::strtoll(frac.c_str(), nullptr, 10);
-      }
-      if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) {
-        const char sign = s[pos];
-        int th = 0, tm = 0;
-        int tz_consumed = 0;
-        // NOLINTNEXTLINE(cert-err34-c)
-        if (std::sscanf(std::string(s.substr(pos + 1)).c_str(), "%d:%d%n", &th,
-                        &tm, &tz_consumed) >= 1 &&
-            tz_consumed > 0 && pos + 1 + tz_consumed == s.size()) {
-          const int offset = (th * 3600) + (tm * 60);
-          return CivilToNanos(ct) - (static_cast<platform::Int128>(offset) *
-                                     1000000000 * (sign == '-' ? -1 : 1));
-        }
-      }
+      s.remove_prefix(1);
+    }
+    if (digits == 0) {
+      return std::nullopt;
+    }
+    while (digits++ < 9) {
+      ct.nanos *= 10;
     }
   }
-  return CivilToNanos(ct);
+
+  const std::string_view zone = TrimAsciiWhitespace(s);
+  const platform::Int128 civil_nanos = CivilToNanos(ct);
+  if (zone.empty()) {
+    return civil_nanos;
+  }
+  const auto offset = TryTimeZoneOffsetAtLocalTime(
+      zone, ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second);
+  if (!offset.HasValue()) {
+    return std::nullopt;
+  }
+  return civil_nanos -
+         (static_cast<platform::Int128>(offset.Value()) * 1000000000);
 }
 
 // Renders epoch nanos in GoogleSQL UTC timestamp text; precision picks the
@@ -475,21 +471,21 @@ StatusOr<Value> ApplyReadConversion(FieldFormat format, Value v) {
   return v;
 }
 
-std::optional<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
+StatusOr<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
   if (v.IsNull()) {
-    return std::nullopt;
+    return v;
   }
   switch (format) {
     case FieldFormat::kNone:
-      return std::nullopt;  // caller uses the value verbatim
+      return v;
     case FieldFormat::kDateDays:
       if (v.type == ValueType::kDate) {
         return Value(v.DateDays());
       }
-      return std::nullopt;
+      return v;
     case FieldFormat::kDateDecimal: {
       if (v.type != ValueType::kDate) {
-        return std::nullopt;
+        return v;
       }
       const std::string text = FormatDateDays(v.DateDays());
       // The text is produced by FormatDateDays and is always a valid date.
@@ -508,7 +504,8 @@ std::optional<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
         const std::optional<platform::Int128> nanos =
             ParseTimestampText(std::string_view(v.value.varchar_value));
         if (!nanos.has_value()) {
-          return std::nullopt;
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid TIMESTAMP for protocol message field");
         }
         auto floor_div = [](platform::Int128 a, platform::Int128 b) -> int64_t {
           const platform::Int128 q = a / b;
@@ -524,9 +521,9 @@ std::optional<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
             return Value(floor_div(*nanos, 1000LL));
         }
       }
-      return std::nullopt;
+      return v;
   }
-  return std::nullopt;
+  return v;
 }
 
 // Default values surfaced for absent annotated fields of the compliance
@@ -1390,7 +1387,7 @@ StatusOr<bool> TryProtoTextExtractField(std::string_view text,
       elem_type = "INT64";
     }
   }
-  *out = Value::Array(std::move(elements), elem_type);
+  *out = Value::Array(std::move(elements), std::move(elem_type));
   return true;
 }
 
@@ -1498,9 +1495,9 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
     }
     // Setting: convert the value per field-name FORMAT annotations, then
     // replace the first matching entry in place (or append at the end).
-    std::optional<Value> converted =
-        ApplyWriteConversion(ClassifyFieldFormat(target), new_value);
-    Value value_to_store = converted.has_value() ? *converted : new_value;
+    ASSIGN_OR_RETURN(
+        Value, value_to_store,
+        ApplyWriteConversion(ClassifyFieldFormat(target), new_value));
 
     std::vector<ProtoTextEntry> replacement;
     replacement.reserve(value_to_store.ArrayElements().size());
@@ -1728,9 +1725,9 @@ StatusOr<std::string> TryConstructProtoText(
       continue;
     }
     RETURN_IF_FAIL(TryValidateEnumFieldValue(type_name, field_name, raw_value));
-    std::optional<Value> converted =
-        ApplyWriteConversion(ClassifyFieldFormat(field_name), raw_value);
-    Value value = converted.has_value() ? *converted : raw_value;
+    ASSIGN_OR_RETURN(
+        Value, value,
+        ApplyWriteConversion(ClassifyFieldFormat(field_name), raw_value));
     if (value.IsArray()) {
       for (const Value& element : value.ArrayElements()) {
         if (element.IsNull()) {
@@ -2018,7 +2015,8 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
     const bool repeated = spec_it != fields.end() && spec_it->second.repeated;
     if (previous == merged.end() || repeated) {
       merged.push_back(entry);
-    } else if (entry.first == "nested_value" || entry.first == "OptionalGroup" ||
+    } else if (entry.first == "nested_value" ||
+               entry.first == "OptionalGroup" ||
                entry.first == "OptionalGroupNested") {
       if (!entry.second.empty()) {
         if (!previous->second.empty()) {
@@ -2111,7 +2109,7 @@ StatusOr<bool> GetFieldPathInBody(std::string_view body,
     return TryProtoTextExtractField(std::string_view(), path.back(), out);
   }
   if (saw_array) {
-    *out = Value::Array(std::move(merged), element_type);
+    *out = Value::Array(std::move(merged), std::move(element_type));
     return true;
   }
   *out = std::move(scalar_result);

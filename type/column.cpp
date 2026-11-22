@@ -81,7 +81,8 @@ bool Column::IntegerValueFits(const Value& value) const {
 
 Encoder& operator<<(Encoder& a, const Column& c) {
   // Bits 0..2 encode ValueType, bit 3 marks INTERVAL, bits 4..5 encode
-  // integer width, and bit 7 marks unsignedness.
+  // integer width, and bit 7 marks unsignedness. For VARCHAR, bit 6 marks
+  // a declared text domain and bit 4 distinguishes TIMESTAMP from STRING.
   auto encoded_type = static_cast<uint8_t>(c.type_);
   if (c.unsigned_) {
     encoded_type |= 0x80;
@@ -94,6 +95,10 @@ Encoder& operator<<(Encoder& a, const Column& c) {
                         : c.integer_bits_ == 32 ? 3
                                                 : 0;
   encoded_type |= static_cast<uint8_t>(width << 4);
+  if (c.type_ == ValueType::kVarChar &&
+      c.text_domain_ != TextDomain::kUnspecified) {
+    encoded_type |= c.text_domain_ == TextDomain::kTimestamp ? 0x50 : 0x40;
+  }
   a << c.col_name_ << encoded_type << c.constraint_;
   return a;
 }
@@ -105,11 +110,16 @@ Decoder& operator>>(Decoder& e, Column& c) {
   c.interval_ = (encoded_type & 0x08) != 0;
   const uint8_t raw_type = encoded_type & 0x07;
   const uint8_t width = (encoded_type >> 4) & 0x03;
-  c.integer_bits_ = width == 0 ? 64 : static_cast<uint8_t>(4U << width);
+  const bool is_varchar = raw_type == static_cast<uint8_t>(ValueType::kVarChar);
+  const bool has_text_domain = (encoded_type & 0x40) != 0;
+  c.integer_bits_ =
+      width == 0 || has_text_domain ? 64 : static_cast<uint8_t>(4U << width);
+  c.text_domain_ = TextDomain::kUnspecified;
   if (raw_type > static_cast<uint8_t>(ValueType::kArray) ||
-      (encoded_type & 0x40) != 0 ||
-      (c.interval_ && raw_type != static_cast<uint8_t>(ValueType::kVarChar)) ||
-      (width != 0 && raw_type != static_cast<uint8_t>(ValueType::kInt64))) {
+      (has_text_domain && (!is_varchar || width > 1 || c.interval_)) ||
+      (c.interval_ && !is_varchar) ||
+      (width != 0 && !has_text_domain &&
+       raw_type != static_cast<uint8_t>(ValueType::kInt64))) {
     // Corrupted persisted schema: sticky decoder failure so the enclosing
     // Schema/Table decode surfaces kCorrupt instead of a throw.
     e.Fail();
@@ -117,6 +127,9 @@ Decoder& operator>>(Decoder& e, Column& c) {
     return e;
   }
   c.type_ = static_cast<ValueType>(raw_type);
+  if (has_text_domain) {
+    c.text_domain_ = width == 1 ? TextDomain::kTimestamp : TextDomain::kString;
+  }
   return e;
 }
 
@@ -131,6 +144,7 @@ uint64_t std::hash<tinylamb::Column>::operator()(
   combine(std::hash<tinylamb::ValueType>()(c.Type()));
   combine((c.IsUnsigned() ? 1U : 0U) | (c.IsInterval() ? 2U : 0U));
   combine(std::hash<uint8_t>()(c.IntegerBits()));
+  combine(static_cast<uint64_t>(c.GetTextDomain()));
   combine(std::hash<tinylamb::Constraint>()(c.GetConstraint()));
   return result;
 }

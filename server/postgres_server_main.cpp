@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
       options.listen_address = argv[++i];
     } else if (argument == "--port" && i + 1 < argc) {
       unsigned long port = 0;
-      if (!ParseUnsigned(argv[++i], &port) ||
+      if (!ParseUnsigned(argv[++i], &port) || port == 0 ||
           port > std::numeric_limits<uint16_t>::max()) {
         std::cerr << "invalid port\n";
         return 2;

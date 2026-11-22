@@ -101,6 +101,9 @@ struct LsmTreeState {
   size_t active_uncommitted_ops{0};
   bool destroyed{false};
   txn_id_t destroyed_by_txn{0};
+  [[nodiscard]] bool DestroyVisibleTo(txn_id_t reader) const noexcept {
+    return destroyed && (destroyed_by_txn == 0 || destroyed_by_txn == reader);
+  }
   bool committed_destroyed{false};
   lsn_t committed_destroy_lsn{0};
   bool flushing_immutable{false};
@@ -317,7 +320,8 @@ class PageManager {
   Status LsmUpdate(Transaction& txn, page_id_t tree_id, std::string_view key,
                    std::string_view value);
   Status LsmDelete(Transaction& txn, page_id_t tree_id, std::string_view key);
-  StatusOr<std::string> LsmRead(page_id_t tree_id, std::string_view key) const;
+  StatusOr<std::string> LsmRead(page_id_t tree_id, std::string_view key,
+                                const Transaction* reader = nullptr) const;
   std::vector<std::pair<std::string, std::string>> LsmScanRange(
       page_id_t tree_id, std::string_view begin, std::string_view end,
       bool ascending, const Transaction* reader = nullptr,
@@ -478,7 +482,8 @@ class PageManager {
   void ReleaseAllTreeMemoryLocked() noexcept;
   StatusOr<bool> LsmLookupLiveLocked(const LsmTreeState& tree,
                                      std::string_view key,
-                                     std::string* value_out) const;
+                                     std::string* value_out,
+                                     bool ignore_pending_destroy = false) const;
   StatusOr<bool> LsmLookupCommittedLocked(const LsmTreeState& tree,
                                           std::string_view key,
                                           std::string* value_out,
@@ -618,7 +623,12 @@ class PageManager {
       retained_block_files_;
 
   mutable std::mutex lsm_file_mu_;
-  mutable int lsm_fd_{-1};
+  // Readers (LsmLookup*Locked, MergeLsmSourcesToFd argument capture) may load
+  // this while holding only a tree latch; checkpoint swaps it under
+  // lsm_file_mu_. Keep it atomic so those loads are not a data race. The
+  // rotation barrier still delays closing the old fd until readers that hold
+  // a tree latch have finished.
+  mutable std::atomic<int> lsm_fd_{-1};
   mutable uint64_t lsm_generation_{0};
   mutable uint64_t lsm_append_offset_{0};
   bool lsm_rotating_{false};

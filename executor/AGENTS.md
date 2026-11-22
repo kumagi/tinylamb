@@ -37,12 +37,13 @@ CMake target `tinylamb_executor` also covers `plan/`, `executor/detail/`, and
   POSITION and assembles each output row from the index images alone
   (`TryReadIndexOnly`) when the entry's page carries no version chains — the
   case no single index covers, since it needs two indexes' stored columns at
-  once. A position on a chain-bearing page, or absent from any participant's
-  range, is dropped; the surviving rows are rechecked against the predicate
-  on the covered columns, so the intersection is a superset filter and never a
-  shortcut. Like `BitmapHeapScan` it materializes the position set, and the
-  plan orders participants narrowest-first so the table starts from the
-  smallest side.
+  once. A position on a chain-bearing page falls back to the heap read (which
+  resolves this snapshot's version), and a position absent from any
+  participant's range is dropped; the surviving rows are rechecked against the
+  predicate on the covered columns, so the intersection is a superset filter
+  and never a shortcut. Like `BitmapHeapScan` it materializes the position
+  set, and the plan orders participants narrowest-first so the table starts
+  from the smallest side.
 - Joins: `hash_join` (+ `hash_join_mode.hpp` cost helper; `EnableDynamicFilter`
   drains the build side first and publishes a `RuntimeFilterGroup` through
   `ExecutorBase::AttachRuntimeFilter`, falling back to filtering the probe side

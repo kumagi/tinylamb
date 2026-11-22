@@ -734,11 +734,11 @@ ARRAY<STRUCT<num_paths INT64>>[{87}]
 [name=trail_path_mode_with_scalar_and_array_edges]
 select * from graph_table(aml
   MATCH TRAIL (a:Human)-[e1]->(b:Human)-[e2]->{1,3}(c:Human)
-  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_legnth
-  ORDER BY a_id, b_id, c_id, path_legnth
+  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_length
+  ORDER BY a_id, b_id, c_id, path_length
 )
 --
-ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_legnth INT64>>[unknown order:
+ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_length INT64>>[unknown order:
   {1, 1, 1, 2},
   {1, 1, 2, 1},
   {1, 2, 1, 1},
@@ -752,22 +752,22 @@ ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_legnth INT64>>[unknown ord
 [name=acyclic_path_mode_with_scalar_and_array_edges]
 select * from graph_table(aml
   MATCH ACYCLIC (a:Human)-[e1]->(b:Human)-[e2]->{1,3}(c:Human)
-  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_legnth
-  ORDER BY a_id, b_id, c_id, path_legnth
+  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_length
+  ORDER BY a_id, b_id, c_id, path_length
 )
 --
-ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_legnth INT64>>[]
+ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_length INT64>>[]
 
 ==
 [required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
 [name=simple_path_mode_with_scalar_and_array_edges]
 select * from graph_table(aml
   MATCH SIMPLE (a:Human)-[e1]->(b:Human)-[e2]->{1,3}(c:Human)
-  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_legnth
-  ORDER BY a_id, b_id, c_id, path_legnth
+  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_length
+  ORDER BY a_id, b_id, c_id, path_length
 )
 --
-ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_legnth INT64>>[unknown order:
+ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_length INT64>>[unknown order:
   {1, 2, 1, 1},
   {2, 1, 2, 1}
 ]

@@ -22,9 +22,10 @@ enum header `type/value_type.hpp`, allowlisted).
 - `query_grant.{hpp,cpp}` — `QueryMemoryCoordinator`, `QueryMemoryGrant`,
   `ActiveConsumerGuard`, `LocalBatchCache`, and `ComputeEffectiveDop`
   (query admission control and operator budget division). See ADR 0004.
-- `spill/spill_store.{hpp,cpp}` — block-multiplexed `SpillStore` over
-  constant unlinked temp file descriptors (`OpenUnlinkedTempFile`), 64 KiB
-  blocks, free-block reuse, `TINYLAMB_TEMP_LIMIT_BYTES` cap (`kNoSpace`). See ADR 0005.
+- `spill/spill_store.{hpp,cpp}` — block-multiplexed `SpillStore` over at most
+  one lazily opened unlinked temp file descriptor (`OpenUnlinkedTempFile`,
+  opened on first Append and closed when empty), 64 KiB blocks, free-block
+  reuse, `TINYLAMB_TEMP_LIMIT_BYTES` cap (`kNoSpace`). See ADR 0005.
 - `incarnation.hpp`, `late_materialization.hpp`, `query_parallelism.hpp`,
   `parallel_work.{hpp,cpp}`, `sorted_distinct_runs.{hpp,cpp}` — per-table
   incarnation state, parallel task execution, and external sorted distinct helpers.
@@ -73,7 +74,11 @@ rely on libstdc++-only library features (`std::chrono::locate_zone`,
 - `synced_stream.hpp` — `SyncedOStream` (`std::osyncstream` or a locked
   fallback).
 
-Test: `./build/platform_test`.
+Test: `./build/platform_test`. Note that this binary runs on the current host
+only: the Windows branches in `event_poller.cpp` (WSAPoll) and `file_io.cpp`
+(and similarly platform-specific macOS paths) are not exercised on a Linux
+runner, so a green `platform_test` is not evidence of cross-platform safety.
+Treat those branches as untested-until-built-on-target.
 
 ## Before reading code here
 

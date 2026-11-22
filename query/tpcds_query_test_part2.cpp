@@ -34,7 +34,8 @@ TEST_F(TpcdsQueryTest, ExplainSeparatesHeuristicAndSelectedCore) {
   EXPECT_EQ(plan.find("Reoptimization"), std::string::npos) << plan;
 }
 
-// q18 executes twice and returns the same rows, pinning its ROLLUP path.
+// q18 executes once, returns rows, and its dumped plan contains "TopN",
+// exercising the ROLLUP path.
 TEST_F(TpcdsQueryTest, RollupQueryExecutes) {
   const tpcds::TpcdsQuery* query = nullptr;
   for (const tpcds::TpcdsQuery& candidate : tpcds::kQueries) {
@@ -374,9 +375,8 @@ TEST_F(TpcdsQueryTest, LeanProvenTpcdsRewritesMatchRelationalFallback) {
           return a.IsNull() == b.IsNull();
         }
         if (a.type == ValueType::kDouble && b.type == ValueType::kDouble) {
-          const double scale =
-              std::max({1.0, std::abs(a.value.double_value),
-                        std::abs(b.value.double_value)});
+          const double scale = std::max({1.0, std::abs(a.value.double_value),
+                                         std::abs(b.value.double_value)});
           return std::abs(a.value.double_value - b.value.double_value) <=
                  1e-6 * scale;
         }

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -88,6 +89,24 @@ std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
   }
   EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
   return rows;
+}
+
+TEST(ColumnarTlcsFastPathTest, HavingComparisonErrorPropagates) {
+  const std::vector<ColAggSpec> specs{{.kind = ColAggKind::kMinVarChar}};
+  const std::vector<relational_detail::PositionalHaving> having{{
+      .agg_index = 0,
+      .op = BinaryOperation::kGreaterThan,
+      .constant = Value(123),
+      .has_constant = true,
+  }};
+  relational_detail::RuntimeAggState state;
+  state.str_ptr = "abc";
+  state.str_len = 3;
+  state.has_value = true;
+  std::vector<Value> scratch(1);
+  const auto result = relational_detail::EvalPositionalHavingOnStates(
+      having, specs, &state, &scratch);
+  EXPECT_FALSE(result.HasValue());
 }
 
 TEST(ColumnarTlcsFastPathTest, JitLiteralSelectionPreservesRowBoundaries) {
@@ -196,6 +215,46 @@ OutputSlotBinding MakeSlotBinding(OutputSlotBinding::Kind kind, size_t index) {
   b.kind = kind;
   b.index = index;
   return b;
+}
+
+TEST(ColumnarTlcsFastPathTest, UnboundedFilteredScanStreams) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
+  const std::string prefix = "tlcs_stream_filter_" + RandomString();
+  auto db = Database::Create(prefix).MoveValue();
+  {
+    auto ctx = db->BeginContext();
+    Schema schema("events", {Column("id", ValueType::kInt64)});
+    ASSERT_TRUE(db->CreateTable(ctx, schema).HasValue());
+    Table table = db->GetTable(ctx, "events").MoveValue();
+    for (int64_t i = 0; i < 5000; ++i) {
+      ASSERT_TRUE(table.Insert(ctx.txn_, Row({Value(i)})).HasValue());
+    }
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  {
+    auto ctx = db->BeginContext();
+    ASSERT_EQ(db->CompactTableToTlcs(ctx, "events"), Status::kSuccess);
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  {
+    auto ctx = db->BeginReadOnlyContext();
+    SqlEngine engine(*db);
+    auto prepared = engine.Prepare(ctx, "SELECT id FROM events WHERE id > 0");
+    ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+    std::ostringstream plan;
+    prepared.Value()->Dump(plan, 0);
+    EXPECT_EQ(plan.str().find("ColumnarTlcsScan"), std::string::npos);
+    size_t count = 0;
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      ++count;
+    }
+    EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
+    EXPECT_EQ(count, 4999U);
+  }
+  db->DeleteAll();
 }
 
 TEST(ColumnarTlcsFastPathTest, ScalarSumInt64OverflowRaisesCanonicalError) {
@@ -418,10 +477,10 @@ TEST(ColumnarTlcsFastPathTest, TopNVarCharCutoffParameterSlotAndScalarAggs) {
               : Value("2013-07-14 12:" + std::string((i % 60) < 10 ? "0" : "") +
                       std::to_string(i % 60) + ":05");
       Value bucket = i % 50 == 0 ? Value() : Value((i % 293) - 150);
-      ASSERT_TRUE(tbl.Insert(ctx.txn_, Row({Value(i), Value(i % 37),
-                                            std::move(v), std::move(ts),
-                                            std::move(bucket)}))
-                      .HasValue());
+      ASSERT_TRUE(
+          tbl.Insert(ctx.txn_, Row({Value(i), Value(i % 37), std::move(v),
+                                    std::move(ts), std::move(bucket)}))
+              .HasValue());
     }
     ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
   }
@@ -461,10 +520,10 @@ TEST(ColumnarTlcsFastPathTest, TopNVarCharCutoffParameterSlotAndScalarAggs) {
     EXPECT_EQ(extrema[0][1].AsInt64(), kRows - 1);
     EXPECT_EQ(extrema[0][2].AsInt64(), kRows);
 
-    const auto exact_counts = RunSql(
-        &engine, &ctx,
-        "SELECT uid, COUNT(*) FROM events WHERE uid <> 0 GROUP BY uid "
-        "ORDER BY uid LIMIT 3 OFFSET 1");
+    const auto exact_counts =
+        RunSql(&engine, &ctx,
+               "SELECT uid, COUNT(*) FROM events WHERE uid <> 0 GROUP BY uid "
+               "ORDER BY uid LIMIT 3 OFFSET 1");
     ASSERT_EQ(exact_counts.size(), 3U);
     for (size_t i = 0; i < exact_counts.size(); ++i) {
       const int64_t key = static_cast<int64_t>(i) + 2;
@@ -523,6 +582,149 @@ TEST(ColumnarTlcsFastPathTest, ParameterSlotInsideArrayStillFolds) {
       /*allow_parameter_slots=*/true));
   ASSERT_EQ(set.compares.size(), 1U);
   EXPECT_EQ(set.compares[0].string_constant, "a,b");
+}
+
+TEST(ColumnarTlcsFastPathTest, MixedGroupTableRespectsQueryMemoryBudget) {
+  using namespace relational_detail;
+  BudgetResetGuard budget_guard;
+  const auto& budget = QueryMemoryBudget::Global();
+  const size_t baseline = budget.Used();
+  ProcessMemoryBudget::Global().ResetForTest(24 * 1024);
+  const std::vector<ColGroupKeySpec> keys{
+      MakeKeySpec(ColKeyKind::kColInt64, 0, "a"),
+      MakeKeySpec(ColKeyKind::kColInt64, 1, "b")};
+  const std::vector<ColAggSpec> aggs{
+      MakeAggSpec(nullptr, ColAggKind::kCountStar, 0)};
+  {
+    QueryMemoryCharge charge;
+    WorkerGroupTable table(&keys, &aggs, &charge);
+    ASSERT_EQ(table.Reserve(64), Status::kSuccess);
+    const size_t slot_bytes = charge.Bytes();
+    for (int64_t i = 0; i < 64; ++i) {
+      const RuntimeKeyCell key[]{{.int_val = i}, {.int_val = i + 1}};
+      const uint64_t hash = GroupKeySliceHasher::HashTyped(key, keys);
+      auto group = table.FindOrInsert(key, hash);
+      if (!group.HasValue()) {
+        EXPECT_EQ(group.GetStatus(), StatusCode::kMemoryLimitExceeded);
+        EXPECT_EQ(table.NumGroups(), static_cast<size_t>(i));
+        break;
+      }
+      table.AggsAt(group.Value())[0].count = i + 1;
+    }
+    EXPECT_GT(table.NumGroups(), 0U);
+    EXPECT_LT(table.NumGroups(), 64U);
+    EXPECT_GT(charge.Bytes(), slot_bytes);
+    const RuntimeKeyCell first[]{{.int_val = 0}, {.int_val = 1}};
+    auto group =
+        table.FindOrInsert(first, GroupKeySliceHasher::HashTyped(first, keys));
+    ASSERT_TRUE(group.HasValue());
+    EXPECT_EQ(table.AggsAt(group.Value())[0].count, 1);
+  }
+  EXPECT_EQ(budget.Used(), baseline);
+}
+
+TEST(ColumnarTlcsFastPathTest, GroupMergeRejectsIncompleteAggregateState) {
+  using namespace relational_detail;
+  const std::vector<ColGroupKeySpec> keys{
+      MakeKeySpec(ColKeyKind::kColInt64, 0, "a")};
+  const std::vector<ColAggSpec> aggs{
+      MakeAggSpec(nullptr, ColAggKind::kCountStar, 0),
+      MakeAggSpec(nullptr, ColAggKind::kCountCol, 0)};
+  WorkerGroupTable table(&keys, &aggs, nullptr);
+  const RuntimeKeyCell key{.int_val = 1};
+  RuntimeAggState count;
+  count.count = 1;
+  count.has_value = true;
+
+  EXPECT_EQ(table.MergeFromGroup(&key, 0, {&count, 1}),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(table.NumGroups(), 0U);
+}
+
+TEST(ColumnarTlcsFastPathTest, DistinctAggregateMemoryFollowsMovedState) {
+  using namespace relational_detail;
+  BudgetResetGuard budget_guard;
+  auto& process = ProcessMemoryBudget::Global();
+  const auto& budget = QueryMemoryBudget::Global();
+  const size_t baseline = budget.Used();
+  process.ResetForTest(512);
+  {
+    PagedStringArena arena;
+    RuntimeAggState worker;
+    RuntimeAggState merged;
+    TlcsFile::DecodedColumnChunk ints;
+    ints.type = ValueType::kInt64;
+    ints.int_cells.resize(64);
+    const auto spec = MakeAggSpec(nullptr, ColAggKind::kCountDistinctInt64, 0);
+    const std::vector<const TlcsFile::DecodedColumnChunk*> columns{&ints};
+    ASSERT_EQ(FoldRowIntoAggState(spec, columns, 0, worker, arena),
+              Status::kSuccess);
+    const size_t used = budget.Used();
+    EXPECT_GT(used, baseline);
+    ASSERT_EQ(MergeAggState(spec, merged, worker, arena), Status::kSuccess);
+    EXPECT_EQ(budget.Used(), used);
+    ASSERT_EQ(FoldRowIntoAggState(spec, columns, 0, merged, arena),
+              Status::kSuccess);
+    EXPECT_EQ(budget.Used(), used);
+    Status status = Status::kSuccess;
+    for (uint32_t i = 1; i < ints.int_cells.size() && status.ok(); ++i) {
+      ints.int_cells[i] = i;
+      status = FoldRowIntoAggState(spec, columns, i, merged, arena);
+    }
+    EXPECT_EQ(status, StatusCode::kMemoryLimitExceeded);
+  }
+  EXPECT_EQ(budget.Used(), baseline);
+
+  process.ResetForTest(4 * 1024 * 1024);
+  {
+    QueryMemoryCharge arena_charge;
+    PagedStringArena arena(&arena_charge);
+    RuntimeAggState worker;
+    RuntimeAggState merged;
+    TlcsFile::DecodedColumnChunk strings;
+    strings.type = ValueType::kVarChar;
+    strings.varchar_bytes = {'a'};
+    strings.varchar_ends = {1};
+    const auto spec =
+        MakeAggSpec(nullptr, ColAggKind::kCountDistinctVarChar, 0);
+    const std::vector<const TlcsFile::DecodedColumnChunk*> columns{&strings};
+    ASSERT_EQ(FoldRowIntoAggState(spec, columns, 0, worker, arena),
+              Status::kSuccess);
+    const size_t used = budget.Used();
+    EXPECT_GT(used, baseline + arena_charge.Bytes());
+    ASSERT_EQ(MergeAggState(spec, merged, worker, arena), Status::kSuccess);
+    ASSERT_EQ(FoldRowIntoAggState(spec, columns, 0, merged, arena),
+              Status::kSuccess);
+    EXPECT_EQ(budget.Used(), used);
+  }
+  EXPECT_EQ(budget.Used(), baseline);
+}
+
+TEST(ColumnarTlcsFastPathTest, EmptyVarcharExtremaSurviveAWorkerMerge) {
+  using namespace relational_detail;
+  TlcsFile::DecodedColumnChunk strings;
+  strings.type = ValueType::kVarChar;
+  strings.varchar_bytes = {'x'};
+  strings.varchar_ends = {0, 1};
+  const std::vector<const TlcsFile::DecodedColumnChunk*> columns{&strings};
+  for (ColAggKind kind : {ColAggKind::kMinVarChar, ColAggKind::kMaxVarChar}) {
+    const auto spec = MakeAggSpec(nullptr, kind, 0);
+    PagedStringArena worker_arena;
+    RuntimeAggState worker;
+    ASSERT_EQ(FoldRowIntoAggState(spec, columns, 0, worker, worker_arena),
+              Status::kSuccess);
+    ASSERT_TRUE(worker.has_value);
+    EXPECT_NE(worker.str_ptr, nullptr);
+    EXPECT_EQ(worker.str_len, 0U);
+    EXPECT_EQ(worker_arena.AllocatedBytes(), 0U);
+    PagedStringArena output_arena;
+    RuntimeAggState merged;
+    ASSERT_EQ(MergeAggState(spec, merged, worker, output_arena),
+              Status::kSuccess);
+    auto result = FinishAggState(spec, merged);
+    ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+    EXPECT_EQ(result.Value(), Value(""));
+  }
 }
 
 TEST(ColumnarTlcsFastPathTest, PartitionedAggStrategiesAndTightBudgetFallback) {
@@ -816,6 +1018,63 @@ TEST(ColumnarTlcsFastPathTest, PartitionedAggStrategiesAndTightBudgetFallback) {
   db->DeleteAll();
 }
 
+TEST(ColumnarTlcsFastPathTest,
+     NullableDictionaryBlocksKeepNullFiltersAndCounts) {
+  const std::string prefix = "tlcs_null_dict_" + RandomString();
+  Schema schema("events", {Column("id", ValueType::kInt64),
+                           Column("s", ValueType::kVarChar),
+                           Column("g", ValueType::kInt64)});
+  auto db = Database::Create(prefix).MoveValue();
+  page_id_t first_pid = 0;
+  {
+    auto context = db->BeginContext();
+    ASSERT_EQ(db->CreateTable(context, schema).GetStatus(), Status::kSuccess);
+    auto table = db->GetTable(context, "events").MoveValue();
+    first_pid = table.FirstPageId();
+    for (int64_t i = 0; i < 300; ++i) {
+      Value text = i % 3 == 0 ? Value() : Value(i % 3 == 1 ? "a" : "b");
+      const int64_t group = i % 3 == 0 ? 0 : 1;
+      ASSERT_TRUE(table
+                      .Insert(context.txn_,
+                              Row({Value(i), std::move(text), Value(group)}))
+                      .HasValue());
+    }
+    ASSERT_EQ(context.PreCommit(), Status::kSuccess);
+  }
+  {
+    auto context = db->BeginContext();
+    ASSERT_EQ(db->CompactTableToTlcs(context, "events"), Status::kSuccess);
+    ASSERT_EQ(context.PreCommit(), Status::kSuccess);
+  }
+  ASSIGN_OR_ASSERT_FAIL(
+      std::shared_ptr<TlcsFile>, tlcs,
+      TlcsFile::Open(prefix + ".db.tlcs." + std::to_string(first_pid), schema));
+  ASSERT_EQ(tlcs->DictKinds().at(1), TlcsDictKind::kCompleteNarrow);
+  auto directory = tlcs->GetDirGroup(0);
+  ASSERT_TRUE(directory.HasValue());
+  ASSERT_FALSE(directory.Value()->blocks.empty());
+  const auto& column = directory.Value()->blocks[0].columns[1];
+  ASSERT_EQ(column.encoding, TlcsColumnEncoding::kNarrowDict);
+  ASSERT_TRUE(column.has_null);
+  ColumnarPredicateSet predicates;
+  predicates.nulls.push_back({.column = 1, .is_null = true});
+  relational_detail::FinalizePredicateMetadata(*tlcs, schema, &predicates);
+  auto blocks = relational_detail::SelectCandidateBlocks(*tlcs, predicates);
+  ASSERT_TRUE(blocks.HasValue());
+  EXPECT_FALSE(blocks.Value().empty());
+  auto context = db->BeginReadOnlyContext();
+  SqlEngine engine(*db);
+  EXPECT_EQ(
+      RunSql(&engine, &context, "SELECT COUNT(*) FROM events WHERE s IS NULL"),
+      (std::vector<Row>{Row({Value(100)})}));
+  EXPECT_EQ(RunSql(&engine, &context,
+                   "SELECT g, AVG(BYTE_LENGTH(s)), COUNT(*) FROM events "
+                   "GROUP BY g ORDER BY g"),
+            (std::vector<Row>{Row({Value(0), Value(), Value(100)}),
+                              Row({Value(1), Value(1.0), Value(200)})}));
+  ASSERT_EQ(context.PreCommit(), Status::kSuccess);
+}
+
 // The TLCS dictionary is file-wide. A scan restricted to one block must not
 // emit groups for dictionary values that only occur in other blocks (those
 // used to show up as `(key, COUNT(DISTINCT x) = 0)` "ghost" rows).
@@ -940,7 +1199,7 @@ TEST(ColumnarTlcsFastPathTest, ClickBenchSixOptimizationsAndSemanticTraps) {
   // NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result)
   // operands bounded
   constexpr int64_t kRows =
-      10 *  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
+      10 *    // NOLINT(bugprone-implicit-widening-of-multiplication-result)
       16384;  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
   {
     TransactionContext ctx = db->BeginContext();
@@ -1199,7 +1458,8 @@ TEST(ColumnarTlcsFastPathTest, BlockMonotonicRunAggAndDoubleArithExpressions) {
         okey = Value(int64_t{20000});
       } else {
         const int64_t base =
-            static_cast<int64_t>(blk) *  // NOLINT(readability-math-missing-parentheses)
+            static_cast<int64_t>(
+                blk) *   // NOLINT(readability-math-missing-parentheses)
                 10000 +  // NOLINT(readability-math-missing-parentheses)
             static_cast<int64_t>((off / 4) * 2);
         const int64_t jitter = (off % 2 == 0) ? 1 : 0;
@@ -1211,8 +1471,10 @@ TEST(ColumnarTlcsFastPathTest, BlockMonotonicRunAggAndDoubleArithExpressions) {
       const double qty =
           (okey.IsNull() ? 90.0 : 50.0) + static_cast<double>((r * 7) % 45);
       const double price =
-          100.0 + static_cast<double>(r % 250) *  // NOLINT(readability-math-missing-parentheses)
-                      1.25;  // NOLINT(readability-math-missing-parentheses)
+          100.0 +
+          static_cast<double>(
+              r % 250) *  // NOLINT(readability-math-missing-parentheses)
+              1.25;       // NOLINT(readability-math-missing-parentheses)
       const double disc = static_cast<double>(r % 11) * 0.01;
       const double tax = static_cast<double>(r % 9) * 0.01;
       ASSERT_TRUE(
@@ -1603,12 +1865,19 @@ TEST(ColumnarTlcsFastPathTest,
                           TryRunPartitionedColumnarTlcsAggregate(req));
     ASSERT_TRUE(res_desc.has_value());
     EXPECT_EQ(TlcsFile::DecodeCallsForTest(), 8U + blocks_129.size());
-    ASSERT_EQ(res_desc->rows.size(), 5U);  // NOLINT(bugprone-unchecked-optional-access)
+    ASSERT_EQ(res_desc->rows.size(),
+              5U);  // NOLINT(bugprone-unchecked-optional-access)
     for (size_t r = 0; r < 5; ++r) {
-      EXPECT_TRUE(res_desc->rows[r][0].AsStringView().starts_with(  // NOLINT(bugprone-unchecked-optional-access)
-          "https://heavy.example/hh_"))
-          << "Unexpected winner: " << res_desc->rows[r][0].AsStringView();  // NOLINT(bugprone-unchecked-optional-access)
-      EXPECT_GT(res_desc->rows[r][1].AsInt64(), 43 * 2000);  // NOLINT(bugprone-unchecked-optional-access)
+      EXPECT_TRUE(
+          res_desc->rows[r][0]
+              .AsStringView()
+              .starts_with(  // NOLINT(bugprone-unchecked-optional-access)
+                  "https://heavy.example/hh_"))
+          << "Unexpected winner: "
+          << res_desc->rows[r][0]
+                 .AsStringView();  // NOLINT(bugprone-unchecked-optional-access)
+      EXPECT_GT(res_desc->rows[r][1].AsInt64(),
+                43 * 2000);  // NOLINT(bugprone-unchecked-optional-access)
     }
 
     // Read two projected streams on the multi-key replay path. The second
@@ -1673,13 +1942,19 @@ TEST(ColumnarTlcsFastPathTest,
     ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res_asc,
                           TryRunPartitionedColumnarTlcsAggregate(req));
     ASSERT_TRUE(res_asc.has_value());
-    ASSERT_EQ(res_asc->rows.size(), 5U);  // NOLINT(bugprone-unchecked-optional-access)
+    ASSERT_EQ(res_asc->rows.size(),
+              5U);  // NOLINT(bugprone-unchecked-optional-access)
     for (size_t r = 0; r < 5; ++r) {
-      EXPECT_TRUE(res_asc->rows[r][0].AsStringView().starts_with(  // NOLINT(bugprone-unchecked-optional-access)
-          "https://rare.example/u_"))
+      EXPECT_TRUE(
+          res_asc->rows[r][0]
+              .AsStringView()
+              .starts_with(  // NOLINT(bugprone-unchecked-optional-access)
+                  "https://rare.example/u_"))
           << "ASC order pruned rare group: "
-          << res_asc->rows[r][0].AsStringView();  // NOLINT(bugprone-unchecked-optional-access)
-      EXPECT_LT(res_asc->rows[r][1].AsInt64(), 43 * 50);  // NOLINT(bugprone-unchecked-optional-access)
+          << res_asc->rows[r][0]
+                 .AsStringView();  // NOLINT(bugprone-unchecked-optional-access)
+      EXPECT_LT(res_asc->rows[r][1].AsInt64(),
+                43 * 50);  // NOLINT(bugprone-unchecked-optional-access)
     }
   }
 
@@ -1757,10 +2032,10 @@ TEST(ColumnarTlcsFastPathTest, TpchShapesMatchRowStoreAfterCompaction) {
                       /*check_rss_pressure=*/false);
 
   const std::string prefix = "tlcs_tpch_shapes_" + RandomString();
-  Schema schema("li", {Column("k", ValueType::kInt64),
-                       Column("s", ValueType::kInt64),
-                       Column("late", ValueType::kInt64),
-                       Column("c", ValueType::kVarChar)});
+  Schema schema(
+      "li",
+      {Column("k", ValueType::kInt64), Column("s", ValueType::kInt64),
+       Column("late", ValueType::kInt64), Column("c", ValueType::kVarChar)});
   std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
   constexpr int64_t kLinesPerOrder = 4;
   constexpr int64_t kOrders = 12000;
@@ -1838,7 +2113,8 @@ TEST(ColumnarTlcsFastPathTest, TpchShapesMatchRowStoreAfterCompaction) {
     const std::vector<std::vector<Row>> tlcs = run_all();
     for (size_t i = 0; i < cases.size(); ++i) {
       ASSERT_EQ(row_store[i].size(), 1U) << cases[i].sql;
-      ASSERT_EQ(tlcs[i].size(), 1U) << "round " << round << ": " << cases[i].sql;
+      ASSERT_EQ(tlcs[i].size(), 1U)
+          << "round " << round << ": " << cases[i].sql;
       EXPECT_EQ(row_store[i][0][0].AsInt64(), cases[i].expected)
           << "row store: " << cases[i].sql;
       EXPECT_EQ(tlcs[i][0][0].AsInt64(), cases[i].expected)
@@ -1865,9 +2141,9 @@ TEST(ColumnarTlcsFastPathTest, MonotonicRunCountDistinctMatchesRowStore) {
                       /*check_rss_pressure=*/false);
 
   const std::string prefix = "tlcs_mono_distinct_" + RandomString();
-  Schema schema("li", {Column("k", ValueType::kInt64),
-                       Column("s", ValueType::kInt64),
-                       Column("late", ValueType::kInt64)});
+  Schema schema("li",
+                {Column("k", ValueType::kInt64), Column("s", ValueType::kInt64),
+                 Column("late", ValueType::kInt64)});
   std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
   constexpr int64_t kOrders = 60000;  // ~180k rows: >= 4 TLCS blocks
   {
@@ -1884,8 +2160,8 @@ TEST(ColumnarTlcsFastPathTest, MonotonicRunCountDistinctMatchesRowStore) {
           s = (k * 10);
         }
         const Value late = (line == 0 && k % 2 == 0) ? Value(int64_t{1})
-                           : (k % 11 == 0)            ? Value()
-                                                      : Value(int64_t{0});
+                           : (k % 11 == 0)           ? Value()
+                                                     : Value(int64_t{0});
         ASSERT_TRUE(
             tbl.Insert(ctx.txn_, Row({Value(k), Value(s), late})).HasValue());
       }

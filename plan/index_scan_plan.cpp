@@ -104,7 +104,15 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
     if (expressions[i]->Type() == TypeTag::kColumnValue) {
       const ColumnName& column =
           expressions[i]->AsColumnValue().GetColumnName();
-      if (column.name != provided[i].name || ascending[i] != scan_ascending) {
+      // `provided[i]` carries the scanned table's qualifier. A request naming
+      // a different relation's column with the same bare name is *not* in
+      // index order, even though the names match. An unqualified request is
+      // resolved to the scanned table, so only reject when both sides name a
+      // relation and disagree (the affine branch above compares strictly).
+      if (column.name != provided[i].name ||
+          (!column.schema.empty() && !provided[i].schema.empty() &&
+           column.schema != provided[i].schema) ||
+          ascending[i] != scan_ascending) {
         return false;
       }
       continue;
@@ -154,10 +162,19 @@ TableStatistics IndexRangeStats(const TableStatistics& source,
   // has no such anchor -- blending toward the source row count just halves
   // the range's real selectivity (e.g. a 30% range read as 60%) and wrongly
   // prices the index out against a full scan.
-  if (equality_keys != 0 && result.Rows() < equality_rows) {
-    const size_t difference = equality_rows - result.Rows();
-    const size_t estimate = equality_rows - (difference / 2) - (difference % 2);
-    result = result.ScaleCardinality(estimate);
+  if (equality_keys != 0) {
+    if (result.Rows() < equality_rows) {
+      const size_t difference = equality_rows - result.Rows();
+      const size_t estimate =
+          equality_rows - (difference / 2) - (difference % 2);
+      result = result.ScaleCardinality(estimate);
+    } else if (result.Rows() > equality_rows) {
+      // A range key *after* an equality prefix can round the estimate above
+      // its own anchor. Such a range cannot actually match more rows than the
+      // pinned prefix, so cap it instead of letting the cost depend on the
+      // order the selectivity heuristic visited the keys.
+      result = result.ScaleCardinality(equality_rows);
+    }
   }
   return result;
 }
@@ -194,9 +211,14 @@ size_t PointUnionRows(
   if (statistics.Rows() == 0 || ranges.empty()) {
     return 0;
   }
+  // One row per range is only justified for *point* ranges. A full-key range
+  // produced by another source may be a genuine interval on a unique index
+  // (identity is keyed by the whole key, not by the range width), so fall back
+  // to the frequency estimate unless begin == end for every range.
   if (index.IsUnique() &&
       std::ranges::all_of(ranges, [&index](const auto& range) {
-        return range.first.size() == index.sc_.key_.size();
+        return range.first.size() == index.sc_.key_.size() &&
+               range.first == range.second;
       })) {
     return ranges.size();
   }
@@ -263,7 +285,8 @@ size_t IndexScanPlan::EmitRowCount() const {
   if (!point_ranges_.empty()) {
     if (index_.IsUnique() && begin_key_.empty() &&
         std::ranges::all_of(point_ranges_, [this](const auto& range) {
-          return range.first.size() == index_.sc_.key_.size();
+          return range.first.size() == index_.sc_.key_.size() &&
+                 range.first == range.second;
         })) {
       return point_ranges_.size();
     }
@@ -404,6 +427,11 @@ struct BoundRange {
         min = max = value;
         return;
       case BinaryOperation::kNotEquals:
+        // A single [min,max] envelope cannot represent the hole a != v cuts
+        // out of it. Splitting it would have to discard one side and would
+        // change which rows the seek visits, so keep the envelope and let the
+        // residual predicate reject v. The only cost is a deliberately
+        // conservative row estimate (the scan recheck is authoritative).
         return;
       case BinaryOperation::kLessThan:
       case BinaryOperation::kGreaterThan: {

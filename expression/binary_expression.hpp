@@ -43,6 +43,13 @@ class EvaluationContext;
 // scan-filter simple-predicate compiler.
 [[nodiscard]] bool PlainStringComparable(std::string_view s);
 
+// Cheap shape check before attempting timestamp comparison on string operands.
+[[nodiscard]] inline bool LooksLikeTimestampText(std::string_view text) {
+  return text.size() >= 19 && text[4] == '-' && text[7] == '-' &&
+         (text[10] == ' ' || text[10] == 'T') && text[13] == ':' &&
+         text[16] == ':';
+}
+
 // Lowercases ASCII letters; the fold applied by case-insensitive collation
 // comparisons ('und:ci').
 [[nodiscard]] std::string FoldCase(std::string_view s);

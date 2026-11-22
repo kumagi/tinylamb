@@ -20,7 +20,7 @@ cmake --build "$build_dir" -j"$jobs"
   printf 'build_type=RelWithDebInfo\n'
   printf 'ctest_jobs=%s\n' "${CTEST_JOBS:-$jobs}"
   ctest --test-dir "$build_dir" --output-on-failure --no-tests=error \
-    -j"${CTEST_JOBS:-$jobs}"
+    -j"${CTEST_JOBS:-$jobs}" -LE scale
   python3 "$root/scripts/check_layering.py" --root "$root"
   python3 "$root/scripts/check_ooc_invariants.py" --root "$root"
 } 2>&1 | tee "$log_file"

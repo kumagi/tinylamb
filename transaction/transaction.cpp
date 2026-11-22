@@ -146,6 +146,24 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
       }
       return false;
     }
+    // Reserve the fixed spill-buffer charge before any destructive step. The
+    // buffer is allocated unconditionally below, so its charge is mandatory;
+    // if the reservation fails we must still own small_/spill_ in full. A
+    // return here with the in-memory entries already swapped away leaves the
+    // write set empty while commit/abort release write intents by iterating it
+    // (write_set_.ForEach), pinning every one of those intents to this txn
+    // forever. Use a temporary charge so a failed TryAdd cannot disturb the
+    // entry charges held by mem_charge_.
+    ProcessMemoryCharge spill_charge(MemoryPoolKind::kTx, 0);
+    if (!spill_charge.TryAdd(kSpillBufferBytes,
+                             /*respect_soft_limit=*/false)) {
+      if (error_out != nullptr) {
+        *error_out = StatusError(
+            StatusCode::kMemoryLimitExceeded,
+            "cannot reserve transaction write-set spill buffer charge");
+      }
+      return false;
+    }
     segment_writer_ =
         std::make_unique<SpillSegmentWriter>(store.get(), kSpillBufferBytes);
     const Status open_st = segment_writer_->EnsureOpen();
@@ -197,11 +215,9 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
     }
     std::vector<RowPosition>().swap(small_);
     std::unordered_set<RowPosition>().swap(spill_);
-    mem_charge_.ReleaseAll();
-    if (!mem_charge_.TryAdd(kSpillBufferBytes,
-                            /*respect_soft_limit=*/false)) {
-      return false;
-    }
+    // Move assignment releases the now-obsolete entry charges and takes over
+    // the already-reserved spill-buffer charge in one step.
+    mem_charge_ = std::move(spill_charge);
     spilled_ = false;
     disk_spilled_ = true;
     if (initial_spill_out != nullptr) {
@@ -262,9 +278,9 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
     }
     if (error_out != nullptr) {
       *error_out = StatusError(
-            StatusCode::kMemoryLimitExceeded,
-            "transaction write-set/version payload exceeds the query memory "
-            "limit and no spill store is configured (pool=query)");
+          StatusCode::kMemoryLimitExceeded,
+          "transaction write-set/version payload exceeds the query memory "
+          "limit and no spill store is configured (pool=query)");
     }
     return false;
   }
@@ -500,10 +516,10 @@ void Transaction::FinishRunningNoexcept() noexcept {
 }
 
 void Transaction::FinalizeFinishHooks() noexcept {
-  if (finish_hooks_finalized_ || !IsFinished()) {
+  if (!IsFinished() ||
+      finish_hooks_finalized_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
-  finish_hooks_finalized_ = true;
   std::vector<std::shared_ptr<TransactionFinishHook>> hooks;
   hooks.swap(finish_hooks_);
   const TransactionStatus status = status_.load(std::memory_order_acquire);
@@ -571,7 +587,8 @@ Transaction::Transaction(Transaction&& o) noexcept
       wal_reread_mode_(o.wal_reread_mode_),
       has_log_(o.has_log_.load(std::memory_order_relaxed)),
       has_table_drop_(o.has_table_drop_.load(std::memory_order_acquire)),
-      finish_hooks_finalized_(o.finish_hooks_finalized_),
+      finish_hooks_finalized_(
+          o.finish_hooks_finalized_.load(std::memory_order_acquire)),
       status_(o.status_.load(std::memory_order_relaxed)),
       failed_(o.failed_.load(std::memory_order_acquire)),
       read_only_(o.read_only_),
@@ -688,6 +705,8 @@ bool Transaction::AddReadSet(const RowPosition& rp) {
 
 bool Transaction::TryInsertWriteSet(const RowPosition& rp, Status* error_out) {
   std::shared_ptr<SpillStore> store;
+  // Mirrors TransactionManager::kDefaultWriteSetSpillEntries (4096) when no
+  // manager is attached.
   size_t threshold = 4096;
   if (transaction_manager_ != nullptr) {
     threshold = transaction_manager_->EffectiveWriteSetSpillThresholdEntries();
@@ -702,6 +721,17 @@ bool Transaction::TryInsertWriteSet(const RowPosition& rp, Status* error_out) {
             transaction_manager_->GetOrCreateWriteSetSpillStore();
       }
       store = write_set_spill_store_;
+    }
+  } else {
+    // Apply the same memory-budget cap as
+    // TransactionManager::EffectiveWriteSetSpillThresholdEntries: a
+    // manager-less (embedded/test) Transaction must not hold 4096 entries
+    // resident when the process budget would shrink the threshold to 16.
+    const size_t pool_max = ProcessMemoryBudget::Global().EffectivePoolMaxBytes(
+        MemoryPoolKind::kTx);
+    if (pool_max > 0) {
+      const size_t by_bytes = std::max<size_t>(16, (pool_max / 8) / 40);
+      threshold = std::min(threshold, by_bytes);
     }
   }
   uint64_t spilled_bytes = 0;
@@ -1051,43 +1081,56 @@ void Transaction::RegisterVersionWrite(const RowPosition& rp,
 }
 
 bool Transaction::CancelStagedVersion(const RowPosition& rp) {
-  if (transaction_manager_ == nullptr) {
-    write_set_.erase(rp);
-    return true;
-  }
-  bool canceled = false;
-  {
-    auto& shard =
-        transaction_manager_
-            ->version_shards_[tinylamb::TransactionManager::VersionShardIndex(
-                rp)];
-    std::scoped_lock lock(shard.mutex);
-    const auto found = shard.versions.find(rp);
-    if (found == shard.versions.end()) {
-      canceled = true;
-    } else if (found->second.pending && found->second.pending->owner == ID() &&
-               found->second.pending->staged) {
-      // Release the payload accounting before dropping the staged version:
-      // every sibling path (ReleaseWriteIntent / AbortVersions /
-      // CommitVersions) does this, and the write-set erase below means no
-      // later abort can recover the charge if we skip it here.
-      transaction_manager_->ReleaseVersionPayloadBytes(
-          found->second.pending->payload.InlineBytes());
-      found->second.pending.reset();
-      shard.write_intent_released.notify_all();
-      canceled = true;
-      if (found->second.committed.empty()) {
-        transaction_manager_->ForgetVersionChain(rp);
-        shard.versions.erase(found);
+  // Best-effort rollback helper called from Status-returning WAL error paths
+  // (see RowPage::Insert/Update/Delete). The cleanup containers and callbacks
+  // below (write_set_, ForgetVersionChain, the version shards) are not
+  // noexcept, so an allocation failure in this path must not escape into the
+  // Status boundary. Report an incomplete cancellation through the bool
+  // result instead: callers either translate `false` into a Status (the
+  // Update path) or have already marked the transaction failed.
+  try {
+    if (transaction_manager_ == nullptr) {
+      write_set_.erase(rp);
+      return true;
+    }
+    bool canceled = false;
+    {
+      auto& shard =
+          transaction_manager_
+              ->version_shards_[tinylamb::TransactionManager::VersionShardIndex(
+                  rp)];
+      std::scoped_lock lock(shard.mutex);
+      const auto found = shard.versions.find(rp);
+      if (found == shard.versions.end()) {
+        canceled = true;
+      } else if (found->second.pending &&
+                 found->second.pending->owner == ID() &&
+                 found->second.pending->staged) {
+        // Release the payload accounting before dropping the staged version:
+        // every sibling path (ReleaseWriteIntent / AbortVersions /
+        // CommitVersions) does this, and the write-set erase below means no
+        // later abort can recover the charge if we skip it here.
+        transaction_manager_->ReleaseVersionPayloadBytes(
+            found->second.pending->payload.InlineBytes());
+        found->second.pending.reset();
+        shard.write_intent_released.notify_all();
+        canceled = true;
+        if (found->second.committed.empty()) {
+          transaction_manager_->ForgetVersionChain(rp);
+          shard.versions.erase(found);
+        }
       }
     }
-  }
-  if (!canceled) {
+    if (!canceled) {
+      return false;
+    }
+    write_set_.erase(rp);
+    InvalidateVersionReadCache();
+    return true;
+  } catch (...) {
+    // Never let a cleanup failure escape the Status-returning WAL error path.
     return false;
   }
-  write_set_.erase(rp);
-  InvalidateVersionReadCache();
-  return true;
 }
 
 bool Transaction::RequiresHistoricalRead() const {
@@ -1119,7 +1162,16 @@ StatusOr<lsn_t> Transaction::AppendLog(const LogRecord& lr) {
   if (IsFailed()) {
     return Status::kRuntimeError;
   }
-  if (transaction_manager_ != nullptr && transaction_manager_->FailStopped()) {
+  if (transaction_manager_ == nullptr ||
+      transaction_manager_->logger_ == nullptr) {
+    // Default-constructed ("for test purpose only") and moved-from
+    // transactions have no WAL. Every other manager-dependent method degrades
+    // safely; dereferencing logger_ here would segfault across a Status
+    // boundary.
+    return StatusError(StatusCode::kRuntimeError,
+                       "transaction has no WAL logger");
+  }
+  if (transaction_manager_->FailStopped()) {
     return StatusError(StatusCode::kIOError,
                        "transaction manager is fail-stopped");
   }
@@ -1344,7 +1396,7 @@ std::chrono::milliseconds Transaction::DefaultStatementTimeout() noexcept {
 namespace {
 // ms * 1e6 and now_ns + delta can both overflow int64 for extreme timeout
 // values (e.g. a corrupt TINYLAMB_STATEMENT_TIMEOUT_MS). Saturate instead of
-// invoking undefined behaviour, which would make the deadline wrap into the
+// invoking undefined behavior, which would make the deadline wrap into the
 // past (instant timeout) or a small positive value (effectively unbounded).
 int64_t SaturatingDeadlineNs(int64_t now_ns, int64_t ms) noexcept {
   if (ms <= 0) {

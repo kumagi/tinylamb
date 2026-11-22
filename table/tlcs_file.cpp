@@ -45,6 +45,7 @@
 #include "common/platform/file_io.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/runtime_filter.hpp"
+#include "common/serdes.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
@@ -643,6 +644,80 @@ class OnlineColumnDict {
 
 // Reusable 1-block (<= 32,768 rows) staging accumulator so TLCS compaction
 // keeps peak scratch memory tiny even across 600M-row tables.
+struct StreamingColSynopsis {
+  ValueType type{ValueType::kNull};
+  bool is_unsigned{false};
+  bool has_null{false};
+  bool is_monotonic{false};
+  bool is_unique_nonnull{false};
+  bool is_identity_1_to_n{false};
+  bool have_prev{false};
+  int64_t prev{0};
+  uint64_t expected_id{1};
+  int64_t min_int{std::numeric_limits<int64_t>::max()};
+  int64_t max_int{std::numeric_limits<int64_t>::min()};
+
+  void Init(ValueType vt, bool u) noexcept {
+    type = vt;
+    is_unsigned = u;
+    const bool track_int =
+        (vt == ValueType::kInt64 || vt == ValueType::kDate) && !u;
+    is_monotonic = track_int;
+    is_unique_nonnull = track_int;
+    is_identity_1_to_n = (vt == ValueType::kInt64) && !u;
+  }
+
+  void AddNull() noexcept {
+    has_null = true;
+    is_monotonic = false;
+    is_unique_nonnull = false;
+    is_identity_1_to_n = false;
+  }
+
+  void AddInt(int64_t v) noexcept {
+    if ((type != ValueType::kInt64 && type != ValueType::kDate) ||
+        is_unsigned) {
+      return;
+    }
+    min_int = std::min(min_int, v);
+    max_int = std::max(max_int, v);
+    if (is_monotonic) {
+      if (have_prev) {
+        if (v < prev) {
+          is_monotonic = false;
+          is_unique_nonnull = false;
+          is_identity_1_to_n = false;
+        } else if (v == prev) {
+          is_unique_nonnull = false;
+          is_identity_1_to_n = false;
+        }
+      }
+      if (is_identity_1_to_n && std::cmp_not_equal(v, expected_id)) {
+        is_identity_1_to_n = false;
+      }
+      ++expected_id;
+      prev = v;
+      have_prev = true;
+    }
+  }
+
+  [[nodiscard]] TlcsFile::ColumnSynopsis Finish(
+      uint64_t total_rows) const noexcept {
+    TlcsFile::ColumnSynopsis out;
+    out.has_null = has_null;
+    if (total_rows > 0 &&
+        (type == ValueType::kInt64 || type == ValueType::kDate) &&
+        !is_unsigned) {
+      out.is_monotonic = is_monotonic;
+      out.is_unique_nonnull = is_unique_nonnull;
+      out.is_identity_1_to_n = is_identity_1_to_n;
+      out.min_int = min_int;
+      out.max_int = max_int;
+    }
+    return out;
+  }
+};
+
 struct BlockStaging {
   struct Col {
     ValueType type{ValueType::kNull};
@@ -701,7 +776,8 @@ struct BlockStaging {
     }
   }
 
-  Status AppendRow(const Row& row) {
+  Status AppendRow(const Row& row,
+                   std::vector<StreamingColSynopsis>* synopses = nullptr) {
     const auto ncol = static_cast<slot_t>(cols.size());
     if (row.Count() != ncol) {
       return StatusError(StatusCode::kCorrupt,
@@ -724,6 +800,9 @@ struct BlockStaging {
         } else {
           col.ints.push_back(0);
         }
+        if (synopses != nullptr) {
+          (*synopses)[c].AddNull();
+        }
         continue;
       }
       if (col.has_null) {
@@ -738,6 +817,9 @@ struct BlockStaging {
             col.has_min_max = true;
             col.min_int = std::min(col.min_int, iv);
             col.max_int = std::max(col.max_int, iv);
+          }
+          if (synopses != nullptr) {
+            (*synopses)[c].AddInt(iv);
           }
           break;
         }
@@ -770,6 +852,137 @@ struct BlockStaging {
               reinterpret_cast<const uint8_t*>(sv.data()),
               reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
           col.varchar_ends.push_back(static_cast<uint32_t>(next_end));
+          break;
+        }
+        default:
+          return StatusError(StatusCode::kNotImplemented,
+                             "tlcs unsupported column type");
+      }
+    }
+    ++row_count;
+    return Status::kSuccess;
+  }
+
+  Status AppendRawRow(std::string_view raw, StreamingStatsCollector* stats,
+                      std::vector<StreamingColSynopsis>* synopses) {
+    constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+    if (raw.size() < sizeof(slot_t)) {
+      return StatusError(StatusCode::kCorrupt, "truncated row image");
+    }
+    const char* cursor = raw.data();
+    const char* const end = raw.data() + raw.size();
+    slot_t encoded_count = 0;
+    cursor += DeserializeSlot(cursor, &encoded_count);
+    const bool row_has_null = (encoded_count & kNullBitmapFlag) != 0;
+    const auto stored_count =
+        static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
+    const auto ncol = static_cast<slot_t>(cols.size());
+    if (stored_count != ncol) {
+      return StatusError(StatusCode::kCorrupt,
+                         "tlcs writer row column count mismatch");
+    }
+    const char* bitmap = nullptr;
+    if (row_has_null) {
+      const size_t bitmap_bytes = (stored_count + 7) / 8;
+      if (std::cmp_less(end - cursor, bitmap_bytes)) {
+        return StatusError(StatusCode::kCorrupt, "truncated row null bitmap");
+      }
+      bitmap = cursor;
+      cursor += bitmap_bytes;
+    }
+    stats->BeginRow();
+    for (slot_t c = 0; c < ncol; ++c) {
+      Col& col = cols[c];
+      const bool is_null =
+          row_has_null &&
+          (bitmap[c / 8] & static_cast<char>(1U << (c % 8))) != 0;
+      if (is_null) {
+        has_any_null = true;
+        if (!col.has_null) {
+          col.has_null = true;
+          col.nulls.assign(row_count, 0);
+        }
+        col.nulls.push_back(1);
+        if (col.type == ValueType::kVarChar) {
+          col.all_single_byte_varchar = false;
+          col.varchar_ends.push_back(
+              static_cast<uint32_t>(col.varchar_bytes.size()));
+        } else {
+          col.ints.push_back(0);
+        }
+        stats->AddNull(c);
+        (*synopses)[c].AddNull();
+        continue;
+      }
+      if (col.has_null) {
+        col.nulls.push_back(0);
+      }
+      switch (col.type) {
+        case ValueType::kInt64:
+        case ValueType::kDate: {
+          if (std::cmp_less(end - cursor, sizeof(uint64_t))) {
+            return StatusError(StatusCode::kCorrupt,
+                               "truncated row integer field");
+          }
+          int64_t iv = 0;
+          cursor += DeserializeInteger(cursor, &iv);
+          col.ints.push_back(iv);
+          if (!col.is_unsigned) {
+            col.has_min_max = true;
+            col.min_int = std::min(col.min_int, iv);
+            col.max_int = std::max(col.max_int, iv);
+          }
+          stats->AddInt(c, iv, col.is_unsigned);
+          (*synopses)[c].AddInt(iv);
+          break;
+        }
+        case ValueType::kDouble: {
+          if (std::cmp_less(end - cursor, sizeof(uint64_t))) {
+            return StatusError(StatusCode::kCorrupt,
+                               "truncated row double field");
+          }
+          double dv = 0.0;
+          cursor += DeserializeDouble(cursor, &dv);
+          int64_t bits = 0;
+          std::memcpy(&bits, &dv, sizeof(bits));
+          col.ints.push_back(bits);
+          if (std::isnan(dv)) {
+            col.has_nan = true;
+          } else {
+            col.has_double_min_max = true;
+            col.min_double = std::min(col.min_double, dv);
+            col.max_double = std::max(col.max_double, dv);
+          }
+          stats->AddDouble(c, dv);
+          break;
+        }
+        case ValueType::kVarChar: {
+          if (std::cmp_less(end - cursor, sizeof(bin_size_t))) {
+            return StatusError(StatusCode::kCorrupt,
+                               "truncated row varchar length");
+          }
+          bin_size_t length = 0;
+          cursor += DeserializeSlot(cursor, &length);
+          if (std::cmp_less(end - cursor, length)) {
+            return StatusError(StatusCode::kCorrupt,
+                               "truncated row varchar payload");
+          }
+          const std::string_view sv(cursor, length);
+          cursor += length;
+          if (sv.size() != 1) {
+            col.all_single_byte_varchar = false;
+          }
+          const size_t next_end = col.varchar_bytes.size() + sv.size();
+          if (next_end > std::numeric_limits<uint32_t>::max()) {
+            return StatusError(StatusCode::kTooBigData,
+                               "tlcs block varchar stream exceeds 4 GiB");
+          }
+          col.varchar_bytes.insert(
+              col.varchar_bytes.end(),
+              reinterpret_cast<const uint8_t*>(sv.data()),
+              reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
+          col.varchar_ends.push_back(static_cast<uint32_t>(next_end));
+          stats->AddVarChar(c, sv);
           break;
         }
         default:
@@ -892,7 +1105,7 @@ Status FlushStagedBlock(const BlockStaging& stage,
       const uint64_t span =
           static_cast<uint64_t>(sc.max_int) - static_cast<uint64_t>(sc.min_int);
       meta.for_base = sc.min_int;
-      const uint64_t base_u =  // NOLINT(modernize-use-auto)
+      const uint64_t base_u =                    // NOLINT(modernize-use-auto)
           static_cast<uint64_t>(meta.for_base);  // NOLINT(modernize-use-auto)
                                                  // reviewed intentional pattern
       if (span == 0) {
@@ -1203,7 +1416,9 @@ std::string EncodeMetaDirectoryBytes(
     const Schema& schema, const std::vector<LSTableColumnDictionary>& dicts,
     const std::vector<TlcsDictKind>& dict_kinds, uint32_t dir_group_size,
     const std::vector<TlcsFile::DirGroupMeta>& dir_groups,
-    std::string_view serialized_column_stats, uint64_t* stats_rel_offset_out) {
+    std::string_view serialized_column_stats,
+    const std::vector<TlcsFile::ColumnSynopsis>& col_synopses,
+    uint64_t* stats_rel_offset_out) {
   std::string dir;
   const uint32_t col_count = schema.ColumnCount();
   for (uint32_t c = 0; c < col_count; ++c) {
@@ -1257,6 +1472,16 @@ std::string EncodeMetaDirectoryBytes(
   AppendU32(dir, static_cast<uint32_t>(serialized_column_stats.size()));
   *stats_rel_offset_out = dir.size();
   dir.append(serialized_column_stats);
+  for (uint32_t c = 0; c < col_count; ++c) {
+    const TlcsFile::ColumnSynopsis syn =
+        c < col_synopses.size() ? col_synopses[c] : TlcsFile::ColumnSynopsis{};
+    AppendU8(dir, syn.has_null ? 1 : 0);
+    AppendU8(dir, syn.is_monotonic ? 1 : 0);
+    AppendU8(dir, syn.is_unique_nonnull ? 1 : 0);
+    AppendU8(dir, syn.is_identity_1_to_n ? 1 : 0);
+    AppendI64(dir, syn.min_int);
+    AppendI64(dir, syn.max_int);
+  }
   return dir;
 }
 
@@ -1355,6 +1580,312 @@ size_t EstimateDecodedBlockBytes(const TlcsFile::DecodedBlock& blk) noexcept {
              (c.varchar_ends.size() * sizeof(uint32_t));
   }
   return total;
+}
+
+void BuildEncounterCodesFromFirstRow(LSTableColumnDictionary* dict) {
+  dict->encounter_codes.clear();
+  std::vector<std::pair<uint64_t, uint32_t>> order;
+  order.reserve(dict->code_counts.size());
+  for (uint32_t code = 0; code < dict->code_counts.size(); ++code) {
+    if (dict->code_counts[code] > 0) {
+      order.emplace_back(dict->code_first_row[code], code);
+    }
+  }
+  std::ranges::sort(order);
+  dict->encounter_codes.reserve(order.size());
+  for (const auto& [first_row, code] : order) {
+    dict->encounter_codes.push_back(code);
+  }
+}
+
+void ComputeZeroColumnBitsetUniqueness(
+    uint64_t total_rows, std::span<const LSTableColumnBlock> blocks,
+    std::span<const uint32_t> row_counts, TlcsFile::ColumnSynopsis* syn) {
+  if (syn->is_unique_nonnull || syn->has_null || total_rows == 0 ||
+      syn->min_int > syn->max_int) {
+    return;
+  }
+  const uint64_t span =
+      static_cast<uint64_t>(syn->max_int) - static_cast<uint64_t>(syn->min_int);
+  if (span > 33'554'432ULL || span + 1 < total_rows) {
+    return;
+  }
+  std::vector<uint64_t> seen_bits(static_cast<size_t>((span >> 6U) + 1U), 0ULL);
+  const auto base_u = static_cast<uint64_t>(syn->min_int);
+  for (size_t bi = 0; bi < blocks.size(); ++bi) {
+    const uint32_t n = row_counts[bi];
+    const int64_t* __restrict cells = blocks[bi].int_cells.data();
+    for (uint32_t r = 0; r < n; ++r) {
+      const uint64_t off = static_cast<uint64_t>(cells[r]) - base_u;
+      const uint64_t mask = uint64_t{1} << (off & 63U);
+      uint64_t& word = seen_bits[static_cast<size_t>(off >> 6U)];
+      if ((word & mask) != 0) {
+        return;
+      }
+      word |= mask;
+    }
+  }
+  syn->is_unique_nonnull = true;
+}
+
+TlcsFile::ColumnSynopsis ComputeColumnSynopsisFromEntry(
+    slot_t c, ValueType vt, bool is_unsigned, uint64_t total_rows,
+    std::span<const LSTableColumnBlock> blocks,
+    std::span<const uint32_t> row_counts) {
+  TlcsFile::ColumnSynopsis syn;
+  const bool track_int = total_rows > 0 &&
+                         (vt == ValueType::kInt64 || vt == ValueType::kDate) &&
+                         !is_unsigned;
+  bool mono = track_int;
+  bool strict_mono = track_int;
+  bool identity_1_to_n = strict_mono && vt == ValueType::kInt64;
+  int64_t prev = 0;
+  bool have_prev = false;
+  uint64_t expected_id = 1;
+  for (size_t bi = 0; bi < blocks.size(); ++bi) {
+    const LSTableColumnBlock& col = blocks[bi];
+    const uint32_t n = row_counts[bi];
+    if (col.has_null) {
+      syn.has_null = true;
+      mono = false;
+      strict_mono = false;
+      identity_1_to_n = false;
+    }
+    if (col.has_min_max) {
+      syn.min_int = std::min(syn.min_int, col.min_int);
+      syn.max_int = std::max(syn.max_int, col.max_int);
+    }
+    if (mono) {
+      if (have_prev && col.has_min_max && col.min_int < prev) {
+        mono = false;
+        strict_mono = false;
+        identity_1_to_n = false;
+      } else {
+        for (uint32_t r = 0; r < n; ++r) {
+          const int64_t v = col.int_cells[r];
+          if (have_prev) {
+            if (v < prev) {
+              mono = false;
+              strict_mono = false;
+              identity_1_to_n = false;
+              break;
+            }
+            if (v == prev) {
+              strict_mono = false;
+              identity_1_to_n = false;
+            }
+          }
+          if (identity_1_to_n && std::cmp_not_equal(v, expected_id)) {
+            identity_1_to_n = false;
+          }
+          ++expected_id;
+          prev = v;
+          have_prev = true;
+        }
+      }
+    }
+  }
+  syn.is_monotonic = mono;
+  syn.is_unique_nonnull = strict_mono;
+  syn.is_identity_1_to_n = identity_1_to_n;
+  if (c == 0 && vt == ValueType::kInt64 && !is_unsigned) {
+    ComputeZeroColumnBitsetUniqueness(total_rows, blocks, row_counts, &syn);
+  }
+  return syn;
+}
+
+bool DecodeColumnBlockFromFile(
+    int fd, const uint8_t* base, bool using_mmap, size_t row_base,
+    const TlcsFile::BlockDirEntry& src_b, const TlcsFile::ColumnMeta& sm,
+    const LSTableColumnDictionary& ro_dict, TlcsDictKind dict_kind,
+    bool zero_copy_64, LSTableColumnDictionary* active_dict_mut,
+    int64_t* dst_ints_base, LSTableColumnBlock* dc_out,
+    std::vector<uint8_t>* raw_tmp, std::vector<int64_t>* dict_counts,
+    std::vector<uint64_t>* dict_first_row) {
+  LSTableColumnBlock& dc = *dc_out;
+  dc.type = sm.type;
+  dc.is_unsigned = sm.is_unsigned;
+  dc.has_null = sm.has_null;
+  dc.has_min_max = sm.has_min_max;
+  dc.has_double_min_max = sm.has_double_min_max;
+  dc.has_nan = sm.has_nan;
+  dc.all_single_byte_varchar = sm.all_single_byte_varchar;
+  dc.min_int = sm.min_int;
+  dc.max_int = sm.max_int;
+  dc.min_double = sm.min_double;
+  dc.max_double = sm.max_double;
+  dc.is_const_code = sm.is_const_code;
+  dc.has_code_min_max = sm.has_code_min_max;
+  dc.const_code = sm.const_code;
+  dc.min_code = sm.min_code;
+  dc.max_code = sm.max_code;
+  dc.dict_mask = sm.dict_mask;
+
+  if (sm.has_null) {
+    if (using_mmap) {
+      dc.nulls_view =
+          std::span<const uint8_t>(base + sm.nulls_offset, sm.nulls_size);
+    } else {
+      dc.nulls.resize(sm.nulls_size);
+      if (sm.nulls_size > 0 &&
+          PreadAllFd(fd, dc.nulls.data(), sm.nulls_size, sm.nulls_offset) !=
+              Status::kSuccess) {
+        return false;
+      }
+    }
+  }
+
+  if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
+      dict_kind == TlcsDictKind::kCompleteNarrow) {
+    uint8_t* dst_codes = active_dict_mut->narrow_codes.data() + row_base;
+    if (using_mmap) {
+      if (sm.data_size > 0) {
+        std::memcpy(dst_codes, base + sm.data_offset, sm.data_size);
+      }
+    } else if (sm.data_size > 0 &&
+               PreadAllFd(fd, dst_codes, sm.data_size, sm.data_offset) !=
+                   Status::kSuccess) {
+      return false;
+    }
+    if (src_b.row_count > 0 && dict_counts != nullptr &&
+        !dict_counts->empty()) {
+      const size_t null_slot = dict_counts->size() - 1;
+      if (!dc.has_null && dc.is_const_code && dc.const_code < null_slot) {
+        (*dict_counts)[dc.const_code] += static_cast<int64_t>(src_b.row_count);
+        (*dict_first_row)[dc.const_code] =
+            std::min<uint64_t>((*dict_first_row)[dc.const_code], row_base);
+      } else {
+        for (uint32_t r = 0; r < src_b.row_count; ++r) {
+          const uint8_t raw = dst_codes[r];
+          const size_t slot =
+              (raw == LSTableColumnDictionary::kNullCode || raw >= null_slot)
+                  ? null_slot
+                  : raw;
+          ++(*dict_counts)[slot];
+          (*dict_first_row)[slot] =
+              std::min<uint64_t>((*dict_first_row)[slot], row_base + r);
+        }
+      }
+    }
+    dc.dict = active_dict_mut;
+    dc.dict_codes = std::span<const uint8_t>(dst_codes, src_b.row_count);
+    dc.wide_code_begin = row_base;
+    dc.wide_code_count = src_b.row_count;
+    if (sm.type != ValueType::kVarChar) {
+      int64_t* dst_ints = dst_ints_base + row_base;
+      MaterializeDictInts(sm, *active_dict_mut, dc.dict_codes, src_b.row_count,
+                          dst_ints);
+      dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
+    }
+    return true;
+  }
+
+  if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
+      dict_kind == TlcsDictKind::kPartialFrozen) {
+    raw_tmp->resize(sm.data_size);
+    if (using_mmap) {
+      if (sm.data_size > 0) {
+        std::memcpy(raw_tmp->data(), base + sm.data_offset, sm.data_size);
+      }
+    } else if (sm.data_size > 0 &&
+               PreadAllFd(fd, raw_tmp->data(), sm.data_size, sm.data_offset) !=
+                   Status::kSuccess) {
+      return false;
+    }
+    if (sm.type == ValueType::kVarChar) {
+      dc.varchar_ends.resize(src_b.row_count);
+      for (uint32_t r = 0; r < src_b.row_count; ++r) {
+        const uint8_t code = (*raw_tmp)[r];
+        if (code != LSTableColumnDictionary::kNullCode &&
+            code < ro_dict.entries.size()) {
+          const std::string_view sv = ro_dict.entries[code];
+          dc.varchar_bytes.insert(
+              dc.varchar_bytes.end(),
+              reinterpret_cast<const uint8_t*>(sv.data()),
+              reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
+        }
+        dc.varchar_ends[r] = static_cast<uint32_t>(dc.varchar_bytes.size());
+      }
+    } else {
+      int64_t* dst_ints = dst_ints_base + row_base;
+      MaterializeDictInts(sm, ro_dict, *raw_tmp, src_b.row_count, dst_ints);
+      dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
+    }
+    return true;
+  }
+
+  if (sm.type == ValueType::kVarChar) {
+    if (using_mmap) {
+      dc.varchar_bytes_view =
+          std::span<const uint8_t>(base + sm.data_offset, sm.data_size);
+      if constexpr (std::endian::native == std::endian::little) {
+        dc.varchar_ends_view = std::span<const uint32_t>(
+            reinterpret_cast<const uint32_t*>(base + sm.aux_offset),
+            src_b.row_count);
+      } else {
+        dc.varchar_ends.resize(src_b.row_count);
+        const auto* raw_ends =
+            reinterpret_cast<const uint32_t*>(base + sm.aux_offset);
+        for (size_t r = 0; r < src_b.row_count; ++r) {
+          dc.varchar_ends[r] = le32toh(raw_ends[r]);
+        }
+      }
+    } else {
+      dc.varchar_bytes.resize(sm.data_size);
+      if (sm.data_size > 0 &&
+          PreadAllFd(fd, dc.varchar_bytes.data(), sm.data_size,
+                     sm.data_offset) != Status::kSuccess) {
+        return false;
+      }
+      dc.varchar_ends.resize(src_b.row_count);
+      if (sm.aux_size > 0 && PreadAllFd(fd, dc.varchar_ends.data(), sm.aux_size,
+                                        sm.aux_offset) != Status::kSuccess) {
+        return false;
+      }
+      if constexpr (std::endian::native != std::endian::little) {
+        for (uint32_t& end : dc.varchar_ends) {
+          end = le32toh(end);
+        }
+      }
+    }
+  } else if (zero_copy_64) {
+    dc.int_cells = std::span<const int64_t>(
+        reinterpret_cast<const int64_t*>(base + sm.data_offset),
+        src_b.row_count);
+  } else {
+    int64_t* dst_ints = dst_ints_base + row_base;
+    if (sm.encoding == TlcsColumnEncoding::kFor) {
+      if (sm.for_width == 0) {
+        UnpackForToInt64(sm, {}, src_b.row_count, dst_ints);
+      } else if (using_mmap) {
+        UnpackForToInt64(
+            sm, std::span<const uint8_t>(base + sm.data_offset, sm.data_size),
+            src_b.row_count, dst_ints);
+      } else {
+        raw_tmp->resize(sm.data_size);
+        if (sm.data_size > 0 &&
+            PreadAllFd(fd, raw_tmp->data(), sm.data_size, sm.data_offset) !=
+                Status::kSuccess) {
+          return false;
+        }
+        UnpackForToInt64(sm, *raw_tmp, src_b.row_count, dst_ints);
+      }
+    } else if (sm.encoding == TlcsColumnEncoding::kRawDouble) {
+      raw_tmp->resize(sm.data_size);
+      if (using_mmap) {
+        if (sm.data_size > 0) {
+          std::memcpy(raw_tmp->data(), base + sm.data_offset, sm.data_size);
+        }
+      } else if (sm.data_size > 0 &&
+                 PreadAllFd(fd, raw_tmp->data(), sm.data_size,
+                            sm.data_offset) != Status::kSuccess) {
+        return false;
+      }
+      Le64BufferToInt64(raw_tmp->data(), src_b.row_count, dst_ints);
+    }
+    dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
+  }
+  return true;
 }
 
 Status FillRowFromDecodedBlock(const TlcsFile::DecodedBlock& blk, uint32_t row,
@@ -1964,6 +2495,36 @@ bool TlcsFile::BlockAllRowsMatchPeek(
   return true;
 }
 
+bool TlcsFile::BlockIntBounds(uint32_t block_idx, slot_t col, int64_t* min_out,
+                              int64_t* max_out) const noexcept {
+  if (block_idx >= block_count_ || dir_group_size_ == 0 || min_out == nullptr ||
+      max_out == nullptr) {
+    return false;
+  }
+  StatusOr<std::shared_ptr<const DirGroup>> grp_or =
+      GetDirGroup(block_idx / dir_group_size_);
+  if (!grp_or.HasValue()) {
+    return false;
+  }
+  const uint32_t lidx = block_idx % dir_group_size_;
+  if (lidx >= grp_or.Value()->blocks.size()) {
+    return false;
+  }
+  const BlockDirEntry& blk = grp_or.Value()->blocks[lidx];
+  if (blk.row_count == 0 || col >= blk.columns.size()) {
+    return false;
+  }
+  const ColumnMeta& cm = blk.columns[col];
+  if (!cm.has_min_max ||
+      (cm.type != ValueType::kInt64 && cm.type != ValueType::kDate) ||
+      cm.max_int < cm.min_int) {
+    return false;
+  }
+  *min_out = cm.min_int;
+  *max_out = cm.max_int;
+  return true;
+}
+
 bool TlcsFile::BlockMatchesZoneMaps(
     uint32_t block_idx, const std::vector<IntegerPeekCompare>* peek_compares,
     const RuntimeFilterGroup* runtime_filter,
@@ -2494,6 +3055,184 @@ Status TlcsFile::DecodeBlockColumns(uint32_t block_idx,
                                     std::vector<uint8_t>* io_scratch) const {
   return DecodeBlockColumnsWithOptions(block_idx, column_ids, schema, out,
                                        materialize_dict_ints, io_scratch, {});
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (gather_decode_commutes)
+bool TlcsFile::TryGatherMmapFixedColumns(uint32_t block_idx,
+                                         std::span<const slot_t> column_ids,
+                                         std::span<const uint32_t> rows,
+                                         const Schema& schema,
+                                         DecodedBlock* out) const {
+  if constexpr (std::endian::native != std::endian::little) {
+    return false;
+  }
+  if (block_idx >= block_count_ || dir_group_size_ == 0 || out == nullptr ||
+      rows.empty()) {
+    return false;
+  }
+  decltype(resident_mmap_) mmap_copy;
+  {
+    std::scoped_lock lk(resident_mu_);
+    mmap_copy = resident_mmap_;
+  }
+  if (mmap_copy == nullptr || !mmap_copy->IsValid()) {
+    return false;
+  }
+  const uint8_t* const mmap_data = mmap_copy->Data();
+  StatusOr<std::shared_ptr<const DirGroup>> grp_or =
+      GetDirGroup(block_idx / dir_group_size_);
+  if (!grp_or.HasValue()) {
+    return false;
+  }
+  const std::shared_ptr<const DirGroup>& grp = grp_or.Value();
+  const uint32_t lidx = block_idx % dir_group_size_;
+  if (lidx >= grp->blocks.size()) {
+    return false;
+  }
+  const auto& blk = grp->blocks[lidx];
+  const uint32_t n = blk.row_count;
+  // Validate all requested columns are fixed-width random-access encodings.
+  for (const slot_t cid : column_ids) {
+    if (cid >= schema.ColumnCount() || cid >= blk.columns.size()) {
+      return false;
+    }
+    const ColumnMeta& meta = blk.columns[cid];
+    if (meta.encoding == TlcsColumnEncoding::kVarChar) {
+      return false;
+    }
+    if (meta.encoding == TlcsColumnEncoding::kNarrowDict &&
+        meta.type == ValueType::kVarChar) {
+      return false;
+    }
+    if (meta.has_null && (meta.nulls_size != static_cast<uint64_t>(n) ||
+                          meta.nulls_offset > file_size_ ||
+                          meta.nulls_size > file_size_ - meta.nulls_offset)) {
+      return false;
+    }
+    if (meta.data_size > 0 &&
+        (meta.data_offset > file_size_ ||
+         meta.data_size > file_size_ - meta.data_offset)) {
+      return false;
+    }
+  }
+  const size_t k = rows.size();
+  out->row_count = static_cast<uint32_t>(k);
+  out->columns.resize(column_ids.size());
+  for (size_t i = 0; i < column_ids.size(); ++i) {
+    const slot_t cid = column_ids[i];
+    const ColumnMeta& meta = blk.columns[cid];
+    DecodedColumnChunk& chunk = out->columns[i];
+    chunk.type = meta.type;
+    chunk.is_unsigned = meta.is_unsigned;
+    chunk.has_null = meta.has_null;
+    chunk.has_min_max = meta.has_min_max;
+    chunk.has_double_min_max = meta.has_double_min_max;
+    chunk.has_nan = meta.has_nan;
+    chunk.row_count = static_cast<uint32_t>(k);
+    chunk.dict = nullptr;
+    chunk.dict_encoded = false;
+    chunk.dict_codes.clear();
+    chunk.varchar_bytes.clear();
+    chunk.varchar_ends.clear();
+
+    if (meta.has_null) {
+      const uint8_t* const np = mmap_data + meta.nulls_offset;
+      chunk.nulls.resize(k);
+      uint8_t* const dnp = chunk.nulls.data();
+      for (size_t j = 0; j < k; ++j) {
+        dnp[j] = np[rows[j]];
+      }
+    } else {
+      chunk.nulls.clear();
+    }
+
+    chunk.int_cells.resize(k);
+    int64_t* const dst = chunk.int_cells.data();
+    const uint8_t* const dp = mmap_data + meta.data_offset;
+    switch (meta.encoding) {
+      case TlcsColumnEncoding::kRawDouble: {
+        if (meta.data_size != static_cast<uint64_t>(n) * sizeof(int64_t)) {
+          return false;
+        }
+        for (size_t j = 0; j < k; ++j) {
+          std::memcpy(&dst[j], dp + (static_cast<size_t>(rows[j]) * 8U), 8U);
+        }
+        break;
+      }
+      case TlcsColumnEncoding::kFor: {
+        const auto base = static_cast<uint64_t>(meta.for_base);
+        if (meta.for_width == 0) {
+          std::fill_n(dst, k, meta.for_base);
+        } else if (meta.for_width == 1) {
+          if (meta.data_size != static_cast<uint64_t>(n)) {
+            return false;
+          }
+          for (size_t j = 0; j < k; ++j) {
+            dst[j] = static_cast<int64_t>(base + dp[rows[j]]);
+          }
+        } else if (meta.for_width == 2) {
+          if (meta.data_size != static_cast<uint64_t>(n) * 2U) {
+            return false;
+          }
+          for (size_t j = 0; j < k; ++j) {
+            uint16_t d = 0;
+            std::memcpy(&d, dp + (static_cast<size_t>(rows[j]) * 2U), 2U);
+            dst[j] = static_cast<int64_t>(base + d);
+          }
+        } else if (meta.for_width == 4) {
+          if (meta.data_size != static_cast<uint64_t>(n) * 4U) {
+            return false;
+          }
+          for (size_t j = 0; j < k; ++j) {
+            uint32_t d = 0;
+            std::memcpy(&d, dp + (static_cast<size_t>(rows[j]) * 4U), 4U);
+            dst[j] = static_cast<int64_t>(base + d);
+          }
+        } else if (meta.for_width == 8) {
+          if (meta.data_size != static_cast<uint64_t>(n) * 8U) {
+            return false;
+          }
+          for (size_t j = 0; j < k; ++j) {
+            std::memcpy(&dst[j], dp + (static_cast<size_t>(rows[j]) * 8U), 8U);
+          }
+        } else {
+          return false;
+        }
+        break;
+      }
+      case TlcsColumnEncoding::kNarrowDict: {
+        if (meta.data_size != static_cast<uint64_t>(n)) {
+          return false;
+        }
+        if (meta.type == ValueType::kDouble) {
+          const auto entries = dicts_[cid].DoubleEntries();
+          for (size_t j = 0; j < k; ++j) {
+            const uint8_t code = dp[rows[j]];
+            if (code == LSTableColumnDictionary::kNullCode ||
+                code >= entries.size()) {
+              dst[j] = 0;
+            } else {
+              std::memcpy(&dst[j], &entries[code], sizeof(int64_t));
+            }
+          }
+        } else {
+          const auto entries = dicts_[cid].IntEntries();
+          for (size_t j = 0; j < k; ++j) {
+            const uint8_t code = dp[rows[j]];
+            dst[j] = (code == LSTableColumnDictionary::kNullCode ||
+                      code >= entries.size())
+                         ? 0
+                         : entries[code];
+          }
+        }
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return true;
 }
 
 Status TlcsFile::DecodeBlockColumnsWithOptions(
@@ -3035,7 +3774,8 @@ Status TlcsFile::DecodeSingleRowByBlockIndex(uint32_t block_idx,
             RETURN_IF_FAIL(read_slice(
                 // NOLINTNEXTLINE(readability-math-missing-parentheses)
                 // precedence is unambiguous
-                meta.data_offset + static_cast<uint64_t>(row_idx) * 2, 2,  // NOLINT(readability-math-missing-parentheses)
+                meta.data_offset + static_cast<uint64_t>(row_idx) * 2,
+                2,     // NOLINT(readability-math-missing-parentheses)
                 &b));  // NOLINT(readability-math-missing-parentheses) reviewed
                        // intentional pattern
             chunk.int_cells[0] = static_cast<int64_t>(base_u + le16toh(b));
@@ -3046,7 +3786,8 @@ Status TlcsFile::DecodeSingleRowByBlockIndex(uint32_t block_idx,
             RETURN_IF_FAIL(read_slice(
                 // NOLINTNEXTLINE(readability-math-missing-parentheses)
                 // precedence is unambiguous
-                meta.data_offset + static_cast<uint64_t>(row_idx) * 4, 4,  // NOLINT(readability-math-missing-parentheses)
+                meta.data_offset + static_cast<uint64_t>(row_idx) * 4,
+                4,     // NOLINT(readability-math-missing-parentheses)
                 &b));  // NOLINT(readability-math-missing-parentheses) reviewed
                        // intentional pattern
             chunk.int_cells[0] = static_cast<int64_t>(base_u + le32toh(b));
@@ -3057,7 +3798,8 @@ Status TlcsFile::DecodeSingleRowByBlockIndex(uint32_t block_idx,
             RETURN_IF_FAIL(read_slice(
                 // NOLINTNEXTLINE(readability-math-missing-parentheses)
                 // precedence is unambiguous
-                meta.data_offset + static_cast<uint64_t>(row_idx) * 8, 8,  // NOLINT(readability-math-missing-parentheses)
+                meta.data_offset + static_cast<uint64_t>(row_idx) * 8,
+                8,     // NOLINT(readability-math-missing-parentheses)
                 &v));  // NOLINT(readability-math-missing-parentheses) reviewed
                        // intentional pattern
             chunk.int_cells[0] = static_cast<int64_t>(le64toh(v));
@@ -3074,7 +3816,8 @@ Status TlcsFile::DecodeSingleRowByBlockIndex(uint32_t block_idx,
         RETURN_IF_FAIL(read_slice(
             // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
             // is unambiguous
-            meta.data_offset + static_cast<uint64_t>(row_idx) * 8, 8,  // NOLINT(readability-math-missing-parentheses)
+            meta.data_offset + static_cast<uint64_t>(row_idx) * 8,
+            8,     // NOLINT(readability-math-missing-parentheses)
             &v));  // NOLINT(readability-math-missing-parentheses) reviewed
                    // intentional pattern
         chunk.int_cells[0] = static_cast<int64_t>(le64toh(v));
@@ -3091,14 +3834,17 @@ Status TlcsFile::DecodeSingleRowByBlockIndex(uint32_t block_idx,
         RETURN_IF_FAIL(read_slice(
             // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
             // is unambiguous
-            meta.aux_offset + static_cast<uint64_t>(row_idx) * 4, 4,  // NOLINT(readability-math-missing-parentheses)
+            meta.aux_offset + static_cast<uint64_t>(row_idx) * 4,
+            4,       // NOLINT(readability-math-missing-parentheses)
             &end));  // NOLINT(readability-math-missing-parentheses) reviewed
                      // intentional pattern
         if (row_idx > 0) {
           RETURN_IF_FAIL(read_slice(
               // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
               // is unambiguous
-              meta.aux_offset + static_cast<uint64_t>(row_idx - 1) * 4,  // NOLINT(readability-math-missing-parentheses)
+              meta.aux_offset +
+                  static_cast<uint64_t>(row_idx - 1) *
+                      4,  // NOLINT(readability-math-missing-parentheses)
               4,  // NOLINT(readability-math-missing-parentheses) reviewed
                   // intentional pattern
               &begin));
@@ -3240,33 +3986,437 @@ Status TlcsFile::ForEachBlockRowByPid(
   return Status::kSuccess;
 }
 
-std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
-    const Schema& schema, const std::vector<slot_t>* projection,
-    uint64_t max_bytes,
-    const std::shared_ptr<const platform::MemoryMap>& mmap, bool* capacity_rejected) const {
-  if (capacity_rejected != nullptr) { *capacity_rejected = false; }
+bool TlcsFile::LoadAllDirGroups(
+    std::vector<std::shared_ptr<const DirGroup>>* groups_out) const {
+  groups_out->clear();
+  groups_out->reserve(dir_groups_.size());
+  uint64_t dir_rows = 0;
+  for (uint32_t g = 0; g < dir_groups_.size(); ++g) {
+    StatusOr<std::shared_ptr<const DirGroup>> grp_or = GetDirGroup(g);
+    if (!grp_or.HasValue()) {
+      return false;
+    }
+    for (const BlockDirEntry& b : grp_or.Value()->blocks) {
+      dir_rows += b.row_count;
+    }
+    groups_out->push_back(std::move(grp_or.Value()));
+  }
+  return dir_rows == total_rows_;
+}
+
+TlcsFile::ColumnDecodePlan TlcsFile::PlanColumnDecode(
+    slot_t c, bool using_mmap,
+    const std::vector<std::shared_ptr<const DirGroup>>& groups) const {
+  ColumnDecodePlan plan;
+  plan.heap_bytes =
+      sizeof(LSTableColumnCacheEntry) +
+      (static_cast<uint64_t>(block_count_) * sizeof(LSTableColumnBlock));
+  const ValueType vt = col_types_[c];
+  if (vt != ValueType::kVarChar) {
+    bool all_raw64 = using_mmap;
+    for (const auto& grp : groups) {
+      if (!all_raw64) {
+        break;
+      }
+      for (const BlockDirEntry& b : grp->blocks) {
+        const ColumnMeta& m = b.columns[c];
+        const bool is_raw64 =
+            (m.encoding == TlcsColumnEncoding::kFor && m.for_width == 8) ||
+            m.encoding == TlcsColumnEncoding::kRawDouble;
+        if (!is_raw64 || (m.data_offset % alignof(int64_t)) != 0) {
+          all_raw64 = false;
+          break;
+        }
+      }
+    }
+    if (all_raw64 && htole64(1ULL) == 1ULL) {
+      plan.zero_copy_64 = true;
+    } else {
+      plan.need_int_vec = true;
+      plan.heap_bytes += total_rows_ * sizeof(int64_t);
+    }
+  }
+  if (dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
+    plan.heap_bytes += total_rows_;
+  }
+  for (const auto& grp : groups) {
+    for (const BlockDirEntry& b : grp->blocks) {
+      const ColumnMeta& m = b.columns[c];
+      if (!using_mmap) {
+        plan.heap_bytes += m.nulls_size + m.data_size + m.aux_size;
+      } else {
+        plan.mapped_bytes += m.nulls_size;
+        if (vt == ValueType::kVarChar &&
+            m.encoding == TlcsColumnEncoding::kVarChar) {
+          plan.mapped_bytes += m.data_size + m.aux_size;
+        } else if (plan.zero_copy_64) {
+          plan.mapped_bytes += m.data_size;
+        }
+      }
+    }
+  }
+  return plan;
+}
+
+size_t TlcsFile::EstimateColumnsCacheBytes(
+    const Schema& schema, const std::vector<slot_t>& columns) const {
+  if (schema.ColumnCount() != column_count_ ||
+      !LSTableStore::SupportsSchema(schema)) {
+    return 0;
+  }
+  std::vector<std::shared_ptr<const DirGroup>> groups;
+  if (!LoadAllDirGroups(&groups)) {
+    return 0;
+  }
+  bool using_mmap = false;
+  {
+    std::scoped_lock lk(resident_mu_);
+    using_mmap = resident_mmap_ != nullptr && resident_mmap_->IsValid();
+  }
+  uint64_t total = 0;
+  for (const slot_t c : columns) {
+    if (c < column_count_) {
+      const ColumnDecodePlan plan = PlanColumnDecode(c, using_mmap, groups);
+      total += plan.mapped_bytes + plan.heap_bytes;
+    }
+  }
+  return static_cast<size_t>(
+      std::min<uint64_t>(total, std::numeric_limits<size_t>::max()));
+}
+
+std::shared_ptr<const LSTableBlockLayout> TlcsFile::BuildBlockLayout(
+    const Schema& schema, uint64_t generation, bool* capacity_rejected) const {
+  if (capacity_rejected != nullptr) {
+    *capacity_rejected = false;
+  }
   if (schema.ColumnCount() != column_count_ ||
       !LSTableStore::SupportsSchema(schema)) {
     return nullptr;
   }
   std::vector<std::shared_ptr<const DirGroup>> groups;
-  groups.reserve(dir_groups_.size());
-  uint64_t dir_rows = 0;
-  for (uint32_t g = 0; g < dir_groups_.size(); ++g) {
-    StatusOr<std::shared_ptr<const DirGroup>> grp_or = GetDirGroup(g);
-    if (!grp_or.HasValue()) {
+  if (!LoadAllDirGroups(&groups)) {
+    return nullptr;
+  }
+  std::shared_ptr<const platform::MemoryMap> mmap_copy;
+  {
+    std::scoped_lock lk(resident_mu_);
+    mmap_copy = resident_mmap_;
+  }
+  const uint8_t* base = mmap_copy != nullptr && mmap_copy->IsValid()
+                            ? mmap_copy->Data()
+                            : nullptr;
+  const bool using_mmap = base != nullptr;
+
+  auto layout = std::make_shared<LSTableBlockLayout>();
+  layout->generation = generation;
+  layout->first_pid = first_pid_;
+  layout->is_persistent_tlcs = true;
+  layout->total_rows = total_rows_;
+  layout->backing_mmap = using_mmap ? mmap_copy : nullptr;
+  if (using_mmap && stats_file_size_ > 0 &&
+      stats_file_offset_ + stats_file_size_ <= mmap_copy->Size()) {
+    layout->serialized_column_stats = std::string_view(
+        reinterpret_cast<const char*>(base + stats_file_offset_),
+        stats_file_size_);
+  } else if (!serialized_column_stats_.empty()) {
+    layout->owned_column_stats = serialized_column_stats_;
+    layout->serialized_column_stats = layout->owned_column_stats;
+  }
+
+  layout->page_ids.reserve(block_count_);
+  layout->block_row_counts.reserve(block_count_);
+  page_id_t max_pid = 0;
+  for (const auto& grp : groups) {
+    for (const BlockDirEntry& src_b : grp->blocks) {
+      layout->page_ids.push_back(src_b.pid);
+      layout->block_row_counts.push_back(src_b.row_count);
+      max_pid = std::max(max_pid, src_b.pid);
+    }
+  }
+
+  layout->memory_charge =
+      std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+  const size_t base_bytes =
+      sizeof(LSTableBlockLayout) +
+      (layout->page_ids.size() * sizeof(page_id_t)) +
+      (layout->block_row_counts.size() * sizeof(uint32_t));
+  if (!layout->memory_charge->TryAddWithReclaim(base_bytes)) {
+    if (capacity_rejected != nullptr) {
+      *capacity_rejected = true;
+    }
+    return nullptr;
+  }
+  if (max_pid < kMaxFlatPageId && !layout->page_ids.empty()) {
+    const size_t flat_bytes =
+        static_cast<size_t>(max_pid + 1) * sizeof(uint32_t);
+    if (layout->memory_charge->TryAddWithReclaim(flat_bytes)) {
+      layout->flat_page_to_block.assign(max_pid + 1,
+                                        LSTableStore::kInvalidBlockIndex);
+      for (size_t i = 0; i < layout->page_ids.size(); ++i) {
+        layout->flat_page_to_block[layout->page_ids[i]] =
+            static_cast<uint32_t>(i);
+      }
+    }
+  }
+  if (layout->flat_page_to_block.empty() && !layout->page_ids.empty()) {
+    const size_t map_bytes = layout->page_ids.size() * 32ULL;
+    if (!layout->memory_charge->TryAddWithReclaim(map_bytes)) {
+      if (capacity_rejected != nullptr) {
+        *capacity_rejected = true;
+      }
       return nullptr;
     }
-    for (const BlockDirEntry& b : grp_or.Value()->blocks) {
-      dir_rows += b.row_count;
+    layout->page_to_block.reserve(layout->page_ids.size());
+    for (size_t i = 0; i < layout->page_ids.size(); ++i) {
+      layout->page_to_block.emplace(layout->page_ids[i], i);
     }
-    groups.push_back(std::move(grp_or.Value()));
   }
-  // The destination buffers below are sized from the header's total_rows_,
-  // while the write offsets are accumulated from each block's directory
-  // row_count. Without reconciliation a header that under-reports the row
-  // count lets those writes run past the end of the allocated buffers.
-  if (dir_rows != total_rows_) {
+  return layout;
+}
+
+std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>
+TlcsFile::BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
+                                  const std::vector<slot_t>& columns,
+                                  uint64_t effective_max_bytes,
+                                  std::vector<slot_t>* rejected_cols) const {
+  std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> result(
+      columns.size());
+  if (columns.empty()) {
+    return result;
+  }
+  if (schema.ColumnCount() != column_count_ ||
+      !LSTableStore::SupportsSchema(schema)) {
+    return result;
+  }
+  for (const slot_t c : columns) {
+    if (c >= column_count_) {
+      return result;
+    }
+  }
+  std::vector<std::shared_ptr<const DirGroup>> groups;
+  if (!LoadAllDirGroups(&groups)) {
+    return result;
+  }
+  std::shared_ptr<const platform::MemoryMap> mmap_copy;
+  {
+    std::scoped_lock lk(resident_mu_);
+    mmap_copy = resident_mmap_;
+  }
+  const uint8_t* base = mmap_copy != nullptr && mmap_copy->IsValid()
+                            ? mmap_copy->Data()
+                            : nullptr;
+  const bool using_mmap = base != nullptr;
+
+  std::vector<const BlockDirEntry*> blk_ptrs;
+  std::vector<size_t> blk_row_bases;
+  std::vector<uint32_t> blk_row_counts;
+  blk_ptrs.reserve(block_count_);
+  blk_row_bases.reserve(block_count_);
+  blk_row_counts.reserve(block_count_);
+  size_t running_rows = 0;
+  for (const auto& grp : groups) {
+    for (const BlockDirEntry& src_b : grp->blocks) {
+      blk_ptrs.push_back(&src_b);
+      blk_row_bases.push_back(running_rows);
+      blk_row_counts.push_back(src_b.row_count);
+      running_rows += src_b.row_count;
+    }
+  }
+
+  std::vector<std::shared_ptr<LSTableColumnCacheEntry>> mutable_entries(
+      columns.size());
+  std::vector<ColumnDecodePlan> plans(columns.size());
+  std::vector<size_t> active_indices;
+  active_indices.reserve(columns.size());
+  const auto& budget = ProcessMemoryBudget::Global();
+  const size_t col_limit =
+      std::min(budget.ColumnarPoolLimit(),
+               budget.EffectivePoolMaxBytes(MemoryPoolKind::kColumnar));
+  for (size_t i = 0; i < columns.size(); ++i) {
+    const slot_t c = columns[i];
+    const ColumnDecodePlan plan = PlanColumnDecode(c, using_mmap, groups);
+    plans[i] = plan;
+    if (plan.mapped_bytes > effective_max_bytes ||
+        plan.heap_bytes > effective_max_bytes) {
+      if (rejected_cols != nullptr) {
+        rejected_cols->push_back(c);
+      }
+      continue;
+    }
+    uint64_t total_reserve = plan.mapped_bytes + plan.heap_bytes;
+    auto entry = std::make_shared<LSTableColumnCacheEntry>();
+    entry->generation = generation;
+    entry->col_index = c;
+    entry->type = col_types_[c];
+    entry->is_unsigned = col_unsigned_[c] != 0;
+    entry->backing_mmap = using_mmap ? mmap_copy : nullptr;
+    entry->memory_charge =
+        std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+    if (total_reserve > 0 &&
+        !entry->memory_charge->TryAddWithReclaim(total_reserve)) {
+      // Only permanently mark the column rejected when it exceeds the entire
+      // pool limit; transient contention should remain retryable later.
+      if (rejected_cols != nullptr && col_limit > 0 &&
+          total_reserve > col_limit) {
+        rejected_cols->push_back(c);
+      }
+      continue;
+    }
+    entry->blocks.resize(blk_ptrs.size());
+    if (plan.need_int_vec) {
+      entry->integer_column.resize(total_rows_);
+    }
+    if (dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
+      entry->dictionary = dicts_[c];
+      entry->dictionary.narrow_codes.resize(total_rows_);
+      if (total_rows_ <= static_cast<uint64_t>(INT64_MAX)) {
+        auto& dict = entry->dictionary;
+        const size_t entry_count = dict.value_type == ValueType::kVarChar
+                                       ? dict.StringEntryCount()
+                                       : (dict.value_type == ValueType::kDouble
+                                              ? dict.DoubleEntryCount()
+                                              : dict.IntEntryCount());
+        if (entry_count <= LSTableColumnDictionary::kMaxEntries) {
+          const size_t summary_bytes =
+              (entry_count + 1) *
+              (sizeof(int64_t) + sizeof(uint64_t) + sizeof(uint32_t));
+          if (entry->memory_charge->TryAddWithReclaim(summary_bytes)) {
+            dict.code_counts.assign(entry_count + 1, 0);
+            dict.code_first_row.assign(entry_count + 1, UINT64_MAX);
+            total_reserve += summary_bytes;
+          }
+        }
+      }
+    }
+    entry->estimated_bytes = static_cast<size_t>(total_reserve);
+    mutable_entries[i] = std::move(entry);
+    active_indices.push_back(i);
+  }
+
+  if (active_indices.empty()) {
+    return result;
+  }
+
+  const size_t nblocks = blk_ptrs.size();
+  const size_t workers =
+      (nblocks >= 4 && total_rows_ >= 65536)
+          ? std::min<size_t>(
+                nblocks,
+                std::max<size_t>(1, QueryParallelWorkerLimit(
+                                        std::thread::hardware_concurrency())))
+          : 1;
+
+  struct WorkerSummary {
+    std::vector<int64_t> counts;
+    std::vector<uint64_t> first_row;
+  };
+  // Per-(worker, active_col) dictionary counters so parallel stripe decodes
+  // stay lock-free without false sharing.
+  std::vector<std::vector<WorkerSummary>> worker_summaries(workers);
+  for (size_t w = 0; w < workers; ++w) {
+    worker_summaries[w].resize(active_indices.size());
+    for (size_t ai = 0; ai < active_indices.size(); ++ai) {
+      const auto& dict = mutable_entries[active_indices[ai]]->dictionary;
+      if (!dict.code_counts.empty()) {
+        worker_summaries[w][ai].counts.assign(dict.code_counts.size(), 0);
+        worker_summaries[w][ai].first_row.assign(dict.code_counts.size(),
+                                                 UINT64_MAX);
+      }
+    }
+  }
+
+  std::atomic<bool> io_failed{false};
+  const Status par_status = RunParallelTasks(workers, [&](size_t w) -> Status {
+    const size_t b_begin = (nblocks * w) / workers;
+    const size_t b_end = (nblocks * (w + 1)) / workers;
+    std::vector<uint8_t> raw_tmp;
+    for (size_t bi = b_begin; bi < b_end; ++bi) {
+      if (io_failed.load(std::memory_order_relaxed)) {
+        return Status::kSuccess;
+      }
+      const BlockDirEntry& src_b = *blk_ptrs[bi];
+      const size_t row_base = blk_row_bases[bi];
+      for (size_t ai = 0; ai < active_indices.size(); ++ai) {
+        const size_t idx = active_indices[ai];
+        LSTableColumnCacheEntry& entry = *mutable_entries[idx];
+        const slot_t c = entry.col_index;
+        LSTableColumnDictionary* active_dict =
+            dict_kinds_[c] == TlcsDictKind::kCompleteNarrow ? &entry.dictionary
+                                                            : nullptr;
+        int64_t* dst_ints = entry.integer_column.empty()
+                                ? nullptr
+                                : entry.integer_column.data();
+        WorkerSummary& ws = worker_summaries[w][ai];
+        if (!DecodeColumnBlockFromFile(
+                fd_, base, using_mmap, row_base, src_b, src_b.columns[c],
+                dicts_[c], dict_kinds_[c], plans[idx].zero_copy_64, active_dict,
+                dst_ints, &entry.blocks[bi], &raw_tmp,
+                ws.counts.empty() ? nullptr : &ws.counts,
+                ws.first_row.empty() ? nullptr : &ws.first_row)) {
+          io_failed.store(true, std::memory_order_relaxed);
+          return Status::kIOError;
+        }
+      }
+    }
+    return Status::kSuccess;
+  });
+  if (par_status != Status::kSuccess ||
+      io_failed.load(std::memory_order_relaxed)) {
+    return result;
+  }
+
+  for (size_t ai = 0; ai < active_indices.size(); ++ai) {
+    const size_t idx = active_indices[ai];
+    LSTableColumnCacheEntry& entry = *mutable_entries[idx];
+    const slot_t c = entry.col_index;
+    if (!entry.dictionary.code_counts.empty()) {
+      auto& dict = entry.dictionary;
+      const size_t ncodes = dict.code_counts.size();
+      for (size_t w = 0; w < workers; ++w) {
+        const WorkerSummary& ws = worker_summaries[w][ai];
+        for (size_t s = 0; s < ncodes; ++s) {
+          dict.code_counts[s] += ws.counts[s];
+          dict.code_first_row[s] =
+              std::min(dict.code_first_row[s], ws.first_row[s]);
+        }
+      }
+      BuildEncounterCodesFromFirstRow(&dict);
+    }
+
+    ColumnSynopsis syn = has_col_synopses_ && c < col_synopses_.size()
+                             ? col_synopses_[c]
+                             : ComputeColumnSynopsisFromEntry(
+                                   c, col_types_[c], col_unsigned_[c] != 0,
+                                   total_rows_, entry.blocks, blk_row_counts);
+    if (has_col_synopses_ && c == 0 && col_types_[c] == ValueType::kInt64 &&
+        col_unsigned_[c] == 0) {
+      ComputeZeroColumnBitsetUniqueness(total_rows_, entry.blocks,
+                                        blk_row_counts, &syn);
+    }
+    entry.has_null = syn.has_null;
+    entry.is_monotonic = syn.is_monotonic;
+    entry.is_unique_nonnull = syn.is_unique_nonnull;
+    entry.is_identity_1_to_n = syn.is_identity_1_to_n;
+    entry.min_int = syn.min_int;
+    entry.max_int = syn.max_int;
+    result[idx] = std::move(mutable_entries[idx]);
+  }
+  return result;
+}
+
+std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
+    const Schema& schema, const std::vector<slot_t>* projection,
+    uint64_t max_bytes, const std::shared_ptr<const platform::MemoryMap>& mmap,
+    bool* capacity_rejected) const {
+  if (capacity_rejected != nullptr) {
+    *capacity_rejected = false;
+  }
+  if (schema.ColumnCount() != column_count_ ||
+      !LSTableStore::SupportsSchema(schema)) {
+    return nullptr;
+  }
+  std::vector<std::shared_ptr<const DirGroup>> groups;
+  if (!LoadAllDirGroups(&groups)) {
     return nullptr;
   }
 
@@ -3355,7 +4505,9 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
   // resident-mmap vs paged mode, matching the TlcsFile class contract.
   const uint64_t mapped_bytes = using_mmap ? file_size_ : 0;
   if (mapped_bytes > max_bytes || alloc_bytes > max_bytes) {
-    if (capacity_rejected != nullptr) { *capacity_rejected = true; }
+    if (capacity_rejected != nullptr) {
+      *capacity_rejected = true;
+    }
     return nullptr;
   }
   const uint64_t total_reserve = mapped_bytes + alloc_bytes;
@@ -3447,176 +4599,36 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
         }
         const ColumnMeta& sm = src_b.columns[c];
         LSTableColumnBlock& dc = dst_b.columns[c];
-        dc.type = sm.type;
-        dc.is_unsigned = sm.is_unsigned;
-        dc.has_null = sm.has_null;
-        dc.has_min_max = sm.has_min_max;
-        dc.has_double_min_max = sm.has_double_min_max;
-        dc.has_nan = sm.has_nan;
-        dc.all_single_byte_varchar = sm.all_single_byte_varchar;
-        dc.min_int = sm.min_int;
-        dc.max_int = sm.max_int;
-        dc.min_double = sm.min_double;
-        dc.max_double = sm.max_double;
-        dc.is_const_code = sm.is_const_code;
-        dc.has_code_min_max = sm.has_code_min_max;
-        dc.const_code = sm.const_code;
-        dc.min_code = sm.min_code;
-        dc.max_code = sm.max_code;
-        dc.dict_mask = sm.dict_mask;
-
-        if (sm.has_null) {
-          if (using_mmap) {
-            dc.nulls_view =
-                std::span<const uint8_t>(base + sm.nulls_offset, sm.nulls_size);
-          } else {
-            dc.nulls.resize(sm.nulls_size);
-            if (PreadAllFd(fd_, dc.nulls.data(), sm.nulls_size,
-                           sm.nulls_offset) != Status::kSuccess) {
-              return nullptr;
-            }
-          }
-        }
-
-        if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
-            dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
-          LSTableColumnDictionary& dict = store->dictionaries[c];
-          uint8_t* dst_codes = dict.narrow_codes.data() + row_base;
-          if (using_mmap) {
-            std::memcpy(dst_codes, base + sm.data_offset, sm.data_size);
-          } else if (PreadAllFd(fd_, dst_codes, sm.data_size, sm.data_offset) !=
-                     Status::kSuccess) {
-            return nullptr;
-          }
-          if (src_b.row_count > 0 && !dict.code_counts.empty()) {
-            const size_t null_slot = dict.code_counts.size() - 1;
-            if (!dc.has_null && dc.is_const_code && dc.const_code < null_slot) {
-              if (dict.code_counts[dc.const_code] == 0) {
-                dict.code_first_row[dc.const_code] = row_base;
-                dict.encounter_codes.push_back(dc.const_code);
-              }
-              dict.code_counts[dc.const_code] +=
-                  static_cast<int64_t>(src_b.row_count);
-            } else {
-              for (uint32_t r = 0; r < src_b.row_count; ++r) {
-                const uint8_t raw = dst_codes[r];
-                const size_t slot =
-                    (raw == LSTableColumnDictionary::kNullCode ||
-                     raw >= null_slot)
-                        ? null_slot
-                        : raw;
-                if (dict.code_counts[slot]++ == 0) {
-                  dict.code_first_row[slot] = row_base + r;
-                  dict.encounter_codes.push_back(static_cast<uint32_t>(slot));
-                }
-              }
-            }
-          }
-          dc.dict = &dict;
-          dc.dict_codes = std::span<const uint8_t>(dst_codes, src_b.row_count);
-          dc.wide_code_begin = row_base;
-          dc.wide_code_count = src_b.row_count;
-          if (sm.type != ValueType::kVarChar) {
-            int64_t* dst_ints = store->integer_columns[c].data() + row_base;
-            MaterializeDictInts(sm, dict, dc.dict_codes, src_b.row_count,
-                                dst_ints);
-            dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
-          }
-          continue;
-        }
-
-        if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
-            dict_kinds_[c] == TlcsDictKind::kPartialFrozen) {
-          // Early block encoded via frozen dict before overflow: materialize
-          // into standard native representation so
-          // `store->dictionaries[c].active` remains consistent.
-          raw_tmp.resize(sm.data_size);
-          if (using_mmap) {
-            std::memcpy(raw_tmp.data(), base + sm.data_offset, sm.data_size);
-          } else if (PreadAllFd(fd_, raw_tmp.data(), sm.data_size,
-                                sm.data_offset) != Status::kSuccess) {
-            return nullptr;
-          }
-          if (sm.type == ValueType::kVarChar) {
-            dc.varchar_ends.resize(src_b.row_count);
-            for (uint32_t r = 0; r < src_b.row_count; ++r) {
-              const uint8_t code = raw_tmp[r];
-              if (code != LSTableColumnDictionary::kNullCode &&
-                  code < dicts_[c].entries.size()) {
-                const std::string_view sv = dicts_[c].entries[code];
-                dc.varchar_bytes.insert(
-                    dc.varchar_bytes.end(),
-                    reinterpret_cast<const uint8_t*>(sv.data()),
-                    reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
-              }
-              dc.varchar_ends[r] =
-                  static_cast<uint32_t>(dc.varchar_bytes.size());
-            }
-          } else {
-            int64_t* dst_ints = store->integer_columns[c].data() + row_base;
-            MaterializeDictInts(sm, dicts_[c], raw_tmp, src_b.row_count,
-                                dst_ints);
-            dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
-          }
-          continue;
-        }
-
-        if (sm.type == ValueType::kVarChar) {
-          if (using_mmap) {
-            dc.varchar_bytes_view =
-                std::span<const uint8_t>(base + sm.data_offset, sm.data_size);
-            dc.varchar_ends_view = std::span<const uint32_t>(
-                reinterpret_cast<const uint32_t*>(base + sm.aux_offset),
-                src_b.row_count);
-          } else {
-            dc.varchar_bytes.resize(sm.data_size);
-            if (sm.data_size > 0 &&
-                PreadAllFd(fd_, dc.varchar_bytes.data(), sm.data_size,
-                           sm.data_offset) != Status::kSuccess) {
-              return nullptr;
-            }
-            dc.varchar_ends.resize(src_b.row_count);
-            if (PreadAllFd(fd_, dc.varchar_ends.data(), sm.aux_size,
-                           sm.aux_offset) != Status::kSuccess) {
-              return nullptr;
-            }
-          }
-        } else if (zero_copy_64[c]) {
-          dc.int_cells = std::span<const int64_t>(
-              reinterpret_cast<const int64_t*>(base + sm.data_offset),
-              src_b.row_count);
-        } else {
-          int64_t* dst_ints = store->integer_columns[c].data() + row_base;
-          if (sm.encoding == TlcsColumnEncoding::kFor) {
-            if (sm.for_width == 0) {
-              UnpackForToInt64(sm, {}, src_b.row_count, dst_ints);
-            } else if (using_mmap) {
-              UnpackForToInt64(
-                  sm,
-                  std::span<const uint8_t>(base + sm.data_offset, sm.data_size),
-                  src_b.row_count, dst_ints);
-            } else {
-              raw_tmp.resize(sm.data_size);
-              if (PreadAllFd(fd_, raw_tmp.data(), sm.data_size,
-                             sm.data_offset) != Status::kSuccess) {
-                return nullptr;
-              }
-              UnpackForToInt64(sm, raw_tmp, src_b.row_count, dst_ints);
-            }
-          } else if (sm.encoding == TlcsColumnEncoding::kRawDouble) {
-            raw_tmp.resize(sm.data_size);
-            if (using_mmap) {
-              std::memcpy(raw_tmp.data(), base + sm.data_offset, sm.data_size);
-            } else if (PreadAllFd(fd_, raw_tmp.data(), sm.data_size,
-                                  sm.data_offset) != Status::kSuccess) {
-              return nullptr;
-            }
-            Le64BufferToInt64(raw_tmp.data(), src_b.row_count, dst_ints);
-          }
-          dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
+        LSTableColumnDictionary* active_dict =
+            dict_kinds_[c] == TlcsDictKind::kCompleteNarrow
+                ? &store->dictionaries[c]
+                : nullptr;
+        int64_t* dst_ints = store->integer_columns[c].empty()
+                                ? nullptr
+                                : store->integer_columns[c].data();
+        std::vector<int64_t>* d_counts =
+            active_dict != nullptr && !active_dict->code_counts.empty()
+                ? &active_dict->code_counts
+                : nullptr;
+        std::vector<uint64_t>* d_first =
+            active_dict != nullptr && !active_dict->code_first_row.empty()
+                ? &active_dict->code_first_row
+                : nullptr;
+        if (!DecodeColumnBlockFromFile(fd_, base, using_mmap, row_base, src_b,
+                                       sm, dicts_[c], dict_kinds_[c],
+                                       zero_copy_64[c], active_dict, dst_ints,
+                                       &dc, &raw_tmp, d_counts, d_first)) {
+          return nullptr;
         }
       }
       row_base += src_b.row_count;
+    }
+  }
+  for (slot_t c = 0; c < column_count_; ++c) {
+    if (store->HasColumn(c) &&
+        dict_kinds_[c] == TlcsDictKind::kCompleteNarrow &&
+        !store->dictionaries[c].code_counts.empty()) {
+      BuildEncounterCodesFromFirstRow(&store->dictionaries[c]);
     }
   }
 
@@ -3658,6 +4670,45 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
                                std::numeric_limits<int64_t>::min());
   for (slot_t c = 0; c < column_count_; ++c) {
     if (!store->HasColumn(c)) {
+      continue;
+    }
+    if (has_col_synopses_ && c < col_synopses_.size()) {
+      const ColumnSynopsis& syn = col_synopses_[c];
+      store->column_has_null[c] = syn.has_null ? 1 : 0;
+      store->column_is_monotonic[c] = syn.is_monotonic ? 1 : 0;
+      store->column_is_unique_nonnull[c] = syn.is_unique_nonnull ? 1 : 0;
+      store->column_is_identity_1_to_n[c] = syn.is_identity_1_to_n ? 1 : 0;
+      store->column_min_int[c] = syn.min_int;
+      store->column_max_int[c] = syn.max_int;
+      if (!syn.is_unique_nonnull && c == 0 && !syn.has_null &&
+          store->total_rows > 0 && col_types_[c] == ValueType::kInt64 &&
+          col_unsigned_[c] == 0 && syn.min_int <= syn.max_int) {
+        const uint64_t span = static_cast<uint64_t>(syn.max_int) -
+                              static_cast<uint64_t>(syn.min_int);
+        if (span <= 33'554'432ULL && span + 1 >= store->total_rows) {
+          std::vector<uint64_t> seen_bits(
+              static_cast<size_t>((span >> 6U) + 1U), 0ULL);
+          const auto base_u = static_cast<uint64_t>(syn.min_int);
+          bool all_unique = true;
+          for (const LSTablePageBlock& blk : store->blocks) {
+            const int64_t* __restrict cells = blk.columns[c].int_cells.data();
+            for (uint32_t r = 0; r < blk.row_count; ++r) {
+              const uint64_t off = static_cast<uint64_t>(cells[r]) - base_u;
+              const uint64_t mask = uint64_t{1} << (off & 63U);
+              uint64_t& word = seen_bits[static_cast<size_t>(off >> 6U)];
+              if ((word & mask) != 0) {
+                all_unique = false;
+                break;
+              }
+              word |= mask;
+            }
+            if (!all_unique) {
+              break;
+            }
+          }
+          store->column_is_unique_nonnull[c] = all_unique ? 1 : 0;
+        }
+      }
       continue;
     }
     bool any_null = false;
@@ -3754,13 +4805,59 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
 std::shared_ptr<const LSTableStore> TlcsFile::BuildProjectedResidentStore(
     const Schema& schema, const std::vector<slot_t>* projection,
     uint64_t effective_max_bytes, bool* capacity_rejected) const {
-  std::shared_ptr<const platform::MemoryMap> mmap_copy;
-  {
-    std::scoped_lock lk(resident_mu_);
-    mmap_copy = resident_mmap_;
+  if (capacity_rejected != nullptr) {
+    *capacity_rejected = false;
   }
-  return BuildResidentStoreInternal(schema, projection, effective_max_bytes,
-                                    mmap_copy, capacity_rejected);
+  if (projection == nullptr) {
+    std::shared_ptr<const platform::MemoryMap> mmap_copy;
+    {
+      std::scoped_lock lk(resident_mu_);
+      mmap_copy = resident_mmap_;
+    }
+    if (mmap_copy != nullptr && file_size_ > effective_max_bytes) {
+      mmap_copy.reset();
+    }
+    return BuildResidentStoreInternal(schema, nullptr, effective_max_bytes,
+                                      mmap_copy, capacity_rejected);
+  }
+  if (schema.ColumnCount() != column_count_ ||
+      !LSTableStore::SupportsSchema(schema)) {
+    return nullptr;
+  }
+  std::vector<slot_t> cols;
+  cols.reserve(projection->size());
+  for (const slot_t c : *projection) {
+    if (c >= column_count_) {
+      return nullptr;
+    }
+    cols.push_back(c);
+  }
+  std::ranges::sort(cols);
+  const auto dup = std::ranges::unique(cols);
+  cols.erase(dup.begin(), dup.end());
+  auto layout = BuildBlockLayout(schema, layout_generation_, capacity_rejected);
+  if (!layout) {
+    return nullptr;
+  }
+  std::vector<slot_t> rejected_cols;
+  auto entries = BuildColumnCacheEntries(schema, layout_generation_, cols,
+                                         effective_max_bytes, &rejected_cols);
+  if (!rejected_cols.empty()) {
+    if (capacity_rejected != nullptr) {
+      *capacity_rejected = true;
+    }
+    return nullptr;
+  }
+  std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> assembled(
+      column_count_);
+  for (size_t i = 0; i < cols.size(); ++i) {
+    if (!entries[i]) {
+      return nullptr;
+    }
+    assembled[cols[i]] = std::move(entries[i]);
+  }
+  return AssembleLSTableStoreView(layout_generation_, column_count_, layout,
+                                  assembled, projection);
 }
 
 StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::Open(const std::string& path,
@@ -3818,12 +4915,22 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
     return StatusError(StatusCode::kCorrupt, "truncated tlcs header");
   }
   const uint32_t computed_hdr_crc = Crc32C(hdr.data(), kTlcsHeaderBytes - 4);
-  if (computed_hdr_crc != hdr_crc || version != kFormatVersion ||
+  if (computed_hdr_crc != hdr_crc ||
+      (version != 2 && version != kFormatVersion) ||
       (expected_schema != nullptr &&
        column_count != expected_schema->ColumnCount()) ||
       column_count == 0 || dir_offset > fsize ||
       dir_length > fsize - dir_offset) {
     return StatusError(StatusCode::kCorrupt, "tlcs header validation failed");
+  }
+  file->format_version_ = version;
+
+  // Every column needs two schema bytes and a nine-byte dictionary header.
+  // Reject impossible counts before allocating any column-indexed vectors.
+  constexpr uint64_t kMinDirectoryBytesPerColumn = 2 + 9;
+  if (column_count > dir_length / kMinDirectoryBytesPerColumn) {
+    return StatusError(StatusCode::kCorrupt,
+                       "tlcs directory too short for column count");
   }
 
   file->column_count_ = static_cast<slot_t>(column_count);
@@ -3868,7 +4975,7 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
     file->col_unsigned_[c] = u;
   }
   if (expected_schema == nullptr && schema_out != nullptr) {
-    *schema_out = Schema("tlcs", stored_cols);
+    *schema_out = Schema("tlcs", std::move(stored_cols));
   }
 
   file->dicts_.resize(column_count);
@@ -4005,6 +5112,34 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
   file->stats_file_size_ = stats_size;
   file->serialized_column_stats_.assign(
       reinterpret_cast<const char*>(dir_buf.data() + dpos), stats_size);
+  dpos += stats_size;
+  if (version >= 3) {
+    file->col_synopses_.resize(column_count);
+    for (uint32_t c = 0; c < column_count; ++c) {
+      uint8_t hn = 0;
+      uint8_t syn_mono = 0;
+      uint8_t uniq = 0;
+      uint8_t id1n = 0;
+      int64_t mn = 0;
+      int64_t mx = 0;
+      if (!ReadU8(dir_buf, &dpos, &hn) || !ReadU8(dir_buf, &dpos, &syn_mono) ||
+          !ReadU8(dir_buf, &dpos, &uniq) || !ReadU8(dir_buf, &dpos, &id1n) ||
+          !ReadI64(dir_buf, &dpos, &mn) || !ReadI64(dir_buf, &dpos, &mx) ||
+          hn > 1 || syn_mono > 1 || uniq > 1 || id1n > 1) {
+        return StatusError(StatusCode::kCorrupt,
+                           "tlcs column synopsis trailer corrupt");
+      }
+      file->col_synopses_[c] = ColumnSynopsis{
+          .has_null = hn != 0,
+          .is_monotonic = syn_mono != 0,
+          .is_unique_nonnull = uniq != 0,
+          .is_identity_1_to_n = id1n != 0,
+          .min_int = mn,
+          .max_int = mx,
+      };
+    }
+    file->has_col_synopses_ = true;
+  }
 
   const size_t meta_bytes = dir_length + (group_count * sizeof(DirGroupMeta));
   if (meta_bytes > 0) {
@@ -4114,19 +5249,35 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
   }
 
   // Decide whether to memory-map and expose a resident LSTableStore or stay
-  // paged with bounded Pread I/O.
+  // paged with bounded Pread I/O. Full resident LSTableStore materialization
+  // stays bounded by `fsize <= mmap_cap`. Read-only `resident_mmap_` alone can
+  // cover larger fixed-width tables up to `budget.Limit() / 2` (and is dropped
+  // by `EvictDecodedCacheForReclaim` under memory pressure) so sparse gathers
+  // read directly from the OS page cache without faulting multi-decagigabyte
+  // files past `RssWarnLimit()`. Explicit `TINYLAMB_TLCS_MMAP_LIMIT_BYTES`
+  // caps both.
   const uint64_t pool_half = effective_col_max / 2;
-  const uint64_t mmap_cap =
-      std::min<uint64_t>(pool_half, ReadResidentMmapLimitBytes());
+  const uint64_t env_limit = ReadResidentMmapLimitBytes();
+  const uint64_t mmap_cap = std::min<uint64_t>(pool_half, env_limit);
+  const char* env_mmap = std::getenv("TINYLAMB_TLCS_MMAP_LIMIT_BYTES");
+  const bool env_override = env_mmap != nullptr && *env_mmap != '\0';
+  const uint64_t map_only_cap =
+      env_override ? mmap_cap
+                   : (budget.Limit() == 0
+                          ? std::numeric_limits<uint64_t>::max()
+                          : std::max<uint64_t>(mmap_cap, budget.Limit() / 2));
   if (expected_schema != nullptr && !budget.AlwaysSpillEnabled() &&
-      fsize <= mmap_cap && mmap_cap > 0) {
+      mmap_cap > 0 && fsize > 0 && fsize <= map_only_cap) {
     auto mmap = std::make_shared<platform::MemoryMap>();
     if (mmap->Open(path) == 0 && mmap->IsValid()) {
-      auto res_store = file->BuildResidentStoreInternal(
-          *expected_schema, nullptr, mmap_cap, mmap);
+      std::shared_ptr<LSTableStore> res_store;
+      if (fsize <= mmap_cap) {
+        res_store = file->BuildResidentStoreInternal(*expected_schema, nullptr,
+                                                     mmap_cap, mmap);
+      }
+      std::scoped_lock rlk(file->resident_mu_);
+      file->resident_mmap_ = std::move(mmap);
       if (res_store != nullptr) {
-        std::scoped_lock rlk(file->resident_mu_);
-        file->resident_mmap_ = std::move(mmap);
         file->resident_store_ = std::move(res_store);
       }
     }
@@ -4149,7 +5300,8 @@ PendingTlcsCommit::PendingTlcsCommit(PendingTlcsCommit&& other) noexcept
       dir_groups(std::move(other.dir_groups)),
       dicts(std::move(other.dicts)),
       dict_kinds(std::move(other.dict_kinds)),
-      serialized_column_stats(std::move(other.serialized_column_stats)) {}
+      serialized_column_stats(std::move(other.serialized_column_stats)),
+      col_synopses(std::move(other.col_synopses)) {}
 
 PendingTlcsCommit& PendingTlcsCommit::operator=(
     PendingTlcsCommit&& other) noexcept {
@@ -4170,6 +5322,7 @@ PendingTlcsCommit& PendingTlcsCommit::operator=(
     dicts = std::move(other.dicts);
     dict_kinds = std::move(other.dict_kinds);
     serialized_column_stats = std::move(other.serialized_column_stats);
+    col_synopses = std::move(other.col_synopses);
   }
   return *this;
 }
@@ -4238,6 +5391,11 @@ StatusOr<PendingTlcsCommit> WriteTlcsTempFile(Transaction& txn,
 
   BlockStaging staging;
   staging.Init(schema);
+  std::vector<StreamingColSynopsis> streaming_synopses(schema.ColumnCount());
+  for (slot_t c = 0; c < schema.ColumnCount(); ++c) {
+    streaming_synopses[c].Init(schema.GetColumn(c).Type(),
+                               schema.GetColumn(c).IsUnsigned());
+  }
   StreamingStatsCollector stats_collector(schema);
   std::vector<uint8_t> scratch_codes;
   std::vector<uint8_t> scratch_for;
@@ -4321,30 +5479,41 @@ StatusOr<PendingTlcsCommit> WriteTlcsTempFile(Transaction& txn,
       RETURN_IF_FAIL(existing_tlcs->ForEachBlockRowByPid(
           pid, schema, [&](slot_t /*slot*/, const Row& row) -> Status {
             stats_collector.AddRow(row);
-            RETURN_IF_FAIL(staging.AppendRow(row));
+            RETURN_IF_FAIL(staging.AppendRow(row, &streaming_synopses));
             if (staging.row_count == RowPage::kMaxColumnarRows) {
               RETURN_IF_FAIL(flush_block());
             }
             return Status::kSuccess;
           }));
     } else {
+      const bool fast_direct =
+          !txn.HasPageVersionChains(pid) && txn.WriteSetEmpty();
       const slot_t row_max = rp.RowMax();
       for (slot_t slot = 0; slot < row_max; ++slot) {
         if (!rp.IsSlotOccupied(slot)) {
           continue;
         }
-        ASSIGN_OR_RETURN(std::string_view, raw, page->Read(txn, slot));
-        if (raw.empty()) {
-          continue;
+        if (fast_direct) {
+          const std::string_view raw = rp.GetRow(slot);
+          if (raw.empty()) {
+            continue;
+          }
+          RETURN_IF_FAIL(
+              staging.AppendRawRow(raw, &stats_collector, &streaming_synopses));
+        } else {
+          ASSIGN_OR_RETURN(std::string_view, raw, page->Read(txn, slot));
+          if (raw.empty()) {
+            continue;
+          }
+          ASSIGN_OR_RETURN(
+              size_t, consumed,
+              scratch_row.TryDeserialize(
+                  raw.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+                  schema));
+          (void)consumed;
+          stats_collector.AddRow(scratch_row);
+          RETURN_IF_FAIL(staging.AppendRow(scratch_row, &streaming_synopses));
         }
-        ASSIGN_OR_RETURN(
-            size_t, consumed,
-            scratch_row.TryDeserialize(
-                raw.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
-                schema));
-        (void)consumed;
-        stats_collector.AddRow(scratch_row);
-        RETURN_IF_FAIL(staging.AppendRow(scratch_row));
         if (staging.row_count == RowPage::kMaxColumnarRows) {
           RETURN_IF_FAIL(flush_block());
         }
@@ -4365,6 +5534,10 @@ StatusOr<PendingTlcsCommit> WriteTlcsTempFile(Transaction& txn,
     online_dicts[c].Finalize(&pending.dicts[c], &pending.dict_kinds[c]);
   }
   pending.serialized_column_stats = stats_collector.FinishEncoded();
+  pending.col_synopses.reserve(schema.ColumnCount());
+  for (const StreamingColSynopsis& ss : streaming_synopses) {
+    pending.col_synopses.push_back(ss.Finish(pending.total_rows));
+  }
   return pending;
 }
 
@@ -4411,7 +5584,7 @@ Status FinalizeTlcsTempFile(PendingTlcsCommit& pending,
   const std::string dir_bytes = EncodeMetaDirectoryBytes(
       pending.schema, pending.dicts, pending.dict_kinds,
       TlcsFile::kDirGroupSize, pending.dir_groups,
-      pending.serialized_column_stats, &stats_rel);
+      pending.serialized_column_stats, pending.col_synopses, &stats_rel);
   (void)stats_rel;
   RETURN_IF_FAIL(PwriteAllFd(pending.fd, dir_bytes.data(), dir_bytes.size(),
                              pending.directory_offset));

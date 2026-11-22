@@ -252,16 +252,14 @@ TEST(ZigZagJoinTest, EmptyAndBatchPathsAreStable) {
   EXPECT_EQ(batch_output, row_output);
   EXPECT_EQ(batch_output.size(), 6U);
 
-  ZigZagJoin empty_left(Source({}), 0, Source(right_rows), 0,
-                        BinaryOperation::kLessThan,
-                        Comparison(BinaryOperation::kLessThan), output_schema,
-                        output_schema);
+  ZigZagJoin empty_left(
+      Source({}), 0, Source(right_rows), 0, BinaryOperation::kLessThan,
+      Comparison(BinaryOperation::kLessThan), output_schema, output_schema);
   EXPECT_TRUE(Drain(&empty_left).empty());
   EXPECT_EQ(empty_left.GetStatus(), Status::kSuccess);
-  ZigZagJoin empty_right(Source(left_rows), 0, Source({}), 0,
-                         BinaryOperation::kLessThan,
-                         Comparison(BinaryOperation::kLessThan), output_schema,
-                         output_schema);
+  ZigZagJoin empty_right(
+      Source(left_rows), 0, Source({}), 0, BinaryOperation::kLessThan,
+      Comparison(BinaryOperation::kLessThan), output_schema, output_schema);
   EXPECT_TRUE(Drain(&empty_right).empty());
   EXPECT_EQ(empty_right.GetStatus(), Status::kSuccess);
 }
@@ -305,8 +303,8 @@ TEST(ZigZagJoinTest, UnsupportedTypeUnsortedInputAndPredicateErrorFail) {
   // T3510: the residual predicate is compiled against the CONCATENATED
   // input schemas. Evaluating it against the (possibly renamed) output
   // schema made qualified references unresolvable / mis-slotted.
-  const Schema renamed_output(
-      "out", {Column("v1", ValueType::kInt64), Column("v2", ValueType::kInt64)});
+  const Schema renamed_output("out", {Column("v1", ValueType::kInt64),
+                                      Column("v2", ValueType::kInt64)});
   ZigZagJoin combined_domain(
       Source({Row({Value(1)}), Row({Value(3)})}), 0,
       Source({Row({Value(1)}), Row({Value(3)})}), 0, BinaryOperation::kEquals,
@@ -321,6 +319,30 @@ TEST(ZigZagJoinTest, UnsupportedTypeUnsortedInputAndPredicateErrorFail) {
                          output_schema);
   EXPECT_FALSE(child_error.Next(&row, &position));
   EXPECT_EQ(child_error.GetStatus(), Status::kRuntimeError);
+}
+
+// An unspecified output schema must not make NextBatch build a width-0
+// DataChunk: appending the joined row to a 0-column chunk trips the chunk's
+// width check instead of letting it bind to the row's shape.
+TEST(ZigZagJoinTest, EmptyOutputSchemaBindsToTheJoinedRow) {
+  const Schema left_schema = IntSchema("l", "k", "id");
+  const Schema right_schema = IntSchema("r", "k", "id");
+  const Schema residual_schema = left_schema + right_schema;
+  const std::vector<Row> left_rows{Row({Value(1), Value(10)})};
+  const std::vector<Row> right_rows{Row({Value(1), Value(20)})};
+  const std::vector<RowPosition> left_positions{RowPosition(10, 0)};
+  const std::vector<RowPosition> right_positions{RowPosition(20, 0)};
+  ZigZagJoin join(
+      std::make_shared<PositionedSource>(left_rows, left_positions), 0,
+      std::make_shared<PositionedSource>(right_rows, right_positions), 0,
+      BinaryOperation::kEquals, Comparison(BinaryOperation::kEquals),
+      residual_schema, /*output_schema=*/Schema{});
+
+  DataChunk chunk;
+  EXPECT_EQ(join.NextBatch(&chunk), 1U);
+  EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+  ASSERT_EQ(chunk.Size(), 1U);
+  EXPECT_EQ(chunk.RowAt(0), (Row({Value(1), Value(10), Value(1), Value(20)})));
 }
 
 TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {

@@ -95,10 +95,11 @@ graph TD
                 group,
                 LogicalExpression{.operation = LogicalOperator::kProjection,
                                   .children = inner.children,
-                                  .target_list = std::move(composed)});
+                                  .target_list = std::move(composed),
+                                  .output_schema = expression.output_schema});
   ```
 
-  親グループの出力スキーマおよび出力名は外側の指定を保持したまま、子ノードのみを内側の入力へと繋ぎ替えます。
+  親グループの出力スキーマは外側の `expression.output_schema` を明示的に設定して保持し、子ノードのみを内側の入力へと繋ぎ替えます。
 
 ## 最適化効果
 
@@ -109,7 +110,6 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `merge_projections`: 同一の `Projection(Projection(X))` を対象とする兄弟 Rule です。あちらは外側の `output_schema` を明示設定し最初に成功した代替で探索を抜けるのに対し、本 Rule はすべての内側代替を網羅的に試行します。
 - 恒等射影の除去は物理実装の `RemoveIdentityProjection` がスキーマを確認して行います。
 
 ## 検証テスト

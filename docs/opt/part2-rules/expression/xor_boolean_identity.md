@@ -55,7 +55,7 @@ bool ConstantBool(const Expression& expression, bool* value) {
 
 1. **ブール定数の同定**: 左右いずれかの被演算子が、非 NULL かつ値が 0 または 1 の `kInt64` 定数であること（tinylamb における真偽値内部表現に適合）。
 2. **TRUE 定数時の分岐**: 定数値が 1（TRUE）である場合、対向側の式を `kNot` 単項演算子でラップして返却。
-3. **FALSE 定数時の型安全ガード**: 定数値が 0（FALSE）である場合、対向側の式が `StaticallyNonBoolean` を満たさない（静的に非ブール型であることが確定していない）場合に限り、対向側の式ノードをそのまま返却。
+3. **両パス共通の型安全ガード**: 定数側が見つかった時点で、対向側の式が `StaticallyNonBoolean`（静的に非ブール型と確定）なら不発火です。TRUE パス（`NOT x` を生成）と FALSE パス（`x` をそのまま返却）のどちらも、この検査を通過してから縮退します。
 
 定数が NULL の場合や、0/1 以外の数値定数の場合は不発火となります。
 
@@ -82,7 +82,7 @@ SQL において XOR 演算子の出力型は常に真偽値（ブール型）�
 // DOUBLE) or non-boolean values (e.g. 2).
 ```
 
-これを抑止するため、FALSE 縮退パスにおいては `StaticallyNonBoolean` による検査を行い、静的に非ブール型と判定される部分式の剥離を拒絶します。一方、TRUE 縮退パスにおいては結果が `NOT` 単項演算子によって覆われるため、出力型がブール型に保たれます。
+これを抑止するため、FALSE 縮退パスに加えて TRUE 縮退パスでも `StaticallyNonBoolean` による検査を行い、静的に非ブール型と判定される部分式の剥離を拒絶します。TRUE パスは `NOT` 単項演算子で結果を反転しますが、`NOT` は入力のブール性を前提とするため、型ガードを省略すると `lower(name) XOR TRUE` が型エラーを起こす式へ書き換えられてしまいます。
 
 ## 実装の詳細
 
@@ -90,18 +90,18 @@ SQL において XOR 演算子の出力型は常に真偽値（ブール型）�
 
 ```cpp
           if (has_right) {
+            if (StaticallyNonBoolean(bindings.at("left"))) {
+              return Expression{};
+            }
             if (right) {
               return UnaryExpressionExp(bindings.at("left"),
                                         UnaryOperation::kNot);
-            }
-            if (StaticallyNonBoolean(bindings.at("left"))) {
-              return Expression{};
             }
             return bindings.at("left");
           }
 ```
 
-左右の対称性を保持しつつ、最小限のノードアロケーションで $O(1)$ の時間計算量により変換を完了します。
+`StaticallyNonBoolean` の検査は `if (right)` より前に置かれており、TRUE パス・FALSE パスの双方が同じ型ガードを通ります。左右の対称性を保持しつつ、最小限のノードアロケーションで $O(1)$ の時間計算量により変換を完了します。
 
 ## 最適化効果
 

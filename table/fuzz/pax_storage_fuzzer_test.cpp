@@ -23,6 +23,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -34,6 +36,28 @@
 namespace tinylamb::fuzz {
 
 namespace {
+
+class ScopedForceScheme {
+ public:
+  explicit ScopedForceScheme(const char* value) {
+    if (const char* old = std::getenv("TINYLAMB_FORCE_SCHEME")) {
+      previous_ = old;
+    }
+    setenv("TINYLAMB_FORCE_SCHEME", value, 1);
+  }
+  ~ScopedForceScheme() {
+    if (previous_) {
+      setenv("TINYLAMB_FORCE_SCHEME", previous_->c_str(), 1);
+    } else {
+      unsetenv("TINYLAMB_FORCE_SCHEME");
+    }
+  }
+  ScopedForceScheme(const ScopedForceScheme&) = delete;
+  ScopedForceScheme& operator=(const ScopedForceScheme&) = delete;
+
+ private:
+  std::optional<std::string> previous_;
+};
 
 struct Rng {
   uint64_t s;
@@ -144,8 +168,11 @@ TEST(PaxStorageFuzzerTest, LsmMergeSeeds) {
       // "reverse-run-merge path"; nruns-1 (0..3) never set it, so the
       // deterministic corpus never exercised that path. Alternate it by
       // variant (the reverse of one run is a no-op, keep those plain).
-      seed.push_back(
-          static_cast<uint8_t>((nruns - 1) | ((variant & 1) ? 0x10 : 0)));  // NOLINT(readability-implicit-bool-conversion)
+      seed.push_back(static_cast<uint8_t>(
+          (nruns - 1) |
+          ((variant & 1)
+               ? 0x10
+               : 0)));  // NOLINT(readability-implicit-bool-conversion)
       seed.push_back(static_cast<uint8_t>(variant));
       for (int r = 0; r < nruns; ++r) {
         const int n_keys = 1 + static_cast<int>(rng.Below(16));
@@ -252,10 +279,9 @@ TEST(PaxStorageFuzzerTest, PostingsCountFoldRejectsUndecodableParam) {
   PaxChunk chunk;
   bool encoded = false;
   for (uint8_t shape : {0, 2, 4, 6}) {
-    setenv("TINYLAMB_FORCE_SCHEME", "POSTINGS", 1);
+    ScopedForceScheme force("POSTINGS");
     auto built =
         PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc);
-    unsetenv("TINYLAMB_FORCE_SCHEME");
     ASSERT_TRUE(built.HasValue());
     chunk = built.MoveValue();
     const auto& enc = chunk.GetFooter().encodings;
@@ -308,6 +334,15 @@ TEST(PaxStorageFuzzerTest, PostingsCountFoldRejectsUndecodableParam) {
   EXPECT_EQ(bad.GetStatus().GetCode(), StatusCode::kCorrupt);
 }
 
+TEST(PaxStorageFuzzerTest, ForceSchemeRestoresPreviousValue) {
+  ScopedForceScheme outer("ORIGINAL");
+  {
+    ScopedForceScheme inner("TEMPORARY");
+    EXPECT_STREQ(std::getenv("TINYLAMB_FORCE_SCHEME"), "TEMPORARY");
+  }
+  EXPECT_STREQ(std::getenv("TINYLAMB_FORCE_SCHEME"), "ORIGINAL");
+}
+
 TEST(PaxStorageFuzzerTest, ForcedDoubleCasesReachTheRequestedEncoding) {
   const Schema schema = MakeStorageSchema();
   auto check = [&schema](const auto& cases) {
@@ -319,11 +354,11 @@ TEST(PaxStorageFuzzerTest, ForcedDoubleCasesReachTheRequestedEncoding) {
       ASSERT_EQ(schema.GetColumn(item.col).Type(), ValueType::kDouble);
       bool reached = false;
       for (size_t i = 0; i < item.nshapes; ++i) {
-        setenv("TINYLAMB_FORCE_SCHEME", item.name, 1);
+        ScopedForceScheme force(item.name);
         auto chunk = PaxChunk::BuildFromSortedRun(
             MakeRun(MakeStorageRowsForScheme(item.shapes[i], item.expected),
-                    schema), schema);
-        unsetenv("TINYLAMB_FORCE_SCHEME");
+                    schema),
+            schema);
         ASSERT_TRUE(chunk.HasValue());
         const auto& encodings = chunk.Value().GetFooter().encodings;
         if (item.col < encodings.size() &&

@@ -247,9 +247,6 @@ int OocMergeJoinSource::CompareKeys(const Row& l, const Row& r) const {
     if (JoinValueEqual(lhs, rhs)) {
       continue;
     }
-    if (!lhs.IsNull() && !rhs.IsNull() && lhs.type != rhs.type) {
-      return static_cast<int>(lhs.type) < static_cast<int>(rhs.type) ? -1 : 1;
-    }
     return CompareForOrderBy(lhs, rhs) < 0 ? -1 : 1;
   }
   return 0;
@@ -261,9 +258,6 @@ int OocMergeJoinSource::CompareLeftKeys(const Row& a, const Row& b) const {
     const Value& rhs = b[col];
     if (JoinValueEqual(lhs, rhs)) {
       continue;
-    }
-    if (!lhs.IsNull() && !rhs.IsNull() && lhs.type != rhs.type) {
-      return static_cast<int>(lhs.type) < static_cast<int>(rhs.type) ? -1 : 1;
     }
     return CompareForOrderBy(lhs, rhs) < 0 ? -1 : 1;
   }
@@ -618,6 +612,10 @@ Status OocBandJoinSource::Open(PipelineContext* ctx) {
   right_store_ = std::make_unique<SpillableStore>(sopts);
   right_matched_bits_.clear();
   right_outer_done_ = false;
+  // A source can be reopened (e.g. a prepared statement rerun) with a
+  // different key type. Drop the type latched by the previous run so it is
+  // inferred again from this run's rows instead of rejecting them all.
+  key_type_.reset();
 
   if (right_.source != nullptr) {
     RETURN_IF_FAIL(right_.source->Open(ctx));
@@ -1449,20 +1447,29 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
       RETURN_IF_FAIL(spill_reached_from_mem());
     }
     if (!spilled_seen) {
-      if (!work_index.Insert(payload)) {
+      // Dedup against the resident set first: a repeat row is rejected
+      // without charging the budget.
+      if (work_index.Contains(payload)) {
         return false;
       }
       const size_t add = EstimateRowMemoryBytes(payload) + 32;
       // Include the first row: a single large row can exceed the budget on
       // its own and must spill immediately rather than stay resident.
+      // Decide the spill BEFORE inserting: `spill_reached_from_mem` writes
+      // every resident row into `reached_seg`, and a row present in both
+      // `reached_seg` and the candidate sorter is anti-joined out of the
+      // output and the next delta by `merge_spilled_candidates`.
       if (mem_seen_bytes + add > seen_budget) {
         RETURN_IF_FAIL(spill_reached_from_mem());
-      } else {
-        // The row already lives in `work_index`; only account for its
-        // approximate footprint here (no parallel copy).
-        mem_seen_bytes += add;
-        return true;
+        return true;  // Deferred to ExternalSorter merge anti-join.
       }
+      if (!work_index.Insert(payload)) {
+        return false;
+      }
+      // The row already lives in `work_index`; only account for its
+      // approximate footprint here (no parallel copy).
+      mem_seen_bytes += add;
+      return true;
     }
     return true;  // Deferred to ExternalSorter merge anti-join when spilled.
   };

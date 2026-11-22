@@ -42,7 +42,8 @@
 namespace tinylamb {
 namespace {
 
-// Counts Unicode code points the same way the AST evaluator does: every byte
+// Counts Unicode code points the same way the AST evaluator does: continuation
+// bytes (0x80..0xBF) are skipped, so every well-formed sequence counts once.
 int64_t Utf8CodePointCount(std::string_view s) {
   int64_t count = 0;
   for (size_t i = 0; i < s.size();) {
@@ -283,11 +284,13 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
           right_type == ValueType::kDouble) {
         operand_type = ValueType::kDouble;
       }
-      // Interval arithmetic (any VARCHAR operand under +,-,*,/,%) returns a
-      // VARCHAR interval string from EvaluateBinary, but BinaryResultType
-      // declares kBigInt for those shapes -- the program's static result
-      // type would then mismatch the Value appended per row ("column vector
-      // type mismatch").  Reject the shape so callers fall back to the AST
+      // Interval arithmetic (any VARCHAR operand under +,-,*,/,%) can return
+      // a VARCHAR interval string from EvaluateBinary, while BinaryResultType
+      // declares other results for those shapes (kVarChar for VARCHAR+VARCHAR
+      // add, kDate for DATE mixing, kDouble for division, kBigInt otherwise).
+      // A typed bytecode kernel cannot represent that shape-dependent result
+      // without mismatching the appended Value ("column vector type
+      // mismatch"). Reject the shape so callers fall back to the AST
       // evaluator, the semantic ground truth.
       const bool arithmetic = binary.Op() == BinaryOperation::kAdd ||
                               binary.Op() == BinaryOperation::kSubtract ||
@@ -334,6 +337,13 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       // compilation and the caller falls back to the AST evaluator.
       const InExpression& in = expression->AsInExpression();
       if (in.list_.empty()) {
+        // The result is a constant FALSE, but the child is deliberately still
+        // compiled and evaluated before being popped. The AST's TryMembership
+        // evaluates the child unconditionally (and propagates its errors /
+        // volatile effects) even for an empty list; skipping it here would
+        // make bytecode diverge from that semantic reference. Folding the
+        // child away is only sound when the rewriter has already proved it
+        // side-effect-free and non-throwing.
         if (!CompileNode(in.child_, schema, program)) {
           return false;
         }
@@ -559,9 +569,10 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       if (!CompileNode(unary.Child(), schema, program)) {
         return false;
       }
-      // The null-check / truthiness family is type-agnostic on both legs:
-      // TryEvaluateUnary dispatches on the value itself and the fast
-      // interpreter implements the same table for any slot type.
+      // The null-check / truthiness family is type-agnostic for IS [NOT] NULL
+      // on both legs; IS [NOT] TRUE/FALSE additionally requires the INT64 BOOL
+      // carrier (or NULL) -- non-INT64, non-NULL operands are rejected by
+      // TryEvaluateUnary's T3698 guard rather than accepted by Truthy().
       switch (unary.Op()) {
         case UnaryOperation::kIsNull:
         case UnaryOperation::kIsNotNull:
@@ -908,10 +919,25 @@ StatusOr<Value> TryEvalInStringSetCanonical(const Value& child,
   if (child.IsNull()) {
     return Value();
   }
-  if (child.type != ValueType::kVarChar || child.IsInterval() ||
-      child.Collation() != 0) {
+  if (child.type != ValueType::kVarChar || child.IsInterval()) {
     return StatusError(StatusCode::kInvalidArgument,
                        "IN string-set operand mismatch");
+  }
+  if (child.Collation() != 0) {
+    for (const auto& slot : spec.table) {
+      if (slot.offset == std::numeric_limits<uint32_t>::max()) {
+        continue;
+      }
+      const Value candidate(
+          std::string(spec.arena.data() + slot.offset, slot.len));
+      ASSIGN_OR_RETURN(
+          Value, match,
+          TryEvaluateBinary(BinaryOperation::kEquals, child, candidate));
+      if (!match.IsNull() && match.Truthy()) {
+        return Value(true);
+      }
+    }
+    return spec.has_null ? Value() : Value(false);
   }
   if (spec.Contains(child.value.varchar_value)) {
     return Value(true);
@@ -999,6 +1025,12 @@ bool ProgramIsFastInterpretable(const BytecodeProgram& program) {
 namespace {
 bool EncodeCompileTree(const Expression& expression, Encoder* encoder,
                        size_t* nodes, size_t depth = 0) {
+  // Bounded key encoding: the cap keeps cache-key construction O(1) per node
+  // and the key under the caller's 16 KiB budget. An oversized/deep tree is
+  // not an error -- the caller simply declines the cache key and compiles the
+  // expression normally (CompileRowCached falls back to Compile,
+  // ScalarExpressionCacheKey returns nullopt). The cliff near 2048 nodes is
+  // therefore a one-time per-execution compile, not a wrong answer.
   if (++*nodes > 2048 || depth > 128) {
     return false;
   }
@@ -1068,8 +1100,9 @@ bool EncodeCompileTree(const Expression& expression, Encoder* encoder,
       if (call.FuncName() != "coalesce" && call.FuncName() != "ifnull" &&
           call.FuncName() != "byte_length" &&
           call.FuncName() != "octet_length" && call.FuncName() != "length" &&
-          call.FuncName() != "abs" && call.FuncName() != "substr" &&
-          call.FuncName() != "substring") {
+          call.FuncName() != "char_length" &&
+          call.FuncName() != "character_length" && call.FuncName() != "abs" &&
+          call.FuncName() != "substr" && call.FuncName() != "substring") {
         return false;
       }
       *encoder << call.FuncName() << static_cast<uint64_t>(call.Args().size());
@@ -1176,7 +1209,17 @@ std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
   Encoder encoder(key);
   encoder << static_cast<uint8_t>(context) << schema;
   size_t nodes = 0;
-  if (!EncodeCompileTree(expression, &encoder, &nodes)) {
+  // EncodeCompileTree may evaluate constant-shaped nodes to build the key
+  // (see ScalarExpressionCacheKey above). An un-rebound INSERT-shaped
+  // ParameterSlot can throw std::out_of_range during that evaluation; mirror
+  // the cache-key helper and simply opt out of the cache, compiling the
+  // expression normally rather than letting an exception escape this
+  // optional-returning path.
+  try {
+    if (!EncodeCompileTree(expression, &encoder, &nodes)) {
+      return Compile(expression, schema, context);
+    }
+  } catch (...) {
     return Compile(expression, schema, context);
   }
   if (key.size() > 16384) {
@@ -1204,24 +1247,37 @@ std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
       program = std::move(dynamic);
     }
   }
-  size_t bytes = key.capacity() + 128;
-  if (program) {
-    bytes +=
-        (program->Instructions().capacity() * sizeof(BytecodeInstruction)) +
-        (program->Constants().capacity() * sizeof(Value));
-    for (const auto& value : program->Constants()) {
-      if (value.type == ValueType::kVarChar) {
-        bytes += (2 * value.value.varchar_value.size()) + 32;
+  const auto entry_bytes = [](const std::string& entry_key,
+                              const std::optional<BytecodeProgram>& value) {
+    size_t result = entry_key.capacity() + 128;
+    if (value) {
+      result +=
+          (value->Instructions().capacity() * sizeof(BytecodeInstruction)) +
+          (value->Constants().capacity() * sizeof(Value));
+      for (const Value& constant : value->Constants()) {
+        if (constant.type == ValueType::kVarChar) {
+          result += (2 * constant.value.varchar_value.size()) + 32;
+        }
       }
     }
-  }
+    return result;
+  };
+  const size_t bytes = entry_bytes(key, program);
   constexpr size_t kLimit = size_t{2} * 1024 * 1024;
   if (bytes > kLimit) {
     return program;
   }
-  if (cache.entries.size() >= 256 || cache.bytes > kLimit - bytes) {
-    cache.entries.clear();
-    cache.bytes = 0;
+  // Evict only as many entries as are needed to fit the new one instead of
+  // dropping the whole cache. A full clear makes a just-compiled expression
+  // recompile on every call once the cache is warm, collapsing the
+  // steady-state hit rate to zero. The map keeps no LRU order, so the victim
+  // is arbitrary, but the rest of the cache survives.
+  while (!cache.entries.empty() &&
+         (cache.entries.size() >= 256 || cache.bytes > kLimit - bytes)) {
+    const auto victim = cache.entries.begin();
+    const size_t victim_bytes = entry_bytes(victim->first, victim->second);
+    cache.bytes = victim_bytes >= cache.bytes ? 0 : cache.bytes - victim_bytes;
+    cache.entries.erase(victim);
   }
   cache.bytes += bytes;
   cache.entries.emplace(std::move(key), program);
@@ -1231,8 +1287,11 @@ std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
 std::optional<BytecodeProgram> BytecodeCompiler::Compile(
     const Expression& expression, const Schema& schema, Context context) {
   try {
-    // Mirror the optimizer's split: the not-inference rule turns NULL into
-    // FALSE, so it is only sound in filter contexts (see plan/optimizer.cpp).
+    // Mirror the optimizer's split: NOT() over an ordered double comparison
+    // is NaN-unsound, so such trees keep the comparison-free rule set instead
+    // of Default() (see plan/optimizer.cpp).  Value contexts additionally
+    // drop the truthiness-preserving collapses in MakeValueRules, which are
+    // only sound where the result is consumed as a predicate.
     const ExpressionRuleSet& base_rules =
         ContainsNotOfOrderedDoubleComparison(expression, schema)
             ? NotComparisonFreeRules()
@@ -2374,7 +2433,8 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
   const FastEval status = ExecuteFastProgram(
       instructions_, constants_, casts_, string_sets_, load_col, &slot, error);
   if (status == FastEval::kDone) {
-    if (slot.is_substring && !slot.is_null && slot.type == ValueType::kVarChar) {
+    if (slot.is_substring && !slot.is_null &&
+        slot.type == ValueType::kVarChar) {
       *out = Value(std::string(slot.text));
     } else {
       *out = FastValueFromSlot(slot);
@@ -3019,6 +3079,13 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateColumnarBatch(
           rollback();
           return FastEval::kUnsupported;
         }
+        // A VARCHAR result may be a view into a program constant that lives
+        // only as long as this BytecodeProgram. The bool is the whole ownership
+        // contract: sinks that observe it copy every output string into their
+        // own arena (BytecodeColumnSink consumers call EnsureArena) before the
+        // program can be retired, so no string_view can outlive its program.
+        // No per-instruction provenance is needed because copying is all-or-
+        // nothing for a program that contains any borrowed string source.
         if (has_varchar_constant_ || has_substr_) {
           sink->may_borrow_constant_strings = true;
         }

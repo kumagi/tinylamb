@@ -29,7 +29,7 @@ def evalWindowPart {Row P Val : Type} [BEq P]
   R.map (fun r => (r, fn (R.filter (fun r' => part r' == part r)) r))
 
 /-- 🚨 **実在バグ証明 M1a (`push_selection_through_window` の異種 `PARTITION BY` 混在破壊)**:
-    旧 C++ (`plan/cascades.cpp:5850-5858`) はノードレベルの `win_expr.partition_by` のみを見て、
+    旧 C++ (`plan/cascades.cpp` の `push_selection_through_window`) はノードレベルの `win_expr.partition_by` のみを見て、
     `target_list` 内の各 `WindowFunctionCallExpression` の `call.partition_by` を検査していなかった。
     `[SUM(x) OVER (PARTITION BY p), SUM(y) OVER (PARTITION BY q)]`（`split_window` 発火前の混在ノード）の上に
     `WHERE p = 1` があるとき、`p = 1` を Window の下へ押し下げると `q` パーティションの他行が消え、第 2 出力が壊れる！ -/
@@ -102,8 +102,9 @@ theorem repaired_push_selection_through_window_sound {Row P Val : Type} [Decidab
 
 /-- 🚨 **実在バグ証明 M1b (`split_window` の非連続インターリーブによる出力列スワップ)**:
     `[w0(p), w1(q), w2(p)]` のように同一 `PARTITION BY` が非連続に現れるとき、
-    旧 C++ (`plan/cascades.cpp:8843-8880`) は `by_spec` マップで `[w0, w2]` を先にまとめ `[w1]` を外側に積むため、
-    出力タプル列順が `(r, w0, w2, w1)` となり、同じ Memo グループの元ノード `(r, w0, w1, w2)` と列が入れ替わる！ -/
+    旧 C++ は仕様ごとに `[w0, w2]` を先にまとめ `[w1]` を外側に積むため、
+    出力タプル列順が `(r, w0, w2, w1)` となり、同じ Memo グループの元ノード `(r, w0, w1, w2)` と列が入れ替わる！
+    現行の `plan/cascades.cpp` の `split_window` は連続する同仕様の run を使い、列順を保つ。 -/
 theorem cpp_split_window_noncontiguous_swaps_columns_bug :
     let origLayout := ["r", "w0_p", "w1_q", "w2_p"]
     let buggyBySpecLayout := ["r", "w0_p", "w2_p", "w1_q"]
@@ -924,8 +925,8 @@ theorem merge_compatible_union_branches_sound {Row : Type} [DecidableEq Row]
 -/
 
 /-- 🚨 **実在バグ証明 M3a (`unnest_filter_pushdown` の空エイリアス / 修飾列見落とし)**:
-    `UNNEST(t.arr)` でエイリアス省略時、既定の列名は `"unnest"` になるが (`cascades.cpp:7111`)、
-    旧 C++ (`cascades.cpp:7011`) は `!unnest.unnest_alias.empty()` のときしか検査しなかったため、
+    `UNNEST(t.arr)` でエイリアス省略時、既定の列名は `"unnest"` になるが、
+    旧 C++ の `unnest_filter_pushdown` は `!unnest.unnest_alias.empty()` のときしか検査しなかったため、
     `WHERE unnest > 10` や `WHERE u.field = 1` を `UNNEST` の下へ誤って押し下げていた！ -/
 def cppBuggyTouchesUnnest (unnestAlias offsetAlias : String) (_colSchema colName : String) : Bool :=
   (!unnestAlias.isEmpty && colName == unnestAlias) ||

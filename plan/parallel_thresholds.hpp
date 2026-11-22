@@ -20,7 +20,7 @@ inline constexpr size_t kParallelScanMinRows = 8192;
 inline constexpr size_t kParallelAggregationMinRows = 32768;
 
 // An inner hash join switches to the shared-build parallel executor when the
-// combined build+probe input reaches this size . Semi/anti,
+// combined build+probe input reaches this size. Semi/anti,
 // outer, null-aware, residual-carrying, and index joins stay sequential:
 // their executors have no parallel counterpart (or untested parallel paths).
 inline constexpr size_t kParallelHashJoinMinRows = 8192;

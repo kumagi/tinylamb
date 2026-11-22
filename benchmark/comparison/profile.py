@@ -27,7 +27,10 @@ def main():
     if min(args.sizes) < 100 or min(args.memory_mib, args.repeats) < 1:
         parser.error("sizes >=100 and memory/repeats >=1 required")
     args.output.mkdir(parents=True, exist_ok=False)
-    cpus = sorted(os.sched_getaffinity(0))[:8]
+    # sched_getaffinity is Linux-only; fall back to a fixed CPU set so the
+    # profiler still starts on platforms that lack it (e.g. macOS/Windows).
+    cpus = (sorted(os.sched_getaffinity(0))[:8]
+            if hasattr(os, 'sched_getaffinity') else list(range(8)))
     environment = {k: v for k, v in os.environ.items() if not k.startswith("TINYLAMB_")}
     environment.update(                       TINYLAMB_QUERY_MEMORY_BYTES=str(args.memory_mib * 1024 * 1024))
     metadata = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

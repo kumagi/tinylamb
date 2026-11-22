@@ -63,11 +63,13 @@ SQL 意味論において、外部結合の結合述語（ON 節 $p$）は NULL 
 
 ## 実装の詳細
 
-変換処理は `"outer_to_inner"` タグを持つ派生グループを確保し、その中に内部結合ノードを配置した上で、上位に元の選択ノードを被せる 2 段構造を構築します。
+変換処理は `"outer_to_inner:"` に左右グループ ID と結合述語のタグを連結したタグを持つ派生グループを確保し、その中に内部結合ノードを配置した上で、上位に元の選択ノードを被せる 2 段構造を構築します。異なる結合・異なる述語の派生グループは互いに隔離されます。
 
 ```cpp
             const GroupId inner_group = memo.EnsureDerivedGroup(
-                memo.Get(input_id).relations, "outer_to_inner");
+                memo.Get(input_id).relations,
+                "outer_to_inner:" + GroupIdsTag({left_id, right_id}) +
+                    PredicateTag(join_expr.predicate));
             if (inner_group == group || inner_group == input_id) {
               continue;
             }

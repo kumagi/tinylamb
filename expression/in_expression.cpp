@@ -39,11 +39,15 @@ StatusOr<Value> TryMembership(const ExpressionBase& child,
                               const std::vector<Expression>& list,
                               Args&&... args) {
   ASSIGN_OR_RETURN(Value, child_value, child.TryEvaluate(args...));
+  // IN is an existential comparison: an empty candidate set has no TRUE
+  // or UNKNOWN comparison, so membership is FALSE even for a NULL probe.
+  // This also matches IN over an empty subquery (and NOT IN becomes TRUE).
   bool saw_null = !list.empty() && child_value.IsNull();
-  // Candidates are tried in order and the first match wins: neither an
-  // evaluation error nor a collation conflict in a later candidate is raised
-  // (`-1 IN (-1, 1/0)` is TRUE), matching the bytecode/rewrite paths that the
-  // differential audits pin.
+  // Candidates are tried in order and the first match wins: once a match is
+  // found, later candidates are never evaluated, so an error or collation
+  // conflict in them is not raised (`-1 IN (-1, 1/0)` is TRUE), matching the
+  // bytecode/rewrite paths the differential audits pin. Without a match,
+  // every candidate is evaluated and its errors propagate normally.
   for (const auto& item : list) {
     ASSIGN_OR_RETURN(Value, candidate, item->TryEvaluate(args...));
     if (!child_value.IsNull() && !candidate.IsNull() &&

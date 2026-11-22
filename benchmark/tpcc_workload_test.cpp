@@ -351,7 +351,8 @@ TEST_F(TpccWorkloadTest, InitializeBeyondThousandCustomersUsesNurandLastName) {
             Status::kSuccess)
       << error;
 
-  // Assert -- the customer count and two boundary rows have well-formed last names.
+  // Assert -- the customer count and two boundary rows have well-formed last
+  // names.
   const std::vector<Row> count = Run("SELECT COUNT(*) FROM customer;");
   ASSERT_EQ(count.size(), 1);
   EXPECT_EQ(count[0][0], Value(1005));
@@ -434,7 +435,8 @@ TEST_F(TpccWorkloadTest, PaymentNameLookupAndBcCreditUpdate) {
 
   // Act -- run payments with a variety of seeds. The 60% name-based lookup
   // path and the BC-credit c_data rewrite are chosen by the workload RNG, so
-  // 60 seeds are tried (without early exit) before checking for a BC-credit update.
+  // 60 seeds are tried (without early exit) before checking for a BC-credit
+  // update.
   const std::vector<Row> bc_customers =
       Run("SELECT COUNT(*) FROM customer WHERE c_credit = 'BC';");
   ASSERT_EQ(bc_customers.size(), 1);
@@ -492,6 +494,17 @@ TEST(TpccScaleTest, NurandFromSeedIsDeterministic) {
 TEST_F(TpccWorkloadTest, InitializeRejectsMaxLinesBelowMin) {
   TpccScale scale = TpccScale::ForTest();
   scale.max_order_lines = scale.min_order_lines - 1;
+  std::string error;
+  EXPECT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kUnknown);
+  EXPECT_FALSE(error.empty());
+}
+
+// NewOrder picks `line_count` distinct item ids from 1..items; with fewer
+// items than max_order_lines the selection loop can never terminate.
+TEST_F(TpccWorkloadTest, InitializeRejectsItemsBelowMaxOrderLines) {
+  TpccScale scale = TpccScale::ForTest();
+  scale.items = scale.max_order_lines - 1;
   std::string error;
   EXPECT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
             Status::kUnknown);
@@ -662,7 +675,7 @@ TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
   };
 
   {
-    // A missing district makes the d_tax/d_next_o_id read return no rows.
+    // A missing district makes the order-id reservation update affect no rows.
     std::unique_ptr<Database> database = MakeDb();
     ASSERT_NE(database, nullptr);
     RunSql(*database, "DELETE FROM district WHERE d_w_id = 1 AND d_id = 1;");
@@ -688,7 +701,8 @@ TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
     database->DeleteAll();
   }
   {
-    // Missing stock makes the first line's s_quantity read return no rows.
+    // Missing stock makes the warehouse's batched `SELECT s_i_id FROM stock
+    // ... WHERE s_i_id IN (...)` return fewer rows than the order lines.
     std::unique_ptr<Database> database = MakeDb();
     ASSERT_NE(database, nullptr);
     RunSql(*database, "DELETE FROM stock;");
@@ -778,7 +792,7 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
     database->DeleteAll();
   }
   {
-    // A missing district makes the d_ytd UPDATE affect zero rows.
+    // A missing district makes the payment district read return no rows.
     std::unique_ptr<Database> database = MakeDb();
     ASSERT_NE(database, nullptr);
     RunSql(*database, "DELETE FROM district WHERE d_w_id = 1 AND d_id = 1;");

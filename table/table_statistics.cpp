@@ -80,9 +80,8 @@ Value CompactValue(const Value& value) {
   // it made stored boundaries and MCVs bare VARCHARs, so comparisons with
   // tagged query values fell into the tag-mismatch arms of Value equality
   // instead of the ordinary prefix comparison the compaction implies.
-  return Value(std::string(
-                   value.value.varchar_value.substr(
-                       0, kStoredStringPrefixLength)))
+  return Value(std::string(value.value.varchar_value.substr(
+                   0, kStoredStringPrefixLength)))
       .WithCollation(value.Collation());
 }
 
@@ -133,6 +132,8 @@ size_t ScaleCount(size_t count, double multiplier) {
 class ColumnCollector {
  public:
   explicit ColumnCollector(ValueType type) : type_(type) {}
+
+  void AddNull() { ++null_count_; }
 
   void Add(const Value& value) {
     if (value.IsNull()) {
@@ -1267,6 +1268,10 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   Iterator iterator = target.BeginFullScan(txn);
   for (; iterator.IsValid(); ++iterator) {
     const Row& row = *iterator;
+    if (row.Count() != collectors.size()) {
+      return StatusError(StatusCode::kCorrupt,
+                         "row column count does not match table schema");
+    }
     ++scanned_rows;
     for (size_t i = 0; i < collectors.size(); ++i) {
       collectors[i].Add(row[i]);
@@ -1331,7 +1336,8 @@ double TableStatistics::EstimateCount(int column_index, const Value& from,
   if (!index_valid) {
     return 0;
   }
-  const ColumnStats& column_stats = (*stats_)[static_cast<size_t>(column_index)];
+  const ColumnStats& column_stats =
+      (*stats_)[static_cast<size_t>(column_index)];
   std::optional<Value> lower;
   std::optional<Value> upper;
   if (!from.IsNull()) {
@@ -1743,6 +1749,42 @@ void StreamingStatsCollector::AddRow(const Row& row) {
   const size_t n = std::min(row.Count(), impl_->collectors.size());
   for (size_t i = 0; i < n; ++i) {
     impl_->collectors[i].Add(row[i]);
+  }
+}
+
+void StreamingStatsCollector::BeginRow() { ++impl_->row_count; }
+
+void StreamingStatsCollector::AddNull(slot_t col) {
+  if (col < impl_->collectors.size()) {
+    impl_->collectors[col].AddNull();
+  }
+}
+
+void StreamingStatsCollector::AddInt(slot_t col, int64_t val,
+                                     bool is_unsigned) {
+  if (col < impl_->collectors.size()) {
+    Value v(val);
+    v.type = impl_->types[col];
+    if (is_unsigned && v.type == ValueType::kInt64) {
+      v.SetUnsigned();
+    }
+    impl_->collectors[col].Add(v);
+  }
+}
+
+void StreamingStatsCollector::AddDouble(slot_t col, double val) {
+  if (col < impl_->collectors.size()) {
+    impl_->collectors[col].Add(Value(val));
+  }
+}
+
+void StreamingStatsCollector::AddVarChar(slot_t col, std::string_view val) {
+  if (col < impl_->collectors.size()) {
+    const std::string_view prefix =
+        val.size() > kStoredStringPrefixLength
+            ? val.substr(0, kStoredStringPrefixLength)
+            : val;
+    impl_->collectors[col].Add(Value(std::string(prefix)));
   }
 }
 

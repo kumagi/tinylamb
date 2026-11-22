@@ -10,7 +10,7 @@ Rule の追加・無効化、D5 監査で求める事前条件ゲート、誤変
 
 tinylamb において Rule セットは大域変数ではなく、`OptimizerOptions` に格納して受け渡す値です（第 1 章 1-4 節）。値として管理するため、Rule の追加、差し替え、除外はすべて複製に対する局所操作で完結します。
 
-論理 Rule セットの管理インターフェースは以下のとおりです（`plan/cascades.cpp` の `RuleSet`）。
+論理 Rule セットの管理インターフェースは以下のとおりです（`plan/cascades_search.cpp` の `RuleSet`）。`RuleSet::Default()` の登録自体は `plan/cascades.cpp` にあります。
 
 ```cpp
 RuleSet& RuleSet::Add(Rule rule) {

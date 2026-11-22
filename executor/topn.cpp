@@ -96,12 +96,13 @@ Status TopNExecutor::Materialize() {
           // compare equal, so extending would emit all rows and ignore LIMIT.
           bool tied = !last.keys.empty();
           for (size_t i = 0; i < last.keys.size(); ++i) {
-            // Peers must collapse exactly the way the ordering groups them,
-            // so a case-insensitive key treats 'a' and 'A' as the same tie
-            // instead of splitting the boundary row. A binary key keeps
-            // Value's equality (NaN, -0.0 and interval equivalence).
-            if (!EqualUnderCollation(last.keys[i],
-                                     rows_[output_end_].keys[i])) {
+            // Peers must collapse exactly the way the ordering groups them:
+            // use the same SortKeyOrder that sorted rows_ (NULL placement,
+            // direction and collation included), not raw EqualUnderCollation.
+            // Raw equality ignores direction and would disagree with the
+            // permutation on DESC keys, extending WITH TIES inconsistently.
+            if (orders[i].Compare(last.keys[i], rows_[output_end_].keys[i]) !=
+                0) {
               tied = false;
               break;
             }

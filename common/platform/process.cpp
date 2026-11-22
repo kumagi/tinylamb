@@ -215,8 +215,12 @@ int RunProcess(
   for (const auto& [k, v] : env_overrides) {
     // T2621: SetEnv/CommandLine both stop at an embedded NUL; reject up
     // front like the POSIX branch does instead of applying a truncated
-    // override.
-    if (k.find('\0') != std::string::npos || v.find('\0') != std::string::npos) {
+    // override. Match the POSIX branch's key validation (empty / '=' too) so
+    // an invalid override is reported here rather than silently failing in
+    // SetEnv and then dirtying errno again while restoring it.
+    if (k.empty() || k.find('=') != std::string::npos ||
+        k.find('\0') != std::string::npos ||
+        v.find('\0') != std::string::npos) {
       if (error_out != nullptr) {
         *error_out = "invalid environment override";
       }
@@ -250,8 +254,9 @@ int RunProcess(
                        : SetEnv(k.c_str(), v.c_str(), 1);
     if (rc != 0) {
       // Environment overrides must not silently leak into later tests in the
-      // same process; surface the failure via errno (logged by the caller).
-      errno = rc;
+      // same process. SetEnv/UnsetEnv set errno to the real reason on failure,
+      // so leave it intact for the caller to log. Never overwrite it with the
+      // -1 return code (that would destroy the diagnostic).
     }
   }
 
@@ -350,8 +355,8 @@ int RunProcess(
       // kills) from a normal nonzero exit; the raw status code alone left
       // operators guessing whether the child crashed or was killed.
       if (WIFSIGNALED(status)) {
-        *error_out = "process terminated by signal " +
-                     std::to_string(WTERMSIG(status));
+        *error_out =
+            "process terminated by signal " + std::to_string(WTERMSIG(status));
 #ifdef WCOREDUMP
         if (WCOREDUMP(status)) {
           *error_out += " (core dumped)";
@@ -458,10 +463,18 @@ uint64_t CurrentProcessRssBytes() noexcept {
   char* end = nullptr;
   // /proc/self/statm fields: size resident shared ... (in pages).
   (void)::strtoull(buf.data(), &end, 10);
-  if (end == nullptr || *end == '\0') {
+  // strtoull leaves end == buf.data() when it consumed no digits. The buffer
+  // is zero-filled but the line can end in '\n', so testing *end alone is not
+  // enough to detect a malformed first field; without this check the second
+  // strtoull would re-parse the same bad input and report a bogus 0 RSS.
+  if (end == buf.data() || end == nullptr || *end == '\0') {
     return 0;
   }
-  const unsigned long long resident_pages = ::strtoull(end, &end, 10);
+  char* resident_end = nullptr;
+  const unsigned long long resident_pages = ::strtoull(end, &resident_end, 10);
+  if (resident_end == end) {
+    return 0;
+  }
   const long page_size = ::sysconf(_SC_PAGESIZE);
   if (page_size <= 0) {
     return 0;
@@ -507,7 +520,8 @@ bool ReleaseFreeHeapToOs() noexcept {
           std::chrono::steady_clock::now().time_since_epoch())
           .count();
   int64_t prev = last_purge_ns.load(std::memory_order_relaxed);
-  // Only one caller per ~20 ms pays for the purge; concurrent callers return false.
+  // Only one caller per ~20 ms pays for the purge; concurrent callers return
+  // false.
   if (now_ns - prev < 20'000'000LL) {
     return false;
   }
@@ -529,11 +543,10 @@ bool ReleaseFreeHeapToOs() noexcept {
 #endif
   // Stamp after the purge finished (T2622) so the next window starts at
   // completion, not at start.
-  last_purge_ns.store(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count(),
-      std::memory_order_relaxed);
+  last_purge_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count(),
+                      std::memory_order_relaxed);
   purge_in_flight.store(false, std::memory_order_release);
   return true;
 #else
@@ -562,7 +575,11 @@ uint64_t ReadCgroupMemoryLimit(const char* path) noexcept {
   errno = 0;
   char* end = nullptr;
   const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
-  if (errno != 0 || end == text.c_str() || value >= (1ULL << 60)) {
+  // Reject trailing garbage as well: query_grant.cpp's ReadGrantEnvU64 uses
+  // the same strict "*end == '\0'" rule, so a value like "1073741824garbage"
+  // must not silently become 1073741824 here.
+  if (errno != 0 || end == text.c_str() || *end != '\0' ||
+      value >= (1ULL << 60)) {
     return 0;
   }
   return static_cast<uint64_t>(value);

@@ -48,7 +48,11 @@ StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
       // so kInt64 stays accepted -- but VARCHAR/DOUBLE/DATE/ARRAY can never
       // be BOOL and used to pass through Truthy() (`'abc' IS FALSE` quietly
       // evaluated FALSE instead of failing like GoogleSQL's signature check).
-      if (child.type != ValueType::kInt64 && !child.IsNull()) {
+      const bool non_bool =
+          !child.IsNull() &&
+          (child.type != ValueType::kInt64 || child.value.int_value < 0 ||
+           child.value.int_value > 1);
+      if (non_bool) {
         return StatusError(
             StatusCode::kInvalidArgument,
             std::string(operation == UnaryOperation::kIsTrue ||
@@ -82,9 +86,10 @@ StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
         if (child.IsUnsigned()) {
           const auto u = static_cast<uint64_t>(child.value.int_value);
           if (u == 0) {
-            // -0 keeps the operand's UINT64 type (UnaryResultType returns the
-            // child type), so the value keeps its unsigned tag.
-            return child;
+            // UnaryResultType declares kBigInt for this operand, so materialize
+            // a signed zero instead of leaking the unsigned tag of `child`
+            // (which broke JSON rendering and UNION type reconciliation).
+            return Value(int64_t{0});
           }
           return StatusError(StatusCode::kIsInfinity,
                              "integer overflow in unary minus");

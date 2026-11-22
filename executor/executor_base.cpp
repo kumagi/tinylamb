@@ -35,6 +35,11 @@ bool ExecutorBase::Next(Row* dst, RowPosition* rp) {
 size_t ExecutorBase::NextBatchDraining(DataChunk* destination,
                                        size_t max_rows) {
   size_t produced = 0;
+  // Same contract as NextBatch: the destination owns the batch and the caller
+  // reads only [0, returned). Without this Reset a second small draining call
+  // would append behind the previous batch's tail while the caller re-read
+  // the stale prefix, re-emitting the same rows.
+  destination->Reset();
   while (produced < max_rows && row_buffer_pos_ < row_buffer_.Size()) {
     destination->AppendFrom(row_buffer_, row_buffer_pos_);
     ++row_buffer_pos_;
@@ -42,7 +47,10 @@ size_t ExecutorBase::NextBatchDraining(DataChunk* destination,
   }
   if (produced > 0) {
     // The batch call below resets `destination`; stop after handing over
-    // what Next() had already buffered so no row is dropped.
+    // what Next() had already buffered so no row is dropped. A draining call
+    // therefore returns at most the buffered rows (or one NextBatch pull when
+    // nothing was buffered): a short batch is normal even while the source
+    // still has rows, and callers must keep pulling until 0 is returned.
     return produced;
   }
   return NextBatch(destination, max_rows);

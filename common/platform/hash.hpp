@@ -27,7 +27,7 @@ namespace tinylamb::platform {
 
 // Byte-string hash with the same value on every platform. std::hash is
 // implementation-defined (libstdc++ uses MurmurHash2-64A, libc++ CityHash),
-// so anything whose *observable* behaviour depends on a hash -- spill
+// so anything whose *observable* behavior depends on a hash -- spill
 // partition assignment, and through it the order rows come back in -- must
 // use this instead. It reproduces libstdc++'s std::hash<std::string>
 // (std::_Hash_bytes with seed 0xc70f6907) on 64-bit little-endian targets,
@@ -46,8 +46,8 @@ inline uint64_t StableHashBytes(std::string_view bytes) {
       std::memcpy(&word, buf + i, sizeof(word));
     } else {
       for (size_t byte = 0; byte < sizeof(word); ++byte) {
-        word |= static_cast<uint64_t>(
-                    static_cast<unsigned char>(buf[i + byte])) << (byte * 8);
+        word |= static_cast<uint64_t>(static_cast<unsigned char>(buf[i + byte]))
+                << (byte * 8);
       }
     }
     hash ^= shift_mix(word * kMul) * kMul;

@@ -2,6 +2,7 @@
 #include "type/collation.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <optional>
 #include <string>
@@ -54,6 +55,9 @@ Collation CollationFromName(std::string_view spec) {
     return Collation::kNone;
   }
   const auto resolved = CollationOfSpec(spec);
+  // The engine has no locale collation: every non-binary spec folds (see
+  // CollationTest.NamesRoundTripAndSpecResolution), so an unknown language
+  // name behaves as case-insensitive instead of silently using binary order.
   return resolved ? *resolved : Collation::kCaseInsensitive;
 }
 
@@ -109,10 +113,13 @@ Value ApplyKeyCollation(const Value& value, Collation key_collation) {
 }
 
 int CompareVarCharForOrderBy(std::string_view left, std::string_view right,
-                             bool case_insensitive) {
+                             bool case_insensitive) noexcept {
   if (!case_insensitive) {
     const int left_rank = EnumRank(left);
     const int right_rank = EnumRank(right);
+    if (left_rank >= 0 && right_rank >= 0) {
+      return (left_rank > right_rank) - (left_rank < right_rank);
+    }
     if (left_rank >= 0 || right_rank >= 0) {
       // Order every string by one key function so the comparator stays a
       // strict weak ordering: an ENUM member sorts as "TESTENUM" followed by
@@ -120,18 +127,15 @@ int CompareVarCharForOrderBy(std::string_view left, std::string_view right,
       // bytes. Mixing "rank when both are members, bytes otherwise" built
       // cycles (NEGATIVE < 0 < "TESTENUM5" < NEGATIVE), which is UB for
       // std::sort / pdqsort.
-      const auto key = [](std::string_view text, int rank) -> std::string {
-        if (rank < 0) {
-          return std::string(text);
-        }
-        std::string out = "TESTENUM";
-        out.push_back(static_cast<char>(rank));
-        return out;
-      };
-      const std::string left_key = key(left, left_rank);
-      const std::string right_key = key(right, right_rank);
-      if (left_key != right_key) {
-        return left_key < right_key ? -1 : 1;
+      const std::array<char, 9> enum_key{
+          'T', 'E', 'S',
+          'T', 'E', 'N',
+          'U', 'M', static_cast<char>(std::max(left_rank, right_rank))};
+      const std::string_view key(enum_key.data(), enum_key.size());
+      const std::string_view left_key = left_rank >= 0 ? key : left;
+      const std::string_view right_key = right_rank >= 0 ? key : right;
+      if (const int cmp = left_key.compare(right_key); cmp != 0) {
+        return cmp < 0 ? -1 : 1;
       }
     }
   }

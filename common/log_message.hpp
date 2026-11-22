@@ -28,9 +28,9 @@
 // filtered message is a no-op: no timestamp, no stringstream formatting and
 // no cerr lock. LOG(FATAL) is never filtered -- it flushes to stderr and then
 // aborts; callers wanting a survivable diagnostic must use LOG(ERROR) or below.
-#define LOG(level)                                                         \
-  LogMessage(level, __FILE__, __LINE__, __func__,                            \
-             ::tinylamb::detail::LogLevelEnabled(level))                    \
+#define LOG(level)                                       \
+  LogMessage(level, __FILE__, __LINE__, __func__,        \
+             ::tinylamb::detail::LogLevelEnabled(level)) \
       .stream()
 #define STATUS(s, message)                    \
   do {                                        \
@@ -44,6 +44,10 @@
 // logs FATAL and aborts instead of throwing. DB logic propagates runtime
 // errors as Status/StatusOr; only "this branch must be unreachable" and
 // "the caller violated a precondition" belong here.
+// LOG(FATAL)'s LogStream destructor already aborts (fatal_ flag), so the
+// LogFatalAbort() below is normally unreachable. It is kept deliberately as a
+// belt-and-suspenders [[noreturn]] hint for the compiler: without it, the macro
+// loses its noreturn guarantee if the destructor's abort behavior ever changes.
 #define CHECK(condition)                            \
   do {                                              \
     if (!(condition)) {                             \
@@ -92,7 +96,7 @@ enum class LogLevel : uint16_t {
 
 namespace tinylamb::detail {
 // The minimum level that is emitted. Set from TINYLAMB_LOG_LEVEL at startup;
-// defaults to kTrace (no filtering) so observable behaviour is unchanged
+// defaults to kTrace (no filtering) so observable behavior is unchanged
 // unless a deployment opts in. FATAL always emits regardless of the threshold.
 void SetMinLogLevel(LogLevel level) noexcept;
 [[nodiscard]] LogLevel MinLogLevel() noexcept;
@@ -112,7 +116,8 @@ class LogStream {
 
   template <size_t N>
   LogStream& operator<<(const std::array<char, N>& rhs) {
-    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
+    if (!enabled_)
+      return *this;  // NOLINT(readability-braces-around-statements)
     // Route through string_view with the explicit array extent: streaming the
     // raw array pointer would make the ostream call strlen(), reading past the
     // array when it is not NUL-terminated and truncating embedded NUL bytes.
@@ -122,7 +127,8 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const std::unordered_set<T>& rhs) {
-    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
+    if (!enabled_)
+      return *this;  // NOLINT(readability-braces-around-statements)
     message_ << "{";
     bool first = true;
     for (const auto& r : rhs) {
@@ -138,7 +144,8 @@ class LogStream {
 
   template <typename K, typename V>
   LogStream& operator<<(const std::unordered_map<K, V>& rhs) {
-    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
+    if (!enabled_)
+      return *this;  // NOLINT(readability-braces-around-statements)
     message_ << "{";
     bool first = true;
     for (const auto& r : rhs) {
@@ -154,7 +161,8 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const std::vector<T>& rhs) {
-    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
+    if (!enabled_)
+      return *this;  // NOLINT(readability-braces-around-statements)
     message_ << "[";
     bool first = true;
     for (const auto& r : rhs) {
@@ -170,7 +178,8 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const T& rhs) {
-    if (!enabled_) return *this;  // NOLINT(readability-braces-around-statements)
+    if (!enabled_)
+      return *this;  // NOLINT(readability-braces-around-statements)
     message_ << rhs;
     return *this;
   }

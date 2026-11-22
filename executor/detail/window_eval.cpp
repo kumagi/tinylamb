@@ -31,7 +31,6 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "common/json_string.hpp"
 #include "common/parallel_work.hpp"
 #include "common/platform/extended_float.hpp"
 #include "common/platform/int128_conversion.hpp"
@@ -46,6 +45,7 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/detail/window_eval_internal.hpp"
 #include "executor/query_memory.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -283,6 +283,16 @@ bool ValueLess(const Value& a, const Value& b, bool ascending,
   }
 }
 
+bool WindowOrderLess(const Value& a, const Value& b,
+                     const WindowOrderTerm& term) {
+  if (a.type == ValueType::kVarChar && b.type == ValueType::kVarChar &&
+      !a.IsInterval() && !b.IsInterval()) {
+    const int cmp = CompareWithCollation(a, b);
+    return term.ascending ? cmp < 0 : cmp > 0;
+  }
+  return ValueLess(a, b, term.ascending, term.nulls_first);
+}
+
 bool ValuesEqual(const Value& a, const Value& b) {
   if (a.IsNull() || b.IsNull()) {
     return a.IsNull() && b.IsNull();
@@ -371,7 +381,7 @@ bool DistanceWithin(const Value& key, const Value& candidate, double off,
   }
   // DOUBLE keys: promote before subtracting so the comparison uses the exact
   // difference of the two doubles (as the INT64 branch and the
-  // the INT64 comparison helpers do).  An absolute epsilon here would
+  // INT64 comparison helpers do).  An absolute epsilon here would
   // misclassify boundaries at magnitude ~1 -- a candidate just outside the
   // offset would be pulled inside -- and make DOUBLE keys disagree with
   // INT64 keys for the same RANGE frame.
@@ -513,7 +523,7 @@ StatusOr<std::pair<size_t, size_t>> WindowRuntime::ResolveFrame(
                      : std::nullopt;
         }
         case WindowFrameBoundType::kUnboundedPreceding:
-          return std::nullopt;
+          return size_t{0};
       }
       return std::nullopt;
     };
@@ -585,12 +595,20 @@ StatusOr<std::pair<size_t, size_t>> WindowRuntime::ResolveFrame(
                                   "FOLLOWING must be non-negative");
         return 0;
       }
-      if (val.type == ValueType::kDouble && value != std::floor(value)) {
+      if (val.type == ValueType::kInt64) {
+        return static_cast<size_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(val.value.int_value), group_count));
+      }
+      if (!std::isfinite(value) || value != std::floor(value)) {
         frame_error = StatusError(StatusCode::kInvalidArgument,
                                   "GROUPS offset must be an integer");
         return 0;
       }
-      return static_cast<size_t>(value);
+      // Offsets beyond the partition are equivalent to its group count.
+      // Clamp before converting because a finite DOUBLE can exceed SIZE_MAX.
+      return value >= static_cast<double>(group_count)
+                 ? group_count
+                 : static_cast<size_t>(value);
     };
     // Start bounds clamp at the partition head and end bounds at the
     // partition tail, but a start bound past the last peer group or an end
@@ -1191,16 +1209,136 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
                     window.args[0]->Type() == TypeTag::kColumnValue &&
                     window.args[0]->AsColumnValue().GetColumnName().name == "*";
   std::vector<Value> values;
-  Value delimiter;
-  // ARRAY_AGG/STRING_AGG honor `AGG(x ORDER BY k LIMIT n)`: each collected
-  // value carries the row's inner_order_by key tuple so it can be
-  // stable-sorted before the limit cut below.
-  const bool need_order_keys = (fn == "ARRAY_AGG" || fn == "STRING_AGG") &&
-                               !window.inner_order_by.empty();
+  // ARRAY_AGG(x ORDER BY k LIMIT n) keeps each row's key tuple until
+  // the values have been ordered and the inner limit applied.
+  const bool need_order_keys =
+      fn == "ARRAY_AGG" && !window.inner_order_by.empty();
   std::vector<std::vector<Value>> order_keys;
   ASSIGN_OR_RETURN(
       std::vector<size_t>, frame_survivors,
       (FrameSurvivors(window, rows, ordered, order_values, current, lo, hi)));
+  if (fn == "STRING_AGG") {
+    if (window.args.empty()) {
+      return Value();
+    }
+    AggregateExpression aggregate(AggregationType::kStringAgg, window.args[0],
+                                  window.distinct);
+    if (window.args.size() > 1) {
+      aggregate.SetSecondaryArg(window.args[1]);
+    }
+    aggregate.SetInnerOrderBy(window.inner_order_by);
+    aggregate.SetInnerLimit(window.inner_limit);
+    AggregateAccumulator accumulator(&aggregate);
+    for (const size_t p : frame_survivors) {
+      const Scope scope{
+          .row = &rows[ordered[p]], .schema = schema, .outer = outer};
+      AggregateInput input;
+      ASSIGN_OR_RETURN(
+          Value, value,
+          (TryEvaluate(aggregate.Child(), scope, nullptr, context, *ctes)));
+      input.value = std::move(value);
+      if (aggregate.SecondaryArg()) {
+        ASSIGN_OR_RETURN(Value, delimiter,
+                         (TryEvaluate(aggregate.SecondaryArg(), scope, nullptr,
+                                      context, *ctes)));
+        input.auxiliary = std::move(delimiter);
+      }
+      input.order_keys.reserve(window.inner_order_by.size());
+      for (const WindowOrderTerm& term : window.inner_order_by) {
+        ASSIGN_OR_RETURN(
+            Value, key,
+            (TryEvaluate(term.expression, scope, nullptr, context, *ctes)));
+        input.order_keys.push_back(std::move(key));
+      }
+      RETURN_IF_FAIL(accumulator.Add(std::move(input)));
+    }
+    return accumulator.TryFinish();
+  }
+  if (fn == "APPROX_TOP_COUNT" || fn == "APPROX_TOP_SUM") {
+    const bool top_sum = fn == "APPROX_TOP_SUM";
+    if (frame_survivors.empty() || window.args.empty()) {
+      return Value();
+    }
+    int64_t k = 1;
+    const size_t n_arg = top_sum ? 2 : 1;
+    if (window.args.size() > n_arg) {
+      ASSIGN_OR_RETURN(Value, n_value,
+                       (TryEvaluate(window.args[n_arg],
+                                    (Scope{.row = &rows[ordered[lo]],
+                                           .schema = schema,
+                                           .outer = outer}),
+                                    nullptr, context, *ctes)));
+      if (n_value.IsNull()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Null top-k count is not supported");
+      }
+      if (n_value.type == ValueType::kInt64) {
+        k = n_value.value.int_value;
+      } else if (n_value.type == ValueType::kDouble) {
+        const double d = n_value.value.double_value;
+        if (std::isnan(d) || d < 1.0 || d > 100000.0) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "Invalid top-k count");
+        }
+        k = static_cast<int64_t>(d);
+      } else {
+        return StatusError(StatusCode::kInvalidArgument,
+                           fn + " requires an integer count");
+      }
+      if (k <= 0 || k > 100000) {
+        return StatusError(StatusCode::kInvalidArgument, "Invalid top-k count");
+      }
+    }
+    const AggregateExpression aggregate(top_sum
+                                            ? AggregationType::kApproxTopSum
+                                            : AggregationType::kApproxTopCount,
+                                        window.args[0]);
+    AggregateAccumulator accumulator(&aggregate);
+    std::string element_type;
+    bool floating_weight = false;
+    for (const size_t p : frame_survivors) {
+      const Scope scope{
+          .row = &rows[ordered[p]], .schema = schema, .outer = outer};
+      ASSIGN_OR_RETURN(
+          Value, value,
+          (TryEvaluate(window.args[0], scope, nullptr, context, *ctes)));
+      if (element_type.empty()) {
+        element_type = ElementSqlTypeOf(value);
+      }
+      AggregateInput input;
+      input.value = std::move(value);
+      if (top_sum) {
+        Value weight(1);
+        if (window.args.size() > 1) {
+          ASSIGN_OR_RETURN(
+              Value, supplied_weight,
+              (TryEvaluate(window.args[1], scope, nullptr, context, *ctes)));
+          weight = std::move(supplied_weight);
+        }
+        if (weight.IsUnsigned() && weight.value.int_value < 0) {
+          weight = Value(static_cast<double>(
+              static_cast<uint64_t>(weight.value.int_value)));
+        }
+        floating_weight |= weight.type == ValueType::kDouble;
+        input.trailing_values.push_back(std::move(weight));
+      }
+      input.trailing_values.emplace_back(k);
+      RETURN_IF_FAIL(accumulator.Add(std::move(input)));
+    }
+    ASSIGN_OR_RETURN(Value, result, accumulator.TryFinish());
+    if (!result.IsArray()) {
+      return result;
+    }
+    if (element_type.empty()) {
+      element_type = "STRING";
+    }
+    const std::string_view metric =
+        top_sum ? (floating_weight ? "sum FLOAT64" : "sum INT64")
+                : "count INT64";
+    return Value::Array(
+        result.ArrayElements(),
+        "STRUCT<value " + element_type + ", " + std::string(metric) + ">");
+  }
   values.reserve(frame_survivors.size());
   if (need_order_keys) {
     order_keys.reserve(frame_survivors.size());
@@ -1228,14 +1366,6 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
         }
         order_keys.push_back(std::move(keys));
       }
-    }
-    if (fn == "STRING_AGG" && window.args.size() > 1) {
-      StatusOr<Value> delimiter_or =
-          TryEvaluate(window.args[1], scope, nullptr, context, *ctes);
-      if (!delimiter_or.HasValue()) {
-        return delimiter_or.GetStatus();
-      }
-      delimiter = delimiter_or.MoveValue();
     }
   }
 
@@ -1341,7 +1471,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
         merged.push_back(element);
       }
     }
-    return Value::Array(std::move(merged), element_type);
+    return Value::Array(std::move(merged), std::move(element_type));
   }
   if (fn == "APPROX_QUANTILES") {
     // Exact percentile interpolation over the frame; returns NUM quantiles
@@ -1398,204 +1528,6 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
       quantiles.push_back(sorted[static_cast<size_t>(idx)]);
     }
     return Value::Array(std::move(quantiles), ElementSqlTypeOf(sorted[0]));
-  }
-  if (fn == "APPROX_TOP_COUNT" || fn == "APPROX_TOP_SUM") {
-    // Exact deterministic evaluation: count/sum occurrences per value over
-    // the frame and return the top-k as ARRAY<STRUCT<value, number>>. These
-    // two aggregates track NULL inputs too (matching the accumulator), so
-    // guard on the full value list, not the NULL-free projection.
-    if (values.empty() || window.args.empty()) {
-      return Value();
-    }
-    int64_t k = 1;
-    if (!window.args.empty()) {
-      const size_t n_arg = fn == "APPROX_TOP_COUNT" ? 1 : 2;
-      if (window.args.size() > n_arg) {
-        ASSIGN_OR_RETURN(Value, n_value,
-                         (TryEvaluate(window.args[n_arg],
-                                      (Scope{.row = &rows[ordered[lo]],
-                                             .schema = schema,
-                                             .outer = outer}),
-                                      nullptr, context, *ctes)));
-        if (n_value.IsNull()) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "Null top-k count is not supported");
-        }
-        if (n_value.type == ValueType::kInt64) {
-          k = n_value.value.int_value;
-        } else if (n_value.type == ValueType::kDouble) {
-          const double d = n_value.value.double_value;
-          if (std::isnan(d) || d < 1.0 || d > 100000.0) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "Invalid top-k count");
-          }
-          k = static_cast<int64_t>(d);
-        } else {
-          return StatusError(StatusCode::kInvalidArgument,
-                             fn + " requires an integer count");
-        }
-        if (k <= 0 || k > 100000) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "Invalid top-k count");
-        }
-      }
-    }
-    struct TopStat {
-      Value value;
-      double total{0};
-      size_t weights{0};  // APPROX_TOP_SUM: rows with a non-NULL weight
-    };
-    std::vector<TopStat> stats;
-    ASSIGN_OR_RETURN(
-        std::vector<size_t>, approx_survivors,
-        (FrameSurvivors(window, rows, ordered, order_values, current, lo, hi)));
-    stats.reserve(approx_survivors.size());
-    for (const size_t r : approx_survivors) {
-      const size_t row = ordered[r];
-      const Scope scope{.row = &rows[row], .schema = schema, .outer = outer};
-      ASSIGN_OR_RETURN(
-          Value, v,
-          (TryEvaluate(window.args[0], scope, nullptr, context, *ctes)));
-      // APPROX_TOP_COUNT/_SUM count NULL as a value (see the grouped
-      // accumulator); only other aggregates skip NULL inputs here.
-      bool has_weight = true;
-      double weight = 1.0;
-      if (fn == "APPROX_TOP_SUM" && window.args.size() > 1) {
-        ASSIGN_OR_RETURN(
-            Value, w,
-            (TryEvaluate(window.args[1], scope, nullptr, context, *ctes)));
-        // A NULL weight must not contribute 1.0; the grouped accumulator
-        // leaves entries whose weights are all NULL with an empty count and
-        // renders their sum as "NULL".
-        if (w.IsNull()) {
-          has_weight = false;
-        } else {
-          if (w.type != ValueType::kDouble && w.type != ValueType::kInt64) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "APPROX_TOP_SUM requires a numeric weight");
-          }
-          weight = w.type == ValueType::kDouble
-                       ? w.value.double_value
-                       : (w.IsUnsigned()
-                              ? static_cast<double>(
-                                    static_cast<uint64_t>(w.value.int_value))
-                              : static_cast<double>(w.value.int_value));
-          // Match the grouped accumulator's error surface: negative and NaN
-          // weights are rejected with kIsInfinity, never silently summed.
-          if ((w.type == ValueType::kInt64 && !w.IsUnsigned() &&
-               w.value.int_value < 0) ||
-              (w.type == ValueType::kDouble &&
-               (std::isnan(w.value.double_value) || weight < 0))) {
-            return StatusError(
-                StatusCode::kIsInfinity,
-                "APPROX_TOP_SUM does not support negative or NaN weights in "
-                "the second argument");
-          }
-        }
-      }
-      bool found = false;
-      for (auto& entry : stats) {
-        // NULL is a counted value for APPROX_TOP_COUNT/_SUM and must group
-        // with other NULLs, which SQL `=` never does. ValuesEqual is the
-        // peer-equality helper used by grouping elsewhere in this file.
-        if (ValuesEqual(entry.value, v)) {
-          if (has_weight) {
-            entry.total += weight;
-            ++entry.weights;
-          }
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        stats.push_back(TopStat{
-            v, 0.0, 0});  // NOLINT(modernize-use-designated-initializers)
-        if (has_weight) {
-          stats.back().total = weight;
-          stats.back().weights = 1;
-        }
-      }
-    }
-    std::stable_sort(
-        stats.begin(), stats.end(), [&](const TopStat& a, const TopStat& b) {
-          if (fn == "APPROX_TOP_SUM" && (a.weights == 0 || b.weights == 0)) {
-            // Entries with all-NULL weights rank last, as in the
-            // grouped accumulator's Finish.
-            return a.weights != 0 && b.weights == 0;
-          }
-          return a.total > b.total;
-        });
-    auto json_of = [](const Value& v) -> std::string {
-      if (v.IsNull()) {
-        return "null";
-      }
-      switch (v.type) {
-        case ValueType::kInt64:
-          return std::to_string(v.value.int_value);
-        case ValueType::kDate:
-          // The grouped accumulator renders DATE entries through
-          // FormatDateDays; emitting the raw day count here made the same
-          // input produce different STRUCT payloads on the two paths.
-          return json_text::EncodeJsonString(FormatDateDays(v.value.int_value));
-        case ValueType::kDouble: {
-          const double d = v.value.double_value;
-          if (std::isnan(d)) {
-            return "NaN";
-          }
-          if (std::isinf(d)) {
-            return d > 0 ? "Infinity" : "-Infinity";
-          }
-          std::array<char, 64> buf{};
-          (void)snprintf(buf.data(), buf.size(), "%.17g", d);
-          return std::string(
-              buf.data());  // NOLINT(modernize-return-braced-init-list)
-        }
-        case ValueType::kVarChar:
-          // Quotes, backslashes and control bytes must be escaped or the
-          // STRUCT payload is not parseable JSON.
-          return json_text::EncodeJsonString(v.value.varchar_value);
-        default:
-          return "null";
-      }
-    };
-    std::vector<Value> out;
-    out.reserve(stats.size());
-    std::string element_type;
-    for (size_t i = 0; i < stats.size() && std::cmp_less(i, k); ++i) {
-      const std::string metric =
-          (fn == "APPROX_TOP_SUM" && stats[i].weights == 0)
-              ? "null"
-              : (stats[i].total == std::floor(stats[i].total)
-                     ? std::to_string(static_cast<int64_t>(stats[i].total))
-                     : std::to_string(stats[i].total));
-      const std::string_view metric_name =
-          fn == "APPROX_TOP_COUNT" ? "count" : "sum";
-      std::string json = "{\"value\":" + json_of(stats[i].value) + ",\"";
-      json += metric_name;
-      json += "\":" + metric + "}";
-      out.emplace_back(std::move(json));
-    }
-    if (!out.empty()) {
-      std::string value_type = "STRING";
-      switch (stats[0].value.type) {
-        case ValueType::kInt64:
-          value_type = "INT64";
-          break;
-        case ValueType::kDouble:
-          value_type = "FLOAT64";
-          break;
-        case ValueType::kDate:
-          value_type = "DATE";
-          break;
-        default:
-          value_type = "STRING";
-          break;
-      }
-      element_type = fn == "APPROX_TOP_COUNT"
-                         ? "STRUCT<value " + value_type + ", count INT64>"
-                         : "STRUCT<value " + value_type + ", sum INT64>";
-    }
-    return Value::Array(std::move(out), element_type);
   }
   if (fn == "COUNTIF") {
     int64_t trues = 0;
@@ -1695,38 +1627,15 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
     }
     return *best;
   }
-  if (fn == "ARRAY_AGG" || fn == "STRING_AGG") {
-    std::vector<Value> final_values = fn == "ARRAY_AGG" && !window.ignore_nulls
-                                          ? std::move(values)
-                                          : std::move(non_null);
+  if (fn == "ARRAY_AGG") {
+    std::vector<Value> final_values =
+        window.ignore_nulls ? std::move(non_null) : std::move(values);
     if (window.inner_limit.has_value() &&
         final_values.size() > *window.inner_limit) {
       final_values.resize(*window.inner_limit);
     }
-    // Both array and string aggregation return NULL (not an empty array or
-    // empty string) when the frame has no contributing non-NULL value, matching
-    // the grouped accumulator's Finalize.
-    if ((fn == "ARRAY_AGG" || fn == "STRING_AGG") && final_values.empty()) {
+    if (final_values.empty()) {
       return Value();
-    }
-    if (fn == "STRING_AGG") {
-      // Raw text for VARCHAR parts: AsString would wrap them in display
-      // quotes, diverging from the streaming STRING_AGG accumulator.
-      const auto raw_text = [](const Value& value) {
-        return value.type == ValueType::kVarChar
-                   ? std::string(value.value.varchar_value)
-                   : value.AsString();
-      };
-      std::string sep = delimiter.IsNull() ? "," : raw_text(delimiter);
-      std::string out;
-      out.reserve(final_values.size());
-      for (size_t i = 0; i < final_values.size(); ++i) {
-        if (i != 0U) {
-          out += sep;
-        }
-        out += raw_text(final_values[i]);
-      }
-      return Value(std::move(out));
     }
     std::string element_type;
     for (const Value& value : final_values) {
@@ -1735,7 +1644,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
         break;
       }
     }
-    return Value::Array(std::move(final_values), element_type);
+    return Value::Array(std::move(final_values), std::move(element_type));
   }
   if (fn == "LOGICAL_AND" || fn == "LOGICAL_OR") {
     bool saw_true = false;
@@ -2070,44 +1979,56 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
       return StatusError(StatusCode::kInvalidArgument,
                          "PERCENTILE argument must be between 0 and 1");
     }
-    std::vector<Value> sorted = frame_values;
-    // PERCENTILE sorts NULLs first, then NaN (unlike ORDER BY, where NaN
-    // is largest).  NUMERIC-typed strings compare numerically.
-    std::sort(sorted.begin(), sorted.end(), [](const Value& a, const Value& b) {
-      if (a.IsNull() || b.IsNull()) {
-        return a.IsNull() && !b.IsNull();
+    struct PercentileValue {
+      Value value;
+      std::optional<double> parsed;
+    };
+    std::vector<PercentileValue> sorted;
+    sorted.reserve(frame_values.size());
+    for (Value& value : frame_values) {
+      std::optional<double> parsed;
+      if (value.type == ValueType::kVarChar && !value.IsInterval()) {
+        try {
+          const std::string text(value.AsStringView());
+          size_t consumed = 0;
+          const double candidate = std::stod(text, &consumed);
+          if (consumed == text.size()) {
+            parsed = candidate;
+          }
+        } catch (const std::invalid_argument&) {
+          // Nonnumeric text keeps its text sort key.
+        } catch (const std::out_of_range&) {
+          // An unrepresentable number also keeps its text sort key.
+        }
       }
-      const bool a_nan =
-          a.type == ValueType::kDouble && std::isnan(a.value.double_value);
-      const bool b_nan =
-          b.type == ValueType::kDouble && std::isnan(b.value.double_value);
+      sorted.push_back({std::move(value), parsed});
+    }
+    // Give every value one fixed sort key. Pairwise parsing with a text
+    // fallback can order the same value differently in different comparisons.
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+      const Value a_key = a.parsed ? Value(*a.parsed) : a.value;
+      const Value b_key = b.parsed ? Value(*b.parsed) : b.value;
+      if (a_key.IsNull() || b_key.IsNull()) {
+        return a_key.IsNull() && !b_key.IsNull();
+      }
+      const bool a_nan = a_key.type == ValueType::kDouble &&
+                         std::isnan(a_key.value.double_value);
+      const bool b_nan = b_key.type == ValueType::kDouble &&
+                         std::isnan(b_key.value.double_value);
       if (a_nan || b_nan) {
         return a_nan && !b_nan;
       }
-      if (a.type == ValueType::kVarChar && b.type == ValueType::kVarChar) {
-        try {
-          const double da = std::stod(std::string(a.value.varchar_value));
-          const double db = std::stod(std::string(b.value.varchar_value));
-          return da < db;
-        } catch (const std::exception& error) {
-          (void)error;
-        }
-      }
-      try {
-        return a < b;
-      } catch (...) {
-        return false;
-      }
+      return CompareForOrderBy(a_key, b_key) < 0;
     });
     const double rank = p * static_cast<double>(sorted.size() - 1);
     if (fn == "PERCENTILE_DISC") {
       // PERCENTILE_DISC rounds the rank UP to the next element.
-      return sorted[static_cast<size_t>(std::ceil(rank))];
+      return sorted[static_cast<size_t>(std::ceil(rank))].value;
     }
     const auto lo_idx = static_cast<size_t>(std::floor(rank));
     const auto hi_idx = static_cast<size_t>(std::ceil(rank));
     if (lo_idx == hi_idx) {
-      const Value& hit = sorted[lo_idx];
+      const Value& hit = sorted[lo_idx].value;
       if (hit.IsNull()) {
         return Value();
       }
@@ -2121,11 +2042,13 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
       return hit;
     }
     // Interpolation across a NULL endpoint yields NULL.
-    if (sorted[lo_idx].IsNull() || sorted[hi_idx].IsNull()) {
+    if (sorted[lo_idx].value.IsNull() || sorted[hi_idx].value.IsNull()) {
       return Value();
     }
-    const double a = NumericOf(sorted[lo_idx]);
-    const double b = NumericOf(sorted[hi_idx]);
+    const double a =
+        sorted[lo_idx].parsed.value_or(NumericOf(sorted[lo_idx].value));
+    const double b =
+        sorted[hi_idx].parsed.value_or(NumericOf(sorted[hi_idx].value));
     const double frac = rank - static_cast<double>(lo_idx);
     // a*(1-frac) + b*frac (NOT a + (b-a)*frac): the former keeps infinite
     // endpoints as-is instead of collapsing to NaN.
@@ -3195,7 +3118,7 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
             continue;
           }
           const auto& term = window.order_by[t];
-          return ValueLess(lhs, rhs, term.ascending, term.nulls_first);
+          return WindowOrderLess(lhs, rhs, term);
         }
         return false;
       });
@@ -3317,20 +3240,19 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
       }
       std::vector<size_t> positions(ordered.size());
       std::iota(positions.begin(), positions.end(), 0);
-      std::stable_sort(positions.begin(), positions.end(),
-                       [&](size_t a, size_t b) {
-                         for (size_t t = 0; t < window.order_by.size(); ++t) {
-                           const WindowOrderTerm& term = window.order_by[t];
-                           if (ValuesEqual(partition.order_values[a][t],
-                                           partition.order_values[b][t])) {
-                             continue;
-                           }
-                           return ValueLess(partition.order_values[a][t],
-                                            partition.order_values[b][t],
-                                            term.ascending, term.nulls_first);
-                         }
-                         return false;
-                       });
+      std::stable_sort(
+          positions.begin(), positions.end(), [&](size_t a, size_t b) {
+            for (size_t t = 0; t < window.order_by.size(); ++t) {
+              const WindowOrderTerm& term = window.order_by[t];
+              if (ValuesEqual(partition.order_values[a][t],
+                              partition.order_values[b][t])) {
+                continue;
+              }
+              return WindowOrderLess(partition.order_values[a][t],
+                                     partition.order_values[b][t], term);
+            }
+            return false;
+          });
       std::vector<size_t> sorted_members(ordered.size());
       WindowOrderValues sorted_values(ordered.size(), window.order_by.size());
       for (size_t k = 0; k < positions.size(); ++k) {

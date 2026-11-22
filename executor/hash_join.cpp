@@ -273,6 +273,12 @@ struct KeyRef {
   uint64_t hash{0};
 };
 
+// `scratch` is caller-owned and may be reused across rows (see e.g.
+// process_probe_spilled's single scratch_key). The kBytes path clears it via
+// EncodeJoinKeyInto() on EVERY call, including error returns, so a previous
+// row's key suffix can never survive into the next KeyRef; the kInt64 path
+// does not touch it at all. A returned byte_key is therefore a view valid
+// only until the next KeyOf() call on the same scratch.
 KeyRef KeyOf(const Row& row, const std::vector<slot_t>& cols,
              JoinHashIndex::KeyMode mode, ValueType int_mode_type,
              std::string* scratch,
@@ -417,12 +423,12 @@ struct PreparedProbeKeys {
     if (state[i] != kValid) {
       return 0;
     }
-    const std::string_view key =
-        mode == JoinHashIndex::KeyMode::kBytes
-            ? std::string_view(bytes).substr(offset[i], offset[i + 1] - offset[i])
-            : std::string_view();
+    const std::string_view key = mode == JoinHashIndex::KeyMode::kBytes
+                                     ? std::string_view(bytes).substr(
+                                           offset[i], offset[i + 1] - offset[i])
+                                     : std::string_view();
     return side.index.Find(hash[i], int_key[i], key) != JoinHashIndex::kNil ? 1
-                                                                          : 0;
+                                                                            : 0;
   }
 };
 
@@ -855,7 +861,8 @@ struct HashJoin::JoinState {
 template <typename LSide, typename RSide>
 // NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
 // intentional
-static std::optional<ValueType> JoinIntModeAvoidingSpillLoss(  // NOLINT(misc-use-anonymous-namespace)
+static std::optional<ValueType>
+JoinIntModeAvoidingSpillLoss(  // NOLINT(misc-use-anonymous-namespace)
     const LSide& left, const RSide& right, const std::vector<slot_t>& left_cols,
     const std::vector<slot_t>& right_cols) {
   if (left.Spilled() || right.Spilled()) {
@@ -1695,8 +1702,8 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
         matched[i] = ProbeState::kNull;
       }
     }
-    const PreparedProbeKeys probe_keys = PrepareProbeKeys(
-        s.left.rows, left_cols_, int_mode, NullSafeArg());
+    const PreparedProbeKeys probe_keys =
+        PrepareProbeKeys(s.left.rows, left_cols_, int_mode, NullSafeArg());
     for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
       ASSIGN_OR_RETURN(std::vector<PositionedRow>, right_part,
                        (s.right.spills[p].ReadAllPositioned()));
@@ -2518,13 +2525,20 @@ Status HashJoin::MaterializeHybrid() {
 
   std::vector<Row> resident_right;
   DataChunk batch;
-  resident_right.reserve(batch.Size());
   QueryMemoryCharge resident_charge;
   std::vector<SpillFile> right_spill(partitions);
   std::vector<SpillFile> left_spill(partitions);
   std::string key;
 
+  bool resident_reserved = false;
   while (right_->NextBatch(&batch) != 0) {
+    if (!resident_reserved && batch.Size() > 0) {
+      // Reserve from the first real batch: batch.Size() is 0 right after
+      // default construction, so reserving before the first NextBatch was a
+      // no-op and every later batch forced a reallocation.
+      resident_right.reserve(batch.Size());
+      resident_reserved = true;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       Row row = batch.RowAt(i);
       if (!EncodeJoinKeyInto(row, right_cols_, &key, NullSafeArg())) {

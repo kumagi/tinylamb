@@ -251,19 +251,32 @@ std::string ErrorResponse(std::string_view message, std::string_view sqlstate,
   AppendCString(&payload, SanitizeField(sqlstate));
   payload.push_back('M');
   AppendCString(&payload, SanitizeField(message));
-  // GoogleSQL frontend diagnostics end with "[at line:column]"; surface the
-  // column as PostgreSQL's P field so psql/JDBC can show an error caret.
+  // GoogleSQL frontend diagnostics end with "[at line:column]". L is a genuine
+  // line number, but P is NOT a character index: PostgreSQL defines P as a
+  // 0-based offset into the query text, which ErrorResponse never receives and
+  // which cannot be derived from a line:column pair. The column is still sent
+  // as a best-effort hint for existing clients, but callers must not rely on P
+  // for caret placement -- the authoritative "[at L:C]" location is carried
+  // verbatim in the M field above.
   if (const size_t at = message.find("[at "); at != std::string_view::npos) {
     const size_t colon = message.find(':', at + 4);
-    const size_t close = message.find(']', colon == std::string_view::npos
-                                                ? at + 4
-                                                : colon + 1);
+    const size_t close =
+        message.find(']', colon == std::string_view::npos ? at + 4 : colon + 1);
     if (colon != std::string_view::npos && close != std::string_view::npos &&
         close > colon + 1) {
       std::string_view pos = message.substr(colon + 1, close - colon - 1);
       bool digits = !pos.empty();
       for (char c : pos) {
         digits = digits && c >= '0' && c <= '9';
+      }
+      std::string_view line = message.substr(at + 4, colon - at - 4);
+      bool line_digits = !line.empty();
+      for (char c : line) {
+        line_digits = line_digits && c >= '0' && c <= '9';
+      }
+      if (line_digits) {
+        payload.push_back('L');
+        AppendCString(&payload, line);
       }
       if (digits) {
         payload.push_back('P');
@@ -458,7 +471,8 @@ StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql) {
         size_t j = i + 1;
         // PostgreSQL dollar-quote tags follow unquoted-identifier rules:
         // the first character cannot be a digit ($1$ is a placeholder).
-        if (j < sql.size() && std::isdigit(static_cast<unsigned char>(sql[j])) != 0) {
+        if (j < sql.size() &&
+            std::isdigit(static_cast<unsigned char>(sql[j])) != 0) {
           Append(current_char);
           continue;
         }

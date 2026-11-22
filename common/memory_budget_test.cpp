@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -17,6 +18,18 @@
 #include "gtest/gtest.h"
 
 namespace tinylamb {
+
+TEST(MemoryBudgetTest, ServerBufferFloorSaturatesInsteadOfWrapping) {
+  auto& budget = ProcessMemoryBudget::Global();
+  budget.ResetForTest(0);
+  budget.AddServerBufferFloorBytes(std::numeric_limits<size_t>::max() - 4);
+  budget.AddServerBufferFloorBytes(10);
+  EXPECT_EQ(budget.ServerBufferFloorBytes(),
+            std::numeric_limits<size_t>::max());
+  EXPECT_EQ(budget.PoolFloorBytes(MemoryPoolKind::kTx),
+            std::numeric_limits<size_t>::max());
+  budget.ResetForTest(0);
+}
 
 TEST(MemoryBudgetTest,
      UncappedColumnarBudgetRetainsLargeProjectionAndOtherFloors) {
@@ -162,9 +175,10 @@ TEST(MemoryBudgetTest, TempDirectoryRespectsRegisteredDefaultWhenEnvUnset) {
   // The default temp directory is process-global: restore it (and clean up
   // the path) on every exit path so a fatal assertion or exception cannot
   // leak the override into later tests.
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
+  // guard type is
   // non-copyable by design
-  struct DefaultTempDirReset {  // NOLINT(cppcoreguidelines-special-member-functions)
+  struct
+      DefaultTempDirReset {  // NOLINT(cppcoreguidelines-special-member-functions)
     ~DefaultTempDirReset() {
       ProcessMemoryBudget::SetDefaultTempDirectory({});
       std::error_code ec;
@@ -505,7 +519,8 @@ TEST(MemoryBudgetTest, UnderMemoryPressureUsesRssWarnLine) {
     GTEST_SKIP() << "RSS reporting unavailable: " << rss0;
   }
   // soft = 0.8 * (rss/0.8375) = 0.955*rss < rss < 1.045*rss = warn.
-  const size_t limit = static_cast<size_t>(rss0 * 10000ULL / 8375ULL);  // NOLINT(modernize-use-auto)
+  const size_t limit = static_cast<size_t>(
+      rss0 * 10000ULL / 8375ULL);  // NOLINT(modernize-use-auto)
   b.ResetForTest(/*limit_bytes=*/limit, 0, 0,
                  /*check_rss_pressure=*/true);
   const uint64_t rss_now = platform::CurrentProcessRssBytes();
@@ -532,10 +547,13 @@ TEST(MemoryBudgetTest, EmergencyReserveHonorsAggregateLimit) {
   // unconditionally and let the ledger grow past the design limit).
   EXPECT_FALSE(b.ReserveEmergency(MemoryPoolKind::kStorage, cap));
   EXPECT_EQ(b.EmergencyUsed(), cap / 2);
-  EXPECT_TRUE(b.ReserveEmergency(MemoryPoolKind::kStorage, cap - cap / 2));  // NOLINT(readability-math-missing-parentheses)
+  EXPECT_TRUE(b.ReserveEmergency(
+      MemoryPoolKind::kStorage,
+      cap - cap / 2));  // NOLINT(readability-math-missing-parentheses)
   EXPECT_EQ(b.EmergencyUsed(), cap);
   b.ReleaseEmergency(MemoryPoolKind::kStorage, cap);
-  EXPECT_EQ(b.EmergencyUsed(), 0u);  // NOLINT(readability-uppercase-literal-suffix)
+  EXPECT_EQ(b.EmergencyUsed(),
+            0u);  // NOLINT(readability-uppercase-literal-suffix)
   EXPECT_TRUE(b.ReserveEmergency(MemoryPoolKind::kTx, 1));  // room again
   b.ReleaseEmergency(MemoryPoolKind::kTx, 1);
   b.ResetForTest(0);
@@ -554,9 +572,12 @@ TEST(MemoryBudgetTest, ConstBudgetGettersDoNotAdvanceRssSampling) {
     (void)b.Available();
     (void)b.CanReserve(MemoryPoolKind::kQuery, 1);
   }
-  EXPECT_EQ(b.PeakRssBytes(), 0u);  // NOLINT(readability-uppercase-literal-suffix)
-  EXPECT_GT(b.SampledRssBytes(/*force_refresh=*/true), 0u);  // NOLINT(readability-uppercase-literal-suffix)
-  EXPECT_GT(b.PeakRssBytes(), 0u);  // NOLINT(readability-uppercase-literal-suffix)
+  EXPECT_EQ(b.PeakRssBytes(),
+            0u);  // NOLINT(readability-uppercase-literal-suffix)
+  EXPECT_GT(b.SampledRssBytes(/*force_refresh=*/true),
+            0u);  // NOLINT(readability-uppercase-literal-suffix)
+  EXPECT_GT(b.PeakRssBytes(),
+            0u);  // NOLINT(readability-uppercase-literal-suffix)
   // The pure getters then read that cached sample without re-sampling.
   const uint64_t peak_before = b.PeakRssBytes();
   (void)b.Available();

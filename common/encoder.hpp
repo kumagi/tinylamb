@@ -35,8 +35,8 @@ class Encoder {
  public:
   explicit Encoder(std::ostream& os) : os_(&os) {}
   // Appends the same binary representation without the per-field ostream
-  // sentry/virtual stream-buffer dispatch. The destination must not also
-  // back a string_view being encoded.
+  // sentry/virtual stream-buffer dispatch. Aliased string views are copied
+  // before appending their length prefix.
   explicit Encoder(std::string& bytes) : bytes_(&bytes) {}
   Encoder& operator<<(std::string_view sv);
   Encoder& operator<<(uint8_t u8);

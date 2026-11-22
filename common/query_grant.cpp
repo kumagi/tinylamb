@@ -141,10 +141,10 @@ QueryMemoryGrant::QueryMemoryGrant(QueryMemoryGrant&& other) noexcept
       budget_(other.budget_),
       granted_bytes_(other.granted_bytes_.load(std::memory_order_acquire)),
       used_bytes_(other.used_bytes_.load(std::memory_order_acquire)),
+      reported_peak_bytes_(
+          other.reported_peak_bytes_.exchange(0, std::memory_order_relaxed)),
       active_consumers_(
           other.active_consumers_.load(std::memory_order_acquire)),
-      reported_peak_bytes_(other.reported_peak_bytes_.exchange(
-          0, std::memory_order_relaxed)),
       limited_(other.limited_),
       wait_ns_(other.wait_ns_) {
   other.budget_ = nullptr;
@@ -222,9 +222,9 @@ void QueryMemoryGrant::RecordPeak(size_t used) noexcept {
   // a genuinely new peak; repeated small consumes below the old peak need no
   // cross-thread traffic at all.
   size_t peak = reported_peak_bytes_.load(std::memory_order_relaxed);
-  while (used > peak &&
-         !reported_peak_bytes_.compare_exchange_weak(
-             peak, used, std::memory_order_relaxed, std::memory_order_relaxed)) {
+  while (used > peak && !reported_peak_bytes_.compare_exchange_weak(
+                            peak, used, std::memory_order_relaxed,
+                            std::memory_order_relaxed)) {
   }
   if (used > peak) {
     ProcessMemoryBudget::Global().RecordOperatorPeakBytes(used);
@@ -240,7 +240,8 @@ bool QueryMemoryGrant::TryConsume(size_t bytes) noexcept {
   }
   const size_t limit = granted_bytes_.load(std::memory_order_acquire);
   if (!limited_ || limit == 0) {
-    const size_t used_after = used_bytes_.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
+    const size_t used_after =
+        used_bytes_.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
     RecordPeak(used_after);
     return true;
   }
@@ -324,10 +325,16 @@ size_t QueryMemoryCoordinator::MaxGrantFromEnv() const noexcept {
 uint64_t QueryMemoryCoordinator::WaitTimeoutMsFromEnv() noexcept {
   const uint64_t raw =
       ReadGrantEnvU64("TINYLAMB_GRANT_WAIT_TIMEOUT_MS", kDefaultWaitTimeoutMs);
+  // 0 is not a meaningful wait budget: AcquireGrant would time out on its
+  // first poll and turn a transient memory contention into a hard failure.
+  // Treat it like an unset/invalid value (same policy as the parser).
+  if (raw == 0) {
+    return kDefaultWaitTimeoutMs;
+  }
   // Keep the configured timeout within the signed millisecond range used
   // by callers displaying this setting.
-  return std::min<uint64_t>(raw,
-                            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  return std::min<uint64_t>(
+      raw, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
 }
 
 void QueryMemoryCoordinator::NotifyReleased() {
@@ -416,8 +423,8 @@ StatusOr<QueryMemoryGrant> QueryMemoryCoordinator::AcquireGrant(
     if (elapsed_ms >= timeout) {
       break;
     }
-    const auto slice = std::chrono::milliseconds(
-        std::min<uint64_t>(timeout - elapsed_ms, 10));
+    const auto slice =
+        std::chrono::milliseconds(std::min<uint64_t>(timeout - elapsed_ms, 10));
     sig->cv.wait_for(lk, slice);
     lk.unlock();
     if (try_once(&granted, &last_err)) {

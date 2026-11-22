@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -48,14 +49,21 @@ size_t DefaultEstimatedRows(const Plan& left, const Plan& right,
              : l * r;
 }
 
+// Validate in the member initializer, before schema_/stats_ dereference the
+// child: a CHECK in the constructor body would be unreachable on a null child.
+Plan RequireChild(Plan child) {
+  CHECK_MSG(child != nullptr, "ZigZagJoinPlan requires non-null children");
+  return child;
+}
+
 }  // namespace
 
 ZigZagJoinPlan::ZigZagJoinPlan(Plan left, ColumnName left_key, Plan right,
                                ColumnName right_key, BinaryOperation operation,
                                Expression predicate,
                                std::optional<size_t> estimated_rows)
-    : left_(std::move(left)),
-      right_(std::move(right)),
+    : left_(RequireChild(std::move(left))),
+      right_(RequireChild(std::move(right))),
       left_key_(std::move(left_key)),
       right_key_(std::move(right_key)),
       operation_(operation),
@@ -63,8 +71,6 @@ ZigZagJoinPlan::ZigZagJoinPlan(Plan left, ColumnName left_key, Plan right,
       schema_(left_->GetSchema() + right_->GetSchema()),
       stats_(left_->GetStats().ScaleCardinality(estimated_rows.value_or(
           DefaultEstimatedRows(left_, right_, operation_)))) {
-  CHECK_MSG(left_ != nullptr && right_ != nullptr,
-            "ZigZagJoinPlan requires non-null children");
   CHECK_MSG(SupportedOperation(operation_),
             "ZigZagJoinPlan requires an ordered comparison");
   CHECK_MSG(predicate_ != nullptr, "ZigZagJoinPlan requires a predicate");
@@ -72,7 +78,11 @@ ZigZagJoinPlan::ZigZagJoinPlan(Plan left, ColumnName left_key, Plan right,
 }
 
 size_t ZigZagJoinPlan::AccessRowCount() const {
-  return left_->AccessRowCount() + right_->AccessRowCount();
+  const size_t l = left_->AccessRowCount();
+  const size_t r = right_->AccessRowCount();
+  return l > std::numeric_limits<size_t>::max() - r
+             ? std::numeric_limits<size_t>::max()
+             : l + r;
 }
 
 size_t ZigZagJoinPlan::EmitRowCount() const { return stats_.Rows(); }

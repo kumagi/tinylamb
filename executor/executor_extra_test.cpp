@@ -110,8 +110,10 @@ TEST(MinMaxIndexExecutorTest,
   // NULL run crossing a batch boundary must keep the scan going instead of
   // stopping at the first all-NULL batch.
   std::vector<Row> rows;
-  for (size_t i = 0; i < 2 * kDefaultVectorSize + 5; ++i) {  // NOLINT(readability-math-missing-parentheses)
-    rows.emplace_back(std::vector<Value>{Value()});  // NOLINT(performance-inefficient-vector-operation)
+  for (size_t i = 0; i < 2 * kDefaultVectorSize + 5;
+       ++i) {  // NOLINT(readability-math-missing-parentheses)
+    rows.emplace_back(std::vector<Value>{
+        Value()});  // NOLINT(performance-inefficient-vector-operation)
   }
   rows.emplace_back(std::vector<Value>{Value(int64_t{-7})});
   MinMaxIndexExecutor executor(
@@ -297,7 +299,8 @@ TEST(ScanFilterExecutorTest, UnsignedComparisonsMatchGroundTruth) {
   EXPECT_FALSE(relational_detail::MatchSimpleCompare(tagged, pred));
 }
 
-TEST(ScanFilterExecutorTest, CompileTimeResolvesDeterministicConstantConjuncts) {
+TEST(ScanFilterExecutorTest,
+     CompileTimeResolvesDeterministicConstantConjuncts) {
   // Constant-residual boundary: a deterministic conjunct with a compile-time
   // value is decided once by CompileScanFilter, not per row.  TRUE
   // discharges the conjunct; FALSE / NULL rejects the whole conjunction
@@ -387,7 +390,8 @@ TEST(ScanFilterExecutorTest, CompileTimeResolvesDeterministicConstantConjuncts) 
 // same expression in SELECT-list position.  The full statement semantics
 // are pinned at the SQL level (QueryTest.
 // GroupedHavingErrorAbsorptionStaysPerRow).
-TEST(ScanFilterExecutorTest, ConstantResidualBoundaryNeverDecidesColumnConjuncts) {
+TEST(ScanFilterExecutorTest,
+     ConstantResidualBoundaryNeverDecidesColumnConjuncts) {
   const Schema schema("boundary_col", {Column("key", ValueType::kInt64)});
   {
     // ISERROR(key + 1/key) touches the key column: stays per-row.
@@ -971,7 +975,7 @@ TEST(PdqSortTest, TiebreakAndNullPlacement) {
   // under the ascending default (nulls_first defaults to ascending).
   std::vector<Row> rows;
   rows.emplace_back(Row({Value(int64_t{2}), Value(int64_t{30})}));
-  rows.emplace_back(Row({Value()}));
+  rows.emplace_back(Row({Value(), Value()}));
   rows.emplace_back(Row({Value(int64_t{2}), Value(int64_t{10})}));
   rows.emplace_back(Row({Value(int64_t{1}), Value(int64_t{99})}));
   PdqSort::Sort(
@@ -1008,13 +1012,13 @@ TEST(PdqSortTest, KeyEvaluationFailureAbortsBeforeSorting) {
   rows.emplace_back(Row({Value(int64_t{1}), Value(int64_t{0})}));
   rows.emplace_back(Row({Value(int64_t{2}), Value(int64_t{2})}));
   Status error = Status::kSuccess;
-  PdqSort::Sort(rows, schema,
-                {SortExecutor::Key{
-                    .expression = BinaryExpressionExp(
-                        ColumnValueExp("a"), BinaryOperation::kDivide,
-                        ColumnValueExp("b")),
-                    .ascending = true}},
-                &error);
+  PdqSort::Sort(
+      rows, schema,
+      {SortExecutor::Key{.expression = BinaryExpressionExp(
+                             ColumnValueExp("a"), BinaryOperation::kDivide,
+                             ColumnValueExp("b")),
+                         .ascending = true}},
+      &error);
   EXPECT_NE(error, Status::kSuccess);
   ASSERT_EQ(rows.size(), 3U);
   EXPECT_EQ(rows[0][0].value.int_value, 3);

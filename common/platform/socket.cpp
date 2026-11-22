@@ -19,6 +19,8 @@
 #include <cerrno>
 
 #ifdef TINYLAMB_OS_WINDOWS
+#include <algorithm>
+#include <climits>
 #include <mutex>
 #include <unordered_map>
 #else
@@ -86,12 +88,16 @@ std::mutex& SocketFlagsMutex() {
   return mu;
 }
 
-std::unordered_map<int, FdFlags>& SocketFlagsMap() {
-  static std::unordered_map<int, FdFlags> map;
+// Keyed by the lossless SocketFd (signed, pointer-sized on Win64), never by a
+// truncated `int`. Two distinct SOCKET handles can share the same low 32 bits;
+// using int here would collide them and make CloseSocket erase/close the wrong
+// entry.
+std::unordered_map<SocketFd, FdFlags>& SocketFlagsMap() {
+  static std::unordered_map<SocketFd, FdFlags> map;
   return map;
 }
 
-int ApplyWinSocketFlags(SOCKET s, FdFlags flags) {
+SocketFd ApplyWinSocketFlags(SOCKET s, FdFlags flags) {
   if (s == INVALID_SOCKET) {
     SetErrnoFromWsa();
     return -1;
@@ -111,7 +117,10 @@ int ApplyWinSocketFlags(SOCKET s, FdFlags flags) {
     errno = saved;
     return -1;
   }
-  const int fd = static_cast<int>(s);
+  // Keep every bit of the native SOCKET handle (UINT_PTR / 64-bit on Win64).
+  // static_cast<int>(s) used to truncate it, yielding a negative or aliased
+  // fd that could identify a different socket on close/poll.
+  const SocketFd fd = static_cast<SocketFd>(s);
   {
     std::scoped_lock lock(SocketFlagsMutex());
     SocketFlagsMap()[fd] = flags;
@@ -128,22 +137,22 @@ const bool kAutoInitWinsock = []() {
 
 void EnsureSocketSubsystemInitialized() { EnsureWinsockInitialized(); }
 
-int OpenSocket(int domain, int type, int protocol, FdFlags flags) {
+SocketFd OpenSocket(int domain, int type, int protocol, FdFlags flags) {
   EnsureWinsockInitialized();
   const SOCKET s = ::socket(domain, type, protocol);
   return ApplyWinSocketFlags(s, flags);
 }
 
-int AcceptSocket(int listener, FdFlags flags) {
+SocketFd AcceptSocket(SocketFd listener, FdFlags flags) {
   EnsureWinsockInitialized();
   const SOCKET accepted =
       ::accept(static_cast<SOCKET>(listener), nullptr, nullptr);
   return ApplyWinSocketFlags(accepted, flags);
 }
 
-int OpenPipe(std::array<int, 2>& fds, FdFlags flags) {
+int OpenPipe(std::array<SocketFd, 2>& fds, FdFlags flags) {
   EnsureWinsockInitialized();
-  const int listener = OpenSocket(
+  const SocketFd listener = OpenSocket(
       AF_INET, SOCK_STREAM, 0, {.nonblocking = false, .close_on_exec = true});
   if (listener < 0) return -1;
   sockaddr_in addr{};
@@ -162,7 +171,7 @@ int OpenPipe(std::array<int, 2>& fds, FdFlags flags) {
     errno = saved;
     return -1;
   }
-  const int write_end =
+  const SocketFd write_end =
       OpenSocket(AF_INET, SOCK_STREAM, 0,
                  {.nonblocking = false, .close_on_exec = flags.close_on_exec});
   if (write_end < 0) {
@@ -180,7 +189,7 @@ int OpenPipe(std::array<int, 2>& fds, FdFlags flags) {
     errno = saved;
     return -1;
   }
-  const int read_end = AcceptSocket(listener, flags);
+  const SocketFd read_end = AcceptSocket(listener, flags);
   CloseSocket(listener);
   if (read_end < 0) {
     const int saved = errno;
@@ -202,7 +211,7 @@ int OpenPipe(std::array<int, 2>& fds, FdFlags flags) {
   return 0;
 }
 
-int CloseSocket(int fd) {
+int CloseSocket(SocketFd fd) {
   if (fd < 0) {
     errno = EBADF;
     return -1;
@@ -218,9 +227,12 @@ int CloseSocket(int fd) {
   return 0;
 }
 
-ssize_t RecvSocket(int fd, void* data, size_t size, int flags) {
-  const int got = ::recv(static_cast<SOCKET>(fd), static_cast<char*>(data),
-                         static_cast<int>(size), flags);
+ssize_t RecvSocket(SocketFd fd, void* data, size_t size, int flags) {
+  // Winsock's length parameter is an int; cap instead of narrowing so a
+  // >INT_MAX buffer cannot wrap into a negative / short read.
+  const int capped = static_cast<int>(std::min<size_t>(size, INT_MAX));
+  const int got =
+      ::recv(static_cast<SOCKET>(fd), static_cast<char*>(data), capped, flags);
   if (got == SOCKET_ERROR) {
     SetErrnoFromWsa();
     return -1;
@@ -228,7 +240,8 @@ ssize_t RecvSocket(int fd, void* data, size_t size, int flags) {
   return got;
 }
 
-ssize_t SendNoSignal(int fd, const void* data, size_t size, int extra_flags) {
+ssize_t SendNoSignal(SocketFd fd, const void* data, size_t size,
+                     int extra_flags) {
   const int flags = extra_flags & ~MSG_DONTWAIT;
   const int sent =
       ::send(static_cast<SOCKET>(fd), static_cast<const char*>(data),
@@ -240,7 +253,7 @@ ssize_t SendNoSignal(int fd, const void* data, size_t size, int extra_flags) {
   return sent;
 }
 
-int ShutdownSocket(int fd, int how) {
+int ShutdownSocket(SocketFd fd, int how) {
   if (::shutdown(static_cast<SOCKET>(fd), how) != 0) {
     SetErrnoFromWsa();
     return -1;
@@ -258,7 +271,7 @@ int PollSockets(pollfd* fds, size_t nfds, int timeout_ms) {
   return rc;
 }
 
-int SetSocketOptInt(int fd, int level, int optname, int value) {
+int SetSocketOptInt(SocketFd fd, int level, int optname, int value) {
   if (::setsockopt(static_cast<SOCKET>(fd), level, optname,
                    reinterpret_cast<const char*>(&value), sizeof(value)) != 0) {
     SetErrnoFromWsa();
@@ -267,7 +280,7 @@ int SetSocketOptInt(int fd, int level, int optname, int value) {
   return 0;
 }
 
-int SetSocketTimeout(int fd, int optname, int timeout_ms) {
+int SetSocketTimeout(SocketFd fd, int optname, int timeout_ms) {
   const DWORD val = timeout_ms > 0 ? static_cast<DWORD>(timeout_ms) : DWORD{0};
   if (::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, optname,
                    reinterpret_cast<const char*>(&val), sizeof(val)) != 0) {
@@ -277,7 +290,7 @@ int SetSocketTimeout(int fd, int optname, int timeout_ms) {
   return 0;
 }
 
-bool IsCloseOnExec(int fd) {
+bool IsCloseOnExec(SocketFd fd) {
   DWORD flags = 0;
   const HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(fd));
   if (::GetHandleInformation(handle, &flags) != 0) {
@@ -288,7 +301,7 @@ bool IsCloseOnExec(int fd) {
   return it != SocketFlagsMap().end() && it->second.close_on_exec;
 }
 
-bool IsNonBlocking(int fd) {
+bool IsNonBlocking(SocketFd fd) {
   std::scoped_lock lock(SocketFlagsMutex());
   const auto it = SocketFlagsMap().find(fd);
   return it != SocketFlagsMap().end() && it->second.nonblocking;
@@ -337,7 +350,7 @@ void DisableSigPipe(int fd) {
 
 void EnsureSocketSubsystemInitialized() {}
 
-int OpenSocket(int domain, int type, int protocol, FdFlags flags) {
+SocketFd OpenSocket(int domain, int type, int protocol, FdFlags flags) {
 #ifdef __linux__
   if (flags.nonblocking) {
     type |= SOCK_NONBLOCK;
@@ -356,7 +369,7 @@ int OpenSocket(int domain, int type, int protocol, FdFlags flags) {
   return fd;
 }
 
-int AcceptSocket(int listener, FdFlags flags) {
+SocketFd AcceptSocket(SocketFd listener, FdFlags flags) {
 #ifdef __linux__
   int accept_flags = 0;
   if (flags.nonblocking) {
@@ -382,7 +395,7 @@ int AcceptSocket(int listener, FdFlags flags) {
   return fd;
 }
 
-int OpenPipe(std::array<int, 2>& fds, FdFlags flags) {
+int OpenPipe(std::array<SocketFd, 2>& fds, FdFlags flags) {
 #ifdef __linux__
   int pipe_flags = 0;
   if (flags.nonblocking) {
@@ -410,45 +423,49 @@ int OpenPipe(std::array<int, 2>& fds, FdFlags flags) {
 #endif
 }
 
-int CloseSocket(int fd) { return ::close(fd); }
+int CloseSocket(SocketFd fd) { return ::close(fd); }
 
-ssize_t RecvSocket(int fd, void* data, size_t size, int flags) {
+ssize_t RecvSocket(SocketFd fd, void* data, size_t size, int flags) {
   return ::recv(fd, data, size, flags);
 }
 
-int ShutdownSocket(int fd, int how) { return ::shutdown(fd, how); }
+int ShutdownSocket(SocketFd fd, int how) { return ::shutdown(fd, how); }
 
 int PollSockets(pollfd* fds, size_t nfds, int timeout_ms) {
   return ::poll(fds, static_cast<nfds_t>(nfds), timeout_ms);
 }
 
-int SetSocketOptInt(int fd, int level, int optname, int value) {
+int SetSocketOptInt(SocketFd fd, int level, int optname, int value) {
   return ::setsockopt(fd, level, optname, &value, sizeof(value));
 }
 
-int SetSocketTimeout(int fd, int optname, int timeout_ms) {
+int SetSocketTimeout(SocketFd fd, int optname, int timeout_ms) {
+  // Match the Windows branch: a non-positive timeout means no wait, so clamp
+  // it to 0 instead of handing a negative timeval to setsockopt (EINVAL).
+  const int clamped = timeout_ms > 0 ? timeout_ms : 0;
   timeval tv{};
-  tv.tv_sec = timeout_ms / 1000;
-  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(timeout_ms % 1000) * 1000;
+  tv.tv_sec = clamped / 1000;
+  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(clamped % 1000) * 1000;
   return ::setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof(tv));
 }
 
-bool IsCloseOnExec(int fd) {
+bool IsCloseOnExec(SocketFd fd) {
   const int flags = ::fcntl(fd, F_GETFD);
   // fcntl returns -1 on a bad fd; -1 & FD_CLOEXEC would masquerade as set.
   return flags != -1 && (flags & FD_CLOEXEC) != 0;
 }
 
-bool IsNonBlocking(int fd) {
+bool IsNonBlocking(SocketFd fd) {
   const int flags = ::fcntl(fd, F_GETFL);
   return flags != -1 && (flags & O_NONBLOCK) != 0;
 }
 
-ssize_t SendNoSignal(int fd, const void* data, size_t size, int extra_flags) {
+ssize_t SendNoSignal(SocketFd fd, const void* data, size_t size,
+                     int extra_flags) {
   return ::send(fd, data, size, kSendNoSignal | extra_flags);
 }
 
-ssize_t SendMsgNoSignal(int fd, const msghdr* message, int extra_flags) {
+ssize_t SendMsgNoSignal(SocketFd fd, const msghdr* message, int extra_flags) {
   return ::sendmsg(fd, message, kSendNoSignal | extra_flags);
 }
 

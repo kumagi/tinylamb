@@ -160,6 +160,8 @@ TEST_F(SqlPlanAndCastSweepTest, ReorderedArithmeticUpdateReplaysAllSlots) {
          "CREATE TABLE pslot (w INT64, d INT64, s INT64)");
   RunSql(engine_.get(), context_.get(),
          "INSERT INTO pslot VALUES (1, 1, 10), (1, 2, 80), (2, 1, 10)");
+  ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
+  *context_ = database_->BeginContext();
 
   RunSql(engine_.get(), context_.get(),
          "UPDATE pslot SET s = s + 1 + 2 + 0 "
@@ -270,8 +272,8 @@ TEST_F(SqlPlanAndCastSweepTest, StructUpdateAndExplainShapes) {
          "UPDATE st_t SET s = STRUCT(5 AS x, 'five' AS y)");
   RunSql(engine_.get(), context_.get(),
          "UPDATE st_t SET id = id + 1 WHERE 1 = id");
-  const auto rows = RunSql(engine_.get(), context_.get(),
-                           "SELECT id, s FROM st_t");
+  const auto rows =
+      RunSql(engine_.get(), context_.get(), "SELECT id, s FROM st_t");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0].value.int_value, 2);
   EXPECT_EQ(rows[0][1].AsStringView(), R"({"x":5,"y":"five"})");

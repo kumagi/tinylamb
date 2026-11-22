@@ -73,6 +73,16 @@ class CheckpointManagerTest : public ::testing::Test {
     std::ignore = std::remove((prefix_ + ".db").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt").c_str());
     std::ignore = std::remove((prefix_ + ".db.ckpt.tmp").c_str());
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+      const std::string fname = entry.path().filename().string();
+      // LSM compaction / page eviction leave <db>.lsm.<gen> and
+      // <db>.blocks.<gen> files behind; clean them up like the sibling tests.
+      if (fname.starts_with(prefix_ + ".db.lsm.") ||
+          fname.starts_with(prefix_ + ".db.blocks.")) {
+        std::filesystem::remove(entry.path(), ec);
+      }
+    }
     RemoveLogAndSegments(prefix_ + ".log");
     std::ignore = std::remove((prefix_ + ".last_checkpoint").c_str());
     std::ignore = std::remove((prefix_ + ".last_checkpoint.tmp").c_str());
@@ -203,12 +213,16 @@ TEST_F(CheckpointManagerTest,
 }
 
 TEST_F(CheckpointManagerTest, RapidConstructAndStopDoesNotLoseWakeup) {
-  const auto begin = std::chrono::steady_clock::now();
   for (int i = 0; i < 64; ++i) {
     SCOPED_TRACE(i);
     CheckpointManager transient(prefix_ + "_transient.db", tm_.get(), pm_.get(),
                                 5);
     transient.Start();
+    // Measure each Stop() on its own: a single lost wakeup must be caught
+    // even when the other 63 iterations return quickly. A cumulative bound
+    // would dilute one hang across all iterations and could also fail
+    // spuriously when a loaded ctest worker slows every iteration slightly.
+    const auto begin = std::chrono::steady_clock::now();
     transient.Stop();
     // Stop() must return promptly: a lost wakeup would park the worker and
     // reappear as a multi-second hang instead of an assertion failure.
@@ -276,13 +290,19 @@ TEST_F(CheckpointManagerTest,
   }
   ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
   const uint64_t before = watchdog.WorkerCheckpointsForTest();
-  for (int wait_ms = 0;
-       wait_ms < 15000 && watchdog.WorkerCheckpointsForTest() == before;
+  // The watchdog wakes at most once per interval_seconds_ (1 s here), so a
+  // handful of intervals is plenty. Keep the budget small: with the old
+  // 15 s literal a stalled worker burned a quarter of the 60 s ctest timeout
+  // before the EXPECT below finally reported the regression.
+  constexpr int kWatchdogBudgetMs = 5000;
+  for (int wait_ms = 0; wait_ms < kWatchdogBudgetMs &&
+                        watchdog.WorkerCheckpointsForTest() == before;
        wait_ms += 50) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   EXPECT_GT(watchdog.WorkerCheckpointsForTest(), before)
-      << "interval watchdog never checkpointed the WAL lag";
+      << "interval watchdog never checkpointed the WAL lag within "
+      << kWatchdogBudgetMs << " ms";
   watchdog.Stop();
 }
 
@@ -315,6 +335,39 @@ TEST_F(CheckpointManagerTest, StopThenStartRestartsWorker) {
   EXPECT_GE(manager.WorkerCheckpointsForTest(), 1U)
       << "worker did not resume after Stop() -> Start()";
   manager.Stop();
+}
+
+TEST_F(CheckpointManagerTest, ConcurrentStartStopDoesNotDeadlock) {
+  // #10850: Start()/Stop() used to race on the PageManager compaction
+  // callback registration (outside worker_wait_mu_), leaving a stale or
+  // missing callback. Hammer the lifecycle transition from two threads and
+  // make sure neither path deadlocks and the manager stays reusable.
+  CheckpointManager manager(prefix_ + "_race.db.last_checkpoint", tm_.get(),
+                            pm_.get(), 1);
+  std::thread starter([&] {
+    for (int i = 0; i < 32; ++i) {
+      manager.Start();
+    }
+  });
+  std::thread stopper([&] {
+    for (int i = 0; i < 32; ++i) {
+      manager.Stop();
+    }
+  });
+  starter.join();
+  stopper.join();
+  // Final state must be well-defined and the worker restartable.
+  manager.Stop();
+  manager.Start();
+  manager.Stop();
+}
+
+TEST(CheckpointManagerNullTest, WriteCheckpointWithoutLoggerReturnsError) {
+  CheckpointManager manager("null_logger_ckpt-" + RandomString(), nullptr,
+                            nullptr, 0);
+  const auto result = manager.WriteCheckpoint();
+  ASSERT_FALSE(result.HasValue());
+  EXPECT_EQ(result.GetStatus(), Status::kInvalidArgument);
 }
 
 }  // namespace

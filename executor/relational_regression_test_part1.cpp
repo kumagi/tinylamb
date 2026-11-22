@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "executor/detail/relational_sort_limit.hpp"
 #include "executor/relational_regression_test.hpp"
 
 namespace tinylamb {
@@ -168,6 +169,58 @@ TEST_F(RelationalRegressionTest,
       << asymmetric_profile;
 }
 
+TEST_F(RelationalRegressionTest, DerivedStarKeepsBaseScanProjectionNarrow) {
+  RelationalRun(*rs_,
+                "CREATE TABLE NarrowScan (k INT64, v INT64, spare STRING)");
+  RelationalRun(*rs_, "INSERT INTO NarrowScan VALUES (1,3,'a'),(2,5,'b')");
+  const std::string sql =
+      "SELECT * FROM (SELECT COUNT(v) AS n FROM NarrowScan WHERE k = 1) a, "
+      "(SELECT SUM(v) AS total FROM NarrowScan WHERE k = 2) b";
+  EXPECT_EQ(RelationalRun(*rs_, sql),
+            std::vector<Row>({Row({Value(1), Value(5)})}));
+  const std::string profile = ExplainAnalyze(*rs_, sql);
+  EXPECT_NE(profile.find("scan_values_decoded=8,"), std::string::npos)
+      << profile;
+}
+
+TEST_F(RelationalRegressionTest, SubqueryCacheTracksOnlyReferencedCteBindings) {
+  using namespace relational_detail;
+  ExecutionRuntime runtime;
+  auto context = rs_->BeginReadOnlyContext();
+  context.set_execution_runtime(&runtime);
+  SelectStatement subquery(
+      {NamedExpression("k", ColumnValueExp(ColumnName("k")))}, {}, nullptr);
+  SelectSource base;
+  base.table = "SmallKeys";
+  subquery.SetSources({base});
+  auto cte = std::make_shared<Relation>();
+  cte->schema = Schema("", {Column("k", ValueType::kInt64)});
+  const CteMap unrelated{{"other", cte}};
+  const Relation* cached =
+      ExecuteCachedUncorrelated(context, subquery, unrelated, false);
+  ASSERT_NE(cached, nullptr);
+  EXPECT_GT(cached->TotalRows(), 0U);
+  EXPECT_EQ(ExecuteCachedUncorrelated(context, subquery, unrelated, false),
+            cached);
+
+  const CteMap shadowing{{"SmallKeys", cte}};
+  const Relation* shadowed =
+      ExecuteCachedUncorrelated(context, subquery, shadowing, false);
+  ASSERT_NE(shadowed, nullptr);
+  EXPECT_EQ(shadowed->TotalRows(), 0U);
+  auto rebound_cte = std::make_shared<Relation>();
+  rebound_cte->schema = cte->schema;
+  rebound_cte->AddRow(Row({Value(42)}));
+  const CteMap rebound{{"SmallKeys", rebound_cte}, {"other", cte}};
+  const Relation* rebound_result =
+      ExecuteCachedUncorrelated(context, subquery, rebound, false);
+  ASSERT_NE(rebound_result, nullptr);
+  EXPECT_EQ(rebound_result->TotalRows(), 1U);
+  EXPECT_EQ(ExecuteCachedUncorrelated(context, subquery, unrelated, false),
+            cached);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(RelationalRegressionTest, CorrelatedExistsStarPrunesUnusedJoinPayload) {
   RelationalRun(*rs_,
                 "CREATE TABLE WideExists(k INT64, flag INT64, payload STRING)");
@@ -246,6 +299,239 @@ TEST_F(RelationalRegressionTest, ParallelFilterMovesOwnedRowBuffers) {
     EXPECT_EQ(row.values_.data(), buffers[key]);
     EXPECT_EQ(row[1].IsNull(), key % 3 == 0);
   }
+}
+
+TEST_F(RelationalRegressionTest, ColumnarResidualUsesValueTruthiness) {
+  auto context = rs_->BeginContext();
+  relational_detail::Relation source;
+  source.schema = Schema(
+      "f", {Column("id", ValueType::kInt64), Column("d", ValueType::kDate),
+            Column("s", ValueType::kVarChar)});
+  const std::vector<Row> rows{
+      Row({Value(1), Value::Date("1969-12-31"), Value("")}),
+      Row({Value(2), Value::Date("1970-01-01"), Value("x")}),
+      Row({Value(3), Value(), Value()})};
+  auto table =
+      relational_detail::BuildColumnarTableFromRows(source.schema, rows);
+  ASSERT_TRUE(table.HasValue());
+  source.SetColumnarTable(table.MoveValue(), false);
+  ASSERT_TRUE(source.HasColumnarOnly());
+
+  const Expression d = ColumnValueExp(ColumnName("d"));
+  for (const Expression& residual :
+       {ColumnValueExp(ColumnName("s")), d,
+        BinaryExpressionExp(d, BinaryOperation::kAdd,
+                            ConstantValueExp(Value(1)))}) {
+    relational_detail::CompiledScanFilter filter;
+    filter.residual.push_back(residual);
+    relational_detail::Relation result;
+    result.schema = source.schema;
+    Status error{Status::kSuccess};
+    ASSERT_TRUE(relational_detail::TryParallelFilterRows(
+        context, source, filter, source.schema, nullptr, {}, nullptr, &result,
+        &error, nullptr));
+    ASSERT_SUCCESS(error);
+    std::vector<Row> matched;
+    ASSERT_SUCCESS(
+        result.ForEachRow([&](const Row& row) { matched.push_back(row); }));
+    EXPECT_EQ(matched, (std::vector<Row>{rows[0], rows[1]}));
+  }
+}
+
+TEST_F(RelationalRegressionTest, StringColumnFiltersCompareTimestampInstants) {
+  auto context = rs_->BeginContext();
+  using namespace relational_detail;
+  Relation source;
+  source.schema = Schema("f", {Column("a", ValueType::kVarChar),
+                               Column("b", ValueType::kVarChar)});
+  const std::vector<Row> rows{
+      Row({Value("2021-01-01 00:00:00.0+00:00"),
+           Value("2021-01-01T00:00:00Z")}),
+      Row({Value("2021-01-01T01:00:00+02:00"), Value("2021-01-01T00:00:00Z")}),
+      Row({Value("plain"), Value("plain")}), Row({Value("plain"), Value()})};
+  auto table = BuildColumnarTableFromRows(source.schema, rows);
+  ASSERT_TRUE(table.HasValue());
+  source.SetColumnarTable(table.MoveValue(), false);
+
+  BaseRelationArena arena;
+  arena.stride = 2;
+  arena.slot_types = {ValueType::kVarChar, ValueType::kVarChar};
+  arena.null_bits.resize(2);
+  arena.varchars.resize(2);
+  for (const Row& row : rows) {
+    const int64_t cells[2]{};
+    const uint8_t nulls[2]{static_cast<uint8_t>(row[0].IsNull()),
+                           static_cast<uint8_t>(row[1].IsNull())};
+    arena.AppendRun(cells, nulls, 1);
+    for (size_t column = 0; column < 2; ++column) {
+      auto& run = arena.varchars[column];
+      if (!row[column].IsNull()) {
+        const std::string_view value = row[column].value.varchar_value;
+        run.bytes.insert(run.bytes.end(), value.begin(), value.end());
+      }
+      run.ends.push_back(run.bytes.size());
+    }
+  }
+
+  for (const BinaryOperation op :
+       {BinaryOperation::kEquals, BinaryOperation::kLessThan}) {
+    const auto filter = CompileScanFilter(
+        {BinaryExpressionExp(ColumnValueExp(ColumnName("a")), op,
+                             ColumnValueExp(ColumnName("b")))},
+        source.schema);
+    ASSERT_EQ(filter.simple.size(), 1U);
+    ASSERT_TRUE(filter.simple[0].column_payload);
+    const std::vector<Row> expected = op == BinaryOperation::kEquals
+                                          ? std::vector<Row>{rows[0], rows[2]}
+                                          : std::vector<Row>{rows[1]};
+    std::vector<Row> matched;
+    for (const Row& row : rows) {
+      if (MatchScanFilter(row, source.schema, filter, nullptr, context, {})) {
+        matched.push_back(row);
+      }
+    }
+    EXPECT_EQ(matched, expected);
+
+    Relation columnar_result;
+    columnar_result.schema = source.schema;
+    Relation arena_result;
+    arena_result.schema = source.schema;
+    Status error{Status::kSuccess};
+    ASSERT_TRUE(TryParallelFilterRows(context, source, filter, source.schema,
+                                      nullptr, {}, nullptr, &columnar_result,
+                                      &error, nullptr));
+    ASSERT_SUCCESS(error);
+    ASSERT_TRUE(TryFilterArenaCache(context, arena, source.schema, &filter,
+                                    &source.schema, nullptr, {}, nullptr,
+                                    &arena_result, &error));
+    ASSERT_SUCCESS(error);
+    for (const Relation* result : {&columnar_result, &arena_result}) {
+      matched.clear();
+      ASSERT_SUCCESS(
+          result->ForEachRow([&](const Row& row) { matched.push_back(row); }));
+      EXPECT_EQ(matched, expected);
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, ParallelFiltersReportCollatedLikeErrors) {
+  auto context = rs_->BeginContext();
+  std::atomic<size_t> active{0};
+  ScopedQueryParallelismBudget budget(&active, 2);
+  using namespace relational_detail;
+  Relation source;
+  source.schema = Schema(
+      "f", {Column("id", ValueType::kInt64), Column("s", ValueType::kVarChar)});
+  constexpr int64_t kRows = 16384;
+  for (int64_t id = 0; id < kRows; ++id) {
+    source.rows.emplace_back(Row({Value(id), Value("axb").WithCollation(2)}));
+  }
+  Relation columnar;
+  columnar.schema = source.schema;
+  auto table = BuildColumnarTableFromRows(columnar.schema, source.rows);
+  ASSERT_TRUE(table.HasValue());
+  columnar.SetColumnarTable(table.MoveValue(), false);
+  const Expression like = BinaryExpressionExp(ColumnValueExp(ColumnName("s")),
+                                              BinaryOperation::kLike,
+                                              ConstantValueExp(Value("a_b")));
+  const Expression reject = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("id")), BinaryOperation::kLessThan,
+      ConstantValueExp(Value(0)));
+  for (const Relation* input : {&source, &columnar}) {
+    for (bool masked : {false, true}) {
+      const auto filter =
+          CompileScanFilter(masked ? std::vector<Expression>{like, reject}
+                                   : std::vector<Expression>{like},
+                            input->schema);
+      Relation result;
+      result.schema = input->schema;
+      Status error{Status::kSuccess};
+      ASSERT_TRUE(TryParallelFilterRows(context, *input, filter, input->schema,
+                                        nullptr, {}, nullptr, &result, &error,
+                                        nullptr));
+      if (masked) {
+        EXPECT_SUCCESS(error);
+        EXPECT_EQ(result.TotalRows(), 0U);
+      } else {
+        EXPECT_FALSE(error.ok());
+        EXPECT_NE(error.GetMessage().find("LIKE pattern has '_'"),
+                  std::string::npos);
+      }
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, WithTiesStreamsSpilledPeerGroup) {
+  auto& budget = QueryMemoryBudget::Global();
+  struct RestoreBudget {
+    size_t limit;
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore{budget.Limit()};
+  budget.ResetForTest(64 * 1024);
+
+  relational_detail::Relation input;
+  input.schema = Schema("sorted", {Column("k", ValueType::kInt64),
+                                   Column("id", ValueType::kInt64),
+                                   Column("payload", ValueType::kVarChar)});
+  input.EnsureSpill();
+  for (int64_t id = 0; id < 2048; ++id) {
+    const int64_t key = id == 0 ? 0 : id < 514 ? 1 : 2;
+    input.AddRow(Row({Value(key), Value(id), Value(std::string(256, 'x'))}));
+  }
+  ASSERT_SUCCESS(input.FinishSpill());
+  ASSERT_TRUE(input.HasSpill());
+  size_t visited = 0;
+  ASSERT_SUCCESS(input.ForEachRowBounded(
+      input.TotalRows(), [&](const Row&) { return ++visited < 3; }));
+  EXPECT_EQ(visited, 3U);
+
+  SelectStatement stmt;
+  stmt.SetOrderBy({{ConstantValueExp(Value(1)), true, std::nullopt}});
+  stmt.SetOffset(2);
+  stmt.SetLimit(3);
+  stmt.SetWithTies(true);
+  auto result = relational_detail::LimitedRows(stmt, std::move(input));
+  ASSERT_TRUE(result.HasValue());
+  EXPECT_TRUE(result.Value().HasSpill());
+  int64_t expected_id = 2;
+  ASSERT_SUCCESS(result.Value().ForEachRow([&](const Row& row) {
+    EXPECT_EQ(row[0], Value(1));
+    EXPECT_EQ(row[1], Value(expected_id++));
+  }));
+  EXPECT_EQ(expected_id, 514);
+}
+
+TEST_F(RelationalRegressionTest, BoundedTraversalEarlyExitLeavesTailWritable) {
+  auto& budget = QueryMemoryBudget::Global();
+  struct RestoreBudget {
+    size_t limit;
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore{budget.Limit()};
+  budget.ResetForTest(64 * 1024);
+
+  relational_detail::Relation input;
+  input.schema = Schema("s", {Column("k", ValueType::kInt64),
+                              Column("payload", ValueType::kVarChar)});
+  for (int64_t i = 0; i < 64; ++i) {
+    input.AddRow(Row({Value(i), Value(std::string(256, 'x'))}));
+  }
+  // Move the resident rows into a finished spill and leave a fresh open tail.
+  input.EnsureSpill();
+  ASSERT_TRUE(input.HasSpill());
+  ASSERT_SUCCESS(input.GetStatus());
+  const size_t before = input.TotalRows();
+
+  // The first spill alone fills max_rows, so the tail is never read. A bounded
+  // traversal must not finalize it on the way out.
+  size_t visited = 0;
+  ASSERT_SUCCESS(input.ForEachRowBounded(3, [&](const Row&) { ++visited; }));
+  EXPECT_EQ(visited, 3U);
+
+  // A later append still goes into the open tail instead of latching
+  // "Append after FinishWriting".
+  input.AddRow(Row({Value(999), Value(std::string(256, 'y'))}));
+  EXPECT_SUCCESS(input.GetStatus());
+  EXPECT_EQ(input.TotalRows(), before + 1);
 }
 
 TEST_F(RelationalRegressionTest, AuditParallelFilterPreservesDeferredRowOrder) {
@@ -1114,6 +1400,41 @@ TEST_F(RelationalRegressionTest, DirectWindowOrderingKeepsPeersAndNulls) {
   EXPECT_EQ(rows[3], Row({Value(1), Value(), Value(30), Value(81), Value(1)}));
   EXPECT_EQ(rows[4], Row({Value(2), Value(2), Value(40), Value(90), Value(1)}));
   EXPECT_EQ(rows[5], Row({Value(2), Value(1), Value(50), Value(50), Value(2)}));
+}
+
+TEST_F(RelationalRegressionTest, MonotonicDictionarySumKeepsInfinity) {
+  RelationalRun(*rs_, "CREATE TABLE MonoInf(k INT64, v FLOAT64)");
+  const double infinity = std::numeric_limits<double>::infinity();
+  {
+    auto context = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable("MonoInf"));
+    for (int64_t i = 0; i < 65536; ++i) {
+      ASSERT_SUCCESS(
+          table
+              ->Insert(context.txn_,
+                       Row({Value(i / 32768), Value(i == 0 ? infinity : 1.0)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  {
+    auto context = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable("MonoInf"));
+    const auto store = table->RebuildLSTableStore(context.txn_);
+    ASSERT_NE(store, nullptr);
+    ASSERT_EQ(store->total_rows, 65536U);
+    ASSERT_NE(store->column_is_monotonic[0], 0U);
+    ASSERT_TRUE(store->dictionaries[1].active);
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  const auto result =
+      RelationalRun(*rs_, "SELECT k, SUM(v) FROM MonoInf GROUP BY k", true);
+  ASSERT_EQ(result.size(), 2U);
+  for (const auto& row : result) {
+    EXPECT_EQ(row[1], Value(row[0] == Value(0) ? infinity : 32768.0));
+  }
 }
 
 TEST_F(RelationalRegressionTest, DirectDoubleWindowOrderKeepsExceptionalPeers) {

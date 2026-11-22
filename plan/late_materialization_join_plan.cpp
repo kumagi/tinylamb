@@ -30,6 +30,14 @@ size_t SaturatingAdd(size_t left, size_t right) {
   return left > kMax - right ? kMax : left + right;
 }
 
+// Validate in the member initializer, before schema_/stats_ dereference the
+// child: a CHECK in the constructor body would be unreachable on a null child.
+Plan RequireLeft(Plan left) {
+  CHECK_MSG(left != nullptr,
+            "LateMaterializationJoinPlan requires a left plan");
+  return left;
+}
+
 }  // namespace
 
 LateMaterializationJoinPlan::LateMaterializationJoinPlan(
@@ -38,7 +46,7 @@ LateMaterializationJoinPlan::LateMaterializationJoinPlan(
     const TableStatistics& right_statistics, Expression predicate,
     Schema declared_output, std::vector<slot_t> right_projection,
     bool unique_winner, std::optional<size_t> estimated_rows)
-    : left_(std::move(left)),
+    : left_(RequireLeft(std::move(left))),
       right_table_(&right_table),
       right_index_(&right_index),
       left_keys_(std::move(left_keys)),
@@ -55,8 +63,6 @@ LateMaterializationJoinPlan::LateMaterializationJoinPlan(
       stats_(left_->GetStats().ScaleCardinality(estimated_rows.value_or(
           EstimatedJoinRowCount(JoinKind::kInner, left_->GetStats().Rows(),
                                 right_statistics.Rows())))) {
-  CHECK_MSG(left_ != nullptr,
-            "LateMaterializationJoinPlan requires a left plan");
   CHECK_MSG(schema_.ColumnCount() > left_->GetSchema().ColumnCount(),
             "LateMaterializationJoinPlan requires a payload projection");
   const bool keys_aligned =
@@ -78,7 +84,7 @@ LateMaterializationJoinPlan::LateMaterializationJoinPlan(
     Plan left, const Table& right_table, Schema declared_output,
     std::vector<slot_t> right_projection, LateMaterializationRowIdBinding rowid,
     Expression predicate, std::optional<size_t> estimated_rows)
-    : left_(std::move(left)),
+    : left_(RequireLeft(std::move(left))),
       right_table_(&right_table),
       right_projection_(std::move(right_projection)),
       predicate_(std::move(predicate)),
@@ -90,8 +96,6 @@ LateMaterializationJoinPlan::LateMaterializationJoinPlan(
                   : std::move(declared_output)),
       stats_(left_->GetStats().ScaleCardinality(
           estimated_rows.value_or(left_->GetStats().Rows()))) {
-  CHECK_MSG(left_ != nullptr,
-            "LateMaterializationJoinPlan requires a left plan");
   CHECK_MSG(schema_.ColumnCount() > left_->GetSchema().ColumnCount(),
             "LateMaterializationJoinPlan requires a payload projection");
   CHECK_MSG(right_projection_.size() <= right_table.GetSchema().ColumnCount(),

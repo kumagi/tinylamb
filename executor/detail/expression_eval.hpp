@@ -120,6 +120,15 @@ struct GroupKeyTransparentEqual {
 using GroupKeyMap = std::unordered_map<Row, size_t, GroupKeyTransparentHash,
                                        GroupKeyTransparentEqual>;
 
+inline StatusOr<double> CheckedDoubleSumAdd(double lhs, double rhs) {
+  const double result = lhs + rhs;
+  if (std::isinf(result) && std::isfinite(lhs) && std::isfinite(rhs)) {
+    return StatusError(StatusCode::kIsInfinity,
+                       "SUM overflow: result is infinite");
+  }
+  return result;
+}
+
 // The layout mirrors the per-stat switch structure for readability.
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct AggregateAccumulator {

@@ -126,7 +126,8 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
     }
   } else {
     Status morsel_status = Status::kSuccess;
-    morsels_ = table_->BuildScanMorsels(*txn_, pages_per_morsel, &morsel_status);
+    morsels_ =
+        table_->BuildScanMorsels(*txn_, pages_per_morsel, &morsel_status);
     if (morsel_status != Status::kSuccess) {
       // Surface the planning failure through the normal worker-status path
       // instead of streaming an empty (= "no rows") result.
@@ -601,6 +602,10 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
       const size_t b_end = (total_blocks * (w + 1)) / fold_workers;
       std::vector<uint32_t> matched_rows;
       matched_rows.reserve(256);
+      // Per-worker high-water mark: the compact integer-comparison path
+      // reallocates only when a block is strictly larger than every block
+      // seen so far. Fluctuating (smaller) blocks reuse this one buffer, so
+      // there is no per-block malloc/free churn at LSTable boundaries.
       std::unique_ptr<uint32_t[]> simple_matches;
       size_t simple_capacity = 0;
       for (size_t b = b_begin; b < b_end; ++b) {
@@ -786,7 +791,8 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           if (!col.has_null &&
               (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
             if (simple_capacity < blk.row_count) {
-              simple_matches = std::make_unique_for_overwrite<uint32_t[]>(blk.row_count);
+              simple_matches =
+                  std::make_unique_for_overwrite<uint32_t[]>(blk.row_count);
               simple_capacity = blk.row_count;
             }
             uint32_t* __restrict out = simple_matches.get();
@@ -1054,16 +1060,13 @@ void ParallelScan::Start(size_t batch_size) {
     }
   }
   workers_.reserve(worker_count_);
-  size_t launched = 0;
   for (size_t worker = 0; worker < worker_count_; ++worker) {
     try {
       workers_.emplace_back(
           [this, batch_size, worker] { RunWorker(batch_size, worker); });
-      ++launched;
     } catch (...) {
-      // Thread creation can fail (e.g. resource_unavailable). Account only
-      // for the workers that actually started and wake the consumer via
-      // worker_error_ instead of blocking on active_workers_ forever.
+      // Thread creation can fail (e.g. resource_unavailable). Wake the
+      // consumer via worker_error_ so it can stop waiting for results.
       if (worker_error_ == Status::kSuccess) {
         worker_error_ =
             StatusFromCurrentException("parallel scan worker failed");
@@ -1071,7 +1074,6 @@ void ParallelScan::Start(size_t batch_size) {
       break;
     }
   }
-  active_workers_ = launched;
   ready_cv_.notify_all();
 }
 
@@ -1544,10 +1546,6 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
     }
     cancelled_.store(true, std::memory_order_release);
   }
-  {
-    std::scoped_lock lock(mutex_);
-    --active_workers_;
-  }
   ready_cv_.notify_all();
   space_cv_.notify_all();
 }
@@ -1606,8 +1604,7 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
              worker_error_ != Status::kSuccess ||
              worker_status_ != Status::kSuccess ||
              next_out_morsel_ >= morsels_.size() ||
-             morsels_done_[next_out_morsel_] ||
-             [&] {
+             morsels_done_[next_out_morsel_] || [&] {
                auto it = inflight_.find(next_out_morsel_);
                return it != inflight_.end() && !it->second.empty();
              }();

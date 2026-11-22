@@ -21,7 +21,12 @@ def selected_engines(records):
               ('oracle', 'Oracle Free', '#b74738'),
               ('duckdb', 'DuckDB', '#927200')]
     present = {r.get('engine') for r in records}
-    return tuple(zip(*(style for style in styles if style[0] in present)))
+    matched = [style for style in styles if style[0] in present]
+    if not matched:
+        # Keep the 3-tuple shape so callers can always unpack it, even for an
+        # empty run or one that only contains unknown engine names.
+        return (), (), ()
+    return tuple(zip(*matched))
 
 
 def load(directory):
@@ -42,7 +47,10 @@ def olap_table(records, suite, scale):
     for name, engines in grouped.items():
         values = []
         for engine in ENGINES:
-            record = engines[engine]
+            record = engines.get(engine)
+            if record is None:
+                values.append("n/a")
+                continue
             value = f"{record['median_ms']:.3f}" if record["status"] == "ok" else record["status"]
             values.append(value if record["correct"] else f"**不一致／失敗 ({value})**")
         rows.append([name, *values])
@@ -58,7 +66,11 @@ def oltp_tables(records):
     for (name, clients), engines in groups.items():
         tps_values, latency_values = [], []
         for engine in ENGINES:
-            trials = engines[engine]
+            trials = engines.get(engine)
+            if not trials:
+                tps_values.append("n/a")
+                latency_values.append("n/a")
+                continue
             valid = [t for t in trials if t["valid"]]
             if len(valid) != len(trials):
                 tps_values.append("不変条件／実行失敗")
@@ -114,10 +126,16 @@ def draw(records, output, micro, tpch, oltp):
         step = .72 / len(ENGINES)
         for index, (engine, label, color) in enumerate(zip(ENGINES, LABELS, COLORS)):
             offset = (index - (len(ENGINES) - 1) / 2) * step
-            values = [engines[engine].get("median_ms", float("nan")) if engines[engine]["correct"] else float("nan") for engines in grouped.values()]
+            values = []
+            for engines in grouped.values():
+                record = engines.get(engine)
+                values.append(record.get("median_ms", float("nan"))
+                              if record is not None and record["correct"]
+                              else float("nan"))
             ax.barh(y + offset, values, height=step * .95, color=color, label=label)
             for position, engines in enumerate(grouped.values()):
-                if not engines[engine]["correct"]:
+                record = engines.get(engine)
+                if record is not None and not record["correct"]:
                     ax.text(.99, position + offset, f"{label}: incorrect/failed", transform=ax.get_yaxis_transform(), ha="right", va="center", color="#ab2424", fontsize=8)
         ax.set_yticks(y, grouped.keys())
         ax.invert_yaxis()
@@ -143,7 +161,7 @@ def draw(records, output, micro, tpch, oltp):
         for engine, label, color in zip(ENGINES, LABELS, COLORS):
             points = []
             for (workload, clients), engines in oltp.items():
-                valid = [t for t in engines[engine] if t["valid"]]
+                valid = [t for t in engines.get(engine, ()) if t["valid"]]
                 if workload == name and valid:
                     values = [t["tps"] for t in valid]
                     middle = statistics.median(values)
@@ -216,7 +234,9 @@ def main():
     for suite, group in (("micro_largest", micro), ("tpch", tpch)):
         for baseline in ENGINES[1:]:
             pairs = [(engines[baseline]["median_ms"], engines["tinylamb"]["median_ms"])
-                     for engines in group.values() if engines[baseline]["correct"] and engines["tinylamb"]["correct"]]
+                     for engines in group.values()
+                     if baseline in engines and "tinylamb" in engines
+                     and engines[baseline]["correct"] and engines["tinylamb"]["correct"]]
             if pairs:
                 ratios[f"{suite}_vs_{baseline}"] = {"n": len(pairs), "tinylamb_faster": sum(a > b for a, b in pairs),
                                                     "geomean_baseline_over_tinylamb": math.exp(statistics.mean(math.log(a / b) for a, b in pairs))}

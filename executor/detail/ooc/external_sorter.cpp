@@ -345,6 +345,9 @@ void ExternalSorter::Reset() noexcept {
   spilled_ = false;
   finished_ = false;
   if (grant_cache_.has_value()) {
+    // Safe inside noexcept: ReleaseAll only calls the noexcept
+    // QueryMemoryGrant::ReleaseConsumed (plus weak_ptr::lock) and does no
+    // logging/allocating, so it cannot throw out of this teardown path.
     grant_cache_->ReleaseAll();
   }
 }
@@ -611,6 +614,10 @@ Status ExternalSorter::MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
 
   while (tree.Top() >= 0) {
     if (options_.limit.has_value() && written >= *options_.limit) {
+      // Top-N pruning: only the first `limit` rows of a merge can hold the
+      // global top-N, so leaving the rest unread is intentional. The limit is
+      // fixed in Options at construction (Reset() cannot clear it), so a
+      // limit-less sorter never enters this branch and cannot lose runs.
       break;
     }
     const auto idx = static_cast<size_t>(tree.Top());
@@ -730,7 +737,11 @@ Status ExternalSorter::Finish() {
   }
 
   if (!run_segments_.empty()) {
-    ++merge_passes_;
+    // A lone remaining run is only wrapped in a cursor, not merged; counting
+    // it here would inflate EXPLAIN's MergePasses by one.
+    if (run_segments_.size() > 1) {
+      ++merge_passes_;
+    }
     RETURN_IF_FAIL(OpenFinalMergeStreams(reader_buf));
   }
   emitted_rows_ = 0;

@@ -17,7 +17,11 @@ import threading
 
 def connect_local(threads=1, database=':memory:', memory_mib=None):
     import duckdb
-    config = dict(threads=str(threads), extension_directory=os.environ['TINYLAMB_BENCH_DUCKDB_EXTENSIONS'])
+    extension_directory = os.environ.get('TINYLAMB_BENCH_DUCKDB_EXTENSIONS')
+    if not extension_directory:
+        raise RuntimeError('TINYLAMB_BENCH_DUCKDB_EXTENSIONS is not set; '
+                           'start the DuckDB server before connecting')
+    config = dict(threads=str(threads), extension_directory=extension_directory)
     if memory_mib is not None:
         config['memory_limit'] = f'{memory_mib}MiB'
     connection = duckdb.connect(database, config=config)
@@ -115,12 +119,14 @@ def main():
         parser.error('--port must be in [1, 65535] for the benchmark client')
     if args.threads < 1:
         parser.error('--threads must be positive')
-    if args.memory_mib < 0:
-        parser.error('--memory-mib must be nonnegative')
+    if args.memory_mib < 1:
+        # connect_local treats None as "no limit"; accepting 0 here would
+        # silently turn an explicit 0 MiB request into unlimited memory.
+        parser.error('--memory-mib must be at least 1')
     stopped = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopped.set())
-    connection = connect_local(args.threads, args.database, args.memory_mib or None)
+    connection = connect_local(args.threads, args.database, args.memory_mib)
     uri = f'quack:127.0.0.1:{args.port}'
     token = os.environ['TINYLAMB_BENCH_DUCKDB_TOKEN']
     connection.execute(f"CALL quack_serve('{uri}', token='{token}')").fetchall()

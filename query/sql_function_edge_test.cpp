@@ -21,6 +21,7 @@
 #include "executor/executor_base.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
+#include "type/date.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -83,6 +84,33 @@ class SqlFunctionEdgeTest : public ::testing::Test {
   std::unique_ptr<TransactionContext> context_;
   std::unique_ptr<SqlEngine> engine_;
 };
+
+TEST_F(SqlFunctionEdgeTest, FormatTimestampUsesDefaultTimeZoneOffset) {
+  const std::string previous_zone = GetDefaultTimeZone();
+  SetDefaultTimeZone("+05:45");
+  std::vector<Row> rows;
+  EXPECT_NO_THROW(rows = RunSql(engine_.get(), context_.get(),
+                                "SELECT FORMAT_TIMESTAMP('%z %Ez', "
+                                "TIMESTAMP '2026-01-02 03:04:05+00')"));
+  SetDefaultTimeZone(previous_zone);
+  ASSERT_EQ(rows.size(), 1u);
+  EXPECT_EQ(rows[0][0], Value("+0545 +05:45"));
+}
+
+TEST_F(SqlFunctionEdgeTest, FormatTimestampsWithNumericTimeZoneOffsets) {
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT FORMAT_TIMESTAMP('%Ez', TIMESTAMP '2026-01-02 03:04:05+00'), "
+      "FORMAT_TIMESTAMP('%T %z %Ez %%z', TIMESTAMP '2026-01-02 03:04:05+00', "
+      "'+05:30'), FORMAT_TIMESTAMP('%T %z %Ez', "
+      "TIMESTAMP '2026-07-02 12:04:05+00', 'America/Los_Angeles'), "
+      "FORMAT_DATETIME('%z %Ez', DATETIME '2026-01-02T03:04:05', '-03:30')");
+  ASSERT_EQ(rows.size(), 1u);
+  EXPECT_EQ(rows[0][0], Value("+00:00"));
+  EXPECT_EQ(rows[0][1], Value("08:34:05 +0530 +05:30 %z"));
+  EXPECT_EQ(rows[0][2], Value("05:04:05 -0700 -07:00"));
+  EXPECT_EQ(rows[0][3], Value("-0330 -03:30"));
+}
 
 // Pinned results: one row, first column equals the recorded repr.
 TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
@@ -182,10 +210,7 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
       {"SELECT LN(1)", "0"},
       {"SELECT LOG(100)", "4.605170185988092"},
       {"SELECT LOG(8, 2)", "3"},
-      {"SELECT LOG(0, 2)", "-inf"},
-      {"SELECT LOG(-1, 2)", "nan"},
       {"SELECT LOG10(1000)", "3"},
-      {"SELECT LOG10(0)", "-inf"},
       {"SELECT POW(2, 10)", "1024"},
       {"SELECT POW(2, 0.5)", "1.4142135623730951"},
       {"SELECT POWER(2, -2)", "0.25"},
@@ -398,7 +423,7 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
        "03:04:05+00')",
        R"sql("2026-01-02 03:04:05+0000")sql"},
       {"SELECT FORMAT_TIMESTAMP('%Ez', TIMESTAMP '2026-01-02 03:04:05+00')",
-       R"sql("+0000")sql"},
+       R"sql("+00:00")sql"},
       // America/Los_Angeles kept Pacific War Time (UTC-7) through 1945; the
       // lookup must use the timestamp's own year, not a post-epoch clamp.
       {"SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', TIMESTAMP "
@@ -586,6 +611,16 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT TIMESTAMP '2026-01-02 03:04:05 JST'",
       "SELECT TIMESTAMP '2026-02-29 00:00:00+00'",
       "SELECT TIMESTAMP '2026-01-02 23:59:60+00'",
+      // Garbage text and a fractional dot with no digits are not TIMESTAMPs.
+      "SELECT TIMESTAMP 'nonsense_123456'",
+      "SELECT TIMESTAMP '2026-01-01 00:00:00.'",
+      // DATETIME/TIME literal fields are range-checked at literal time.
+      "SELECT DATETIME '2026-13-99 99:00:60'",
+      "SELECT DATETIME '2026-13-01'",
+      "SELECT DATETIME '2026-01-02T24:00:00'",
+      "SELECT DATETIME '2026-02-29'",
+      "SELECT TIME '25:99:99'",
+      "SELECT TIME '12:34:60'",
       "SELECT FORMAT('%.*f', 'x', 1.5)",
       "SELECT FORMAT('%d %d', 1)",
       // GoogleSQL FORMAT has no %q specifier; unknown specifiers are errors.
@@ -597,6 +632,9 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT LN(0)",
       "SELECT LN(-1)",
       "SELECT LN(-0.0)",
+      "SELECT LOG(0, 2)",
+      "SELECT LOG(-1, 2)",
+      "SELECT LOG10(0)",
       "SELECT CONCAT_WS('-', 'a', 'b', NULL, 'c')",
       "SELECT CHR(-1)",
       "SELECT CHR(55296)",
@@ -631,6 +669,9 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', "
       "'2026-01-02T03:04:05.123456+05:30')",
       "SELECT PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', 'bad')",
+      "SELECT DATE_BUCKET(DATE '2026-01-02', 7)",
+      "SELECT DATETIME_BUCKET(DATETIME '2026-01-02 03:04:05', 7)",
+      "SELECT TIMESTAMP_BUCKET(TIMESTAMP '2026-01-02 03:04:05+00', 7)",
       "SELECT DATE '2026-01-02' + INTERVAL 24 HOUR",
       "SELECT DATE(2026, 1, 2)",
       "SELECT DATE('bad')",
@@ -655,9 +696,6 @@ TEST_F(SqlFunctionEdgeTest, DeviationSweep) {
       "SELECT SUBSTR('abcdef', 0, 3)",
       "SELECT '2026-01-02' + INTERVAL 5 DAY",
       "SELECT 'x' + INTERVAL 5 DAY",
-      "SELECT DATETIME '2026-13-01'",
-      "SELECT DATETIME '2026-01-02T24:00:00'",
-      "SELECT DATETIME '2026-02-29'",
   };
   for (const auto& sql : cases) {
     SCOPED_TRACE(sql);

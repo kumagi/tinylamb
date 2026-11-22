@@ -37,18 +37,31 @@ namespace {
 constexpr const SchemeCase* const kCases = kSchemeCases.data();
 constexpr size_t kCaseCount = kSchemeCaseCount;
 
+// RAII so a throwing build (e.g. bad_alloc) cannot leave a stale scheme name
+// in the process environment for later iterations or other harnesses.
+class ScopedForcedScheme {
+ public:
+  explicit ScopedForcedScheme(const char* name) {
+    setenv("TINYLAMB_FORCE_SCHEME", name, 1);
+  }
+  ~ScopedForcedScheme() { unsetenv("TINYLAMB_FORCE_SCHEME"); }
+  ScopedForcedScheme(const ScopedForcedScheme&) = delete;
+  ScopedForcedScheme& operator=(const ScopedForcedScheme&) = delete;
+};
+
 PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
   *ok = false;
   // Always try all shapes: a process-static "first successful shape" cache
   // collapses the four distributions into one and hides data-dependent bugs.
   for (int s = 0; std::cmp_less(s, c.nshapes); ++s) {
-    setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
+    ScopedForcedScheme forced(c.name);
     PaxChunk chunk =
         PaxChunk::BuildFromSortedRun(
             MakeRun(MakeStorageRowsForScheme(c.shapes[static_cast<size_t>(s)],
-                                              c.expected), sc), sc)
+                                             c.expected),
+                    sc),
+            sc)
             .MoveValue();
-    unsetenv("TINYLAMB_FORCE_SCHEME");
     const auto& enc = chunk.GetFooter().encodings;
     if (!enc.empty() && enc[c.col] == static_cast<uint8_t>(c.expected)) {
       *ok = true;

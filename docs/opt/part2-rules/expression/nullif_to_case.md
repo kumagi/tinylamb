@@ -39,7 +39,7 @@ graph TD
 引数の性質に応じて以下の 5 経路に分岐します。
 
 1. **両辺定数**: `TryEvaluateBinary(kEquals, val_a, val_b)` により直接スカラー値へ畳み込み。
-2. **同一式 `Same(a, b)`**: `a` が静的に double（`StaticallyDouble`）、投げ得る（`!ExpressionCannotThrow`）、または揮発性（`!SafeToReduceEvaluationCount`）でない場合に限り NULL 定数へ畳み込み。
+2. **同一式 `Same(a, b)`**: `a` が非 double と静的に証明でき（`StaticallyProvesNonDouble`）、投げず（`ExpressionCannotThrow`）、揮発性もなく（`SafeToReduceEvaluationCount`）場合に限り NULL 定数へ畳み込み。型が解決できない列参照は fail-closed で拒否されます。
 3. **左辺が NULL 定数**: 右辺が定数ノードである場合に限り NULL 定数へ畳み込み（未評価式の例外消去抑止）。
 4. **右辺が NULL 定数**: 左辺ノード $a$ をそのまま返却。
 5. **一般形**: 左辺 $a$ が `SafeToReduceEvaluationCount` を満たす場合に限り searched CASE 式へ展開。
@@ -53,7 +53,7 @@ SQL における $\text{NULLIF}(a, b)$ の厳密な意味論は、「$a = b$ が
 searched CASE 式 `CASE WHEN a = b THEN NULL ELSE a END` において、式 $a$ は条件節と ELSE 節の双方に重複して配置されます。もし $a$ に `RAND()` などの揮発性関数や相関サブクエリが含まれていた場合、評価回数の増加がタプルごとの副作用や結果の揺らぎを引き起こすため、`SafeToReduceEvaluationCount(a)` により展開が禁止されます。
 
 ### 3. 特殊形縮退における NaN および例外保護
-- **同一式比較**: SQL において $\text{NaN} = \text{NaN}$ は `FALSE` であるため、引数が浮動小数点数（`StaticallyDouble`）である場合、$\text{NULLIF}(\text{NaN}, \text{NaN})$ は NaN を返さなければなりません。また、引数 $a$ の評価を消去するため、例外を送出しないこと（`ExpressionCannotThrow`）が不可欠です。
+- **同一式比較**: SQL において $\text{NaN} = \text{NaN}$ は `FALSE` であるため、引数が double、あるいは型が静的に確定していない場合（列参照など）は $\text{NULLIF}(\text{NaN}, \text{NaN})$ が NaN を返す可能性を排除できません。現行ガードは `StaticallyProvesNonDouble(a)` であり、非 double と証明できた場合にのみ畳み込みを許可する fail-closed 判定です（旧 `StaticallyDouble` による fail-open 判定では型未解決の引数を誤って受け入れていました）。また、引数 $a$ の評価を消去するため、例外を送出しないこと（`ExpressionCannotThrow`）が不可欠です。
 - **左辺 NULL 定数**: $\text{NULLIF}(\text{NULL}, b)$ において結果は常に NULL ですが、ファジング検証により発見された `nullif(NULL, 2971756592411605 % 0)` の反例が示すように、第 2 引数 $b$ が例外を送出し得る式である場合、それを消去して NULL を返すことは許されません。したがって、$b$ が定数ノードである場合に限定されます。
 
 ## 実装の詳細

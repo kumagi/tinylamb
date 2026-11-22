@@ -207,7 +207,8 @@ RuntimeFilterGroup::RuntimeFilterGroup(
         reject_all_ = true;
         break;
       case RuntimeFilterKind::kMinMax: {
-        const auto& mm = static_cast<const MinMaxRuntimeFilter&>(*part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& mm = static_cast<const MinMaxRuntimeFilter&>(
+            *part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         if (!has_bounds_) {
           has_bounds_ = true;
           lo_ = mm.Lo();
@@ -219,7 +220,8 @@ RuntimeFilterGroup::RuntimeFilterGroup(
         break;
       }
       case RuntimeFilterKind::kExactSet: {
-        const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& exact = static_cast<const ExactSetRuntimeFilter&>(
+            *part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& keys = exact.Keys();
         if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
           exact_keys_ = &keys;
@@ -258,24 +260,25 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       if (span <= kMaxDenseSpan) {
         const auto words = static_cast<size_t>((span >> 6) + 1);
         dense_bits_.assign(words, 0);
-        const bool single_part =
-            (parts_.size() <= 1) ||
-            (sorted_distinct_keys != nullptr && parts_.size() == 2);
+        // dense_bits_ replaces the parts_ scan in Reject()/RejectRange(), so
+        // every set bit must be justified by the parts' conjunction: a key a
+        // part rejects keeps a clear bit even when the caller-supplied key
+        // list contains it. Skipping the check (the old single_part heuristic)
+        // is only sound when the parts provably accept every candidate, which
+        // the constructor cannot know for arbitrary part sets.
         for (const int64_t k : *candidate_keys) {
           if (k < lo_ || k > hi_) {
             continue;
           }
-          if (!single_part) {
-            bool keep = true;
-            for (const auto& part : parts_) {
-              if (part->Reject(k)) {
-                keep = false;
-                break;
-              }
+          bool keep = true;
+          for (const auto& part : parts_) {
+            if (part->Reject(k)) {
+              keep = false;
+              break;
             }
-            if (!keep) {
-              continue;
-            }
+          }
+          if (!keep) {
+            continue;
           }
           const uint64_t off =
               static_cast<uint64_t>(k) - static_cast<uint64_t>(lo_);
@@ -301,7 +304,8 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       continue;
     }
     if (part->Kind() == RuntimeFilterKind::kExactSet) {
-      const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      const auto& exact = static_cast<const ExactSetRuntimeFilter&>(
+          *part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& keys = exact.Keys();
       if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
         exact_keys_ = &keys;
@@ -384,8 +388,9 @@ void RuntimeFilterBuilder::Observe(int64_t key) {
 }
 
 void RuntimeFilterBuilder::Observe(std::span<const int64_t> keys) {
-  if (keys.empty()) { return;
-}
+  if (keys.empty()) {
+    return;
+  }
   observations_ += keys.size();
   int64_t low = keys.front(), high = keys.front();
   for (int64_t key : keys) {

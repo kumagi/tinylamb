@@ -131,7 +131,7 @@ return BatchNestedLoopFor(logical.predicate, children[0], children[1],
 
 ## 関連 Rule との相互作用
 
-- `nested_loop_join`: 同一の結合形状をタプル駆動で実装するルールであり、登録順序の優位性によりデフォルトで勝利します。
+- `nested_loop_join`: 同一の結合形状をタプル駆動で実装するルールです。本 Rule は直積ペア部分に 0.8 の係数を乗せるため低コスト側は本 Rule となり、デフォルトの勝者は登録順序ではなくコスト比較で決まります（`nested_loop_join` を無効化するとタプル版の代替手段が消えるため、本 Rule が唯一の候補になります）。
 - `hash_join` / `merge_join`: 等値キー対を持つ通常の内部結合を担当するルール群です。本 Rule とは適用領域が相互排他です。
 - `batch_nested_loop_semi` / `batch_nested_loop_anti` / `batch_nested_loop_outer`: 同一のビルダを共有する兄弟ルール群であり、タプル版が存在しないセミ/アンチ/外部結合において新規の物理実行能力を提供します。
 

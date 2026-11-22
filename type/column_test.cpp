@@ -53,6 +53,15 @@ TEST(ColumnTest, AuditIntervalMetadataSurvivesSerialization) {
   SerializeDeserializeTest(column);
 }
 
+TEST(ColumnTest, DeclaredTextDomainsSurviveSchemaEncoding) {
+  for (const TextDomain domain : {TextDomain::kUnspecified, TextDomain::kString,
+                                  TextDomain::kTimestamp}) {
+    Column column("v", ValueType::kVarChar);
+    column.SetTextDomain(domain);
+    SerializeDeserializeTest(column);
+  }
+}
+
 TEST(ColumnTest, AuditIntegerWidthsSurviveSerializationAndEnforceBounds) {
   for (const uint8_t bits :
        {uint8_t{8}, uint8_t{16}, uint8_t{32}, uint8_t{64}}) {

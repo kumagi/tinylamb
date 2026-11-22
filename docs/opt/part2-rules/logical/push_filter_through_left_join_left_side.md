@@ -32,7 +32,7 @@ graph TD
 パターンは `Selection(OuterJoin(Any("left"), Any("right"), "join"))` です。
 DSL の `LeftOuterJoin`(型をパターンで固定するヘルパー)ではなく素の
 `OuterJoin` を使っており、**join_type の検査は変換ラムダ側**で行います。
-guard は次の 5 つです。
+guard は次の 6 つです。
 
 1. 述語を持つこと(`!expression.predicate` で早期 return)。
 2. 左子グループのリレーション集合が空でないこと。

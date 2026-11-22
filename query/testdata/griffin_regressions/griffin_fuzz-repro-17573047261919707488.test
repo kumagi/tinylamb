@@ -16,4 +16,4 @@
 -- stmt: WITH c1 AS (SELECT pk, pv, ps FROM gf_p WHERE pv IS NOT NULL OR pk IS NULL), c2 AS (SELECT pk, pv FROM c1 WHERE pk IS NOT NULL) SELECT c1.pk, c2.pv, c1.ps FROM c1 LEFT JOIN c2 ON c1.pk IS NOT DISTINCT FROM c2.pk;
 -- stmt: SELECT p.pk, lat.cnt, lat.sm FROM gf_p p, LATERAL (SELECT COUNT(*) AS cnt, SUM(q.pv) AS sm FROM gf_p q WHERE q.ps IS NOT DISTINCT FROM p.ps) lat;
 -- ran_select: true
--- failure: evaluation-path mismatch (statements regenerated after SubstituteIdentifiers became per-identifier consistent)
+-- failure: evaluation-path mismatch (statements regenerated after SubstituteIdentifiers became per-identifier consistent; guards the tree CROSS/LEFT self-joins on parent, the non-grouped qualified columns tree.a/t1.parent/t2.d, and the gf_p CTE/LATERAL IS NOT DISTINCT FROM)

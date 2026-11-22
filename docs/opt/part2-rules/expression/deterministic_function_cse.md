@@ -41,14 +41,18 @@ graph TD
 2. **同一引数を持つ多引数関数経路**: `GetFunctionVolatility` が `kImmutable` であり、引数を 2 個以上持つ関数呼び出しを対象とします。
    - `coalesce` / `greatest` / `least`: 全引数が第 1 引数と `Same` かつ `SafeToReduceEvaluationCount`（揮発性関数やサブクエリを含まない）を満たす場合、第 1 引数そのものへ置き換えます。
    - `ifnull(a, a)`: 2 つの引数が `Same` であれば `a` へ置き換えます。
-   - `nullif(a, a)`: 以下の guard をすべて満たす場合にのみ、NULL 定数へ畳み込みます。
+   - `nullif(a, a)`: 第 1 引数が定数リテラルの場合は本 Rule では扱わず定数畳み込みに委ね、それ以外で以下の guard をすべて満たす場合にのみ NULL 定数へ畳み込みます。
 
    ```cpp
-   } else if (Same(fn.Args()[0], fn.Args()[1]) &&
-              !StaticallyDouble(fn.Args()[0]) &&
-              ExpressionCannotThrow(fn.Args()[0]) &&
-              SafeToReduceEvaluationCount(fn.Args()[0])) {
-     return ConstantValueExp(Value());
+   } else if (name == "nullif" && fn.Args().size() == 2) {
+     if (IsConstant(fn.Args()[0])) {
+       // Constant folding handles constant cases.
+     } else if (Same(fn.Args()[0], fn.Args()[1]) &&
+                StaticallyProvesNonDouble(fn.Args()[0]) &&
+                ExpressionCannotThrow(fn.Args()[0]) &&
+                SafeToReduceEvaluationCount(fn.Args()[0])) {
+       return ConstantValueExp(Value());
+     }
    }
    ```
 
@@ -73,7 +77,7 @@ graph TD
 
 自己同一形（`f - f` や `f / f`）を二分演算で安易に畳むことは、三値論理および例外意味論の観点から不正です。たとえ決定的関数であっても、NULL を返す可能性があります。SQL の三値論理において `NULL - NULL` は `UNKNOWN`（NULL）であり、`0` ではありません。同様に、`f(x) / f(x)` は `f(x) = 0` のときにゼロ除算エラーを送出すべきであり、これを `1` に畳み込むと実行時エラーが不当に隠蔽されます。
 
-`nullif(a, a)` において `!StaticallyDouble`、`ExpressionCannotThrow`、`SafeToReduceEvaluationCount` の 3 条件を課す理由も同義です。IEEE 754 の浮動小数点演算では `NaN = NaN` は false と判定されるため、`NULLIF(NaN, NaN)` は NULL ではなく NaN を返さなければなりません。また、引数 `a` が例外を送出し得る式や副作用を伴う揮発性式である場合、評価を省略して NULL に置換すると例外や副作用が消去されてしまいます。
+`nullif(a, a)` において `StaticallyProvesNonDouble`、`ExpressionCannotThrow`、`SafeToReduceEvaluationCount` の 3 条件を課す理由も同義です。IEEE 754 の浮動小数点演算では `NaN = NaN` は false と判定されるため、`NULLIF(NaN, NaN)` は NULL ではなく NaN を返さなければなりません。現行ガードは旧 `!StaticallyDouble` を `StaticallyProvesNonDouble` へ反転した fail-closed 判定であり、double と分かる場合だけでなく列参照など型が未解決な場合も畳み込みを拒否します（定数第 1 引数はそもそも本 Rule の対象外で、定数畳み込み系 Rule に委ねます）。また、引数 `a` が例外を送出し得る式や副作用を伴う揮発性式である場合、評価を省略して NULL に置換すると例外や副作用が消去されてしまいます。
 
 全分岐が同一の `CASE` 式を `ELSE` 式へ短縮する際も、すべての `WHEN` 条件式の評価が完全に消失します。条件式に型キャスト例外を引き起こす式や `rand()` 等の揮発性関数が含まれている場合、それらの評価がスキップされると観測可能な動作が変化します。したがって、条件式すべてに対して `ExpressionCannotThrow` かつ `SafeToReduceEvaluationCount` であることの確認が不可欠です。
 

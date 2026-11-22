@@ -167,7 +167,7 @@ Setting `TINYLAMB_RULE_STATS` (any present value) logs per-rule attempt counts d
 
 **Execution lowering note:** By default (`TINYLAMB_EXEC_ENGINE` unset or `!= legacy`),
 `SqlEngine` lowers the physical `Plan` chosen here through `PipelineLowering`
-(`executor/pipeline_lowering.hpp`) and `GroupedStatementToPipeline`
+(`executor/pipeline_lowering.hpp`) and `TryLowerGroupedStatementToPipeline`
 (`query/grouped_pipeline_lowering.hpp`) onto OOC spillable pipelines rather than
 calling `PlanBase::EmitExecutor` directly. Notice also that planner shape policies
 (`kSortDefaultMemoryBudgetBytes`, `kWindowDefaultMemoryBudgetBytes`,

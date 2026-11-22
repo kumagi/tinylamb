@@ -97,9 +97,10 @@ B+Tree 探索キーの境界決定において、等号プレフィックスを�
 
 ### コストモデルの計算
 - **範囲スキャン**:
-  アクセス行数を `AccessRowCount()` から見積もり、複合索引の等号プレフィックス行数 `EqualityPrefixRows` との最小値を取ります。
+  アクセス行数を `AccessRowCount()` から見積もり、最低 1.0 行の下限ガードを掛けたうえで、複合索引の等号プレフィックス行数 `EqualityPrefixRows` との最小値を取ります。
   ```cpp
-  auto local_cost = static_cast<double>(candidate->AccessRowCount());
+  auto local_cost =
+      std::max(1.0, static_cast<double>(candidate->AccessRowCount()));
   local_cost = std::min(
       local_cost,
       EqualityPrefixRows(statistics, index, equality_prefix_values));

@@ -47,6 +47,7 @@ Column ProjectionDomainColumn(std::string_view name, const Column& source) {
   result.SetUnsigned(source.IsUnsigned());
   result.SetIntegerBits(source.IntegerBits());
   result.SetInterval(source.IsInterval());
+  result.SetTextDomain(source.GetTextDomain());
   result.SetScale(source.Scale());
   return result;
 }
@@ -67,6 +68,11 @@ Column ProjectionExpressionColumn(std::string_view name,
     Column result(name, cast.TargetValueType());
     const std::string target = AsciiToLower(cast.TargetTypeName());
     result.SetInterval(target == "interval");
+    if (target == "timestamp") {
+      result.SetTextDomain(TextDomain::kTimestamp);
+    } else if (target == "string" || target == "varchar" || target == "char") {
+      result.SetTextDomain(TextDomain::kString);
+    }
     result.SetUnsigned(target.starts_with("uint"));
     if (target == "int8" || target == "uint8") {
       result.SetIntegerBits(8);
@@ -86,6 +92,7 @@ Column ProjectionExpressionColumn(std::string_view name,
       Column result(name, constant.type);
       result.SetUnsigned(constant.IsUnsigned());
       result.SetInterval(constant.IsInterval());
+      result.SetTextDomain(expression->AsConstantValue().GetTextDomain());
       return result;
     }
   }
@@ -340,18 +347,30 @@ StatusOr<ColumnarTopNResult> TryColumnarBoundedTopN(
   }
   relational_detail::ChunkStringArena* arena = nullptr;
   Value cell;
+  Row src_row;
   for (size_t out_r = 0; out_r < heap.size(); ++out_r) {
     const auto& entry = heap[out_r];
     const auto& src_ch = src_table.chunks[entry.chunk_idx];
+    bool src_row_ready = false;
     for (size_t col_i = 0; col_i < out_width; ++col_i) {
       if (output_slots.empty()) {
         src_ch.columns[col_i].WriteValueInto(entry.row_idx, &cell);
       } else {
         const TopNOutputSlot& slot = output_slots[col_i];
-        src_ch.columns[slot.col].WriteValueInto(entry.row_idx, &cell);
-        if (slot.is_coalesce && cell.IsNull()) {
-          src_ch.columns[slot.fallback_col].WriteValueInto(entry.row_idx,
-                                                           &cell);
+        if (slot.program != nullptr) {
+          if (!src_row_ready) {
+            src_ch.MaterializeRowInto(entry.row_idx, &src_row);
+            src_row_ready = true;
+          }
+          ASSIGN_OR_RETURN(Value, evaluated,
+                           TryEvaluateRowAuto(*slot.program, src_row));
+          cell = std::move(evaluated);
+        } else {
+          src_ch.columns[slot.col].WriteValueInto(entry.row_idx, &cell);
+          if (slot.is_coalesce && cell.IsNull()) {
+            src_ch.columns[slot.fallback_col].WriteValueInto(entry.row_idx,
+                                                             &cell);
+          }
         }
       }
       auto& dst_col = dst_chunk.columns[col_i];
@@ -1090,7 +1109,8 @@ StatusOr<Relation> LimitedRows(const SelectStatement& statement,
     return limited;
   }
 
-  if (!statement.WithTies()) {
+  if (!statement.WithTies() || statement.OrderBy().empty() ||
+      count == available) {
     if (!input.HasSpill()) {
       if (input.HasColumnarOnly()) {
         if (begin == 0 && count >= total) {
@@ -1117,116 +1137,116 @@ StatusOr<Relation> LimitedRows(const SelectStatement& statement,
       return limited;
     }
     size_t seen = 0;
-    size_t emitted = 0;
-    RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
-      if (seen++ < begin || emitted >= count) {
-        return;
+    RETURN_IF_FAIL(input.ForEachRowBounded(begin + count, [&](const Row& row) {
+      if (seen++ >= begin) {
+        limited.AddRow(row);
       }
-      limited.AddRow(row);
-      ++emitted;
     }));
     RETURN_IF_FAIL(limited.FinishSpill());
     return limited;
   }
 
-  std::vector<Row> all_rows;
-  all_rows.reserve(total);
-  RETURN_IF_FAIL(
-      input.ForEachRow([&](const Row& row) { all_rows.push_back(row); }));
-
-  if (!statement.OrderBy().empty() && count > 0 &&
-      begin + count <= all_rows.size()) {
-    const size_t last_idx = begin + count - 1;
-    const Row& last_row = all_rows[last_idx];
-    size_t end_idx = begin + count;
-    while (end_idx < all_rows.size()) {
-      bool tied = true;
-      for (const auto& term : statement.OrderBy()) {
-        // ORDER BY <ordinal> COLLATE 'spec': the sort bound the ordinal to
-        // that output column under the spec's collation. Evaluating the
-        // COLLATE wrapper per row compares the ordinal literal with itself
-        // and ties every row, so resolve to the bound column value first
-        // (same gate as the ordinal binding above; an unsupported spec
-        // resolves to the engine default exactly as COLLATE() does).
-        if (term.expression) {
-          const std::optional<CollatedOrdinal> collated =
-              AsCollatedOrdinal(term.expression);
-          if (collated.has_value() && collated->ordinal >= 1 &&
-              std::cmp_less_equal(collated->ordinal, last_row.values_.size()) &&
-              std::cmp_less_equal(collated->ordinal,
-                                  all_rows[end_idx].values_.size())) {
-            const auto column = static_cast<size_t>(collated->ordinal - 1);
-            const std::optional<Collation> spec =
-                CollationOfSpec(collated->spec);
-            const int cmp = CompareUnderCollation(
-                last_row.values_[column], all_rows[end_idx].values_[column],
-                spec.value_or(Collation::kNone));
-            if (cmp != 0) {
-              tied = false;
-              break;
-            }
-            continue;
+  // The sort already ordered peers next to each other. Retain only the
+  // boundary row for comparison, and send accepted rows through AddRow so
+  // even an arbitrarily large peer group can spill.
+  const auto tied = [&](const Row& last_row,
+                        const Row& current_row) -> StatusOr<bool> {
+    for (const auto& term : statement.OrderBy()) {
+      // ORDER BY <ordinal> COLLATE 'spec': the sort bound the ordinal to
+      // that output column under the spec's collation. Evaluating the
+      // COLLATE wrapper per row compares the ordinal literal with itself
+      // and ties every row, so resolve to the bound column value first
+      // (same gate as the ordinal binding above; an unsupported spec
+      // resolves to the engine default exactly as COLLATE() does).
+      if (term.expression) {
+        const std::optional<CollatedOrdinal> collated =
+            AsCollatedOrdinal(term.expression);
+        if (collated.has_value() && collated->ordinal >= 1 &&
+            std::cmp_less_equal(collated->ordinal, last_row.values_.size()) &&
+            std::cmp_less_equal(collated->ordinal,
+                                current_row.values_.size())) {
+          const auto column = static_cast<size_t>(collated->ordinal - 1);
+          const std::optional<Collation> spec = CollationOfSpec(collated->spec);
+          const int cmp = CompareUnderCollation(
+              last_row.values_[column], current_row.values_[column],
+              spec.value_or(Collation::kNone));
+          if (cmp != 0) {
+            return false;
           }
-        }
-        // ORDER BY <ordinal>: the sort bound the integer to that output
-        // column; comparing the literal with itself would tie every row.
-        if (term.expression &&
-            term.expression->Type() == TypeTag::kConstantValue) {
-          const Value& ordinal = term.expression->AsConstantValue().GetValue();
-          if (ordinal.type == ValueType::kInt64 && !ordinal.IsUnsigned() &&
-              ordinal.value.int_value >= 1 &&
-              std::cmp_less_equal(ordinal.value.int_value,
-                                  last_row.values_.size()) &&
-              std::cmp_less_equal(ordinal.value.int_value,
-                                  all_rows[end_idx].values_.size())) {
-            const auto column =
-                static_cast<size_t>(ordinal.value.int_value - 1);
-            if (!EqualUnderCollation(last_row.values_[column],
-                                     all_rows[end_idx].values_[column])) {
-              tied = false;
-              break;
-            }
-            continue;
-          }
-        }
-        Scope scope_last{
-            .row = &last_row, .schema = &input.schema, .outer = outer};
-        Scope scope_curr{
-            .row = &all_rows[end_idx], .schema = &input.schema, .outer = outer};
-        StatusOr<Value> last_or =
-            context != nullptr && ctes != nullptr
-                ? TryEvaluate(term.expression, scope_last, nullptr, *context,
-                              *ctes)
-                : term.expression->TryEvaluate(last_row, input.schema);
-        ASSIGN_OR_RETURN(Value, val_last, (std::move(last_or)));
-        StatusOr<Value> curr_or =
-            context != nullptr && ctes != nullptr
-                ? TryEvaluate(term.expression, scope_curr, nullptr, *context,
-                              *ctes)
-                : term.expression->TryEvaluate(all_rows[end_idx], input.schema);
-        ASSIGN_OR_RETURN(Value, val_curr, (std::move(curr_or)));
-        // Peers must collapse exactly the way the ORDER BY grouped them, so a
-        // case-insensitive key treats 'a' and 'A' as the same tie instead of
-        // cutting the tie group at the LIMIT boundary.
-        if (!EqualUnderCollation(val_last, val_curr)) {
-          tied = false;
-          break;
+          continue;
         }
       }
-      if (!tied) {
-        break;
+      // ORDER BY <ordinal>: the sort bound the integer to that output
+      // column; comparing the literal with itself would tie every row.
+      if (term.expression &&
+          term.expression->Type() == TypeTag::kConstantValue) {
+        const Value& ordinal = term.expression->AsConstantValue().GetValue();
+        if (ordinal.type == ValueType::kInt64 && !ordinal.IsUnsigned() &&
+            ordinal.value.int_value >= 1 &&
+            std::cmp_less_equal(ordinal.value.int_value,
+                                last_row.values_.size()) &&
+            std::cmp_less_equal(ordinal.value.int_value,
+                                current_row.values_.size())) {
+          const auto column = static_cast<size_t>(ordinal.value.int_value - 1);
+          if (!EqualUnderCollation(last_row.values_[column],
+                                   current_row.values_[column])) {
+            return false;
+          }
+          continue;
+        }
       }
-      ++end_idx;
+      Scope scope_last{
+          .row = &last_row, .schema = &input.schema, .outer = outer};
+      Scope scope_curr{
+          .row = &current_row, .schema = &input.schema, .outer = outer};
+      StatusOr<Value> last_or =
+          context != nullptr && ctes != nullptr
+              ? TryEvaluate(term.expression, scope_last, nullptr, *context,
+                            *ctes)
+              : term.expression->TryEvaluate(last_row, input.schema);
+      ASSIGN_OR_RETURN(Value, val_last, (std::move(last_or)));
+      StatusOr<Value> curr_or =
+          context != nullptr && ctes != nullptr
+              ? TryEvaluate(term.expression, scope_curr, nullptr, *context,
+                            *ctes)
+              : term.expression->TryEvaluate(current_row, input.schema);
+      ASSIGN_OR_RETURN(Value, val_curr, (std::move(curr_or)));
+      // Peers must collapse exactly the way the ORDER BY grouped them, so a
+      // case-insensitive key treats 'a' and 'A' as the same tie instead of
+      // cutting the tie group at the LIMIT boundary.
+      if (!EqualUnderCollation(val_last, val_curr)) {
+        return false;
+      }
     }
-    for (size_t i = begin; i < end_idx; ++i) {
-      limited.AddRow(all_rows[i]);
-    }
-  } else {
-    for (size_t i = begin; i < begin + count && i < all_rows.size(); ++i) {
-      limited.AddRow(all_rows[i]);
-    }
-  }
+    return true;
+  };
 
+  const size_t end = begin + count;
+  size_t seen = 0;
+  Row boundary;
+  Status tie_error{Status::kSuccess};
+  const Status read = input.ForEachRowBounded(total, [&](const Row& row) {
+    const size_t index = seen++;
+    if (index < begin) {
+      return true;
+    }
+    if (index >= end) {
+      auto peer = tied(boundary, row);
+      if (!peer.HasValue()) {
+        tie_error = peer.GetStatus();
+        return false;
+      }
+      if (!peer.Value()) {
+        return false;
+      }
+    } else if (index == end - 1) {
+      boundary = row;
+    }
+    limited.AddRow(row);
+    return limited.GetStatus().ok();
+  });
+  RETURN_IF_FAIL(tie_error);
+  RETURN_IF_FAIL(read);
   RETURN_IF_FAIL(limited.FinishSpill());
   return limited;
 }

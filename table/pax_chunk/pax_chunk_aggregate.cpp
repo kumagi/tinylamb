@@ -20,11 +20,32 @@
 #include <utility>
 
 #include "common/exception_status.hpp"
-#include "table/pax_chunk/pax_chunk.hpp"
 #include "common/parallel_work.hpp"
+#include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
 namespace tinylamb {
+
+namespace {
+
+// DecodeInt64ColumnRg throws std::out_of_range on a hand-built footer with a
+// hostile column offset or misaligned arrays. The pushdown kernels below
+// cannot return a Status; they report an unusable chunk with an invalid/empty
+// result (or a false return), so funnel every decode through this guard and
+// take that same fail-closed path instead of letting the exception escape the
+// kernel boundary. The Status-returning entry points that need the error text
+// keep their own try/catch + StatusFromCurrentException conversion.
+bool TryDecodeInt64ColumnRg(const PaxChunk& chunk, slot_t col, uint32_t group,
+                            int64_t* out) noexcept {
+  try {
+    chunk.DecodeInt64ColumnRg(col, group, out);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+}  // namespace
 
 bool TryAccumulateScaledSum(int64_t coefficient, platform::Int128 subtotal,
                             platform::Int128* total) {
@@ -954,7 +975,8 @@ const uint8_t* PaxChunk::CellNullBits(uint32_t g, slot_t c) const {
     const size_t cell_bytes =
         (static_cast<size_t>(footer_.row_counts[g]) + 7) / 8;
     const size_t off = static_cast<size_t>(null_rg_offsets_[g]) +
-                       // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is unambiguous
+                       // NOLINTNEXTLINE(readability-math-missing-parentheses)
+                       // precedence is unambiguous
                        static_cast<size_t>(c) * cell_bytes;
     if (off + cell_bytes > footer_.null_bitmaps.size()) {
       return nullptr;
@@ -1501,8 +1523,8 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       const char* end = packed + ((bit_len + 7) / 8);
       end = std::min(end, reg_end);
       brb = WordBitReader(packed, end);
-      // deltas[0] is unused (MakeDeltasInto sets it to 0); consume it to keep the
-      // contiguous word-window reader aligned with rows 1..rc-1.
+      // deltas[0] is unused (MakeDeltasInto sets it to 0); consume it to keep
+      // the contiguous word-window reader aligned with rows 1..rc-1.
       (void)brb.get(bw);
     }
     uint64_t v = ReadBE64(ck);
@@ -2146,7 +2168,9 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kChimp128) {
       std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
-      chunk.DecodeInt64ColumnRg(col, group, decoded.data());
+      if (!TryDecodeInt64ColumnRg(chunk, col, group, decoded.data())) {
+        return false;
+      }
       for (uint32_t row = 0; row < rows; ++row) {
         if (CellIsNull(f, group, col, row)) {
           continue;
@@ -2320,7 +2344,9 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kAlpRdTans) {
       std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
-      chunk.DecodeInt64ColumnRg(col, group, decoded.data());
+      if (!TryDecodeInt64ColumnRg(chunk, col, group, decoded.data())) {
+        return false;
+      }
       for (uint32_t row = 0; row < rows; ++row) {
         if (CellIsNull(f, group, col, row)) {
           continue;
@@ -2491,7 +2517,9 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kPatas) {
       std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
-      chunk.DecodeInt64ColumnRg(col, group, decoded.data());
+      if (!TryDecodeInt64ColumnRg(chunk, col, group, decoded.data())) {
+        return false;
+      }
       for (uint32_t row = 0; row < rows; ++row) {
         if (CellIsNull(f, group, col, row)) {
           continue;
@@ -2817,7 +2845,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           }
           sel_ready = true;
         } else {
-          chunk.DecodeInt64ColumnRg(plan.col, g, fused_stack.data());
+          if (!TryDecodeInt64ColumnRg(chunk, plan.col, g, fused_stack.data())) {
+            return ReduceResult{};
+          }
           fused_vals = fused_stack.data();
         }
       }
@@ -2831,8 +2861,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       // encode NULL as raw 0; drop UNKNOWN rows. BuildSelectionVector already
       // did this, so re-applying is harmless. Recompute count after the AND.
       if (!sel.bits.empty()) {
-        AndNotColumnNulls(rc, chunk.CellNullBits(g, plan.col),
-                          sel.bits.data());
+        AndNotColumnNulls(rc, chunk.CellNullBits(g, plan.col), sel.bits.data());
         sel.count = 0;
         for (const uint64_t w : sel.bits) {
           sel.count += static_cast<uint64_t>(__builtin_popcountll(w));
@@ -3084,10 +3113,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           const uint32_t nexc = ReadBE16(tr + 21);
           const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
           if (nexc <= rc && tr + 23 + bmp_bytes <= treg_end) {
-            __int128 s =
-                (static_cast<__int128>(static_cast<int64_t>(a)) * rc) +
-                (static_cast<__int128>(static_cast<int64_t>(d)) *
-                 (static_cast<__int128>(rc) * (rc - 1) / 2));
+            __int128 s = (static_cast<__int128>(static_cast<int64_t>(a)) * rc) +
+                         (static_cast<__int128>(static_cast<int64_t>(d)) *
+                          (static_cast<__int128>(rc) * (rc - 1) / 2));
             if (nexc > 0) {
               std::vector<int64_t> exc(nexc, 0);
               DecodeInnerI64All(tr + 23 + bmp_bytes,
@@ -3200,16 +3228,15 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           if (m >= 2 && m <= (UINT64_C(1) << 63) && a < m && b < m && b != 0 &&
               nexc <= rc && tr + 31 + bmp_bytes <= treg_end &&
               (nexc == 0 || InnerSchemeOk(ischeme))) {
-            __int128 s =
-                (static_cast<__int128>(static_cast<int64_t>(a)) * rc) +
-                (static_cast<__int128>(static_cast<int64_t>(b)) *
-                 (static_cast<__int128>(rc) * (rc - 1) / 2)) -
-                (static_cast<__int128>(static_cast<int64_t>(m)) *
-                 static_cast<__int128>(ModFloorSum(
-                     static_cast<platform::UInt128>(rc),
-                     static_cast<platform::UInt128>(a),
-                     static_cast<platform::UInt128>(b),
-                     static_cast<platform::UInt128>(m))));
+            __int128 s = (static_cast<__int128>(static_cast<int64_t>(a)) * rc) +
+                         (static_cast<__int128>(static_cast<int64_t>(b)) *
+                          (static_cast<__int128>(rc) * (rc - 1) / 2)) -
+                         (static_cast<__int128>(static_cast<int64_t>(m)) *
+                          static_cast<__int128>(
+                              ModFloorSum(static_cast<platform::UInt128>(rc),
+                                          static_cast<platform::UInt128>(a),
+                                          static_cast<platform::UInt128>(b),
+                                          static_cast<platform::UInt128>(m))));
             if (nexc > 0) {
               std::vector<int64_t> exc(nexc, 0);
               DecodeInnerI64All(tr + 31 + bmp_bytes, ischeme, iparam, nexc,
@@ -4002,7 +4029,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           } else {
             std::memset(freq_stack.data(), 0, nfreq * sizeof(freq_stack[0]));
           }
-          // SUM takes the specialised histogram (no lambda, so the strength
+          // SUM takes the specialized histogram (no lambda, so the strength
           // reduction is uncontested); MIN/MAX keep the generic fold.
           if (plan.op == AggOp::kSum &&
               DictPassByteExpandable(static_cast<uint32_t>(cw))) {
@@ -4125,7 +4152,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           vals_heap.resize(rc);
           vals = vals_heap.data();
         }
-        chunk.DecodeInt64ColumnRg(plan.col, g, const_cast<int64_t*>(vals));
+        if (!TryDecodeInt64ColumnRg(chunk, plan.col, g,
+                                    const_cast<int64_t*>(vals))) {
+          return ReduceResult{};
+        }
       }
       const uint8_t* gnulls = RgColNullBits(f, g, plan.col);
       for (uint64_t w = 0; w < sel.bits.size(); ++w) {
@@ -4902,19 +4932,20 @@ StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
     // on the caller's thread after the join.
     std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
                                       Status::kSuccess);
-    RETURN_IF_FAIL(RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
-        try {
-          for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
-            for (auto g = static_cast<uint32_t>(t); g < rg;
-                 g += static_cast<uint32_t>(nthreads)) {
-              scan_rg(g, res[static_cast<size_t>(t)]);
+    RETURN_IF_FAIL(
+        RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
+          try {
+            for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+              for (auto g = static_cast<uint32_t>(t); g < rg;
+                   g += static_cast<uint32_t>(nthreads)) {
+                scan_rg(g, res[static_cast<size_t>(t)]);
+              }
             }
+          } catch (...) {
+            worker_errors[static_cast<size_t>(t)] =
+                StatusFromCurrentException("pax chunk scan worker failed");
           }
-        } catch (...) {
-          worker_errors[static_cast<size_t>(t)] =
-              StatusFromCurrentException("pax chunk scan worker failed");
-        }
-    }));
+        }));
     for (const Status& worker_status : worker_errors) {
       if (worker_status != Status::kSuccess) {
         return worker_status;
@@ -4930,10 +4961,14 @@ StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
                                static_cast<uint64_t>(r.hit_sum));
     }
   } else {
-    for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
-      for (uint32_t g = 0; g < rg; ++g) {
-        scan_rg(g, total);
+    try {
+      for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+        for (uint32_t g = 0; g < rg; ++g) {
+          scan_rg(g, total);
+        }
       }
+    } catch (...) {
+      return StatusFromCurrentException("pax chunk scan failed");
     }
   }
   return total;
@@ -5401,17 +5436,18 @@ StatusOr<ScanResult> VectorizedScanColumnInList(
     std::vector<ScanResult> res(static_cast<size_t>(nthreads));
     std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
                                       Status::kSuccess);
-    RETURN_IF_FAIL(RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
-        try {
-          for (auto g = static_cast<uint32_t>(t); g < rg;
-               g += static_cast<uint32_t>(nthreads)) {
-            scan_rg(g, res[static_cast<size_t>(t)]);
+    RETURN_IF_FAIL(
+        RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
+          try {
+            for (auto g = static_cast<uint32_t>(t); g < rg;
+                 g += static_cast<uint32_t>(nthreads)) {
+              scan_rg(g, res[static_cast<size_t>(t)]);
+            }
+          } catch (...) {
+            worker_errors[static_cast<size_t>(t)] =
+                StatusFromCurrentException("pax chunk scan worker failed");
           }
-        } catch (...) {
-          worker_errors[static_cast<size_t>(t)] =
-              StatusFromCurrentException("pax chunk scan worker failed");
-        }
-    }));
+        }));
     for (const Status& worker_status : worker_errors) {
       if (worker_status != Status::kSuccess) {
         return worker_status;
@@ -5424,8 +5460,12 @@ StatusOr<ScanResult> VectorizedScanColumnInList(
                                static_cast<uint64_t>(r.hit_sum));
     }
   } else {
-    for (uint32_t g = 0; g < rg; ++g) {
-      scan_rg(g, total);
+    try {
+      for (uint32_t g = 0; g < rg; ++g) {
+        scan_rg(g, total);
+      }
+    } catch (...) {
+      return StatusFromCurrentException("pax chunk scan failed");
     }
   }
   return total;
@@ -6546,7 +6586,9 @@ bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p, uint32_t g,
       heap_values.resize(rc);
       values = heap_values.data();
     }
-    chunk.DecodeInt64ColumnRg(p.col, g, values);
+    if (!TryDecodeInt64ColumnRg(chunk, p.col, g, values)) {
+      return false;
+    }
     if (FillPredicateMaskAvx2(values, rc, p.op, p.lit, out)) {
       return true;
     }
@@ -7624,7 +7666,7 @@ bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p, uint32_t g,
     return true;
   }
   if (s == Scheme::kSfor) {
-    // SFOR is the double-column analogue of the kInterp/kDeltaPfor brackets,
+    // SFOR is the double-column analog of the kInterp/kDeltaPfor brackets,
     // one level stronger: the group directory partitions the column into
     // DISJOINT ASCENDING value ranges [msb<<s, (msb<<s) | (2^s-1)] AND the
     // values ascend INSIDE each group (lsbits are ascending under a shared
@@ -8213,8 +8255,8 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
             dec_heap.resize(rc);
             decoded = dec_heap.data();
           }
-          if (rc > 0) {
-            chunk.DecodeInt64ColumnRg(col, g, decoded);
+          if (rc > 0 && !TryDecodeInt64ColumnRg(chunk, col, g, decoded)) {
+            return PaxSelectionVector{};
           }
         }
         if (rc > 0) {
@@ -8357,7 +8399,7 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
   // element, so one scratch per worker is reused across groups: a row group
   // never allocates (and zero-fills) its own decode buffers.
   struct TermScratch {
-    std::vector<slot_t> cols;               // sorted unique term columns
+    std::vector<slot_t> cols;                // sorted unique term columns
     std::vector<std::vector<int64_t>> bufs;  // one decode buffer per column
 
     void Prepare(const std::vector<AggTerm>& terms) {
@@ -8384,7 +8426,11 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
     }
   };
 
-  auto agg_rg = [&](uint32_t g, AggResult& r, TermScratch& scratch) {
+  const auto overflow = [] {
+    return StatusError(StatusCode::kIsInfinity,
+                       "integer overflow in PAX scan aggregate");
+  };
+  auto agg_rg = [&](uint32_t g, AggResult& r, TermScratch& scratch) -> Status {
     const uint16_t rc = f.row_counts[g];
 
     // Zone-map evaluation: prune the whole group if any predicate provably
@@ -8430,7 +8476,7 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
             continue;
         }
         if (range_empty) {
-          return;  // this predicate kills the whole group
+          return Status::kSuccess;  // this predicate kills the whole group
         }
         const size_t zi = (static_cast<size_t>(g) * cc) + p.col;
         if (zi >= f.all_zone_mins.size() || zi >= f.all_zone_maxs.size()) {
@@ -8444,7 +8490,7 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
         const bool col_has_null = RgColHasNull(f, g, p.col);
         if (!col_has_null &&
             (f.all_zone_mins[zi] > phi || f.all_zone_maxs[zi] < plo)) {
-          return;
+          return Status::kSuccess;
         }
         if (f.all_zone_mins[zi] < plo || f.all_zone_maxs[zi] > phi) {
           all_inside = false;
@@ -8462,10 +8508,10 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
         BuildSelectionVector(chunk, plan.preds, g, all_inside);
     r.count += sel.count;
     if (plan.count_only || plan.terms.empty()) {
-      return;
+      return Status::kSuccess;
     }
     if (sel.count == 0) {
-      return;  // late materialization: nothing to aggregate
+      return Status::kSuccess;  // nothing to aggregate
     }
 
     scratch.Decode(chunk, g, rc);
@@ -8495,13 +8541,20 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
         for (const auto& t : plan.terms) {
           platform::Int128 term = t.coeff;
           for (slot_t c : t.cols) {
-            term *= tcol(c)[i];
+            if (__builtin_mul_overflow(term, tcol(c)[i], &term)) {
+              return overflow();
+            }
           }
-          acc += term;
+          if (__builtin_add_overflow(acc, term, &acc)) {
+            return overflow();
+          }
         }
-        r.sum += acc;
+        if (__builtin_add_overflow(r.sum, acc, &r.sum)) {
+          return overflow();
+        }
       }
     }
+    return Status::kSuccess;
   };
 
   AggResult total;
@@ -8519,39 +8572,49 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
     // std::terminate.
     std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
                                       Status::kSuccess);
-    RETURN_IF_FAIL(RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
-        try {
-          // One decode scratch per worker: the term buffers are reused
-          // across the row groups this worker visits.
-          TermScratch scratch;
-          scratch.Prepare(plan.terms);
-          for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
-            for (auto g = static_cast<uint32_t>(t); g < rg;
-                 g += static_cast<uint32_t>(nthreads)) {
-              agg_rg(g, res[static_cast<size_t>(t)], scratch);
+    RETURN_IF_FAIL(
+        RunParallelTasks(static_cast<size_t>(nthreads), [&](size_t t) {
+          try {
+            // One decode scratch per worker: the term buffers are reused
+            // across the row groups this worker visits.
+            TermScratch scratch;
+            scratch.Prepare(plan.terms);
+            for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+              for (auto g = static_cast<uint32_t>(t); g < rg;
+                   g += static_cast<uint32_t>(nthreads)) {
+                worker_errors[t] = agg_rg(g, res[t], scratch);
+                if (worker_errors[t] != Status::kSuccess) {
+                  return;
+                }
+              }
             }
+          } catch (...) {
+            worker_errors[static_cast<size_t>(t)] =
+                StatusFromCurrentException("pax chunk scan worker failed");
           }
-        } catch (...) {
-          worker_errors[static_cast<size_t>(t)] =
-              StatusFromCurrentException("pax chunk scan worker failed");
-        }
-    }));
+        }));
     for (const Status& worker_status : worker_errors) {
       if (worker_status != Status::kSuccess) {
         return worker_status;
       }
     }
-    for (auto& r : res) {
-      total.sum += r.sum;
+    for (const auto& r : res) {
+      if (__builtin_add_overflow(total.sum, r.sum, &total.sum)) {
+        return overflow();
+      }
       total.count += r.count;
     }
   } else {
-    TermScratch scratch;
-    scratch.Prepare(plan.terms);
-    for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
-      for (uint32_t g = 0; g < rg; ++g) {
-        agg_rg(g, total, scratch);
+    try {
+      TermScratch scratch;
+      scratch.Prepare(plan.terms);
+      for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+        for (uint32_t g = 0; g < rg; ++g) {
+          RETURN_IF_FAIL(agg_rg(g, total, scratch));
+        }
       }
+    } catch (...) {
+      return StatusFromCurrentException("pax chunk aggregate failed");
     }
   }
   return total;
@@ -8739,7 +8802,9 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
     if (!sum_ready && ss != Scheme::kConst && ss != Scheme::kRle &&
         ss != Scheme::kDict && ss != Scheme::kOpDict) {
       ResizeDecodeBuffer(sbuf, rc);
-      chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
+      if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
+        return std::vector<GroupByEntry>{};
+      }
       sum_decoded = true;
       sum_ready = true;
     }
@@ -8774,8 +8839,11 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
       }
       if (!sum_ready || !sum_decoded) {
         ResizeDecodeBuffer(sbuf, rc);
-        chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
-        // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
+        if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
+          return std::vector<GroupByEntry>{};
+        }
+        // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
+        // pattern in this code
         sum_decoded = true;
       }
       platform::Int128 s = 0;
@@ -8837,8 +8905,11 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
         } else {
           if (!sum_ready || !sum_decoded) {
             ResizeDecodeBuffer(sbuf, rc);
-            chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
-            // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
+            if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
+              return std::vector<GroupByEntry>{};
+            }
+            // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
+            // pattern in this code
             sum_decoded = true;
           }
           for (uint32_t i = 0; i < rc; ++i) {
@@ -8887,10 +8958,11 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
                                   sum_dict + (static_cast<size_t>(scode) * 8)))
                             : 0;
             }
-          } else {
-            chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
+          } else if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
+            return std::vector<GroupByEntry>{};
           }
-          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
+          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
+          // pattern in this code
           sum_decoded = true;
         }
         const char* q = gr + 4;
@@ -8957,10 +9029,11 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
                                   sum_dict + (static_cast<size_t>(scode) * 8)))
                             : 0;
             }
-          } else {
-            chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
+          } else if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
+            return std::vector<GroupByEntry>{};
           }
-          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional pattern in this code
+          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
+          // pattern in this code
           sum_decoded = true;
         }
         const char* q = gruns_hdr + 4;
@@ -9005,8 +9078,10 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
       if (sv.size() < rc) {
         sv.resize(rc);
       }
-      chunk.DecodeInt64ColumnRg(group_col, g, gv.data());
-      chunk.DecodeInt64ColumnRg(sum_col, g, sv.data());
+      if (!TryDecodeInt64ColumnRg(chunk, group_col, g, gv.data()) ||
+          !TryDecodeInt64ColumnRg(chunk, sum_col, g, sv.data())) {
+        return std::vector<GroupByEntry>{};
+      }
       for (uint32_t i = 0; i < rc; ++i) {
         if (snulls != nullptr && ((snulls[i >> 3] >> (7 - (i & 7))) & 1) != 0) {
           emit_null(gv[i]);
@@ -9123,10 +9198,14 @@ StatusOr<std::vector<GroupByEntryN>> GroupBySumColumns(
       // The decode overwrites every element, so the buffer is only sized,
       // never re-zeroed, when the row group changes length.
       ResizeDecodeBuffer(gbuf[ki], rc);
-      chunk.DecodeInt64ColumnRg(group_cols[ki], g, gbuf[ki].data());
+      if (!TryDecodeInt64ColumnRg(chunk, group_cols[ki], g, gbuf[ki].data())) {
+        return Status::kCorruption;
+      }
     }
     ResizeDecodeBuffer(sbuf, rc);
-    chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
+    if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
+      return Status::kCorruption;
+    }
     const uint8_t* snulls = RgColNullBits(f, g, sum_col);
     for (uint32_t i = 0; i < rc; ++i) {
       key.clear();
@@ -9235,7 +9314,9 @@ std::vector<TopKEntry> TopKColumn(const PaxChunk& chunk, slot_t col, size_t k,
       if (buf.size() < rc) {
         buf.resize(rc);
       }
-      chunk.DecodeInt64ColumnRg(col, g, buf.data());
+      if (!TryDecodeInt64ColumnRg(chunk, col, g, buf.data())) {
+        return {};
+      }
       for (uint16_t i = 0; i < rc; ++i) {
         const TopKEntry e{.value = buf[i], .row = base_row + i};
         if (!full) {

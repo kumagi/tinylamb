@@ -112,7 +112,7 @@ Schema IndexOnlyScan::KeySchema(const Index& idx, const Schema& input_schema) {
   for (const auto& key : is.key_) {
     cols.push_back(input_schema.GetColumn(key));
   }
-  return {"", cols};
+  return {"", std::move(cols)};
 }
 
 Schema IndexOnlyScan::ValueSchema(const Index& idx,
@@ -123,7 +123,7 @@ Schema IndexOnlyScan::ValueSchema(const Index& idx,
   for (const auto& key : is.include_) {
     cols.push_back(input_schema.GetColumn(key));
   }
-  return {"", cols};
+  return {"", std::move(cols)};
 }
 
 Schema IndexOnlyScan::OutputSchema(const Index& idx,
@@ -137,7 +137,7 @@ Schema IndexOnlyScan::OutputSchema(const Index& idx,
   for (const auto& included : is.include_) {
     cols.push_back(input_schema.GetColumn(included));
   }
-  return {"", cols};
+  return {"", std::move(cols)};
 }
 
 bool IndexOnlyScan::TryEnableKeyDeduplication() {
@@ -169,12 +169,23 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
         dst = iter_.GetKey();
       } else {
         const Row& key = iter_.GetKey();
-        dst.values_.clear();
-        dst.values_.reserve(key.values_.size() + include_offsets_.size());
-        dst.values_.insert(dst.values_.end(), key.values_.begin(), key.values_.end());
+        // Build the whole row and assign it in one go instead of mutating
+        // dst.values_ in place: the row's identity is carried by the Row
+        // object, not by its value vector alone, and a stale state left from
+        // the previous iteration must not survive a key replacement.
+        std::vector<Value> combined;
+        combined.reserve(key.Count() + include_offsets_.size());
+        combined.insert(combined.end(), key.values_.begin(), key.values_.end());
         for (slot_t offset : include_offsets_) {
-          dst.values_.push_back(heap_row[offset]);
+          if (offset >= heap_row.Count()) {
+            FailWith(
+                StatusError(StatusCode::kInvalidArgument,
+                            "index only scan INCLUDE offset out of range"));
+            return destination->Size();
+          }
+          combined.push_back(heap_row[offset]);
         }
+        dst = Row(std::move(combined));
       }
     }
     if (distinct_keys_ && dst.IsValid()) {

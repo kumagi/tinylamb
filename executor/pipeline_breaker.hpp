@@ -20,7 +20,12 @@ class PipelineBreaker {
   PipelineBreaker& operator=(PipelineBreaker&&) = delete;
   virtual ~PipelineBreaker() = default;
 
-  [[nodiscard]] virtual bool IsPipelineBreaker() const { return true; }
+  // Fixed trait: deriving from PipelineBreaker is what makes an operator a
+  // pipeline boundary. Keep it non-virtual so a subclass cannot claim the
+  // boundary role while omitting the MaterializePipeline/Materialized* methods
+  // that consumers rely on (an operator that does not materialize must not
+  // derive from this interface at all).
+  [[nodiscard]] bool IsPipelineBreaker() const { return true; }
   [[nodiscard]] virtual bool IsMaterialized() const = 0;
   virtual void MaterializePipeline() = 0;
   [[nodiscard]] virtual size_t MaterializedRowCount() const = 0;

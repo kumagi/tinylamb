@@ -53,13 +53,21 @@ Memo は追記型のデータ構造であるため、元の `Join(L, R)` は保�
 ## 実装の詳細
 
 1. **探索エンジンとの連携**: 探索エンジンのワークリストから Group 内の各代替式に対して順次 Rule が評価されます。`expression.children` に格納された左右の子 GroupId を反転させて `NewJoin` に渡します。
-2. **重複排除の動作**: `Memo::AddExpression` は式を追加する前に指紋を計算し、グループ内に既に同一指紋が存在する場合は登録を破棄します。
+2. **重複排除の動作**: `Memo::AddExpression` は、まず演算子・テーブル・子 GroupId の前方一致で比較し、そこで弾かれなかった場合に限って指紋（`std::optional<std::string>`）を遅延計算して比較します。グループ内に既に同一指紋が存在する場合は登録を破棄します。大半の結合代替は前方一致の段階で異なると分かるため、指紋のシリアライズを回避しています。
 
 ```cpp
-  const std::string fingerprint = expression.Fingerprint();
+  std::optional<std::string> fingerprint;
   const bool duplicate =
       std::ranges::any_of(target.expressions, [&](const auto& existing) {
-        return existing.Fingerprint() == fingerprint;
+        if (existing.operation != expression.operation ||
+            existing.table != expression.table ||
+            existing.children != expression.children) {
+          return false;
+        }
+        if (!fingerprint) {
+          fingerprint = expression.Fingerprint();
+        }
+        return existing.Fingerprint() == *fingerprint;
       });
 ```
 

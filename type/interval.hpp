@@ -148,12 +148,19 @@ struct IntervalValue {
   }
 };
 
+// Session constants live in a thread-local ledger, but several connections
+// share one event-loop thread. The query layer calls this whenever its UDF /
+// session scope changes so every ledger entry belongs to exactly one session;
+// without it a name defined by one connection resolves in another, and one
+// disconnect wipes every connection's constants.
+void SetSessionConstantScope(uint64_t scope);
 void SetSessionConstant(std::string_view name, std::string_view value);
 [[nodiscard]] std::string GetSessionConstant(std::string_view name);
 [[nodiscard]] bool HasSessionConstant(std::string_view name);
-// Drop every session constant on the current thread. Called by the server when
-// a session that defined constants ends so the next session cannot resolve
-// its identifiers through the previous session's values.
+// Drop the current scope's session constants. Called by the server when a
+// session that defined constants ends so the next session cannot resolve its
+// identifiers through the previous session's values; a different live session
+// on this thread keeps its own constants.
 void ClearSessionConstants();
 
 }  // namespace tinylamb

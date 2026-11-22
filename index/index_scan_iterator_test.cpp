@@ -25,6 +25,8 @@
 #include <thread>
 #include <tuple>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
@@ -122,8 +124,10 @@ TEST_F(IndexScanIteratorTest, Construct) {
 
 // T2116: the scan dump must carry the index mode (UNIQUE vs NON_UNIQUE was
 // invisible) and resolve key/include slots against the table schema it
-// already holds; a mode value outside the enum (corrupt record) must render
-// kInvalid(n) instead of nothing.
+// already holds. Dump renders the mode via IndexSchema's operator<<, so the
+// corrupt-mode arm below checks that formatter directly (a persisted mode
+// outside the enum must render kInvalid(n) instead of nothing) -- the normal
+//-mode Dump path is covered by the iterator assertions just above.
 TEST_F(IndexScanIteratorTest, DumpShowsModeAndColumnNames) {
   auto read = db_->BeginReadOnlyContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
@@ -138,12 +142,46 @@ TEST_F(IndexScanIteratorTest, DumpShowsModeAndColumnNames) {
   EXPECT_NE(text.find("2:SampleTable.col3"), std::string::npos) << text;
 
   std::ostringstream broken;
-  broken << IndexSchema("Broken", {0}, {}, static_cast<IndexMode>(200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): exercise unknown persisted mode
-  EXPECT_NE(broken.str().find("kInvalid(200)"), std::string::npos)
+  broken << IndexSchema(
+      "Broken", {0}, {},
+      static_cast<IndexMode>(
+          200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange):
+                  // exercise unknown persisted mode
+  EXPECT_NE(broken.str().find("Invalid(200)"), std::string::npos)
       << broken.str();
   std::ostringstream pk;
   pk << IndexSchema("PK", {0});
   EXPECT_NE(pk.str().find(" Unique]"), std::string::npos) << pk.str();
+}
+
+// A catalog re-open must not resurrect INCLUDE duplicates (or a key repeated
+// under INCLUDE) that the IndexSchema constructor had already removed: an
+// index-only scan would otherwise emit the same column twice.
+TEST(IndexSchemaDecodeTest, GenerateCompositeKeyPreservesEncodedValues) {
+  Row row({Value(int64_t{42}), Value(std::string(32, 'x')), Value()});
+  IndexSchema schema("composite", {0, 1, 2});
+  const std::string expected = row[0].EncodeMemcomparableFormat() +
+                               row[1].EncodeMemcomparableFormat() +
+                               row[2].EncodeMemcomparableFormat();
+  EXPECT_EQ(schema.GenerateKey(row), expected);
+}
+
+TEST(IndexSchemaDecodeTest, DeduplicatesStoredIncludes) {
+  std::stringstream stream;
+  {
+    Encoder encoder(stream);
+    // Write the raw fields: the constructor dedups, but operator>> must too.
+    encoder << std::string("DupIdx") << std::vector<slot_t>{0}
+            << std::vector<slot_t>{0, 1, 1, 2}
+            << static_cast<uint8_t>(IndexMode::kNonUnique);
+  }
+  Decoder decoder(stream);
+  IndexSchema decoded;
+  decoder >> decoded;
+  ASSERT_FALSE(decoder.Failed());
+  EXPECT_EQ(decoded.key_, (std::vector<slot_t>{0}));
+  EXPECT_EQ(decoded.include_, (std::vector<slot_t>{1, 2}));
+  EXPECT_EQ(decoded.mode_, IndexMode::kNonUnique);
 }
 
 TEST_F(IndexScanIteratorTest, ProjectedDecodeCanRebindWithoutChangingPosition) {

@@ -107,6 +107,10 @@ struct SelectSource {
   std::optional<TableSampleSpec> sample;
 };
 
+// There is deliberately no kExplain here: EXPLAIN [ANALYZE] (and its
+// PIPELINE variants) is a Prepare-level string prefix for SELECT/WITH only and
+// never becomes a Statement.  Do not add a kExplain member when extending the
+// visitor; reject other statement kinds before executing them.
 enum class StatementType : uint8_t {
   kCreateTable,
   kDropTable,

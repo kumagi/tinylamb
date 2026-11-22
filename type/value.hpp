@@ -259,9 +259,9 @@ class Value {
     }
     InitCopySlow(o);
   }
-  // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar move may allocate
-  [[gnu::always_inline]] Value(Value&& o)
-      : value(o.value), type(o.type) {
+  // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar
+  // move may allocate
+  [[gnu::always_inline]] Value(Value&& o) : value(o.value), type(o.type) {
     if (TINYLAMB_VALUE_SCALAR(type)) [[likely]] {
       collation_ = o.collation_;
       o.type = ValueType::kNull;
@@ -290,7 +290,8 @@ class Value {
     CopyAssignSlow(rhs);
     return *this;
   }
-  // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar move may allocate
+  // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar
+  // move may allocate
   [[gnu::always_inline]] Value& operator=(Value&& o) {
     if (this == &o) [[unlikely]] {
       return *this;
@@ -423,7 +424,8 @@ class Value {
   [[nodiscard]] StatusOr<bool> TryLess(const Value& rhs) const;
   [[nodiscard]] StatusOr<bool> TryGreater(const Value& rhs) const;
   // Hot path: homogeneous scalar ordering (statistics tracking, sort keys)
-  // resolves inline; mismatched types, NULLs, unsigned tags, collation,
+  // resolves inline for the numerically ordered tags; mismatched types, NULLs,
+  // unsigned tags, VARCHAR (its canonical order needs collation/ENUM rank),
   // interval-shaped strings and arrays tail into LessSlow.
   bool operator<(const Value& rhs) const {
     if (type == rhs.type) [[likely]] {
@@ -438,10 +440,11 @@ class Value {
         case ValueType::kDouble:
           return value.double_value < rhs.value.double_value;
         case ValueType::kVarChar: {
-          if (IsInterval() || rhs.IsInterval()) {
-            break;
-          }
-          return value.varchar_value < rhs.value.varchar_value;
+          // Canonical VARCHAR order (collation tag, ENUM rank, interval
+          // parsing) is defined by TryLess/CompareWithCollation. A raw
+          // std::string_view byte compare here used to disagree with ORDER BY
+          // and GROUP BY (#11464), so every VARCHAR pair tails into LessSlow.
+          break;
         }
         default:
           break;
@@ -455,8 +458,8 @@ class Value {
   // (inline homogeneous fast path + LessSlow total order) mirrors
   // TryGreater for every tag combination, so operator> reuses it verbatim
   // instead of forcing every comparison through the StatusOr TryGreater —
-  // homogeneous non-interval VARCHAR paid an interval re-parse there while
-  // operator< completes with a raw byte compare.
+  // homogeneous VARCHAR now pays the canonical collation-aware compare either
+  // way, so keeping operator> a flip of operator< preserves that agreement.
   bool operator>(const Value& rhs) const { return rhs.operator<(*this); }
   // Derived from < and == (not from negating >) so that NaN, which compares
   // false against everything in both < and >, stays consistent: the old
@@ -591,24 +594,41 @@ class Value {
   [[nodiscard]] std::string MoveString();
 
   // Collation attachment (COLLATE(value, spec)).  0 = none, 1 = 'binary',
-  // 2 = case-insensitive ('und:ci' style).  The tag survives serialization
-  // and participates in hashing, but the generic Value comparison paths in
-  // value.cpp do NOT fold case from it -- case-insensitive equality/ordering
-  // is applied by call sites that resolve the collation explicitly (join
-  // keys, ORDER BY, set ops via EqualUnderCollation in type/collation.cpp).
-  // Carrying the tag here keeps those call sites able to recover the intent.
+  // 2 = case-insensitive ('und:ci' style).  The tag survives serialization.
+  // The generic Value comparison paths (TryLess/TryGreater ->
+  // CompareWithCollation, and LessSlow/operator<) DO fold case when either
+  // side carries the case-insensitive tag; explicit call sites (join keys,
+  // ORDER BY, set ops via EqualUnderCollation in type/collation.cpp) resolve
+  // the same collation contract themselves. std::hash<Value> only consults
+  // the tag for interval-shaped VARCHARs: an ordinary case-insensitive string
+  // hashes exactly like its binary twin, so don't rely on the tag to split
+  // hash buckets. Carrying it here keeps both comparison paths able to
+  // recover the intent.
   [[nodiscard]] uint8_t Collation() const { return collation_; }
-  void SetCollation(uint8_t collation) { collation_ = collation; }
+  // Reject unknown serialized tags without changing the existing value.
+  bool SetCollation(uint8_t collation) {
+    if (collation > 4) return false;
+    collation_ = collation;
+    return true;
+  }
   [[nodiscard]] bool IsCaseInsensitive() const { return collation_ == 2; }
   // UINT64 values share the INT64 storage representation, so retain their
   // SQL signedness in the otherwise-unused collation tag.  This lets joins
   // and comparisons distinguish UINT64(2^64-1) from INT64(-1).
-  [[nodiscard]] bool IsUnsigned() const { return collation_ == 3; }
+  [[nodiscard]] bool IsUnsigned() const {
+    // The tag is also restored on NULLs decoded from older spill streams;
+    // require a real payload so a NULL never masquerades as UINT64.
+    return type != ValueType::kNull && collation_ == 3;
+  }
   // Hot path: tag in place (WithUnsigned copies the whole value).
-  void SetUnsigned() { collation_ = 3; }
+  // NULL has no signedness, so never turn it into a "UINT64 NULL" here.
+  void SetUnsigned() {
+    if (type == ValueType::kNull) return;
+    collation_ = 3;
+  }
   [[nodiscard]] Value WithUnsigned() const {
     Value copy = *this;
-    copy.collation_ = 3;
+    copy.SetUnsigned();
     return copy;
   }
   [[nodiscard]] bool IsInterval() const {
@@ -622,7 +642,12 @@ class Value {
   }
   [[nodiscard]] Value WithCollation(uint8_t collation) const {
     Value copy = *this;
-    copy.collation_ = collation;
+    // A tagged NULL would be indistinguishable from a tagged number after a
+    // spill round-trip (IsUnsigned()/CollationOf() read only the tag), and
+    // NULL==NULL would stop agreeing with itself. Leave NULL untouched.
+    if (copy.type != ValueType::kNull) {
+      copy.SetCollation(collation);
+    }
     return copy;
   }
 

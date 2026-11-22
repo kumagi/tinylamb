@@ -106,7 +106,10 @@ bool SplitTrailingIdentifier(const std::string& s, size_t* split) {
           s[end - 1] == '_')) {
     --end;
   }
-  if (end == s.size() || end == 0) {
+  // The identifier must be preceded by whitespace *and* by a non-empty
+  // expression. `end == 1` leaves no expression before the separator (and
+  // would make the loop bound `end - 1` zero), so reject it explicitly.
+  if (end == s.size() || end < 2) {
     return false;
   }
   // The identifier must be preceded by whitespace...
@@ -719,7 +722,11 @@ GoogleSqlComplianceCase ParseSegment(
 }
 
 std::string Unquote(std::string_view token) {
-  if (!token.empty() && (token.front() == 'b' || token.front() == 'B')) {
+  // A bytes prefix is only a prefix when it is immediately followed by a
+  // quote.  Stripping a leading 'b' from a bare token such as `banana` would
+  // silently corrupt the golden (`anana`).
+  if (token.size() >= 2 && (token.front() == 'b' || token.front() == 'B') &&
+      (token[1] == '"' || token[1] == '\'')) {
     token.remove_prefix(1);
   }
   if (token.size() >= 2 && ((token.front() == '"' && token.back() == '"') ||
@@ -730,11 +737,19 @@ std::string Unquote(std::string_view token) {
       if (token[i] == '\\' && i + 2 < token.size()) {
         char next = token[++i];
         if (next == 'x' && i + 2 < token.size()) {
-          std::string hex_str = std::string(token.substr(i + 1, 2));
+          const std::string hex_str = std::string(token.substr(i + 1, 2));
+          size_t consumed = 0;
           try {
-            int val = std::stoi(hex_str, nullptr, 16);
-            out.push_back(static_cast<char>(val));
-            i += 2;
+            const int val = std::stoi(hex_str, &consumed, 16);
+            // std::stoi accepts a numeric prefix ("1g" parses as 1).  A
+            // well-formed \x escape has exactly two hex digits and fits in a
+            // byte; anything else stays literal instead of injecting garbage.
+            if (consumed == hex_str.size() && val >= 0 && val <= 0xFF) {
+              out.push_back(static_cast<char>(val));
+              i += 2;
+            } else {
+              out.push_back(next);
+            }
           } catch (...) {
             out.push_back(next);
           }
@@ -1070,9 +1085,11 @@ void SplitProtoMembers(const std::string& body,
     if (!piece.empty()) {
       const size_t colon = piece.find(':');
       // Only treat the first top-level colon as a name separator when the
-      // prefix is identifier-shaped.
+      // prefix is identifier-shaped.  An empty value (`field:` at the end of
+      // the piece) is valid: `colon + 1 <= piece.size()` allows it, unlike
+      // `colon + 1 <= piece.size() - 1`.
       bool ident = colon != std::string::npos && colon > 0 &&
-                   colon + 1 <= piece.size() - 1 && ProtoIsIdentStart(piece[0]);
+                   colon + 1 <= piece.size() && ProtoIsIdentStart(piece[0]);
       for (size_t k = 0; ident && k < colon; ++k) {
         const char c = piece[k];
         if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_' &&
@@ -1375,7 +1392,8 @@ bool ComplianceErrorTextMatches(std::string_view expected,
   // StatusCode names as spelled by common/constants.hpp ToString; used to
   // recover the engine's error category from "<Name>: message" reports.
   auto is_status_code_name = [](std::string_view name) {
-    static constexpr std::string_view kNames[] = {  // NOLINT(modernize-avoid-c-arrays)
+    static constexpr std::string_view kNames[] = {
+        // NOLINT(modernize-avoid-c-arrays)
         // NOLINT(modernize-avoid-c-arrays)
         "Unknown",
         "Success",
@@ -1396,7 +1414,7 @@ bool ComplianceErrorTextMatches(std::string_view expected,
         "MemoryLimitExceeded",
     };
     for (const std::string_view n :  // NOLINT(readability-use-anyofallof)
-         kNames) {  // NOLINT(readability-use-anyofallof)
+         kNames) {                   // NOLINT(readability-use-anyofallof)
       if (n == name) {
         return true;
       }
@@ -1467,9 +1485,6 @@ bool ComplianceErrorTextMatches(std::string_view expected,
     msg = msg.substr(0, at_pos);
   }
   const std::string want = normalize(msg);
-  if (want.empty()) {
-    return true;
-  }
   const std::string got = normalize(actual);
   // The engine's error category: a "<Name>:" prefix inside the reported text
   // wins (executor errors embed ToString(status)); otherwise fall back to
@@ -1482,8 +1497,10 @@ bool ComplianceErrorTextMatches(std::string_view expected,
       observed = actual.substr(0, colon);
     }
   }
-  if (got.empty()) {
-    // No message to compare: only a matching error category can vouch.
+  if (want.empty() || got.empty()) {
+    // No message to compare on one side.  Only a matching error category can
+    // vouch: an empty expectation ("ERROR:" or "ERROR: generic::code:" with
+    // no text) must never become a wildcard that passes any error.
     return !generic_code.empty() && code_allowed(generic_code, observed);
   }
   if (got.find(want) != std::string::npos) {
@@ -1529,7 +1546,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     const std::string lower_actual_type = ToLower(actual.ArrayElementSqlType());
     // ENUM<T> / PROTO<T> goldens match engines that carry the bare type path
     // (ENUM<googlesql_test.X> vs "googlesql_test.X").
-    if (lower_type != lower_actual_type &&
+    if (!lower_type.empty() && lower_type != lower_actual_type &&
         (lower_type.starts_with("enum<") || lower_type.starts_with("proto<")) &&
         lower_type.back() == '>') {
       const std::string unwrapped =
@@ -1660,26 +1677,39 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     return actual.type == ValueType::kInt64 && actual.value.int_value == 0;
   }
   if (actual.type == ValueType::kInt64) {
+    // A quoted ("5") or bytes (b"5") golden declares a STRING expectation.
+    // Accepting its digits as an INT64 would hide a type-tag confusion — the
+    // VARCHAR branch below rejects the mirror-image case for the same reason.
     if ((want.size() >= 2 && want.front() == '"' && want.back() == '"') ||
         (want.size() >= 3 && (want.front() == 'b' || want.front() == 'B') &&
          want[1] == '"' && want.back() == '"')) {
-      const std::string token =
-          want.front() == 'b' || want.front() == 'B' ? want.substr(1) : want;
-      return std::to_string(actual.value.int_value) == Unquote(token);
+      return false;
     }
+    // std::stoll parses only a numeric prefix ("2.5" -> 2, "1e3" -> 1), so
+    // require the whole golden to be consumed. Otherwise a DOUBLE golden
+    // would match a truncated INT64 value and hide a real rounding bug.
+    size_t consumed = 0;
     try {
-      return actual.value.int_value == static_cast<int64_t>(std::stoll(want));
-    } catch (...) {
-      // Goldens may carry UINT64 magnitudes (2^63 .. 2^64-1) that engines
-      // storing every integer as INT64 keep as their two's-complement bit
-      // pattern; compare those on the unsigned bit representation.
-      try {
-        return static_cast<uint64_t>(actual.value.int_value) ==
-               std::stoull(want);
-      } catch (...) {
-        return false;
+      const int64_t parsed = std::stoll(want, &consumed);
+      if (consumed == want.size()) {
+        return actual.value.int_value == parsed;
       }
+    } catch (...) {
+      // Overflow (a UINT64 magnitude) or a non-numeric golden: retry below.
+      consumed = 0;
     }
+    // Goldens may carry UINT64 magnitudes (2^63 .. 2^64-1) that engines
+    // storing every integer as INT64 keep as their two's-complement bit
+    // pattern; compare those on the unsigned bit representation.
+    try {
+      const uint64_t parsed = std::stoull(want, &consumed);
+      if (consumed == want.size()) {
+        return static_cast<uint64_t>(actual.value.int_value) == parsed;
+      }
+    } catch (...) {
+      return false;
+    }
+    return false;
   }
   if (actual.type == ValueType::kDouble) {
     const std::string lower_want = ToLower(want);
@@ -1711,12 +1741,13 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     if (parsed == 0.0) {
       return got == 0.0;
     }
-    const double scale = std::max(  // NOLINT(modernize-min-max-use-initializer-list)
-        std::max(
-            std::fabs(got),
-            std::fabs(
-                parsed)),  // NOLINT(modernize-min-max-use-initializer-list)
-        std::numeric_limits<double>::min());
+    const double scale =
+        std::max(  // NOLINT(modernize-min-max-use-initializer-list)
+            std::max(
+                std::fabs(got),
+                std::fabs(
+                    parsed)),  // NOLINT(modernize-min-max-use-initializer-list)
+            std::numeric_limits<double>::min());
     // A few-ULP relative bound: goldens produced by the same IEEE-754
     // computation agree to the last bits, so a looser tolerance hides real
     // discrepancies in the 7th significant digit. The DBL_MIN floor keeps
@@ -1751,7 +1782,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         if (consumed == want.size()) {
           return false;
         }
-      } catch (  // NOLINT(bugprone-empty-catch)
+      } catch (   // NOLINT(bugprone-empty-catch)
           ...) {  // NOLINT(bugprone-empty-catch) non-numeric golden is expected
       }
       try {
@@ -1759,7 +1790,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         if (consumed == want.size()) {
           return false;
         }
-      } catch (  // NOLINT(bugprone-empty-catch)
+      } catch (   // NOLINT(bugprone-empty-catch)
           ...) {  // NOLINT(bugprone-empty-catch) non-numeric golden is expected
       }
     }
@@ -1858,23 +1889,11 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         if (actual_elements.size() == expected_elements.size()) {
           bool matched = true;
           for (size_t i = 0; i < actual_elements.size(); ++i) {
-            const std::string item = Trim(actual_elements[i]);
-            if (ToLower(item) == "null") {
-              if (!ComplianceValueMatches(Value(), expected_elements[i])) {
-                matched = false;
-                break;
-              }
-            } else {
-              std::string scalar = item;
-              if (scalar.size() >= 2 && scalar.front() == '"' &&
-                  scalar.back() == '"') {
-                scalar = Unquote(scalar);
-              }
-              if (!ComplianceValueMatches(Value(std::move(scalar)),
-                                          expected_elements[i])) {
-                matched = false;
-                break;
-              }
+            if (!ComplianceValueMatches(
+                    ParseEmbeddedComplianceValue(actual_elements[i]),
+                    expected_elements[i])) {
+              matched = false;
+              break;
             }
           }
           if (matched) {
@@ -2078,8 +2097,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
           if (name.empty()) {
             return val;
           }
-          return name + "=" +  // NOLINT(performance-inefficient-string-concatenation)
-                 val;  // NOLINT(performance-inefficient-string-concatenation)
+          return name +
+                 "=" +  // NOLINT(performance-inefficient-string-concatenation)
+                 val;   // NOLINT(performance-inefficient-string-concatenation)
         }
       }
       return elem;
@@ -2215,6 +2235,12 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         std::chrono::year_month_day ymd{
             std::chrono::year{Y}, std::chrono::month{static_cast<unsigned>(M)},
             std::chrono::day{static_cast<unsigned>(D)}};
+        // sys_days{ymd} requires ymd.ok(): converting a calendar-invalid date
+        // (month 13, day 45, ...) is UB and aborts in assertion builds.  The
+        // sscanf field count alone cannot establish a valid date.
+        if (!ymd.ok()) {
+          return {false, {0, 0}};
+        }
         int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
         int64_t total_secs =
             (days * 86400LL) + (h * 3600LL) + (m * 60LL) + sec - tz_sec;

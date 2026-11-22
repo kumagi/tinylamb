@@ -55,6 +55,33 @@ TEST(SortedDistinctRunsTest, FiveMillionInputsUseBoundedRuns) {
   EXPECT_EQ(expected, kDomain);
 }
 
+TEST(SortedDistinctRunsTest, FailedAbsorbPreservesBothInputs) {
+  SortedDistinctRuns left, right;
+  ASSERT_SUCCESS(left.Add(std::array<uint64_t, 2>{1, 3}));
+  ASSERT_SUCCESS(right.Add(std::array<uint64_t, 2>{2, 4}));
+  SortedDistinctRuns::SetFailNextMergeForTest(true);
+  EXPECT_FALSE(left.Absorb(std::move(right)).ok());
+  SortedDistinctRuns::SetFailNextMergeForTest(false);
+  ASSERT_SUCCESS(left.Absorb(std::move(right)));
+  std::vector<uint64_t> actual;
+  ASSERT_SUCCESS(left.ForEach([&](uint64_t v) { actual.push_back(v); }));
+  EXPECT_EQ(actual, (std::vector<uint64_t>{1, 2, 3, 4}));
+}
+
+TEST(SortedDistinctRunsTest, FailedForEachMergePreservesAllRuns) {
+  SortedDistinctRuns runs;
+  ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{1, 3}));
+  ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{2, 3}));
+  ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{3, 4}));
+  ASSERT_EQ(runs.RunCountForTest(), 2U);
+  SortedDistinctRuns::SetFailNextMergeForTest(true);
+  EXPECT_FALSE(runs.ForEach([](uint64_t) {}).ok());
+  SortedDistinctRuns::SetFailNextMergeForTest(false);
+  std::vector<uint64_t> actual;
+  ASSERT_SUCCESS(runs.ForEach([&](uint64_t v) { actual.push_back(v); }));
+  EXPECT_EQ(actual, (std::vector<uint64_t>{1, 2, 3, 4}));
+}
+
 TEST(SortedDistinctRunsTest, FailedMergeKeepsPriorRunsUsable) {
   SortedDistinctRuns runs;
   ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{1, 3}));

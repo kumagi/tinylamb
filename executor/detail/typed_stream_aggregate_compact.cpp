@@ -1317,13 +1317,25 @@ StatusOr<bool> TryBuildPackedGroupingSets(
     const std::vector<uint8_t>& flat_arg_kinds, bool exact_partial_merge,
     bool finite_sum, bool all_double, bool no_nulls, bool finest_keys_unique,
     std::vector<TypedWorkerGroups>& groups, std::vector<size_t>& row_groups,
-    std::vector<std::vector<size_t>>& coarse_maps) {
+    std::vector<std::vector<size_t>>& coarse_maps,
+    QueryMemoryCharge* retained_charge) {
   const bool is_columnar = input.HasColumnarOnly();
   const ColumnarTable* columnar = is_columnar ? input.columnar.get() : nullptr;
   const size_t nrows = input.TotalRows();
   const bool use_flat_args = !flat_double_args.empty();
   const bool need_row_groups = !row_groups.empty();
   const size_t count = plans.size();
+  const auto reserve_packed_groups = [&](size_t group_count, size_t map_rows) {
+    // The packed-only path stores one row ID, packed key and slim SUM state
+    // per group. Allow for growth of the representative/key vectors as well
+    // as the mapping from each finest group to this set.
+    constexpr size_t kBytesPerGroup =
+        (2 * (sizeof(uint32_t) + sizeof(uint64_t))) + (3 * sizeof(int64_t)) +
+        sizeof(uint8_t);
+    return retained_charge == nullptr ||
+           retained_charge->TryAdd((group_count * kBytesPerGroup) +
+                                   (map_rows * sizeof(size_t)));
+  };
   std::vector<slot_t> unique_cols;
   unique_cols.reserve(plans.size());
   for (const auto& plan : plans) {
@@ -1569,6 +1581,9 @@ StatusOr<bool> TryBuildPackedGroupingSets(
 
   // Trivial single-group path when every grouping column has cardinality 1.
   if (set_masks[0] == 0) {
+    if (!reserve_packed_groups(count, (count - 1) + row_groups.size())) {
+      return false;
+    }
     std::vector<std::vector<std::vector<uint32_t>>>().swap(worker_codes);
     std::vector<std::vector<std::vector<uint32_t>>>().swap(local_to_global);
     groups[0].ReserveGroups(1);
@@ -1967,6 +1982,9 @@ StatusOr<bool> TryBuildPackedGroupingSets(
     // The fused partial aggregate already emitted one row per finest key.
     // Use its row index as the group ID and keep the original row order.
     total_groups = nrows;
+    if (!reserve_packed_groups(total_groups, 0)) {
+      return false;
+    }
     finest.ReserveGroups(nrows);
     finest.group_count = nrows;
     if (is_columnar) {
@@ -2010,6 +2028,9 @@ StatusOr<bool> TryBuildPackedGroupingSets(
     }
     const size_t pg_count = groups[parent].GroupCount();
     if (set_masks[s] == 0 && pg_count > 0) {
+      if (!reserve_packed_groups(1, total_groups)) {
+        return false;
+      }
       groups[s].ReserveGroups(1);
       groups[s].group_count = 1;
       if (is_columnar) {
@@ -2023,6 +2044,9 @@ StatusOr<bool> TryBuildPackedGroupingSets(
       continue;
     }
     if (set_masks[s] == set_masks[parent]) {
+      if (!reserve_packed_groups(pg_count, total_groups)) {
+        return false;
+      }
       groups[s].ReserveGroups(pg_count);
       groups[s].group_count = pg_count;
       if (is_columnar) {
@@ -2041,6 +2065,13 @@ StatusOr<bool> TryBuildPackedGroupingSets(
     }
     const uint64_t mask_s = set_masks[s];
     const auto& parent_pks = group_pks[parent];
+    QueryMemoryCharge work_charge;
+    // One level at a time holds the hash index, radix buckets and parent
+    // mappings. Charge this separately from the retained groups.
+    if (retained_charge != nullptr &&
+        !work_charge.TryAdd((pg_count * 128) + (size_t{64} << 10))) {
+      return false;
+    }
     if (pg_count >= 16384 && agg_workers > 1) {
       const size_t cw = std::min<size_t>(8, agg_workers);
       std::vector<uint64_t> c_pks(pg_count);
@@ -2113,6 +2144,9 @@ StatusOr<bool> TryBuildPackedGroupingSets(
           c_active_w.push_back(w);
         }
       }
+      if (!reserve_packed_groups(total_c, total_groups)) {
+        return false;
+      }
       groups[s].ReserveGroups(total_c);
       groups[s].group_count = total_c;
       group_pks[s].resize(total_c);
@@ -2174,6 +2208,9 @@ StatusOr<bool> TryBuildPackedGroupingSets(
             c_out_pks.push_back(cpk);
           }
           parent_groups[g] = *slot;
+        }
+        if (!reserve_packed_groups(c_row_ids.size(), total_groups)) {
+          return false;
         }
         groups[s].ReserveGroups(c_row_ids.size());
         groups[s].group_count = c_row_ids.size();
@@ -4780,8 +4817,11 @@ StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
   std::vector<Column> columns;
   columns.reserve(statement.SelectList().size());
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-    columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
-                         ValueTypeFromTypeTag(statement.SelectList()[i].expression->ResultType(input.schema).GetType()));
+    columns.emplace_back(
+        ProjectionName(statement.SelectList()[i], i),
+        ValueTypeFromTypeTag(statement.SelectList()[i]
+                                 .expression->ResultType(input.schema)
+                                 .GetType()));
   }
   const auto finish_row_into = [&](size_t r, AggregateResultMap* finished,
                                    const std::vector<Value*>& agg_slots,
@@ -4896,7 +4936,9 @@ StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
   }
   if (!output.rows.empty()) {
     for (size_t i = 0; i < columns.size(); ++i) {
-      if (output.rows.front()[i].IsNull()) { continue; }
+      if (output.rows.front()[i].IsNull()) {
+        continue;
+      }
       columns[i] =
           Column(columns[i].Name(), ValueTypeOf(output.rows.front()[i]));
       columns[i].SetUnsigned(output.rows.front()[i].IsUnsigned());
@@ -4924,6 +4966,340 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
       (!columnar_only && input.rows.size() != input.TotalRows()) ||
       !statement.OrderBy().empty() || HasWindowFunctions(statement)) {
     return std::optional<Relation>{};
+  }
+  // Fast path before PlanTypedAggregation: ungrouped scalar COUNT(CASE WHEN
+  // <AND of int_col op const> THEN <non-null const> ELSE NULL END) over a
+  // ColumnarTable (e.g. merged multi-bucket scalar counts such as TPC-DS Q88
+  // and Q90). Bypasses PlanTypedAggregation's CASE rejection and runs across
+  // all query workers with zero Row materialization.
+  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  //   (scalar_count_case_int_cmps_sound)
+  if ((!columnar_only || input.columnar != nullptr) &&
+      statement.GroupBy().empty() && !statement.Having() &&
+      !statement.Distinct() && !statement.HasDistinctOn() &&
+      !aggregates.empty() && aggregates.size() <= 16 &&
+      statement.SelectList().size() == aggregates.size()) {
+    struct FastIntCmp {
+      slot_t col{0};
+      BinaryOperation op{BinaryOperation::kEquals};
+      int64_t val{0};
+    };
+    const size_t agg_count = aggregates.size();
+    std::vector<std::vector<FastIntCmp>> fcases(agg_count);
+    std::vector<size_t> out_to_agg(agg_count, SIZE_MAX);
+    bool all_fast_cc = true;
+    auto eval_const_i64 = [](const Expression& e, int64_t* out) -> bool {
+      if (!e) return false;
+      if (e->Type() == TypeTag::kConstantValue) {
+        const Value& v = e->AsConstantValue().GetValue();
+        if (v.IsNull() ||
+            (v.type != ValueType::kInt64 && v.type != ValueType::kDate) ||
+            v.IsUnsigned()) {
+          return false;
+        }
+        *out = v.value.int_value;
+        return true;
+      }
+      if (e->Type() == TypeTag::kBinaryExp) {
+        const auto& b = e->AsBinaryExpression();
+        if (b.Left() && b.Right() &&
+            b.Left()->Type() == TypeTag::kConstantValue &&
+            b.Right()->Type() == TypeTag::kConstantValue) {
+          const Value& lval = b.Left()->AsConstantValue().GetValue();
+          const Value& rval = b.Right()->AsConstantValue().GetValue();
+          if (!lval.IsNull() && !rval.IsNull() &&
+              lval.type == ValueType::kInt64 &&
+              rval.type == ValueType::kInt64 && !lval.IsUnsigned() &&
+              !rval.IsUnsigned()) {
+            if (b.Op() == BinaryOperation::kAdd &&
+                !__builtin_add_overflow(lval.value.int_value,
+                                        rval.value.int_value, out)) {
+              return true;
+            }
+            if (b.Op() == BinaryOperation::kSubtract &&
+                !__builtin_sub_overflow(lval.value.int_value,
+                                        rval.value.int_value, out)) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    };
+    std::function<bool(const Expression&, std::vector<FastIntCmp>*)>
+        parse_and_cmps =
+            [&](const Expression& e, std::vector<FastIntCmp>* out) -> bool {
+      if (!e || e->Type() != TypeTag::kBinaryExp) return false;
+      const auto& b = e->AsBinaryExpression();
+      if (b.Op() == BinaryOperation::kAnd) {
+        return parse_and_cmps(b.Left(), out) && parse_and_cmps(b.Right(), out);
+      }
+      const BinaryOperation op = b.Op();
+      if (op != BinaryOperation::kEquals && op != BinaryOperation::kNotEquals &&
+          op != BinaryOperation::kLessThan &&
+          op != BinaryOperation::kLessThanEquals &&
+          op != BinaryOperation::kGreaterThan &&
+          op != BinaryOperation::kGreaterThanEquals) {
+        return false;
+      }
+      auto extract_col = [&](const Expression& ce, slot_t* slot_out) -> bool {
+        if (!ce || ce->Type() != TypeTag::kColumnValue) return false;
+        const auto off = LocalColumnOffset(input.schema,
+                                           ce->AsColumnValue().GetColumnName());
+        if (!off.has_value() ||
+            static_cast<size_t>(*off) >= input.schema.ColumnCount()) {
+          return false;
+        }
+        const Column& col = input.schema.GetColumn(static_cast<size_t>(*off));
+        if (col.IsUnsigned() || (col.Type() != ValueType::kInt64 &&
+                                 col.Type() != ValueType::kDate)) {
+          return false;
+        }
+        *slot_out = *off;
+        return true;
+      };
+      slot_t col = 0;
+      int64_t val = 0;
+      if (extract_col(b.Left(), &col) && eval_const_i64(b.Right(), &val)) {
+        out->push_back({col, op, val});
+        return true;
+      }
+      if (eval_const_i64(b.Left(), &val) && extract_col(b.Right(), &col)) {
+        BinaryOperation flipped = op;
+        if (op == BinaryOperation::kLessThan)
+          flipped = BinaryOperation::kGreaterThan;
+        else if (op == BinaryOperation::kLessThanEquals)
+          flipped = BinaryOperation::kGreaterThanEquals;
+        else if (op == BinaryOperation::kGreaterThan)
+          flipped = BinaryOperation::kLessThan;
+        else if (op == BinaryOperation::kGreaterThanEquals)
+          flipped = BinaryOperation::kLessThanEquals;
+        out->push_back({col, flipped, val});
+        return true;
+      }
+      return false;
+    };
+    for (size_t i = 0; i < agg_count; ++i) {
+      const auto& sel_item = statement.SelectList()[i];
+      if (!sel_item.expression ||
+          sel_item.expression->Type() != TypeTag::kAggregateExp) {
+        all_fast_cc = false;
+        break;
+      }
+      const AggregateExpression* ap =
+          &sel_item.expression->AsAggregateExpression();
+      const auto it = std::ranges::find(aggregates, ap);
+      if (it == aggregates.end() || ap->GetType() != AggregationType::kCount ||
+          ap->Distinct() || ap->HasWhereFilter() || !ap->Child() ||
+          ap->Child()->Type() != TypeTag::kCaseExp) {
+        all_fast_cc = false;
+        break;
+      }
+      const auto aidx =
+          static_cast<size_t>(std::distance(aggregates.begin(), it));
+      out_to_agg[i] = aidx;
+      const auto& ce = ap->Child()->AsCaseExpression();
+      if (ce.when_clauses_.size() != 1 || !ce.when_clauses_[0].first ||
+          !ce.when_clauses_[0].second ||
+          ce.when_clauses_[0].second->Type() != TypeTag::kConstantValue ||
+          ce.when_clauses_[0].second->AsConstantValue().GetValue().IsNull()) {
+        all_fast_cc = false;
+        break;
+      }
+      if (ce.else_clause_ != nullptr &&
+          (ce.else_clause_->Type() != TypeTag::kConstantValue ||
+           !ce.else_clause_->AsConstantValue().GetValue().IsNull())) {
+        all_fast_cc = false;
+        break;
+      }
+      if (!parse_and_cmps(ce.when_clauses_[0].first, &fcases[aidx]) ||
+          fcases[aidx].empty()) {
+        all_fast_cc = false;
+        break;
+      }
+    }
+    if (all_fast_cc && columnar_only) {
+      const ColumnarTable& col_tbl = *input.columnar;
+      for (const ColumnarChunk& ch : col_tbl.chunks) {
+        if (ch.rows == 0) continue;
+        for (size_t a = 0; a < agg_count && all_fast_cc; ++a) {
+          for (const auto& cmp : fcases[a]) {
+            if (cmp.col >= ch.columns.size() ||
+                !ch.columns[cmp.col].is_uniform ||
+                ch.columns[cmp.col].is_unsigned ||
+                (ch.columns[cmp.col].type != ValueType::kInt64 &&
+                 ch.columns[cmp.col].type != ValueType::kDate)) {
+              all_fast_cc = false;
+              break;
+            }
+          }
+        }
+        if (!all_fast_cc) break;
+      }
+    }
+    if (all_fast_cc) {
+      const auto started = std::chrono::steady_clock::now();
+      const size_t total_rows =
+          columnar_only ? input.columnar->total_rows : input.rows.size();
+      std::array<int64_t, 16> totals{};
+      totals.fill(0);
+      auto eval_op = [](int64_t v, BinaryOperation op,
+                        int64_t rhs) noexcept -> bool {
+        switch (op) {
+          case BinaryOperation::kEquals:
+            return v == rhs;
+          case BinaryOperation::kNotEquals:
+            return v != rhs;
+          case BinaryOperation::kLessThan:
+            return v < rhs;
+          case BinaryOperation::kLessThanEquals:
+            return v <= rhs;
+          case BinaryOperation::kGreaterThan:
+            return v > rhs;
+          case BinaryOperation::kGreaterThanEquals:
+            return v >= rhs;
+          default:
+            return false;
+        }
+      };
+      if (total_rows > 0) {
+        const size_t max_w =
+            QueryParallelWorkerLimit(std::thread::hardware_concurrency());
+        const size_t workers =
+            total_rows >= 8192 && max_w > 1
+                ? std::min<size_t>(max_w, (total_rows + 4095) / 4096)
+                : 1;
+        std::vector<std::array<int64_t, 16>> wcounts(workers);
+        for (auto& arr : wcounts) arr.fill(0);
+        if (columnar_only) {
+          const ColumnarTable& col_tbl = *input.columnar;
+          std::vector<uint32_t> chunk_prefix;
+          chunk_prefix.reserve(col_tbl.chunks.size() + 1);
+          chunk_prefix.push_back(0);
+          size_t pfx = 0;
+          for (const ColumnarChunk& ch : col_tbl.chunks) {
+            pfx += ch.rows;
+            chunk_prefix.push_back(static_cast<uint32_t>(pfx));
+          }
+          auto run_w = [&](size_t w) {
+            const size_t begin = (total_rows * w) / workers;
+            const size_t end = (total_rows * (w + 1)) / workers;
+            if (begin >= end) return;
+            size_t ci_hint = 0;
+            auto [ci, lr_start] = TypedWorkerGroups::LocateColumnarChunkRow(
+                chunk_prefix, static_cast<uint32_t>(begin), &ci_hint);
+            size_t rem = end - begin;
+            auto& cnts = wcounts[w];
+            while (rem > 0) {
+              const ColumnarChunk& ch = col_tbl.chunks[ci];
+              const size_t take = std::min(rem, ch.rows - lr_start);
+              const size_t r_end = lr_start + take;
+              for (size_t a = 0; a < agg_count; ++a) {
+                const auto& cmps = fcases[a];
+                int64_t local_c = 0;
+                for (size_t r = lr_start; r < r_end; ++r) {
+                  bool ok = true;
+                  for (const auto& cmp : cmps) {
+                    const ColumnarColumn& col = ch.columns[cmp.col];
+                    if (col.has_null && col.IsNull(r)) {
+                      ok = false;
+                      break;
+                    }
+                    if (!eval_op(col.IntAt(r), cmp.op, cmp.val)) {
+                      ok = false;
+                      break;
+                    }
+                  }
+                  local_c += ok ? 1 : 0;
+                }
+                cnts[a] += local_c;
+              }
+              rem -= take;
+              ++ci;
+              lr_start = 0;
+            }
+          };
+          if (workers > 1) {
+            RETURN_IF_FAIL(RunParallelTasks(workers, run_w));
+          } else {
+            run_w(0);
+          }
+        } else {
+          std::atomic<bool> row_type_mismatch{false};
+          auto run_w = [&](size_t w) {
+            const size_t begin = (total_rows * w) / workers;
+            const size_t end = (total_rows * (w + 1)) / workers;
+            auto& cnts = wcounts[w];
+            for (size_t r = begin; r < end; ++r) {
+              const Row& row = input.rows[r];
+              for (size_t a = 0; a < agg_count; ++a) {
+                bool ok = true;
+                for (const auto& cmp : fcases[a]) {
+                  if (cmp.col >= row.values_.size()) {
+                    ok = false;
+                    break;
+                  }
+                  const Value& v = row.values_[cmp.col];
+                  if (v.IsNull()) {
+                    ok = false;
+                    break;
+                  }
+                  if ((v.type != ValueType::kInt64 &&
+                       v.type != ValueType::kDate) ||
+                      v.IsUnsigned()) {
+                    row_type_mismatch.store(true, std::memory_order_relaxed);
+                    return;
+                  }
+                  if (!eval_op(v.value.int_value, cmp.op, cmp.val)) {
+                    ok = false;
+                    break;
+                  }
+                }
+                cnts[a] += ok ? 1 : 0;
+              }
+            }
+          };
+          if (workers > 1) {
+            RETURN_IF_FAIL(RunParallelTasks(workers, run_w));
+          } else {
+            run_w(0);
+          }
+          if (row_type_mismatch.load(std::memory_order_relaxed)) {
+            all_fast_cc = false;
+          }
+        }
+        if (all_fast_cc) {
+          for (size_t a = 0; a < agg_count; ++a) {
+            for (size_t w = 0; w < workers; ++w) {
+              totals[a] += wcounts[w][a];
+            }
+          }
+        }
+      }
+      if (all_fast_cc) {
+        std::vector<Column> out_cols;
+        out_cols.reserve(agg_count);
+        std::vector<Value> row_vals;
+        row_vals.reserve(agg_count);
+        for (size_t i = 0; i < agg_count; ++i) {
+          const auto& sel_item = statement.SelectList()[i];
+          out_cols.emplace_back(sel_item.name, ValueType::kInt64);
+          row_vals.emplace_back(totals[out_to_agg[i]]);
+        }
+        Relation out(context.execution_runtime());
+        out.schema = Schema("", std::move(out_cols));
+        out.rows.emplace_back(std::move(row_vals));
+        out.uniform_cell_types = true;
+        CopyExecutionStats(&out, input);
+        if (auto* rt = context.execution_runtime()) {
+          rt->aggregate_input_rows += total_rows;
+          rt->aggregate_groups += 1;
+          rt->aggregate_updates += total_rows * agg_count;
+          rt->project_ms += ElapsedMs(started);
+        }
+        return std::optional<Relation>(std::move(out));
+      }
+    }
   }
   auto plan =
       PlanTypedAggregation(statement, nullptr, input.schema, aggregates, {});
@@ -5415,10 +5791,22 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     return std::optional<std::vector<Relation>>{};
   }
   const size_t bytes = input.charged_bytes_ + ((total_rows + 4096) * per_row);
-  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
+  const auto* grouping_runtime = context.execution_runtime();
+  const auto* rank_limit =
+      grouping_runtime != nullptr && grouping_runtime->grouping_rank_limit
+          ? &*grouping_runtime->grouping_rank_limit
+          : nullptr;
+  QueryMemoryCharge charge;
+  const bool packed_only =
+      !QueryMemoryBudget::Global().CanReserve(bytes) || !charge.TryAdd(bytes);
+  // A ranked rollup can consume columnar partial sums directly. When the
+  // general bound does not fit, reserve the packed structures as they grow.
+  if (packed_only && (!finest_keys_unique || !is_columnar_input ||
+                      rank_limit == nullptr || rank_limit->limit == 0 ||
+                      !plans[0].slim || plans[0].slim_kinds.size() != 1 ||
+                      plans[0].slim_kinds[0] != SlimAggKind::kSumDouble)) {
     return std::optional<std::vector<Relation>>{};
   }
-  QueryMemoryCharge charge(bytes);
   const auto started = std::chrono::steady_clock::now();
   const bool group_phases =
       std::getenv("TINYLAMB_GROUP_PHASES") != nullptr && total_rows >= 100000;
@@ -5559,6 +5947,9 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
       std::ranges::all_of(plans[0].aggregates, [](const auto& item) {
         return item.column.has_value();
       });
+  if (packed_only && (!borrow_keys || !all_direct_args)) {
+    return std::optional<std::vector<Relation>>{};
+  }
   bool flat_double_eligible =
       parallel_sets && !all_direct_args && argument_count >= 1;
   if (flat_double_eligible) {
@@ -6289,6 +6680,9 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     }
   }
   phase("arguments");
+  if (packed_only && (!parallel_sets || !finite_sum || !all_double)) {
+    return std::optional<std::vector<Relation>>{};
+  }
   if (parallel_sets) {
     const bool can_fold_partials =
         exact_partial_merge || (finite_sum && all_non_negative);
@@ -6322,12 +6716,15 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
           arg_chunk, argument_count, all_direct_args, worker_arguments,
           flat_double_args, flat_arg_kinds, exact_partial_merge, finite_sum,
           all_double, no_nulls, finest_keys_unique, groups, row_groups,
-          coarse_maps);
+          coarse_maps, packed_only ? &charge : nullptr);
       RETURN_IF_FAIL(packed_or.GetStatus());
       packed_done = packed_or.MoveValue();
     }
     const size_t finest_workers = std::min<size_t>(8, agg_workers);
     if (!packed_done) {
+      if (packed_only) {
+        return std::optional<std::vector<Relation>>{};
+      }
       if (input.HasColumnarOnly()) {
         RETURN_IF_FAIL(input.EnsureRowsMaterialized());
       }
@@ -7204,12 +7601,6 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
   // A parent RANK() <= K only needs the groups that can still place. Keeping
   // boundary ties preserves the rank values of every surviving row.
   std::vector<std::vector<uint8_t>> rank_keep;
-  const auto* rank_limit =
-      context.execution_runtime() != nullptr
-          ? context.execution_runtime()->grouping_rank_limit
-                ? &*context.execution_runtime()->grouping_rank_limit
-                : nullptr
-          : nullptr;
   if (rank_limit != nullptr && rank_limit->limit > 0 &&
       std::ranges::all_of(plans, [](const auto& plan) { return plan.slim; })) {
     struct RankRef {
@@ -7371,6 +7762,12 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
       for (size_t s = 0; s < count; ++s) {
         total_rank_groups += groups[s].GroupCount();
       }
+    }
+    QueryMemoryCharge rank_charge;
+    if (packed_only &&
+        (!shaped || !rank_charge.TryAdd(total_rank_groups *
+                                        ((3 * sizeof(RankRef)) + 128)))) {
+      return std::optional<std::vector<Relation>>{};
     }
     const size_t rank_workers =
         (shaped && agg_workers > 1 && total_rank_groups >= 8192)
@@ -7590,6 +7987,9 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     }
   }
   size_t output_groups = 0;
+  if (packed_only && rank_keep.empty()) {
+    return std::optional<std::vector<Relation>>{};
+  }
   for (size_t s = 0; s < count; ++s) {
     output_groups += groups[s].GroupCount();
   }

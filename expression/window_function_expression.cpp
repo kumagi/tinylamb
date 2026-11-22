@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/string_util.hpp"
 #include "expression/expression.hpp"
 #include "type/column_name.hpp"
 #include "type/type.hpp"
@@ -65,8 +66,33 @@ Value WindowFunctionCallExpression::Evaluate(const Row& row,
                        "WindowFunctionCallExpression::Evaluate");
 }
 
-Type WindowFunctionCallExpression::ResultType(const Schema& /*unused*/) const {
-  // The executor fixes the hidden column type from the computed values.
+Type WindowFunctionCallExpression::ResultType(const Schema& schema) const {
+  // The executor still fixes the hidden column type from the computed values,
+  // but consumers that read the expression's static type ahead of execution
+  // (UNION coercion, ORDER BY encoding, server type reporting) must not see a
+  // blanket VARCHAR: ROW_NUMBER yields INT64, PERCENT_RANK a DOUBLE, and
+  // LAG/FIRST_VALUE carry their argument's type.
+  const std::string fn = AsciiToUpper(function);
+  if (fn == "ROW_NUMBER" || fn == "RANK" || fn == "DENSE_RANK" ||
+      fn == "NTILE" || fn == "COUNT" || fn == "COUNTIF") {
+    return {TypeTag::kBigInt};
+  }
+  if (fn == "PERCENT_RANK" || fn == "CUME_DIST" || fn == "PERCENTILE_CONT" ||
+      fn == "AVG" || fn == "STDDEV_SAMP" || fn == "STDDEV_POP" ||
+      fn == "VAR_SAMP" || fn == "VAR_POP" || fn == "COVAR_SAMP" ||
+      fn == "COVAR_POP" || fn == "CORR") {
+    return {TypeTag::kDouble};
+  }
+  // Navigation functions and value aggregates carry the first argument's
+  // type. STRING_AGG (and unrecognized functions) keep the VARCHAR fallback.
+  if (fn == "LAG" || fn == "LEAD" || fn == "FIRST_VALUE" ||
+      fn == "LAST_VALUE" || fn == "NTH_VALUE" || fn == "MIN" || fn == "MAX" ||
+      fn == "SUM" || fn == "ANY_VALUE" || fn == "PERCENTILE_DISC" ||
+      fn == "ARRAY_AGG") {
+    if (!args.empty() && args.front()) {
+      return args.front()->ResultType(schema);
+    }
+  }
   return {TypeTag::kVarChar};
 }
 
@@ -114,7 +140,10 @@ std::string WindowFunctionCallExpression::ToString() const {
     if (i != 0U) {
       out << ", ";
     }
-    out << args[i]->ToString();
+    // Hand-built / degenerate nodes may carry a null argument; TouchedColumns
+    // already skips those. Render a placeholder instead of dereferencing it
+    // so EXPLAIN / dump / rewrite identity keys cannot segfault.
+    out << (args[i] ? args[i]->ToString() : std::string("?"));
   }
   if (!inner_order_by.empty()) {
     out << " ORDER BY " << OrderTermsToString(inner_order_by);
@@ -129,7 +158,7 @@ std::string WindowFunctionCallExpression::ToString() const {
       if (i != 0U) {
         out << ", ";
       }
-      out << partition_by[i]->ToString();
+      out << (partition_by[i] ? partition_by[i]->ToString() : std::string("?"));
     }
     out << " ";
   }

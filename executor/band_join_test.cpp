@@ -110,7 +110,8 @@ TEST(BandJoinTest, RefusesOverBudgetMaterializationAndReleasesCharge) {
   budget.ResetForTest(1024);
   const auto inputs = std::vector<Row>(32, Row({Value(1)}));
   auto schema = IntSchema("l", "x") + IntSchema("r", "x");
-  BandJoin join(Source(inputs), {0}, Source(inputs), {0}, BinaryOperation::kLessThan,
+  BandJoin join(Source(inputs), {0}, Source(inputs), {0},
+                BinaryOperation::kLessThan,
                 IntComparison(BinaryOperation::kLessThan), schema);
   EXPECT_TRUE(Drain(&join).empty());
   EXPECT_EQ(join.GetStatus().GetCode(), StatusCode::kMemoryLimitExceeded);
@@ -530,6 +531,24 @@ TEST(BandJoinTest, FactoryEmitsBandJoinFromPlan) {
   EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
   EXPECT_TRUE(context.PreCommit().ok());
   database->DeleteAll();
+}
+
+// PairPasses evaluates the residual predicate for every join kind. A
+// hand-built semi/anti join that omits the residual schema must still resolve
+// its column references via the output schema, not evaluate against an empty
+// schema (which made every candidate pair fail).
+TEST(BandJoinTest, SemiJoinFallsBackToOutputSchemaForResidualPredicate) {
+  const Schema combined = IntSchema("l", "x") + IntSchema("r", "x");
+  BandJoin join(Source({Row({Value(1)}), Row({Value(3)})}), {0},
+                Source({Row({Value(2)}), Row({Value(4)})}), {0},
+                BinaryOperation::kLessThan,
+                IntComparison(BinaryOperation::kLessThan), Schema(),
+                JoinKind::kSemi, 1, 1, combined);
+  const std::vector<Row> output = Drain(&join);
+  ASSERT_EQ(output.size(), 2U);
+  EXPECT_EQ(output[0], Row({Value(1)}));
+  EXPECT_EQ(output[1], Row({Value(3)}));
+  EXPECT_EQ(join.GetStatus(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

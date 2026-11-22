@@ -3,7 +3,7 @@
 - 状態: draft / 更新基準: `9ce7837` 上の作業ツリー (2026-10-06)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()`
   (`BandJoinAlternative`)
-- 実行器: `executor/band_join.cpp` (`BandJoinPlan::EmitExecutor`)
+- 実行器: `executor/relational_factory.cpp` 経由 (`BandJoinPlan::EmitExecutor`)
 
 ## 概要
 

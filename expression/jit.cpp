@@ -115,7 +115,9 @@ void UnpackNullBitmapToBytes(std::span<const uint64_t> bitmap, size_t count,
 }
 
 // Lean proof: lean/TinylambOpt/BranchlessJitCodegen.lean
-//   (zonemap_prefix_sum_masked_sound)
+//   (zonemap_prefix_sum_masked_sound; the masked sum degenerates to the
+//   plain sum on NULL-free batches, so this envelope also covers the
+//   unchecked-sum and fused filter-project-sum callers)
 bool JitInt64Kernels::CanUseUncheckedSum(int64_t running_total,
                                          int64_t min_value, int64_t max_value,
                                          size_t count) noexcept {
@@ -1995,9 +1997,9 @@ struct ValidatedProgram {
 };
 
 // Static Bytecode DAG & Stack-Depth Verifier.
-// Enforces `ValidStackDepths` and `stepInst_forward` required by
-// `lean/TinylambOpt/BranchlessJitCodegen.lean
-// (if_conversion_sound_and_complete)`.
+// Enforces `ValidStackDepths` and `stepInst_forward`, required by the
+// `if_conversion_sound_and_complete` theorem in
+// `lean/TinylambOpt/BranchlessJitCodegen.lean`.
 std::optional<ValidatedProgram> ValidateForBranchlessJit(
     const BytecodeProgram& program, const Schema& schema) {
   if (program.ResultType() != ValueType::kInt64 ||
@@ -2302,6 +2304,8 @@ struct JitBranchlessProgram::Impl {
 namespace {
 
 using BranchlessImplPtr = std::shared_ptr<JitBranchlessProgram::Impl>;
+// Live programs retain their own shared ownership after cache eviction.
+constexpr size_t kMaxBranchlessCacheEntries = 64;
 // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
 std::unordered_map<std::string, BranchlessImplPtr>& branchless_program_cache =
     *new std::unordered_map<std::string, BranchlessImplPtr>;
@@ -3049,12 +3053,25 @@ std::optional<JitBranchlessProgram> JitBranchlessProgram::Compile(
   impl->compile_ms = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - begin)
                          .count();
+  BranchlessImplPtr evicted;
+  BranchlessImplPtr selected;
   {
     std::scoped_lock lock(jit_cache_mutex);
-    auto [it, inserted] =
-        branchless_program_cache.try_emplace(impl->spec.cache_key, impl);
-    return JitBranchlessProgram(it->second);
+    const auto existing = branchless_program_cache.find(impl->spec.cache_key);
+    if (existing != branchless_program_cache.end()) {
+      selected = existing->second;
+    } else {
+      if (branchless_program_cache.size() >= kMaxBranchlessCacheEntries) {
+        auto victim = branchless_program_cache.begin();
+        evicted = std::move(victim->second);
+        branchless_program_cache.erase(victim);
+      }
+      branchless_program_cache.emplace(impl->spec.cache_key, impl);
+      selected = impl;
+    }
   }
+  // LLJIT destruction can be expensive; do it outside the shared cache lock.
+  return JitBranchlessProgram(std::move(selected));
 #endif
 }
 
@@ -3512,6 +3529,1607 @@ bool JitBranchlessProgram::Filter(std::span<const JitColumnInput> columns,
     offset += slice;
   }
   return true;
+}
+
+#ifdef TINYLAMB_HAS_LLVM
+namespace {
+
+llvm::Value* EmitSplitMix64Packed(llvm::IRBuilder<>& b, llvm::Value* k) {
+  llvm::Value* h = b.CreateMul(b.CreateXor(k, b.CreateLShr(k, b.getInt64(30))),
+                               b.getInt64(0xbf58476d1ce4e5b9ULL));
+  h = b.CreateMul(b.CreateXor(h, b.CreateLShr(h, b.getInt64(27))),
+                  b.getInt64(0x94d049bb133111ebULL));
+  return b.CreateXor(h, b.CreateLShr(h, b.getInt64(31)));
+}
+
+void EmitPrefetchRead(llvm::IRBuilder<>& b, llvm::Function* pf_fn,
+                      llvm::Value* ptr) {
+  b.CreateCall(pf_fn, {ptr, b.getInt32(0), b.getInt32(3), b.getInt32(1)});
+}
+
+void EmitPrefetchWrite(llvm::IRBuilder<>& b, llvm::Function* pf_fn,
+                       llvm::Value* ptr) {
+  b.CreateCall(pf_fn, {ptr, b.getInt32(1), b.getInt32(3), b.getInt32(1)});
+}
+
+llvm::MDNode* UnlikelyBranchWeights(llvm::LLVMContext& ctx) {
+  auto* i32 = llvm::Type::getInt32Ty(ctx);
+  llvm::Metadata* md[] = {
+      llvm::MDString::get(ctx, "branch_weights"),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32, 1)),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32, 100000)),
+  };
+  return llvm::MDNode::get(ctx, md);
+}
+
+llvm::Value* LoadAsDouble(llvm::IRBuilder<>& b, llvm::Value* ptr,
+                          llvm::Value* idx, bool as_int64) {
+  auto* i64 = b.getInt64Ty();
+  auto* raw = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, ptr, idx));
+  return as_int64 ? b.CreateSIToFP(raw, b.getDoubleTy())
+                  : b.CreateBitCast(raw, b.getDoubleTy());
+}
+
+}  // namespace
+#endif  // TINYLAMB_HAS_LLVM
+
+// ----------------------------------------------------------------------------
+// JitDenseSplitRadixAgg
+// ----------------------------------------------------------------------------
+
+std::optional<JitDenseSplitRadixAgg::ExtractKernel>
+JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
+#ifndef TINYLAMB_HAS_LLVM
+  (void)spec;
+  return std::nullopt;
+#else
+  if (spec.part_shift == 0 || spec.part_shift > 21 ||
+      static_cast<uint8_t>(spec.op) >
+          static_cast<uint8_t>(ExprOp::kCoalesceMulIntZero)) {
+    return std::nullopt;
+  }
+  uint8_t used_mask = 0x03U;
+  if (spec.op == ExprOp::kColDouble || spec.op == ExprOp::kColInt64) {
+    used_mask = 0x01U;
+  } else if (spec.op == ExprOp::kSubSubAddDivConst) {
+    used_mask = 0x0FU;
+  }
+  const uint8_t masked_val_nulls = spec.val_null_mask & used_mask;
+  const uint32_t key =
+      (static_cast<uint32_t>(spec.op) & 0x0FU) |
+      (static_cast<uint32_t>(spec.use_sel ? 1U : 0U) << 4U) |
+      (static_cast<uint32_t>(spec.jk_has_null ? 1U : 0U) << 5U) |
+      (static_cast<uint32_t>(spec.pk0_has_null ? 1U : 0U) << 6U) |
+      (static_cast<uint32_t>(masked_val_nulls) << 8U) |
+      (static_cast<uint32_t>(spec.part_shift) << 12U);
+
+  struct CacheEntry {
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    ExtractFn fn{nullptr};
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto& cache = *new std::unordered_map<uint32_t, CacheEntry>;
+  const std::scoped_lock lock(jit_cache_mutex);
+  if (auto it = cache.find(key); it != cache.end()) {
+    return ExtractKernel(it->second.fn);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module =
+      std::make_unique<llvm::Module>("tinylamb.dense_split_extract", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i8 = b.getInt8Ty();
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* f64 = b.getDoubleTy();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_dense_split_extract";
+  std::array<llvm::Type*, 25> arg_tys{
+      i32, ptr, ptr, ptr, i64, i64, ptr, ptr, ptr, i64, i64, ptr, i32,
+      ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, f64, ptr, ptr, ptr};
+  auto* fn =
+      llvm::Function::Create(llvm::FunctionType::get(i32, arg_tys, false),
+                             llvm::Function::ExternalLinkage, kSymbol, *module);
+  for (unsigned ai = 1; ai <= 20; ++ai) {
+    if (arg_tys[ai] == ptr) {
+      fn->addParamAttr(ai, llvm::Attribute::ReadOnly);
+    }
+  }
+  fn->addParamAttr(22, llvm::Attribute::NoAlias);
+  fn->addParamAttr(23, llvm::Attribute::NoAlias);
+  fn->addParamAttr(24, llvm::Attribute::NoAlias);
+
+  auto* count = fn->getArg(0);
+  auto* sel = fn->getArg(1);
+  auto* jk_vals = fn->getArg(2);
+  auto* jk_nulls = fn->getArg(3);
+  auto* jk_min = fn->getArg(4);
+  auto* jk_span = fn->getArg(5);
+  auto* key_to_rsubgid = fn->getArg(6);
+  auto* pk0_vals = fn->getArg(7);
+  auto* pk0_nulls = fn->getArg(8);
+  auto* pk0_min = fn->getArg(9);
+  auto* pk0_span = fn->getArg(10);
+  auto* pk0_subgid = fn->getArg(11);
+  auto* pk0_card = fn->getArg(12);
+  std::array<llvm::Value*, 4> v_ptrs{fn->getArg(13), fn->getArg(15),
+                                     fn->getArg(17), fn->getArg(19)};
+  std::array<llvm::Value*, 4> n_ptrs{fn->getArg(14), fn->getArg(16),
+                                     fn->getArg(18), fn->getArg(20)};
+  auto* div_const = fn->getArg(21);
+  auto* out_tagged = fn->getArg(22);
+  auto* out_vals = fn->getArg(23);
+  auto* part_hist = fn->getArg(24);
+
+  const auto blk = [&](std::string_view name) {
+    return llvm::BasicBlock::Create(*ctx, name, fn);
+  };
+  auto* entry = blk("entry");
+  auto* loop_hdr = blk("loop.hdr");
+  auto* loop_latch = blk("loop.latch");
+  auto* exit_blk = blk("exit");
+
+  b.SetInsertPoint(entry);
+  b.CreateCondBr(b.CreateICmpEQ(count, b.getInt32(0)), exit_blk, loop_hdr);
+
+  b.SetInsertPoint(loop_hdr);
+  auto* idx_phi = b.CreatePHI(i32, 2, "idx");
+  auto* m_phi = b.CreatePHI(i32, 2, "m");
+  idx_phi->addIncoming(b.getInt32(0), entry);
+  m_phi->addIncoming(b.getInt32(0), entry);
+
+  llvm::Value* r64 = b.CreateZExt(idx_phi, i64);
+  if (spec.use_sel) {
+    auto* r32 = b.CreateLoad(i32, b.CreateInBoundsGEP(i32, sel, r64));
+    r64 = b.CreateZExt(r32, i64);
+  }
+
+  std::vector<llvm::BasicBlock*> skip_blocks;
+  if (spec.jk_has_null) {
+    auto* next_b = blk("jk.lookup");
+    auto* jkn = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, jk_nulls, r64));
+    auto* cur = b.GetInsertBlock();
+    b.CreateCondBr(b.CreateICmpEQ(jkn, b.getInt8(0)), next_b, loop_latch);
+    skip_blocks.push_back(cur);
+    b.SetInsertPoint(next_b);
+  }
+
+  auto* jk = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, jk_vals, r64));
+  auto* jk_off = b.CreateSub(jk, jk_min);
+  {
+    auto* next_b = blk("jk.table");
+    auto* cur = b.GetInsertBlock();
+    b.CreateCondBr(b.CreateICmpULT(jk_off, jk_span), next_b, loop_latch);
+    skip_blocks.push_back(cur);
+    b.SetInsertPoint(next_b);
+  }
+  auto* r_subgid =
+      b.CreateLoad(i32, b.CreateInBoundsGEP(i32, key_to_rsubgid, jk_off));
+  {
+    auto* next_b = blk(spec.pk0_has_null ? "pk0.null" : "pk0.lookup");
+    auto* cur = b.GetInsertBlock();
+    b.CreateCondBr(b.CreateICmpNE(r_subgid, b.getInt32(UINT32_MAX)), next_b,
+                   loop_latch);
+    skip_blocks.push_back(cur);
+    b.SetInsertPoint(next_b);
+  }
+
+  if (spec.pk0_has_null) {
+    auto* next_b = blk("pk0.lookup");
+    auto* pkn = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, pk0_nulls, r64));
+    auto* cur = b.GetInsertBlock();
+    b.CreateCondBr(b.CreateICmpEQ(pkn, b.getInt8(0)), next_b, loop_latch);
+    skip_blocks.push_back(cur);
+    b.SetInsertPoint(next_b);
+  }
+
+  auto* pk = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, pk0_vals, r64));
+  auto* pk_off = b.CreateSub(pk, pk0_min);
+  {
+    auto* next_b = blk("pk0.table");
+    auto* cur = b.GetInsertBlock();
+    b.CreateCondBr(b.CreateICmpULT(pk_off, pk0_span), next_b, loop_latch);
+    skip_blocks.push_back(cur);
+    b.SetInsertPoint(next_b);
+  }
+  auto* p_subgid =
+      b.CreateLoad(i32, b.CreateInBoundsGEP(i32, pk0_subgid, pk_off));
+  {
+    auto* next_b = blk("emit");
+    auto* cur = b.GetInsertBlock();
+    b.CreateCondBr(b.CreateICmpNE(p_subgid, b.getInt32(UINT32_MAX)), next_b,
+                   loop_latch);
+    skip_blocks.push_back(cur);
+    b.SetInsertPoint(next_b);
+  }
+
+  auto* gid = b.CreateAdd(b.CreateMul(r_subgid, pk0_card), p_subgid);
+  llvm::Value* any_null = b.getFalse();
+  for (uint8_t c = 0; c < 4; ++c) {
+    if ((masked_val_nulls & (1U << c)) != 0U) {
+      auto* nc = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, n_ptrs[c], r64));
+      any_null = b.CreateOr(any_null, b.CreateICmpNE(nc, b.getInt8(0)));
+    }
+  }
+
+  llvm::Value* raw_val = llvm::ConstantFP::get(f64, 0.0);
+  bool is_coalesce = false;
+  switch (spec.op) {
+    case ExprOp::kColDouble:
+      raw_val = LoadAsDouble(b, v_ptrs[0], r64, false);
+      break;
+    case ExprOp::kColInt64:
+      raw_val = LoadAsDouble(b, v_ptrs[0], r64, true);
+      break;
+    case ExprOp::kSubDouble:
+      raw_val = b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
+                             LoadAsDouble(b, v_ptrs[1], r64, false));
+      break;
+    case ExprOp::kAddDouble:
+      raw_val = b.CreateFAdd(LoadAsDouble(b, v_ptrs[0], r64, false),
+                             LoadAsDouble(b, v_ptrs[1], r64, false));
+      break;
+    case ExprOp::kSubDivConst:
+      raw_val =
+          b.CreateFDiv(b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
+                                    LoadAsDouble(b, v_ptrs[1], r64, false)),
+                       div_const);
+      break;
+    case ExprOp::kSubSubAddDivConst: {
+      auto* d01 = b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
+                               LoadAsDouble(b, v_ptrs[1], r64, false));
+      auto* d2 = b.CreateFSub(d01, LoadAsDouble(b, v_ptrs[2], r64, false));
+      auto* d3 = b.CreateFAdd(d2, LoadAsDouble(b, v_ptrs[3], r64, false));
+      raw_val = b.CreateFDiv(d3, div_const);
+      break;
+    }
+    case ExprOp::kMulDoubleInt:
+      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                             LoadAsDouble(b, v_ptrs[1], r64, true));
+      break;
+    case ExprOp::kCoalesceMulZero:
+      is_coalesce = true;
+      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                             LoadAsDouble(b, v_ptrs[1], r64, true));
+      break;
+    case ExprOp::kMulDoubleDouble:
+      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                             LoadAsDouble(b, v_ptrs[1], r64, false));
+      break;
+    case ExprOp::kCoalesceMulDoubleZero:
+      is_coalesce = true;
+      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                             LoadAsDouble(b, v_ptrs[1], r64, false));
+      break;
+    case ExprOp::kMulIntInt:
+      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, true),
+                             LoadAsDouble(b, v_ptrs[1], r64, true));
+      break;
+    case ExprOp::kCoalesceMulIntZero:
+      is_coalesce = true;
+      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, true),
+                             LoadAsDouble(b, v_ptrs[1], r64, true));
+      break;
+  }
+
+  auto* emit_val =
+      b.CreateSelect(any_null, llvm::ConstantFP::get(f64, 0.0), raw_val);
+  llvm::Value* tagged = gid;
+  if (!is_coalesce && masked_val_nulls != 0U) {
+    auto* sign_bit = b.CreateShl(b.CreateZExt(any_null, i32), b.getInt32(31));
+    tagged = b.CreateOr(gid, sign_bit);
+  }
+  auto* m64 = b.CreateZExt(m_phi, i64);
+  b.CreateStore(tagged, b.CreateInBoundsGEP(i32, out_tagged, m64));
+  b.CreateStore(emit_val, b.CreateInBoundsGEP(f64, out_vals, m64));
+  auto* p64 = b.CreateZExt(b.CreateLShr(gid, b.getInt32(spec.part_shift)), i64);
+  auto* hist_p = b.CreateInBoundsGEP(i32, part_hist, p64);
+  b.CreateStore(b.CreateAdd(b.CreateLoad(i32, hist_p), b.getInt32(1)), hist_p);
+  auto* m_inc = b.CreateAdd(m_phi, b.getInt32(1));
+  auto* emit_blk = b.GetInsertBlock();
+  b.CreateBr(loop_latch);
+
+  b.SetInsertPoint(loop_latch);
+  auto* m_next =
+      b.CreatePHI(i32, static_cast<unsigned>(skip_blocks.size() + 1));
+  for (llvm::BasicBlock* sb : skip_blocks) {
+    m_next->addIncoming(m_phi, sb);
+  }
+  m_next->addIncoming(m_inc, emit_blk);
+  auto* idx_next = b.CreateAdd(idx_phi, b.getInt32(1));
+  idx_phi->addIncoming(idx_next, loop_latch);
+  m_phi->addIncoming(m_next, loop_latch);
+  b.CreateCondBr(b.CreateICmpULT(idx_next, count), loop_hdr, exit_blk);
+
+  b.SetInsertPoint(exit_blk);
+  auto* ret_phi = b.CreatePHI(i32, 2);
+  ret_phi->addIncoming(b.getInt32(0), entry);
+  ret_phi->addIncoming(m_next, loop_latch);
+  b.CreateRet(ret_phi);
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "dense-split-extract");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  auto compiled = symbol->toPtr<ExtractFn>();
+  cache.emplace(key, CacheEntry{.jit = std::move(jit), .fn = compiled});
+  return ExtractKernel(compiled);
+#endif
+}
+
+std::optional<JitDenseSplitRadixAgg::ScatterKernel>
+JitDenseSplitRadixAgg::CompileScatter(uint8_t part_shift) {
+#ifndef TINYLAMB_HAS_LLVM
+  (void)part_shift;
+  return std::nullopt;
+#else
+  if (part_shift == 0 || part_shift > 24) {
+    return std::nullopt;
+  }
+  struct CacheEntry {
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    ScatterFn fn{nullptr};
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto& cache = *new std::unordered_map<uint8_t, CacheEntry>;
+  const std::scoped_lock lock(jit_cache_mutex);
+  if (auto it = cache.find(part_shift); it != cache.end()) {
+    return ScatterKernel(it->second.fn);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module =
+      std::make_unique<llvm::Module>("tinylamb.dense_split_scatter", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* f64 = b.getDoubleTy();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_dense_split_scatter";
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(b.getVoidTy(), {i32, ptr, ptr, ptr, ptr, ptr},
+                              false),
+      llvm::Function::ExternalLinkage, kSymbol, *module);
+  fn->addParamAttr(1, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(2, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(3, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(4, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(5, llvm::Attribute::NoAlias);
+
+  auto* count = fn->getArg(0);
+  auto* in_tgs = fn->getArg(1);
+  auto* in_vals = fn->getArg(2);
+  auto* dst_gids = fn->getArg(3);
+  auto* dst_vals = fn->getArg(4);
+  auto* dst_pos = fn->getArg(5);
+
+  auto* entry = llvm::BasicBlock::Create(*ctx, "entry", fn);
+  auto* body = llvm::BasicBlock::Create(*ctx, "body", fn);
+  auto* exit_blk = llvm::BasicBlock::Create(*ctx, "exit", fn);
+
+  b.SetInsertPoint(entry);
+  b.CreateCondBr(b.CreateICmpEQ(count, b.getInt32(0)), exit_blk, body);
+
+  b.SetInsertPoint(body);
+  auto* i_phi = b.CreatePHI(i32, 2);
+  i_phi->addIncoming(b.getInt32(0), entry);
+  auto* i64_v = b.CreateZExt(i_phi, i64);
+  auto* tg = b.CreateLoad(i32, b.CreateInBoundsGEP(i32, in_tgs, i64_v));
+  auto* val = b.CreateLoad(f64, b.CreateInBoundsGEP(f64, in_vals, i64_v));
+  auto* gid = b.CreateAnd(tg, b.getInt32(0x7FFFFFFFU));
+  auto* p64 = b.CreateZExt(b.CreateLShr(gid, b.getInt32(part_shift)), i64);
+  const uint32_t low_mask = (uint32_t{1} << part_shift) - 1U;
+  auto* local_tg = b.CreateOr(b.CreateAnd(gid, b.getInt32(low_mask)),
+                              b.CreateAnd(tg, b.getInt32(0x80000000U)));
+  auto* pos_ptr = b.CreateInBoundsGEP(i32, dst_pos, p64);
+  auto* pos = b.CreateLoad(i32, pos_ptr);
+  b.CreateStore(b.CreateAdd(pos, b.getInt32(1)), pos_ptr);
+  auto* pos64 = b.CreateZExt(pos, i64);
+  auto* gp = b.CreateLoad(ptr, b.CreateInBoundsGEP(ptr, dst_gids, p64));
+  auto* vp = b.CreateLoad(ptr, b.CreateInBoundsGEP(ptr, dst_vals, p64));
+  b.CreateStore(local_tg, b.CreateInBoundsGEP(i32, gp, pos64));
+  b.CreateStore(val, b.CreateInBoundsGEP(f64, vp, pos64));
+  auto* i_next = b.CreateAdd(i_phi, b.getInt32(1));
+  i_phi->addIncoming(i_next, body);
+  b.CreateCondBr(b.CreateICmpULT(i_next, count), body, exit_blk);
+
+  b.SetInsertPoint(exit_blk);
+  b.CreateRetVoid();
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "dense-split-scatter");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  auto compiled = symbol->toPtr<ScatterFn>();
+  cache.emplace(part_shift, CacheEntry{.jit = std::move(jit), .fn = compiled});
+  return ScatterKernel(compiled);
+#endif
+}
+
+std::optional<JitDenseSplitRadixAgg::AccumKernel>
+JitDenseSplitRadixAgg::CompileAccum(bool is_avg, bool check_inf) {
+#ifndef TINYLAMB_HAS_LLVM
+  (void)is_avg;
+  (void)check_inf;
+  return std::nullopt;
+#else
+  const uint8_t key =
+      static_cast<uint8_t>((is_avg ? 1U : 0U) | (check_inf ? 2U : 0U));
+  struct CacheEntry {
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    AccumFn fn{nullptr};
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto& cache = *new std::array<CacheEntry, 4>;
+  const std::scoped_lock lock(jit_cache_mutex);
+  if (cache[key].fn != nullptr) {
+    return AccumKernel(cache[key].fn);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module =
+      std::make_unique<llvm::Module>("tinylamb.dense_split_accum", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* f64 = b.getDoubleTy();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_dense_split_accum";
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(b.getVoidTy(),
+                              {i32, ptr, ptr, ptr, ptr, ptr, ptr, ptr}, false),
+      llvm::Function::ExternalLinkage, kSymbol, *module);
+  fn->addParamAttr(1, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(2, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(3, llvm::Attribute::NoAlias);
+  fn->addParamAttr(4, llvm::Attribute::NoAlias);
+  fn->addParamAttr(5, llvm::Attribute::NoAlias);
+  fn->addParamAttr(6, llvm::Attribute::NoAlias);
+  fn->addParamAttr(7, llvm::Attribute::NoAlias);
+
+  auto* count = fn->getArg(0);
+  auto* in_tgs = fn->getArg(1);
+  auto* in_vals = fn->getArg(2);
+  auto* sums = fn->getArg(3);
+  auto* counts = fn->getArg(4);
+  auto* matched_bits = fn->getArg(5);
+  auto* nonnull_bits = fn->getArg(6);
+  auto* inf_flag = fn->getArg(7);
+
+  llvm::Function* pf_fn =
+      IntrinsicDecl(module.get(), llvm::Intrinsic::prefetch, {ptr});
+  llvm::Function* fabs_fn =
+      check_inf ? IntrinsicDecl(module.get(), llvm::Intrinsic::fabs, {f64})
+                : nullptr;
+  llvm::Constant* pos_inf =
+      check_inf ? llvm::ConstantFP::getInfinity(f64) : nullptr;
+  llvm::MDNode* unlikely_md = check_inf ? UnlikelyBranchWeights(*ctx) : nullptr;
+
+  auto* entry = llvm::BasicBlock::Create(*ctx, "entry", fn);
+  auto* pf_cond = llvm::BasicBlock::Create(*ctx, "pf.cond", fn);
+  auto* tail_cond = llvm::BasicBlock::Create(*ctx, "tail.cond", fn);
+  auto* exit_blk = llvm::BasicBlock::Create(*ctx, "exit", fn);
+
+  b.SetInsertPoint(entry);
+  auto* has_pf = b.CreateICmpUGT(count, b.getInt32(8));
+  auto* pf_end =
+      b.CreateSelect(has_pf, b.CreateSub(count, b.getInt32(8)), b.getInt32(0));
+  b.CreateBr(pf_cond);
+
+  const auto build_stage =
+      [&](llvm::BasicBlock* cond_blk, llvm::BasicBlock* prev_blk,
+          llvm::BasicBlock* next_stage, llvm::Value* start_i,
+          llvm::Value* end_i, bool do_pf,
+          std::string_view tag) -> llvm::Value* {
+    const auto mk = [&](std::string_view s) {
+      return llvm::BasicBlock::Create(*ctx, std::string(tag) + std::string(s),
+                                      fn);
+    };
+    auto* body = mk(".body");
+    auto* nonnull_blk = mk(".nonnull");
+    auto* latch = mk(".latch");
+
+    b.SetInsertPoint(cond_blk);
+    auto* i_phi = b.CreatePHI(i32, 2);
+    i_phi->addIncoming(start_i, prev_blk);
+    b.CreateCondBr(b.CreateICmpULT(i_phi, end_i), body, next_stage);
+
+    b.SetInsertPoint(body);
+    auto* i64_v = b.CreateZExt(i_phi, i64);
+    if (do_pf) {
+      auto* pf_idx = b.CreateAdd(i64_v, b.getInt64(8));
+      auto* pf_tg = b.CreateLoad(i32, b.CreateInBoundsGEP(i32, in_tgs, pf_idx));
+      auto* pf_lg =
+          b.CreateZExt(b.CreateAnd(pf_tg, b.getInt32(0x7FFFFFFFU)), i64);
+      EmitPrefetchWrite(b, pf_fn, b.CreateInBoundsGEP(f64, sums, pf_lg));
+    }
+    auto* tg = b.CreateLoad(i32, b.CreateInBoundsGEP(i32, in_tgs, i64_v));
+    auto* lg32 = b.CreateAnd(tg, b.getInt32(0x7FFFFFFFU));
+    auto* lg64 = b.CreateZExt(lg32, i64);
+    auto* widx = b.CreateLShr(lg64, b.getInt64(6));
+    auto* bit = b.CreateShl(b.getInt64(1), b.CreateAnd(lg64, b.getInt64(63)));
+    auto* mb_ptr = b.CreateInBoundsGEP(i64, matched_bits, widx);
+    b.CreateStore(b.CreateOr(b.CreateLoad(i64, mb_ptr), bit), mb_ptr);
+    b.CreateCondBr(b.CreateICmpSGE(tg, b.getInt32(0)), nonnull_blk, latch);
+
+    b.SetInsertPoint(nonnull_blk);
+    auto* nb_ptr = b.CreateInBoundsGEP(i64, nonnull_bits, widx);
+    b.CreateStore(b.CreateOr(b.CreateLoad(i64, nb_ptr), bit), nb_ptr);
+    auto* s_ptr = b.CreateInBoundsGEP(f64, sums, lg64);
+    auto* prev = b.CreateLoad(f64, s_ptr);
+    auto* dv = b.CreateLoad(f64, b.CreateInBoundsGEP(f64, in_vals, i64_v));
+    auto* next_s = b.CreateFAdd(prev, dv);
+    if (check_inf) {
+      auto* inf_next =
+          b.CreateFCmpOEQ(b.CreateCall(fabs_fn, {next_s}), pos_inf);
+      auto* fin_prev = b.CreateFCmpUNE(b.CreateCall(fabs_fn, {prev}), pos_inf);
+      auto* fin_dv = b.CreateFCmpUNE(b.CreateCall(fabs_fn, {dv}), pos_inf);
+      auto* ovf = b.CreateAnd(inf_next, b.CreateAnd(fin_prev, fin_dv));
+      auto* set_inf = mk(".set_inf");
+      auto* after_inf = mk(".after_inf");
+      auto* br = b.CreateCondBr(ovf, set_inf, after_inf);
+      br->setMetadata(llvm::LLVMContext::MD_prof, unlikely_md);
+      b.SetInsertPoint(set_inf);
+      b.CreateStore(b.getInt8(1), inf_flag);
+      b.CreateBr(after_inf);
+      b.SetInsertPoint(after_inf);
+    }
+    b.CreateStore(next_s, s_ptr);
+    if (is_avg) {
+      auto* c_ptr = b.CreateInBoundsGEP(i64, counts, lg64);
+      b.CreateStore(b.CreateAdd(b.CreateLoad(i64, c_ptr), b.getInt64(1)),
+                    c_ptr);
+    }
+    b.CreateBr(latch);
+
+    b.SetInsertPoint(latch);
+    auto* i_next = b.CreateAdd(i_phi, b.getInt32(1));
+    i_phi->addIncoming(i_next, latch);
+    b.CreateBr(cond_blk);
+    return end_i;
+  };
+
+  llvm::Value* tail_start =
+      build_stage(pf_cond, entry, tail_cond, b.getInt32(0), pf_end, true, "pf");
+  (void)build_stage(tail_cond, pf_cond, exit_blk, tail_start, count, false,
+                    "tl");
+
+  b.SetInsertPoint(exit_blk);
+  b.CreateRetVoid();
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "dense-split-accum");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  auto compiled = symbol->toPtr<AccumFn>();
+  cache[key] = CacheEntry{.jit = std::move(jit), .fn = compiled};
+  return AccumKernel(compiled);
+#endif
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+uint32_t JitDenseSplitRadixAgg::ExtractKernel::Run(
+    uint32_t count, const uint32_t* sel, const int64_t* jk_vals,
+    const uint8_t* jk_nulls, int64_t jk_min, uint64_t jk_span,
+    const uint32_t* key_to_rsubgid, const int64_t* pk0_vals,
+    const uint8_t* pk0_nulls, int64_t pk0_min, uint64_t pk0_span,
+    const uint32_t* pk0_subgid, uint32_t pk0_card, const int64_t* v0,
+    const uint8_t* n0, const int64_t* v1, const uint8_t* n1, const int64_t* v2,
+    const uint8_t* n2, const int64_t* v3, const uint8_t* n3, double div_const,
+    uint32_t* out_tagged_gids, double* out_vals,
+    uint32_t* part_hist) const noexcept {
+  return fn_(count, sel, jk_vals, jk_nulls, jk_min, jk_span, key_to_rsubgid,
+             pk0_vals, pk0_nulls, pk0_min, pk0_span, pk0_subgid, pk0_card, v0,
+             n0, v1, n1, v2, n2, v3, n3, div_const, out_tagged_gids, out_vals,
+             part_hist);
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+void JitDenseSplitRadixAgg::ScatterKernel::Run(
+    uint32_t count, const uint32_t* in_tagged_gids, const double* in_vals,
+    uint32_t* const* dst_gids, double* const* dst_vals,
+    uint32_t* dst_pos) const noexcept {
+  fn_(count, in_tagged_gids, in_vals, dst_gids, dst_vals, dst_pos);
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+void JitDenseSplitRadixAgg::AccumKernel::Run(
+    uint32_t count, const uint32_t* local_tagged_gids, const double* vals,
+    double* sums, uint64_t* counts, uint64_t* matched_bits,
+    uint64_t* nonnull_bits, uint8_t* inf_flag) const noexcept {
+  fn_(count, local_tagged_gids, vals, sums, counts, matched_bits, nonnull_bits,
+      inf_flag);
+}
+
+// ----------------------------------------------------------------------------
+// JitPacked2x32HashProbe
+// ----------------------------------------------------------------------------
+
+std::optional<JitPacked2x32HashProbe> JitPacked2x32HashProbe::Compile(
+    bool has_null0, bool has_null1, bool has_bloom, bool has_bias) {
+#ifndef TINYLAMB_HAS_LLVM
+  (void)has_null0;
+  (void)has_null1;
+  (void)has_bloom;
+  (void)has_bias;
+  return std::nullopt;
+#else
+  const uint8_t key =
+      static_cast<uint8_t>((has_null0 ? 1U : 0U) | (has_null1 ? 2U : 0U) |
+                           (has_bloom ? 4U : 0U) | (has_bias ? 8U : 0U));
+  struct CacheEntry {
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    ProbeFn fn{nullptr};
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto& cache = *new std::array<CacheEntry, 16>;
+  const std::scoped_lock lock(jit_cache_mutex);
+  if (cache[key].fn != nullptr) {
+    return JitPacked2x32HashProbe(cache[key].fn);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module =
+      std::make_unique<llvm::Module>("tinylamb.packed2x32_hash_probe", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i8 = b.getInt8Ty();
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_packed2x32_hash_probe";
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(
+          b.getVoidTy(),
+          {i32, ptr, ptr, ptr, ptr, i64, i64, ptr, i64, ptr, ptr, i64, ptr},
+          false),
+      llvm::Function::ExternalLinkage, kSymbol, *module);
+  for (unsigned ai : {1U, 2U, 3U, 4U, 7U, 9U, 10U}) {
+    fn->addParamAttr(ai, llvm::Attribute::ReadOnly);
+  }
+  fn->addParamAttr(12, llvm::Attribute::NoAlias);
+
+  auto* count = fn->getArg(0);
+  auto* k0_ptr = fn->getArg(1);
+  auto* n0_ptr = fn->getArg(2);
+  auto* k1_ptr = fn->getArg(3);
+  auto* n1_ptr = fn->getArg(4);
+  auto* bias0 = fn->getArg(5);
+  auto* bias1 = fn->getArg(6);
+  auto* bloom_words = fn->getArg(7);
+  auto* bloom_mask = fn->getArg(8);
+  auto* ht_keys = fn->getArg(9);
+  auto* ht_heads = fn->getArg(10);
+  auto* ht_mask = fn->getArg(11);
+  auto* out_heads = fn->getArg(12);
+
+  llvm::Function* pf_fn =
+      IntrinsicDecl(module.get(), llvm::Intrinsic::prefetch, {ptr});
+
+  auto* entry = llvm::BasicBlock::Create(*ctx, "entry", fn);
+  auto* pf_cond = llvm::BasicBlock::Create(*ctx, "pf.cond", fn);
+  auto* tl_cond = llvm::BasicBlock::Create(*ctx, "tl.cond", fn);
+  auto* exit_blk = llvm::BasicBlock::Create(*ctx, "exit", fn);
+
+  b.SetInsertPoint(entry);
+  auto* pf_end =
+      b.CreateSelect(b.CreateICmpUGT(count, b.getInt32(8)),
+                     b.CreateSub(count, b.getInt32(8)), b.getInt32(0));
+  b.CreateBr(pf_cond);
+
+  const auto pack_and_hash = [&](llvm::Value* v0, llvm::Value* v1,
+                                 llvm::Value** out_packed,
+                                 llvm::Value** out_fits) {
+    if (has_bias) {
+      v0 = b.CreateAdd(v0, bias0);
+      v1 = b.CreateAdd(v1, bias1);
+    }
+    auto* t0 = b.CreateTrunc(v0, i32);
+    auto* t1 = b.CreateTrunc(v1, i32);
+    *out_fits = b.CreateAnd(b.CreateICmpEQ(b.CreateSExt(t0, i64), v0),
+                            b.CreateICmpEQ(b.CreateSExt(t1, i64), v1));
+    *out_packed = b.CreateOr(b.CreateShl(b.CreateZExt(t0, i64), b.getInt64(32)),
+                             b.CreateZExt(t1, i64));
+    return EmitSplitMix64Packed(b, *out_packed);
+  };
+
+  const auto build_stage = [&](llvm::BasicBlock* cond_blk,
+                               llvm::BasicBlock* prev_blk,
+                               llvm::BasicBlock* next_stage,
+                               llvm::Value* start_i, llvm::Value* end_i,
+                               bool do_pf, std::string_view tag) {
+    const auto mk = [&](std::string_view s) {
+      return llvm::BasicBlock::Create(*ctx, std::string(tag) + std::string(s),
+                                      fn);
+    };
+    auto* body = mk(".body");
+    auto* check_range = mk(".range");
+    auto* probe_hdr = mk(".probe.hdr");
+    auto* probe_key = mk(".probe.key");
+    auto* write_miss = mk(".miss");
+    auto* latch = mk(".latch");
+
+    b.SetInsertPoint(cond_blk);
+    auto* i_phi = b.CreatePHI(i32, 2);
+    i_phi->addIncoming(start_i, prev_blk);
+    b.CreateCondBr(b.CreateICmpULT(i_phi, end_i), body, next_stage);
+
+    b.SetInsertPoint(body);
+    auto* i64_v = b.CreateZExt(i_phi, i64);
+    if (do_pf) {
+      auto* pi = b.CreateAdd(i64_v, b.getInt64(8));
+      auto* pv0 = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, k0_ptr, pi));
+      auto* pv1 = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, k1_ptr, pi));
+      llvm::Value* pf_packed = nullptr;
+      llvm::Value* pf_fits = nullptr;
+      auto* ph = pack_and_hash(pv0, pv1, &pf_packed, &pf_fits);
+      (void)pf_packed;
+      (void)pf_fits;
+      if (has_bloom) {
+        auto* bw = b.CreateAnd(b.CreateLShr(ph, b.getInt64(6)), bloom_mask);
+        EmitPrefetchRead(b, pf_fn, b.CreateInBoundsGEP(i64, bloom_words, bw));
+      } else {
+        auto* ps = b.CreateAnd(ph, ht_mask);
+        EmitPrefetchRead(b, pf_fn, b.CreateInBoundsGEP(i32, ht_heads, ps));
+        EmitPrefetchRead(b, pf_fn, b.CreateInBoundsGEP(i64, ht_keys, ps));
+      }
+    }
+
+    if (has_null0 || has_null1) {
+      llvm::Value* any_null = b.getFalse();
+      if (has_null0) {
+        auto* nv0 = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, n0_ptr, i64_v));
+        any_null = b.CreateOr(any_null, b.CreateICmpNE(nv0, b.getInt8(0)));
+      }
+      if (has_null1) {
+        auto* nv1 = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, n1_ptr, i64_v));
+        any_null = b.CreateOr(any_null, b.CreateICmpNE(nv1, b.getInt8(0)));
+      }
+      b.CreateCondBr(any_null, write_miss, check_range);
+    } else {
+      b.CreateBr(check_range);
+    }
+
+    b.SetInsertPoint(check_range);
+    auto* v0 = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, k0_ptr, i64_v));
+    auto* v1 = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, k1_ptr, i64_v));
+    llvm::Value* packed = nullptr;
+    llvm::Value* fits = nullptr;
+    auto* h = pack_and_hash(v0, v1, &packed, &fits);
+    auto* init_slot = b.CreateAnd(h, ht_mask);
+    if (has_bloom) {
+      auto* bloom_chk = mk(".bloom");
+      b.CreateCondBr(fits, bloom_chk, write_miss);
+      b.SetInsertPoint(bloom_chk);
+      auto* w0_idx = b.CreateAnd(b.CreateLShr(h, b.getInt64(6)), bloom_mask);
+      auto* w1_idx = b.CreateAnd(b.CreateLShr(h, b.getInt64(30)), bloom_mask);
+      auto* w0 =
+          b.CreateLoad(i64, b.CreateInBoundsGEP(i64, bloom_words, w0_idx));
+      auto* w1 =
+          b.CreateLoad(i64, b.CreateInBoundsGEP(i64, bloom_words, w1_idx));
+      auto* b0 = b.CreateAnd(b.CreateLShr(w0, b.CreateAnd(h, b.getInt64(63))),
+                             b.getInt64(1));
+      auto* b1 = b.CreateAnd(
+          b.CreateLShr(
+              w1, b.CreateAnd(b.CreateLShr(h, b.getInt64(24)), b.getInt64(63))),
+          b.getInt64(1));
+      auto* both = b.CreateICmpNE(b.CreateAnd(b0, b1), b.getInt64(0));
+      b.CreateCondBr(both, probe_hdr, write_miss);
+    } else {
+      b.CreateCondBr(fits, probe_hdr, write_miss);
+    }
+
+    llvm::BasicBlock* probe_pred = b.GetInsertBlock();
+    b.SetInsertPoint(probe_hdr);
+    auto* slot_phi = b.CreatePHI(i64, 2);
+    slot_phi->addIncoming(init_slot, probe_pred);
+    auto* head =
+        b.CreateLoad(i32, b.CreateInBoundsGEP(i32, ht_heads, slot_phi));
+    b.CreateCondBr(b.CreateICmpEQ(head, b.getInt32(UINT32_MAX)), write_miss,
+                   probe_key);
+
+    b.SetInsertPoint(probe_key);
+    auto* hk = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, ht_keys, slot_phi));
+    auto* hit_blk = mk(".hit");
+    auto* next_slot_blk = mk(".next_slot");
+    b.CreateCondBr(b.CreateICmpEQ(hk, packed), hit_blk, next_slot_blk);
+
+    b.SetInsertPoint(hit_blk);
+    b.CreateStore(head, b.CreateInBoundsGEP(i32, out_heads, i64_v));
+    b.CreateBr(latch);
+
+    b.SetInsertPoint(next_slot_blk);
+    auto* next_slot =
+        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask);
+    slot_phi->addIncoming(next_slot, next_slot_blk);
+    b.CreateBr(probe_hdr);
+
+    b.SetInsertPoint(write_miss);
+    b.CreateStore(b.getInt32(UINT32_MAX),
+                  b.CreateInBoundsGEP(i32, out_heads, i64_v));
+    b.CreateBr(latch);
+
+    b.SetInsertPoint(latch);
+    auto* i_next = b.CreateAdd(i_phi, b.getInt32(1));
+    i_phi->addIncoming(i_next, latch);
+    b.CreateBr(cond_blk);
+  };
+
+  build_stage(pf_cond, entry, tl_cond, b.getInt32(0), pf_end, true, "pf");
+  build_stage(tl_cond, pf_cond, exit_blk, pf_end, count, false, "tl");
+
+  b.SetInsertPoint(exit_blk);
+  b.CreateRetVoid();
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "packed2x32-hash-probe");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  auto compiled = symbol->toPtr<ProbeFn>();
+  cache[key] = CacheEntry{.jit = std::move(jit), .fn = compiled};
+  return JitPacked2x32HashProbe(compiled);
+#endif
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+void JitPacked2x32HashProbe::Probe(uint32_t count, const int64_t* k0,
+                                   const uint8_t* n0, const int64_t* k1,
+                                   const uint8_t* n1, int64_t bias0,
+                                   int64_t bias1, const uint64_t* bloom_words,
+                                   uint64_t bloom_word_mask,
+                                   const uint64_t* ht_keys,
+                                   const uint32_t* ht_heads, uint64_t ht_mask,
+                                   uint32_t* out_heads) const noexcept {
+  fn_(count, k0, n0, k1, n1, bias0, bias1, bloom_words, bloom_word_mask,
+      ht_keys, ht_heads, ht_mask, out_heads);
+}
+
+// ----------------------------------------------------------------------------
+// JitPacked2x32RadixDedup
+// ----------------------------------------------------------------------------
+
+std::optional<JitPacked2x32RadixDedup::PackKernel>
+JitPacked2x32RadixDedup::CompilePack(bool has_null0, bool has_null1,
+                                     bool use_sel, uint8_t part_shift) {
+#ifndef TINYLAMB_HAS_LLVM
+  (void)has_null0;
+  (void)has_null1;
+  (void)use_sel;
+  (void)part_shift;
+  return std::nullopt;
+#else
+  if (part_shift < 40 || part_shift >= 64) {
+    return std::nullopt;
+  }
+  const uint32_t key = (has_null0 ? 1U : 0U) | (has_null1 ? 2U : 0U) |
+                       (use_sel ? 4U : 0U) |
+                       (static_cast<uint32_t>(part_shift) << 8U);
+  struct CacheEntry {
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    PackFn fn{nullptr};
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto& cache = *new std::unordered_map<uint32_t, CacheEntry>;
+  const std::scoped_lock lock(jit_cache_mutex);
+  if (auto it = cache.find(key); it != cache.end()) {
+    return PackKernel(it->second.fn);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module =
+      std::make_unique<llvm::Module>("tinylamb.packed2x32_dedup_pack", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i8 = b.getInt8Ty();
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_packed2x32_dedup_pack";
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(
+          b.getVoidTy(),
+          {i32, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr}, false),
+      llvm::Function::ExternalLinkage, kSymbol, *module);
+  for (unsigned ai : {1U, 2U, 3U, 4U, 5U}) {
+    fn->addParamAttr(ai, llvm::Attribute::ReadOnly);
+  }
+  for (unsigned ai : {6U, 7U, 8U, 9U, 10U}) {
+    fn->addParamAttr(ai, llvm::Attribute::NoAlias);
+  }
+
+  auto* count = fn->getArg(0);
+  auto* sel = fn->getArg(1);
+  auto* k0_ptr = fn->getArg(2);
+  auto* n0_ptr = fn->getArg(3);
+  auto* k1_ptr = fn->getArg(4);
+  auto* n1_ptr = fn->getArg(5);
+  auto* out_packed = fn->getArg(6);
+  auto* out_hist = fn->getArg(7);
+  auto* out_fb = fn->getArg(8);
+  auto* out_packed_cnt = fn->getArg(9);
+  auto* out_fb_cnt = fn->getArg(10);
+
+  auto* entry = llvm::BasicBlock::Create(*ctx, "entry", fn);
+  auto* loop_hdr = llvm::BasicBlock::Create(*ctx, "loop.hdr", fn);
+  auto* range_chk = llvm::BasicBlock::Create(*ctx, "range.chk", fn);
+  auto* emit_pack = llvm::BasicBlock::Create(*ctx, "emit.pack", fn);
+  auto* emit_fb = llvm::BasicBlock::Create(*ctx, "emit.fb", fn);
+  auto* loop_latch = llvm::BasicBlock::Create(*ctx, "loop.latch", fn);
+  auto* exit_blk = llvm::BasicBlock::Create(*ctx, "exit", fn);
+
+  b.SetInsertPoint(entry);
+  b.CreateCondBr(b.CreateICmpEQ(count, b.getInt32(0)), exit_blk, loop_hdr);
+
+  b.SetInsertPoint(loop_hdr);
+  auto* idx_phi = b.CreatePHI(i32, 2);
+  auto* m_phi = b.CreatePHI(i32, 2);
+  auto* fb_phi = b.CreatePHI(i32, 2);
+  idx_phi->addIncoming(b.getInt32(0), entry);
+  m_phi->addIncoming(b.getInt32(0), entry);
+  fb_phi->addIncoming(b.getInt32(0), entry);
+
+  llvm::Value* r32 = idx_phi;
+  if (use_sel) {
+    r32 = b.CreateLoad(
+        i32, b.CreateInBoundsGEP(i32, sel, b.CreateZExt(idx_phi, i64)));
+  }
+  auto* r64 = b.CreateZExt(r32, i64);
+  if (has_null0 || has_null1) {
+    llvm::Value* any_null = b.getFalse();
+    if (has_null0) {
+      auto* nv0 = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, n0_ptr, r64));
+      any_null = b.CreateOr(any_null, b.CreateICmpNE(nv0, b.getInt8(0)));
+    }
+    if (has_null1) {
+      auto* nv1 = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, n1_ptr, r64));
+      any_null = b.CreateOr(any_null, b.CreateICmpNE(nv1, b.getInt8(0)));
+    }
+    b.CreateCondBr(any_null, emit_fb, range_chk);
+  } else {
+    b.CreateBr(range_chk);
+  }
+
+  b.SetInsertPoint(range_chk);
+  auto* v0 = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, k0_ptr, r64));
+  auto* v1 = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, k1_ptr, r64));
+  auto* t0 = b.CreateTrunc(v0, i32);
+  auto* t1 = b.CreateTrunc(v1, i32);
+  auto* fits = b.CreateAnd(b.CreateICmpEQ(b.CreateSExt(t0, i64), v0),
+                           b.CreateICmpEQ(b.CreateSExt(t1, i64), v1));
+  b.CreateCondBr(fits, emit_pack, emit_fb);
+
+  b.SetInsertPoint(emit_pack);
+  auto* packed = b.CreateOr(b.CreateShl(b.CreateZExt(t0, i64), b.getInt64(32)),
+                            b.CreateZExt(t1, i64));
+  auto* h = EmitSplitMix64Packed(b, packed);
+  auto* part = b.CreateLShr(h, b.getInt64(part_shift));
+  b.CreateStore(packed,
+                b.CreateInBoundsGEP(i64, out_packed, b.CreateZExt(m_phi, i64)));
+  auto* hist_ptr = b.CreateInBoundsGEP(i32, out_hist, part);
+  b.CreateStore(b.CreateAdd(b.CreateLoad(i32, hist_ptr), b.getInt32(1)),
+                hist_ptr);
+  auto* m_inc = b.CreateAdd(m_phi, b.getInt32(1));
+  b.CreateBr(loop_latch);
+
+  b.SetInsertPoint(emit_fb);
+  b.CreateStore(r32,
+                b.CreateInBoundsGEP(i32, out_fb, b.CreateZExt(fb_phi, i64)));
+  auto* fb_inc = b.CreateAdd(fb_phi, b.getInt32(1));
+  b.CreateBr(loop_latch);
+
+  b.SetInsertPoint(loop_latch);
+  auto* m_next = b.CreatePHI(i32, 2);
+  m_next->addIncoming(m_inc, emit_pack);
+  m_next->addIncoming(m_phi, emit_fb);
+  auto* fb_next = b.CreatePHI(i32, 2);
+  fb_next->addIncoming(fb_phi, emit_pack);
+  fb_next->addIncoming(fb_inc, emit_fb);
+  auto* idx_next = b.CreateAdd(idx_phi, b.getInt32(1));
+  idx_phi->addIncoming(idx_next, loop_latch);
+  m_phi->addIncoming(m_next, loop_latch);
+  fb_phi->addIncoming(fb_next, loop_latch);
+  b.CreateCondBr(b.CreateICmpULT(idx_next, count), loop_hdr, exit_blk);
+
+  b.SetInsertPoint(exit_blk);
+  auto* m_final = b.CreatePHI(i32, 2);
+  m_final->addIncoming(b.getInt32(0), entry);
+  m_final->addIncoming(m_next, loop_latch);
+  auto* fb_final = b.CreatePHI(i32, 2);
+  fb_final->addIncoming(b.getInt32(0), entry);
+  fb_final->addIncoming(fb_next, loop_latch);
+  b.CreateStore(m_final, out_packed_cnt);
+  b.CreateStore(fb_final, out_fb_cnt);
+  b.CreateRetVoid();
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "packed2x32-dedup-pack");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  auto compiled = symbol->toPtr<PackFn>();
+  cache.emplace(key, CacheEntry{.jit = std::move(jit), .fn = compiled});
+  return PackKernel(compiled);
+#endif
+}
+
+std::optional<JitPacked2x32RadixDedup::ScatterKernel>
+JitPacked2x32RadixDedup::CompileScatter(uint8_t part_shift) {
+#ifndef TINYLAMB_HAS_LLVM
+  (void)part_shift;
+  return std::nullopt;
+#else
+  if (part_shift < 40 || part_shift >= 64) {
+    return std::nullopt;
+  }
+  struct CacheEntry {
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    ScatterFn fn{nullptr};
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto& cache = *new std::unordered_map<uint8_t, CacheEntry>;
+  const std::scoped_lock lock(jit_cache_mutex);
+  if (auto it = cache.find(part_shift); it != cache.end()) {
+    return ScatterKernel(it->second.fn);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module =
+      std::make_unique<llvm::Module>("tinylamb.packed2x32_dedup_scatter", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_packed2x32_dedup_scatter";
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(b.getVoidTy(), {i32, ptr, ptr, ptr}, false),
+      llvm::Function::ExternalLinkage, kSymbol, *module);
+  fn->addParamAttr(1, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(2, llvm::Attribute::ReadOnly);
+  fn->addParamAttr(3, llvm::Attribute::NoAlias);
+
+  auto* count = fn->getArg(0);
+  auto* in_packed = fn->getArg(1);
+  auto* dst_ptrs = fn->getArg(2);
+  auto* dst_pos = fn->getArg(3);
+
+  auto* entry = llvm::BasicBlock::Create(*ctx, "entry", fn);
+  auto* body = llvm::BasicBlock::Create(*ctx, "body", fn);
+  auto* exit_blk = llvm::BasicBlock::Create(*ctx, "exit", fn);
+
+  b.SetInsertPoint(entry);
+  b.CreateCondBr(b.CreateICmpEQ(count, b.getInt32(0)), exit_blk, body);
+
+  b.SetInsertPoint(body);
+  auto* i_phi = b.CreatePHI(i32, 2);
+  i_phi->addIncoming(b.getInt32(0), entry);
+  auto* i64_v = b.CreateZExt(i_phi, i64);
+  auto* packed = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, in_packed, i64_v));
+  auto* p =
+      b.CreateLShr(EmitSplitMix64Packed(b, packed), b.getInt64(part_shift));
+  auto* pos_ptr = b.CreateInBoundsGEP(i32, dst_pos, p);
+  auto* pos = b.CreateLoad(i32, pos_ptr);
+  b.CreateStore(b.CreateAdd(pos, b.getInt32(1)), pos_ptr);
+  auto* dst_base = b.CreateLoad(ptr, b.CreateInBoundsGEP(ptr, dst_ptrs, p));
+  b.CreateStore(packed,
+                b.CreateInBoundsGEP(i64, dst_base, b.CreateZExt(pos, i64)));
+  auto* i_next = b.CreateAdd(i_phi, b.getInt32(1));
+  i_phi->addIncoming(i_next, body);
+  b.CreateCondBr(b.CreateICmpULT(i_next, count), body, exit_blk);
+
+  b.SetInsertPoint(exit_blk);
+  b.CreateRetVoid();
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "packed2x32-dedup-scatter");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  auto compiled = symbol->toPtr<ScatterFn>();
+  cache.emplace(part_shift, CacheEntry{.jit = std::move(jit), .fn = compiled});
+  return ScatterKernel(compiled);
+#endif
+}
+
+std::optional<JitPacked2x32RadixDedup::DedupKernel>
+JitPacked2x32RadixDedup::CompileOpenAddrDedup() {
+#ifndef TINYLAMB_HAS_LLVM
+  return std::nullopt;
+#else
+  const std::scoped_lock lock(jit_cache_mutex);
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto* const owner = new std::unique_ptr<llvm::orc::LLJIT>;
+  static DedupFn compiled = nullptr;
+  if (compiled != nullptr) {
+    return DedupKernel(compiled);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module = std::make_unique<llvm::Module>(
+      "tinylamb.packed2x32_open_addr_dedup", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_packed2x32_open_addr_dedup";
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(
+          i32, {i32, ptr, ptr, ptr, i32, i64, i32, ptr, ptr, ptr}, false),
+      llvm::Function::ExternalLinkage, kSymbol, *module);
+  fn->addParamAttr(1, llvm::Attribute::ReadOnly);
+  for (unsigned ai : {2U, 3U, 7U, 8U, 9U}) {
+    fn->addParamAttr(ai, llvm::Attribute::NoAlias);
+  }
+
+  auto* count = fn->getArg(0);
+  auto* in_keys = fn->getArg(1);
+  auto* ht_keys = fn->getArg(2);
+  auto* ht_gens = fn->getArg(3);
+  auto* cur_gen = fn->getArg(4);
+  auto* ht_mask = fn->getArg(5);
+  auto* max_load = fn->getArg(6);
+  auto* n_occ_ptr = fn->getArg(7);
+  auto* out_k0 = fn->getArg(8);
+  auto* out_k1 = fn->getArg(9);
+
+  llvm::Function* pf_fn =
+      IntrinsicDecl(module.get(), llvm::Intrinsic::prefetch, {ptr});
+
+  auto* entry = llvm::BasicBlock::Create(*ctx, "entry", fn);
+  auto* pf_cond = llvm::BasicBlock::Create(*ctx, "pf.cond", fn);
+  auto* tl_cond = llvm::BasicBlock::Create(*ctx, "tl.cond", fn);
+  auto* full_exit = llvm::BasicBlock::Create(*ctx, "full.exit", fn);
+  auto* done_exit = llvm::BasicBlock::Create(*ctx, "done.exit", fn);
+
+  b.SetInsertPoint(entry);
+  auto* init_occ = b.CreateLoad(i32, n_occ_ptr);
+  auto* pf_end =
+      b.CreateSelect(b.CreateICmpUGT(count, b.getInt32(8)),
+                     b.CreateSub(count, b.getInt32(8)), b.getInt32(0));
+  b.CreateBr(pf_cond);
+
+  std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> full_preds;
+  std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> full_occ_preds;
+
+  const auto build_stage = [&](llvm::BasicBlock* cond_blk,
+                               llvm::BasicBlock* prev_blk, llvm::Value* start_i,
+                               llvm::Value* start_occ,
+                               llvm::BasicBlock* next_stage, llvm::Value* end_i,
+                               bool do_pf, std::string_view tag) {
+    const auto mk = [&](std::string_view s) {
+      return llvm::BasicBlock::Create(*ctx, std::string(tag) + std::string(s),
+                                      fn);
+    };
+    auto* body = mk(".body");
+    auto* probe_hdr = mk(".probe.hdr");
+    auto* probe_key = mk(".probe.key");
+    auto* ins_check = mk(".ins.chk");
+    auto* ins_do = mk(".ins.do");
+    auto* next_slot = mk(".next.slot");
+    auto* latch = mk(".latch");
+
+    b.SetInsertPoint(cond_blk);
+    auto* i_phi = b.CreatePHI(i32, 2);
+    auto* occ_phi = b.CreatePHI(i32, 2);
+    i_phi->addIncoming(start_i, prev_blk);
+    occ_phi->addIncoming(start_occ, prev_blk);
+    b.CreateCondBr(b.CreateICmpULT(i_phi, end_i), body, next_stage);
+
+    b.SetInsertPoint(body);
+    auto* i64_v = b.CreateZExt(i_phi, i64);
+    if (do_pf) {
+      auto* pf_k = b.CreateLoad(
+          i64,
+          b.CreateInBoundsGEP(i64, in_keys, b.CreateAdd(i64_v, b.getInt64(8))));
+      auto* pf_slot = b.CreateAnd(EmitSplitMix64Packed(b, pf_k), ht_mask);
+      EmitPrefetchRead(b, pf_fn, b.CreateInBoundsGEP(i32, ht_gens, pf_slot));
+      EmitPrefetchRead(b, pf_fn, b.CreateInBoundsGEP(i64, ht_keys, pf_slot));
+    }
+    auto* k = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, in_keys, i64_v));
+    auto* init_slot = b.CreateAnd(EmitSplitMix64Packed(b, k), ht_mask);
+    b.CreateBr(probe_hdr);
+
+    b.SetInsertPoint(probe_hdr);
+    auto* slot_phi = b.CreatePHI(i64, 2);
+    slot_phi->addIncoming(init_slot, body);
+    auto* g = b.CreateLoad(i32, b.CreateInBoundsGEP(i32, ht_gens, slot_phi));
+    b.CreateCondBr(b.CreateICmpNE(g, cur_gen), ins_check, probe_key);
+
+    b.SetInsertPoint(ins_check);
+    b.CreateCondBr(b.CreateICmpUGE(occ_phi, max_load), full_exit, ins_do);
+    full_preds.emplace_back(i_phi, ins_check);
+    full_occ_preds.emplace_back(occ_phi, ins_check);
+
+    b.SetInsertPoint(ins_do);
+    b.CreateStore(k, b.CreateInBoundsGEP(i64, ht_keys, slot_phi));
+    b.CreateStore(cur_gen, b.CreateInBoundsGEP(i32, ht_gens, slot_phi));
+    auto* occ64 = b.CreateZExt(occ_phi, i64);
+    auto* k0_val =
+        b.CreateSExt(b.CreateTrunc(b.CreateLShr(k, b.getInt64(32)), i32), i64);
+    auto* k1_val = b.CreateSExt(b.CreateTrunc(k, i32), i64);
+    b.CreateStore(k0_val, b.CreateInBoundsGEP(i64, out_k0, occ64));
+    b.CreateStore(k1_val, b.CreateInBoundsGEP(i64, out_k1, occ64));
+    auto* occ_inc = b.CreateAdd(occ_phi, b.getInt32(1));
+    b.CreateBr(latch);
+
+    b.SetInsertPoint(probe_key);
+    auto* hk = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, ht_keys, slot_phi));
+    b.CreateCondBr(b.CreateICmpEQ(hk, k), latch, next_slot);
+
+    b.SetInsertPoint(next_slot);
+    slot_phi->addIncoming(
+        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask), next_slot);
+    b.CreateBr(probe_hdr);
+
+    b.SetInsertPoint(latch);
+    auto* occ_next = b.CreatePHI(i32, 2);
+    occ_next->addIncoming(occ_inc, ins_do);
+    occ_next->addIncoming(occ_phi, probe_key);
+    auto* i_next = b.CreateAdd(i_phi, b.getInt32(1));
+    i_phi->addIncoming(i_next, latch);
+    occ_phi->addIncoming(occ_next, latch);
+    b.CreateBr(cond_blk);
+
+    return std::pair<llvm::Value*, llvm::Value*>{i_phi, occ_phi};
+  };
+
+  auto [pf_end_i, pf_end_occ] = build_stage(
+      pf_cond, entry, b.getInt32(0), init_occ, tl_cond, pf_end, true, "pf");
+  auto [tl_end_i, tl_end_occ] = build_stage(
+      tl_cond, pf_cond, pf_end_i, pf_end_occ, done_exit, count, false, "tl");
+  (void)tl_end_i;
+
+  b.SetInsertPoint(full_exit);
+  auto* ret_full = b.CreatePHI(i32, static_cast<unsigned>(full_preds.size()));
+  auto* occ_full =
+      b.CreatePHI(i32, static_cast<unsigned>(full_occ_preds.size()));
+  for (const auto& [v, bb] : full_preds) {
+    ret_full->addIncoming(v, bb);
+  }
+  for (const auto& [v, bb] : full_occ_preds) {
+    occ_full->addIncoming(v, bb);
+  }
+  b.CreateStore(occ_full, n_occ_ptr);
+  b.CreateRet(ret_full);
+
+  b.SetInsertPoint(done_exit);
+  b.CreateStore(tl_end_occ, n_occ_ptr);
+  b.CreateRet(count);
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "packed2x32-open-addr-dedup");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  compiled = symbol->toPtr<DedupFn>();
+  *owner = std::move(jit);
+  return DedupKernel(compiled);
+#endif
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+void JitPacked2x32RadixDedup::PackKernel::Run(
+    uint32_t count, const uint32_t* sel, const int64_t* k0, const uint8_t* n0,
+    const int64_t* k1, const uint8_t* n1, uint64_t* out_packed,
+    uint32_t* out_hist, uint32_t* out_fb_rows, uint32_t* out_packed_count,
+    uint32_t* out_fb_count) const noexcept {
+  fn_(count, sel, k0, n0, k1, n1, out_packed, out_hist, out_fb_rows,
+      out_packed_count, out_fb_count);
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+void JitPacked2x32RadixDedup::ScatterKernel::Run(
+    uint32_t count, const uint64_t* in_packed, uint64_t* const* dst_ptrs,
+    uint32_t* dst_pos) const noexcept {
+  fn_(count, in_packed, dst_ptrs, dst_pos);
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+uint32_t JitPacked2x32RadixDedup::DedupKernel::Run(
+    uint32_t count, const uint64_t* in_keys, uint64_t* ht_keys,
+    uint32_t* ht_gens, uint32_t cur_gen, uint64_t ht_mask, uint32_t max_load,
+    uint32_t* n_occ, int64_t* out_k0, int64_t* out_k1) const noexcept {
+  return fn_(count, in_keys, ht_keys, ht_gens, cur_gen, ht_mask, max_load,
+             n_occ, out_k0, out_k1);
+}
+
+// ----------------------------------------------------------------------------
+// JitRadixKeyDoubleAgg
+// ----------------------------------------------------------------------------
+
+std::optional<JitRadixKeyDoubleAgg> JitRadixKeyDoubleAgg::Compile(
+    bool check_inf) {
+#ifndef TINYLAMB_HAS_LLVM
+  (void)check_inf;
+  return std::nullopt;
+#else
+  struct CacheEntry {
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    AggFn fn{nullptr};
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+  static auto& cache = *new std::array<CacheEntry, 2>;
+  const std::scoped_lock lock(jit_cache_mutex);
+  const size_t key = check_inf ? 1U : 0U;
+  if (cache[key].fn != nullptr) {
+    return JitRadixKeyDoubleAgg(cache[key].fn);
+  }
+
+  InitializeLlvm();
+  auto ctx = std::make_unique<llvm::LLVMContext>();
+  auto module =
+      std::make_unique<llvm::Module>("tinylamb.radix_key_double_agg", *ctx);
+  llvm::IRBuilder<> b(*ctx);
+  auto* i8 = b.getInt8Ty();
+  auto* i32 = b.getInt32Ty();
+  auto* i64 = b.getInt64Ty();
+  auto* f64 = b.getDoubleTy();
+  auto* ptr = b.getPtrTy();
+  constexpr std::string_view kSymbol = "tinylamb_radix_key_double_agg";
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(i32,
+                              {i32, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, i32,
+                               i64, i32, ptr, ptr},
+                              false),
+      llvm::Function::ExternalLinkage, kSymbol, *module);
+  for (unsigned ai : {1U, 2U, 3U}) {
+    fn->addParamAttr(ai, llvm::Attribute::ReadOnly);
+  }
+  for (unsigned ai : {4U, 5U, 6U, 7U, 8U, 12U, 13U}) {
+    fn->addParamAttr(ai, llvm::Attribute::NoAlias);
+  }
+
+  auto* count = fn->getArg(0);
+  auto* in_keys = fn->getArg(1);
+  auto* in_vals = fn->getArg(2);
+  auto* in_valids = fn->getArg(3);
+  auto* ht_keys = fn->getArg(4);
+  auto* ht_sums = fn->getArg(5);
+  auto* ht_counts = fn->getArg(6);
+  auto* ht_gens = fn->getArg(7);
+  auto* ht_inf = fn->getArg(8);
+  auto* cur_gen = fn->getArg(9);
+  auto* ht_mask = fn->getArg(10);
+  auto* max_load = fn->getArg(11);
+  auto* occupied = fn->getArg(12);
+  auto* n_occ_ptr = fn->getArg(13);
+
+  llvm::Function* pf_fn =
+      IntrinsicDecl(module.get(), llvm::Intrinsic::prefetch, {ptr});
+  llvm::Function* fabs_fn =
+      check_inf ? IntrinsicDecl(module.get(), llvm::Intrinsic::fabs, {f64})
+                : nullptr;
+  llvm::Constant* pos_inf =
+      check_inf ? llvm::ConstantFP::getInfinity(f64) : nullptr;
+  llvm::MDNode* unlikely_md = check_inf ? UnlikelyBranchWeights(*ctx) : nullptr;
+
+  auto* entry = llvm::BasicBlock::Create(*ctx, "entry", fn);
+  auto* pf_cond = llvm::BasicBlock::Create(*ctx, "pf.cond", fn);
+  auto* tl_cond = llvm::BasicBlock::Create(*ctx, "tl.cond", fn);
+  auto* full_exit = llvm::BasicBlock::Create(*ctx, "full.exit", fn);
+  auto* done_exit = llvm::BasicBlock::Create(*ctx, "done.exit", fn);
+
+  b.SetInsertPoint(entry);
+  auto* init_occ = b.CreateLoad(i32, n_occ_ptr);
+  auto* pf_end =
+      b.CreateSelect(b.CreateICmpUGT(count, b.getInt32(8)),
+                     b.CreateSub(count, b.getInt32(8)), b.getInt32(0));
+  b.CreateBr(pf_cond);
+
+  std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> full_preds;
+  std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> full_occ_preds;
+
+  const auto build_stage = [&](llvm::BasicBlock* cond_blk,
+                               llvm::BasicBlock* prev_blk, llvm::Value* start_i,
+                               llvm::Value* start_occ,
+                               llvm::BasicBlock* next_stage, llvm::Value* end_i,
+                               bool do_pf, std::string_view tag) {
+    const auto mk = [&](std::string_view s) {
+      return llvm::BasicBlock::Create(*ctx, std::string(tag) + std::string(s),
+                                      fn);
+    };
+    auto* body = mk(".body");
+    auto* probe_hdr = mk(".probe.hdr");
+    auto* probe_key = mk(".probe.key");
+    auto* ins_chk = mk(".ins.chk");
+    auto* ins_do = mk(".ins.do");
+    auto* next_slot = mk(".next.slot");
+    auto* check_valid = mk(".chk.valid");
+    auto* do_add = mk(".do.add");
+    auto* latch = mk(".latch");
+
+    b.SetInsertPoint(cond_blk);
+    auto* i_phi = b.CreatePHI(i32, 2);
+    auto* occ_phi = b.CreatePHI(i32, 2);
+    i_phi->addIncoming(start_i, prev_blk);
+    occ_phi->addIncoming(start_occ, prev_blk);
+    b.CreateCondBr(b.CreateICmpULT(i_phi, end_i), body, next_stage);
+
+    b.SetInsertPoint(body);
+    auto* i64_v = b.CreateZExt(i_phi, i64);
+    if (do_pf) {
+      auto* pf_k = b.CreateLoad(
+          i64,
+          b.CreateInBoundsGEP(i64, in_keys, b.CreateAdd(i64_v, b.getInt64(8))));
+      auto* pf_slot = b.CreateAnd(EmitSplitMix64Packed(b, pf_k), ht_mask);
+      EmitPrefetchWrite(b, pf_fn, b.CreateInBoundsGEP(i32, ht_gens, pf_slot));
+      EmitPrefetchWrite(b, pf_fn, b.CreateInBoundsGEP(i64, ht_keys, pf_slot));
+      EmitPrefetchWrite(b, pf_fn, b.CreateInBoundsGEP(f64, ht_sums, pf_slot));
+    }
+    auto* k = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, in_keys, i64_v));
+    auto* init_slot = b.CreateAnd(EmitSplitMix64Packed(b, k), ht_mask);
+    b.CreateBr(probe_hdr);
+
+    b.SetInsertPoint(probe_hdr);
+    auto* slot_phi = b.CreatePHI(i64, 2);
+    slot_phi->addIncoming(init_slot, body);
+    auto* g = b.CreateLoad(i32, b.CreateInBoundsGEP(i32, ht_gens, slot_phi));
+    b.CreateCondBr(b.CreateICmpNE(g, cur_gen), ins_chk, probe_key);
+
+    b.SetInsertPoint(ins_chk);
+    b.CreateCondBr(b.CreateICmpUGE(occ_phi, max_load), full_exit, ins_do);
+    full_preds.emplace_back(i_phi, ins_chk);
+    full_occ_preds.emplace_back(occ_phi, ins_chk);
+
+    b.SetInsertPoint(ins_do);
+    b.CreateStore(k, b.CreateInBoundsGEP(i64, ht_keys, slot_phi));
+    b.CreateStore(llvm::ConstantFP::get(f64, 0.0),
+                  b.CreateInBoundsGEP(f64, ht_sums, slot_phi));
+    b.CreateStore(b.getInt64(0), b.CreateInBoundsGEP(i64, ht_counts, slot_phi));
+    b.CreateStore(cur_gen, b.CreateInBoundsGEP(i32, ht_gens, slot_phi));
+    if (check_inf) {
+      b.CreateStore(b.getInt8(0), b.CreateInBoundsGEP(i8, ht_inf, slot_phi));
+    }
+    b.CreateStore(
+        b.CreateTrunc(slot_phi, i32),
+        b.CreateInBoundsGEP(i32, occupied, b.CreateZExt(occ_phi, i64)));
+    auto* occ_inc = b.CreateAdd(occ_phi, b.getInt32(1));
+    b.CreateBr(check_valid);
+
+    b.SetInsertPoint(probe_key);
+    auto* hk = b.CreateLoad(i64, b.CreateInBoundsGEP(i64, ht_keys, slot_phi));
+    b.CreateCondBr(b.CreateICmpEQ(hk, k), check_valid, next_slot);
+
+    b.SetInsertPoint(next_slot);
+    slot_phi->addIncoming(
+        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask), next_slot);
+    b.CreateBr(probe_hdr);
+
+    b.SetInsertPoint(check_valid);
+    auto* occ_cur = b.CreatePHI(i32, 2);
+    occ_cur->addIncoming(occ_inc, ins_do);
+    occ_cur->addIncoming(occ_phi, probe_key);
+    auto* vld = b.CreateLoad(i8, b.CreateInBoundsGEP(i8, in_valids, i64_v));
+    b.CreateCondBr(b.CreateICmpNE(vld, b.getInt8(0)), do_add, latch);
+
+    b.SetInsertPoint(do_add);
+    auto* sum_ptr = b.CreateInBoundsGEP(f64, ht_sums, slot_phi);
+    auto* cnt_ptr = b.CreateInBoundsGEP(i64, ht_counts, slot_phi);
+    auto* prev = b.CreateLoad(f64, sum_ptr);
+    auto* dv = b.CreateLoad(f64, b.CreateInBoundsGEP(f64, in_vals, i64_v));
+    auto* next_s = b.CreateFAdd(prev, dv);
+    if (check_inf) {
+      auto* inf_next =
+          b.CreateFCmpOEQ(b.CreateCall(fabs_fn, {next_s}), pos_inf);
+      auto* fin_prev = b.CreateFCmpUNE(b.CreateCall(fabs_fn, {prev}), pos_inf);
+      auto* fin_dv = b.CreateFCmpUNE(b.CreateCall(fabs_fn, {dv}), pos_inf);
+      auto* ovf = b.CreateAnd(inf_next, b.CreateAnd(fin_prev, fin_dv));
+      auto* set_inf = mk(".set_inf");
+      auto* after_inf = mk(".after_inf");
+      auto* br = b.CreateCondBr(ovf, set_inf, after_inf);
+      br->setMetadata(llvm::LLVMContext::MD_prof, unlikely_md);
+      b.SetInsertPoint(set_inf);
+      b.CreateStore(b.getInt8(1), b.CreateInBoundsGEP(i8, ht_inf, slot_phi));
+      b.CreateBr(after_inf);
+      b.SetInsertPoint(after_inf);
+    }
+    b.CreateStore(next_s, sum_ptr);
+    b.CreateStore(b.CreateAdd(b.CreateLoad(i64, cnt_ptr), b.getInt64(1)),
+                  cnt_ptr);
+    auto* add_end = b.GetInsertBlock();
+    b.CreateBr(latch);
+
+    b.SetInsertPoint(latch);
+    (void)add_end;
+    auto* i_next = b.CreateAdd(i_phi, b.getInt32(1));
+    i_phi->addIncoming(i_next, latch);
+    occ_phi->addIncoming(occ_cur, latch);
+    b.CreateBr(cond_blk);
+
+    return std::pair<llvm::Value*, llvm::Value*>{i_phi, occ_phi};
+  };
+
+  auto [pf_end_i, pf_end_occ] = build_stage(
+      pf_cond, entry, b.getInt32(0), init_occ, tl_cond, pf_end, true, "pf");
+  auto [tl_end_i, tl_end_occ] = build_stage(
+      tl_cond, pf_cond, pf_end_i, pf_end_occ, done_exit, count, false, "tl");
+  (void)tl_end_i;
+
+  b.SetInsertPoint(full_exit);
+  auto* ret_full = b.CreatePHI(i32, static_cast<unsigned>(full_preds.size()));
+  auto* occ_full =
+      b.CreatePHI(i32, static_cast<unsigned>(full_occ_preds.size()));
+  for (const auto& [v, bb] : full_preds) {
+    ret_full->addIncoming(v, bb);
+  }
+  for (const auto& [v, bb] : full_occ_preds) {
+    occ_full->addIncoming(v, bb);
+  }
+  b.CreateStore(occ_full, n_occ_ptr);
+  b.CreateRet(ret_full);
+
+  b.SetInsertPoint(done_exit);
+  b.CreateStore(tl_end_occ, n_occ_ptr);
+  b.CreateRet(count);
+
+  auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
+                                      "radix-key-double-agg");
+  if (!jit) {
+    return std::nullopt;
+  }
+  auto symbol = jit->lookup(kSymbol);
+  if (!symbol) {
+    llvm::consumeError(symbol.takeError());
+    return std::nullopt;
+  }
+  auto compiled = symbol->toPtr<AggFn>();
+  cache[key] = CacheEntry{.jit = std::move(jit), .fn = compiled};
+  return JitRadixKeyDoubleAgg(compiled);
+#endif
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+uint32_t JitRadixKeyDoubleAgg::Accumulate(
+    uint32_t count, const uint64_t* in_keys, const double* in_vals,
+    const uint8_t* in_valids, uint64_t* ht_keys, double* ht_sums,
+    uint64_t* ht_counts, uint32_t* ht_gens, uint8_t* ht_inf, uint32_t cur_gen,
+    uint64_t ht_mask, uint32_t max_load, uint32_t* occupied,
+    uint32_t* n_occ) const noexcept {
+  return fn_(count, in_keys, in_vals, in_valids, ht_keys, ht_sums, ht_counts,
+             ht_gens, ht_inf, cur_gen, ht_mask, max_load, occupied, n_occ);
 }
 
 #undef TINYLAMB_JIT_CALL_BOUNDARY

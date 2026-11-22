@@ -30,6 +30,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/decoder.hpp"
@@ -259,6 +260,49 @@ TEST(ValueTest, ArrayEquality_TreatsDocumentedTypeSynonymsAsEqual) {
   EXPECT_FALSE(bool_tagged == int64_spelled);
   const Value bytes_tagged = Value::Array({Value("x")}, "BYTES");
   EXPECT_FALSE(bytes_tagged == string_plain);
+}
+
+TEST(ValueTest, ArrayElementTypeMismatchHasTotalOrder) {
+  // Distinct canonical element types used to make both TryLess and
+  // TryGreater return false, so all five comparisons were false and the
+  // ordering was not strict weak. CompareForOrderBy already breaks the tie
+  // by type name; the Try* paths must agree with it.
+  const Value doubles = Value::Array({Value(1.5)}, "DOUBLE");
+  const Value ints = Value::Array({Value(int64_t{1})}, "INT64");
+  EXPECT_FALSE(doubles == ints);
+  const bool doubles_less = doubles.TryLess(ints).Value();
+  const bool doubles_greater = doubles.TryGreater(ints).Value();
+  EXPECT_NE(doubles_less, doubles_greater);
+  EXPECT_EQ(ints.TryLess(doubles).Value(), doubles_greater);
+  EXPECT_EQ(ints.TryGreater(doubles).Value(), doubles_less);
+  EXPECT_EQ(doubles_less, CompareForOrderBy(doubles, ints) < 0);
+}
+
+TEST(ValueTest, CollationSetterRejectsUnknownTags) {
+  Value value("text");
+  EXPECT_TRUE(value.SetCollation(2));
+  EXPECT_FALSE(value.SetCollation(5));
+  EXPECT_FALSE(value.SetCollation(255));
+  EXPECT_EQ(value.Collation(), 2);
+  EXPECT_EQ(value.WithCollation(255).Collation(), 2);
+  EXPECT_TRUE(value.SetCollation(4));
+  EXPECT_EQ(value.Collation(), 4);
+}
+
+TEST(ValueTest, ArrayEncoderDecoderRoundTripPreservesCollation) {
+  // Encoder writes the collation tag for arrays too; the Decoder used to
+  // overwrite it with the fresh Value::Array's tag (0) on move-assign.
+  const Value original =
+      Value::Array({Value(int64_t{1}), Value("x")}, "INT64").WithCollation(2);
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << original;
+  Value restored;
+  Decoder decoder(stream);
+  decoder >> restored;
+  ASSERT_FALSE(decoder.Failed());
+  EXPECT_EQ(restored.Collation(), original.Collation());
+  EXPECT_EQ(restored, original);
 }
 
 TEST(ValueTest, LessThan_DiverseTypes_ReturnsTrueWhenSmaller) {
@@ -786,10 +830,11 @@ TEST(ValueTest, ToString_UnaryAndAggregationEnums_FormatsExpectedStrings) {
         << UnaryOperation::kBitwiseNot << "|" << invalid_unary;
   agg << AggregationType::kCount << "|" << AggregationType::kSum << "|"
       << AggregationType::kAvg << "|" << AggregationType::kMin << "|"
-      << AggregationType::kMax << "|" << invalid_agg;
+      << AggregationType::kMax << "|" << AggregationType::kPercentileDisc << "|"
+      << invalid_agg;
 
   EXPECT_EQ(unary.str(), "IS NULL|IS NOT NULL|NOT|-|~|UNKNOWN");
-  EXPECT_EQ(agg.str(), "COUNT|SUM|AVG|MIN|MAX|UNKNOWN");
+  EXPECT_EQ(agg.str(), "COUNT|SUM|AVG|MIN|MAX|PERCENTILE_DISC|UNKNOWN");
 }
 
 TEST(ValueTest, Serialize_NullValue_ProducesOneByteAndRejectsDeserialize) {
@@ -1285,13 +1330,13 @@ TEST(ValueTest, Operations_OnInvalidValueType_AbortOrThrow) {
   EXPECT_DEATH(std::ignore = broken.AsString(), "undefined type");
   EXPECT_DEATH(std::ignore = (broken == broken), "undefined type");
   EXPECT_DEATH(std::hash<Value>{}(broken), "undefined type");
-  // Typed stream / index-image decoding reports corruption instead.
-  EXPECT_THROW(broken.Deserialize(buffer.data(), invalid_type),
-               std::runtime_error);
   EXPECT_DEATH(std::ignore = broken.EncodeMemcomparableFormat(),
                "undefined type");
   EXPECT_THROW(std::ignore = (broken < broken), std::runtime_error);
   EXPECT_THROW(std::ignore = (broken > broken), std::runtime_error);
+  // Typed stream decoding reports corruption and clears the destination.
+  EXPECT_THROW(broken.Deserialize(buffer.data(), invalid_type),
+               std::runtime_error);
 }
 
 TEST(ValueTest,
@@ -1444,6 +1489,26 @@ TEST(ValueTest, GreaterThan_WithArrays_ComparesElementsCorrectly) {
 
   EXPECT_TRUE(b > a);
   EXPECT_FALSE(a > b);
+}
+
+// #11464: operator< must not use raw byte order for VARCHAR while TryLess
+// uses the canonical (collation / ENUM rank) order -- std::sort and ORDER BY
+// would then disagree on the exact same pair of values.
+TEST(ValueTest, OperatorLessAgreesWithTryLessForVarchar) {
+  const Value negative("TESTENUMNEGATIVE");
+  const Value zero("TESTENUM0");
+  const Value ci_a = Value("a").WithCollation(2);  // und:ci
+  const Value ci_B = Value("B").WithCollation(2);
+  const Value plain_B("B");
+  const std::pair<const Value*, const Value*> pairs[] = {
+      {&negative, &zero}, {&zero, &negative}, {&ci_a, &ci_B},
+      {&ci_B, &ci_a},     {&ci_B, &zero},     {&zero, &plain_B}};
+  for (const auto& [lhs, rhs] : pairs) {
+    const auto canonical = lhs->TryLess(*rhs);
+    ASSERT_TRUE(canonical.HasValue());
+    EXPECT_EQ(*lhs < *rhs, canonical.Value());
+    EXPECT_EQ(*lhs > *rhs, *rhs < *lhs);
+  }
 }
 
 TEST(ValueTest, TryCompare_WithArrays_LexicographicAndPrefixOrdering) {

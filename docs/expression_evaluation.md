@@ -63,6 +63,13 @@ null-check/truthiness unary family (IS [NOT] NULL, IS [NOT] TRUE/FALSE) is
 type-agnostic on both legs and compiles for any operand type. Coverage:
 `bytecode_test.cpp` (`SearchedCase_*`) and `differential_test.cpp`.
 
+The VARCHAR/DATE fast kernels only cover non-collated, non-interval operands:
+`FastSlotFromValue` reports `kUnsupported` for collated or interval VARCHAR, so
+the fast evaluator first returns to the canonical bytecode VM, which in turn
+falls back to the AST evaluator for shapes it cannot compile. The two-step
+fallback (fast VM → canonical VM → AST) preserves the AST result for every
+rejected shape.
+
 ### IN lists (kDup / operand-carrying kPop)
 
 `x IN (a, b, ...)` evaluates the child **exactly once**, matching
@@ -112,12 +119,14 @@ division-by-zero propagation case (no rejecting sibling → error).
 
 ## JIT as a bytecode compiler
 
-LLVM kernels (`JitInt64Kernels`) are **not a third semantic definition**. They
-are optional native code for a narrow subset of bytecode programs:
+LLVM kernels (`JitInt64Kernels` and the general `JitBranchlessProgram`) are
+**not a third semantic definition**. They are optional native code for
+bytecode programs:
 
 | Kernel | Bytecode shape | Notes |
 | --- | --- | --- |
-| INT64 filter | `LoadColumn`, `LoadConstant`, `BinaryInt64` compare | Selection derives `column`, `constant`, and `op` from bytecode (`selection.cpp`). Used only when the batch has **no NULLs** in that column (see `docs/jit_profile.md`). |
+| INT64 filter (narrow) | `LoadColumn`, `LoadConstant`, `BinaryInt64` compare | `JitInt64Kernels::CompileFilter`; Selection derives `column`, `constant`, and `op` from bytecode (`selection.cpp`). Used only when the batch has **no NULLs** in that column (see `docs/jit_profile.md`). |
+| Branchless INT64 program | forward-jumping signed-INT64 DAG (`AND`/`OR`, `CASE`, `COALESCE`, `IS [NOT] NULL`, arithmetic, comparisons) | `JitBranchlessProgram::Compile`/`Filter`/`Evaluate` takes per-column 0/1 NULL bytes (`JitColumnInput::nulls`) and applies the same 3-valued logic as bytecode, so NULL-bearing batches are supported. Selection uses it for any signed-INT64 layout. |
 | INT64 projection | linear `LoadColumn` + `BinaryInt64` multiply/add | Projection fast path |
 | SUM | aggregate over INT64 column | Parallel aggregation |
 

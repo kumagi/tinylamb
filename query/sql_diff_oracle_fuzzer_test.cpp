@@ -6,6 +6,7 @@
 #include <random>
 #include <string>
 
+#include "common/unwind_guard.hpp"
 #include "gtest/gtest.h"
 
 namespace tinylamb {
@@ -69,14 +70,19 @@ TEST(SqlDiffOracleFuzzer, DqpPathsAgree) {
 
 TEST(SqlDiffOracleFuzzer, RadarInstancesAgree) {
   int compared = 0;
+  int skipped = 0;
   for (uint32_t seed = 0; seed < 12; ++seed) {
     std::mt19937 rng(seed + 200);
     DiffOracleStats stats;
     const std::string report = RunRadarIteration(rng, false, &stats, nullptr);
     ASSERT_EQ(report, "") << "seed " << seed << "\n" << report;
     compared += stats.radar_queries;
+    skipped += stats.skipped;
   }
-  EXPECT_EQ(compared, 12 * 4);
+  // Disk-quota pressure makes ScopedDb fail and that arm contributes no
+  // query -- a skip, not a disagreement.  Require all four queries only for
+  // the seeds that actually ran.
+  EXPECT_EQ(compared, 4 * (12 - skipped));
 }
 
 TEST(SqlDiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
@@ -85,6 +91,10 @@ TEST(SqlDiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
   // on an empty report has to be told it was skipped instead -- otherwise a
   // run that executed nothing looks like a fully-agreed sweep.
   ASSERT_EQ(setenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
+  // An ASSERT or an exception below must not leak the hatch into the next
+  // test in this process; restore it on every exit path.
+  tinylamb::UnwindGuard restore_env(
+      [] { unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"); });
   // Fixed seed: the trace must stay reproducible, only the database is gone.
   std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
   for (int arm = 0; arm < 4; ++arm) {
@@ -115,6 +125,7 @@ TEST(SqlDiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
         << ") counted queries that never ran";
   }
   EXPECT_EQ(unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
+  restore_env.Disarm();
   // The hatch is off again: the very next sweep must run and count normally.
   DiffOracleStats stats;
   DiffOracleTrace trace;

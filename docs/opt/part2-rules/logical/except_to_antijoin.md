@@ -5,7 +5,7 @@
 
 ## 概要
 
-`except_to_antijoin` は、集合差演算 `Except(L, R)` を、全出力列の等値比較を結合述語とする `AntiJoin(L, R, L.c1 = R.c1 AND ...)` へと変換する論理 Rule です。
+`except_to_antijoin` は、集合差演算 `Except(L, R)` を、全出力列の等値比較を結合述語とする `Distinct(AntiJoin(L, R, L.c1 = R.c1 AND ...))` へと変換する論理 Rule です。EXCEPT 自体が DISTINCT であるため、アンチ結合を派生 Group に置き、その上に `kDistinct` を重ねます。
 
 「左辺のタプルのうち、右辺に同一タプルが存在しないもののみを通過させる」という EXCEPT 演算の意味論を、アンチ結合（Anti-Join）演算子へと還元することで、ハッシュ結合等の効率的な物理結合アルゴリズムの適用を可能にします。
 
@@ -17,8 +17,9 @@ graph TD
     E1["Except"] --> L1["Group L (t1)"]
     E1 --> R1["Group R (t2)"]
   end
-  subgraph after["変換後: AntiJoin(L, R, 全列等値)"]
-    A1["AntiJoin<br>predicate: t1.a = t2.a AND t1.b = t2.b"] --> L2["Group L"]
+  subgraph after["変換後: Distinct(AntiJoin(L, R, 全列等値))"]
+    D1["Distinct"] --> A1["AntiJoin<br>predicate: t1.a = t2.a AND t1.b = t2.b"]
+    A1 --> L2["Group L"]
     A1 --> R2["Group R"]
   end
 ```
@@ -53,20 +54,25 @@ graph TD
 
 - **リレーションの排他性と修飾**: 等値述語は `left_rel.col = right_rel.col` の形式で生成されます。左右のリレーション集合が重複している場合、同一列名の参照解決が曖昧になるため、積集合が空であることを必須条件とします。
 - **三値論理と NULL 同値性**: SQL 規格の `EXCEPT` において、NULL 同士の比較は「同値（Distinct でない）」として扱われます。一方、通常の結合等式（`=`）は NULL 同士の比較で UNKNOWN を返すため、右辺に NULL が存在する場合にアンチ結合の判定が乖離する潜在的課題が存在します。tinylamb の現行実装では `kEquals` による等値結合式を生成しており、NULL を含むタプルにおける三値論理の挙動は物理アンチ結合の実装側に依存します。
-- **左入力の重複度（D6 規律）**: 標準 SQL の `EXCEPT DISTINCT` は左入力に重複タプルが存在する場合に 1 件へ重複排除して出力しますが、通常の `AntiJoin` は右辺にマッチしない左辺タプルを重複度を保持したまま通過させます。左辺の重複排除が先行していない場合、厳密な集合意味論としての出力行数に乖離が生じ得る点に留意が必要です。
+- **左入力の重複度（D6 規律）**: 標準 SQL の `EXCEPT DISTINCT` は左入力に重複タプルが存在する場合に 1 件へ重複排除して出力しますが、通常の `AntiJoin` は右辺にマッチしない左辺タプルを重複度を保持したまま通過させます。本 Rule はアンチ結合を派生 Group に置き、その上に `kDistinct` を重ねることでこの差を解消しています。
 
 ## 実装の詳細
 
-発火処理では、左右の子ノードおよび生成された全列等値述語を引き継いだ `kAntiJoin` 式を親 Group へ追加します。
+発火処理では、まず左右の子ノードおよび生成された全列等値述語を引き継いだ `kAntiJoin` 式を**派生 Group** へ追加し、その派生 Group を子に持つ `kDistinct` 式を親 Group へ追加します。
 
 ```cpp
+          const GroupId join_group =
+              memo.EnsureDerivedGroup(memo.Get(group).relations, tag);
           memo.AddExpression(
-              group,
+              join_group,
               LogicalExpression{.operation = LogicalOperator::kAntiJoin,
                                 .children = {left, right},
                                 .predicate = equality_predicate,
                                 .target_list = expression.target_list,
                                 .output_schema = expression.output_schema});
+          memo.AddExpression(
+              group, LogicalExpression{.operation = LogicalOperator::kDistinct,
+                                       .children = {join_group}});
 ```
 
 等値条件の構築は `BuildEqualityOnAllColumns` を用いて、`output_schema` の各列に対応する左右リレーションの列参照等式（`BinaryOperation::kEquals`）を連言（AND）で結合します。
@@ -86,7 +92,6 @@ graph TD
 ## 関連 Rule との相互作用
 
 - `intersect_to_semijoin`: 集合積（INTERSECT）をセミ結合（Semi-Join）へ変換する対称 Rule です。
-- `intersect_to_semijoin / except_to_antijoin`: コストベースで集合演算の物理展開を指示する Rule です。
 - `outer_to_anti_join`: 外部結合と IS NULL 述語の組み合わせからアンチ結合を導出する Rule です。
 
 ## 検証テスト

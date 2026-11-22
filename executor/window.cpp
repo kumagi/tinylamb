@@ -52,16 +52,22 @@ WindowExecutor::WindowExecutor(TransactionContext& context, Executor child,
                    SharedPartitionKey() != nullptr;
 }
 
-Schema WindowExecutor::InputSchema() const {
+StatusOr<Schema> WindowExecutor::InputSchema() const {
   // The output schema appends one column per call; strip those suffix columns
-  // to recover the schema the calls resolve against.
+  // to recover the schema the calls resolve against. Check before subtracting:
+  // ColumnCount() is unsigned, so a schema narrower than the call list would
+  // wrap into a gigantic reserve() instead of a clean error.
+  if (schema_.ColumnCount() < outputs_.size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "window output schema is narrower than its calls");
+  }
   const size_t input_width = schema_.ColumnCount() - outputs_.size();
   std::vector<Column> input_columns;
   input_columns.reserve(input_width);
   for (size_t i = 0; i < input_width; ++i) {
     input_columns.push_back(schema_.GetColumn(i));
   }
-  return {schema_.Name(), std::move(input_columns)};
+  return Schema{schema_.Name(), std::move(input_columns)};
 }
 
 const std::vector<Expression>* WindowExecutor::SharedPartitionKey() const {
@@ -97,7 +103,11 @@ const std::vector<Expression>* WindowExecutor::SharedPartitionKey() const {
 }
 
 bool WindowExecutor::ComputeColumns() {
-  const Schema input_schema = InputSchema();
+  StatusOr<Schema> input_schema_or = InputSchema();
+  if (!input_schema_or.HasValue()) {
+    return FailWith(input_schema_or.GetStatus());
+  }
+  const Schema input_schema = input_schema_or.MoveValue();
   const relational_detail::CteMap empty_ctes;
   const size_t begin = appended_columns_;
   if (begin >= outputs_.size()) {
@@ -185,7 +195,11 @@ bool WindowExecutor::DrainIntoSpills(
     const std::vector<Expression>& partition_by) {
   const size_t files = std::max<size_t>(1, options_.spill_partition_count);
   spills_.resize(files);
-  const Schema input_schema = InputSchema();
+  StatusOr<Schema> input_schema_or = InputSchema();
+  if (!input_schema_or.HasValue()) {
+    return FailWith(input_schema_or.GetStatus());
+  }
+  const Schema input_schema = input_schema_or.MoveValue();
   const relational_detail::CteMap empty_ctes;
   DataChunk batch;
   while (child_->NextBatch(&batch) != 0) {
@@ -241,8 +255,9 @@ bool WindowExecutor::NextChunk() {
   }
   if (schema_.ColumnCount() < outputs_.size()) {
     exhausted_ = true;
-    return FailWith(StatusError(StatusCode::kInvalidArgument,
-                                "window output schema is narrower than its calls"));
+    return FailWith(
+        StatusError(StatusCode::kInvalidArgument,
+                    "window output schema is narrower than its calls"));
   }
   if (!spill_enabled_) {
     if (buffered_done_) {

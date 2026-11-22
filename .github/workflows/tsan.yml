@@ -52,7 +52,11 @@ jobs:
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
           cmake --build build -j"$(nproc)"
           ctest --test-dir build \
-            -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|PageManager|ParallelWork|SpillStore|Logger|TableTest)' \
+            # Keep this subset in sync with the concurrency job above: the
+            # missing QueueTable/FullScanMvccFastPath/MemoryBudget/QueryGrant/
+            # QueryParallelismBudget suites take the same latch/budget paths
+            # and must also run under the deadlock detector.
+            -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|QueueTable|FullScanMvccFastPath|PageManager|ParallelWork|SpillStore|Logger|TableTest|MemoryBudget|QueryGrant|QueryParallelismBudget)' \
             -j"$(nproc)" --output-on-failure
 
       - name: Clean test database artifacts

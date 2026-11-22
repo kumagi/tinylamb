@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-// Contract tests for common/platform: every expectation here must hold on
-// both Linux (epoll, eventfd, accept4, tzdb) and macOS (kqueue, pipe,
-// fcntl, CFTimeZone).
+// Contract tests for common/platform: expectations apply on Linux (epoll,
+// eventfd, accept4, tzdb), macOS (kqueue, pipe, fcntl, CFTimeZone) and
+// Windows (WSAPoll, Winsock SOCKET); POSIX-only cases are guarded out there.
 
 #include <algorithm>
 #include <array>
@@ -49,6 +49,7 @@
 #include "common/platform/random.hpp"
 #include "common/platform/socket.hpp"
 #include "common/platform/synced_stream.hpp"
+#include "common/platform/time_format.hpp"
 #include "common/platform/time_zone.hpp"
 #include "gtest/gtest.h"
 
@@ -58,6 +59,28 @@
 #endif
 
 namespace tinylamb::platform {
+
+// Socket descriptors must survive a round trip without losing any bits: the
+// -1 error sentinel needs a signed type, and on Win64 a Winsock SOCKET is a
+// 64-bit UINT_PTR that must not be narrowed to int (bug 10586).
+static_assert(static_cast<SocketFd>(-1) < 0,
+              "SocketFd must be signed for the -1 error sentinel");
+#ifdef TINYLAMB_OS_WINDOWS
+static_assert(sizeof(SocketFd) >= sizeof(SOCKET),
+              "SocketFd must hold a full Winsock SOCKET without truncation");
+#endif
+
+TEST(PlatformTimeTest, TwoDigitYearUsesPosixPivot) {
+  for (const auto& [text, year] : std::array<std::pair<const char*, int>, 4>{
+           {{"00", 100}, {"68", 168}, {"69", 69}, {"99", 99}}}) {
+    std::tm parsed{};
+    const char* end = platform::ParseTime(text, "%y", &parsed);
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(*end, '\0');
+    EXPECT_EQ(parsed.tm_year, year) << text;
+  }
+}
+
 #ifdef __SIZEOF_INT128__
 TEST(Int128ConversionAuditTest, SignedAndUnsignedBoundarySaturation) {
   const UInt128 sign_bit = static_cast<UInt128>(1) << 127;
@@ -109,6 +132,21 @@ TEST(SoftExtendedAuditTest,
       0);
 }
 
+TEST(SoftExtendedAuditTest, BoolConversionMatchesArithmeticSemantics) {
+  // bool is a C++ arithmetic conversion (non-zero -> true), not a truncating
+  // integral conversion: -0.5 and huge negatives must not become false.
+  EXPECT_TRUE(static_cast<bool>(SoftExtended(-1e100)));
+  EXPECT_TRUE(static_cast<bool>(SoftExtended(1e100)));
+  EXPECT_TRUE(static_cast<bool>(SoftExtended(-0.5)));
+  EXPECT_TRUE(static_cast<bool>(SoftExtended(0.5)));
+  EXPECT_TRUE(
+      static_cast<bool>(SoftExtended(std::numeric_limits<double>::infinity())));
+  EXPECT_TRUE(static_cast<bool>(
+      SoftExtended(std::numeric_limits<double>::quiet_NaN())));
+  EXPECT_FALSE(static_cast<bool>(SoftExtended(0.0)));
+  EXPECT_FALSE(static_cast<bool>(SoftExtended(-0.0)));
+}
+
 TEST(SoftExtendedAuditTest, ArithmeticRetainsLowBitsAndRoundsEven) {
   const SoftExtended two_to_53(uint64_t{1} << 53);
   const SoftExtended one(1);
@@ -122,6 +160,11 @@ TEST(SoftExtendedAuditTest, ArithmeticRetainsLowBitsAndRoundsEven) {
 #ifndef TINYLAMB_OS_WINDOWS
 TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
   ASSERT_EQ(SetEnv("TINYLAMB_AUDIT_SPAWN_ENV", "parent", 1), 0);
+  // A failed EXPECT below still unwinds this guard: the variable is
+  // process-wide, so an early ASSERT/return must not leak it to later tests.
+  struct EnvGuard {
+    ~EnvGuard() { EXPECT_EQ(UnsetEnv("TINYLAMB_AUDIT_SPAWN_ENV"), 0); }
+  } env_guard;
   std::string error;
   EXPECT_EQ(RunProcess("/bin/sh",
                        {"-c",
@@ -135,13 +178,12 @@ TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
   EXPECT_EQ(RunProcess("/bin/sh", {"-c", "exit 23"}, {}, &error), 23);
   EXPECT_EQ(RunProcess("/path/that/does/not/exist", {}, {}, &error), -1);
   EXPECT_FALSE(error.empty());
-  EXPECT_EQ(UnsetEnv("TINYLAMB_AUDIT_SPAWN_ENV"), 0);
 }
 #endif
 
 namespace {
 
-uint32_t WaitFor(EventPoller& poller, int fd, int timeout_ms = 1000) {
+uint32_t WaitFor(EventPoller& poller, SocketFd fd, int timeout_ms = 1000) {
   std::array<PollResult, 8> results{};
   const int count = poller.Wait(results, timeout_ms);
   uint32_t events = 0;
@@ -157,8 +199,8 @@ uint32_t WaitFor(EventPoller& poller, int fd, int timeout_ms = 1000) {
 }
 
 // A connected loopback TCP pair: {client, server-side accepted}.
-std::array<int, 2> TcpPair() {
-  const int listener = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
+std::array<SocketFd, 2> TcpPair() {
+  const SocketFd listener = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   EXPECT_GE(listener, 0);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -169,10 +211,10 @@ std::array<int, 2> TcpPair() {
   socklen_t size = sizeof(addr);
   EXPECT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &size),
             0);
-  const int client = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
+  const SocketFd client = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   EXPECT_EQ(::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
             0);
-  const int server =
+  const SocketFd server =
       AcceptSocket(listener, {.nonblocking = true, .close_on_exec = true});
   EXPECT_GE(server, 0);
   CloseSocket(listener);
@@ -193,7 +235,8 @@ TEST(PlatformEndianTest, BigEndianRoundTrip) {
   // pair i of the original value. Checking all eight bytes keeps this
   // endian-independent (a host-order leak fails on either endianness).
   for (size_t i = 0; i < 8; ++i) {
-    EXPECT_EQ(bytes[i], static_cast<unsigned char>((value >> (56 - 8 * i)) & 0xFF))
+    EXPECT_EQ(bytes[i],
+              static_cast<unsigned char>((value >> (56 - 8 * i)) & 0xFF))
         << "byte " << i;
   }
   EXPECT_EQ(be64toh(be), value);
@@ -202,14 +245,15 @@ TEST(PlatformEndianTest, BigEndianRoundTrip) {
 }
 
 #if defined(__GLIBCXX__)
-// random.hpp's contract is bit-for-bit libstdc% (GCC >= 11) reproduction so
+// random.hpp's contract is bit-for-bit libstdc++ (GCC >= 11) reproduction so
 // seeded fuzzers and pinned regression traces replay identically everywhere.
 // Compare every draw against the real std:: facilities on identically-seeded
 // engines: any drift by one output fails here instead of silently
 // invalidating committed .test replays. Covers both shuffle paths (the
 // two-positions-per-draw optimization and the single-draw fallback).
 TEST(PlatformRandomTest, MatchesLibstdcxxDraws) {
-  for (const uint32_t seed : {uint32_t{0}, uint32_t{1}, uint32_t{0xDEADBEEFU}}) {
+  for (const uint32_t seed :
+       {uint32_t{0}, uint32_t{1}, uint32_t{0xDEADBEEFU}}) {
     {
       std::mt19937 ours(seed);
       std::mt19937 theirs(seed);
@@ -252,7 +296,9 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
   EXPECT_EQ(DataSync(fd), 0);
   AdviseDontNeed(fd, 0, 3);  // best effort; must not crash
   CloseFile(fd);
-  EXPECT_EQ(DataSync(fd), -1);  // closed descriptor reports failure
+  // -1 is never a valid descriptor; reusing the just-closed integer would
+  // make this check depend on fd allocation and flake if it got reopened.
+  EXPECT_EQ(DataSync(-1), -1);  // invalid descriptor reports failure
 
   MemoryMap mapped;
   ASSERT_EQ(mapped.Open(path), 0);
@@ -267,7 +313,8 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
   mapped.AdviseRandom(0, mapped.Size());
 
   MemoryMap moved(std::move(mapped));
-  // MemoryMap guarantees that moving releases the source handle.  // NOLINT(clang-analyzer-cplusplus.Move)
+  // MemoryMap guarantees that moving releases the source handle.  //
+  // NOLINT(clang-analyzer-cplusplus.Move)
   // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_FALSE(mapped.IsValid());
   EXPECT_TRUE(moved.IsValid());
@@ -299,20 +346,20 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
 }
 
 TEST(PlatformSocketTest, FlagsAreApplied) {
-  const int blocking = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
+  const SocketFd blocking = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   ASSERT_GE(blocking, 0);
   EXPECT_TRUE(IsCloseOnExec(blocking));
   EXPECT_FALSE(IsNonBlocking(blocking));
   CloseSocket(blocking);
 
-  const int nonblocking = OpenSocket(
+  const SocketFd nonblocking = OpenSocket(
       AF_INET, SOCK_STREAM, 0, {.nonblocking = true, .close_on_exec = false});
   ASSERT_GE(nonblocking, 0);
   EXPECT_FALSE(IsCloseOnExec(nonblocking));
   EXPECT_TRUE(IsNonBlocking(nonblocking));
   CloseSocket(nonblocking);
 
-  std::array<int, 2> fds{-1, -1};
+  std::array<SocketFd, 2> fds{-1, -1};
   ASSERT_EQ(OpenPipe(fds, {.nonblocking = true, .close_on_exec = true}), 0);
   for (int fd : fds) {
     EXPECT_TRUE(IsCloseOnExec(fd));
@@ -437,7 +484,7 @@ TEST(PlatformEventPollerTest, WakeDuringCloseIsRaceFree) {
   std::vector<std::thread> wakers;
   for (int i = 0; i < 4; ++i) {
     wakers.emplace_back(  // NOLINT(performance-inefficient-vector-operation)
-        [&] {  // NOLINT(performance-inefficient-vector-operation)
+        [&] {             // NOLINT(performance-inefficient-vector-operation)
           while (!stop.load(std::memory_order_relaxed)) {
             waker.Wake();
           }
@@ -460,7 +507,7 @@ TEST(PlatformCpuAffinityTest, EqualityComparesBitmaskContents) {
   // sched_getaffinity snapshot, and stay a fixed-size POD compare (the
   // implementation contracts on std::memcmp over the raw words).
   if (!CpuSet::Supported()) {
-    return;
+    GTEST_SKIP() << "CpuSet affinity is not supported on this platform";
   }
   const CpuSet a = CpuSet::Single(0);
   const CpuSet b = CpuSet::Single(0);
@@ -490,7 +537,8 @@ TEST(PlatformCpuAffinityTest, CurrentThreadMatchesSupport) {
   // below must not leave the whole test binary pinned to a single CPU.
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
-  struct AffinityRestore {  // NOLINT(cppcoreguidelines-special-member-functions)
+  struct
+      AffinityRestore {  // NOLINT(cppcoreguidelines-special-member-functions)
     ~AffinityRestore() { (void)set.ApplyToCurrentThread(); }
     CpuSet set;
   } affinity_restore{*current};
@@ -530,21 +578,22 @@ TEST(PlatformTimeZoneTest, AtUtcAndInvalidCivilInputs) {
   EXPECT_EQ(TimeZoneOffsetAtLocalTime("Asia/Tokyo", 2024, 1, 1, 0, 0, 0, true),
             9 * 3600);
   // A spring-forward gap is nonexistent in local time but unambiguous in UTC.
-  const auto gap_local = TimeZoneOffsetAtLocalTime(
-      "America/New_York", 2024, 3, 10, 2, 30, 0, false);
+  const auto gap_local = TimeZoneOffsetAtLocalTime("America/New_York", 2024, 3,
+                                                   10, 2, 30, 0, false);
   const auto gap_utc = TimeZoneOffsetAtLocalTime(
-      "America/New_York", 2024, 3, 10, 2, 30, 0, true);  // NOLINT(bugprone-unchecked-optional-access)
+      "America/New_York", 2024, 3, 10, 2, 30, 0,
+      true);  // NOLINT(bugprone-unchecked-optional-access)
   EXPECT_TRUE(gap_local.has_value());
   EXPECT_TRUE(gap_utc.has_value());
   // Fields outside civil bounds must not be accepted.
-  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 13, 1, 0, 0, 0)
-                   .has_value());
-  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 0, 0, 0, 0)
-                   .has_value());
-  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 1, 24, 0, 0)
-                   .has_value());
-  EXPECT_FALSE(TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 1, 0, 60, 0)
-                   .has_value());
+  EXPECT_FALSE(
+      TimeZoneOffsetAtLocalTime("UTC", 2024, 13, 1, 0, 0, 0).has_value());
+  EXPECT_FALSE(
+      TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 0, 0, 0, 0).has_value());
+  EXPECT_FALSE(
+      TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 1, 24, 0, 0).has_value());
+  EXPECT_FALSE(
+      TimeZoneOffsetAtLocalTime("UTC", 2024, 1, 1, 0, 60, 0).has_value());
 }
 
 // T2093: Linux now memoises zone lookups (positive and negative).  Repeated
@@ -751,7 +800,7 @@ TEST(ProcessMemoryAuditTest, PhysicalMemoryRespectsCgroupLimit) {
   EXPECT_EQ(phys, expected);
 }
 
-// T2623: the mkstemp fallback must honour the non-inheritable promise of
+// T2623: the mkstemp fallback must honor the non-inheritable promise of
 // the header (O_TMPFILE/_O_NOINHERIT paths do); assert CLOEXEC is set.
 TEST(PlatformFileIoTest, UnlinkedTempFdIsCloseOnExec) {
   std::error_code ec;

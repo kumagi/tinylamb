@@ -16,8 +16,9 @@ namespace tinylamb {
 // buffers, variable-length string/nested Value payloads, and row positions.
 [[nodiscard]] size_t EstimateChunkMemoryBytes(const DataChunk& chunk) noexcept;
 
-// Encodes `chunk` (columnar types, unsigned/collation/heterogeneous metadata,
-// valid RowPositions, NULL bitmaps, and column payloads) onto `dst`.
+// Encodes `chunk` (columnar types, unsigned/heterogeneous flags, valid
+// RowPositions, NULL bitmaps, column collation, and column payloads) onto
+// `dst`. Fallback values also carry their individual tags.
 [[nodiscard]] Status EncodeDataChunk(const DataChunk& chunk, std::string* dst);
 
 // Decodes one DataChunk emitted by `EncodeDataChunk` from `src`, resetting

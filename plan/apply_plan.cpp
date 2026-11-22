@@ -2,6 +2,7 @@
 #include "plan/apply_plan.hpp"
 
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <sstream>
@@ -31,6 +32,16 @@ TableStatistics MakeStats(const Schema& schema, size_t rows) {
   return stats;
 }
 
+// Mirror EmitRowCount() so a huge child estimate cannot wrap the row count
+// stored in stats_ (which would desynchronise cost and spill decisions).
+size_t EstimatedRows(const Plan& child) {
+  constexpr size_t kMaxRows = std::numeric_limits<size_t>::max();
+  constexpr size_t kApplyEstimate = 10;
+  const size_t child_rows = child ? child->EmitRowCount() : 1;
+  return child_rows > kMaxRows / kApplyEstimate ? kMaxRows
+                                                : child_rows * kApplyEstimate;
+}
+
 Schema BuildApplySchema(const Plan& child, const Plan& inner_child,
                         const std::string& alias, JoinKind kind,
                         Schema declared_schema) {
@@ -48,7 +59,10 @@ Schema BuildApplySchema(const Plan& child, const Plan& inner_child,
       }
       return child->GetSchema() + output;
     }
-    return declared_schema;
+    // Keep the alias applied in both branches; returning the original
+    // declared_schema here made the qualified name depend on whether a
+    // child column happened to appear in the declaration.
+    return output;
   }
   if (!child) {
     return declared_schema;
@@ -75,7 +89,7 @@ ApplyPlan::ApplyPlan(Plan child,
       kind_(kind),
       schema_(BuildApplySchema(child_, inner_child_, alias_, kind_,
                                std::move(schema))),
-      stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
+      stats_(MakeStats(schema_, EstimatedRows(child_))) {}
 
 ApplyPlan::ApplyPlan(Plan child, Plan inner_child, Expression predicate,
                      JoinKind kind, Schema schema)
@@ -85,7 +99,7 @@ ApplyPlan::ApplyPlan(Plan child, Plan inner_child, Expression predicate,
       kind_(kind),
       schema_(BuildApplySchema(child_, inner_child_, alias_, kind_,
                                std::move(schema))),
-      stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
+      stats_(MakeStats(schema_, EstimatedRows(child_))) {}
 
 ApplyPlan::ApplyPlan(Plan child, Plan inner_child,
                      std::shared_ptr<const SelectStatement> inner_query,
@@ -99,7 +113,7 @@ ApplyPlan::ApplyPlan(Plan child, Plan inner_child,
       kind_(kind),
       schema_(BuildApplySchema(child_, inner_child_, alias_, kind_,
                                std::move(schema))),
-      stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
+      stats_(MakeStats(schema_, EstimatedRows(child_))) {}
 
 void ApplyPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent))

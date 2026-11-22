@@ -42,7 +42,13 @@ size_t SpillableStore::EffectiveBudgetBytes() const noexcept {
 
 size_t SpillableStore::EffectiveIoBufferBytes() const noexcept {
   const size_t budget = EffectiveBudgetBytes();
-  size_t cap = options_.io_buffer_bytes;
+  // EffectiveBudgetBytes() already folds in the grant's operator budget, so a
+  // zero budget means there is no owner reservation to pay this buffer from
+  // (the caller explicitly opted out). Even in that unlimited case, keep the
+  // buffer within one grant refill quantum so a misconfigured
+  // io_buffer_bytes cannot silently grow the unreserved footprint.
+  size_t cap = std::min(options_.io_buffer_bytes,
+                        QueryMemoryGrant::LocalBatchCache::kDefaultRefillBytes);
   if (budget > 0) {
     cap = std::min(cap, std::max<size_t>(4096, budget / 4));
   }
@@ -102,15 +108,22 @@ Status SpillableStore::TransitionToSpill() {
         StatusCode::kMemoryLimitExceeded,
         "SpillableStore exceeded memory budget with no SpillStore configured");
   }
-  auto writer = std::make_unique<SpillSegmentWriter>(
-      options_.spill_store, EffectiveIoBufferBytes());
+  auto writer = std::make_unique<SpillSegmentWriter>(options_.spill_store,
+                                                     EffectiveIoBufferBytes());
   RETURN_IF_FAIL(writer->EnsureOpen());
   for (const DataChunk& chunk : mem_chunks_) {
     RETURN_IF_FAIL(WriteDataChunk(writer.get(), chunk, &scratch_codec_,
                                   StagingFlushBytes()));
     TrimCodecScratch();
   }
-  RETURN_IF_FAIL(writer->Flush());
+  const Status flush = writer->Flush();
+  if (flush != Status::kSuccess) {
+    // Release the half-built segment explicitly instead of relying on the
+    // local unique_ptr's destructor to Abort() it during unwinding. mem_chunks_
+    // is still intact and spilled_ is still false, so the caller may retry.
+    writer->Abort();
+    return flush;
+  }
   spilled_bytes_ += writer->BytesWritten();
   writer_ = std::move(writer);
   // T3462: shrink_to_fit may throw bad_alloc out of this Status path.
@@ -185,18 +198,22 @@ Status SpillableStore::AppendRow(const Row& row, RowPosition pos) {
                        "cannot append to sealed SpillableStore");
   }
   const size_t row_bytes = EstimateRowMemoryBytes(row) + sizeof(RowPosition);
-  if (!spilled_ && grant_cache_.has_value()) {
+  bool flush_unreserved_row = false;
+  if (grant_cache_.has_value()) {
     if (!grant_cache_->Reserve(row_bytes)) {
       if (!staging_chunk_.Empty()) {
         RETURN_IF_FAIL(FlushStagingChunk());
       }
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-      // success
-      if (!spilled_ && !grant_cache_->Reserve(row_bytes)) {  // NOLINT(bugprone-unchecked-optional-access)
-        RETURN_IF_FAIL(TransitionToSpill());
+      if (!grant_cache_->Reserve(row_bytes)) {
+        if (!spilled_) {
+          RETURN_IF_FAIL(TransitionToSpill());
+        }
+        // A row larger than the available grant must still be spillable.
+        // Do not retain it uncharged in the staging buffer between calls.
+        flush_unreserved_row = true;
       }
     }
-    if (!spilled_) {
+    if (!flush_unreserved_row) {
       staging_reserved_bytes_ += row_bytes;
     }
   }
@@ -207,7 +224,7 @@ Status SpillableStore::AppendRow(const Row& row, RowPosition pos) {
       budget > 0
           ? std::max<size_t>(4096, std::min<size_t>(budget / 4, 256ULL << 10))
           : (256ULL << 10);
-  if (staging_chunk_.Size() >= kDefaultVectorSize ||
+  if (flush_unreserved_row || staging_chunk_.Size() >= kDefaultVectorSize ||
       staging_bytes_ >= staging_cap ||
       (!spilled_ && budget > 0 && mem_bytes_ + staging_bytes_ >= budget)) {
     RETURN_IF_FAIL(FlushStagingChunk());
@@ -303,13 +320,19 @@ StatusOr<bool> SpillableStore::NextRow(Row* row_out, RowPosition* pos_out) {
 
 void SpillableStore::Reset() noexcept {
   reader_.reset();
+  // Ownership of the spill segment lives in exactly one place: the in-flight
+  // writer before Seal(), or segment_id_ afterwards (Seal() transfers the id
+  // and resets writer_). Capture and clear the member id first so the release
+  // below cannot target the same segment twice even if a Finish()-ed writer
+  // is still around -- Abort() is a no-op once finished_ is set.
+  const SpillSegmentId owned = segment_id_;
+  segment_id_ = kInvalidSpillSegmentId;
   if (writer_ != nullptr) {
     writer_->Abort();
     writer_.reset();
   }
   SpillStore::DropSegmentIfAlive(options_.spill_store, spill_store_alive_,
-                                 segment_id_);
-  segment_id_ = kInvalidSpillSegmentId;
+                                 owned);
   mem_chunks_.clear();
   staging_chunk_.Reset();
   active_read_chunk_.Reset();

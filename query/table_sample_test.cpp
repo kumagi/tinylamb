@@ -87,9 +87,8 @@ TEST_F(TableSampleTest, LimitDoesNotTruncateSamplePopulation) {
   // SYSTEM samples whole storage blocks; with a single block it legitimately
   // returns all 100 rows, so only BERNOULLI gives a sample smaller than LIMIT.
   const char* method = "BERNOULLI (50 PERCENT)";
-  const std::string head =
-      std::string("SELECT v FROM samp_lim TABLESAMPLE ") + method +
-      " REPEATABLE (7)";
+  const std::string head = std::string("SELECT v FROM samp_lim TABLESAMPLE ") +
+                           method + " REPEATABLE (7)";
   const std::vector<Row> base = RunSql(*engine_, *context_, head);
   ASSERT_GT(base.size(), 0U) << method;
   ASSERT_LT(base.size(), 90U) << method;
@@ -151,6 +150,43 @@ TEST_F(TableSampleTest, BernoulliFullWeight) {
   }
 }
 
+TEST_F(TableSampleTest, QualifiedStarKeepsSampleWeightColumn) {
+  ASSERT_NO_FATAL_FAILURE(Seed());
+  // `t.*` must expand the TABLESAMPLE weight pseudo-column exactly like the
+  // bare `*` does: BuildInputSchema appends it to the relation's columns
+  // unconditionally, so dropping it only for the qualified form loses data.
+  const std::vector<Row> rows =
+      RunSql(*engine_, *context_,
+             "SELECT sample_t.* FROM sample_t TABLESAMPLE "
+             "BERNOULLI(100 PERCENT) WITH WEIGHT AS w");
+  ASSERT_EQ(rows.size(), 5U);
+  for (const Row& row : rows) {
+    ASSERT_EQ(row.values_.size(), 3U);
+    EXPECT_EQ(row[2], Value(1.0));
+  }
+  // The alias-qualified form must keep it too, and a partial sample must
+  // still carry the per-row weight rather than dropping the column.
+  const std::vector<Row> aliased =
+      RunSql(*engine_, *context_,
+             "SELECT s.* FROM sample_t s TABLESAMPLE BERNOULLI(100 PERCENT) "
+             "WITH WEIGHT AS w");
+  ASSERT_EQ(aliased.size(), 5U);
+  for (const Row& row : aliased) {
+    ASSERT_EQ(row.values_.size(), 3U);
+    EXPECT_EQ(row[2], Value(1.0));
+  }
+  const std::vector<Row> partial = RunSql(
+      *engine_, *context_,
+      "SELECT sample_t.* FROM sample_t TABLESAMPLE BERNOULLI(50 PERCENT) "
+      "WITH WEIGHT AS w REPEATABLE (7)");
+  ASSERT_FALSE(partial.empty());
+  ASSERT_LT(partial.size(), 5U);
+  for (const Row& row : partial) {
+    ASSERT_EQ(row.values_.size(), 3U);
+    EXPECT_GT(row[2].AsDouble(), 0.0);
+  }
+}
+
 TEST_F(TableSampleTest, SystemMethodSamplesStorageBlocks) {
   // SYSTEM now samples whole storage blocks (page-level include/exclude);
   // 0% and 100% pin the boundary behavior.
@@ -183,8 +219,8 @@ TEST_F(TableSampleTest, DerivedRelationUsesRelationalSamplePath) {
   const auto plan = RunSql(*engine_, *context_, "EXPLAIN ANALYZE " + sql);
   bool used_relational = false;
   for (const Row& row : plan) {
-    used_relational |=
-        row[0].AsStringView().find("RelationalExecutor") != std::string_view::npos;
+    used_relational |= row[0].AsStringView().find("RelationalExecutor") !=
+                       std::string_view::npos;
   }
   EXPECT_TRUE(used_relational);
 }

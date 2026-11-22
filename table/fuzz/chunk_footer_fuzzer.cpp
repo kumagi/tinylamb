@@ -63,7 +63,16 @@ bool MapImage(const std::vector<char>& b, ImageMap* m) {
   m->ncell = static_cast<size_t>(rg) * cc;
   m->row_counts_off = fo + 30;
   m->col_offsets_off = m->row_counts_off + (static_cast<size_t>(rg) * 2);
+  // Keep the computed data end consistent with the footer offset WireLayout
+  // reported; a mismatch means a mutant slipped past the layout gate and a
+  // "data" mutation would silently miss the footer path being targeted.
+  if (m->footer_size + 4 > b.size()) {
+    return false;
+  }
   m->data_end = b.size() - m->footer_size - 4;
+  if (m->data_end != fo) {
+    return false;
+  }
   if (m->col_offsets_off + (m->ncell * 4) > fo + m->footer_size) {
     return false;
   }

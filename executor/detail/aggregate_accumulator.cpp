@@ -37,6 +37,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
+#include "executor/detail/relational_sort_limit.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
@@ -177,6 +178,21 @@ AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
       (aggregate->NeedsGroupContext() ||
        !IsIdempotentDistinctInsensitive(aggregate->GetType()));
   shape.resolved_element_type = aggregate->ArrayElementSqlType();
+  if (shape.resolved_element_type.empty() &&
+      aggregate->GetType() == AggregationType::kApproxQuantiles &&
+      aggregate->Child() != nullptr) {
+    static const Schema empty_schema;
+    const TextDomain domain =
+        ProjectionExpressionColumn(
+            "", aggregate->Child(),
+            input_schema != nullptr ? *input_schema : empty_schema)
+            .GetTextDomain();
+    if (domain == TextDomain::kString) {
+      shape.resolved_element_type = "STRING";
+    } else if (domain == TextDomain::kTimestamp) {
+      shape.resolved_element_type = "TIMESTAMP";
+    }
+  }
   if (shape.resolved_element_type.empty() && input_schema != nullptr &&
       aggregate->GetType() == AggregationType::kArrayAgg &&
       aggregate->Child() != nullptr &&
@@ -704,6 +720,14 @@ Status AggregateAccumulator::TryRecordQuantileParam(
           "The second argument to APPROX_QUANTILES function cannot be greater "
           "than 100000");
     }
+    // An integral DOUBLE (2.0) is accepted for compatibility, but a
+    // fractional one must not be silently truncated into a different
+    // quantile count (2.9 -> 2).
+    if (std::floor(d) != d) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "The second argument to APPROX_QUANTILES function "
+                         "must be an integer");
+    }
   }
   const int64_t n = number.type == ValueType::kInt64
                         ? number.value.int_value
@@ -740,7 +764,13 @@ Status AggregateAccumulator::TryRecordLimitParam(
   if (number.type == ValueType::kInt64) {
     n = number.value.int_value;
   } else if (number.type == ValueType::kDouble) {
-    n = static_cast<int64_t>(number.value.double_value);
+    const double d = number.value.double_value;
+    if (!std::isfinite(d) || std::floor(d) != d) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "The second argument to APPROX_TOP must be an integer");
+    }
+    n = static_cast<int64_t>(d);
   } else {
     return StatusError(StatusCode::kInvalidArgument,
                        "The second argument to APPROX_TOP must be an integer");
@@ -1171,9 +1201,8 @@ StatusOr<std::string> TryQuantilesElementTypeName(
   if (any && all_bool_text) {
     return std::string("BOOL");
   }
-  // TIMESTAMP values are represented as canonical text in Value.  Preserve
-  // their SQL type for aggregate results so APPROX_QUANTILES does not report
-  // them as STRING arrays.
+  // Legacy schemas can omit the distinction between STRING and TIMESTAMP.
+  // Keep the historical fallback for those untyped inputs.
   for (const Value& value : values) {
     if (value.type != ValueType::kVarChar) {
       continue;
@@ -2028,7 +2057,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
           if (count < 2 || sxx <= 0 || syy <= 0) {
             return Value();
           }
-          double r2 = static_cast<double>((sxy * sxy) / (sxx * syy));  // NOLINT(modernize-use-auto)
+          const auto r2 = static_cast<double>((sxy * sxy) / (sxx * syy));
           return Value(std::clamp(r2, 0.0, 1.0));  // R^2 is in [0,1]
         }
         default:
@@ -2055,8 +2084,12 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         const int64_t index = std::min<int64_t>((i * n) / number, n - 1);
         picked.push_back(quantile_values_[static_cast<size_t>(index)]);
       }
-      ASSIGN_OR_RETURN(std::string, element_type,
-                       (TryQuantilesElementTypeName(quantile_values_)));
+      std::string element_type = resolved_element_type_;
+      if (element_type.empty()) {
+        ASSIGN_OR_RETURN(std::string, inferred_type,
+                         (TryQuantilesElementTypeName(quantile_values_)));
+        element_type = std::move(inferred_type);
+      }
       if (element_type == "BOOL") {
         // Boolean inputs materialize as text; report canonical INT64
         // truth values so downstream BOOL handling sees real booleans.

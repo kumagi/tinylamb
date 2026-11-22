@@ -16,6 +16,15 @@ NAMES = {
     'D': 'Grouped join', 'E': 'LEFT JOIN', 'F': 'Nonkey read',
     'G': 'Durable writes', 'H': 'HTAP reader',
 }
+# Right edge of the log x-axis below. gaps.py stores None for an unbounded
+# (infinite) loss factor; such a row still qualifies for comparison, so the
+# plotting code must handle it instead of letting max() compare None to float.
+UNBOUNDED_LOSS_PLOT_VALUE = 15000
+
+
+def _max_loss(values):
+    finite = [v for v in values if v is not None]
+    return max(finite) if finite else UNBOUNDED_LOSS_PLOT_VALUE
 
 
 def main():
@@ -35,9 +44,9 @@ def main():
         groups[PLANS[row['before']['workload']]].append(row)
     summary = {
         name: dict(count=len(items),
-                   before=max(r['before']['loss_factor'] for r in items),
-                   current_pg=max(r['after']['loss_factor'] for r in items),
-                   historical_pg=max(r['loss_against_original_pg'] for r in items))
+                   before=_max_loss(r['before']['loss_factor'] for r in items),
+                   current_pg=_max_loss(r['after']['loss_factor'] for r in items),
+                   historical_pg=_max_loss(r['loss_against_original_pg'] for r in items))
         for name, items in groups.items()
     }
     records = [json.loads(line) for line in a.unindexed_results.read_text().splitlines()]

@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
-#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <queue>
 #include <ranges>
 #include <shared_mutex>
@@ -230,11 +230,16 @@ Status PwriteAllFd(int fd, const void* data, size_t len, uint64_t offset) {
     const ssize_t n = platform::Pwrite(fd, ptr + done, len - done,
                                        static_cast<int64_t>(offset + done));
     if (n <= 0) {
-      if (errno == EINTR) {
+      if (n < 0 && errno == EINTR) {
         continue;
       }
-      return StatusError(StatusCode::kIOError,
-                         "pwrite failed: " + std::string(std::strerror(errno)));
+      // errno is not guaranteed to be updated when pwrite returns 0
+      // (disk full / file-size limit / invalid fd); never print "Success"
+      // or spin forever on a stale EINTR from an earlier syscall.
+      const std::string reason = n == 0
+                                     ? "no progress (disk full or invalid fd)"
+                                     : std::string(std::strerror(errno));
+      return StatusError(StatusCode::kIOError, "pwrite failed: " + reason);
     }
     done += static_cast<size_t>(n);
   }
@@ -340,7 +345,10 @@ class StreamingCheckpointReader {
       off += to_read;
     }
     uint32_t stored_crc = 0;
-    if (payload_size + sizeof(uint32_t) > fsize) {
+    // The trailing CRC must be the final bytes of the snapshot. Reject both
+    // a truncated file and trailing garbage after the CRC so loading honors
+    // the "complete consumption" recovery invariant.
+    if (payload_size + sizeof(uint32_t) != fsize) {
       return Status::kCorrupt;
     }
     RETURN_IF_FAIL(
@@ -480,7 +488,7 @@ Status DecodeCommittedBlockRecord(std::string_view buf, page_id_t expected_pid,
       !ConsumeU64(buf.data(), payload_size, &off, link_lsn_out) ||
       !ConsumeU64(buf.data(), payload_size, &off, max_lsn_out) ||
       !ConsumeU32(buf.data(), payload_size, &off, &nslots) ||
-      nslots > RowPage::kMaxColumnarRows) {
+      nslots > RowPage::kMaxSlotsPerBlock) {
     return Status::kCorrupt;
   }
   const size_t arrays_bytes =
@@ -805,9 +813,13 @@ void PageManager::CleanupStaleLsmFiles(uint64_t keep_generation) const {
       break;
     }
     const std::string fname = entry.path().filename().string();
+    // A failed remove must not be confused with a directory-iteration error:
+    // `ec` is shared with the iterator, and a stale value here would break
+    // the loop and leave all later stale files behind. Cleanup is best effort.
+    std::error_code remove_ec;
     if (fname == base) {
       if (keep_generation != 0) {
-        std::filesystem::remove(entry.path(), ec);
+        std::filesystem::remove(entry.path(), remove_ec);
       }
       continue;
     }
@@ -816,7 +828,7 @@ void PageManager::CleanupStaleLsmFiles(uint64_t keep_generation) const {
       const std::string gen_str = fname.substr(prefix.size());
       if (keep_generation == std::numeric_limits<uint64_t>::max() ||
           gen_str != std::to_string(keep_generation)) {
-        std::filesystem::remove(entry.path(), ec);
+        std::filesystem::remove(entry.path(), remove_ec);
       }
     }
   }
@@ -921,10 +933,10 @@ void PageManager::ReleaseAllTreeMemoryLocked() noexcept {
   }
 }
 
-StatusOr<bool> PageManager::LsmLookupLiveLocked(const LsmTreeState& tree,
-                                                std::string_view key,
-                                                std::string* value_out) const {
-  if (tree.destroyed) {
+StatusOr<bool> PageManager::LsmLookupLiveLocked(
+    const LsmTreeState& tree, std::string_view key, std::string* value_out,
+    bool ignore_pending_destroy) const {
+  if (tree.destroyed && !ignore_pending_destroy) {
     return false;
   }
   if (auto mit = tree.memtable.find(key); mit != tree.memtable.end()) {
@@ -974,6 +986,11 @@ StatusOr<bool> PageManager::LsmLookupLiveLocked(const LsmTreeState& tree,
     if (!blk_or.HasValue()) {
       return blk_or.GetStatus();
     }
+    // GetOrLoad must never publish a null value, but a cache bug must not
+    // turn a lookup into a null dereference (#10872).
+    if (blk_or.Value() == nullptr) {
+      return Status::kCorrupt;
+    }
     if (const LsmRunEntry* e = blk_or.Value()->Find(key)) {
       if (e->deleted) {
         return false;
@@ -988,9 +1005,9 @@ StatusOr<bool> PageManager::LsmLookupLiveLocked(const LsmTreeState& tree,
 }
 
 StatusOr<bool> PageManager::LsmLookupCommittedLocked(const LsmTreeState& tree,
-                                           std::string_view key,
-                                           std::string* value_out,
-                                           lsn_t* lsn_out) const {
+                                                     std::string_view key,
+                                                     std::string* value_out,
+                                                     lsn_t* lsn_out) const {
   if (tree.committed_destroyed) {
     if (lsn_out != nullptr) {
       *lsn_out = tree.committed_destroy_lsn;
@@ -1040,6 +1057,11 @@ StatusOr<bool> PageManager::LsmLookupCommittedLocked(const LsmTreeState& tree,
                              cache_lim, /*populate_cache=*/true);
     if (!blk_or.HasValue()) {
       return blk_or.GetStatus();
+    }
+    // GetOrLoad must never publish a null value, but a cache bug must not
+    // turn a lookup into a null dereference (#10872).
+    if (blk_or.Value() == nullptr) {
+      return Status::kCorrupt;
     }
     if (const LsmRunEntry* e = blk_or.Value()->Find(key)) {
       if (lsn_out != nullptr) {
@@ -1102,6 +1124,11 @@ StatusOr<bool> PageManager::LsmLookupCommittedBaselineLocked(
                              cache_lim, /*populate_cache=*/true);
     if (!blk_or.HasValue()) {
       return blk_or.GetStatus();
+    }
+    // GetOrLoad must never publish a null value, but a cache bug must not
+    // turn a lookup into a null dereference (#10872).
+    if (blk_or.Value() == nullptr) {
+      return Status::kCorrupt;
     }
     if (const LsmRunEntry* e = blk_or.Value()->Find(key)) {
       if (value_out != nullptr) {
@@ -1378,7 +1405,7 @@ StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
   try {
     auto pm = std::unique_ptr<PageManager>(new PageManager(path, fd));
     // A non-zero capacity is an explicit buffer-pool limit from the caller
-    // (tests/benchmarks use it to control spilling); honour it instead of
+    // (tests/benchmarks use it to control spilling); honor it instead of
     // silently falling back to the process-wide storage budget.
     if (capacity != 0) {
       pm->SetBufferPoolLimitBytesForTest(capacity);
@@ -1388,6 +1415,13 @@ StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
     platform::CloseFile(fd);
     return StatusError(StatusCode::kMemoryLimitExceeded,
                        "failed to allocate page manager for " + path);
+  } catch (...) {
+    // The constructor can also throw non-allocation exceptions (e.g. the
+    // ReclaimBridge registration's std::system_error). The fd is already
+    // exclusively locked, so it must be closed on every failure path.
+    platform::CloseFile(fd);
+    return StatusError(StatusCode::kRuntimeError,
+                       "failed to construct page manager for " + path);
   }
 }
 
@@ -1595,9 +1629,12 @@ void PageManager::CleanupStaleBlocksFiles(uint64_t keep_generation) const {
       break;
     }
     const std::string fname = entry.path().filename().string();
+    // Keep the iterator's error_code separate from remove()'s: one temporary
+    // remove failure (EBUSY etc.) must not abort the rest of the sweep.
+    std::error_code remove_ec;
     if (fname == base) {
       if (keep_generation != 0) {
-        std::filesystem::remove(entry.path(), ec);
+        std::filesystem::remove(entry.path(), remove_ec);
       }
       continue;
     }
@@ -1606,7 +1643,7 @@ void PageManager::CleanupStaleBlocksFiles(uint64_t keep_generation) const {
       const std::string gen_str = fname.substr(prefix.size());
       if (keep_generation == std::numeric_limits<uint64_t>::max() ||
           gen_str != std::to_string(keep_generation)) {
-        std::filesystem::remove(entry.path(), ec);
+        std::filesystem::remove(entry.path(), remove_ec);
       }
     }
   }
@@ -1656,6 +1693,9 @@ Status PageManager::OpenOrCreateBlocksFileLocked(uint64_t generation,
 
 Status PageManager::WaitForDurableLSN(lsn_t lsn) {
   if (lsn == 0) {
+    // No WAL record stands behind the data about to be persisted (e.g. an
+    // embedded PageManager that has no logger at all). There is no durability
+    // frontier to prove, so this is a genuine no-op.
     return Status::kSuccess;
   }
   std::function<Status(lsn_t)> waiter;
@@ -1664,7 +1704,17 @@ Status PageManager::WaitForDurableLSN(lsn_t lsn) {
     waiter = durable_waiter_;
   }
   if (!waiter) {
-    return Status::kSuccess;
+    // A positive LSN means committed WAL records exist and the caller is
+    // about to persist a page image or a committed block record to
+    // `.db`/`.blocks`. Without a connected durability waiter we cannot prove
+    // WAL-before-data (docs/recovery_invariants.md), so failing open here
+    // would silently persist data before its WAL reached the durable LSN.
+    // Fail closed instead of claiming success; callers with no WAL take the
+    // lsn == 0 path above.
+    return StatusError(StatusCode::kRuntimeError,
+                       "durable waiter is not configured for WAL LSN " +
+                           std::to_string(lsn) +
+                           "; refusing to persist data before WAL durability");
   }
   return waiter(lsn);
 }
@@ -2093,7 +2143,7 @@ Status PageManager::EvictBatch(size_t target_bytes, bool try_locks_only) {
             for (const auto& sp : retry_later) {
               if (blocks_.contains(sp->PageID())) {
                 std::shared_lock<std::shared_mutex> plk(*sp->Latch(),
-                                                       std::try_to_lock);
+                                                        std::try_to_lock);
                 if (plk.owns_lock()) {
                   NotePageTouchedLocked(*sp);
                 }
@@ -2105,7 +2155,7 @@ Status PageManager::EvictBatch(size_t target_bytes, bool try_locks_only) {
           for (const auto& sp : retry_later) {
             if (blocks_.contains(sp->PageID())) {
               std::shared_lock<std::shared_mutex> plk(*sp->Latch(),
-                                                     std::try_to_lock);
+                                                      std::try_to_lock);
               if (plk.owns_lock()) {
                 NotePageTouchedLocked(*sp);
               }
@@ -2228,19 +2278,37 @@ Status PageManager::EvictBatch(size_t target_bytes, bool try_locks_only) {
                       .file_gen = 0,
                   };
                 }
-                if (item.has_uncommitted) {
-                  uncommitted_spills_[item.pid] = item.uncommitted_seg_id;
-                  uncommitted_spill_evictions_.fetch_add(
-                      1, std::memory_order_relaxed);
-                  item.uncommitted_seg_id = kInvalidSpillSegmentId;
+                // A fuzzy checkpoint may have swapped to a newer block-file
+                // generation (and deleted the old file) after this batch wrote
+                // its image but before we publish the descriptor. The
+                // checkpoint's fixup pass only rewrites descriptors that
+                // already exist at that moment, so a late registration would
+                // leave evicted_pages_ pointing at a removed generation; a
+                // later fault-in would then recreate an empty "zombie" file
+                // and lose committed rows. Keep the page resident and dirty so
+                // a subsequent EvictBatch rewrites it to a live generation.
+                // (blocks_mu_ -> blocks_file_mu_ is the documented lock order;
+                // GetBlockFileHandle only takes the leaf blocks_file_mu_.)
+                if (desc.HasCommittedDiskBlock() &&
+                    GetBlockFileHandle(desc.file_gen) == nullptr) {
+                  rp.disk_dirty_ = true;
+                  NotePageTouchedLocked(*item.page);
+                  dropped_in_race = true;
+                } else {
+                  if (item.has_uncommitted) {
+                    uncommitted_spills_[item.pid] = item.uncommitted_seg_id;
+                    uncommitted_spill_evictions_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    item.uncommitted_seg_id = kInvalidSpillSegmentId;
+                  }
+                  rp.EvictPayloadsLocked();
+                  item.page->SetEvicted(true);
+                  ReleasePageMemoryOnEraseLocked(*item.page);
+                  AccountEvictedDirDeltaLocked(
+                      evicted_pages_.Set(item.pid, desc));
+                  evicted_page_count_.fetch_add(1, std::memory_order_relaxed);
+                  blocks_.erase(cur_it);
                 }
-                rp.EvictPayloadsLocked();
-                item.page->SetEvicted(true);
-                ReleasePageMemoryOnEraseLocked(*item.page);
-                AccountEvictedDirDeltaLocked(
-                    evicted_pages_.Set(item.pid, desc));
-                evicted_page_count_.fetch_add(1, std::memory_order_relaxed);
-                blocks_.erase(cur_it);
               }
             }
           }
@@ -2317,8 +2385,8 @@ bool PageManager::ShouldSkipRecoveryByDestroyFloorLocked(page_id_t pid,
   if (fit == recovery_destroy_floors_.end() || lsn > fit->second) {
     return false;  // NOLINT(readability-simplify-boolean-expr)
   }
-  // NOLINTNEXTLINE(readability-simplify-boolean-expr) explicit boolean expression
-  // A later committed destroy makes every earlier image of this page
+  // NOLINTNEXTLINE(readability-simplify-boolean-expr) explicit boolean
+  // expression A later committed destroy makes every earlier image of this page
   // obsolete, even when the checkpoint still contains its old incarnation.
   // In particular, DROP may already have removed a stub's backing TLCS file.
   return true;
@@ -2426,10 +2494,11 @@ StatusOr<PageRef> PageManager::GetPage(page_id_t page_id, bool shared) {
           // them with blocks_mu_ alone is a data race. Take the page latch
           // non-blockingly while holding blocks_mu_. Note the acquisition
           // order is the reverse of EvictBatch (page latch first there);
-          // try_to_lock keeps this inversion deadlock-free.: if a writer owns the latch, skip the refresh —
-          // a later GetPage will recompute it, and the accounting is an
-          // approximation anyway. Never *wait* for the latch here, since a
-          // latch holder must not take blocks_mu_ (docs/lock_order.md).
+          // try_to_lock keeps this inversion deadlock-free: if a writer owns
+          // the latch, skip the refresh — a later GetPage will recompute it,
+          // and the accounting is an approximation anyway. Never *wait* for the
+          // latch here, since a latch holder must not take blocks_mu_
+          // (docs/lock_order.md).
           std::shared_lock<std::shared_mutex> page_lk(*page_sp->Latch(),
                                                       std::try_to_lock);
           if (page_lk.owns_lock() && !page_sp->IsEvicted()) {
@@ -2466,14 +2535,27 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
   std::shared_ptr<Page> page_sp;
   page_id_t pid = 0;
   bool recycled = false;
+  bool created_slot = false;
   {
     std::scoped_lock lk(blocks_mu_);
+    std::vector<page_id_t> skipped_free_ids;
     while (free_ids_.TryPop(&pid)) {
       if (pid != 0 && !evicted_pages_.Contains(pid)) {
         recycled = true;
         break;
       }
+      // A free id that still has a lingering evicted descriptor (or a stray
+      // 0) cannot be reused now, but popping it and dropping it would leak it
+      // permanently. Keep it for later. Re-insert only after the loop stops:
+      // TryPop returns the highest id, so putting it back mid-loop would make
+      // us pop the same id again forever.
+      if (pid != 0) {
+        skipped_free_ids.push_back(pid);
+      }
       pid = 0;
+    }
+    for (page_id_t skipped : skipped_free_ids) {
+      free_ids_.Insert(skipped);
     }
     if (pid == 0) {
       pid = ++max_page_id_;
@@ -2483,6 +2565,7 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
       // Publish only an unavailable placeholder until initialization owns
       // the content latch and the allocation WAL record has been queued.
       slot = std::make_shared<Page>(pid, PageType::kUnknown);
+      created_slot = true;
     } else {
       recycled = true;
     }
@@ -2492,7 +2575,23 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
   if (recycled) {
     txn.InvalidatePageVersions(pid);
   }
-  ASSIGN_OR_RETURN(lsn_t, lsn, txn.AllocatePageLog(pid, new_page_type));
+  StatusOr<lsn_t> lsn_or = txn.AllocatePageLog(pid, new_page_type);
+  if (!lsn_or.HasValue()) {
+    // The id and the kUnknown placeholder were published above. Without
+    // undoing that, a WAL write failure permanently leaks both the id and
+    // the resident shell. Drop the latch first: never take blocks_mu_ while
+    // holding a page content latch (see the publication step below).
+    initialized.PageUnlock();
+    std::scoped_lock lk(blocks_mu_);
+    auto it = blocks_.find(pid);
+    if (created_slot && it != blocks_.end() && it->second == page_sp) {
+      ReleasePageMemoryOnEraseLocked(*it->second);
+      blocks_.erase(it);
+    }
+    free_ids_.Insert(pid);
+    return lsn_or.GetStatus();
+  }
+  const lsn_t lsn = lsn_or.Value();
   {
     // GetPage checks type under blocks_mu_. Keep that publication atomic
     // with respect to lookups while the content latch protects the reset.
@@ -2533,7 +2632,6 @@ Status PageManager::DestroyPage(Transaction& txn, Page* target) {
   }
   return Status::kSuccess;
 }
-
 
 StatusOr<std::vector<page_id_t>>
 PageManager::ReplaceTableChainWithColumnarStubs(
@@ -2757,10 +2855,10 @@ Status PageManager::HydrateColumnarStubPage(
   }
   if (hydrated_live) {
     std::scoped_lock lk(blocks_mu_);
-    // Refresh accounting only when the page latch is free: AccountPageMemoryLocked
-    // reads live state, and a latch holder must not take blocks_mu_ (see
-    // docs/lock_order.md). Skipping is safe -- accounting is an approximation
-    // recomputed on a later GetPage.
+    // Refresh accounting only when the page latch is free:
+    // AccountPageMemoryLocked reads live state, and a latch holder must not
+    // take blocks_mu_ (see docs/lock_order.md). Skipping is safe -- accounting
+    // is an approximation recomputed on a later GetPage.
     std::shared_lock<std::shared_mutex> page_lk(*page->Latch(),
                                                 std::try_to_lock);
     if (page_lk.owns_lock()) {
@@ -2927,7 +3025,8 @@ Status PageManager::LsmDelete(Transaction& txn, page_id_t tree_id,
 }
 
 StatusOr<std::string> PageManager::LsmRead(page_id_t tree_id,
-                                           std::string_view key) const {
+                                           std::string_view key,
+                                           const Transaction* reader) const {
   cache_hits_.fetch_add(1, std::memory_order_relaxed);
   LsmTreeState* tree = nullptr;
   {
@@ -2939,7 +3038,10 @@ StatusOr<std::string> PageManager::LsmRead(page_id_t tree_id,
   }
   std::shared_lock tree_lk(tree->mutex);
   std::string value;
-  ASSIGN_OR_RETURN(bool, found, LsmLookupLiveLocked(*tree, key, &value));
+  const txn_id_t reader_id = reader != nullptr ? reader->ID() : 0;
+  ASSIGN_OR_RETURN(bool, found,
+                   LsmLookupLiveLocked(*tree, key, &value,
+                                       !tree->DestroyVisibleTo(reader_id)));
   if (!found) {
     return Status::kNotExists;
   }
@@ -2953,10 +3055,9 @@ namespace {
 // unbounded above. The snapshot is what lets a lazy scan cursor iterate
 // without holding the tree latch.
 template <typename EntryT>
-void CopyLsmSnapshotRange(
-    const std::map<std::string, EntryT, std::less<>>& src,
-    std::string_view begin, std::string_view end,
-    std::vector<std::pair<std::string, EntryT>>* out) {
+void CopyLsmSnapshotRange(const std::map<std::string, EntryT, std::less<>>& src,
+                          std::string_view begin, std::string_view end,
+                          std::vector<std::pair<std::string, EntryT>>* out) {
   auto it = begin.empty() ? src.begin() : src.lower_bound(begin);
   for (; it != src.end(); ++it) {
     if (!end.empty() && end < it->first) {
@@ -2983,14 +3084,13 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
  public:
   using CommittedSnap =
       std::vector<std::pair<std::string, LsmTreeState::CommittedEntry>>;
-  using MemSnap =
-      std::vector<std::pair<std::string, LsmTreeState::MemEntry>>;
+  using MemSnap = std::vector<std::pair<std::string, LsmTreeState::MemEntry>>;
 
-  PageManagerLsmScanCursor(
-      int fd, std::mutex& file_mu, LsmBlockCache& cache, size_t cache_limit,
-      CommittedSnap committed, CommittedSnap immutable, MemSnap memtable,
-      std::vector<std::unique_ptr<LsmSortedRun>> runs, std::string begin,
-      std::string end, Status status)
+  PageManagerLsmScanCursor(int fd, std::mutex& file_mu, LsmBlockCache& cache,
+                           size_t cache_limit, CommittedSnap committed,
+                           CommittedSnap immutable, MemSnap memtable,
+                           std::vector<std::unique_ptr<LsmSortedRun>> runs,
+                           std::string begin, std::string end, Status status)
       : fd_(fd),
         file_mu_(file_mu),
         cache_(cache),
@@ -3006,10 +3106,10 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
     for (const auto& run : runs_) {
       // runs_ elements are heap-allocated, so the blocks span below stays
       // valid for the cursor's lifetime regardless of vector moves.
-      run_cursors_.emplace_back(
-          fd_, file_mu_, cache_, run->run_id,
-          std::span<const LsmRunBlockMeta>(run->blocks), cache_limit_,
-          /*populate_cache=*/true);
+      run_cursors_.emplace_back(fd_, file_mu_, cache_, run->run_id,
+                                std::span<const LsmRunBlockMeta>(run->blocks),
+                                cache_limit_,
+                                /*populate_cache=*/true);
     }
     SeedHeap();
   }
@@ -3075,8 +3175,7 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
   [[nodiscard]] uint32_t RunSrc(size_t run_index) const {
     // runs_ is ordered oldest -> newest; the newest run must win ties, so
     // it receives the smallest run src id.
-    return kSrcRunBase +
-           static_cast<uint32_t>(runs_.size() - 1 - run_index);
+    return kSrcRunBase + static_cast<uint32_t>(runs_.size() - 1 - run_index);
   }
   [[nodiscard]] size_t RunIndex(uint32_t src) const {
     return runs_.size() - 1 - static_cast<size_t>(src - kSrcRunBase);
@@ -3102,16 +3201,16 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
       return;
     }
     if (!memtable_.empty()) {
-      heap_.push(HeapItem{std::string_view(memtable_.front().first),
-                          kSrcMemtable});
+      heap_.push(
+          HeapItem{std::string_view(memtable_.front().first), kSrcMemtable});
     }
     if (!committed_.empty()) {
-      heap_.push(HeapItem{std::string_view(committed_.front().first),
-                          kSrcCommitted});
+      heap_.push(
+          HeapItem{std::string_view(committed_.front().first), kSrcCommitted});
     }
     if (!immutable_.empty()) {
-      heap_.push(HeapItem{std::string_view(immutable_.front().first),
-                          kSrcImmutable});
+      heap_.push(
+          HeapItem{std::string_view(immutable_.front().first), kSrcImmutable});
     }
     for (size_t i = 0; i < run_cursors_.size(); ++i) {
       const Status st = begin_.empty() ? run_cursors_[i].SeekToFirst()
@@ -3130,8 +3229,9 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
   }
 
   template <typename EntryT>
-  void AdvanceMapSource(uint32_t src, size_t* pos,
-                        const std::vector<std::pair<std::string, EntryT>>& vec) {
+  void AdvanceMapSource(
+      uint32_t src, size_t* pos,
+      const std::vector<std::pair<std::string, EntryT>>& vec) {
     ++(*pos);
     if (*pos < vec.size()) {
       heap_.push(HeapItem{std::string_view(vec[*pos].first), src});
@@ -3236,7 +3336,7 @@ std::unique_ptr<LsmScanCursor> PageManager::OpenLsmScanCursor(
   }
   if (tree != nullptr) {
     std::shared_lock tree_lk(tree->mutex);
-    if (!tree->destroyed) {
+    if (!tree->DestroyVisibleTo(reader_txn_id)) {
       // Snapshot only the in-range slice of each memory overlay; runs carry
       // only block fence metadata, never entry payloads.
       CopyLsmSnapshotRange(tree->committed_mem, begin, end, &committed_snap);
@@ -3282,23 +3382,20 @@ std::unique_ptr<LsmScanCursor> PageManager::OpenLsmScanCursor(
           }
           const bool base_found = base_found_or.Value();
           bool has_own = false;
-          reader->ForEachPendingLsmWrite(
-              tree_id, key, [&](const LogRecord& r) {
-                has_own = true;
-                const bool is_del = r.type == LogType::kLsmDelete;
-                const bool before_del = !is_del && !r.lsm_had_prev;
-                const std::string_view before_bytes =
-                    before_del ? std::string_view{}
-                               : std::string_view(r.undo_data);
-                const std::string_view after_bytes =
-                    is_del ? std::string_view{} : std::string_view(r.redo_data);
-                if (!TryApplyIndexListDelta(before_bytes, before_del,
-                                            after_bytes, is_del, &cur_val,
-                                            &cur_del)) {
-                  cur_del = is_del;
-                  cur_val = is_del ? std::string() : r.redo_data;
-                }
-              });
+          reader->ForEachPendingLsmWrite(tree_id, key, [&](const LogRecord& r) {
+            has_own = true;
+            const bool is_del = r.type == LogType::kLsmDelete;
+            const bool before_del = !is_del && !r.lsm_had_prev;
+            const std::string_view before_bytes =
+                before_del ? std::string_view{} : std::string_view(r.undo_data);
+            const std::string_view after_bytes =
+                is_del ? std::string_view{} : std::string_view(r.redo_data);
+            if (!TryApplyIndexListDelta(before_bytes, before_del, after_bytes,
+                                        is_del, &cur_val, &cur_del)) {
+              cur_del = is_del;
+              cur_val = is_del ? std::string() : r.redo_data;
+            }
+          });
           if (has_own || base_found) {
             me.value = std::move(cur_val);
             me.deleted = cur_del;
@@ -3359,9 +3456,13 @@ Status PageManager::LsmDestroy(Transaction& txn, page_id_t tree_id) {
   if (tree == nullptr) {
     return Status::kSuccess;
   }
+  std::unique_lock tree_lk(tree->mutex);
+  if (tree->destroyed_by_txn != 0) {
+    return tree->destroyed_by_txn == txn.ID() ? Status::kSuccess
+                                              : Status::kConflicts;
+  }
   ASSIGN_OR_RETURN(lsn_t, lsn, txn.LsmDestroyLog(tree_id));
   (void)lsn;
-  std::unique_lock tree_lk(tree->mutex);
   tree->destroyed = true;
   tree->destroyed_by_txn = txn.ID();
   ++tree->next_generation;  // destroyed flips every probe to false (386)
@@ -3380,7 +3481,8 @@ void PageManager::BeginTransactionCommit(txn_id_t txn_id) {
 Status PageManager::ApplyTransactionCommitRecord(
     txn_id_t txn_id, lsn_t commit_lsn, const LogRecord& r,
     TransactionCommitState* state) {
-  const lsn_t rec_lsn = r.record_lsn != 0 ? r.record_lsn : commit_lsn;
+  const lsn_t rec_lsn =
+      r.record_lsn == LogRecord::kUnknownRecordLsn ? commit_lsn : r.record_lsn;
   switch (r.type) {
     case LogType::kSystemAllocPage: {
       while (true) {
@@ -3390,12 +3492,25 @@ Status PageManager::ApplyTransactionCommitRecord(
           committed_max_page_id_ = std::max(committed_max_page_id_, r.pid);
           auto it = blocks_.find(r.pid);
           if (it != blocks_.end() && it->second != nullptr) {
-            RowPage& rp = it->second->body.row_page;
+            Page* const page = it->second.get();
+            // A kUnknown placeholder can reach commit if the allocating
+            // writer has not run PageInit yet. Mirror ReplayCommittedRecord
+            // and publish it as a row page, otherwise GetPage keeps rejecting
+            // it by type and the committed allocation stays invisible.
+            if (page->Type() != PageType::kRowPage &&
+                rec_lsn >= page->PageLSN()) {
+              if (page->IsEvicted()) {
+                evicted_page_count_.fetch_sub(1, std::memory_order_relaxed);
+              }
+              page->PageInit(r.pid, PageType::kRowPage);
+              AccountPageMemoryLocked(*page);
+            }
+            RowPage& rp = page->body.row_page;
             rp.committed_allocated_ = true;
             rp.committed_max_lsn_ = std::max(rp.committed_max_lsn_, rec_lsn);
             rp.disk_dirty_ = true;
             ++rp.committed_seq_;
-            it->second->SetPageLSN(std::max(it->second->PageLSN(), rec_lsn));
+            page->SetPageLSN(std::max(page->PageLSN(), rec_lsn));
             break;
           }
           if (const EvictedPageDesc* found = evicted_pages_.Find(r.pid)) {
@@ -3596,7 +3711,7 @@ Status PageManager::ApplyTransactionCommitRecord(
         std::string committed_val;
         ASSIGN_OR_RETURN(bool, committed_found,
                          LsmLookupCommittedLocked(*tree, r.key, &committed_val,
-                                                &existing_lsn));
+                                                  &existing_lsn));
         bool committed_del = !committed_found;
         const bool before_del = !is_delete && !r.lsm_had_prev;
         const std::string_view before_bytes =
@@ -3684,27 +3799,27 @@ void PageManager::FinishTransactionCommit(txn_id_t txn_id,
     if (it != pending_destroyed_pages_.end()) {
       for (const page_id_t pid : it->second) {
         auto bit = blocks_.find(pid);
-        // Only recycle an id whose old resident object is really gone. If a
-        // live cursor still holds the Page (use_count() > 1) or it was already
-        // re-allocated (type != kUnknown), the erase is skipped; putting the
-        // id back on free_ids_ anyway would let AllocateNewPage find the old
-        // object still in blocks_[pid] and PageInit it under that referrer,
-        // so the new owner and the stale referrer would share one page.
+        // Only recycle an id whose shell is still the destroyed (kUnknown)
+        // placeholder, or which has already left blocks_. A stale cursor may
+        // still hold a PageRef to that shell (use_count() > 1); dropping it
+        // from blocks_ is safe because the referrer keeps its own shared_ptr
+        // and the next AllocateNewPage builds a fresh Page object for the
+        // recycled id. Skipping the erase on use_count() > 1 used to leak
+        // both the id and the shell forever: the eviction path skips
+        // kUnknown pages, so no "final release" path ever reclaimed them.
         const bool gone_from_blocks =
             bit == blocks_.end() || bit->second == nullptr;
-        const bool erasable =
-            gone_from_blocks ||
-            (bit->second.use_count() == 1 &&
-             bit->second->Type() == PageType::kUnknown);
-        if (erasable) {
-          if (!gone_from_blocks) {
+        const bool stale_shell =
+            !gone_from_blocks && bit->second->Type() == PageType::kUnknown;
+        if (gone_from_blocks || stale_shell) {
+          if (stale_shell) {
             ReleasePageMemoryOnEraseLocked(*bit->second);
             blocks_.erase(bit);
           }
           free_ids_.Insert(pid);
         }
-        // Otherwise leave the id out of free_ids_: the eviction / final
-        // release path owns it once the last stale reference goes away.
+        // If the shell was already re-allocated (type != kUnknown), the id
+        // is in use again and must not be put back on free_ids_.
       }
       pending_destroyed_pages_.erase(it);
     }
@@ -3735,11 +3850,14 @@ void PageManager::FinishTransactionCommit(txn_id_t txn_id,
 
 Status PageManager::ApplyTransactionCommit(
     txn_id_t txn_id, lsn_t commit_lsn, const std::vector<LogRecord>& records) {
-  BeginTransactionCommit(txn_id);
   TransactionCommitState state;
   for (const LogRecord& r : records) {
     RETURN_IF_FAIL(ApplyTransactionCommitRecord(txn_id, commit_lsn, r, &state));
   }
+  // max_committed_txn_id_ is the seed for the next transaction id (and for
+  // recovery). Publish it only after every record applied: advancing it
+  // first would make a partially applied commit permanently look committed.
+  BeginTransactionCommit(txn_id);
   FinishTransactionCommit(txn_id, state);
   return Status::kSuccess;
 }
@@ -3780,7 +3898,11 @@ void PageManager::ApplyTransactionAbortRecord(txn_id_t txn_id,
     case LogType::kInsertRow: {
       if (std::shared_ptr<Page> page = acquire_resident(r.pid)) {
         auto page_lk = lock_page_if_needed(page.get());
-        page->body.row_page.DeleteRow(r.slot);
+        // Aborting an INSERT must restore the empty slot it came from, not
+        // DELETE a pre-existing row: DeleteRow records the removed row length
+        // in hole_sizes_ as an undo reservation, leaving a phantom locked hole
+        // that makes later inserts report kNoSpace on a full page.
+        page->body.row_page.RestoreLiveSlot(r.slot, {});
       }
       break;
     }
@@ -4034,9 +4156,10 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   // which makes the just-written snapshot unloadable (and the cleanup below
   // deletes the blocks file that holds those records). Keeping the flag set
   // is conservative: an unused blocks file is harmless, a missing one is not.
-  const bool no_disk_blocks_needed = false;
+  // Consequently a used blocks file is never dropped here, even if it ends
+  // up empty after emission; the next checkpoint can still clean it up.
   const bool compacted_blocks =
-      use_disk_blocks && !no_disk_blocks_needed && has_open_blocks_file &&
+      use_disk_blocks && has_open_blocks_file &&
       current_blocks_size > (uint64_t{64} << 20) &&
       (live_clean_disk_bytes * 2 < current_blocks_size);
   const uint64_t target_blocks_gen =
@@ -4346,8 +4469,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     cleanup_compacted_lsm();
   };
 
-  const uint32_t has_blocks_flag =
-      (use_disk_blocks && !no_disk_blocks_needed) ? 1U : 0U;
+  const uint32_t has_blocks_flag = use_disk_blocks ? 1U : 0U;
   const uint32_t has_lsm_flag = use_lsm_disk ? 1U : 0U;
 
   BufferedCheckpointWriter writer(tmp_fd);
@@ -4427,8 +4549,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   // new block-file offsets. Accumulate those fixups while writing so the
   // committed checkpoint does not have to re-read and re-parse the whole
   // .db file just to rediscover the (pid, offset, length) triples.
-  std::vector<std::tuple<page_id_t, uint64_t, uint32_t>>
-      checkpoint_disk_fixups;
+  std::vector<std::tuple<page_id_t, uint64_t, uint32_t>> checkpoint_disk_fixups;
 
   while (write_status == Status::kSuccess) {
     batch.clear();
@@ -4453,6 +4574,17 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
         if (take_ev) {
           const page_id_t epid = ev_batch[ei].first;
           if (bit != blocks_.end() && bit->first == epid) {
+            if (!ev_batch[ei].second.HasCommittedDiskBlock()) {
+              // A concurrent fault-in is folding the descriptor back into
+              // blocks_. The evicted entry has no usable image, so skip it
+              // and emit the resident page on the next iteration instead;
+              // otherwise the pid would be emitted twice (or dropped).
+              page_cursor = epid;
+              ++ei;
+              continue;
+            }
+            // The resident entry is the same image as the evicted one;
+            // skipping it keeps exactly one record for this pid.
             ++bit;
           }
           if (ev_batch[ei].second.HasCommittedDiskBlock()) {
@@ -4791,10 +4923,28 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
             // have evicted it before emit (blocks_.erase). Fault it back in
             // and emit the resident committed image. blocks_mu_ must not be
             // held here: EnsureEvictedPageResident takes it itself.
-            auto p_or = EnsureEvictedPageResident(rec.pid, EvictedPageDesc{});
-            if (p_or.HasValue() && p_or.Value() != nullptr &&
-                p_or.Value()->body.row_page.committed_allocated_) {
-              page = p_or.MoveValue();
+            // Capture the live descriptor (and re-check for a completed
+            // fault-in) instead of passing an empty one: the helper's
+            // kCorrupt check would reject an empty desc before it can
+            // refresh it from evicted_pages_, dropping the page's rows.
+            std::optional<EvictedPageDesc> ev_desc;
+            {
+              std::scoped_lock lk(blocks_mu_);
+              if (auto it = blocks_.find(rec.pid);
+                  it != blocks_.end() && it->second != nullptr) {
+                page = it->second;
+              } else if (const EvictedPageDesc* found =
+                             evicted_pages_.Find(rec.pid)) {
+                ev_desc = *found;
+              }
+            }
+            if (page == nullptr) {
+              auto p_or = EnsureEvictedPageResident(
+                  rec.pid, ev_desc.value_or(EvictedPageDesc{}));
+              if (p_or.HasValue() && p_or.Value() != nullptr &&
+                  p_or.Value()->body.row_page.committed_allocated_) {
+                page = p_or.MoveValue();
+              }
             }
           }
           if (page == nullptr || !page->body.row_page.committed_allocated_) {
@@ -4957,11 +5107,14 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
       std::filesystem::path(db_name_).parent_path();
   // The renamed entry must be durable before the caller recycles WAL;
   // a failed directory fsync must surface as a checkpoint error.
-  const int dir_sync_rc =
-      platform::SyncDirectory(parent_dir.empty() ? std::filesystem::path(".")
-                                                 : parent_dir);
+  const int dir_sync_rc = platform::SyncDirectory(
+      parent_dir.empty() ? std::filesystem::path(".") : parent_dir);
+  // Capture the fsync errno now; the unlock/close/file_size calls below can
+  // overwrite errno and would otherwise produce a misleading strerror().
+  const int dir_sync_errno = errno;
   (void)platform::UnlockFile(lock_fd_);
   platform::CloseFile(lock_fd_);
+  // The checkpoint file now owns the database lock.
   lock_fd_ = tmp_fd;
 
   // Durable checkpoint committed on disk: switch LSM & blocks files safely.
@@ -5022,12 +5175,9 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   }
 
   if (use_disk_blocks) {
-    if (no_disk_blocks_needed) {
-      std::scoped_lock blk_lk(blocks_file_mu_);
-      CloseBlocksFileLocked();
-      blocks_generation_ = 0;
-      CleanupStaleBlocksFiles(std::numeric_limits<uint64_t>::max());
-    } else if (compacted_blocks && compacted_fd >= 0) {
+    // The blocks file is always retained once in use (see the header-flag
+    // comment above): an unused file is harmless, a missing one is not.
+    if (compacted_blocks && compacted_fd >= 0) {
       std::error_code ec;
       const auto new_size =
           std::filesystem::file_size(BlocksFilePath(target_blocks_gen), ec);
@@ -5050,8 +5200,8 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
         constexpr size_t kFixupBatchSize = 256;
         for (size_t start = 0; start < checkpoint_disk_fixups.size();
              start += kFixupBatchSize) {
-          const size_t end = std::min(start + kFixupBatchSize,
-                                      checkpoint_disk_fixups.size());
+          const size_t end =
+              std::min(start + kFixupBatchSize, checkpoint_disk_fixups.size());
           std::scoped_lock lk(blocks_mu_);
           for (size_t i = start; i < end; ++i) {
             const auto& [pid, doff, dlen] = checkpoint_disk_fixups[i];
@@ -5092,7 +5242,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   if (dir_sync_rc != 0) {
     return StatusError(StatusCode::kIOError,
                        "directory fsync failed after checkpoint rename: " +
-                           std::string(std::strerror(errno)));
+                           std::string(std::strerror(dir_sync_errno)));
   }
   return Status::kSuccess;
 }
@@ -5290,6 +5440,10 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
             pid, EvictedPageDesc{.disk_offset = disk_off,
                                  .disk_length = disk_len,
                                  .file_gen = block_file_gen_u32}));
+        // The snapshot's free ranges are loaded before this loop. An evicted
+        // pid must be removed from them just like a resident one, or a later
+        // AllocateNewPage can reuse the id and overwrite its descriptor.
+        free_ids_.Erase(pid);
         evicted_page_count_.fetch_add(1, std::memory_order_relaxed);
         max_page_id_ = std::max(max_page_id_, pid);
         committed_max_page_id_ = max_page_id_;
@@ -5300,8 +5454,12 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
       page_id_t prev_pid = 0;
       page_id_t next_pid = 0;
       lsn_t link_lsn = 0;
+      // These are ordinary row slots (PackedSlots elements), whose writer-side
+      // cap is kMaxSlotsPerBlock (4096), not the columnar-row cap (32768).
+      // Accepting a larger value would over-allocate committed_lsns_ and the
+      // slot array from a corrupt snapshot.
       if (!reader.ReadU64(&prev_pid) || !reader.ReadU64(&next_pid) ||
-          !reader.ReadU64(&link_lsn) || nslots > RowPage::kMaxColumnarRows ||
+          !reader.ReadU64(&link_lsn) || nslots > RowPage::kMaxSlotsPerBlock ||
           nslots > reader.Remaining() / (sizeof(uint64_t) + sizeof(uint32_t))) {
         return Status::kCorrupt;
       }
@@ -5515,8 +5673,14 @@ Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
     case LogType::kInsertRow:
     case LogType::kUpdateRow:
     case LogType::kCompensateUpdate: {
-      if (EnsurePidResident(r.pid) == Status::kCorrupt) {
-        return Status::kCorrupt;
+      // Only kNotExists is benign (no evicted descriptor; a fresh page will
+      // be created below). Any other failure -- notably kIOError from a
+      // pread of the evicted image -- must abort recovery: continuing would
+      // apply the redo to a new empty page and silently lose the other
+      // committed rows of that page.
+      if (const Status s = EnsurePidResident(r.pid);
+          s != Status::kSuccess && s != Status::kNotExists) {
+        return s;
       }
       bool skip = false;
       RETURN_IF_FAIL(EnsureRecoveryStubHydrated(r.pid, lsn, &skip));
@@ -5649,9 +5813,8 @@ Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
           // failed and the whole post-image (including positions inserted
           // by uncommitted loser transactions) became the committed list.
           ASSIGN_OR_RETURN(bool, committed_found,
-                           LsmLookupCommittedLocked(*tree, r.key,
-                                                    &committed_val,
-                                                    &existing_lsn));
+                           LsmLookupCommittedLocked(
+                               *tree, r.key, &committed_val, &existing_lsn));
           bool committed_del = !committed_found;
           const bool before_del = !is_delete && !r.lsm_had_prev;
           const std::string_view before_bytes =
@@ -5834,10 +5997,10 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
       break;
     }
     if (holds_other_tail()) {
-      early_result = StatusError(
-          StatusCode::kConflicts,
-          "table tail is reserved by another transaction while "
-          "this transaction holds a different table tail");
+      early_result =
+          StatusError(StatusCode::kConflicts,
+                      "table tail is reserved by another transaction while "
+                      "this transaction holds a different table tail");
       break;
     }
     if (watcher != nullptr && res->second.owner != recorded_holder) {

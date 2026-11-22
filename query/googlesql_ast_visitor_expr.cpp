@@ -972,7 +972,7 @@ bool IsBytesAstNode(const GoogleSqlAstNode& node) {
         }
       }
     }
-    if (UpperCopy(type_name).find("BYTES") != std::string::npos ||
+    if (UpperCopy(std::move(type_name)).find("BYTES") != std::string::npos ||
         type_node.detail.find("BYTES") != std::string::npos) {
       return true;
     }
@@ -1161,14 +1161,33 @@ SelectSource MakeLambdaSource(Expression array_expr,
   return source;
 }
 
+// The NULL guard and the UNNEST source must not duplicate a volatile or
+// subquery array argument: sharing the Expression handle only shares the AST
+// node, not its per-row evaluation. Bind the argument once as a column of a
+// one-row derived table (the same idiom ExpandUdfCall uses for SQL-function
+// arguments) and reference that column from both places.
+constexpr std::string_view kLambdaArrayColumn = "__lambda_array_arg";
+
+SelectSource MakeLambdaArrayBindingSource(Expression array_expr) {
+  auto arg_query = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(
+          std::string(kLambdaArrayColumn), std::move(array_expr))},
+      std::vector<std::string>{}, Expression{});
+  SelectSource source;
+  source.query = std::move(arg_query);
+  source.alias = "__lambda_array_binding";
+  return source;
+}
+
+Expression LambdaArrayColumn() {
+  return ColumnValueExp(ColumnName("", std::string(kLambdaArrayColumn)));
+}
+
 StatusOr<Expression> RewriteLambdaArrayFunction(
     const GoogleSqlAstNode& array_node, const GoogleSqlAstNode& lambda,
     bool as_filter) {
   ASSIGN_OR_RETURN(Expression, hv58424_0, (VisitExpression(array_node)));
   Expression array_expr = std::move(hv58424_0);
-  // A NULL array argument propagates: UNNEST over it yields no rows, which
-  // would otherwise collapse to an empty (non-NULL) result array.
-  Expression array_for_null_check = array_expr;
   ASSIGN_OR_RETURN(LambdaBindingResult, hv58670_0, (BindLambdaBody(lambda)));
   LambdaBindingResult binding = std::move(hv58670_0);
   auto inner = std::make_shared<SelectStatement>(
@@ -1178,7 +1197,7 @@ StatusOr<Expression> RewriteLambdaArrayFunction(
                 : std::vector<NamedExpression>{NamedExpression(
                       std::string(""), std::move(binding.body))},
       std::vector<std::string>{}, as_filter ? binding.body : Expression{});
-  inner->SetSources({MakeLambdaSource(std::move(array_expr), binding)});
+  inner->SetSources({MakeLambdaSource(LambdaArrayColumn(), binding)});
   inner->MarkComplex();
   auto query_expression = std::make_shared<QueryExpression>(
       std::move(inner), nullptr, false, false);
@@ -1205,10 +1224,20 @@ StatusOr<Expression> RewriteLambdaArrayFunction(
     query_expression->SetArrayElementSqlType(std::move(h_elem_sql));
   }
   Expression array_result(query_expression);
-  return CaseExpressionExp({{UnaryExpressionExp(std::move(array_for_null_check),
-                                                UnaryOperation::kIsNull),
-                             ConstantValueExp(Value())}},
-                           std::move(array_result));
+  // UNNEST(NULL) is empty, so the NULL guard has to live outside the ARRAY
+  // subquery. Both the guard and the UNNEST source read the bound column, so
+  // the array argument is evaluated exactly once per row.
+  auto outer = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(
+          std::string(""),
+          CaseExpressionExp({{UnaryExpressionExp(LambdaArrayColumn(),
+                                                 UnaryOperation::kIsNull),
+                              ConstantValueExp(Value())}},
+                            std::move(array_result)))},
+      std::vector<std::string>{}, Expression{});
+  outer->SetSources({MakeLambdaArrayBindingSource(std::move(array_expr))});
+  outer->MarkComplex();
+  return QueryExpressionExp(std::move(outer));
 }
 
 // ARRAY_INCLUDES(array, e -> pred) asks whether any element satisfies the
@@ -1219,9 +1248,6 @@ StatusOr<Expression> RewriteLambdaIncludes(const GoogleSqlAstNode& array_node,
                                            const GoogleSqlAstNode& lambda) {
   ASSIGN_OR_RETURN(Expression, hv60357_0, (VisitExpression(array_node)));
   Expression array_expr = std::move(hv60357_0);
-  // The NULL-array guard and the UNNEST source share one evaluation of the
-  // array argument; keep a handle for both.
-  Expression array_for_null_check = array_expr;
   ASSIGN_OR_RETURN(LambdaBindingResult, hv60581_0, (BindLambdaBody(lambda)));
   LambdaBindingResult binding = std::move(hv60581_0);
   auto inner = std::make_shared<SelectStatement>(
@@ -1229,16 +1255,22 @@ StatusOr<Expression> RewriteLambdaIncludes(const GoogleSqlAstNode& array_node,
           std::string(""),
           ColumnValueExp(ColumnName("", binding.element_binding)))},
       std::vector<std::string>{}, std::move(binding.body));
-  inner->SetSources({MakeLambdaSource(std::move(array_expr), binding)});
+  inner->SetSources({MakeLambdaSource(LambdaArrayColumn(), binding)});
   inner->MarkComplex();
   auto exists =
       std::make_shared<QueryExpression>(std::move(inner), nullptr, true, false);
-  return CaseExpressionExp(
-      {{UnaryExpressionExp(std::move(array_for_null_check),
-                           UnaryOperation::kIsNull),
+  Expression guarded = CaseExpressionExp(
+      {{UnaryExpressionExp(LambdaArrayColumn(), UnaryOperation::kIsNull),
         ConstantValueExp(Value())},
        {Expression(std::move(exists)), ConstantValueExp(Value(int64_t{1}))}},
       ConstantValueExp(Value(int64_t{0})));
+  auto outer = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{
+          NamedExpression(std::string(""), std::move(guarded))},
+      std::vector<std::string>{}, Expression{});
+  outer->SetSources({MakeLambdaArrayBindingSource(std::move(array_expr))});
+  outer->MarkComplex();
+  return QueryExpressionExp(std::move(outer));
 }
 StatusOr<Expression> VisitFunction(
     const GoogleSqlAstNode&
@@ -1364,7 +1396,9 @@ StatusOr<Expression> VisitFunction(
             return {ConstantValueExp(Value(std::move(*token)))};
           }
         }
-        name = std::string("extract_") + std::string(alias->second);
+        if (FindUdf(name) == nullptr) {
+          name = std::string("extract_") + std::string(alias->second);
+        }
       }
     }
   }
@@ -1551,9 +1585,10 @@ StatusOr<Expression> VisitFunction(
             const Value& cv = limit_expr->AsConstantValue().GetValue();
             if (cv.type == ValueType::kInt64 && !cv.IsNull() &&
                 cv.value.int_value >= 0) {
+              // kInt64 stores the value in the int_value bit pattern (already
+              // range-checked >= 0 above); IsUnsigned() adds no information.
               inner_limit = WindowLimitFromUint64(
-                  cv.IsUnsigned() ? static_cast<uint64_t>(cv.value.int_value)
-                                  : static_cast<uint64_t>(cv.value.int_value));
+                  static_cast<uint64_t>(cv.value.int_value));
             } else {
               return AstError<Expression>(
                   "aggregate LIMIT must be a non-negative integer constant");
@@ -1656,7 +1691,7 @@ StatusOr<Expression> VisitFunction(
         ASSIGN_OR_RETURN(std::string, element_type,
                          (InferAggregateArrayElementType(child)));
         if (!element_type.empty()) {
-          aggregate->SetArrayElementSqlType(element_type);
+          aggregate->SetArrayElementSqlType(std::move(element_type));
         }
         break;
       }
@@ -1698,10 +1733,9 @@ StatusOr<Expression> VisitFunction(
     // single-argument aggregate arity check.
     const bool arity_checked =
         !is_bit && !is_approx_top && name != "string_agg";
-    const bool arity_ok =
-        !arity_checked || (name == "count" && !arguments.empty()) ||
-        arguments.size() == 1 || (is_bit && arguments.size() == 2) ||
-        (is_approx_top && arguments.size() == approx_arity);
+    const bool arity_ok = !arity_checked || arguments.size() == 1 ||
+                          (is_bit && arguments.size() == 2) ||
+                          (is_approx_top && arguments.size() == approx_arity);
     if (!arity_ok) {
       return AstError<Expression>("GoogleSQL AST: aggregate arity");
     }
@@ -2347,7 +2381,7 @@ void CollectFromBoundNames(
     }
     std::string alias = hv87740_0.MoveValue();
     if (!alias.empty()) {
-      names->insert(Lower(alias));
+      names->insert(Lower(std::move(alias)));
     }
     if (const GoogleSqlAstNode* unnest = node.Child("UnnestExpression")) {
       for (const auto& child : unnest->children) {
@@ -2358,7 +2392,7 @@ void CollectFromBoundNames(
           }
           std::string unnest_alias = hv88025_0.MoveValue();
           if (!unnest_alias.empty()) {
-            names->insert(Lower(unnest_alias));
+            names->insert(Lower(std::move(unnest_alias)));
           }
           break;
         }
@@ -2407,7 +2441,7 @@ void CollectFromBoundNames(
             }
             std::string name = hv89455_0.MoveValue();
             if (!name.empty()) {
-              names->insert(Lower(name));
+              names->insert(Lower(std::move(name)));
               continue;
             }
             for (const auto& child : column->children) {
@@ -2538,7 +2572,7 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
   NamedWindowParts parts;
   if (const auto* inherited = spec.Child("Identifier")) {
     ASSIGN_OR_RETURN(std::string, name, Identifier(*inherited));
-    const auto found = t_named_windows.find(name);
+    const auto found = t_named_windows.find(Lower(name));
     if (found == t_named_windows.end()) {
       return AstError<NamedWindowParts>("GoogleSQL AST: unknown window " +
                                         name);
@@ -2694,9 +2728,10 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
             const Value& cv = limit_expr->AsConstantValue().GetValue();
             if (cv.type == ValueType::kInt64 && !cv.IsNull() &&
                 cv.value.int_value >= 0) {
+              // kInt64 stores the value in the int_value bit pattern (already
+              // range-checked >= 0 above); IsUnsigned() adds no information.
               window->inner_limit = WindowLimitFromUint64(
-                  cv.IsUnsigned() ? static_cast<uint64_t>(cv.value.int_value)
-                                  : static_cast<uint64_t>(cv.value.int_value));
+                  static_cast<uint64_t>(cv.value.int_value));
             } else {
               return AstError<Expression>(
                   "aggregate LIMIT must be a non-negative integer constant");
@@ -2711,6 +2746,9 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
     }
     ASSIGN_OR_RETURN(Expression, hv94904_0, (VisitExpression(child)));
     window->args.push_back(std::move(hv94904_0));
+  }
+  if (window->function == "COUNT" && window->args.size() != 1) {
+    return AstError<Expression>("GoogleSQL AST: COUNT requires one argument");
   }
   if (median_window_alias) {
     window->args.push_back(ConstantValueExp(Value(0.5)));
@@ -2727,7 +2765,7 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
                        (Identifier(*spec->Child("Identifier"))));
       // Bare reference to a WINDOW-clause definition.
       const std::string name = std::move(hv95299_0);
-      const auto found = t_named_windows.find(name);
+      const auto found = t_named_windows.find(Lower(name));
       if (found == t_named_windows.end()) {
         return AstError<Expression>("GoogleSQL AST: unknown window " + name);
       }
@@ -2766,7 +2804,6 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
 // offset / UTC marker when present and the session default time zone
 // otherwise.  Shared by TIMESTAMP literals and typed array elements.
 std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
-  std::string norm_ts = text;
   if (text.size() < 10) {
     return std::nullopt;  // too short for YYYY-MM-DD
   }
@@ -2852,7 +2889,10 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
     matched = sscanf(base_time.c_str(), "%d-%d-%d", &Y, &M, &D);
   }
   if (matched < 3) {
-    return norm_ts;
+    // No date fields at all: the text is garbage, not a TIMESTAMP literal.
+    // Letting it through would hand a plain string constant to callers and
+    // silently turn TIMESTAMP comparisons into string comparisons.
+    return std::nullopt;
   }
   // Validate the calendar date and clock fields: TimeGm below normalizes
   // out-of-range fields like mktime, so 2026-02-29 used to roll silently to
@@ -2943,6 +2983,11 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
            text[end_digit] <= '9') {
       ++end_digit;
     }
+    if (end_digit == dot_pos + 1) {
+      // A trailing '.' with no fractional digits would normalize to the
+      // malformed "...:00.+00". GoogleSQL rejects that spelling.
+      return std::nullopt;
+    }
     std::string frac_str = text.substr(dot_pos, end_digit - dot_pos);
     (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d%s+00",
                    utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
@@ -2953,6 +2998,83 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
                    utc.tm_min, utc.tm_sec);
   }
   return std::string{buf.data()};
+}
+
+// Validates the clock fields (H:M:S[.fraction]) of a DATETIME/TIME literal.
+// `allow_leap_second` admits the 23:59:60 spelling that the DATETIME folder
+// carries into the next minute; every other second value must be < 60.
+bool IsValidCivilClock(std::string_view s, bool allow_leap_second) {
+  size_t pos = 0;
+  const auto number = [&s, &pos](int* out) {
+    if (pos >= s.size() || s[pos] < '0' || '9' < s[pos]) {
+      return false;
+    }
+    int value = 0;
+    size_t digits = 0;
+    while (pos < s.size() && '0' <= s[pos] && s[pos] <= '9') {
+      if (++digits > 9) {
+        return false;  // cap the field length so `value` cannot overflow
+      }
+      value = (value * 10) + (s[pos++] - '0');
+    }
+    *out = value;
+    return true;
+  };
+  const auto take = [&s, &pos](char ch) {
+    if (pos >= s.size() || s[pos] != ch) {
+      return false;
+    }
+    ++pos;
+    return true;
+  };
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  if (!number(&hour) || !take(':') || !number(&minute) || !take(':') ||
+      !number(&second)) {
+    return false;
+  }
+  if (hour > 23 || minute > 59 || second > 59) {
+    if (!allow_leap_second || hour != 23 || minute != 59 || second != 60) {
+      return false;
+    }
+  }
+  if (pos < s.size()) {
+    if (!take('.')) {
+      return false;  // trailing junk after the clock
+    }
+    size_t digits = 0;
+    while (pos < s.size() && '0' <= s[pos] && s[pos] <= '9') {
+      ++pos;
+      ++digits;
+    }
+    if (digits == 0 || pos != s.size()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// DATETIME accepts a civil date, a date + clock (T or space separator), and
+// the legacy time-only spelling; TIME accepts only the clock. Range-check the
+// fields here instead of folding out-of-range text into a string constant.
+bool IsValidCivilTimeLiteral(const std::string& text, bool is_datetime) {
+  if (!is_datetime) {
+    return IsValidCivilClock(text, /*allow_leap_second=*/false);
+  }
+  if (TryParseDateDays(text).HasValue()) {
+    return true;  // date-only DATETIME
+  }
+  const std::string_view view(text);
+  const size_t sep = view.find_first_of(" Tt");
+  if (sep == std::string_view::npos) {
+    // The pinned parser also accepts DATETIME 'HH:MM:SS'; keep it working,
+    // but validate its fields like any other literal.
+    return IsValidCivilClock(view, /*allow_leap_second=*/true);
+  }
+  return TryParseDateDays(view.substr(0, sep)).HasValue() &&
+         IsValidCivilClock(view.substr(sep + 1),
+                           /*allow_leap_second=*/true);
 }
 
 // Splits a JSON object text (as produced by the eager struct constructors
@@ -3239,7 +3361,8 @@ StatusOr<Expression> VisitExpression(
   }
   if (node.kind == "StringLiteral") {
     ASSIGN_OR_RETURN(std::string, h_tmp_2964, (DecodeString(node)));
-    return ConstantValueExp(Value(std::move(h_tmp_2964)));
+    return std::make_shared<ConstantValue>(Value(std::move(h_tmp_2964)),
+                                           TextDomain::kString);
   }
   if (node.kind == "JSONLiteral" || node.kind == "NumericLiteral" ||
       node.kind == "BigNumericLiteral") {
@@ -3291,6 +3414,10 @@ StatusOr<Expression> VisitExpression(
       }
     }
     if (node.detail == "TYPE_DATETIME") {
+      if (!IsValidCivilTimeLiteral(text, /*is_datetime=*/true)) {
+        return AstError<Expression>("GoogleSQL AST: invalid DATETIME literal " +
+                                    text);
+      }
       std::string dt_str = text;
       if (dt_str.find(":59:60") != std::string::npos) {
         int Y = 0, M = 0, D = 0, h = 0;
@@ -3316,6 +3443,10 @@ StatusOr<Expression> VisitExpression(
       return ConstantValueExp(Value(std::move(dt_str)));
     }
     if (node.detail == "TYPE_TIME") {
+      if (!IsValidCivilTimeLiteral(text, /*is_datetime=*/false)) {
+        return AstError<Expression>("GoogleSQL AST: invalid TIME literal " +
+                                    text);
+      }
       return ConstantValueExp(Value(std::string(text)));
     }
     // TYPE_TIMESTAMP
@@ -3325,7 +3456,8 @@ StatusOr<Expression> VisitExpression(
       return AstError<Expression>("GoogleSQL AST: invalid TIMESTAMP literal " +
                                   text);
     }
-    return ConstantValueExp(Value(std::move(*normalized_timestamp)));
+    return std::make_shared<ConstantValue>(
+        Value(std::move(*normalized_timestamp)), TextDomain::kTimestamp);
   }
 
   if (node.kind == "NullLiteral") {
@@ -3445,9 +3577,12 @@ StatusOr<Expression> VisitExpression(
         return {array_query};
       }
     }
-    AlignAnonymousStructFieldNames(&elements, struct_field_names.size() >= 2
-                                                  ? &struct_field_names
-                                                  : nullptr);
+    // The callee applies declared names starting at element 0 (unlike the
+    // head-based inference path, which starts at element 1), so a single
+    // declared STRUCT field is enough; gating this on >= 2 left .a/.f1 wrong
+    // for ARRAY<STRUCT<a INT64>>[STRUCT(1)].
+    AlignAnonymousStructFieldNames(
+        &elements, struct_field_names.empty() ? nullptr : &struct_field_names);
     return ArrayExpressionExp(std::move(elements), std::move(element_type));
   }
   // `a << b` / `a >> b`: the dump interleaves a Location node between the
@@ -3922,7 +4057,7 @@ StatusOr<Expression> VisitExpression(
       array_query->SetArrayResult(true);
       ASSIGN_OR_RETURN(std::string, h_arr_t,
                        (InferSubqueryArrayElementType(*query)));
-      array_query->SetArrayElementSqlType(h_arr_t);
+      array_query->SetArrayElementSqlType(std::move(h_arr_t));
       return {array_query};
     }
     ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, h_q,
@@ -3988,10 +4123,10 @@ StatusOr<Expression> VisitExpression(
         // The IntervalExpression constructor parses eagerly and its EXC-SHIM
         // wrapper THROWS on unparsable text (fuzz-found: INTERVAL '<empty>'
         // with no unit aborted the process).  Reject through Status instead.
-        if (!IntervalValue::TryParse(
-                 str_val.empty() ? std::string_view("0")
-                                 : std::string_view(str_val),
-                 unit)
+        if (!IntervalValue::TryParse(str_val.empty()
+                                         ? std::string_view("0")
+                                         : std::string_view(str_val),
+                                     unit)
                  .HasValue()) {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -4016,10 +4151,10 @@ StatusOr<Expression> VisitExpression(
         if (v.type == ValueType::kVarChar) {
           std::string str_val = std::string(v.value.varchar_value);
           const int64_t amount = ParseIntervalAmount(str_val);
-          if (!IntervalValue::TryParse(
-                   str_val.empty() ? std::string_view("0")
-                                   : std::string_view(str_val),
-                   unit)
+          if (!IntervalValue::TryParse(str_val.empty()
+                                           ? std::string_view("0")
+                                           : std::string_view(str_val),
+                                       unit)
                    .HasValue()) {
             return StatusError(
                 StatusCode::kInvalidArgument,
@@ -4062,10 +4197,10 @@ StatusOr<Expression> VisitExpression(
         if (v.Value().type == ValueType::kVarChar) {
           std::string str_val = std::string(v.Value().value.varchar_value);
           const int64_t amount = ParseIntervalAmount(str_val);
-          if (!IntervalValue::TryParse(
-                   str_val.empty() ? std::string_view("0")
-                                   : std::string_view(str_val),
-                   unit)
+          if (!IntervalValue::TryParse(str_val.empty()
+                                           ? std::string_view("0")
+                                           : std::string_view(str_val),
+                                       unit)
                    .HasValue()) {
             return StatusError(
                 StatusCode::kInvalidArgument,
@@ -4394,21 +4529,6 @@ StatusOr<Expression> VisitExpression(
       }
       return FunctionCallExp("__struct_json__", std::move(args));
     }
-    // Collation propagation: when any field value carries a case-insensitive
-    // collator, the whole struct comparison folds (GoogleSQL resolves one
-    // collation per comparison; struct JSON carries no per-field metadata).
-    if (any_ci) {
-      for (auto& field : fields) {
-        if (field.is_string) {
-          std::transform(field.text.begin(), field.text.end(),
-                         field.text.begin(), [](unsigned char c) {
-                           return c >= 'A' && c <= 'Z'
-                                      ? static_cast<char>(c - 'A' + 'a')
-                                      : static_cast<char>(c);
-                         });
-        }
-      }
-    }
     std::string json_out = "{";
     bool first = true;
     // JSON string escaping shared by field names and string values: an
@@ -4453,7 +4573,18 @@ StatusOr<Expression> VisitExpression(
           field.is_string ? "\"" + escape_json(field.text) + "\"" : field.text;
     }
     json_out += "}";
-    return ConstantValueExp(Value(std::move(json_out)));
+    // Collation propagation: when any field value carries a case-insensitive
+    // collator, the whole struct comparison folds (GoogleSQL resolves one
+    // collation per comparison; struct JSON carries no per-field metadata).
+    // Fold at comparison time via the value's collation tag instead of
+    // lowercasing the field text here: projections and TO_JSON_STRING must
+    // keep the literal's original case.
+    Value struct_value(std::move(json_out));
+    if (any_ci) {
+      struct_value.SetCollation(
+          static_cast<uint8_t>(Collation::kCaseInsensitive));
+    }
+    return ConstantValueExp(std::move(struct_value));
   }
 
   if (node.kind == "DotIdentifier") {
@@ -4794,7 +4925,11 @@ bool NeedsRelationalEvaluation(
       // its arguments may contain subqueries/relations that still need the
       // relational route (same recursion every other node kind performs).
       for (const Expression& arg : call.Args()) {
-        if (NeedsRelationalEvaluation(arg)) {
+        // Every other composite node recurses with top_level=false; a
+        // function argument is nested too. Passing true here would treat
+        // ABS(COUNT(x))'s inner aggregate as top-level and skip the
+        // relational route, diverging from -COUNT(x).
+        if (NeedsRelationalEvaluation(arg, false)) {
           return true;
         }
       }

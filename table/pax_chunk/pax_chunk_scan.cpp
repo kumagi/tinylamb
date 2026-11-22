@@ -481,7 +481,7 @@ int64_t PaxChunk::PBitSFilteredSum(const char* region, uint32_t param,
 // DictSelectedCodeFold with a lambda that does real per-row work (the
 // zero-value-vs-NULL test), and giving that three inlined copies measured ~2%
 // slower on bench_tpch's reduce_min / reduce_max -- a worse trade than the
-// specialisation won there -- so MIN/MAX keep the generic fold.
+// specialization won there -- so MIN/MAX keep the generic fold.
 bool DictCodeHistogram(const char* region, uint32_t n, uint32_t param,
                        const char* region_end,
                        std::vector<uint64_t>* freq_out) {
@@ -1894,8 +1894,8 @@ StatusOr<uint32_t> PaxChunk::ByteSliceNullAwareCount(
   // form over the lists the predicate passes -- zero bitstream reads, zero
   // row decode, any row order. A null bitmap is corrected analytically: the
   // closed form folds the RAW-value histogram (nulls are raw 0 by the
-  // the reference-computation convention), and the null-aware count excludes null
-  // rows, so the null rows are subtracted exactly when raw 0 matches the
+  // the reference-computation convention), and the null-aware count excludes
+  // null rows, so the null rows are subtracted exactly when raw 0 matches the
   // literal. (The generic loop below cannot serve this scheme with a null
   // region_end: the Rice stream has no self-described length.)
   if (s == Scheme::kPostings && n > 0) {
@@ -2109,9 +2109,9 @@ StatusOr<std::vector<char>> PaxChunk::DecompressRegionExact(
     std::string_view in, size_t uncompressed_size) {
   // Allocation bound first: callers inflate pre-validation footer bytes, so a
   // hostile length must not become an unbounded reservation. Real footers are
-  // O(rows) indexes over chunks of at most the pack-record row cap rows per pack record
-  // (hash dominates at ~48B/row); 1 GiB covers even multi-million-row
-  // standalone chunks with wide margin.
+  // O(rows) indexes over chunks of at most the pack-record row cap rows per
+  // pack record (hash dominates at ~48B/row); 1 GiB covers even
+  // multi-million-row standalone chunks with wide margin.
   constexpr size_t kMaxExactOutput = 1ULL * 1024 * 1024 * 1024;
   if (uncompressed_size > kMaxExactOutput) {
     return Status::kCorruption;
@@ -3197,13 +3197,19 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
       footer.col_hists[(static_cast<size_t>(c) * B) + idx] += cnt;
     });
   }
-  // Write inline footer at end of data (v4): schema_version(8) +
+  // Write the inline footer at the end of data. The serialized
+  // format_version is 1 (original layout) or 2 (adds crc_data/crc_footer);
+  // it is NOT the version tag of the optional sections appended below.
+  // Base fields, all big-endian: schema_version(8) + format_version(4) +
   // row_group_count(4) + column_count(2) + key_column_index(2) +
   // key_column_type(1) + zone_map_present(1) + generation(8) +
   // row_counts (row_group_count * 2) + column_offsets (row_group_count *
   // column_count * 4) + [group_min_keys + group_max_keys (row_group_count *
   // 8 each, if zone map present)] + encodings (rg*col bytes) +
-  // params (rg*col * 4) + footer_size(4). All big-endian.
+  // params (rg*col * 4). These are followed by the optional sections appended
+  // below (column stats, all-column zone maps, bloom, per-RG sums, HLL, hash
+  // index, null bitmaps, extended stats, inverted/xor8/PGM, ...), then the
+  // format_version-2 CRC fields when present, and finally footer_size(4).
   size_t footer_start = data.size();
   // Read per call (see kNoNewSchemes): a function-local static would latch
   // the first build's answer, silently ignoring later setenv toggles.
@@ -3798,7 +3804,8 @@ bool DecodableIntCacheScheme(Scheme scheme) {
 
 }  // namespace
 
-std::span<const int64_t> PaxChunk::DecodedIntCell(slot_t col, uint32_t group) const {
+std::span<const int64_t> PaxChunk::DecodedIntCell(slot_t col,
+                                                  uint32_t group) const {
   const size_t index = static_cast<size_t>(group) * footer_.column_count + col;
   if (group >= footer_.row_counts.size() || index >= footer_.encodings.size() ||
       !DecodableIntCacheScheme(static_cast<Scheme>(footer_.encodings[index]))) {
@@ -4217,7 +4224,14 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       }
       Value tv = VarcharRegionAt(cur.region, cur.scheme, cur.prm, cache->seq_rc,
                                  loc, cur.region_end, &cur.fsst);
-      if (!tv.IsNull()) {
+      if (tv.IsNull()) {
+        // VarcharRegionAt's default arm returns a null Value for an unknown
+        // scheme (e.g. an int64-encoded cell declared varchar). Reset the
+        // slot instead of leaving a stale string from a previous row: the
+        // caller may reuse the same Row across ReadRowInto calls. This
+        // matches the FrontCode decode-failure arm above.
+        slot = Value();
+      } else {
         slot.SetString(tv.MoveString());
       }
     }
@@ -4258,8 +4272,10 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
   // Per-row null-bitmap state: the group's bitmap base is shared by every
   // column, so the O(row_groups) offset walk runs once per row instead of
   // once per column (CellIsNull in the loop made ReadRow quadratic in the
-  // group count whenever null bitmaps were present). null_ok=false mirrors
-  // CellIsNull's "not null" answer for feature-off / truncated footers.
+  // group count whenever null bitmaps were present). null_ok=false covers
+  // feature-off / short-row_counts footers. For a truncated bitmap
+  // CellIsNull reports "may be NULL", so the per-byte checks below treat an
+  // out-of-range byte as NULL rather than decoding raw 0 as a real value.
   bool null_ok = false;
   size_t null_base = 0;
   size_t null_bytes = 0;
@@ -4325,15 +4341,17 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
     const size_t off_idx = (g * footer_.column_count) + c;
     const ValueType vt = sc.GetColumn(c).Type();
     const auto decoded = (vt == ValueType::kInt64 || vt == ValueType::kDouble)
-                             ? DecodedIntCell(c, g) : std::span<const int64_t>{};
+                             ? DecodedIntCell(c, g)
+                             : std::span<const int64_t>{};
     if (local < decoded.size()) {
       const size_t null_byte =
           null_base + (static_cast<size_t>(c) * null_bytes) + (local >> 3);
       const bool is_null =
-          null_ok && null_byte < footer_.null_bitmaps.size() &&
-          ((static_cast<unsigned>(footer_.null_bitmaps[null_byte]) >>
-            (7U - (local & 7U))) &
-           1U) != 0;
+          null_ok &&
+          (null_byte >= footer_.null_bitmaps.size() ||
+           ((static_cast<unsigned>(footer_.null_bitmaps[null_byte]) >>
+             (7U - (local & 7U))) &
+            1U) != 0);
       Value& cached_slot = row_out->values_[c];
       if (is_null) {
         cached_slot = Value();
@@ -4371,7 +4389,11 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
     if (null_ok) {
       const size_t null_off = null_base + (static_cast<size_t>(c) * null_bytes);
       const size_t byte_idx = null_off + (local >> 3);
-      if (byte_idx < footer_.null_bitmaps.size()) {
+      // Truncated bitmap: CellIsNull answers "may be NULL" here, so do not
+      // surface raw 0 as a value (keeps ReadRow in sync with ReadColumnValue).
+      if (byte_idx >= footer_.null_bitmaps.size()) {
+        is_null = true;
+      } else {
         is_null =
             (((footer_.null_bitmaps[byte_idx] >> (7 - (local & 7))) & 1) != 0);
       }
@@ -4409,7 +4431,11 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       const FsstDecodeView fsst_view = FsstViewAt(off_idx);
       Value tv =
           VarcharRegionAt(region, s, prm, rc, local, region_end, &fsst_view);
-      if (!tv.IsNull()) {
+      if (tv.IsNull()) {
+        // Unknown scheme: clear a reused Row's previous string instead of
+        // leaving a stale value (same contract as the sequential path).
+        slot = Value();
+      } else {
         slot.SetString(tv.MoveString());
       }
     }
@@ -4619,8 +4645,8 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
   // Decoded-int fast path for the single-group shape (the dominant stored
   // layout): a fully cached cell reads as one load plus the null test,
   // mirroring ReadRowIntoImpl's cached arm. Like the legacy paths, a NULL
-  // cell reports null (callers such as the LSM reader's key refresh and the merge
-  // join's null-key skip depend on that verdict); the cache itself stores
+  // cell reports null (callers such as the LSM reader's key refresh and the
+  // merge join's null-key skip depend on that verdict); the cache itself stores
   // the raw-0 clamped value, so the bitmap gate decides which of the two is
   // served. Partial spans fall through to the region decoders below:
   // Each cached cell contains every local row of the group.
@@ -4642,8 +4668,7 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
             return Value();
           }
         }
-        const int64_t cached =
-            decoded[global_row_index];
+        const int64_t cached = decoded[global_row_index];
         if (vt == ValueType::kInt64) {
           return Value(cached);
         }
@@ -4823,10 +4848,18 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
   if (workload != nullptr) {
     workload->RecordPointLookup(sc, kci);
   }
-  // Fast path: hash index first (O(1), zone-map independent).
+  // Fast path: hash index first (O(1), zone-map independent). A hit answers
+  // directly and a verified miss may fall through to the zone-map/PGM paths,
+  // but kCorruption (e.g. a hash row number past the chunk end in a
+  // hand-built footer) must reach the caller: falling back would hide the
+  // broken index behind a kNotExists / re-verified kSuccess.
   {
     size_t hidx = 0;
-    if (HashLookup(key_value, &hidx) == Status::kSuccess) {
+    const Status hash_status = HashLookup(key_value, &hidx);
+    if (hash_status == Status::kCorruption) {
+      return hash_status;
+    }
+    if (hash_status == Status::kSuccess) {
       *row_index_out = hidx;
       return Status::kSuccess;
     }
@@ -4908,12 +4941,13 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
       // NULL key cells encode raw 0: they must never satisfy a point
       // lookup (the hash-index builder skips them; the region path has to
       // agree or key 0 phantom-matches a NULL row). Walk to the first
-      // non-null cell that still decodes to the key.
-      const uint8_t* nulls = RgColNullBits(footer_, g, kci);
+      // non-null cell that still decodes to the key. CellIsNull (rather
+      // than RgColNullBits) is used here because it treats a truncated
+      // null bitmap as "may be NULL"; RgColNullBits returns nullptr for
+      // that footer, which would silently drop the NULL-key skip.
       bool hit = false;
       for (; local < rc; ++local) {
-        if (nulls != nullptr &&
-            ((nulls[local >> 3] >> (7 - (local & 7))) & 1) != 0) {
+        if (CellIsNull(footer_, g, kci, local)) {
           continue;
         }
         // Sorted-region contract: the first non-null cell at/after the
@@ -4980,12 +5014,11 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
     return Status::kNotExists;
   }
   // NULL key cells encode raw 0: skip them like the no-zone-map path (and
-  // the hash index) does.
-  const uint8_t* nulls = RgColNullBits(footer_, g, kci);
+  // the hash index) does. CellIsNull also covers a truncated bitmap, where
+  // RgColNullBits would return nullptr and let a NULL row match key 0.
   bool hit = false;
   for (; local < rc; ++local) {
-    if (nulls != nullptr &&
-        ((nulls[local >> 3] >> (7 - (local & 7))) & 1) != 0) {
+    if (CellIsNull(footer_, g, kci, local)) {
       continue;
     }
     hit = Int64RegionAt(region, s, footer_.params[off_idx], rc, local, reg_end,
@@ -5453,10 +5486,11 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
               RegionEndAt(footer_, g, kci, data_), EfSelectDirAt(off_idx))) {
         // NULL key cells encode raw 0 and are not key values: a seek that
         // lands on them (key <= 0, NULLs sort at the 0 position) advances
-        // to the first real value.
-        const uint8_t* nulls = RgColNullBits(footer_, g, kci);
-        while (local < footer_.row_counts[g] && nulls != nullptr &&
-               ((nulls[local >> 3] >> (7 - (local & 7))) & 1) != 0) {
+        // to the first real value. CellIsNull (not RgColNullBits) also
+        // treats a truncated bitmap as NULL, so raw 0 cannot become a
+        // lower bound for key 0.
+        while (local < footer_.row_counts[g] &&
+               CellIsNull(footer_, g, kci, local)) {
           ++local;
         }
         if (local < footer_.row_counts[g]) {
@@ -5507,10 +5541,10 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
     return Status::kNotExists;
   }
   // NULL key cells encode raw 0: skip them like the no-zone-map path.
+  // CellIsNull keeps a truncated bitmap from exposing raw 0 as a key.
   {
-    const uint8_t* nulls = RgColNullBits(footer_, candidate, kci);
-    while (local < footer_.row_counts[candidate] && nulls != nullptr &&
-           ((nulls[local >> 3] >> (7 - (local & 7))) & 1) != 0) {
+    while (local < footer_.row_counts[candidate] &&
+           CellIsNull(footer_, candidate, kci, local)) {
       ++local;
     }
     if (local >= footer_.row_counts[candidate]) {
@@ -5650,7 +5684,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
   // plus a few minimum sizes measured against the WHOLE data area. A
   // mutated chunk could therefore validate with, say, a Wavelet cell whose
   // region is 9 bytes but whose decoder walks 9 + W*ceil(n/8) bytes,
-  // reading across every neighbour region and past the footer into
+  // reading across every neighbor region and past the footer into
   // unbacked memory. Here each cell's true worst-case read extent is
   // computed from the scheme/params and required to fit inside
   // [off, succ), where succ is the NEXT cell's offset (or the data-area

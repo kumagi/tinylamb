@@ -6,7 +6,9 @@ Not C++ layers; ignored by `check_layering.py` (`IGNORED_PREFIXES`).
 
 - `check_layering.py` — include-lint. `python3 scripts/check_layering.py`
   must exit 0. Reads quoted `#include`s, ranks `common → … → server`
-  (`executor/detail/` before `executor/`), exempts `build*`, `benchmark/`,
+  (`executor/detail/` before `executor/`) and rejects the unconditional
+  `FORBIDDEN_PATTERNS` edges (currently `expression/* -> database/*`)
+  regardless of rank or allowlist. Exempts `build*`, `benchmark/`,
   `main.cpp`, `*_test*`/`*_fuzzer*`/`*_benchmark.*` — except the nine fuzzer
   harnesses in `PRODUCTION_FUZZERS`, which CMake builds into `tinylamb_sql`.
   Accepted debt lives in
@@ -26,8 +28,9 @@ Not C++ layers; ignored by `check_layering.py` (`IGNORED_PREFIXES`).
   `*-repro-*.test` files are removed only with `--fuzz-artifacts`.
 - `bench_gate.py` — compares benchmark JSON/TSV against the
   `BenchmarkHistory.md` baseline section; exits 1 past threshold.
-- `compliance_summary.py` — runs `build/googlesql_compliance_test` and
-  aggregates results.
+- `compliance_summary.py` — runs the `googlesql_compliance_test` binary and
+  aggregates results. Default is `build/googlesql_compliance_test`; pass
+  `--binary PATH` to use a custom build directory (e.g. `build-fuzz/`).
 - `expr_oracle.py` — Python oracle for Lisp S-expressions with GoogleSQL
   semantics (`[PY-DIFF]` marks intentional divergences).
 - `fetch_googlesql_compliance.py` — fetches

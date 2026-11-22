@@ -209,12 +209,16 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
   bool pending_ambiguous = false;
   bool elem_quantified = false;  // trailing '?' is a laziness modifier
 
+  bool fixed_length_overflow = false;
   const auto flush = [&] {
     if (!groups.empty()) {
       Frame& f = groups.back();
-      f.cur_len = (f.cur_len == kVar || pending_len == kVar)
-                      ? kVar
-                      : f.cur_len + pending_len;
+      if (f.cur_len == kVar || pending_len == kVar) {
+        f.cur_len = kVar;
+      } else if (__builtin_add_overflow(f.cur_len, pending_len, &f.cur_len)) {
+        fixed_length_overflow = true;
+        f.cur_len = kVar;
+      }
       if (!f.first_done) {
         f.cur_first |= pending_first;
         if (!pending_nullable) {
@@ -510,13 +514,18 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
                       (pending_nullable && pending_first.any()))) {
       return true;
     }
-    pending_len = (exact && pending_len != kVar) ? pending_len * repeat : kVar;
+    if (!exact || pending_len == kVar) {
+      pending_len = kVar;
+    } else if (__builtin_mul_overflow(pending_len, repeat, &pending_len)) {
+      // A fixed length that cannot be represented is unsafe to compile.
+      return true;
+    }
     pending_var = (pending_len == kVar);
     pending_nullable = can_be_empty || pending_nullable;
     elem_quantified = true;
     i += len;
   }
-  return false;
+  return fixed_length_overflow;
 }
 
 // Compile `pattern` after the nested-repetition check above; callers get a
@@ -544,8 +553,9 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
       }
     }
     if (RegexPatternHasNestedRepetition(pattern)) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "regular expression has nested repetition: " + pattern);
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "regular expression has nested repetition: " + pattern);
     }
     std::regex compiled(Transform(pattern));
     // std::regex exposes no introspection; charge 16x the pattern text as a
@@ -583,7 +593,8 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
 inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
   return regex_guard_detail::CompileCheckedPattern<
       [](const std::string& original) -> const std::string& {
-        return original;  // NOLINT(bugprone-return-const-ref-from-parameter): consumed immediately by std::regex
+        return original;  // NOLINT(bugprone-return-const-ref-from-parameter):
+                          // consumed immediately by std::regex
       }>(pattern);
 }
 

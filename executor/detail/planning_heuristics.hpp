@@ -116,6 +116,9 @@ std::vector<EqualityKey> EqualityKeys(
     const Schema& left, const Schema& right,
     const std::vector<Expression>& predicates);
 
+Status DisableRawCollatedKeys(const Relation& left, const Relation& right,
+                              std::vector<EqualityKey>* keys);
+
 bool HasNullKey(const Row& row, const std::vector<slot_t>& columns);
 
 bool SingleIntegerJoinKey(const Schema& schema,

@@ -21,6 +21,7 @@
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "executor/query_memory.hpp"
+#include "expression/bytecode.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "type/column.hpp"
@@ -856,6 +857,14 @@ std::string CheckEvaluationPaths(Database& db, TransactionContext& ctx,
                                  const RunOutcome& first) {
   {
     ScopedBytecodeDisabled guard(true);
+    // Make the AST differential self-checking: if the disable hook ever
+    // becomes inert, the second arm would just re-run the bytecode path and
+    // every "clean" comparison would be vacuous. Fail loudly instead.
+    if (BytecodeEnabled()) {
+      return "[GRIFFIN-BYTECODE-DISABLE-NOOP] " + sql +
+             "\n  TINYLAMB_DISABLE_BYTECODE did not reach the engine; the AST "
+             "differential is vacuous\n";
+    }
     const RunOutcome again = RunStatement(db, ctx, sql);
     if (again.threw) {
       return "[GRIFFIN-THROW-AST] " + sql + "\n  what: " + again.error + "\n" +
@@ -969,13 +978,12 @@ std::string RunSession(
     const std::string sql =
         (mutate != nullptr && !IsDdl(original)) ? mutate(original) : original;
     t->statements.push_back(sql);
-    // The frontend rejects CREATE INDEX; route it through the catalog API so
-    // index-coverage seeds actually build indexes.
-    if (sql.starts_with("CREATE INDEX ") ||
-        sql.starts_with("CREATE UNIQUE INDEX ")) {
-      ApplyIndexSpec(db, ctx, sql);
-      continue;
-    }
+    // Record the cut position at every step. The final value is the session
+    // length at failure (or the full shuffled session on a clean run) and is
+    // serialized so replay can detect a trimmed trace.
+    t->executed_count = t->statements.size();
+    // Use the SQL frontend for index DDL. Shuffled sessions can legitimately
+    // reference a table before creating it or issue the same DDL twice.
     const RunOutcome first = RunStatement(db, ctx, sql);
     if (first.threw) {
       // Oracle (1): an escaped exception is a crash-adjacent finding; under
@@ -1166,6 +1174,14 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose,
     return "tampered trace: statements do not match seed " +
            std::to_string(trace.seed);
   }
+  // The prefix check above alone accepts a file whose trailing statements
+  // were trimmed: a shorter prefix still matches the seed, yet the recorded
+  // failure may no longer be reached. The cut position recorded at capture
+  // time pins the exact length, so reject any mismatch here.
+  if (trace.executed_count != 0 &&
+      trace.executed_count != trace.statements.size()) {
+    return "tampered trace: statement count does not match recorded cut";
+  }
 
   // Re-run the recorded session verbatim (identity mutation) and report
   // whether the failure still reproduces. "" means fixed or flaky-clean.
@@ -1183,6 +1199,14 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose,
   const std::string report =
       RunSession(db, ctx, trace.statements, &fresh, nullptr);
   db.DeleteAll();
+  if (trace.ran_select && !fresh.ran_select) {
+    // The recorded regression ran a SELECT; this replay did not (missing
+    // parser binary, resource pressure, unexpected statement shape). An
+    // empty report here would mistake "SELECT stopped running" for a fixed
+    // bug, so fail the replay instead (mirrors expr_oracle's engine_ran).
+    return "SELECT did not run on replay (recorded ran_select=true)" +
+           (report.empty() ? "" : "\n" + report);
+  }
   if (verbose && report.empty()) {
     std::cerr << "[griffin_fuzz][replay-clean] seed=" << trace.seed << "\n";
   }
@@ -1197,6 +1221,9 @@ std::string SerializeGriffinTest(const GriffinTrace& trace) {
   }
   out += std::string("-- ran_select: ") +
          (trace.ran_select ? "true" : "false") + "\n";
+  if (trace.executed_count != 0) {
+    out += "-- executed_count: " + std::to_string(trace.executed_count) + "\n";
+  }
   if (!trace.failure.empty()) {
     out += "-- failure: " + trace.failure + "\n";
   }
@@ -1248,6 +1275,17 @@ bool ParseGriffinTest(std::string_view text, GriffinTrace* trace) {
         return false;
       }
       trace->ran_select = (value == "true");
+    } else if (consume("-- executed_count: ", &value)) {
+      try {
+        size_t used = 0;
+        const auto n = std::stoull(value, &used);
+        if (used != value.size() || n > SIZE_MAX) {
+          return false;
+        }
+        trace->executed_count = static_cast<size_t>(n);
+      } catch (const std::exception&) {
+        return false;
+      }
     } else if (consume("-- failure: ", &value)) {
       trace->failure = value;
     } else {

@@ -38,7 +38,13 @@ namespace tinylamb {
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string db_name = RandomString();
-  auto db = Database::Create(db_name).MoveValue();
+  auto db_or = Database::Create(db_name);
+  if (!db_or.HasValue()) {
+    // File creation / out-of-space failures are environmental, not engine
+    // bugs: bail out rather than tripping MoveValue()'s contract check.
+    return;
+  }
+  auto db = db_or.MoveValue();
 
   Schema schema("FuzzerTable", {Column("f_id", ValueType::kInt64,
                                        Constraint(Constraint::kIndex)),
@@ -46,9 +52,15 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
                                 Column("double", ValueType::kDouble)});
   {
     TransactionContext ctx = db->BeginContext();
-    db->CreateTable(ctx, schema);
-    db->CreateIndex(ctx, "FuzzerTable", {"num_idx", {0}});
-    db->CreateIndex(ctx, "FuzzerTable", {"str_idx", {1}});
+    if (!db->CreateTable(ctx, schema).HasValue() ||
+        db->CreateIndex(ctx, "FuzzerTable", {"num_idx", {0}}) !=
+            Status::kSuccess ||
+        db->CreateIndex(ctx, "FuzzerTable", {"str_idx", {1}}) !=
+            Status::kSuccess) {
+      // Setup failure (e.g. kNoSpace) must not leave the model assuming two
+      // indexes that were never created; it is not an engine bug either.
+      return;
+    }
     assert(ctx.txn_.PreCommit() == Status::kSuccess);
   }
 
@@ -104,7 +116,13 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     if (stream.Pick(32) == 0) {
       db->EmulateCrash();
       db.reset();
-      auto recovered = Database::Create(db_name).MoveValue();
+      auto recovered_or = Database::Create(db_name);
+      if (!recovered_or.HasValue()) {
+        // Reopen failed after EmulateCrash(); there is no database to keep
+        // exercising (and db is null, so fall through would deref it).
+        return;
+      }
+      auto recovered = recovered_or.MoveValue();
       {
         TransactionContext verify_ctx = recovered->BeginContext();
         ASSIGN_OR_CRASH_CONST(Table, verify_table,

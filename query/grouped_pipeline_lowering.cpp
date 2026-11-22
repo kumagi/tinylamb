@@ -18,11 +18,11 @@
 #include "executor/detail/window_eval.hpp"
 #include "executor/pipeline_lowering.hpp"
 #include "expression/aggregate_expression.hpp"
-#include "expression/collation.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/function_call_expression.hpp"
@@ -353,7 +353,7 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   for (const NamedExpression& item : select.SelectList()) {
     if (!item.name.empty() && item.expression) {
       // Duplicate aliases are invalid SQL; the general path reports the
-      // error. try_emplace's first-wins behaviour here would silently pick
+      // error. try_emplace's first-wins behavior here would silently pick
       // one of the two expressions for HAVING/ORDER BY.
       if (!select_aliases.emplace(item.name, item.expression).second) {
         return std::optional<PipelineGraph>(std::nullopt);
@@ -468,7 +468,7 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
     for (size_t i = 0; i < select.SelectList().size(); ++i) {
       final_cols.push_back(proj_schema.GetColumn(i));
       // proj_schema already carries unique __tinylamb_sel_i names (or explicit
-      // aliases). The has_dup_sel_names branch above keeps those internal names
+      // aliases). The has_dup_sel_names branch below keeps those internal names
       // through the final projection so colliding user aliases remain distinct.
       strip_items.emplace_back(proj_items[i].name,
                                MakeSynthCol(proj_items[i].name));
@@ -480,9 +480,9 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   }
 
   // If any two user select names collide (e.g. `SELECT a, a`), give the
-  // pre-sort/distinct ProjectOp unambiguous `__tinylamb_sel_i` names (unless we keep
-  // them unique all the way through!). Notice Column names on output rows are
-  // positional for clients; result_column_names_ already came from AST.
+  // pre-sort/distinct ProjectOp unambiguous `__tinylamb_sel_i` names (unless we
+  // keep them unique all the way through!). Notice Column names on output rows
+  // are positional for clients; result_column_names_ already came from AST.
   bool has_dup_sel_names = false;
   if (!order_keys.empty() || select.Distinct()) {
     std::unordered_map<std::string, size_t> seen_names;

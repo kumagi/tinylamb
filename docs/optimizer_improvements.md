@@ -96,7 +96,9 @@ Three improvements landed after auditing the aliased/self-join path:
    on a leading index key becomes one point range per distinct value,
    offered as an alternative against full/range scans; the IN conjunct stays
    in the scan predicate so correctness never depends on bound tightness.
-   Multi-range scans keep global order only when a single range remains.
+   Point unions and OR-of-prefix ranges build sorted, disjoint ranges and
+   advertise the full key order, so an ORDER BY on the key (or any prefix)
+   needs no Sort.
 
 Routing note: plain multi-table joins with table aliases now go to the
 cost-based optimizer; the relational-engine EXPLAIN/spill tests that pin
@@ -171,8 +173,10 @@ Completed 2026-08 unless noted. Routing contract after this phase:
   conjunction into WHERE before planning); plain single LEFT JOIN over two
   base tables with an explicit ON (M6 slice: ON rides the `kOuterJoin`
   predicate via `Memo::NewOuterJoin`, WHERE over the null-supplying side
-  stays above the join; anything beyond the slice returns
-  `kNotImplemented` and falls back to the relational path); single-table
+  stays above the join); left-deep LEFT chains, including an inner prefix,
+  lower to nested `kOuterJoin` nodes so the outer hash and nested-loop
+  executors run, with WHERE rechecked above the chain and only
+  preserved-prefix conjuncts pushed into scan filters; single-table
   uncorrelated FROM-subqueries without stars/grouping (M5 slice: flattened
   by `FlattenDerivedSources` before routing, inner WHERE merged into WHERE
   or — for a null-supplying outer side — into ON); singly-referenced
@@ -188,11 +192,11 @@ Completed 2026-08 unless noted. Routing contract after this phase:
   above the nodes).
 - **Relational path (heuristic)**: unaliased multi-table joins, RIGHT/FULL
   JOIN chains (single RIGHT/FULL edges route through Cascades since M6+1),
-  LEFT JOIN chains / mixed outer+inner graphs / USING / nested joins /
-  outer joins with grouping, FROM-subqueries with aggregation, stars,
-  correlation or multiple tables, multiply-referenced or recursive CTEs that
-  miss the M4 gates (over-budget, CTE-dependent, nested placements),
-  GROUP BY/HAVING, OR/subquery expressions (`NeedsRelationalEvaluation`),
+  mixed outer+inner graphs / USING / nested joins / outer joins with grouping,
+  FROM-subqueries with aggregation, stars, correlation or multiple tables,
+  multiply-referenced or recursive CTEs that miss the M4 gates (over-budget,
+  CTE-dependent, nested placements), GROUP BY/HAVING, subquery expressions
+  (`NeedsRelationalEvaluation`; OR is no longer a routing boundary),
   and unqualified column references across several relations (precise
   ambiguity diagnostics live there).
 
@@ -210,12 +214,15 @@ Implemented in this phase:
 - [x] INNER/CROSS `JOIN ... ON` through SQL: conditions fold into WHERE and
       attach to their deepest covering join (`Memo::NewJoin`); non-equality
       residuals apply above the cross product.
-- [x] Disjunctions: verified safe by construction — `NeedsRelationalEvaluation`
-      routes any OR to the relational engine, so opaque predicates never
-      enter pushdown reasoning. Covered by existing relational tests.
+- [x] Disjunctions: `NeedsRelationalEvaluation` no longer treats OR as a
+      complexity boundary — it just recurses into the two operands. Cost-based
+      scan rules derive either a full-scan residual or a union of disjoint
+      composite-prefix index ranges, and `or_to_union` can expand OR into a
+      UNION in the Memo, so disjunctive predicates stay inside pushdown
+      reasoning. Covered by the optimizer's OR/index-union tests.
 - [x] LEFT JOIN end-to-end correctness guarded by a dedicated test
-      (`SqlEngineLeftJoinStaysCorrect`): stays on the relational path, which
-      null-pads unmatched rows.
+      (`SqlEngineLeftJoinStaysCorrect`): the aliased join plans through
+      Cascades and the outer executor null-pads unmatched rows.
 - [x] Ambiguity diagnostics preserved: unqualified columns across aliased
       relations keep the relational resolver's "ambiguous column" error.
 
@@ -232,13 +239,16 @@ relational executor; each needs its own design note):
   outer joins, and a memo-level (vs statement-level) unused-outer-side
   elimination; null-rejection analysis must still gate every remaining
   pushdown rule and commutativity restriction.
-- Subquery decorrelation into SemiJoin/AntiJoin: IN/EXISTS evaluate via
-  `subquery_runtime` today; decorrelation changes cardinality estimation and
-  needs new implementation rules.
+- Subquery decorrelation into SemiJoin/AntiJoin: `in_list_to_semi_join` and
+  `semi_reduction_pushdown_semi_join` / `semi_reduction_pushdown_anti_join`
+  are registered and gated (see `docs/cascades_optimizer.md`), while IN/EXISTS
+  still evaluate via `subquery_runtime`. Further decorrelation shapes change
+  cardinality estimation and need their own implementation rules.
 - Projection pushdown as true rewrite rules (`push_projection_through_join`
   etc.): the global touched-set approximation remains sound for the shapes
-  that reach the optimizer now that disjunctive/subquery shapes route to the
-  relational engine; revisit if those shapes ever move over.
+  that reach the optimizer. Disjunctive shapes now reach it too (OR is no
+  longer a routing boundary); subquery shapes still route to the relational
+  engine. Revisit if those move over as well.
 - RIGHT/FULL OUTER joins: single edges lower through the M6+1 slice; chains,
   USING and grouped shapes stay on the syntactic relational path and need
   null-rejection-aware rewrites.

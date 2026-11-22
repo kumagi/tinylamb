@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -29,8 +30,8 @@
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/regex_guard.hpp"
-#include "common/string_util.hpp"
 #include "common/status_or.hpp"
+#include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/columnar_table.hpp"
 #include "executor/detail/columnar_tlcs_internal.hpp"
@@ -170,7 +171,12 @@ void FinalizePredicateMetadata(const TlcsFile& tlcs, const Schema& table_schema,
   for (slot_t c = 0; c < ncols && c < dict_kinds.size() && c < dicts.size();
        ++c) {
     if (set->col_referenced[c] == 0U ||
-        dict_kinds[c] != TlcsDictKind::kCompleteNarrow) {
+        dict_kinds[c] != TlcsDictKind::kCompleteNarrow ||
+        std::ranges::any_of(set->nulls, [c](const TypedNullCompare& filter) {
+          return filter.column == c && filter.is_null;
+        })) {
+      // Directory masks represent non-NULL codes only. The NULL metadata
+      // above already determines which blocks can satisfy IS NULL.
       continue;
     }
     const LSTableColumnDictionary& dict = dicts[c];
@@ -286,14 +292,6 @@ void FinalizePredicateMetadata(const TlcsFile& tlcs, const Schema& table_schema,
               ok = false;
               break;
             }
-          }
-        }
-      }
-      if (ok) {
-        for (const TypedNullCompare& nf : set->nulls) {
-          if (nf.column == c && nf.is_null) {
-            ok = false;
-            break;
           }
         }
       }
@@ -1119,6 +1117,936 @@ Value ValueFromChunkRow(const TlcsFile::DecodedColumnChunk& chunk,
 // 3. Shared TLCS Columnar Agg Primitives & Streaming/Pruned Engine
 // ============================================================================
 
+namespace {
+
+Status DistinctBudgetExceeded() {
+  return StatusError(StatusCode::kMemoryLimitExceeded,
+                     "columnar COUNT(DISTINCT) exceeded budget");
+}
+
+template <typename DistinctValues>
+StatusOr<std::unique_ptr<DistinctValues>> MakeDistinctValues() {
+  QueryMemoryCharge charge;
+  if (!charge.TryAdd(sizeof(DistinctValues))) {
+    return DistinctBudgetExceeded();
+  }
+  auto values = std::make_unique<DistinctValues>();
+  values->charge = std::move(charge);
+  return values;
+}
+
+Status InsertDistinctString(DistinctStringValues& set, std::string_view value,
+                            PagedStringArena& arena) {
+  if (set.values.contains(value)) {
+    return Status::kSuccess;
+  }
+  // Estimate the unordered_set node and its share of the bucket array.
+  // The string bytes themselves are reserved by the arena.
+  constexpr size_t kEntryBytes = 64;
+  constexpr size_t kInitialBucketBytes = 128;
+  const size_t bytes =
+      kEntryBytes + (set.values.empty() ? kInitialBucketBytes : 0);
+  if (!set.charge.TryAdd(bytes)) {
+    return DistinctBudgetExceeded();
+  }
+  auto interned = arena.Intern(value);
+  if (!interned.HasValue()) {
+    set.charge.Release(bytes);
+    return interned.GetStatus();
+  }
+  set.values.insert(interned.Value());
+  return Status::kSuccess;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (filterColumnAtATime_eq_row_at_a_time, filter_skip_always_true,
+//    range_fusion_filter_eq)
+// Column-at-a-time conjunctive filter for non-null int64/date and double
+// constant comparisons, with ZoneMap always-true elimination and same-column
+// range fusion.
+struct FastNumericPred {
+  enum class Kind : uint8_t {
+    kIntSingle = 0,
+    kIntRange,
+    kDoubleSingle,
+    kDoubleRange,
+  };
+  Kind kind{Kind::kIntSingle};
+  slot_t col{0};
+  const int64_t* cells{nullptr};
+  BinaryOperation op{BinaryOperation::kEquals};
+  int64_t int_lo{0};
+  int64_t int_hi{0};
+  double dbl_lo{0.0};
+  double dbl_hi{0.0};
+  bool lo_inclusive{true};
+  bool hi_inclusive{true};
+  uint8_t priority{2};
+};
+
+template <typename PredFn>
+void ApplyFirstPred(uint32_t rc, std::vector<uint32_t>* cand_rows,
+                    PredFn&& pred) noexcept {
+  cand_rows->resize(rc);
+  uint32_t* out = cand_rows->data();
+  size_t k = 0;
+  for (uint32_t r = 0; r < rc; ++r) {
+    out[k] = r;
+    k += static_cast<size_t>(pred(r));
+  }
+  cand_rows->resize(k);
+}
+
+template <typename PredFn>
+void RefinePredInPlace(std::vector<uint32_t>* cand_rows,
+                       PredFn&& pred) noexcept {
+  uint32_t* data = cand_rows->data();
+  const size_t n = cand_rows->size();
+  size_t out = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t r = data[i];
+    data[out] = r;
+    out += static_cast<size_t>(pred(r));
+  }
+  cand_rows->resize(out);
+}
+
+void RunFastNumericPred(const FastNumericPred& p, uint32_t rc, bool is_first,
+                        std::vector<uint32_t>* cand_rows) noexcept {
+  const int64_t* cells = p.cells;
+  auto dispatch = [&](auto&& fn) {
+    if (is_first) {
+      ApplyFirstPred(rc, cand_rows, fn);
+    } else {
+      RefinePredInPlace(cand_rows, fn);
+    }
+  };
+  switch (p.kind) {
+    case FastNumericPred::Kind::kIntSingle: {
+      const int64_t c = p.int_lo;
+      switch (p.op) {
+        case BinaryOperation::kEquals:
+          dispatch([cells, c](uint32_t r) noexcept { return cells[r] == c; });
+          return;
+        case BinaryOperation::kNotEquals:
+          dispatch([cells, c](uint32_t r) noexcept { return cells[r] != c; });
+          return;
+        case BinaryOperation::kLessThan:
+          dispatch([cells, c](uint32_t r) noexcept { return cells[r] < c; });
+          return;
+        case BinaryOperation::kLessThanEquals:
+          dispatch([cells, c](uint32_t r) noexcept { return cells[r] <= c; });
+          return;
+        case BinaryOperation::kGreaterThan:
+          dispatch([cells, c](uint32_t r) noexcept { return cells[r] > c; });
+          return;
+        case BinaryOperation::kGreaterThanEquals:
+          dispatch([cells, c](uint32_t r) noexcept { return cells[r] >= c; });
+          return;
+        default:
+          return;
+      }
+    }
+    case FastNumericPred::Kind::kIntRange: {
+      const int64_t lo = p.int_lo;
+      const int64_t hi = p.int_hi;
+      if (p.lo_inclusive && p.hi_inclusive) {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const int64_t v = cells[r];
+          return v >= lo && v <= hi;
+        });
+      } else if (p.lo_inclusive && !p.hi_inclusive) {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const int64_t v = cells[r];
+          return v >= lo && v < hi;
+        });
+      } else if (!p.lo_inclusive && p.hi_inclusive) {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const int64_t v = cells[r];
+          return v > lo && v <= hi;
+        });
+      } else {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const int64_t v = cells[r];
+          return v > lo && v < hi;
+        });
+      }
+      return;
+    }
+    case FastNumericPred::Kind::kDoubleSingle: {
+      const double c = p.dbl_lo;
+      switch (p.op) {
+        case BinaryOperation::kEquals:
+          dispatch([cells, c](uint32_t r) noexcept {
+            return std::bit_cast<double>(cells[r]) == c;
+          });
+          return;
+        case BinaryOperation::kNotEquals:
+          dispatch([cells, c](uint32_t r) noexcept {
+            return std::bit_cast<double>(cells[r]) != c;
+          });
+          return;
+        case BinaryOperation::kLessThan:
+          dispatch([cells, c](uint32_t r) noexcept {
+            return std::bit_cast<double>(cells[r]) < c;
+          });
+          return;
+        case BinaryOperation::kLessThanEquals:
+          dispatch([cells, c](uint32_t r) noexcept {
+            return std::bit_cast<double>(cells[r]) <= c;
+          });
+          return;
+        case BinaryOperation::kGreaterThan:
+          dispatch([cells, c](uint32_t r) noexcept {
+            return std::bit_cast<double>(cells[r]) > c;
+          });
+          return;
+        case BinaryOperation::kGreaterThanEquals:
+          dispatch([cells, c](uint32_t r) noexcept {
+            return std::bit_cast<double>(cells[r]) >= c;
+          });
+          return;
+        default:
+          return;
+      }
+    }
+    case FastNumericPred::Kind::kDoubleRange: {
+      const double lo = p.dbl_lo;
+      const double hi = p.dbl_hi;
+      if (p.lo_inclusive && p.hi_inclusive) {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const double v = std::bit_cast<double>(cells[r]);
+          return v >= lo && v <= hi;
+        });
+      } else if (p.lo_inclusive && !p.hi_inclusive) {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const double v = std::bit_cast<double>(cells[r]);
+          return v >= lo && v < hi;
+        });
+      } else if (!p.lo_inclusive && p.hi_inclusive) {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const double v = std::bit_cast<double>(cells[r]);
+          return v > lo && v <= hi;
+        });
+      } else {
+        dispatch([cells, lo, hi](uint32_t r) noexcept {
+          const double v = std::bit_cast<double>(cells[r]);
+          return v > lo && v < hi;
+        });
+      }
+      return;
+    }
+  }
+}
+
+bool TryFilterBlockNumericColumnAtATime(
+    const ColumnarPredicateSet& preds,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
+    uint32_t rc, std::vector<uint32_t>* cand_rows) noexcept {
+  if (!preds.nulls.empty() || !preds.inlists.empty() ||
+      preds.compares.empty() || preds.compares.size() > 16) {
+    return false;
+  }
+  for (const TypedFilterCompare& cmp : preds.compares) {
+    if (!cmp.constant_payload || cmp.string_payload ||
+        col_ptrs[cmp.left] == nullptr || col_ptrs[cmp.left]->has_null) {
+      return false;
+    }
+    switch (cmp.op) {
+      case BinaryOperation::kEquals:
+      case BinaryOperation::kNotEquals:
+      case BinaryOperation::kLessThan:
+      case BinaryOperation::kLessThanEquals:
+      case BinaryOperation::kGreaterThan:
+      case BinaryOperation::kGreaterThanEquals:
+        break;
+      default:
+        return false;
+    }
+  }
+
+  std::array<FastNumericPred, 16> fps{};
+  size_t nf = 0;
+  for (const TypedFilterCompare& cmp : preds.compares) {
+    const auto& column = *col_ptrs[cmp.left];
+    if (!cmp.is_double) {
+      if (column.has_min_max && !column.is_unsigned) {
+        const int64_t lo = column.min_int;
+        const int64_t hi = column.max_int;
+        const int64_t c = cmp.int_constant;
+        const bool always_true =
+            (cmp.op == BinaryOperation::kEquals && lo == c && hi == c) ||
+            (cmp.op == BinaryOperation::kNotEquals && (hi < c || c < lo)) ||
+            (cmp.op == BinaryOperation::kLessThan && hi < c) ||
+            (cmp.op == BinaryOperation::kLessThanEquals && hi <= c) ||
+            (cmp.op == BinaryOperation::kGreaterThan && lo > c) ||
+            (cmp.op == BinaryOperation::kGreaterThanEquals && lo >= c);
+        if (always_true) {
+          continue;
+        }
+        const bool always_false =
+            (cmp.op == BinaryOperation::kEquals && (c < lo || c > hi)) ||
+            (cmp.op == BinaryOperation::kNotEquals && lo == c && hi == c) ||
+            (cmp.op == BinaryOperation::kLessThan && lo >= c) ||
+            (cmp.op == BinaryOperation::kLessThanEquals && lo > c) ||
+            (cmp.op == BinaryOperation::kGreaterThan && hi <= c) ||
+            (cmp.op == BinaryOperation::kGreaterThanEquals && hi < c);
+        if (always_false) {
+          cand_rows->clear();
+          return true;
+        }
+      }
+      const uint8_t prio =
+          (cmp.op == BinaryOperation::kEquals && cmp.int_constant != 0)
+              ? 0
+              : (cmp.op == BinaryOperation::kEquals ? 1 : 3);
+      fps[nf++] = FastNumericPred{
+          .kind = FastNumericPred::Kind::kIntSingle,
+          .col = cmp.left,
+          .cells = column.int_cells.data(),
+          .op = cmp.op,
+          .int_lo = cmp.int_constant,
+          .priority = prio,
+      };
+    } else {
+      const double c = cmp.double_constant;
+      if (column.has_double_min_max && !column.has_nan &&
+          std::isfinite(column.min_double) &&
+          std::isfinite(column.max_double) && !std::isnan(c)) {
+        const double lo = column.min_double;
+        const double hi = column.max_double;
+        const bool always_true =
+            (cmp.op == BinaryOperation::kEquals && lo == c && hi == c) ||
+            (cmp.op == BinaryOperation::kNotEquals && (hi < c || c < lo)) ||
+            (cmp.op == BinaryOperation::kLessThan && hi < c) ||
+            (cmp.op == BinaryOperation::kLessThanEquals && hi <= c) ||
+            (cmp.op == BinaryOperation::kGreaterThan && lo > c) ||
+            (cmp.op == BinaryOperation::kGreaterThanEquals && lo >= c);
+        if (always_true) {
+          continue;
+        }
+        const bool always_false =
+            (cmp.op == BinaryOperation::kEquals && (c < lo || c > hi)) ||
+            (cmp.op == BinaryOperation::kNotEquals && lo == c && hi == c) ||
+            (cmp.op == BinaryOperation::kLessThan && lo >= c) ||
+            (cmp.op == BinaryOperation::kLessThanEquals && lo > c) ||
+            (cmp.op == BinaryOperation::kGreaterThan && hi <= c) ||
+            (cmp.op == BinaryOperation::kGreaterThanEquals && hi < c);
+        if (always_false) {
+          cand_rows->clear();
+          return true;
+        }
+      }
+      const uint8_t prio = (cmp.op == BinaryOperation::kEquals) ? 1 : 4;
+      fps[nf++] = FastNumericPred{
+          .kind = FastNumericPred::Kind::kDoubleSingle,
+          .col = cmp.left,
+          .cells = column.int_cells.data(),
+          .op = cmp.op,
+          .dbl_lo = c,
+          .priority = prio,
+      };
+    }
+  }
+
+  if (nf == 0) {
+    cand_rows->resize(rc);
+    for (uint32_t r = 0; r < rc; ++r) {
+      (*cand_rows)[r] = r;
+    }
+    return true;
+  }
+
+  // Fuse same-column (lower, upper) pairs into a single range predicate.
+  std::array<FastNumericPred, 16> fused{};
+  std::array<bool, 16> consumed{};
+  size_t nfused = 0;
+  for (size_t i = 0; i < nf; ++i) {
+    if (consumed[i]) {
+      continue;
+    }
+    const FastNumericPred& a = fps[i];
+    const bool a_is_lo = (a.op == BinaryOperation::kGreaterThan ||
+                          a.op == BinaryOperation::kGreaterThanEquals);
+    const bool a_is_hi = (a.op == BinaryOperation::kLessThan ||
+                          a.op == BinaryOperation::kLessThanEquals);
+    bool merged = false;
+    if (a_is_lo || a_is_hi) {
+      for (size_t j = i + 1; j < nf; ++j) {
+        if (consumed[j] || fps[j].col != a.col || fps[j].kind != a.kind) {
+          continue;
+        }
+        const FastNumericPred& b = fps[j];
+        const bool b_is_lo = (b.op == BinaryOperation::kGreaterThan ||
+                              b.op == BinaryOperation::kGreaterThanEquals);
+        const bool b_is_hi = (b.op == BinaryOperation::kLessThan ||
+                              b.op == BinaryOperation::kLessThanEquals);
+        if ((a_is_lo && b_is_hi) || (a_is_hi && b_is_lo)) {
+          const FastNumericPred& lo_p = a_is_lo ? a : b;
+          const FastNumericPred& hi_p = a_is_hi ? a : b;
+          FastNumericPred rp = lo_p;
+          rp.kind = (a.kind == FastNumericPred::Kind::kIntSingle)
+                        ? FastNumericPred::Kind::kIntRange
+                        : FastNumericPred::Kind::kDoubleRange;
+          rp.int_hi = hi_p.int_lo;
+          rp.dbl_hi = hi_p.dbl_lo;
+          rp.lo_inclusive = (lo_p.op == BinaryOperation::kGreaterThanEquals);
+          rp.hi_inclusive = (hi_p.op == BinaryOperation::kLessThanEquals);
+          rp.priority = (a.kind == FastNumericPred::Kind::kIntSingle) ? 2 : 3;
+          fused[nfused++] = rp;
+          consumed[i] = true;
+          consumed[j] = true;
+          merged = true;
+          break;
+        }
+      }
+    }
+    if (!merged) {
+      fused[nfused++] = a;
+      consumed[i] = true;
+    }
+  }
+
+  std::sort(fused.begin(), fused.begin() + nfused,
+            [](const FastNumericPred& a, const FastNumericPred& b) {
+              return a.priority < b.priority;
+            });
+
+  for (size_t i = 0; i < nfused; ++i) {
+    RunFastNumericPred(fused[i], rc, i == 0, cand_rows);
+    if (cand_rows->empty()) {
+      return true;
+    }
+  }
+  return true;
+}
+
+// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+//   (dense_group_block_accum_monoid_eq, finite_sum_implies_no_inf,
+//    nonnull_avg_count_eq_count_star)
+struct CompiledFastAgg {
+  enum class Kind : uint8_t {
+    kUnsupported = 0,
+    kCountStar,
+    kCountCol,
+    kSumDoubleCol,
+    kAvgDoubleCol,
+    kSumDoubleMul2,               // c0 * c1
+    kSumDoubleMulOneMinus,        // c0 * (k1 - c1)
+    kSumDoubleMulOneMinusOnePlus  // c0 * (k1 - c1) * (k2 + c2)
+  };
+  Kind kind{Kind::kUnsupported};
+  slot_t c0{0};
+  slot_t c1{0};
+  slot_t c2{0};
+  double k1{0.0};
+  double k2{0.0};
+  bool is_avg{false};
+  int8_t share_dp_with{
+      -1};  // index of kSumDoubleMulOneMinus with same (c0,c1,k1)
+};
+
+struct CompiledFastAggPlan {
+  static constexpr size_t kMaxAggs = 16;
+  bool eligible{false};
+  size_t count{0};
+  std::array<CompiledFastAgg, kMaxAggs> ops{};
+  std::vector<slot_t> checked_cols;
+};
+
+CompiledFastAggPlan CompileFastAggPlan(const std::vector<ColAggSpec>& specs) {
+  CompiledFastAggPlan plan;
+  if (specs.empty() || specs.size() > CompiledFastAggPlan::kMaxAggs) {
+    return plan;
+  }
+  auto add_col = [&](slot_t c) {
+    if (std::ranges::find(plan.checked_cols, c) == plan.checked_cols.end()) {
+      plan.checked_cols.push_back(c);
+    }
+  };
+  for (size_t a = 0; a < specs.size(); ++a) {
+    const ColAggSpec& s = specs[a];
+    CompiledFastAgg op;
+    if (s.kind == ColAggKind::kCountStar) {
+      op.kind = CompiledFastAgg::Kind::kCountStar;
+    } else if (s.double_arith != nullptr) {
+      if (s.kind != ColAggKind::kSumDouble &&
+          s.kind != ColAggKind::kAvgDouble) {
+        return plan;
+      }
+      op.is_avg = (s.kind == ColAggKind::kAvgDouble);
+      const auto& rpn = s.double_arith->rpn;
+      using Op = ColDoubleArithExpr::Op;
+      if (rpn.size() == 3 && rpn[0].op == Op::kColDouble &&
+          rpn[1].op == Op::kColDouble && rpn[2].op == Op::kMul) {
+        op.kind = CompiledFastAgg::Kind::kSumDoubleMul2;
+        op.c0 = rpn[0].full_col;
+        op.c1 = rpn[1].full_col;
+        add_col(op.c0);
+        add_col(op.c1);
+      } else if (rpn.size() == 5 && rpn[0].op == Op::kColDouble &&
+                 rpn[1].op == Op::kConst && rpn[2].op == Op::kColDouble &&
+                 rpn[3].op == Op::kSub && rpn[4].op == Op::kMul) {
+        op.kind = CompiledFastAgg::Kind::kSumDoubleMulOneMinus;
+        op.c0 = rpn[0].full_col;
+        op.c1 = rpn[2].full_col;
+        op.k1 = rpn[1].constant;
+        add_col(op.c0);
+        add_col(op.c1);
+      } else if (rpn.size() == 9 && rpn[0].op == Op::kColDouble &&
+                 rpn[1].op == Op::kConst && rpn[2].op == Op::kColDouble &&
+                 rpn[3].op == Op::kSub && rpn[4].op == Op::kMul &&
+                 rpn[5].op == Op::kConst && rpn[6].op == Op::kColDouble &&
+                 rpn[7].op == Op::kAdd && rpn[8].op == Op::kMul) {
+        op.kind = CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus;
+        op.c0 = rpn[0].full_col;
+        op.c1 = rpn[2].full_col;
+        op.c2 = rpn[6].full_col;
+        op.k1 = rpn[1].constant;
+        op.k2 = rpn[5].constant;
+        add_col(op.c0);
+        add_col(op.c1);
+        add_col(op.c2);
+      } else {
+        return plan;
+      }
+    } else if (s.kind == ColAggKind::kCountCol) {
+      op.kind = CompiledFastAgg::Kind::kCountCol;
+      op.c0 = s.full_col;
+      add_col(op.c0);
+    } else if (s.kind == ColAggKind::kSumDouble) {
+      op.kind = CompiledFastAgg::Kind::kSumDoubleCol;
+      op.c0 = s.full_col;
+      add_col(op.c0);
+    } else if (s.kind == ColAggKind::kAvgDouble) {
+      op.kind = CompiledFastAgg::Kind::kAvgDoubleCol;
+      op.c0 = s.full_col;
+      op.is_avg = true;
+      add_col(op.c0);
+    } else {
+      return plan;
+    }
+    plan.ops[a] = op;
+  }
+  // Detect CSE between kSumDoubleMulOneMinus and kSumDoubleMulOneMinusOnePlus.
+  for (size_t a = 0; a < specs.size(); ++a) {
+    if (plan.ops[a].kind ==
+        CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus) {
+      for (size_t b = 0; b < a; ++b) {
+        if (plan.ops[b].kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinus &&
+            plan.ops[b].c0 == plan.ops[a].c0 &&
+            plan.ops[b].c1 == plan.ops[a].c1 &&
+            plan.ops[b].k1 == plan.ops[a].k1) {
+          plan.ops[a].share_dp_with = static_cast<int8_t>(b);
+          break;
+        }
+      }
+    }
+  }
+  plan.count = specs.size();
+  plan.eligible = true;
+  return plan;
+}
+
+bool FastAggBlockColumnsReady(
+    const CompiledFastAggPlan& plan,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs) noexcept {
+  if (!plan.eligible) {
+    return false;
+  }
+  for (size_t a = 0; a < plan.count; ++a) {
+    const CompiledFastAgg& op = plan.ops[a];
+    if (op.kind == CompiledFastAgg::Kind::kCountStar) {
+      continue;
+    }
+    if (op.kind == CompiledFastAgg::Kind::kCountCol) {
+      const auto* ch = col_ptrs[op.c0];
+      if (ch == nullptr || ch->has_null) {
+        return false;
+      }
+      continue;
+    }
+    const auto* ch0 = col_ptrs[op.c0];
+    if (ch0 == nullptr || ch0->has_null || ch0->type != ValueType::kDouble) {
+      return false;
+    }
+    if (op.kind == CompiledFastAgg::Kind::kSumDoubleMul2 ||
+        op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinus ||
+        op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus) {
+      const auto* ch1 = col_ptrs[op.c1];
+      if (ch1 == nullptr || ch1->has_null || ch1->type != ValueType::kDouble) {
+        return false;
+      }
+    }
+    if (op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus) {
+      const auto* ch2 = col_ptrs[op.c2];
+      if (ch2 == nullptr || ch2->has_null || ch2->type != ValueType::kDouble) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool TryFoldBlockScalarFastAggs(
+    const CompiledFastAggPlan& plan,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
+    const std::vector<uint32_t>& cand_rows,
+    std::vector<RuntimeAggState>& sa) noexcept {
+  if (!FastAggBlockColumnsReady(plan, col_ptrs)) {
+    return false;
+  }
+  const size_t n = cand_rows.size();
+  if (n == 0) {
+    return true;
+  }
+  const uint32_t* rows = cand_rows.data();
+  for (size_t a = 0; a < plan.count; ++a) {
+    const CompiledFastAgg& op = plan.ops[a];
+    RuntimeAggState& st = sa[a];
+    if (op.kind == CompiledFastAgg::Kind::kCountStar ||
+        op.kind == CompiledFastAgg::Kind::kCountCol) {
+      st.count += static_cast<int64_t>(n);
+      st.has_value = true;
+      continue;
+    }
+    double local_sum = 0.0;
+    const int64_t* c0 = col_ptrs[op.c0]->int_cells.data();
+    switch (op.kind) {
+      case CompiledFastAgg::Kind::kSumDoubleCol:
+      case CompiledFastAgg::Kind::kAvgDoubleCol:
+        for (size_t i = 0; i < n; ++i) {
+          local_sum += std::bit_cast<double>(c0[rows[i]]);
+        }
+        break;
+      case CompiledFastAgg::Kind::kSumDoubleMul2: {
+        const int64_t* c1 = col_ptrs[op.c1]->int_cells.data();
+        for (size_t i = 0; i < n; ++i) {
+          const uint32_t r = rows[i];
+          local_sum +=
+              std::bit_cast<double>(c0[r]) * std::bit_cast<double>(c1[r]);
+        }
+        break;
+      }
+      case CompiledFastAgg::Kind::kSumDoubleMulOneMinus: {
+        const int64_t* c1 = col_ptrs[op.c1]->int_cells.data();
+        const double k1 = op.k1;
+        for (size_t i = 0; i < n; ++i) {
+          const uint32_t r = rows[i];
+          local_sum += std::bit_cast<double>(c0[r]) *
+                       (k1 - std::bit_cast<double>(c1[r]));
+        }
+        break;
+      }
+      case CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus: {
+        const int64_t* c1 = col_ptrs[op.c1]->int_cells.data();
+        const int64_t* c2 = col_ptrs[op.c2]->int_cells.data();
+        const double k1 = op.k1;
+        const double k2 = op.k2;
+        for (size_t i = 0; i < n; ++i) {
+          const uint32_t r = rows[i];
+          local_sum += std::bit_cast<double>(c0[r]) *
+                       (k1 - std::bit_cast<double>(c1[r])) *
+                       (k2 + std::bit_cast<double>(c2[r]));
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    // Lean proof: finite_sum_implies_no_inf.
+    if (!op.is_avg && !std::isfinite(local_sum)) {
+      for (size_t i = 0; i < n; ++i) {
+        const uint32_t r = rows[i];
+        double v = 0.0;
+        if (op.kind == CompiledFastAgg::Kind::kSumDoubleCol) {
+          v = std::bit_cast<double>(c0[r]);
+        } else if (op.kind == CompiledFastAgg::Kind::kSumDoubleMul2) {
+          v = std::bit_cast<double>(c0[r]) *
+              std::bit_cast<double>(col_ptrs[op.c1]->int_cells[r]);
+        } else if (op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinus) {
+          v = std::bit_cast<double>(c0[r]) *
+              (op.k1 - std::bit_cast<double>(col_ptrs[op.c1]->int_cells[r]));
+        } else {
+          v = std::bit_cast<double>(c0[r]) *
+              (op.k1 - std::bit_cast<double>(col_ptrs[op.c1]->int_cells[r])) *
+              (op.k2 + std::bit_cast<double>(col_ptrs[op.c2]->int_cells[r]));
+        }
+        if (std::isinf(v)) {
+          st.saw_inf = true;
+          break;
+        }
+      }
+    }
+    st.double_val += local_sum;
+    if (op.is_avg) {
+      st.count += static_cast<int64_t>(n);
+    }
+    st.has_value = true;
+  }
+  return true;
+}
+
+template <typename GroupTableT>
+bool TryFoldBlockDenseGroupsFastAggs(
+    const CompiledFastAggPlan& plan,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
+    const std::vector<uint32_t>& cand_rows,
+    const std::vector<uint32_t>& dk_row_gid, size_t num_groups,
+    GroupTableT& wtable) noexcept {
+  constexpr size_t kMaxDenseGroups = 64;
+  if (num_groups == 0 || num_groups > kMaxDenseGroups ||
+      !FastAggBlockColumnsReady(plan, col_ptrs)) {
+    return false;
+  }
+  const size_t n = cand_rows.size();
+  if (n == 0) {
+    return true;
+  }
+  // Check if cand_rows is dense [0, n) to avoid indirect row loads.
+  const bool dense_rows = (cand_rows.front() == 0 && cand_rows.back() == n - 1);
+
+  std::array<uint64_t, kMaxDenseGroups> g_cnt{};
+  std::array<std::array<double, kMaxDenseGroups>, CompiledFastAggPlan::kMaxAggs>
+      g_sum{};
+
+  const uint32_t* gids = dk_row_gid.data();
+  const uint32_t* rows = cand_rows.data();
+
+  // Single fused pass over the block so every column is read from L1/L2 once!
+  std::array<const int64_t*, CompiledFastAggPlan::kMaxAggs> p0{};
+  std::array<const int64_t*, CompiledFastAggPlan::kMaxAggs> p1{};
+  std::array<const int64_t*, CompiledFastAggPlan::kMaxAggs> p2{};
+  for (size_t a = 0; a < plan.count; ++a) {
+    const CompiledFastAgg& op = plan.ops[a];
+    if (op.kind != CompiledFastAgg::Kind::kCountStar) {
+      p0[a] = col_ptrs[op.c0]->int_cells.data();
+    }
+    if (op.kind == CompiledFastAgg::Kind::kSumDoubleMul2 ||
+        op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinus ||
+        op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus) {
+      p1[a] = col_ptrs[op.c1]->int_cells.data();
+    }
+    if (op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus) {
+      p2[a] = col_ptrs[op.c2]->int_cells.data();
+    }
+  }
+
+  // Hoist switch outside the row loop so each aggregate executes a tight,
+  // branch-free inner loop. Fuse (c0*(k1-c1), c0*(k1-c1)*(k2+c2)) pairs so
+  // the common subexpression dp is computed once.
+  if (dense_rows) {
+    for (uint32_t i = 0; i < static_cast<uint32_t>(n); ++i) {
+      ++g_cnt[gids[i]];
+    }
+  } else {
+    for (size_t i = 0; i < n; ++i) {
+      ++g_cnt[gids[i]];
+    }
+  }
+
+  std::array<bool, CompiledFastAggPlan::kMaxAggs> done{};
+  for (size_t a = 0; a < plan.count; ++a) {
+    if (done[a]) {
+      continue;
+    }
+    const CompiledFastAgg& op = plan.ops[a];
+    if (op.kind == CompiledFastAgg::Kind::kCountStar ||
+        op.kind == CompiledFastAgg::Kind::kCountCol) {
+      done[a] = true;
+      continue;
+    }
+    // Check if another aggregate shares dp = c0*(k1-c1) with `a`.
+    int8_t paired = -1;
+    if (op.kind == CompiledFastAgg::Kind::kSumDoubleMulOneMinus) {
+      for (size_t b = a + 1; b < plan.count; ++b) {
+        if (!done[b] && plan.ops[b].share_dp_with == static_cast<int8_t>(a)) {
+          paired = static_cast<int8_t>(b);
+          break;
+        }
+      }
+    }
+    double* dst = g_sum[a].data();
+    const int64_t* c0 = p0[a];
+    if (paired >= 0) {
+      const size_t b = static_cast<size_t>(paired);
+      double* dst_b = g_sum[b].data();
+      const int64_t* c1 = p1[a];
+      const int64_t* c2 = p2[b];
+      const double k1 = op.k1;
+      const double k2 = plan.ops[b].k2;
+      if (dense_rows) {
+        for (uint32_t r = 0; r < static_cast<uint32_t>(n); ++r) {
+          const uint32_t g = gids[r];
+          const double dp = std::bit_cast<double>(c0[r]) *
+                            (k1 - std::bit_cast<double>(c1[r]));
+          dst[g] += dp;
+          dst_b[g] += dp * (k2 + std::bit_cast<double>(c2[r]));
+        }
+      } else {
+        for (size_t i = 0; i < n; ++i) {
+          const uint32_t r = rows[i];
+          const uint32_t g = gids[i];
+          const double dp = std::bit_cast<double>(c0[r]) *
+                            (k1 - std::bit_cast<double>(c1[r]));
+          dst[g] += dp;
+          dst_b[g] += dp * (k2 + std::bit_cast<double>(c2[r]));
+        }
+      }
+      done[a] = true;
+      done[b] = true;
+      continue;
+    }
+    // Check if another aggregate sums the exact same single column (e.g.
+    // SUM(x) and AVG(x) on the same non-null column).
+    int8_t same_col_dup = -1;
+    if (op.kind == CompiledFastAgg::Kind::kSumDoubleCol ||
+        op.kind == CompiledFastAgg::Kind::kAvgDoubleCol) {
+      for (size_t b = a + 1; b < plan.count; ++b) {
+        if (!done[b] &&
+            (plan.ops[b].kind == CompiledFastAgg::Kind::kSumDoubleCol ||
+             plan.ops[b].kind == CompiledFastAgg::Kind::kAvgDoubleCol) &&
+            plan.ops[b].c0 == op.c0) {
+          same_col_dup = static_cast<int8_t>(b);
+          break;
+        }
+      }
+    }
+    switch (op.kind) {
+      case CompiledFastAgg::Kind::kSumDoubleCol:
+      case CompiledFastAgg::Kind::kAvgDoubleCol:
+        if (dense_rows) {
+          for (uint32_t r = 0; r < static_cast<uint32_t>(n); ++r) {
+            dst[gids[r]] += std::bit_cast<double>(c0[r]);
+          }
+        } else {
+          for (size_t i = 0; i < n; ++i) {
+            dst[gids[i]] += std::bit_cast<double>(c0[rows[i]]);
+          }
+        }
+        if (same_col_dup >= 0) {
+          const size_t b = static_cast<size_t>(same_col_dup);
+          std::copy(dst, dst + num_groups, g_sum[b].data());
+          done[b] = true;
+        }
+        break;
+      case CompiledFastAgg::Kind::kSumDoubleMul2: {
+        const int64_t* c1 = p1[a];
+        if (dense_rows) {
+          for (uint32_t r = 0; r < static_cast<uint32_t>(n); ++r) {
+            dst[gids[r]] +=
+                std::bit_cast<double>(c0[r]) * std::bit_cast<double>(c1[r]);
+          }
+        } else {
+          for (size_t i = 0; i < n; ++i) {
+            const uint32_t r = rows[i];
+            dst[gids[i]] +=
+                std::bit_cast<double>(c0[r]) * std::bit_cast<double>(c1[r]);
+          }
+        }
+        break;
+      }
+      case CompiledFastAgg::Kind::kSumDoubleMulOneMinus: {
+        const int64_t* c1 = p1[a];
+        const double k1 = op.k1;
+        if (dense_rows) {
+          for (uint32_t r = 0; r < static_cast<uint32_t>(n); ++r) {
+            dst[gids[r]] += std::bit_cast<double>(c0[r]) *
+                            (k1 - std::bit_cast<double>(c1[r]));
+          }
+        } else {
+          for (size_t i = 0; i < n; ++i) {
+            const uint32_t r = rows[i];
+            dst[gids[i]] += std::bit_cast<double>(c0[r]) *
+                            (k1 - std::bit_cast<double>(c1[r]));
+          }
+        }
+        break;
+      }
+      case CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus: {
+        const int64_t* c1 = p1[a];
+        const int64_t* c2 = p2[a];
+        const double k1 = op.k1;
+        const double k2 = op.k2;
+        if (dense_rows) {
+          for (uint32_t r = 0; r < static_cast<uint32_t>(n); ++r) {
+            dst[gids[r]] += std::bit_cast<double>(c0[r]) *
+                            (k1 - std::bit_cast<double>(c1[r])) *
+                            (k2 + std::bit_cast<double>(c2[r]));
+          }
+        } else {
+          for (size_t i = 0; i < n; ++i) {
+            const uint32_t r = rows[i];
+            dst[gids[i]] += std::bit_cast<double>(c0[r]) *
+                            (k1 - std::bit_cast<double>(c1[r])) *
+                            (k2 + std::bit_cast<double>(c2[r]));
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    done[a] = true;
+  }
+
+  // Merge block-local dense accumulators into global worker table once per
+  // group (Lean proof: dense_group_block_accum_monoid_eq,
+  // finite_sum_implies_no_inf, nonnull_avg_count_eq_count_star).
+  for (size_t g = 0; g < num_groups; ++g) {
+    if (g_cnt[g] == 0) {
+      continue;
+    }
+    RuntimeAggState* st_arr = wtable.AggsAt(static_cast<uint32_t>(g));
+    for (size_t a = 0; a < plan.count; ++a) {
+      const CompiledFastAgg& op = plan.ops[a];
+      RuntimeAggState& st = st_arr[a];
+      if (op.kind == CompiledFastAgg::Kind::kCountStar ||
+          op.kind == CompiledFastAgg::Kind::kCountCol) {
+        st.count += static_cast<int64_t>(g_cnt[g]);
+        st.has_value = true;
+      } else {
+        const double lsum = g_sum[a][g];
+        if (!op.is_avg && !std::isfinite(lsum)) {
+          for (size_t i = 0; i < n; ++i) {
+            if (gids[i] != g) {
+              continue;
+            }
+            const uint32_t r = dense_rows ? static_cast<uint32_t>(i) : rows[i];
+            double v = 0.0;
+            if (op.kind == CompiledFastAgg::Kind::kSumDoubleCol) {
+              v = std::bit_cast<double>(p0[a][r]);
+            } else if (op.kind == CompiledFastAgg::Kind::kSumDoubleMul2) {
+              v = std::bit_cast<double>(p0[a][r]) *
+                  std::bit_cast<double>(p1[a][r]);
+            } else if (op.kind ==
+                       CompiledFastAgg::Kind::kSumDoubleMulOneMinus) {
+              v = std::bit_cast<double>(p0[a][r]) *
+                  (op.k1 - std::bit_cast<double>(p1[a][r]));
+            } else {
+              v = std::bit_cast<double>(p0[a][r]) *
+                  (op.k1 - std::bit_cast<double>(p1[a][r])) *
+                  (op.k2 + std::bit_cast<double>(p2[a][r]));
+            }
+            if (std::isinf(v)) {
+              st.saw_inf = true;
+              break;
+            }
+          }
+        }
+        st.double_val += lsum;
+        if (op.is_avg) {
+          st.count += static_cast<int64_t>(g_cnt[g]);
+        }
+        st.has_value = true;
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 Status FoldRowIntoAggState(
     const ColAggSpec& spec,
     const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
@@ -1415,24 +2343,25 @@ Status FoldRowIntoAggState(
         }
       }
       if (!st.distinct_ints) {
-        st.distinct_ints = std::make_unique<FlatIntKeyMap<uint8_t>>();
+        ASSIGN_OR_RETURN(std::unique_ptr<DistinctIntegerValues>, values,
+                         (MakeDistinctValues<DistinctIntegerValues>()));
+        st.distinct_ints = std::move(values);
       }
-      st.distinct_ints->TryEmplace(raw);
+      if (!st.distinct_ints->values.TryInsertCharged(
+              raw, st.distinct_ints->charge)) {
+        return DistinctBudgetExceeded();
+      }
       st.has_value = true;
       break;
     }
     case ColAggKind::kCountDistinctVarChar: {
       if (!st.distinct_strs) {
-        st.distinct_strs =
-            std::make_unique<std::unordered_set<std::string_view>>();
+        ASSIGN_OR_RETURN(std::unique_ptr<DistinctStringValues>, values,
+                         (MakeDistinctValues<DistinctStringValues>()));
+        st.distinct_strs = std::move(values);
       }
-      const std::string_view sv = chunk.VarcharAt(row);
-      if (!st.distinct_strs->contains(sv)) {
-        // Intern only when the value is first seen: one allocation per
-        // distinct string instead of one per row.
-        ASSIGN_OR_RETURN(std::string_view, interned, arena.Intern(sv));
-        st.distinct_strs->insert(interned);
-      }
+      RETURN_IF_FAIL(
+          InsertDistinctString(*st.distinct_strs, chunk.VarcharAt(row), arena));
       st.has_value = true;
       break;
     }
@@ -1584,8 +2513,16 @@ Status MergeAggState(const ColAggSpec& spec, RuntimeAggState& dst,
         if (!dst.distinct_ints) {
           dst.distinct_ints = std::move(src.distinct_ints);
         } else {
-          src.distinct_ints->ForEach(
-              [&](int64_t k, uint8_t&) { dst.distinct_ints->TryEmplace(k); });
+          bool inserted = true;
+          src.distinct_ints->values.ForEach([&](int64_t key, uint8_t&) {
+            if (inserted) {
+              inserted = dst.distinct_ints->values.TryInsertCharged(
+                  key, dst.distinct_ints->charge);
+            }
+          });
+          if (!inserted) {
+            return DistinctBudgetExceeded();
+          }
         }
         dst.has_value = true;
       }
@@ -1595,9 +2532,8 @@ Status MergeAggState(const ColAggSpec& spec, RuntimeAggState& dst,
         if (!dst.distinct_strs) {
           dst.distinct_strs = std::move(src.distinct_strs);
         } else {
-          for (const std::string_view s : *src.distinct_strs) {
-            ASSIGN_OR_RETURN(std::string_view, interned, arena.Intern(s));
-            dst.distinct_strs->insert(interned);
+          for (const std::string_view s : src.distinct_strs->values) {
+            RETURN_IF_FAIL(InsertDistinctString(*dst.distinct_strs, s, arena));
           }
         }
         dst.has_value = true;
@@ -1616,6 +2552,60 @@ Status WorkerGroupTable::Reserve(size_t expected_groups) {
   return Rehash(need_slots);
 }
 
+Status WorkerGroupTable::ReserveGroupStorage(size_t groups) {
+  const size_t previous = group_hashes_.capacity();
+  if (groups <= previous) {
+    return Status::kSuccess;
+  }
+  const size_t capacity = std::max(groups, previous * 2);
+  const size_t nkeys = key_specs_->size();
+  const size_t naggs = agg_specs_->size();
+  size_t key_capacity = 0;
+  size_t agg_capacity = 0;
+  size_t bytes = 0;
+  const size_t bytes_per_group = nkeys * sizeof(RuntimeKeyCell) +
+                                 naggs * sizeof(RuntimeAggState) +
+                                 sizeof(uint64_t);
+  const auto limit = [] {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "columnar group storage exceeded budget");
+  };
+  if (__builtin_mul_overflow(capacity, nkeys, &key_capacity) ||
+      __builtin_mul_overflow(capacity, naggs, &agg_capacity) ||
+      __builtin_mul_overflow(capacity, bytes_per_group, &bytes)) {
+    return limit();
+  }
+  QueryMemoryCharge replacement_charge;
+  if (charge_ != nullptr && !replacement_charge.TryAdd(bytes)) {
+    return limit();
+  }
+  // Allocate all three arrays before moving the live groups.
+  std::vector<RuntimeKeyCell> keys;
+  keys.reserve(key_capacity);
+  std::vector<RuntimeAggState> aggs;
+  aggs.reserve(agg_capacity);
+  std::vector<uint64_t> hashes;
+  hashes.reserve(capacity);
+  keys.insert(keys.end(), keys_.begin(), keys_.end());
+  aggs.insert(aggs.end(), std::make_move_iterator(aggs_.begin()),
+              std::make_move_iterator(aggs_.end()));
+  hashes.insert(hashes.end(), group_hashes_.begin(), group_hashes_.end());
+  keys_.swap(keys);
+  aggs_.swap(aggs);
+  group_hashes_.swap(hashes);
+  if (charge_ != nullptr) {
+    const size_t old_bytes = keys.capacity() * sizeof(RuntimeKeyCell) +
+                             aggs.capacity() * sizeof(RuntimeAggState) +
+                             hashes.capacity() * sizeof(uint64_t);
+    std::vector<RuntimeKeyCell>().swap(keys);
+    std::vector<RuntimeAggState>().swap(aggs);
+    std::vector<uint64_t>().swap(hashes);
+    charge_->Release(old_bytes);
+    charge_->Adopt(replacement_charge.DetachBytes());
+  }
+  return Status::kSuccess;
+}
+
 StatusOr<uint32_t> WorkerGroupTable::FindOrInsert(
     const RuntimeKeyCell* probe_keys, uint64_t hash, bool borrow_strings) {
   const size_t nkeys = key_specs_->size();
@@ -1628,7 +2618,8 @@ StatusOr<uint32_t> WorkerGroupTable::FindOrInsert(
   while (true) {
     Slot& s = slots_[pos];
     if (s.group_plus_one == 0) {
-      const auto gid = static_cast<uint32_t>(num_groups_++);
+      RETURN_IF_FAIL(ReserveGroupStorage(num_groups_ + 1));
+      const auto gid = static_cast<uint32_t>(num_groups_);
       const size_t kbase = keys_.size();
       keys_.resize(kbase + nkeys);
       for (size_t i = 0; i < nkeys; ++i) {
@@ -1638,16 +2629,21 @@ StatusOr<uint32_t> WorkerGroupTable::FindOrInsert(
             (kk == ColKeyKind::kColVarChar ||
              kk == ColKeyKind::kCaseWhenVarChar ||
              kk == ColKeyKind::kRegexReplaceVarChar)) {
-          ASSIGN_OR_RETURN(std::string_view, interned,
-                           arena_.Intern(probe_keys[i].StrView()));
-          keys_[kbase + i].str_ptr = interned.data();
-          keys_[kbase + i].str_len = static_cast<uint32_t>(interned.size());
+          auto interned = arena_.Intern(probe_keys[i].StrView());
+          if (!interned.HasValue()) {
+            keys_.resize(kbase);
+            return interned.GetStatus();
+          }
+          keys_[kbase + i].str_ptr = interned.Value().data();
+          keys_[kbase + i].str_len =
+              static_cast<uint32_t>(interned.Value().size());
         }
       }
       aggs_.resize(aggs_.size() + agg_specs_->size());
       group_hashes_.push_back(hash);
       s.hash = hash;
       s.group_plus_one = gid + 1;
+      ++num_groups_;
       return gid;
     }
     if (s.hash == hash) {
@@ -1664,11 +2660,15 @@ StatusOr<uint32_t> WorkerGroupTable::FindOrInsert(
 
 Status WorkerGroupTable::MergeFromGroup(const RuntimeKeyCell* src_keys,
                                         uint64_t hash,
-                                        RuntimeAggState* src_aggs,
+                                        std::span<RuntimeAggState> src_aggs,
                                         bool borrow_strings) {
+  if (src_aggs.size() != agg_specs_->size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "columnar group aggregate state width mismatch");
+  }
   ASSIGN_OR_RETURN(uint32_t, gid, FindOrInsert(src_keys, hash, borrow_strings));
-  const size_t abase = static_cast<size_t>(gid) * agg_specs_->size();
-  for (size_t a = 0; a < agg_specs_->size(); ++a) {
+  const size_t abase = static_cast<size_t>(gid) * src_aggs.size();
+  for (size_t a = 0; a < src_aggs.size(); ++a) {
     RETURN_IF_FAIL(
         MergeAggState((*agg_specs_)[a], aggs_[abase + a], src_aggs[a], arena_));
   }
@@ -1891,8 +2891,11 @@ StatusOr<Value> FinishAggState(const ColAggSpec& spec,
                               : st.double_val);
     case ColAggKind::kMinVarChar:
     case ColAggKind::kMaxVarChar:
-      return st.has_value ? Value(std::string(st.str_ptr, st.str_len))
-                          : Value();
+      if (!st.has_value) {
+        return Value();
+      }
+      return st.str_len == 0 ? Value("")
+                             : Value(std::string(st.str_ptr, st.str_len));
     case ColAggKind::kCountDistinctInt64:
     case ColAggKind::kCountDistinctDate:
     case ColAggKind::kCountDistinctDouble:
@@ -1900,13 +2903,13 @@ StatusOr<Value> FinishAggState(const ColAggSpec& spec,
         return Value(st.count);
       }
       return Value(static_cast<int64_t>(
-          st.distinct_ints != nullptr ? st.distinct_ints->Size() : 0));
+          st.distinct_ints != nullptr ? st.distinct_ints->values.Size() : 0));
     case ColAggKind::kCountDistinctVarChar:
       if (st.distinct_count_final) {
         return Value(st.count);
       }
       return Value(static_cast<int64_t>(
-          st.distinct_strs != nullptr ? st.distinct_strs->size() : 0));
+          st.distinct_strs != nullptr ? st.distinct_strs->values.size() : 0));
   }
   return Value();
 }
@@ -2417,7 +3420,8 @@ StatusOr<Value> MaterializeKeyCellValue(const ColGroupKeySpec& spec,
     case ColKeyKind::kColVarChar:
     case ColKeyKind::kCaseWhenVarChar:
     case ColKeyKind::kRegexReplaceVarChar:
-      return Value(std::string(cell.str_ptr, cell.str_len));
+      return cell.str_len == 0 ? Value("")
+                               : Value(std::string(cell.str_ptr, cell.str_len));
   }
   return Value();
 }
@@ -2436,11 +3440,11 @@ StatusOr<Value> EvaluateBindingValue(
       // NOLINTNEXTLINE(clang-analyzer-core.NullDereference) intentional pattern
       // in this code
       if (!cached.IsNull() ||
-          keys[b.index]  // NOLINT(clang-analyzer-core.NullDereference)
+          keys[b.index]    // NOLINT(clang-analyzer-core.NullDereference)
               .is_null) {  // NOLINT(clang-analyzer-core.NullDereference)
         // NOLINTNEXTLINE(clang-analyzer-core.NullDereference) intentional
         // pattern in this code
-        if (keys[b.index]  // NOLINT(clang-analyzer-core.NullDereference)
+        if (keys[b.index]    // NOLINT(clang-analyzer-core.NullDereference)
                 .is_null) {  // NOLINT(clang-analyzer-core.NullDereference)
           return Value();
         }
@@ -2533,11 +3537,12 @@ StatusOr<bool> EvalPositionalHavingOnStates(
                            ? &(*finished_scratch)[clause.rhs_agg_index]
                            : nullptr;
     Status err = Status::kSuccess;
-    if (!EvalPositionalHavingValues(
-            clause, (*finished_scratch)[clause.agg_index], rhs, &err)) {
+    const bool passes = EvalPositionalHavingValues(
+        clause, (*finished_scratch)[clause.agg_index], rhs, &err);
+    RETURN_IF_FAIL(err);
+    if (!passes) {
       return false;
     }
-    RETURN_IF_FAIL(err);
   }
   return true;
 }
@@ -2953,97 +3958,8 @@ StatusOr<bool> DecodeAndFilterBlock(
         }
       }
     } else {
-      bool flat_int_ok = preds.nulls.empty() && preds.inlists.empty() &&
-                         !preds.compares.empty() && preds.compares.size() <= 16;
-      if (flat_int_ok) {
-        for (const TypedFilterCompare& cmp : preds.compares) {
-          if (!cmp.constant_payload || cmp.string_payload || cmp.is_double ||
-              (*col_ptrs)[cmp.left] == nullptr ||
-              (*col_ptrs)[cmp.left]->has_null) {
-            flat_int_ok = false;
-            break;
-          }
-        }
-      }
-      if (flat_int_ok) {
-        struct FastIntPred {
-          const int64_t* cells;
-          BinaryOperation op;
-          int64_t c;
-          uint8_t priority;
-        };
-        std::array<FastIntPred, 16> fps{};
-        size_t nf = 0;
-        for (const auto& cmp : preds.compares) {
-          const auto& column = *(*col_ptrs)[cmp.left];
-          if (column.has_min_max && !column.is_unsigned) {
-            // Lean: bounded_compare_true. The flat path already checked that
-            // the input contains no NULLs, so the zone may prove the atom.
-            const int64_t lo = column.min_int;
-            const int64_t hi = column.max_int;
-            const int64_t c = cmp.int_constant;
-            const bool always_true =
-                (cmp.op == BinaryOperation::kEquals && lo == c && hi == c) ||
-                (cmp.op == BinaryOperation::kNotEquals && (hi < c || c < lo)) ||
-                (cmp.op == BinaryOperation::kLessThan && hi < c) ||
-                (cmp.op == BinaryOperation::kLessThanEquals && hi <= c) ||
-                (cmp.op == BinaryOperation::kGreaterThan && lo > c) ||
-                (cmp.op == BinaryOperation::kGreaterThanEquals && lo >= c);
-            if (always_true) {
-              continue;
-            }
-          }
-          const uint8_t prio =
-              (cmp.op == BinaryOperation::kEquals && cmp.int_constant != 0)
-                  ? 0
-                  : (cmp.op == BinaryOperation::kEquals ? 1 : 2);
-          fps[nf++] = {.cells = column.int_cells.data(),
-                       .op = cmp.op,
-                       .c = cmp.int_constant,
-                       .priority = prio};
-        }
-        std::sort(fps.begin(), fps.begin() + nf,
-                  [](const FastIntPred& a, const FastIntPred& b) {
-                    return a.priority < b.priority;
-                  });
-        for (uint32_t r = 0; r < rc; ++r) {
-          bool ok = true;
-          for (size_t i = 0; i < nf; ++i) {
-            const int64_t lv = fps[i].cells[r];
-            const int64_t rv = fps[i].c;
-            switch (fps[i].op) {
-              case BinaryOperation::kEquals:
-                ok = (lv == rv);
-                break;
-              case BinaryOperation::kNotEquals:
-                ok = (lv != rv);
-                break;
-              case BinaryOperation::kLessThan:
-                ok = (lv < rv);
-                break;
-              case BinaryOperation::kLessThanEquals:
-                ok = (lv <= rv);
-                break;
-              case BinaryOperation::kGreaterThan:
-                ok = (lv > rv);
-                break;
-              case BinaryOperation::kGreaterThanEquals:
-                ok = (lv >= rv);
-                break;
-              default:
-                ok = RowMatchesColPtrs(preds, *col_ptrs, r);
-                i = nf;
-                break;
-            }
-            if (!ok) {
-              break;
-            }
-          }
-          if (ok) {
-            cand_rows->push_back(r);
-          }
-        }
-      } else {
+      if (!TryFilterBlockNumericColumnAtATime(preds, *col_ptrs, rc,
+                                              cand_rows)) {
         for (uint32_t r = 0; r < rc; ++r) {
           if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
             cand_rows->push_back(r);
@@ -3347,7 +4263,7 @@ StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
       }
     }
   } else {
-    const auto* compare = grouped_count ? nullptr : &preds.compares[0];
+    const auto* compare = grouped_count ? nullptr : preds.compares.data();
     const slot_t slot = grouped_count ? keys[0].full_col : compare->left;
     if (!valid_stats(slot) ||
         (compare != nullptr &&
@@ -3884,12 +4800,13 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                                  ? &finished_aggs[clause.rhs_agg_index]
                                  : nullptr;
           Status err = Status::kSuccess;
-          if (!EvalPositionalHavingValues(
-                  clause, finished_aggs[clause.agg_index], rhs, &err)) {
+          const bool passes = EvalPositionalHavingValues(
+              clause, finished_aggs[clause.agg_index], rhs, &err);
+          RETURN_IF_FAIL(err);
+          if (!passes) {
             passes_having = false;
             break;
           }
-          RETURN_IF_FAIL(err);
         }
         if (passes_having) {
           std::vector<Value> row_vals;
@@ -4291,6 +5208,242 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                              {QueryParallelWorkerLimit(
                                   std::thread::hardware_concurrency()),
                               mblocks.size(), size_t{16}}));
+        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        //   (count_distinct_gt_one_iff_min_lt_max,
+        //    count_distinct_eq_one_iff_min_eq_max)
+        // Ultra-fast register-only streaming path for:
+        //   SELECT k FROM T [WHERE ...] GROUP BY k HAVING MIN(v) < MAX(v) | =
+        // Emits surviving keys directly into a 1-column ColumnarTable with
+        // zero per-group Row/Value/MonoSurvivor allocations.
+        const bool mono_key_only_minmax_fast =
+            plan_emit.size() == 1 &&
+            plan_emit[0].kind == OutputSlotBinding::Kind::kKey &&
+            plan_order.empty() && !stmt.HasLimit() && stmt.Offset() == 0 &&
+            plan_having.size() == 1 && plan_having[0].rhs_is_agg &&
+            (plan_having[0].op == BinaryOperation::kLessThan ||
+             plan_having[0].op == BinaryOperation::kEquals) &&
+            plan_agg_specs.size() == 2 &&
+            ((plan_agg_specs[0].kind == ColAggKind::kMinInt64 &&
+              plan_agg_specs[1].kind == ColAggKind::kMaxInt64 &&
+              plan_having[0].agg_index == 0 &&
+              plan_having[0].rhs_agg_index == 1) ||
+             (plan_agg_specs[0].kind == ColAggKind::kMaxInt64 &&
+              plan_agg_specs[1].kind == ColAggKind::kMinInt64 &&
+              plan_having[0].agg_index == 1 &&
+              plan_having[0].rhs_agg_index == 0)) &&
+            plan_agg_specs[0].full_col == plan_agg_specs[1].full_col &&
+            !table_schema.GetColumn(plan_agg_specs[0].full_col).IsUnsigned();
+        if (mono_key_only_minmax_fast) {
+          const slot_t vcol = plan_agg_specs[0].full_col;
+          const bool want_lt =
+              (plan_having[0].op == BinaryOperation::kLessThan);
+          struct MinMaxBoundary {
+            int64_t key{0};
+            int64_t rmin{0};
+            int64_t rmax{0};
+            bool has_val{false};
+          };
+          std::vector<std::vector<int64_t>> w_keys(mworkers);
+          std::vector<std::vector<MinMaxBoundary>> w_bmm(mworkers);
+          std::vector<Status> w_st(mworkers, Status::kSuccess);
+          std::atomic<bool> fallback_needed{false};
+          std::atomic<size_t> next_mb{0};
+          std::atomic<uint64_t> mm_scanned{0};
+          std::atomic<uint64_t> mm_matching{0};
+          std::atomic<uint64_t> mm_groups{0};
+
+          auto mm_worker = [&](size_t tid) {
+            BlockDecodeScratch scratch;
+            std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(
+                table_schema.ColumnCount(), nullptr);
+            std::vector<uint32_t> cand_rows;
+            uint64_t local_scanned = 0;
+            uint64_t local_matching = 0;
+            uint64_t local_groups = 0;
+            auto& out_keys = w_keys[tid];
+            auto& out_b = w_bmm[tid];
+            out_keys.reserve(65536);
+
+            while (!fallback_needed.load(std::memory_order_relaxed)) {
+              const size_t m = next_mb.fetch_add(1, std::memory_order_relaxed);
+              if (m >= mblocks.size()) {
+                break;
+              }
+              const MonoBlockMeta& mb = mblocks[m];
+              auto dec_or = DecodeAndFilterBlock(
+                  *tlcs, mb.bidx, table_schema, preds, msched, &scratch,
+                  &col_ptrs, &cand_rows, &local_scanned);
+              if (!dec_or.HasValue()) {
+                w_st[tid] = dec_or.GetStatus();
+                fallback_needed.store(true, std::memory_order_relaxed);
+                return;
+              }
+              if (!dec_or.Value() || cand_rows.empty()) {
+                continue;
+              }
+              local_matching += cand_rows.size();
+              const auto* kch = col_ptrs[kcol];
+              const auto* vch = col_ptrs[vcol];
+              if (kch == nullptr || vch == nullptr || kch->has_null ||
+                  vch->has_null) {
+                fallback_needed.store(true, std::memory_order_relaxed);
+                return;
+              }
+              const int64_t* kcells = kch->int_cells.data();
+              const int64_t* vcells = vch->int_cells.data();
+              const uint32_t* rows = cand_rows.data();
+              const size_t n = cand_rows.size();
+              const bool dense = (rows[0] == 0 && rows[n - 1] == n - 1);
+              // Verify monotonic key order within the block while streaming.
+              int64_t cur_k = kcells[rows[0]];
+              int64_t rmin = vcells[rows[0]];
+              int64_t rmax = rmin;
+              auto flush_mm = [&](int64_t fk, int64_t lo, int64_t hi) {
+                if ((mb.shared_lo && fk == mb.min_k) ||
+                    (mb.shared_hi && fk == mb.max_k)) {
+                  out_b.push_back({fk, lo, hi, true});
+                } else {
+                  ++local_groups;
+                  if (want_lt ? (lo < hi) : (lo == hi)) {
+                    out_keys.push_back(fk);
+                  }
+                }
+              };
+              if (dense) {
+                for (uint32_t r = 1; r < static_cast<uint32_t>(n); ++r) {
+                  const int64_t kv = kcells[r];
+                  const int64_t vv = vcells[r];
+                  if (kv == cur_k) {
+                    if (vv < rmin) {
+                      rmin = vv;
+                    }
+                    if (vv > rmax) {
+                      rmax = vv;
+                    }
+                  } else if (kv > cur_k) {
+                    flush_mm(cur_k, rmin, rmax);
+                    cur_k = kv;
+                    rmin = vv;
+                    rmax = vv;
+                  } else {
+                    fallback_needed.store(true, std::memory_order_relaxed);
+                    return;
+                  }
+                }
+              } else {
+                for (size_t i = 1; i < n; ++i) {
+                  const uint32_t r = rows[i];
+                  const int64_t kv = kcells[r];
+                  const int64_t vv = vcells[r];
+                  if (kv == cur_k) {
+                    if (vv < rmin) {
+                      rmin = vv;
+                    }
+                    if (vv > rmax) {
+                      rmax = vv;
+                    }
+                  } else if (kv > cur_k) {
+                    flush_mm(cur_k, rmin, rmax);
+                    cur_k = kv;
+                    rmin = vv;
+                    rmax = vv;
+                  } else {
+                    fallback_needed.store(true, std::memory_order_relaxed);
+                    return;
+                  }
+                }
+              }
+              flush_mm(cur_k, rmin, rmax);
+            }
+            mm_scanned.fetch_add(local_scanned, std::memory_order_relaxed);
+            mm_matching.fetch_add(local_matching, std::memory_order_relaxed);
+            mm_groups.fetch_add(local_groups, std::memory_order_relaxed);
+          };
+
+          if (mworkers == 1) {
+            mm_worker(0);
+          } else {
+            RETURN_IF_FAIL(RunParallelTasks(mworkers, mm_worker));
+          }
+          for (const Status& st : w_st) {
+            RETURN_IF_FAIL(st);
+          }
+          if (!fallback_needed.load(std::memory_order_relaxed)) {
+            const auto merge_begin = std::chrono::steady_clock::now();
+            std::vector<MinMaxBoundary> all_b;
+            for (auto& wb : w_bmm) {
+              all_b.insert(all_b.end(), wb.begin(), wb.end());
+            }
+            std::ranges::sort(
+                all_b, [](const MinMaxBoundary& a, const MinMaxBoundary& b) {
+                  return a.key < b.key;
+                });
+            std::vector<int64_t> b_survivors;
+            size_t b_groups = 0;
+            for (size_t i = 0; i < all_b.size();) {
+              int64_t lo = all_b[i].rmin;
+              int64_t hi = all_b[i].rmax;
+              size_t j = i + 1;
+              while (j < all_b.size() && all_b[j].key == all_b[i].key) {
+                if (all_b[j].rmin < lo) {
+                  lo = all_b[j].rmin;
+                }
+                if (all_b[j].rmax > hi) {
+                  hi = all_b[j].rmax;
+                }
+                ++j;
+              }
+              ++b_groups;
+              if (want_lt ? (lo < hi) : (lo == hi)) {
+                b_survivors.push_back(all_b[i].key);
+              }
+              i = j;
+            }
+            auto out_table = std::make_shared<ColumnarTable>();
+            const ValueType ktype = (key_specs[0].kind == ColKeyKind::kColDate)
+                                        ? ValueType::kDate
+                                        : ValueType::kInt64;
+            auto append_vec = [&](std::vector<int64_t>&& vec) {
+              if (vec.empty()) {
+                return;
+              }
+              ColumnarColumn col;
+              col.type = ktype;
+              col.is_uniform = true;
+              col.has_null = false;
+              col.encoding = ColumnarColumn::Encoding::kFlat;
+              col.ints = std::move(vec);
+              ColumnarChunk chunk;
+              chunk.rows = col.ints.size();
+              chunk.columns.push_back(std::move(col));
+              out_table->AppendChunk(std::move(chunk));
+            };
+            for (auto& wk : w_keys) {
+              append_vec(std::move(wk));
+            }
+            append_vec(std::move(b_survivors));
+
+            Relation output(plan_runtime);
+            std::string cname = plan_select_names[0].name;
+            if (cname.empty()) {
+              cname = "col_0";
+            }
+            output.schema = Schema("", {Column(std::move(cname), ktype)});
+            output.SetColumnarTable(std::move(out_table), true);
+            if (plan_runtime != nullptr) {
+              const double scan_ms = MsSince(scan_begin);
+              plan_runtime->scan_ms += scan_ms;
+              plan_runtime->filter_ms += scan_ms;
+              plan_runtime->scan_rows += mm_scanned.load();
+              plan_runtime->scan_output_rows += mm_matching.load();
+              plan_runtime->aggregate_groups += mm_groups.load() + b_groups;
+              plan_runtime->aggregate_input_rows += mm_matching.load();
+              plan_runtime->aggregate_ms += MsSince(merge_begin);
+            }
+            return std::optional<Relation>(std::move(output));
+          }
+        }
+
         struct MonoSurvivor {
           int64_t key{0};
           std::vector<Value> order_vals;
@@ -4473,9 +5626,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                                           *b_arenas[tid], w_boundaries[tid]);
                 }
                 ++local_groups;
-                return emit_interior_or_boundary(
-                    fk, run_aggs.data(), w_batch, w_survivors[tid],
-                    finished_scratch, cached_keys);
+                return emit_interior_or_boundary(fk, run_aggs.data(), w_batch,
+                                                 w_survivors[tid],
+                                                 finished_scratch, cached_keys);
               };
               for (const uint32_t r : cand_rows) {
                 const int64_t kv = kcells[r];
@@ -4491,11 +5644,11 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                     // a fresh one per group is one allocation per key (15M
                     // for Q21).  A set that grew large is dropped instead,
                     // since Clear() costs its capacity.
-                    std::unique_ptr<FlatIntKeyMap<uint8_t>> keep =
+                    std::unique_ptr<DistinctIntegerValues> keep =
                         std::move(st.distinct_ints);
                     st = RuntimeAggState{};
-                    if (keep != nullptr && keep->Size() <= 64) {
-                      keep->Clear();
+                    if (keep != nullptr && keep->values.Size() <= 64) {
+                      keep->values.Clear();
                       st.distinct_ints = std::move(keep);
                     }
                   }
@@ -4543,10 +5696,10 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                     is_boundary
                         ? copy_to_boundary(fk, btable.AggsAt(g), w_batch,
                                            *b_arenas[tid], w_boundaries[tid])
-                        : (++local_groups, emit_interior_or_boundary(
-                                               fk, btable.AggsAt(g),
-                                               w_batch, w_survivors[tid],
-                                               finished_scratch, cached_keys));
+                        : (++local_groups,
+                           emit_interior_or_boundary(
+                               fk, btable.AggsAt(g), w_batch, w_survivors[tid],
+                               finished_scratch, cached_keys));
                 if (fst != Status::kSuccess) {
                   w_status[tid] = std::move(fst);
                   return;
@@ -4563,7 +5716,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         if (mworkers == 1) {
           mono_worker_fn(0);
         } else {
-          RunParallelTasks(mworkers, mono_worker_fn);
+          RETURN_IF_FAIL(RunParallelTasks(mworkers, mono_worker_fn));
         }
         bool mono_mem_exceeded = false;
         for (const Status& st : w_status) {
@@ -4886,6 +6039,105 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     std::vector<std::unique_ptr<PagedStringArena>> scalar_arenas;
     std::vector<std::unique_ptr<WorkerGroupTable>> worker_tables;
     std::vector<std::unique_ptr<SingleIntWorkerTable>> single_int_tables;
+    const CompiledFastAggPlan fast_agg_plan =
+        CompileFastAggPlan(plan_agg_specs);
+
+    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    //   (direct_int_key_injective, direct_int_key_in_bounds,
+    //    parallel_direct_array_merge_eq, finite_sum_implies_no_inf)
+    // Direct-indexed dense array for single bounded INT64/DATE group key with
+    // a single compiled double-sum or count aggregate.
+    bool use_direct_int_array = false;
+    int64_t direct_lo = 0;
+    size_t direct_span = 0;
+    bool direct_is_count = false;
+    QueryMemoryCharge direct_array_charge;
+    std::vector<std::vector<double>> direct_sums;
+    std::vector<std::vector<uint64_t>> direct_counts;
+    std::vector<std::vector<uint8_t>> direct_seen;
+    if (single_int_key && !packed_int32_pair && certificate == nullptr &&
+        !plan_any_distinct && plan_having.empty() && plan_order.empty() &&
+        !stmt.HasLimit() && stmt.Offset() == 0 &&
+        (key_specs[0].kind == ColKeyKind::kColInt64 ||
+         key_specs[0].kind == ColKeyKind::kColDate) &&
+        !table_schema.GetColumn(key_specs[0].full_col).IsUnsigned() &&
+        plan_agg_specs.size() == 1 && fast_agg_plan.eligible &&
+        (fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kCountStar ||
+         fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kCountCol ||
+         fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kSumDoubleCol ||
+         fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kSumDoubleMul2 ||
+         fast_agg_plan.ops[0].kind ==
+             CompiledFastAgg::Kind::kSumDoubleMulOneMinus ||
+         fast_agg_plan.ops[0].kind ==
+             CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus) &&
+        std::ranges::all_of(plan_emit, [](const OutputSlotBinding& b) {
+          return b.kind == OutputSlotBinding::Kind::kKey ||
+                 b.kind == OutputSlotBinding::Kind::kAgg ||
+                 b.kind == OutputSlotBinding::Kind::kConstValue;
+        })) {
+      const slot_t kcol = key_specs[0].full_col;
+      const uint32_t dg_sz = tlcs->DirGroupSize();
+      int64_t lo = std::numeric_limits<int64_t>::max();
+      int64_t hi = std::numeric_limits<int64_t>::min();
+      bool bounds_ok = !candidate_blocks.empty();
+      // Check that all candidate blocks have non-null int key bounds and
+      // non-null double aggregate columns.
+      for (const uint32_t bidx : candidate_blocks) {
+        auto dir_or = tlcs->GetDirGroup(bidx / dg_sz);
+        if (!dir_or.HasValue()) {
+          bounds_ok = false;
+          break;
+        }
+        const auto& bmeta = dir_or.Value()->blocks[bidx % dg_sz];
+        const auto& kcm = bmeta.columns[kcol];
+        if (kcm.has_null || !kcm.has_min_max) {
+          bounds_ok = false;
+          break;
+        }
+        lo = std::min(lo, kcm.min_int);
+        hi = std::max(hi, kcm.max_int);
+        const bool agg_is_count =
+            (fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kCountStar ||
+             fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kCountCol);
+        for (const slot_t ac : fast_agg_plan.checked_cols) {
+          if (bmeta.columns[ac].has_null ||
+              (!agg_is_count &&
+               table_schema.GetColumn(ac).Type() != ValueType::kDouble)) {
+            bounds_ok = false;
+            break;
+          }
+        }
+        if (!bounds_ok) {
+          break;
+        }
+      }
+      if (bounds_ok && hi >= lo) {
+        const uint64_t diff =
+            static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+        if (diff < 2000000ULL) {
+          direct_span = static_cast<size_t>(diff) + 1;
+          direct_lo = lo;
+          direct_is_count =
+              (fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kCountStar ||
+               fast_agg_plan.ops[0].kind == CompiledFastAgg::Kind::kCountCol);
+          const size_t bytes_per_worker =
+              direct_is_count
+                  ? direct_span * sizeof(uint64_t)
+                  : direct_span * (sizeof(double) + sizeof(uint8_t));
+          if (direct_array_charge.TryAdd(workers * bytes_per_worker)) {
+            use_direct_int_array = true;
+            if (direct_is_count) {
+              direct_counts.assign(workers,
+                                   std::vector<uint64_t>(direct_span, 0));
+            } else {
+              direct_sums.assign(workers,
+                                 std::vector<double>(direct_span, 0.0));
+              direct_seen.assign(workers, std::vector<uint8_t>(direct_span, 0));
+            }
+          }
+        }
+      }
+    }
     std::vector<std::vector<RuntimeAggState>> scalar_worker_aggs;
     const bool single_int_count_star =
         single_int_key && plan_agg_specs.size() == 1 &&
@@ -4898,6 +6150,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         scalar_arenas.push_back(
             std::make_unique<PagedStringArena>(&worker_charges[w]));
       }
+    } else if (use_direct_int_array) {
+      // Workers accumulate directly into direct_sums / direct_counts.
     } else if (single_int_key) {
       single_int_tables.reserve(workers);
       for (size_t w = 0; w < workers; ++w) {
@@ -5156,6 +6410,10 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             sa[0].has_value = true;
             continue;
           }
+          if (TryFoldBlockScalarFastAggs(fast_agg_plan, col_ptrs, cand_rows,
+                                         sa)) {
+            continue;
+          }
           for (const uint32_t r : cand_rows) {
             for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
               Status fold_st = FoldRowIntoAggState(
@@ -5218,6 +6476,76 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           continue;
         }
 
+        if (use_direct_int_array) {
+          const int64_t* kcells =
+              col_ptrs[key_specs[0].full_col]->int_cells.data();
+          const uint32_t* rows = cand_rows.data();
+          const size_t n = cand_rows.size();
+          const int64_t lo = direct_lo;
+          if (direct_is_count) {
+            uint64_t* cnts = direct_counts[tid].data();
+            for (size_t i = 0; i < n; ++i) {
+              ++cnts[static_cast<uint64_t>(kcells[rows[i]] - lo)];
+            }
+          } else {
+            double* sums = direct_sums[tid].data();
+            uint8_t* seen = direct_seen[tid].data();
+            const CompiledFastAgg& op = fast_agg_plan.ops[0];
+            const int64_t* c0 = col_ptrs[op.c0]->int_cells.data();
+            switch (op.kind) {
+              case CompiledFastAgg::Kind::kSumDoubleCol:
+                for (size_t i = 0; i < n; ++i) {
+                  const uint32_t r = rows[i];
+                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  sums[idx] += std::bit_cast<double>(c0[r]);
+                  seen[idx] = 1;
+                }
+                break;
+              case CompiledFastAgg::Kind::kSumDoubleMul2: {
+                const int64_t* c1 = col_ptrs[op.c1]->int_cells.data();
+                for (size_t i = 0; i < n; ++i) {
+                  const uint32_t r = rows[i];
+                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  sums[idx] += std::bit_cast<double>(c0[r]) *
+                               std::bit_cast<double>(c1[r]);
+                  seen[idx] = 1;
+                }
+                break;
+              }
+              case CompiledFastAgg::Kind::kSumDoubleMulOneMinus: {
+                const int64_t* c1 = col_ptrs[op.c1]->int_cells.data();
+                const double k1 = op.k1;
+                for (size_t i = 0; i < n; ++i) {
+                  const uint32_t r = rows[i];
+                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  sums[idx] += std::bit_cast<double>(c0[r]) *
+                               (k1 - std::bit_cast<double>(c1[r]));
+                  seen[idx] = 1;
+                }
+                break;
+              }
+              case CompiledFastAgg::Kind::kSumDoubleMulOneMinusOnePlus: {
+                const int64_t* c1 = col_ptrs[op.c1]->int_cells.data();
+                const int64_t* c2 = col_ptrs[op.c2]->int_cells.data();
+                const double k1 = op.k1;
+                const double k2 = op.k2;
+                for (size_t i = 0; i < n; ++i) {
+                  const uint32_t r = rows[i];
+                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  sums[idx] += std::bit_cast<double>(c0[r]) *
+                               (k1 - std::bit_cast<double>(c1[r])) *
+                               (k2 + std::bit_cast<double>(c2[r]));
+                  seen[idx] = 1;
+                }
+                break;
+              }
+              default:
+                break;
+            }
+          }
+          continue;
+        }
+
         if (single_int_key) {
           SingleIntWorkerTable& itable = *single_int_tables[tid];
           const ColGroupKeySpec& ks0 = key_specs[0];
@@ -5235,8 +6563,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           std::array<int64_t, 256> dict_ts_vals{};
           size_t dict_ts_nd = 0;
           bool dict_ts_fast = false;
-          if (!direct_int_col && kch->dict_encoded && kch->dict != nullptr &&
-              kch->dict->StringEntryCount() <= 256 &&
+          if (!direct_int_col && !cand_rows.empty() && kch->dict_encoded &&
+              kch->dict != nullptr && kch->dict->StringEntryCount() <= 256 &&
               kch->dict_codes.size() >= cand_rows.back() + 1) {
             dict_ts_fast = true;
             const size_t nd = kch->dict->StringEntryCount();
@@ -5322,14 +6650,14 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             if (single_int_count_star) {
               ++itable.CountAt(gid);
             } else if (q28_fast) {
+              RuntimeAggState* st_arr = itable.AggsAt(gid);
+              ++st_arr[1].count;
+              st_arr[1].has_value = true;
               if (b0_no_null || !b0->IsNull(r)) {
-                RuntimeAggState* st_arr = itable.AggsAt(gid);
                 st_arr[0].double_val +=
                     static_cast<double>(b0->VarcharLength(r));
                 ++st_arr[0].count;
                 st_arr[0].has_value = true;
-                ++st_arr[1].count;
-                st_arr[1].has_value = true;
               }
             } else {
               RuntimeAggState* st_arr = itable.AggsAt(gid);
@@ -5379,8 +6707,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 const auto* kch = col_ptrs[ks.full_col];
                 dk_dicts.push_back(kch->dict);
                 dk_stride.push_back(stride);
-                stride *= static_cast<uint32_t>(
-                    kch->dict->StringEntryCount() + 1);
+                stride *=
+                    static_cast<uint32_t>(kch->dict->StringEntryCount() + 1);
               }
               dk_gid.assign(tuples, -1);
             }
@@ -5425,11 +6753,15 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               dk_row_gid[i] = static_cast<uint32_t>(slot);
             }
             if (resolved_all) {
+              if (TryFoldBlockDenseGroupsFastAggs(fast_agg_plan, col_ptrs,
+                                                  cand_rows, dk_row_gid,
+                                                  wtable.NumGroups(), wtable)) {
+                continue;
+              }
               for (size_t a = 0; a < plan_agg_specs.size(); ++a) {
                 const ColAggSpec& as = plan_agg_specs[a];
                 for (size_t i = 0; i < cand_rows.size(); ++i) {
-                  RuntimeAggState& st =
-                      wtable.AggsAt(dk_row_gid[i])[a];
+                  RuntimeAggState& st = wtable.AggsAt(dk_row_gid[i])[a];
                   if (as.kind == ColAggKind::kCountStar) {
                     ++st.count;
                     st.has_value = true;
@@ -5492,7 +6824,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     if (workers == 1) {
       worker_fn(0);
     } else {
-      RunParallelTasks(workers, worker_fn);
+      RETURN_IF_FAIL(RunParallelTasks(workers, worker_fn));
     }
     for (const Status& st : worker_status) {
       if (st == StatusCode::kInvalidArgument ||
@@ -5553,12 +6885,13 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         const Value* rhs =
             clause.rhs_is_agg ? &finished_aggs[clause.rhs_agg_index] : nullptr;
         Status err = Status::kSuccess;
-        if (!EvalPositionalHavingValues(clause, finished_aggs[clause.agg_index],
-                                        rhs, &err)) {
+        const bool matches = EvalPositionalHavingValues(
+            clause, finished_aggs[clause.agg_index], rhs, &err);
+        RETURN_IF_FAIL(err);
+        if (!matches) {
           passes = false;
           break;
         }
-        RETURN_IF_FAIL(err);
       }
       if (plan_publish_marker && plan_runtime != nullptr) {
         auto marker = std::make_shared<Relation>(plan_runtime);
@@ -5602,6 +6935,111 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
         plan_runtime->scan_rows += total_scanned.load();
         plan_runtime->scan_output_rows += total_matching.load();
         plan_runtime->aggregate_groups += passes ? 1 : 0;
+        plan_runtime->aggregate_input_rows += total_matching.load();
+        plan_runtime->aggregate_ms += MsSince(merge_begin);
+      }
+      return std::optional<Relation>(std::move(out));
+    }
+
+    if (use_direct_int_array) {
+      Relation out(plan_runtime);
+      const bool key_is_date = (key_specs[0].kind == ColKeyKind::kColDate);
+      size_t group_count = 0;
+      if (direct_is_count) {
+        auto& cnt0 = direct_counts[0];
+        for (size_t w = 1; w < workers; ++w) {
+          const auto& cw = direct_counts[w];
+          for (size_t i = 0; i < direct_span; ++i) {
+            cnt0[i] += cw[i];
+          }
+        }
+        for (size_t i = 0; i < direct_span; ++i) {
+          if (cnt0[i] == 0) {
+            continue;
+          }
+          ++group_count;
+          const int64_t kval = direct_lo + static_cast<int64_t>(i);
+          std::vector<Value> row_vals;
+          row_vals.reserve(plan_emit.size());
+          for (const OutputSlotBinding& b : plan_emit) {
+            if (b.kind == OutputSlotBinding::Kind::kKey) {
+              row_vals.push_back(key_is_date ? Value::DateFromDays(kval)
+                                             : Value(kval));
+            } else if (b.kind == OutputSlotBinding::Kind::kAgg) {
+              row_vals.emplace_back(static_cast<int64_t>(cnt0[i]));
+            } else {
+              row_vals.push_back(b.constant);
+            }
+          }
+          out.AddRow(Row(std::move(row_vals)));
+        }
+      } else {
+        auto& sum0 = direct_sums[0];
+        auto& seen0 = direct_seen[0];
+        for (size_t w = 1; w < workers; ++w) {
+          const auto& sw = direct_sums[w];
+          const auto& kw = direct_seen[w];
+          for (size_t i = 0; i < direct_span; ++i) {
+            if (kw[i]) {
+              sum0[i] += sw[i];
+              seen0[i] = 1;
+            }
+          }
+        }
+        for (size_t i = 0; i < direct_span; ++i) {
+          if (!seen0[i]) {
+            continue;
+          }
+          if (!std::isfinite(sum0[i])) {
+            // Fall back to generic path for non-finite infinity provenance.
+            return std::optional<Relation>{};
+          }
+          ++group_count;
+          const int64_t kval = direct_lo + static_cast<int64_t>(i);
+          std::vector<Value> row_vals;
+          row_vals.reserve(plan_emit.size());
+          for (const OutputSlotBinding& b : plan_emit) {
+            if (b.kind == OutputSlotBinding::Kind::kKey) {
+              row_vals.push_back(key_is_date ? Value::DateFromDays(kval)
+                                             : Value(kval));
+            } else if (b.kind == OutputSlotBinding::Kind::kAgg) {
+              row_vals.emplace_back(sum0[i]);
+            } else {
+              row_vals.push_back(b.constant);
+            }
+          }
+          out.AddRow(Row(std::move(row_vals)));
+        }
+      }
+      RETURN_IF_FAIL(out.FinishSpill());
+      std::vector<Column> out_cols;
+      out_cols.reserve(plan_select_names.size());
+      for (size_t i = 0; i < plan_select_names.size(); ++i) {
+        std::string cname = plan_select_names[i].name;
+        if (cname.empty()) {
+          cname = "col_" + std::to_string(i);
+        }
+        const OutputSlotBinding& b = plan_emit[i];
+        if (b.kind == OutputSlotBinding::Kind::kKey) {
+          out_cols.emplace_back(std::move(cname), key_is_date
+                                                      ? ValueType::kDate
+                                                      : ValueType::kInt64);
+        } else if (b.kind == OutputSlotBinding::Kind::kAgg) {
+          out_cols.emplace_back(std::move(cname), direct_is_count
+                                                      ? ValueType::kInt64
+                                                      : ValueType::kDouble);
+        } else {
+          out_cols.emplace_back(std::move(cname), b.constant.type);
+        }
+      }
+      out.schema = Schema("", std::move(out_cols));
+      if (plan_runtime != nullptr) {
+        const double scan_ms = MsSince(scan_begin);
+        plan_runtime->scan_ms += scan_ms;
+        plan_runtime->filter_ms += scan_ms;
+        plan_runtime->scan_rows += total_scanned.load();
+        plan_runtime->scan_output_rows += total_matching.load();
+        plan_runtime->aggregate_groups += group_count;
         plan_runtime->aggregate_input_rows += total_matching.load();
         plan_runtime->aggregate_ms += MsSince(merge_begin);
       }
@@ -6038,12 +7476,12 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 count_only_state.has_value = true;
                 mst = mt->MergeFromGroup(unpack_cells.data(),
                                          SingleIntWorkerTable::kNullHash,
-                                         &count_only_state, true);
+                                         {&count_only_state, 1}, true);
               } else {
-                mst = mt->MergeFromGroup(unpack_cells.data(),
-                                         SingleIntWorkerTable::kNullHash,
-                                         src.NullAggs(),
-                                         /*borrow_strings=*/true);
+                mst = mt->MergeFromGroup(
+                    unpack_cells.data(), SingleIntWorkerTable::kNullHash,
+                    {src.NullAggs(), plan_agg_specs.size()},
+                    /*borrow_strings=*/true);
               }
             } else {
               const RuntimeKeyCell* kptr = nullptr;
@@ -6055,17 +7493,20 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               if (single_int_count_star) {
                 count_only_state.count = src.CountAt(ref.gid);
                 count_only_state.has_value = true;
-                mst = mt->MergeFromGroup(kptr, kh, &count_only_state, true);
+                mst =
+                    mt->MergeFromGroup(kptr, kh, {&count_only_state, 1}, true);
               } else {
-                mst = mt->MergeFromGroup(kptr, kh, src.AggsAt(ref.gid),
-                                         /*borrow_strings=*/true);
+                mst = mt->MergeFromGroup(
+                    kptr, kh, {src.AggsAt(ref.gid), plan_agg_specs.size()},
+                    /*borrow_strings=*/true);
               }
             }
           } else {
             WorkerGroupTable& src = *worker_tables[ref.worker_id];
-            mst = mt->MergeFromGroup(src.KeysAt(ref.gid), src.HashAt(ref.gid),
-                                     src.AggsAt(ref.gid),
-                                     /*borrow_strings=*/true);
+            mst =
+                mt->MergeFromGroup(src.KeysAt(ref.gid), src.HashAt(ref.gid),
+                                   {src.AggsAt(ref.gid), plan_agg_specs.size()},
+                                   /*borrow_strings=*/true);
           }
           if (mst != Status::kSuccess) {
             merge_status[s] = std::move(mst);
@@ -6249,7 +7690,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     } else {
       const size_t mworkers = std::min(workers, merge_shards);
       std::atomic<size_t> next_s{0};
-      RunParallelTasks(mworkers, [&](size_t) {
+      RETURN_IF_FAIL(RunParallelTasks(mworkers, [&](size_t) {
         while (true) {
           const size_t s = next_s.fetch_add(1, std::memory_order_relaxed);
           if (s >= merge_shards) {
@@ -6257,7 +7698,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           }
           merge_and_extract_fn(s);
         }
-      });
+      }));
     }
     for (const Status& st : merge_status) {
       if (st == StatusCode::kMemoryLimitExceeded) {
@@ -7329,7 +8770,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             if (p2_workers == 1) {
               p2_worker_fn(0);
             } else {
-              RunParallelTasks(p2_workers, p2_worker_fn);
+              RETURN_IF_FAIL(RunParallelTasks(p2_workers, p2_worker_fn));
             }
             bool p2_mem_exceeded = false;
             for (const Status& st : p2_status) {
@@ -7372,7 +8813,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                     dworkers, std::vector<uint64_t>(n_win, 0));
                 std::vector<Status> dstatus(dworkers, Status::kSuccess);
                 std::atomic<size_t> next_ds{0};
-                RunParallelTasks(dworkers, [&](size_t dtid) {
+                RETURN_IF_FAIL(RunParallelTasks(dworkers, [&](size_t dtid) {
                   QueryMemoryCharge set_charge;
                   FlatIntKeyMap<uint8_t> dset;
                   while (true) {
@@ -7435,7 +8876,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                     }
                     dist_shards[s].clear();
                   }
-                });
+                }));
                 for (size_t dtid = 0; dtid < dworkers; ++dtid) {
                   for (size_t w = 0; w < n_win; ++w) {
                     sharded_dist_counts[w] += thread_dcounts[dtid][w];

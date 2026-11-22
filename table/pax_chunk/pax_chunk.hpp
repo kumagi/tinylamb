@@ -23,11 +23,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <unordered_map>
 #include <ostream>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1881,9 +1881,9 @@ class PaxChunk final {
   void DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const;
 
   // The encoder's per-scheme linear decode cost, normalized to PLAIN = 1.0
-  // (the unit the comparison contract defines as "compare one PLAIN int64 against
-  // one literal"). The same table drives the adaptive encoder's choice and
-  // the fragment IR's estimate, so the two can never disagree about what a
+  // (the unit the comparison contract defines as "compare one PLAIN int64
+  // against one literal"). The same table drives the adaptive encoder's choice
+  // and the fragment IR's estimate, so the two can never disagree about what a
   // scheme costs to expand. The cost of a COMPRESSED-DOMAIN kernel (a count
   // that never expands the column) is not in this table: it is priced by the
   // kernel itself, not by the expansion.
@@ -1942,7 +1942,8 @@ class PaxChunk final {
   // and a single plain-column term, a metadata fast-path (rg_sums) is used.
   // `parallel` splits row groups across a thread pool; `scan_sweeps` repeats
   // the scan to model steady-state throughput. Returns the sum (as __int128 to
-  // avoid overflow on large decimal products) and the matched tuple count.
+  // accommodate large decimal products) and the matched tuple count.
+  // An intermediate outside the signed 128-bit range returns kIsInfinity.
   // The kernel decodes every referenced column as int64; passing `sc` opts
   // into a schema type gate that rejects plans touching a non-int64 (or
   // out-of-range) column with an empty AggResult, instead of decoding
@@ -2028,7 +2029,8 @@ class PaxChunk final {
     size_t values{0};
     std::unordered_map<size_t, std::vector<int64_t>> cells;
   };
-  std::shared_ptr<DecodedCells> decoded_cells_{std::make_shared<DecodedCells>()};
+  std::shared_ptr<DecodedCells> decoded_cells_{
+      std::make_shared<DecodedCells>()};
 };
 
 // Metadata-only range aggregate across multiple chunks whose key ranges are

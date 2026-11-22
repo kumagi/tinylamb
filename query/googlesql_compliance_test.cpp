@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/string_util.hpp"
 #include "query/googlesql_compliance_file.hpp"
 #include "type/column_name.hpp"
 
@@ -73,7 +74,10 @@ std::vector<Row> Drain(SqlEngine& engine, TransactionContext& context,
   // at EOF and on failure); inspect it after the drain to tell the two
   // apart.
   if (const Status st = prepared.Value()->GetStatus(); st != Status::kSuccess) {
-    *status = Status::kUnknown;
+    // Preserve the real sticky code: the runner passes it to the golden-file
+    // category check, and kUnknown would falsely satisfy the generic
+    // unimplemented allowance regardless of the actual error category.
+    *status = st;
     if (error_msg != nullptr) {
       *error_msg =
           engine.LastError().empty() ? ToString(st) : engine.LastError();
@@ -435,6 +439,20 @@ TEST(GoogleSqlComplianceFile, MatchesIntBoolAndNull) {
   EXPECT_FALSE(ComplianceValueMatches(Value(int64_t{2}), "1"));
 }
 
+TEST(GoogleSqlComplianceFile, Int64GoldenRejectsPartialNumericParse) {
+  // std::stoll accepts a numeric prefix; a DOUBLE golden must not match an
+  // INT64 whose fractional/exponent part was silently discarded.
+  EXPECT_FALSE(ComplianceValueMatches(Value(int64_t{2}), "2.5"));
+  EXPECT_FALSE(ComplianceValueMatches(Value(int64_t{1}), "1e3"));
+  EXPECT_FALSE(ComplianceValueMatches(Value(int64_t{1}), "1abc"));
+  EXPECT_FALSE(ComplianceValueMatches(Value(int64_t{0}), "-0.5"));
+  // Fully consumed integers and UINT64 magnitudes still match.
+  EXPECT_TRUE(ComplianceValueMatches(Value(int64_t{42}), "42"));
+  EXPECT_TRUE(ComplianceValueMatches(
+      Value(static_cast<int64_t>(UINT64_C(18446744073709551615))),
+      "18446744073709551615"));
+}
+
 TEST(GoogleSqlComplianceFile, ParsesExplainPlanAssertions) {
   constexpr std::string_view kFile = R"test(
 [mode=explain_analyze]
@@ -607,28 +625,72 @@ bool CaseFeatureSupported(const GoogleSqlComplianceCase& test_case) {
 }
 
 bool IsMutatingSql(std::string_view sql) {
-  size_t begin = 0;
-  while (begin < sql.size() &&
-         std::isspace(static_cast<unsigned char>(sql[begin])) != 0) {
-    ++begin;
-  }
-  sql = sql.substr(begin);
-  auto prefix = [&sql](std::string_view keyword) {
-    if (sql.size() < keyword.size()) {
+  auto prefix = [](std::string_view text, std::string_view keyword) {
+    if (text.size() < keyword.size()) {
       return false;
     }
-    if (!sql.starts_with(keyword)) {
+    if (!text.starts_with(keyword)) {
       return false;
     }
-    if (sql.size() == keyword.size()) {
+    if (text.size() == keyword.size()) {
       return true;
     }
-    const char next = sql[keyword.size()];
+    const char next = text[keyword.size()];
     return !std::isalnum(static_cast<unsigned char>(next)) && next != '_';
   };
-  return prefix("INSERT") || prefix("UPDATE") || prefix("DELETE");
+
+  // ParseSegment keeps '--' comment lines in case SQL, so a DML statement
+  // can start behind a comment banner. Skip leading whitespace and comments
+  // and classify the first real token, not the first byte.
+  size_t begin = 0;
+  while (begin < sql.size()) {
+    if (std::isspace(static_cast<unsigned char>(sql[begin])) != 0) {
+      ++begin;
+      continue;
+    }
+    if (sql[begin] == '#' || (sql[begin] == '-' && begin + 1 < sql.size() &&
+                              sql[begin + 1] == '-')) {
+      const size_t eol = sql.find('\n', begin);
+      if (eol == std::string_view::npos) {
+        return false;  // comment-only SQL cannot mutate state
+      }
+      begin = eol + 1;
+      continue;
+    }
+    if (sql[begin] == '/' && begin + 1 < sql.size() && sql[begin + 1] == '*') {
+      const size_t end = sql.find("*/", begin + 2);
+      if (end == std::string_view::npos) {
+        return false;  // unterminated comment: no statement to classify
+      }
+      begin = end + 2;
+      continue;
+    }
+    break;
+  }
+  // SQL keywords are case-insensitive; normalize before matching.
+  const std::string upper = AsciiToUpper(sql.substr(begin));
+  return prefix(upper, "INSERT") || prefix(upper, "UPDATE") ||
+         prefix(upper, "DELETE") || prefix(upper, "MERGE") ||
+         prefix(upper, "TRUNCATE") || prefix(upper, "DROP");
 }
 }  // namespace
+
+TEST(GoogleSqlComplianceFile, IsMutatingSqlDetectsCommentPrefixesAndDdl) {
+  EXPECT_TRUE(IsMutatingSql("INSERT INTO t VALUES (1)"));
+  EXPECT_TRUE(IsMutatingSql("  update t set a = 1"));
+  EXPECT_TRUE(IsMutatingSql("-- setup\nINSERT INTO t VALUES (1)"));
+  EXPECT_TRUE(IsMutatingSql("# comment\nDELETE FROM t"));
+  EXPECT_TRUE(IsMutatingSql("/* banner */ MERGE INTO t USING s ON TRUE"));
+  EXPECT_TRUE(IsMutatingSql("TRUNCATE TABLE t"));
+  EXPECT_TRUE(IsMutatingSql("DROP TABLE t"));
+  EXPECT_TRUE(IsMutatingSql("\n-- a\n-- b\nMERGE INTO t USING s ON t.k = s.k"));
+  // Non-mutating statements (and comment-only SQL) do not force isolation.
+  EXPECT_FALSE(IsMutatingSql("SELECT 1"));
+  EXPECT_FALSE(IsMutatingSql("-- just a comment\nSELECT 1"));
+  EXPECT_FALSE(IsMutatingSql("INSERTION IS NOT INSERT"));
+  EXPECT_FALSE(IsMutatingSql("-- nothing but a comment"));
+  EXPECT_FALSE(IsMutatingSql(""));
+}
 
 class GoogleSqlComplianceFileTest
     : public ::testing::TestWithParam<std::string> {};

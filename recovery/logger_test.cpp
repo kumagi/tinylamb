@@ -162,9 +162,9 @@ TEST_F(LoggerTest, AppendTwo) {
 
   // Act -- append d1, sleep 1us, append d2; wait for commit; read back via
   // ifstream
-  l_->AddLog(d1);
+  ASSERT_SUCCESS(l_->AddLog(d1).GetStatus());
   std::this_thread::sleep_for(std::chrono::microseconds(1));
-  l_->AddLog(d2);
+  ASSERT_SUCCESS(l_->AddLog(d2).GetStatus());
   WaitForCommit(d1.size() + d2.size());
   EXPECT_EQ(std::filesystem::file_size(log_name_), d1.size() + d2.size());
   std::ifstream file;
@@ -238,7 +238,7 @@ TEST_F(LoggerTest, Verify) {
 TEST_F(LoggerTest, WaitForDurableObservesFsync) {
   std::string payload = RandomString(256);
   const lsn_t lsn = l_->AddLog(payload).Value();
-  l_->WaitForDurable(lsn + payload.size());
+  ASSERT_SUCCESS(l_->WaitForDurable(lsn + payload.size()));
   EXPECT_GE(l_->DurableLSN(), lsn + payload.size());
   EXPECT_GE(l_->CommittedLSN(), lsn + payload.size());
   EXPECT_GT(l_->GetSyncStats().count, 0U);
@@ -419,7 +419,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
   size_t records = 0;
   while (file.peek() != std::ifstream::traits_type::eof()) {
     const uint32_t magic = read32();
-    ASSERT_EQ(magic, kD1Magic) << (records != 0U);
+    ASSERT_EQ(magic, kD1Magic) << "record=" << records;
     const uint32_t thread = read32();
     const uint32_t seq = read32();
     const uint32_t length = read32();
@@ -428,7 +428,8 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
     const int fill = static_cast<unsigned char>((thread * 31) + seq);
     for (uint32_t i = 0; i < length; ++i) {
       ASSERT_EQ(file.get(), fill)
-          << (records != 0U) << (thread != 0U) << (seq != 0U);
+          << "record=" << records << " thread=" << thread << " seq=" << seq
+          << " byte=" << i;
     }
     ++records;
   }

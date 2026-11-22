@@ -95,6 +95,16 @@ bool BatchMayMatch(  // NOLINT(misc-no-recursion)
       (*constant)->Type() != TypeTag::kConstantValue) {
     return true;
   }
+  // Zone maps are indexed by the input chunk's physical slot, but `schema`
+  // is only the Selection's declared input schema. If a projection below us
+  // renamed or reordered columns, `schema.Offset(name)` would name a slot
+  // that holds a different column in `chunk`, and pruning on that zone map
+  // could discard rows that actually match. Stay conservative unless this
+  // chunk really carries the declared layout -- the same guard the SIMD
+  // fast path in AppendSelected applies before using a schema-derived slot.
+  if (!chunk.HasLayout(schema)) {
+    return true;
+  }
   const int offset = schema.Offset((*column)->AsColumnValue().GetColumnName());
   if (offset < 0) {
     return true;
@@ -207,8 +217,7 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
   std::optional<ColumnVector> predicates;
   rows_seen_ += input.Size();
   if (simd_filter_.enabled) {
-    const ColumnVector& simd_column =
-        input.ColumnAt(simd_filter_.column);
+    const ColumnVector& simd_column = input.ColumnAt(simd_filter_.column);
     const ZoneMap& simd_zone = input.ZoneMapAt(simd_filter_.column);
     if (input.HasLayout(schema_) &&
         simd_column.Type() == schema_.GetColumn(simd_filter_.column).Type() &&
@@ -244,11 +253,15 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
     // The bytecode compiler emits operands left-to-right, so a literal on
     // the left ("5 < x") is LoadConstant->LoadColumn. Accept both orders
     // like the zone-map and SIMD gates above, flipping the operation.
+    // A bare column/constant predicate compiles to a single kLoadColumn /
+    // kLoadConstant instruction; guard the second read just like the
+    // size()==3 guard below guards the third.
+    const bool has_two_insns = instructions.size() >= 2;
     const bool column_first =
-        instructions[0].opcode == BytecodeOp::kLoadColumn &&
+        has_two_insns && instructions[0].opcode == BytecodeOp::kLoadColumn &&
         instructions[1].opcode == BytecodeOp::kLoadConstant;
     const bool constant_first =
-        instructions[0].opcode == BytecodeOp::kLoadConstant &&
+        has_two_insns && instructions[0].opcode == BytecodeOp::kLoadConstant &&
         instructions[1].opcode == BytecodeOp::kLoadColumn;
     const size_t column_insn = column_first ? 0 : 1;
     const size_t constant_insn = column_first ? 1 : 0;
@@ -263,14 +276,17 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
     // unsigned-aware bytecode path (cf. the aggregation SUM guard).
     const bool constant_unsigned =
         simple_int_cmp &&
-        bytecode_->Constants()[instructions[constant_insn].operand].IsUnsigned();
+        bytecode_->Constants()[instructions[constant_insn].operand]
+            .IsUnsigned();
     const bool column_unsigned =
-        simple_int_cmp && instructions[column_insn].operand < schema_.ColumnCount() &&
+        simple_int_cmp &&
+        instructions[column_insn].operand < schema_.ColumnCount() &&
         schema_.GetColumn(instructions[column_insn].operand).IsUnsigned();
     if (simple_int_cmp && !constant_unsigned && !column_unsigned) {
       jit_column_ = instructions[column_insn].operand;
       jit_constant_ =
-          bytecode_->Constants()[instructions[constant_insn].operand].value.int_value;
+          bytecode_->Constants()[instructions[constant_insn].operand]
+              .value.int_value;
       jit_operation_ = constant_first ? Flip(instructions[2].binary)
                                       : instructions[2].binary;
       jit_filter_ = JitInt64Kernels::CompileFilter(jit_operation_);
@@ -286,16 +302,14 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
   // storage.  Only fire when the runtime batch really carries a signed
   // INT64 layout: an unsigned column under a signed schema would compare
   // UINT64 > INT64_MAX keys wrong with ICmpSLT/SGT.
-  if (jit_filter_ &&
-      input.ColumnAt(jit_column_).Type() == ValueType::kInt64 &&
-      !input.ColumnAt(jit_column_).IsUnsigned() &&
-      input.HasLayout(schema_) &&
+  if (jit_filter_ && input.ColumnAt(jit_column_).Type() == ValueType::kInt64 &&
+      !input.ColumnAt(jit_column_).IsUnsigned() && input.HasLayout(schema_) &&
       input.ZoneMapAt(jit_column_).Initialized() &&
       input.ZoneMapAt(jit_column_).NullCount() == 0) {
     jit_keep_bytes_.resize(input.Size());
-    jit_filter_->Filter(
-        input.ColumnAt(jit_column_).IntegerData().data(),
-        jit_keep_bytes_.data(), jit_keep_bytes_.size(), jit_constant_);
+    jit_filter_->Filter(input.ColumnAt(jit_column_).IntegerData().data(),
+                        jit_keep_bytes_.data(), jit_keep_bytes_.size(),
+                        jit_constant_);
     selection_vector_.clear();
     for (size_t i = 0; i < jit_keep_bytes_.size(); ++i) {
       if (jit_keep_bytes_[i] != 0) {
@@ -372,8 +386,7 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
       // conjunct path below (skipping whole-expression `TryEvaluateBatch`,
       // which would fail on the same row anyway).
     } else if (bytecode_) {
-      StatusOr<ColumnVector> batch =
-          bytecode_->TryEvaluateBatch(input);
+      StatusOr<ColumnVector> batch = bytecode_->TryEvaluateBatch(input);
       if (batch.HasValue()) {
         predicates.emplace(batch.MoveValue());
       }

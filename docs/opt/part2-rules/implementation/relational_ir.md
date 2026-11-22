@@ -41,14 +41,21 @@ graph TD
 ## 意味論的根拠と物理実行の契約
 
 ### 1. 縮退実行による正しさの保証
-`RelationalPlan` の唯一の責務は、保持する `std::shared_ptr<const SelectStatement>` を関係代数実行系（`query/sql_engine.cpp` のレガシーパイプライン）へ引き渡し、解釈実行させることです。
+`RelationalPlan` の唯一の責務は、保持する `std::shared_ptr<const SelectStatement>` を関係代数実行系（レガシーパイプライン）へ引き渡し、解釈実行させることです。現行の `Optimizer::OptimizeRelational`（`plan/optimizer.cpp`）は Memo を構成せず、`kRelational` 式を `memo.AddExpression` で追加するのではなく、`RelationalPlan` を直接生成して返します。
 
 ```cpp
-  cascades::LogicalExpression logical;
-  logical.operation = cascades::LogicalOperator::kRelational;
-  logical.relational_statement = std::move(statement);
-  logical.output_schema = std::move(output_schema);
-  memo.AddExpression(root, std::move(logical));
+StatusOr<Plan> Optimizer::OptimizeRelational(
+    std::shared_ptr<const SelectStatement> statement, Schema output_schema,
+    TransactionContext& ctx) {
+  (void)ctx;
+  if (!statement) {
+    return Status::kNotImplemented;
+  }
+  Plan plan = std::make_shared<RelationalPlan>(std::move(statement),
+                                               std::move(output_schema));
+  // ... EXPLAIN 情報の付与 ...
+  return plan;
+}
 ```
 
 Cascades 探索エンジンが最適化ルールを適用できない構文であっても、関係代数実行系が正しく解釈可能であればクエリは正常終了します。「誤った最適化を行うより、最適化をバイパスして正確に実行する」という設計原則に基づく防護壁です。
@@ -89,7 +96,7 @@ Cascades 最適化パイプラインにおける致命的エラーを回避し�
 
 ## 関連 Rule との相互作用
 
-- `Optimizer::OptimizeRelational`: `query/sql_engine.cpp` において Cascades 本体の最適化が失敗（`kNotImplemented`）した際、単一の `kRelational` 式を持つ Memo を構成して本 Rule を駆動します。
+- `Optimizer::OptimizeRelational`: `plan/optimizer.cpp` に定義され、Cascades 本体の最適化が失敗（`kNotImplemented`）した際の縮退経路として `RelationalPlan` を直接生成します（`query/sql_engine.cpp` はその呼び出し側です）。Memo を構成して本 Rule を駆動するわけではありません。
 - 他の探索 Rule 群: 通常のクエリ探索プロセスでは `kRelational` 式は生成されないため、論理書き換え Rule や結合 Rule との直接的な相互作用はありません。
 
 ## 検証テスト

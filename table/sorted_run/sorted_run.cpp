@@ -68,7 +68,8 @@ int SortedRun::Entry::Compare(std::string_view rhs,
   return my_key_bytes.compare(rhs);  // neg/0/pos like string_view::compare
 }
 
-std::string_view SortedRun::Entry::KeyView(const std::vector<char>& blob) const {
+std::string_view SortedRun::Entry::KeyView(
+    const std::vector<char>& blob) const {
   if (static_cast<size_t>(key_offset_) + sizeof(uint32_t) > blob.size()) {
     return {};
   }
@@ -191,14 +192,17 @@ StatusOr<Row> SortedRun::Find(std::string_view key, const Schema& sc) const {
 
 std::string SortedRun::Iterator::Key() const {
   if (!IsValid()) {
-    throw std::invalid_argument("Key() on invalid SortedRun::Iterator");
+    // An exhausted iterator has no entry: return a sentinel like IsDeleted()
+    // instead of throwing past the SortedRun Status boundary.
+    return {};
   }
   return GetEntry().BuildKey(parent_->Blob());
 }
 
 Row SortedRun::Iterator::Value() const {
   if (!IsValid()) {
-    throw std::invalid_argument("Value() on invalid SortedRun::Iterator");
+    // Same sentinel convention as Key()/IsDeleted() at an invalid position.
+    return {};
   }
   // A corrupt blob makes DeserializeBounded throw; translate it at this
   // reader boundary like SortedRun::Lookup() already does.

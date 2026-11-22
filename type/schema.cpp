@@ -114,6 +114,10 @@ void Schema::RefreshDerived() {
 }
 
 bool Schema::operator==(const Schema& rhs) const {
+  // Deliberately only name + columns: the serialized form (operator<<) does
+  // not carry key_column_index_ / schema_version_, so including them here
+  // would make a serialize/deserialize round-trip compare unequal. Callers
+  // that need key/version identity must compare those fields explicitly.
   return name_ == rhs.name_ && columns_ == rhs.columns_;
 }
 
@@ -121,6 +125,8 @@ std::unordered_set<ColumnName> Schema::ColumnSet() const {
   std::unordered_set<ColumnName> ret;
   ret.reserve(columns_.size());
   for (const auto& c : columns_) {
+    // Unnamed columns are registered as (schema, "") by contract; see
+    // SchemaTest.ColumnSet_FromMixedNamedAndUnnamedColumns_CollectsAllColumnNames.
     if (c.Name().name.empty()) {
       ret.emplace(Name(), c.Name().name);
     } else {
@@ -193,7 +199,7 @@ Schema Schema::operator+(const Schema& rhs) const {
   for (const auto& c : rhs.columns_) {
     merged.push_back(c);
   }
-  return {"", merged};
+  return {"", std::move(merged)};
 }
 
 std::ostream& operator<<(std::ostream& o, const Schema& s) {

@@ -7,7 +7,7 @@
 削除した演算子の enum・DSL・専用テスト・旧ルール解説も除去しています。
 既存の未コミット変更とは別に監査開始時のファイルを保存して比較しました。
 
-2026-11-19 更新: 以下の現在一覧を作業ツリーの登録順に再生成しました。論理 95、物理 46、式 71 登録です。冒頭の削減数は 2026-10-02 当時の記録です。
+2026-11-19 更新: 以下の現在一覧を作業ツリーの登録順に再生成しました。論理 95、物理 46、式 70 登録です。冒頭の削減数は 2026-10-02 当時の記録です。
 
 ## 判定と修正
 
@@ -60,7 +60,6 @@
 | `check_constraint_predicate_intake` | 同じ未設定 schema を前提とし、CHECK 文字列の部分一致を論理的証明と誤認する。OR を含む CHECK 等で不健全。SQL の制約検査は維持。 |
 | `semijoin_to_inner_plus_distinct` | 射影を兼ねる SemiJoin の target_list を前提とするが、通常 SQL の半結合は射影を別ノードに持つ。撤去した unused join 由来以外は人工形状だけ。 |
 | `unique_group_key_aggregate_elimination` | 未設定の Scan.output_schema の UNIQUE を要求し SQL から不発火。現行の keys + aggregate 出力契約で必要なキーも落とす。名前上の一意集約除去を撤去し、通常の集約を維持。 |
-| `eager_aggregation_over_join` | 1:1 証明を作る経路は ORDER BY + LIMIT の二表 SELECT のみで、対応する grouped SQL の Memo payload とは交わらない。人工形状でも最終集約の引数を部分集約の出力名に再束縛しない。 |
 | `group_by_functional_dependency_reduction` | target_list にないキーを落とすが、現行 AggregationPlan は全 grouping key を暗黙に出力する。親の Projection が必要とするキーまで消え、実行可能な同一 Group の代替にならない。出力復元のない変換を撤去。 |
 | `projection_constant_propagation` | merge_projections が同じ置換を行い、内側射影も除去する。二段のまま定数だけ置換する旧登録は同額または余分な一走査で勝てない。定数伝搬の回帰を merge_projections 単独で検証する。 |
 
@@ -157,7 +156,9 @@ non-null/NULL 件数、NDV、typed histogram の範囲を読んで結合行数�
 - 最終ソースの関連 CTest: **746 件、失敗 0**（24.69 秒）。
   Cascades、optimizer、SQL 到達性、aggregate/sort shape、統計、
   expression differential、bytecode/JIT、rewrite/function-call を含みます。
-- `check_layering.py`: 成功。65 個の既存 allowlist 辺のみ、追加なし。
+- `check_layering.py`: 成功。65 個の既存 allowlist 辺のみ、追加なし
+  (監査実行時点の記録。現行 `scripts/check_layering.py` の
+  `DEFAULT_ALLOWLIST` は 116 辺)。
 - 登録一覧はソースと順序まで照合し、撤去した論理 38 登録すべてに
   判定理由があることと、文字列登録がソースに残らないことを確認しました。
 - OR の UNION ALL 化は non-throwing 証明が必要なため、典型 SQL では述語保持を

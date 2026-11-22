@@ -33,6 +33,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
@@ -108,6 +109,28 @@ TEST_F(FullScanIteratorTest, Construct_Default_Succeeds) {
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   Iterator it = table.BeginFullScan(ctx.txn_);
   EXPECT_EQ(it.GetStatus(), Status::kSuccess);
+  EXPECT_FALSE(it.IsValid());
+}
+
+// I11046: operator-- used to CHECK_MSG(false) and abort the process (even in
+// release builds). It must instead surface a sticky kInvalidArgument through
+// GetStatus and invalidate the cursor, so a generic caller can detect the
+// unsupported operation and its loop terminates.
+TEST_F(FullScanIteratorTest, DecrementReportsInvalidArgumentInsteadOfAborting) {
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+    ASSERT_SUCCESS(
+        table.Insert(ctx.txn_, Row({Value(1), Value("foo"), Value(1.0)}))
+            .GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  TransactionContext reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "SampleTable"));
+  Iterator it = table.BeginFullScan(reader.txn_);
+  ASSERT_TRUE(it.IsValid());
+  --it;
+  EXPECT_EQ(it.GetStatus(), Status::kInvalidArgument);
   EXPECT_FALSE(it.IsValid());
 }
 
@@ -452,10 +475,13 @@ TEST(LSTableIntegerRunsTest, RunBoundsRefuseNullWideAndUnbudgetedColumns) {
   }
 }
 
-TEST_F(FullScanIteratorTest, ProjectionRejectionIsSpecificToGenerationColumnsAndLimit) {
+TEST_F(FullScanIteratorTest,
+       ProjectionRejectionIsSpecificToGenerationColumnsAndLimit) {
   auto writer = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(writer, "SampleTable"));
-  ASSERT_SUCCESS(table.Insert(writer.txn_, Row({Value(1), Value("foo"), Value(1.0)})).GetStatus());
+  ASSERT_SUCCESS(
+      table.Insert(writer.txn_, Row({Value(1), Value("foo"), Value(1.0)}))
+          .GetStatus());
   ASSERT_SUCCESS(writer.PreCommit());
   auto reader = db_->BeginReadOnlyContext();
   const std::vector<slot_t> projection{0};
@@ -490,7 +516,9 @@ TEST_F(FullScanIteratorTest,
   auto& budget = ProcessMemoryBudget::Global();
   // NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result)
   // operands bounded
-  constexpr size_t cap = 2 * 1024 * 1024;  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
+  constexpr size_t cap =
+      2 * 1024 *
+      1024;  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
   ASSERT_LT(budget.ColumnarUsed(), cap - 65536);
   // Model a large old image without putting MiB of row payload in a unit test.
   ASSERT_TRUE(
@@ -514,8 +542,8 @@ TEST_F(FullScanIteratorTest,
   EXPECT_EQ(budget.TelemetrySnapshot().reclaim_calls, before);
   EXPECT_TRUE(replacement->HasColumn(1));
   EXPECT_FALSE(replacement->HasColumn(0));
-  EXPECT_EQ(replacement->integer_columns[1].front(), 0);
-  EXPECT_EQ(replacement->integer_columns[1].back(), -8999);
+  EXPECT_EQ(replacement->IntegerColumn(1).front(), 0);
+  EXPECT_EQ(replacement->IntegerColumn(1).back(), -8999);
   ASSERT_SUCCESS(reader.PreCommit());
 }
 
@@ -556,7 +584,7 @@ TEST_F(FullScanIteratorTest, IntegerRunIndexStaysWithItsLayoutImage) {
   EXPECT_EQ(nullable->IntegerRunBounds(0, 0), nullptr);
   EXPECT_TRUE(new_bounds->MayExceed(7, 6));
   EXPECT_EQ(new_index->Find(7), std::make_pair(5U, 6U));
-  ctx.Abort();
+  ASSERT_SUCCESS(ctx.Abort());
 }
 
 TEST_F(FullScanIteratorTest,
@@ -695,13 +723,12 @@ TEST_F(FullScanIteratorTest, NumericStreamsOwnPageSlicesAndPreserveBits) {
   const auto store = BuildLSTableStore(reader.txn_, table);
   ASSERT_NE(store, nullptr);
   ASSERT_GT(store->blocks.size(), 1U);
-  ASSERT_EQ(store->integer_columns.size(), 5U);
-  EXPECT_TRUE(store->integer_columns[4].empty());
+  EXPECT_TRUE(store->IntegerColumn(4).empty());
   size_t base = 0;
   for (const auto& block : store->blocks) {
     EXPECT_TRUE(block.columns[4].int_cells.empty());
     for (size_t c = 0; c < 4; ++c) {
-      const auto& cells = store->integer_columns[c];
+      const auto cells = store->IntegerColumn(c);
       const auto& column = block.columns[c];
       ASSERT_EQ(cells.size(), kRows);
       EXPECT_EQ(column.int_cells.data(), cells.data() + base);
@@ -1390,6 +1417,117 @@ TEST_F(FullScanIteratorTest, IntegerDictionaryCrossesFormerCardinalityLimit) {
   EXPECT_EQ(dictionary.DictionaryCodeAt(static_cast<size_t>(rows + 1)),
             UINT32_MAX);
   ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest,
+       PerColumnCacheReusesSharedColumnsAcrossProjections) {
+  constexpr int64_t kRows = 300;
+  {
+    auto setup = db_->BeginContext();
+    Schema schema(
+        "PerColReuse",
+        {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
+         Column("c", ValueType::kInt64), Column("d", ValueType::kVarChar)});
+    ASSERT_SUCCESS(db_->CreateTable(setup, schema).GetStatus());
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(setup, "PerColReuse"));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(setup.txn_,
+                     Row({Value(i + 1), Value((i * 3) + 7), Value(i ^ 0x55),
+                          Value("s_" + std::to_string(i % 17))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "PerColReuse"));
+  // Force the projected incremental builder path on this RowPage table.
+  table.NoteLSTableCapacityRejected(table.LayoutGeneration());
+
+  const std::vector<slot_t> p01 = {0, 1};
+  const auto s01 = GetOrBuildLSTableStore(reader.txn_, table, true, &p01);
+  ASSERT_NE(s01, nullptr);
+  EXPECT_TRUE(s01->HasColumn(0));
+  EXPECT_TRUE(s01->HasColumn(1));
+  EXPECT_FALSE(s01->HasColumn(2));
+  EXPECT_EQ(table.CachedColumnCountForTest(), 2U);
+  ASSERT_EQ(s01->IntegerColumn(0).size(), static_cast<size_t>(kRows));
+  EXPECT_EQ(s01->IntegerColumn(1)[42], (42 * 3) + 7);
+
+  const std::vector<slot_t> p12 = {1, 2};
+  const auto s12 = GetOrBuildLSTableStore(reader.txn_, table, true, &p12);
+  ASSERT_NE(s12, nullptr);
+  EXPECT_FALSE(s12->HasColumn(0));
+  EXPECT_TRUE(s12->HasColumn(1));
+  EXPECT_TRUE(s12->HasColumn(2));
+  // Shared column 1 is reused from the cache; only column 2 was built.
+  EXPECT_EQ(table.CachedColumnCountForTest(), 3U);
+  EXPECT_EQ(s12->column_owners[1], s01->column_owners[1]);
+  EXPECT_EQ(s12->IntegerColumn(2)[42], 42 ^ 0x55);
+
+  const auto s01_again = GetOrBuildLSTableStore(reader.txn_, table, true, &p01);
+  ASSERT_NE(s01_again, nullptr);
+  EXPECT_EQ(s01_again, s01);
+  EXPECT_EQ(table.CachedColumnCountForTest(), 3U);
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest,
+       PerColumnCacheEvictsIdleLruColumnsAndSkipsPinnedColumns) {
+  auto ctx = db_->BeginContext();
+  ASSERT_SUCCESS(
+      db_->CreateTable(ctx,
+                       Schema("EvictTest", {Column("c0", ValueType::kInt64),
+                                            Column("c1", ValueType::kInt64),
+                                            Column("c2", ValueType::kInt64)}))
+          .GetStatus());
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(ctx, "EvictTest"));
+  const uint64_t gen = tbl.LayoutGeneration();
+
+  auto make_entry = [&](slot_t col) {
+    auto entry = std::make_shared<LSTableColumnCacheEntry>();
+    entry->generation = gen;
+    entry->col_index = col;
+    entry->estimated_bytes = 1000;
+    entry->type = ValueType::kInt64;
+    entry->integer_column = {static_cast<int64_t>(col)};
+    return entry;
+  };
+  auto e0 = make_entry(0);
+  auto e1 = make_entry(1);
+  auto e2 = make_entry(2);
+  tbl.RefillCachedLSTableColumn(0, gen, 1000, e0);
+  tbl.RefillCachedLSTableColumn(1, gen, 1000, e1);
+  tbl.RefillCachedLSTableColumn(2, gen, 1000, e2);
+  e0.reset();
+  e1.reset();
+  e2.reset();
+
+  // Touch column 0 so LRU order from oldest to newest is: col 1, col 2, col 0.
+  auto pinned_c1 = tbl.GetCachedLSTableColumn(1, gen);
+  ASSERT_NE(pinned_c1, nullptr);
+  // Make col 2 newer than col 1, and col 0 newest; col 1 stays pinned.
+  EXPECT_NE(tbl.GetCachedLSTableColumn(2, gen), nullptr);
+  EXPECT_NE(tbl.GetCachedLSTableColumn(0, gen), nullptr);
+  // Reset local ref? Wait: GetCachedLSTableColumn returned a temporary
+  // destroyed immediately, so col 1 still has pinned_c1 held! Reclaim 1000
+  // bytes: col 1 is pinned (skip), so oldest idle col 2 is evicted.
+  (void)tbl.EvictIdleColumnarHeadroom(1000);
+  EXPECT_EQ(tbl.CachedColumnCountForTest(), 2U);
+  EXPECT_NE(tbl.GetCachedLSTableColumn(1, gen), nullptr);
+  EXPECT_EQ(tbl.GetCachedLSTableColumn(2, gen), nullptr);
+  EXPECT_NE(tbl.GetCachedLSTableColumn(0, gen), nullptr);
+
+  // Unpin col 1; col 1 was touched above so col 0 is now older than col 1?
+  // Touch col 0 again so col 1 is strictly oldest idle, then unpin col 1.
+  EXPECT_NE(tbl.GetCachedLSTableColumn(0, gen), nullptr);
+  pinned_c1.reset();
+  (void)tbl.EvictIdleColumnarHeadroom(1000);
+  EXPECT_EQ(tbl.CachedColumnCountForTest(), 1U);
+  EXPECT_EQ(tbl.GetCachedLSTableColumn(1, gen), nullptr);
+  EXPECT_NE(tbl.GetCachedLSTableColumn(0, gen), nullptr);
+  ASSERT_SUCCESS(ctx.PreCommit());
 }
 
 }  // namespace tinylamb

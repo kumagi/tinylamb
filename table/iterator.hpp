@@ -52,6 +52,10 @@ class Iterator {
                         ValueType type) {
     iter_->SetRuntimeFilter(group, column, type);
   }
+  void AddExtraRuntimeFilter(const RuntimeFilterGroup* group, slot_t column,
+                             ValueType type) {
+    iter_->AddExtraRuntimeFilter(group, column, type);
+  }
   // Typed batch decode; 0 means exhausted or unsupported (check GetStatus()).
   size_t DecodeNextTypedBatch(TypedCellBatch* batch, size_t max_rows) {
     return iter_->DecodeNextTypedBatch(batch, max_rows);

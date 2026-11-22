@@ -110,24 +110,28 @@ void OwnedValuePayload::Release() noexcept {
   ValuePayload* previous = std::exchange(payload_, nullptr);
   if (previous->references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
     if (previous->is_array) {
-      const std::unique_ptr<ArrayPayload> last_owner(
-          static_cast<ArrayPayload*>(previous));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      const std::unique_ptr<ArrayPayload> last_owner(static_cast<ArrayPayload*>(
+          previous));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     } else {
-      const std::unique_ptr<StringPayload> last_owner(
-          static_cast<StringPayload*>(previous));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      const std::unique_ptr<StringPayload> last_owner(static_cast<
+                                                      StringPayload*>(
+          previous));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     }
   }
 }
 
 bool OwnedValuePayload::empty() const {
   return payload_ == nullptr || payload_->is_array ||
-         static_cast<const StringPayload*>(payload_)->text.empty();  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+         static_cast<const StringPayload*>(payload_)
+             ->text
+             .empty();  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 OwnedValuePayload::operator std::string_view() const {
   return payload_ == nullptr || payload_->is_array
              ? std::string_view("")
-             : static_cast<const StringPayload*>(payload_)->text;  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+             : static_cast<const StringPayload*>(payload_)
+                   ->text;  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 std::string& OwnedValuePayload::Mutable() {
@@ -137,11 +141,13 @@ std::string& OwnedValuePayload::Mutable() {
     payload_ = next.release();
   } else if (payload_->references.load(std::memory_order_acquire) != 1) {
     auto next = std::make_unique<StringPayload>(
-        static_cast<const StringPayload*>(payload_)->text);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+        static_cast<const StringPayload*>(payload_)
+            ->text);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     Release();
     payload_ = next.release();
   }
-  auto* string = static_cast<StringPayload*>(payload_);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  auto* string = static_cast<StringPayload*>(
+      payload_);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   string->hash.store(UINT64_MAX, std::memory_order_relaxed);
   return string->text;
 }
@@ -151,7 +157,8 @@ void OwnedValuePayload::assign(std::string_view text) {
   // including a string nested inside an array being overwritten.
   if (payload_ != nullptr && !payload_->is_array &&
       payload_->references.load(std::memory_order_acquire) == 1) {
-    auto* string = static_cast<StringPayload*>(payload_);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+    auto* string = static_cast<StringPayload*>(
+        payload_);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     if (string->hash.load(std::memory_order_relaxed) != UINT64_MAX) {
       string->hash.store(0, std::memory_order_relaxed);
     }
@@ -166,10 +173,14 @@ std::string OwnedValuePayload::Take() {
   if (payload_ == nullptr || payload_->is_array) {
     return {};
   }
-  auto& text = static_cast<StringPayload*>(payload_)->text;  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+  auto& text =
+      static_cast<StringPayload*>(payload_)
+          ->text;  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   if (payload_->references.load(std::memory_order_acquire) == 1) {
-    static_cast<StringPayload*>(payload_)->hash.store(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
-        UINT64_MAX, std::memory_order_relaxed);
+    static_cast<StringPayload*>(payload_)
+        ->hash
+        .store(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+            UINT64_MAX, std::memory_order_relaxed);
     return std::move(text);
   }
   return text;
@@ -183,7 +194,8 @@ void OwnedValuePayload::SetArray(
 
 ArrayPayload* OwnedValuePayload::Array() const noexcept {
   return payload_ != nullptr && payload_->is_array
-             ? static_cast<ArrayPayload*>(payload_)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+             ? static_cast<ArrayPayload*>(
+                   payload_)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
              : nullptr;
 }
 
@@ -287,6 +299,8 @@ std::string ToString(AggregationType type) {
       return "KLL_QUANTILES.MERGE_PARTIAL";
     case AggregationType::kPercentileCont:
       return "PERCENTILE_CONT";
+    case AggregationType::kPercentileDisc:
+      return "PERCENTILE_DISC";
     case AggregationType::kApproxCountDistinct:
       return "APPROX_COUNT_DISTINCT";
     case AggregationType::kMode:
@@ -715,6 +729,14 @@ size_t Value::Serialize(char* dst) const {
 
 size_t Value::DeserializeInto(const char* src, ValueType as_type,
                               Status* out_status) {
+  // Reject a corrupt type tag before touching `this`: leaving an invalid
+  // ValueType installed makes a later Size()/CheckSerializable() CHECK-fail.
+  if (static_cast<uint8_t>(as_type) > static_cast<uint8_t>(ValueType::kArray)) {
+    *out_status = StatusError(StatusCode::kCorrupt, "corrupt value type tag");
+    type = ValueType::kNull;
+    collation_ = 0;
+    return 0;
+  }
   type = as_type;
   collation_ = 0;
   switch (as_type) {
@@ -990,7 +1012,11 @@ uint64_t HashStringView(std::string_view text) {
   h ^= h >> 33;
   h *= 0xff51afd7ed558ccdULL;
   h ^= h >> 33;
-  return h == 0 ? 1 : h;
+  // Zero is the "hash not computed" sentinel in StringPayload, so it must
+  // never escape as a cached hash. Remap it to a high, well-mixed pattern
+  // instead of 1, which would make a zero-hash string share a bucket (and a
+  // cached hash) with a string whose genuine hash is 1.
+  return h == 0 ? 0x9E3779B97F4A7C15ULL : h;
 }
 
 // Canonical element-type spelling for array comparison. Documented SQL
@@ -1019,9 +1045,11 @@ std::string_view CanonicalArrayElementType(std::string_view type) {
 }  // namespace
 
 uint64_t OwnedValuePayload::StringHash(std::string_view text) const {
-  StringPayload* owned = payload_ != nullptr && !payload_->is_array
-                             ? static_cast<StringPayload*>(payload_)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
-                             : nullptr;
+  StringPayload* owned =
+      payload_ != nullptr && !payload_->is_array
+          ? static_cast<StringPayload*>(
+                payload_)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+          : nullptr;
   // Values can carry borrowed views (including slices of another value).
   // Only cache a hash when the view denotes this owner's complete string.
   if (owned != nullptr && (owned->text.data() != text.data() ||
@@ -1220,26 +1248,13 @@ StatusOr<size_t> DecodeMemcomparableFormatVarchar(const char* src,
 }
 
 std::string EncodeMemcomparableFormatDouble(double in) {
+  // Single source of truth: the pointer-taking encoder used by index keys.
+  // Keeping the byte-order/NaN transform in two places let them drift apart
+  // between index-key encoding and string-based encoding.
   std::string ret(1 + 8, '\0');
-  ret[0] = static_cast<char>(ValueType::kDouble);  // Embeds prefix.
-  if (std::isnan(in)) {
-    in = std::numeric_limits<double>::quiet_NaN();
-  }
-  uint64_t bits = 0;
-  std::memcpy(&bits, &in, sizeof(bits));
-  uint64_t be = htobe64(bits);
-  if (in < 0) {
-    // Strictly negative: invert every byte.  (NaN and -0.0 fall through to
-    // the flag branch so the decoder's XOR restores their exact bits.)
-    be = ~be;
-  }
-  std::memcpy(ret.data() + 1, &be, 8);
-  // Flip the sign bit in the first byte of the big-endian image.  The old
-  // `be |= 0x80` wrote the flag into the uint64's low byte, which memcpy
-  // happened to land on this byte only on little-endian hosts.
-  if (!(in < 0)) {
-    ret[1] |= static_cast<char>(0x80);
-  }
+  [[maybe_unused]] const size_t written =
+      EncodeMemcomparableFormatDoubleTo(ret.data(), in);
+  assert(written == ret.size());
   return ret;
 }
 
@@ -1708,10 +1723,14 @@ StatusOr<bool> Value::TryLess(const Value& rhs) const {
       // Equality requires matching element_sql_type; ordering must agree or
       // the same pair yields all five comparisons FALSE (breaking HAVING /
       // group-by sort paths). Synonym spellings compare through the same
-      // canonical form as operator==.
-      if (CanonicalArrayElementType(ArrayElementSqlType()) !=
-          CanonicalArrayElementType(rhs.ArrayElementSqlType())) {
-        return false;
+      // canonical form as operator==. For distinct element types break the
+      // tie by canonical type name, mirroring CompareForOrderBy, so < and >
+      // cannot both be false for the same pair.
+      const auto lhs_type = CanonicalArrayElementType(ArrayElementSqlType());
+      const auto rhs_type =
+          CanonicalArrayElementType(rhs.ArrayElementSqlType());
+      if (lhs_type != rhs_type) {
+        return lhs_type < rhs_type;
       }
       // Lexicographic compare through the StatusOr path: std::vector::operator<
       // would call the throwing Value::operator< (ExcShimUnwrap) and let a C++
@@ -1789,9 +1808,11 @@ StatusOr<bool> Value::TryGreater(const Value& rhs) const {
       return value.double_value > rhs.value.double_value;
     }
     case ValueType::kArray: {
-      if (CanonicalArrayElementType(ArrayElementSqlType()) !=
-          CanonicalArrayElementType(rhs.ArrayElementSqlType())) {
-        return false;
+      const auto lhs_type = CanonicalArrayElementType(ArrayElementSqlType());
+      const auto rhs_type =
+          CanonicalArrayElementType(rhs.ArrayElementSqlType());
+      if (lhs_type != rhs_type) {
+        return lhs_type > rhs_type;
       }
       const auto& lhs_elements = ArrayElements();
       const auto& rhs_elements = rhs.ArrayElements();
@@ -2233,7 +2254,12 @@ Decoder& operator>>(Decoder& e, Value& v) {
       std::string sql_type;
       std::vector<Value> elements;
       e >> sql_type >> elements;
+      // Value::Array produces a fresh value with collation 0; move-assigning
+      // it would overwrite the tag decoded above. Keep it so ARRAY round-trips
+      // through Encoder/Decoder without losing its collation.
+      const uint8_t collation = v.collation_;
       v = Value::Array(std::move(elements), std::move(sql_type));
+      v.SetCollation(collation);
       break;
     }
     default:

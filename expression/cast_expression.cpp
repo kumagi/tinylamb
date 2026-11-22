@@ -185,7 +185,8 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
         // junk (e.g. "+05:00garbage") is not a timestamp spelling.
         for (size_t i = 1; i < s.size(); ++i) {
           const char ch = s[i];
-          // NOLINTNEXTLINE(readability-implicit-bool-conversion) explicit intent
+          // NOLINTNEXTLINE(readability-implicit-bool-conversion) explicit
+          // intent
           if (!std::isdigit(static_cast<unsigned char>(ch)) && ch != ':' &&
               (std::isspace(static_cast<unsigned char>(ch)) == 0)) {
             return false;
@@ -202,7 +203,10 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
   const std::chrono::year_month_day ymd{std::chrono::year{ct->year},
                                         std::chrono::month{ct->month},
                                         std::chrono::day{ct->day}};
-  if (!ymd.ok() || ct->hour > 23 || ct->minute > 59 || ct->second > 59) {
+  // Allow second == 60 through so the leap-second normalization below is
+  // reachable: the comparison path accepts the same spelling and TimeGm
+  // carries it into the next minute/hour/day, so CAST must agree.
+  if (!ymd.ok() || ct->hour > 23 || ct->minute > 59 || ct->second > 60) {
     return false;
   }
   if (ct->second == 60) {
@@ -467,7 +471,12 @@ StatusOr<std::string> EncodeProtoWireMessage(std::string_view type_name,
     body = body.substr(1, body.size() - 2);
   }
   if (!ParseProtoTextEntries(body, &entries)) {
-    return std::string{};
+    // This helper returns StatusOr<std::string>; a parse failure must surface
+    // as an error instead of an empty (successful) wire message. Otherwise the
+    // BYTES cast silently turns malformed proto TEXT into b'' while the
+    // dotted-TEXT direction rejects the very same payload.
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid proto TEXT payload: " + std::string(payload));
   }
   const std::string lower = ToLower(std::string(type_name));
   std::string out;
@@ -1299,7 +1308,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
   }
 
   // Dotted non-enum message targets: TEXT payloads normalize through the
-  // shared proto-text helpers; modelled protos additionally decode their
+  // shared proto-text helpers; modeled protos additionally decode their
   // wire-format byte casts.
   {
     const std::string upper_path = ToUpper(type_name);
@@ -1440,8 +1449,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             const char* d_end = digits.data() + digits.size();
             auto [d_ptr, d_ec] = std::from_chars(d_begin, d_end, magnitude, 16);
             if (d_ec != std::errc() || d_ptr != d_end) {
-              return StatusError(StatusCode::kInvalidArgument,
-                                 "Bad " + AsciiLowerCopy(upper) + " value: " + s);
+              return StatusError(
+                  StatusCode::kInvalidArgument,
+                  "Bad " + AsciiLowerCopy(upper) + " value: " + s);
             }
             const bool unsigned_target = upper == "UINT8" ||
                                          upper == "UINT16" ||
@@ -1478,8 +1488,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             // from_chars accepts a minus sign for signed targets, so require
             // a digit here to avoid accepting a second sign after '+'.
             if (s.size() == 1 || s[1] < '0' || s[1] > '9') {
-              return StatusError(StatusCode::kInvalidArgument,
-                                 "Bad " + AsciiLowerCopy(upper) + " value: " + s);
+              return StatusError(
+                  StatusCode::kInvalidArgument,
+                  "Bad " + AsciiLowerCopy(upper) + " value: " + s);
             }
             ++begin_ptr;
           }
@@ -1504,8 +1515,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                                  "int overflow casting from string: " + s);
             }
             if (ec != std::errc() || ptr != end_ptr) {
-              return StatusError(StatusCode::kInvalidArgument,
-                                 "Bad " + AsciiLowerCopy(upper) + " value: " + s);
+              return StatusError(
+                  StatusCode::kInvalidArgument,
+                  "Bad " + AsciiLowerCopy(upper) + " value: " + s);
             }
             return Value(static_cast<int64_t>(u_result)).WithUnsigned();
           }
@@ -1605,10 +1617,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         std::string s =
             (val.type == ValueType::kDate) ? FormatDateDays(val.DateDays())
             : (val.type == ValueType::kInt64)
-                ? (val.IsUnsigned()
-                       ? IntegerToString(static_cast<uint64_t>(
-                             val.value.int_value))
-                       : IntegerToString(val.value.int_value))
+                ? (val.IsUnsigned() ? IntegerToString(static_cast<uint64_t>(
+                                          val.value.int_value))
+                                    : IntegerToString(val.value.int_value))
             : (val.type == ValueType::kDouble)
                 ? ([&]() {
                     if (std::isnan(val.value.double_value)) {

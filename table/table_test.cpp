@@ -63,9 +63,9 @@ class TableTest : public ::testing::Test {
                                       Constraint(Constraint::kIndex)),
                                Column("col2", ValueType::kVarChar),
                                Column("col3", ValueType::kDouble)});
-    rs_->CreateTable(ctx, schema);
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
     IndexSchema idx("idx1", {0, 1});
-    rs_->CreateIndex(ctx, schema.Name(), idx);
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, schema.Name(), idx));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -96,14 +96,16 @@ TEST_F(TableTest, SnapshotReaderSkipsAnOpenWritersUnpublishedTail) {
   {
     auto setup = rs_->BeginContext();
     ASSERT_SUCCESS(
-        rs_->CreateTable(setup, Schema(name, {Column("k", ValueType::kInt64),
-                                              Column("v", ValueType::kVarChar)}))
+        rs_->CreateTable(setup,
+                         Schema(name, {Column("k", ValueType::kInt64),
+                                       Column("v", ValueType::kVarChar)}))
             .GetStatus());
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, setup.GetTable(name));
     for (int64_t i = 0; i < kRows; ++i) {
-      ASSERT_TRUE(
-          table->Insert(setup.txn_, Row({Value(i), Value(std::string(4000, 'a'))}))
-              .HasValue());
+      ASSERT_TRUE(table
+                      ->Insert(setup.txn_,
+                               Row({Value(i), Value(std::string(4000, 'a'))}))
+                      .HasValue());
     }
     ASSERT_SUCCESS(setup.PreCommit());
   }
@@ -124,9 +126,9 @@ TEST_F(TableTest, SnapshotReaderSkipsAnOpenWritersUnpublishedTail) {
                     .HasValue());
   }
   for (const bool read_only : {false, true}) {
-    auto reader =
-        read_only ? rs_->BeginReadOnlyContext() : rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, rtable, reader.GetTable(name));
+    auto reader = read_only ? rs_->BeginReadOnlyContext() : rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, rtable,
+                          reader.GetTable(name));
     const auto start = std::chrono::steady_clock::now();
     size_t rows = 0;
     Iterator it = rtable->BeginFullScan(reader.txn_);
@@ -137,11 +139,13 @@ TEST_F(TableTest, SnapshotReaderSkipsAnOpenWritersUnpublishedTail) {
     EXPECT_SUCCESS(it.GetStatus());
     EXPECT_EQ(rows, static_cast<size_t>(kRows));
     Status morsel_status = Status::kSuccess;
-    const auto morsels = rtable->BuildScanMorsels(reader.txn_, 2, &morsel_status);
+    const auto morsels =
+        rtable->BuildScanMorsels(reader.txn_, 2, &morsel_status);
     EXPECT_SUCCESS(morsel_status);
     EXPECT_FALSE(morsels.empty());
     EXPECT_FALSE(reader.txn_.IsFailed());
-    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(2));
     ASSERT_SUCCESS(reader.PreCommit());
   }
   ASSERT_SUCCESS(writer.PreCommit());
@@ -947,6 +951,27 @@ TEST_F(TableTest, CreateIndex_WhenBackfillFails_CleansUpHalfBuiltIndex) {
 
   ASSERT_SUCCESS(
       rs_->CreateIndex(fresh_ctx, kTableName, IndexSchema("col3_idx", {2})));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, CreateIndexRejectsInvalidColumnsBeforeBuilding) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  const size_t indexes_before = table->IndexCount();
+  const auto include_status = table->CreateIndex(
+      ctx.txn_,
+      IndexSchema("invalid_include", {0}, {3}, IndexMode::kNonUnique));
+  EXPECT_EQ(include_status.GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_NE(include_status.GetMessage().find("INCLUDE"), std::string::npos);
+  EXPECT_EQ(table->IndexCount(), indexes_before);
+
+  const auto key_status =
+      rs_->CreateIndex(ctx, kTableName, IndexSchema("invalid_key", {3}));
+  EXPECT_EQ(key_status.GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_TRUE(ctx.txn_.WriteSetEmpty());
+  ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName,
+                                  IndexSchema("valid_include", {0}, {2})));
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
@@ -1815,6 +1840,70 @@ TEST_F(TableTest,
   EXPECT_EQ(it.GetStatus(), Status::kSuccess);
   EXPECT_TRUE(found_pk1);
   ASSERT_SUCCESS(verify.txn_.PreCommit());
+}
+
+TEST_F(TableTest, CleanPageDirectoryCachesMorselsAndInvalidatesOnInsert) {
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                ctx.GetTable(kTableName));
+    std::string payload(300, 'a');
+    for (int i = 0; i < 40; ++i) {
+      ASSERT_SUCCESS(
+          tbl->Insert(ctx.txn_,
+                      Row({Value(i), Value(std::string(payload)), Value(1.0)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  size_t pages_before = 0;
+  {
+    TransactionContext ro = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                ro.GetTable(kTableName));
+    auto m1 = tbl->BuildScanMorsels(ro.txn_, 1);
+    ASSERT_FALSE(m1.empty());
+    pages_before = m1.size();
+    auto dir = tbl->GetCleanPageDirectory();
+    ASSERT_NE(dir, nullptr);
+    EXPECT_EQ(dir->page_ids.size(), pages_before);
+    auto m2 = tbl->BuildScanMorsels(ro.txn_, 1);
+    EXPECT_EQ(m2.size(), pages_before);
+    ASSERT_SUCCESS(ro.txn_.PreCommit());
+  }
+  // Insert enough rows to allocate new pages; LayoutGeneration() must bump so
+  // the cached TablePageDirectory is invalidated and the new pages are visible.
+  {
+    TransactionContext wr = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                wr.GetTable(kTableName));
+    std::string payload(1000, 'b');
+    for (int i = 40; i < 120; ++i) {
+      ASSERT_SUCCESS(
+          tbl->Insert(wr.txn_,
+                      Row({Value(i), Value(std::string(payload)), Value(2.0)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(wr.txn_.PreCommit());
+  }
+  {
+    TransactionContext ro2 = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                ro2.GetTable(kTableName));
+    auto m3 = tbl->BuildScanMorsels(ro2.txn_, 1);
+    EXPECT_GT(m3.size(), pages_before);
+    size_t count = 0;
+    for (const auto& m : m3) {
+      Iterator it = tbl->BeginMorselScan(ro2.txn_, m);
+      while (it.IsValid()) {
+        ++count;
+        ++it;
+      }
+      ASSERT_EQ(it.GetStatus(), Status::kSuccess);
+    }
+    EXPECT_EQ(count, 120U);
+    ASSERT_SUCCESS(ro2.txn_.PreCommit());
+  }
 }
 
 }  // namespace tinylamb

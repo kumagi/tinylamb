@@ -94,7 +94,7 @@ TEST_F(MergeTest, UpdatesMatchedAndInsertsUnmatchedSourceRows) {
              "MERGE INTO tgt USING src ON tgt.k = src.k "
              "WHEN MATCHED THEN UPDATE SET v = src.nv "
              "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.nv);");
-  EXPECT_EQ(affected.size(), 1);
+  ASSERT_EQ(affected.size(), 1u);
   EXPECT_EQ(CellText(affected[0], 1), "3");
   EXPECT_EQ((TargetRows()),
             (std::vector<std::string>{"1:\"new1\"", "2:\"new2\"", "3:\"old3\"",
@@ -433,6 +433,7 @@ TEST_F(MergeTest, SelfReferencingDeleteIgnoresRowsThisStatementRemoves) {
 TEST_F(MergeTest, TruncateTableDropsRowsAndKeepsSchema) {
   const std::vector<Row> affected =
       RunSql(engine_.get(), context_.get(), "TRUNCATE TABLE tgt;");
+  ASSERT_EQ(affected.size(), 1u);
   EXPECT_EQ(CellText(affected[0], 1), "3");
   EXPECT_TRUE(
       RunSql(engine_.get(), context_.get(), "SELECT k FROM tgt;").empty());
@@ -495,6 +496,7 @@ TEST_F(MergeTest, UpdateFromReportsUpdateCommand) {
              "UPDATE tgt SET v = src.nv FROM src WHERE tgt.k = src.k;");
   // The statement ran on the MERGE machinery, but the user statement is an
   // UPDATE: the diagnostic and server tags report UPDATE with the count.
+  ASSERT_EQ(affected.size(), 1u);
   EXPECT_EQ(CellText(affected[0], 0), "\"Update Rows\"");
   EXPECT_EQ(CellText(affected[0], 1), "2");
   EXPECT_EQ(engine_->LastStatementType(), StatementType::kUpdate);

@@ -33,7 +33,12 @@ set(_tinylamb_win_triple x86_64-w64-windows-gnu)
 set(_tinylamb_win_flags "--target=${_tinylamb_win_triple}")
 set(CMAKE_C_FLAGS_INIT "${_tinylamb_win_flags}")
 set(CMAKE_CXX_FLAGS_INIT "${_tinylamb_win_flags}")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic")
+# Link the runtime consistently: the previous -Wl,-Bstatic -lwinpthread
+# -Wl,-Bdynamic combination made winpthread static while libstdc++ stayed
+# dynamic, and libstdc++-6.dll resolves pthread symbols against a different
+# winpthread implementation at process start. Fully static executables avoid
+# that mixed-runtime startup failure.
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld -static")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld")
 
 set(CMAKE_FIND_ROOT_PATH "${TINYLAMB_WIN_SYSROOT}")

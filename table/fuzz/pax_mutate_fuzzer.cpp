@@ -117,7 +117,10 @@ int FuzzPaxMutateOneInput(const uint8_t* data, size_t size) {
       }
     }
   }
-  const auto row_i = static_cast<size_t>(probe % 64);
+  // Take the remainder in the unsigned domain: a negative probe yields a
+  // negative `% 64`, and casting that straight to size_t produces a huge
+  // row index instead of the small boundary value the oracle wants.
+  const auto row_i = static_cast<size_t>(static_cast<uint64_t>(probe) % 64);
   auto cv = bad.ReadColumnValue(row_i, col, sc);
   (void)cv;
   size_t idx = 12345;

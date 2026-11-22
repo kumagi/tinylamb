@@ -37,7 +37,8 @@ class Encoder;
 class Decoder;
 
 // The on-disk value representation is part of the mode:
-//  * kUnique stores one IndexValueType per key.
+//  * kUnique stores one IndexValueType per non-NULL key; keys containing
+//    NULL use a vector because multiple rows may share the same NULL key.
 //  * kNonUnique stores a vector and physically removes deleted positions.
 //  * kVersionedUnique stores a vector and retains deleted positions so an
 //    older MVCC snapshot can still find the row version through the heap.
@@ -77,20 +78,7 @@ class IndexSchema {
         key_(std::move(key)),
         include_(std::move(include)),
         mode_(mode) {
-    // A key column listed again under INCLUDE/STORING (or an include listed
-    // twice) adds nothing but a duplicate output column: an index-only scan
-    // would then emit [c2, c2] for `SELECT DISTINCT c2`. Keep the first
-    // occurrence only. (Decoded schemas keep their stored layout.)
-    std::vector<slot_t> unique_include;
-    unique_include.reserve(include_.size());
-    for (const slot_t slot : include_) {
-      if (std::find(key_.begin(), key_.end(), slot) == key_.end() &&
-          std::find(unique_include.begin(), unique_include.end(), slot) ==
-              unique_include.end()) {
-        unique_include.push_back(slot);
-      }
-    }
-    include_ = std::move(unique_include);
+    NormalizeInclude();
   }
   IndexSchema(const IndexSchema&) = default;
   IndexSchema(IndexSchema&&) = default;
@@ -111,6 +99,13 @@ class IndexSchema {
   friend Encoder& operator<<(Encoder& a, const IndexSchema& idx);
   friend Decoder& operator>>(Decoder& e, IndexSchema& idx);
   friend std::ostream& operator<<(std::ostream& o, const IndexSchema& rhs);
+
+  // A key column listed again under INCLUDE/STORING (or an include listed
+  // twice) adds nothing but a duplicate output column: an index-only scan
+  // would then emit [c2, c2] for `SELECT DISTINCT c2`. Keep the first
+  // occurrence only. Shared by the constructor and operator>> so a decoded
+  // catalog cannot resurrect duplicates that CREATE INDEX had removed.
+  void NormalizeInclude();
 
   std::string name_;
   std::vector<slot_t> key_;

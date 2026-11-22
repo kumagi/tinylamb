@@ -51,16 +51,14 @@ graph TD
 
 16 表上限は探索効率とメモリ消費を両立させる境界です。関係数 $N$ に対して二分割の組合せは $2^{N-1}$ 通り存在し、各分割で `EnsureGroup` が部分 Group を生成するため、16 表を超える結合では列挙を行わず、貪欲法を用いる `GreedyConnectedSplit（Memo 初期構築）` に処理を委ねます。
 
-最下位ビットが0のマスクをスキップする処理（`(mask & 1U) == 0`）は、二分割の対称性を利用した冗長性排除です。マスクとその補集合は左右を入れ替えた同一の二分割を表すため、最下位ビット（最初の関係）を常に左側に固定することで、`{a}|{b,c}` と `{b,c}|{a}` の一方のみを生成します。左右を反転させた形状は `join_commutativity` によって網羅されます。
+最下位ビットが0のマスクをスキップする処理（`(local & 1U) == 0`）は、二分割の対称性を利用した冗長性排除です。マスクとその補集合は左右を入れ替えた同一の二分割を表すため、最下位ビット（最初の関係）を常に左側に固定することで、`{a}|{b,c}` と `{b,c}|{a}` の一方のみを生成します。左右を反転させた形状は `join_commutativity` によって網羅されます。
 
 分割面が連結かどうかの判定（`CutConnected` による枝刈り）は、探索空間の質を保つ重要な機構です（`plan/cascades.cpp`）。
 
 ```cpp
           const uint64_t within = memo.Get(group).relation_mask;
-          // Connected join graphs: bipartitions whose cut is
-          // not crossed by any conjunct are pure cross products and can be
-          // pruned; a fully disconnected graph keeps exhaustive enumeration.
-          const bool prune = !memo.JoinGraphDisconnected();
+          const bool connected = memo.InducedSubgraphConnected(within);
+          const bool prune_open_cuts = !memo.JoinGraphDisconnected();
 ```
 
 結合グラフ全体が連結である場合、分割面を跨ぐ連接詞が存在しない分割は実質的なクロス積（直積結合）となります。このような結合順序は一般にコストが高く、最適解となる可能性が低いため列挙から除外されます。ただし、クエリ自体に結合述語が存在しない非連結グラフの場合は、枝刈りを行うと計画が生成できなくなるため、すべての二分割を網羅的に列挙します。
@@ -71,16 +69,35 @@ graph TD
 
 ```cpp
           const uint64_t limit = uint64_t{1} << relations.size();
-          for (uint64_t mask = 1; mask + 1 < limit; ++mask) {
-            if ((mask & 1U) == 0) {
+          std::vector<uint64_t> global_bit(relations.size());
+          for (size_t i = 0; i < relations.size(); ++i) {
+            global_bit[i] = memo.RelationMask({relations[i]});
+          }
+          // ...(省略: 連結性の高速枝刈り用 adjacent / locally_connected の準備)
+          for (uint64_t local = 1; local + 1 < limit; ++local) {
+            if ((local & 1U) == 0) {
               continue;
             }
-            if (prune && !memo.CutConnected(mask, within)) {
+            if (connected && (!locally_connected(local) ||
+                              !locally_connected((limit - 1) & ~local))) {
               continue;
+            }
+            uint64_t left_global = 0;
+            // ...(省略: local の各ビットを left / right へ振り分け、
+            //        left_global にグローバルビットを累積)
+            if (prune_open_cuts && !memo.CutConnected(left_global, within)) {
+              continue;
+            }
+            if (connected) {
+              const uint64_t right_global = within & ~left_global;
+              if (!memo.InducedSubgraphConnected(left_global) ||
+                  !memo.InducedSubgraphConnected(right_global)) {
+                continue;
+              }
             }
 ```
 
-`mask` の各ビットは、対応する関係を左側の子 Group に含めるかどうかを示します。0（左側が空）および全ビット点灯（右側が空）を除く範囲を走査します。
+`local` の各ビットは、対応する関係を左側の子 Group に含めるかどうかを示します（`global_bit` がローカルビットからグローバルビットへの対応表です）。0（左側が空）および全ビット点灯（右側が空）を除く範囲を走査します。
 
 `Memo::CutConnected` は、登録済みの連接詞マスク集合（`conjunct_masks_`）のうち、root-only の述語を除いて左側と右側の双方にまたがる述語が1 つ以上存在するかを検査します。
 
@@ -106,14 +123,23 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
 枝刈りを通過したマスクに対しては、左右の関係リストを構築して Group を確保します。
 
 ```cpp
+            uint64_t left_global = 0;
             std::vector<std::string> left;
             std::vector<std::string> right;
+            left.reserve(relations.size());
+            right.reserve(relations.size());
             for (size_t i = 0; i < relations.size(); ++i) {
-              ((mask >> i) & 1U ? left : right).push_back(relations[i]);
+              if (((local >> i) & 1U) != 0) {
+                left_global |= global_bit[i];
+                left.push_back(relations[i]);
+              } else {
+                right.push_back(relations[i]);
+              }
             }
-            if (left.empty() || right.empty()) {
+            if (prune_open_cuts && !memo.CutConnected(left_global, within)) {
               continue;
             }
+            // ...(省略: connected の場合の InducedSubgraphConnected 枝刈り)
             const GroupId left_group = memo.EnsureGroup(std::move(left));
             const GroupId right_group = memo.EnsureGroup(std::move(right));
             memo.AddExpression(group, memo.NewJoin(left_group, right_group));

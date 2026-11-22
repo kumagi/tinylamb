@@ -40,7 +40,7 @@ relational            executor/detail/ (物理中間表現, scan filter, subquer
   ↓
 plan                  plan/            (Cascades memo, Plan ノード, rules)
   ↓
-executor              executor/*.      (物理演算子)
+executor              executor/        (物理演算子)
   ↓
 sql                   query/           (GoogleSQL frontend, SqlEngine,
                        statement IR 本体は query/statement.hpp)

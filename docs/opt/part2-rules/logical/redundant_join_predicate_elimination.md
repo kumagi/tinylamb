@@ -55,11 +55,13 @@ graph TD
   NULL が絡まないため `a = c` は TRUE)。ところが不等号
   (`a < c` など)は推移性が成り立たないか(演算子による)、成り立っても
   削除の根拠にできる形が違います。非等値項は `kept` にそのまま残ります。
-- **同名列の文字列一致**: 併合のキーは列名の文字列(`ColumnName::ToString`)
-  です。`t1.a` と `t2.a` のように同名だが所属表が違う列同士は
-  同じキーとして併合されます(文字列が `t1.a` と `t2.a` で異なるため、
-  実際に同じクラスタに入るのは等値項で結ばれた場合に限ります)。
-  推移律は「同じ 2 列間の等値の重複」にしか適用しない、保守的な設計です。
+- **完全修飾名の文字列一致**: 併合のキーは列名の文字列
+  (`ColumnName::ToString`、修飾子を含む完全修飾名) です。
+  `t1.a` と `t2.a` のように同名だが所属表が違う列は文字列が異なるため
+  最初から別キーであり、等値項で結ばれて初めて同じクラスタになります。
+  修飾子を落としてキーを作ると異なる表の同名列を誤って同一視し、
+  冗長削除で結合述語を失うおそれがあるため、完全修飾名をキーにする
+  保守的な設計です。推移律は「同じ 2 列間の等値の重複」にしか適用しません。
   なお実装は `kJoin` の述語だけが対象で、コードは非等値項も含めて
   順序どおりに `kept` へ残します。
 
@@ -76,23 +78,29 @@ Union-Find の構築と項の選別です。
               if (bin.Op() == BinaryOperation::kEquals &&
                   bin.Left()->Type() == TypeTag::kColumnValue &&
                   bin.Right()->Type() == TypeTag::kColumnValue) {
-                const std::string u =
-                    bin.Left()->AsColumnValue().GetColumnName().ToString();
-                const std::string v =
-                    bin.Right()->AsColumnValue().GetColumnName().ToString();
-                if (unite(u, v)) {
-                  kept.push_back(conj);
-                } else {
-                  removed = true;
+                const ColumnName lhs_col =
+                    bin.Left()->AsColumnValue().GetColumnName();
+                const ColumnName rhs_col =
+                    bin.Right()->AsColumnValue().GetColumnName();
+                if (!ColumnsProvenDifferentType(memo, lhs_col, rhs_col)) {
+                  const std::string u = lhs_col.ToString();
+                  const std::string v = rhs_col.ToString();
+                  if (unite(u, v)) {
+                    kept.push_back(conj);
+                  } else {
+                    removed = true;
+                  }
+                  continue;
                 }
-                continue;
               }
             }
             kept.push_back(conj);
           }
 ```
 
-`unite` が `false` を返す(= 2 列がすでに同じクラスタ)のが冗長検出です。
+`ColumnsProvenDifferentType` が真の等値項(型が矛盾していて常に偽になる)は
+併合に使わず `kept` へ残します。`unite` が `false` を返す
+(= 2 列がすでに同じクラスタ、または自己等値が既に制約済み)のが冗長検出です。
 **最初に現れた項だけを残す**ので、どの項が残るかは連言内の順序で決まり
 ます(意味は変わらず、評価の安い順に並んでいる前提を活かす設計です)。
 書き戻しは正規化を通して行います。

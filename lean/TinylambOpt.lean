@@ -23,3 +23,37 @@ import TinylambOpt.FusedAggregateJit
 import TinylambOpt.FilterHashProbe
 import TinylambOpt.TlcsBoundaryAggregate
 import TinylambOpt.TpcdsNextDiscovery
+import TinylambOpt.TpchSf10VectorizedExec
+
+-- `issues/` の未証明問題に対する証明モデル（反例定理を含む）
+import TinylambOpt.AdaptiveSelection
+import TinylambOpt.BlockKleene
+import TinylambOpt.BloomBlockIntersection
+import TinylambOpt.CheckedEagerSum
+import TinylambOpt.DeoptResume
+import TinylambOpt.DfaBlockSummary
+import TinylambOpt.FilterEvalOrder
+import TinylambOpt.FirstErrorBallot
+import TinylambOpt.LateGatherVersions
+import TinylambOpt.LazyDictionary
+import TinylambOpt.LikeSegmentChain
+import TinylambOpt.LikeShiftAnd
+import TinylambOpt.LikeUnderscore
+import TinylambOpt.LimitErrorFrontier
+import TinylambOpt.MaskedLoadTail
+import TinylambOpt.MaskToRanges
+import TinylambOpt.NullableMarkJoin
+import TinylambOpt.OuterFetchTies
+import TinylambOpt.OuterOrBranches
+import TinylambOpt.RankScatter
+import TinylambOpt.RegexBitsetNfa
+import TinylambOpt.RegexCapturePriority
+import TinylambOpt.RegexMandatoryLiteral
+import TinylambOpt.RleRunSkip
+import TinylambOpt.SimdGroupConflicts
+import TinylambOpt.SimdInRange
+import TinylambOpt.SnapshotZoneMap
+import TinylambOpt.TopNBlockFence
+import TinylambOpt.TopnBlockFence
+import TinylambOpt.TrigramSkip
+import TinylambOpt.WindowHalo

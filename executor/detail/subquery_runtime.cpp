@@ -528,8 +528,10 @@ void EnsureReusableProjections(TransactionContext& context,
       }
       runtime->reusable_projections[table] = std::move(all);
     } else {
-      runtime->reusable_projections[table] =
-          RequiredColumns(*runtime->root_statement, schema);
+      // A star over derived sources expands their outputs. The direct-star
+      // check above handles stars that actually expand this base table.
+      runtime->reusable_projections[table] = RequiredColumns(
+          *runtime->root_statement, schema, /*ignore_star=*/true);
     }
   }
 }
@@ -2607,6 +2609,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       correlated_expressions.push_back(term.expression);
     }
     for (const Expression& expression : correlated_expressions) {
+      if (!expression) {
+        continue;
+      }
       for (const ColumnName& column : expression->TouchedColumns()) {
         if (column.name == "*") {
           continue;
@@ -3549,6 +3554,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         *out_val = v.MoveValue();
         *kept = true;
       };
+      RelationPtr rejected_group;
       auto emit_group = [&](const std::string& key, GroupAggs& group) {
         AggregateResultMap aggregate_results;
         aggregate_results.reserve(group.accumulators.size());
@@ -3564,11 +3570,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         Row representative;
         Scope scope{
             .row = &representative, .schema = &source.schema, .outer = nullptr};
-        // A HAVING predicate eliminates whole groups.  The probe path
-        // treats a cache miss as an empty relation, so filtered-out groups
-        // must simply not enter the cache; evaluating the group as if it
-        // survived would return a value where SQL requires the scalar NULL
-        // / zero-row semantics.
+        // Cache an empty result for a rejected group. Only a missing key
+        // should be evaluated as an aggregate over empty input.
         if (statement.Having()) {
           if (group_error != Status::kSuccess) {
             return;
@@ -3580,6 +3583,17 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             return;
           }
           if (!Truthy(keep.Value())) {
+            if (!rejected_group) {
+              std::vector<Column> columns;
+              columns.reserve(emit_names.size());
+              for (const auto& name : emit_names) {
+                columns.emplace_back(name, ValueType::kNull);
+              }
+              auto empty = std::make_shared<Relation>();
+              empty->schema = Schema("", std::move(columns));
+              rejected_group = std::move(empty);
+            }
+            created->cached_results.emplace(key, rejected_group);
             return;
           }
         }
@@ -3641,10 +3655,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
               bool kept = false;
               Value val;
               eval_group_scalar(group, &kept, &val);
-              if (group_error == Status::kSuccess && kept) {
-                *created->preagg_int_scalars.TryEmplace(key) = std::move(val);
-              } else if (group_error == Status::kSuccess) {
-                created->preagg_rejected_int_keys.insert(key);
+              if (group_error == Status::kSuccess) {
+                *created->preagg_int_scalars.TryEmplace(key) =
+                    kept ? std::move(val) : Value();
               }
             });
           } else {
@@ -3657,8 +3670,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
               bool kept = false;
               Value val;
               eval_group_scalar(group, &kept, &val);
-              if (group_error == Status::kSuccess && kept) {
-                created->preagg_str_scalars.emplace(key, std::move(val));
+              if (group_error == Status::kSuccess) {
+                created->preagg_str_scalars.emplace(
+                    key, kept ? std::move(val) : Value());
               }
             }
           }
@@ -4055,9 +4069,6 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           hit != nullptr) {
         ++context.execution_runtime()->correlated_result_cache_hits;
         *scalar_answer = *hit;
-      } else if (index->preagg_rejected_int_keys.contains(packed)) {
-        // The group existed but HAVING rejected it: the aggregate is empty.
-        *scalar_answer = Value();
       } else {
         *scalar_answer = index->preagg_empty_scalar;
       }
@@ -4149,6 +4160,12 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       cache_values, [](const Value& value) { return !value.IsNull(); });
   std::optional<std::string> cache_key;
   if (cacheable) {
+    // Fold collation-tagged VARCHARs (and the other peer-equality canonical
+    // forms) so 'A' with a CI tag and a plain 'a' share one cache entry, just
+    // like EqualUnderCollation does for the predicate itself.
+    for (Value& value : cache_values) {
+      value = CanonicalDistinctValue(value);
+    }
     cache_key = Row(std::move(cache_values)).EncodeMemcomparableFormat();
     index->parameter_keys_seen.insert(*cache_key);
     if (const auto cached_result = index->cached_results.find(*cache_key);
@@ -4333,9 +4350,12 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     }
     return copied.MoveValue();
   }
-  auto [iter, inserted] = index->cached_results.emplace(
-      *cache_key, std::make_shared<Relation>(std::move(result)));
-  StatusOr<Relation> copied = MaterializeRelation(*iter->second);
+  auto result_ptr = std::make_shared<Relation>(std::move(result));
+  // A nested FinishQuery may have inserted this key while we were computing;
+  // make the freshly computed result authoritative rather than silently
+  // discarding it and returning the older cache entry.
+  index->cached_results.insert_or_assign(*cache_key, result_ptr);
+  StatusOr<Relation> copied = MaterializeRelation(*result_ptr);
   if (!copied.HasValue()) {
     return std::nullopt;
   }
@@ -4434,6 +4454,9 @@ bool StatementUsesOnlyScopes(  // NOLINT(misc-no-recursion)
   }
   expressions.insert(expressions.end(), statement.GroupBy().begin(),
                      statement.GroupBy().end());
+  expressions.insert(expressions.end(), statement.DistinctOn().begin(),
+                     statement.DistinctOn().end());
+  expressions.push_back(statement.Qualify());
   if (statement.Having()) {
     expressions.push_back(statement.Having());
   }
@@ -4457,6 +4480,12 @@ bool ExpressionsAreLocal(TransactionContext& context,
   }
   expressions.insert(expressions.end(), statement.GroupBy().begin(),
                      statement.GroupBy().end());
+  expressions.insert(expressions.end(), statement.DistinctOn().begin(),
+                     statement.DistinctOn().end());
+  expressions.push_back(statement.Qualify());
+  for (const SelectSource& source : statement.Sources()) {
+    expressions.push_back(source.join_condition);
+  }
   if (statement.Having()) {
     expressions.push_back(statement.Having());
   }
@@ -4531,6 +4560,8 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
         ExpressionChildren(expression),
         [&](const Expression& child) { return self(child, self); });
   };
+  // A set-operation operand can also appear in the legacy UnionAll list.
+  std::unordered_set<const SelectStatement*> visited_operands;
   const auto statement_contains_volatile = [&](const SelectStatement& current,
                                                const auto& self) -> bool {
     for (const NamedExpression& item : current.SelectList()) {
@@ -4540,6 +4571,12 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
       }
     }
     for (const Expression& expression : current.GroupBy()) {
+      if (expression_contains_volatile(expression,
+                                       expression_contains_volatile)) {
+        return true;
+      }
+    }
+    for (const Expression& expression : current.DistinctOn()) {
       if (expression_contains_volatile(expression,
                                        expression_contains_volatile)) {
         return true;
@@ -4581,11 +4618,17 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
         return true;
       }
     }
-    return std::ranges::any_of(
-        current.UnionAll(),
-        [&self](const std::shared_ptr<SelectStatement>& query) {
-          return query && self(*query, self);
-        });
+    const auto operand_contains_volatile = [&](const auto& operand) {
+      return operand && visited_operands.insert(operand.get()).second &&
+             self(*operand, self);
+    };
+    if (const auto& tree = current.GetSetOperationTree(); tree != nullptr) {
+      if (operand_contains_volatile(tree->first) ||
+          std::ranges::any_of(tree->branches, operand_contains_volatile)) {
+        return true;
+      }
+    }
+    return std::ranges::any_of(current.UnionAll(), operand_contains_volatile);
   };
   return statement_contains_volatile(statement, statement_contains_volatile);
 }
@@ -4606,7 +4649,7 @@ bool StatementContainsVolatileFunctionCached(ExecutionRuntime* runtime,
 
 std::string UncorrelatedCacheKey(const SelectStatement& statement,
                                  const CteMap& ctes, bool exists_only) {
-  // Fingerprint() re-serialises the whole statement; the statement is
+  // Fingerprint() re-serializes the whole statement; the statement is
   // immutable while pinned by a session, so memoise by address + runtime id.
   struct FingerprintMemo {
     const SelectStatement* stmt{nullptr};
@@ -4617,9 +4660,7 @@ std::string UncorrelatedCacheKey(const SelectStatement& statement,
   const uint64_t id = statement.RuntimeId();
   if (memo.stmt != &statement || memo.stmt_id != id) {
     memo = FingerprintMemo{
-        &statement, id,
-        statement
-            .Fingerprint()};  // NOLINT(modernize-use-designated-initializers)
+        .stmt = &statement, .stmt_id = id, .text = statement.Fingerprint()};
   }
   std::string key = memo.text;
   key += exists_only ? "|mode=exists" : "|mode=rows";
@@ -4630,7 +4671,8 @@ std::string UncorrelatedCacheKey(const SelectStatement& statement,
   names.reserve(ctes.size());
   for (const auto& [name, relation] : ctes) {
     std::ostringstream part;
-    part << name << '@' << static_cast<const void*>(relation.get());
+    part << name.size() << ':' << name << '@'
+         << static_cast<const void*>(relation.get());
     names.push_back(part.str());
   }
   std::ranges::sort(names);
@@ -4764,7 +4806,7 @@ std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
 
 const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const SelectStatement& statement,
-                                          const CteMap& ctes,
+                                          const CteMap& inherited_ctes,
                                           bool exists_only) {
   if (context.execution_runtime() == nullptr ||
       context.execution_runtime()->noncacheable_queries.contains(&statement) ||
@@ -4772,12 +4814,29 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                               statement)) {
     return nullptr;
   }
+  auto& runtime = *context.execution_runtime();
+  // The result depends only on the inherited bindings the subquery reads.
+  // A recursive CTE can rebind a reference without changing the subquery AST,
+  // so include those bindings in the cache key.
+  CteMap ctes;
+  if (!inherited_ctes.empty()) {
+    if (!statement.WithQueries().empty() || !statement.UnionAll().empty() ||
+        statement.GetSetOperationTree() != nullptr) {
+      return nullptr;
+    }
+    std::unordered_set<std::string> referenced_tables;
+    CollectStatementTableRefs(statement, {}, &referenced_tables);
+    for (const auto& name : referenced_tables) {
+      if (const auto binding = inherited_ctes.find(name);
+          binding != inherited_ctes.end()) {
+        ctes.insert(*binding);
+      }
+    }
+  }
   // Separate AST nodes can describe the same uncorrelated subquery (for
   // example two identical scalar expressions in one SELECT list).  Use a
   // structural key for supported nodes (opaque aggregate/window/set-operation
-  // nodes retain identity), and include the identity of inherited CTE
-  // relations so a name resolving to different materialized contents can
-  // never reuse an unrelated result.
+  // nodes retain identity).
   // EXISTS may safely execute a capped copy, while scalar/IN consumers need
   // the complete relation (and scalar consumers must still observe a second
   // row as a cardinality violation). Never let the capped representation be
@@ -4787,45 +4846,39 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
   // once per outer row, 61128 times) with one pointer-keyed find. The
   // structural fingerprint lookup below hashes a multi-hundred-byte key
   // string and only needs to run when the node entry is missing.
-  const auto cached =
-      context.execution_runtime()->uncorrelated_results.find(&statement);
-  if (cached != context.execution_runtime()->uncorrelated_results.end()) {
-    if (CacheEntryIsCurrent(statement, *context.execution_runtime())) {
-      ++context.execution_runtime()->uncorrelated_cache_hits;
+  std::string structural_key;
+  if (!ctes.empty()) {
+    structural_key = UncorrelatedCacheKey(statement, ctes, exists_only);
+    if (const auto cached = runtime.cte_subquery_results.find(structural_key);
+        cached != runtime.cte_subquery_results.end()) {
+      ++runtime.uncorrelated_cache_hits;
+      return cached->second.result.get();
+    }
+  } else {
+    const auto cached_node = runtime.uncorrelated_results.find(&statement);
+    if (cached_node != runtime.uncorrelated_results.end()) {
+      if (CacheEntryIsCurrent(statement, runtime)) {
+        ++runtime.uncorrelated_cache_hits;
+        return cached_node->second.get();
+      }
+      DropCacheEntry(runtime, &statement);
+      runtime.uncorrelated_results.erase(cached_node);
+    }
+    const uint64_t stmt_id = statement.RuntimeId();
+    auto& memo = runtime.uncorrelated_key_memo[&statement];
+    if (memo.first != stmt_id) {
+      memo = {stmt_id, UncorrelatedCacheKey(statement, ctes, exists_only)};
+    }
+    structural_key = memo.second;
+    if (const auto cached =
+            runtime.uncorrelated_results_by_fingerprint.find(structural_key);
+        cached != runtime.uncorrelated_results_by_fingerprint.end()) {
+      ++runtime.uncorrelated_cache_hits;
+      runtime.uncorrelated_results.emplace(&statement, cached->second);
       return cached->second.get();
     }
-    DropCacheEntry(*context.execution_runtime(), &statement);
-    context.execution_runtime()->uncorrelated_results.erase(cached);
+    CacheEntryIsCurrent(statement, runtime);
   }
-  const uint64_t stmt_id = statement.RuntimeId();
-  auto key_memo =
-      context.execution_runtime()->uncorrelated_key_memo.find(&statement);
-  if (key_memo != context.execution_runtime()->uncorrelated_key_memo.end() &&
-      key_memo->second.first != stmt_id) {
-    key_memo->second = {stmt_id,
-                        UncorrelatedCacheKey(statement, ctes, exists_only)};
-  } else if (key_memo ==
-             context.execution_runtime()->uncorrelated_key_memo.end()) {
-    key_memo =
-        context.execution_runtime()
-            ->uncorrelated_key_memo
-            .emplace(&statement,
-                     std::make_pair(stmt_id, UncorrelatedCacheKey(
-                                                 statement, ctes, exists_only)))
-            .first;
-  }
-  const std::string& structural_key = key_memo->second.second;
-  if (const auto structural =
-          context.execution_runtime()->uncorrelated_results_by_fingerprint.find(
-              structural_key);
-      structural !=
-      context.execution_runtime()->uncorrelated_results_by_fingerprint.end()) {
-    ++context.execution_runtime()->uncorrelated_cache_hits;
-    context.execution_runtime()->uncorrelated_results.emplace(
-        &statement, structural->second);
-    return structural->second.get();
-  }
-  CacheEntryIsCurrent(statement, *context.execution_runtime());
 
   std::vector<Relation> schemas;
   schemas.reserve(statement.Sources().size());
@@ -4927,12 +4980,18 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
   if (!executed.HasValue()) {
     return nullptr;
   }
-  Relation result = executed.MoveValue();
-  auto [iter, inserted] =
-      context.execution_runtime()->uncorrelated_results.emplace(
-          &statement, std::make_shared<Relation>(std::move(result)));
-  context.execution_runtime()->uncorrelated_results_by_fingerprint.emplace(
-      structural_key, iter->second);
+  auto result = std::make_shared<Relation>(executed.MoveValue());
+  if (!ctes.empty()) {
+    const auto [iter, inserted] = runtime.cte_subquery_results.try_emplace(
+        structural_key,
+        ExecutionRuntime::CteSubqueryResult{.bindings = std::move(ctes),
+                                            .result = std::move(result)});
+    return iter->second.result.get();
+  }
+  const auto [iter, inserted] =
+      runtime.uncorrelated_results.emplace(&statement, std::move(result));
+  runtime.uncorrelated_results_by_fingerprint.emplace(structural_key,
+                                                      iter->second);
   return iter->second.get();
 }
 
@@ -5083,6 +5142,9 @@ void CollectStatementTableRefs(const SelectStatement& statement,
     CollectExpressionTableRefs(item.expression, local, names);
   }
   for (const Expression& expression : statement.GroupBy()) {
+    CollectExpressionTableRefs(expression, local, names);
+  }
+  for (const Expression& expression : statement.DistinctOn()) {
     CollectExpressionTableRefs(expression, local, names);
   }
   CollectExpressionTableRefs(statement.Having(), local, names);

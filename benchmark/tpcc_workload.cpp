@@ -112,11 +112,13 @@ constexpr std::array<std::string_view, 10> kLastNameSyllables = {
 
 int ComputeNURand(int a, int x, int y, int c, int rand_a, int rand_xy) {
   (void)a;
-  // TPC-C callers guarantee x < y (fixed ranges or populated scale factors);
-  // the analyzer's "empty range" path already trips UB in Random(x, y) first.
+  // TPC-C callers keep x <= y (fixed ranges or populated scale factors);
+  // x == y is reachable for a one-customer district, giving a range of 1.
+  // The analyzer's "empty range" path already trips UB in Random(x, y) first.
   const int range = y - x + 1;
   const int numerator = (rand_a | rand_xy) + c;
-  // Callers guarantee x < y (see comment above), so the modulo is safe.
+  // Callers guarantee x <= y (see comment above), so range >= 1 and the
+  // modulo is safe.
   // NOLINTNEXTLINE(clang-analyzer-core.DivideZero)
   return (numerator % range) + x;
 }
@@ -375,6 +377,14 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
     }
     return Status::kUnknown;
   }
+  if (scale.items < scale.max_order_lines) {
+    if (error != nullptr) {
+      *error =
+          "item count must cover max order lines (NewOrder picks "
+          "distinct item ids)";
+    }
+    return Status::kUnknown;
+  }
   if (scale.initial_orders_per_district < scale.customers_per_district) {
     if (error != nullptr) {
       *error = "initial orders must cover every customer for Order-Status";
@@ -596,11 +606,13 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
         for (int line = 1; status == Status::kSuccess && line <= line_count;
              ++line) {
           const int item_id = load_random(1, scale.items);
+          // TPC-C 4.3.3.1: a pre-loaded (already delivered) order line has
+          // OL_AMOUNT = 0.00; the 5.00 unit price applies to new orders only.
           status = insert(
               8, Row({Value(warehouse_id), Value(district_id), Value(order_id),
                       Value(line), Value(item_id), Value(warehouse_id),
                       queued ? Value() : Value("2026-01-01 00:00:00"), Value(5),
-                      Value(5.0)}));
+                      Value(0.0)}));
         }
       }
     }
@@ -697,6 +709,9 @@ Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
 #ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
   StatusOr<QueryResult> query_result =
       sql_engine_->Execute(context.Native(), sql);
+  // Count every attempt, including failures, to match the external-session
+  // path above and keep the tpcc_tcp SQL metric from undercounting aborts.
+  ++result->sql_statements;
   if (!query_result.HasValue()) {
     result->error = std::string(ToString(result->type)) + ": " +
                     (sql_engine_->LastError().empty()
@@ -705,7 +720,6 @@ Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
                     " [" + std::string(sql) + "]";
     return query_result.GetStatus();
   }
-  ++result->sql_statements;
   if (std::getenv("TPCC_SQL_TRACE") != nullptr) {
     if (sql.size() <= static_cast<size_t>(std::numeric_limits<int>::max())) {
       fprintf(stderr, "[tpcc-sql][%d] %.*s\n", static_cast<int>(result->type),
@@ -791,8 +805,8 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   result.type = TpccTransactionType::kNewOrder;
   result.warehouse_id = home_warehouse_;
   // TPC-C 5.11.0 §2.4.1.2: unlike Stock-Level, New-Order does not stay on
-  // the terminal's fixed district; it chooses one of the home warehouse's
-  // ten districts for every transaction.
+  // the terminal's fixed district; it picks from the home warehouse's
+  // configured districts (10 at standard scale, fewer in test scales).
   result.district_id = Random(1, scale_.districts_per_warehouse);
   result.customer_id = PickCustomerId();
   const int line_count = Random(scale_.min_order_lines, scale_.max_order_lines);
@@ -880,9 +894,13 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     sql << item_ids[static_cast<size_t>(line)];
   }
   sql << ");";
-  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+  const Status item_read_status = RunSql(context, sql.str(), &rows, &result);
+  if (item_read_status != Status::kSuccess ||
       rows.size() != static_cast<size_t>(line_count)) {
-    if (rollback) {
+    // Only a successful query that came back short because of the invalid
+    // item id is the mandated 1% user rollback. A SQL failure is an engine
+    // abort and must keep its own error (set by RunSql) for classification.
+    if (rollback && item_read_status == Status::kSuccess) {
       // Clause 2.4.3.4 requires the rolled-back O_ID to be displayed. Reserve
       // it transactionally, then abort it along with the invalid item.
       if (!reserve_order_id()) {

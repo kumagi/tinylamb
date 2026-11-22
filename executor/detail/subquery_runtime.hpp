@@ -23,8 +23,9 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+class RuntimeFilterGroup;
 class TransactionContext;
-}
+}  // namespace tinylamb
 
 namespace tinylamb::relational_detail {
 
@@ -335,9 +336,8 @@ struct CorrelatedIndex {
   bool has_preagg_str_scalars{false};
   bool preagg_two_int_key{false};
   bool preagg_empty_has_row{false};
-  // Keys whose group existed but was rejected by HAVING. They must answer
-  // NULL/false, not the empty-input aggregate used for genuinely absent keys.
-  std::unordered_set<int64_t> preagg_rejected_int_keys;
+  // Scalar maps include a NULL entry for each group rejected by HAVING.
+  // Only an absent key uses preagg_empty_scalar.
   FlatIntKeyMap<Value> preagg_int_scalars{};
   FlatIntKeyMap<uint8_t> preagg_seen_keys{};
   std::unordered_map<std::string, Value, TransparentStringHash,
@@ -418,7 +418,7 @@ struct TableKeyFilter {
     return owner == &statement && owner_runtime_id == statement.RuntimeId();
   }
   bool exact_in{false};
-  // Expression this filter was built from, used to recognise the direct
+  // Expression this filter was built from, used to recognize the direct
   // base-scan path during bytecode lowering.
   const ExpressionBase* source_expr{nullptr};
 
@@ -621,6 +621,13 @@ struct ExecutionRuntime {
   // one execution (CSE across a SELECT list).
   std::unordered_map<std::string, RelationPtr>
       uncorrelated_results_by_fingerprint;
+  struct CteSubqueryResult {
+    CteMap bindings;
+    RelationPtr result;
+  };
+  // The key names the referenced CTE relations by address. Keep the bindings
+  // alive so a different relation cannot reuse an address in a cached key.
+  std::unordered_map<std::string, CteSubqueryResult> cte_subquery_results;
   // Hashed membership for uncorrelated `x IN (SELECT ...)` probes.  The
   // NULL flag is recorded once while the hash is built; per-probe NULL
   // ambiguity must never rescan the build relation (Q22-sized builds make a
@@ -748,6 +755,15 @@ struct ExecutionRuntime {
   // Retained for the query so BuildInput does not deep-copy every string
   // before the store would otherwise die. Any Value copied out of the query
   // (InitCopySlow) materializes its own bytes.
+  // Scoped extra runtime filters injected by outer set operations (e.g.
+  // INTERSECT DISTINCT semi-filter from an already-evaluated smaller branch).
+  struct ScopedExtraTableRf {
+    std::string table_name;
+    std::string column_name;
+    std::shared_ptr<const RuntimeFilterGroup> group;
+  };
+  std::vector<ScopedExtraTableRf> scoped_extra_table_rfs;
+
   std::vector<std::shared_ptr<const void>> retained_scan_stores;
   // Relational inner hash joins that keep a resident build and may stream a
   // spilled probe. Counts aggregate across the statement's join steps.

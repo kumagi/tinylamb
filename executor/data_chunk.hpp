@@ -72,7 +72,8 @@ class ColumnVector {
   void SetUnsigned(bool value) { unsigned_ = value; }
   [[nodiscard]] bool IsHeterogeneous() const { return heterogeneous_; }
   void SetAllowHeterogeneous(bool allow) { allow_heterogeneous_ = allow; }
-  void RebindEmptyType(ValueType type, bool is_unsigned) {
+  void RebindEmptyType(ValueType type, bool is_unsigned,
+                       Collation collation = Collation::kNone) {
     // assert() disappears under NDEBUG; leaving stale integers_/doubles_
     // data behind a changed type_ would make ValueAt() silently wrong.
     if (size_ != 0) {
@@ -81,6 +82,18 @@ class ColumnVector {
     type_ = type;
     unsigned_ = is_unsigned;
     heterogeneous_ = false;
+    // The column is empty, so no existing cell is observable. Still drop the
+    // storage (and collation state) left by the previous binding: assert() is
+    // gone under NDEBUG, and appending the new type without this would let
+    // ValueAt() read the old integers_/doubles_/strings_ payload.
+    collation_ = type == ValueType::kVarChar ? collation : Collation::kNone;
+    observed_collation_ = collation_ != Collation::kNone;
+    mixed_collation_ = false;
+    null_bitmap_.clear();
+    integers_.clear();
+    doubles_.clear();
+    strings_.clear();
+    nested_.clear();
   }
   // VARCHAR only: the collator shared by every value in this column, so a
   // value that arrived tagged (COLLATE) leaves the batch carrying it and the

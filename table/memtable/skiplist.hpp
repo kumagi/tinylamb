@@ -52,7 +52,11 @@ class SkipArena final {
     bytes = (bytes + 15U) & ~size_t{15};  // 16B alignment
     if (remaining_ < bytes) {
       const size_t cap = bytes > kChunkSize ? bytes : kChunkSize;
-      // Each chunk owns its bytes even if growing the outer vector throws.
+      // The chunk owns its bytes: emplace_back either succeeds (vector<char>'s
+      // move steals the allocation, so `chunks_.back().data()` owns it) or
+      // throws with the outer vector unchanged. Reallocation moves the other
+      // chunks too, but only cursor_ points into them and it is refreshed
+      // from the newly appended chunk right below.
       chunks_.emplace_back(cap);
       cursor_ = chunks_.back().data();
       remaining_ = cap;
@@ -85,8 +89,9 @@ class SkipArena final {
 
 // Ordered map keyed by memcomparable byte strings, tuned for write-heavy
 // memtable duty: one arena allocation per entry (key bytes stored inline),
-// probabilistic balancing, and O(log n) search with short lock-free-friendly
-// read paths. Values are RowEntries (row payload + tombstone flag).
+// probabilistic balancing, and O(log n) search with cache-friendly but
+// non-atomic reads. Values are RowEntries (row payload + tombstone flag).
+// Reads are NOT lock-free: MemTable's per-shard mutex must be held (see Find).
 //
 // Not thread-safe by itself: MemTable serializes access.
 class SkipList final {

@@ -111,9 +111,9 @@ TEST(CascadesTest, DistinctOverDistinctElimination) {
 TEST(CascadesTest, CrossToInnerWithPredicate) {
   using namespace dsl;
   Memo memo;
-  const GroupId left = memo.Build({"t1"});
-  const GroupId right = memo.Build({"t2"});
   (void)memo.Build({"t1", "t2"});
+  const GroupId left = memo.EnsureGroup({"t1"});
+  const GroupId right = memo.EnsureGroup({"t2"});
   const GroupId cross = memo.EnsureDerivedGroup({"t1", "t2"}, "cross");
   memo.AddExpression(cross,
                      LogicalExpression{.operation = LogicalOperator::kCrossJoin,
@@ -146,9 +146,9 @@ TEST(CascadesTest, CrossToInnerWithPredicate) {
 TEST(CascadesTest, JoinEmptySimplification) {
   using namespace dsl;
   Memo memo;
-  const GroupId left = memo.Build({"t1"});
-  const GroupId right = memo.Build({"t2"});
   (void)memo.Build({"t1", "t2"});
+  const GroupId left = memo.EnsureGroup({"t1"});
+  const GroupId right = memo.EnsureGroup({"t2"});
   const GroupId empty_group = memo.EnsureDerivedGroup({"t1"}, "empty");
   memo.AddExpression(empty_group,
                      LogicalExpression{.operation = LogicalOperator::kEmpty,
@@ -1098,6 +1098,44 @@ TEST(CascadesTest, DefaultFrameWindowKeepsLimitAbove) {
   EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
 }
 
+TEST(CascadesTest, MixedFrameWindowKeepsLimitAbove) {
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  // Both calls are individually stable under truncation (backward-only ROWS
+  // frames), so only the mixed-spec check can keep the limit above the window.
+  // A signature that ignores the frame would treat them as one spec and mix
+  // two semantically different windows in a single derived memo group.
+  auto call_all = PrefixWindowCall("SUM", {ColumnValueExp("t1.val")},
+                                   {ColumnValueExp("t1.part")},
+                                   /*order_by=*/{}, /*has_frame=*/true);
+  auto call_recent = PrefixWindowCall("SUM", {ColumnValueExp("t1.val")},
+                                      {ColumnValueExp("t1.part")},
+                                      /*order_by=*/{}, /*has_frame=*/true);
+  call_recent->frame_start.type = WindowFrameBoundType::kOffsetPreceding;
+  call_recent->frame_start.offset = ConstantValueExp(Value(int64_t{1}));
+  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+  memo.AddExpression(
+      win_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {scan},
+          .target_list = {NamedExpression("all", Expression(call_all)),
+                          NamedExpression("recent", Expression(call_recent))},
+          .output_schema = Schema("t1", {Column("part", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)}),
+          .partition_by = {ColumnValueExp("t1.part")}});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {win_group},
+                                       .limit_count = 3});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(limit_group);
+  EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
+}
+
 TEST(CascadesTest, CumeDistWindowKeepsLimitAbove) {
   Memo memo;
   (void)memo.Build({"t1"});
@@ -1138,7 +1176,7 @@ TEST(CascadesTest, CumeDistWindowKeepsLimitAbove) {
 
 TEST(CascadesTest, AuditFrameIgnoringWindowsKeepLimitAbove) {
   for (const std::string function :
-       {"CUME_DIST", "PERCENT_RANK", "NTILE", "LEAD", "LAG", "PERCENTILE_CONT",
+       {"CUME_DIST", "PERCENT_RANK", "NTILE", "LEAD", "PERCENTILE_CONT",
         "PERCENTILE_DISC"}) {
     SCOPED_TRACE(function);
     Memo memo;

@@ -32,20 +32,22 @@ graph TD
 パターン照合は `Join()` であり、対象演算子は `LogicalOperator::kJoin` に限定されます。
 
 ```cpp
-        [](const Bindings&, Memo& memo, GroupId,
+        [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (expression.predicate) {
+          if (SelectionMayStrengthenSharedScans(memo, group) &&
+              expression.predicate) {
             InferJoinInequalities(memo, *expression.predicate);
           }
         },
         LogicalOperator::kJoin));
 ```
 
-ヘルパー関数 `InferJoinInequalities` 内において、以下のガード条件が評価されます。
+登録ラムダでは、まず `SelectionMayStrengthenSharedScans(memo, group)` を確認し、共有スキャンを強化する Selection が無い場合は推論しません。その上で、ヘルパー関数 `InferJoinInequalities` 内において以下のガード条件が評価されます。
 
-1. **等式連言の検出**: 結合述語の連言のうち、両辺が `kColumnValue` である等号式（`kEquals`）を推論の伝播路として抽出します。
-2. **不等号連言の抽出**: `from` 側の単一表グループの scan filter を走査し、「列 OP 定数」または「定数 OP 列」（`OP` は `kEquals` 以外の二項演算子）である連言を対象とします。等号式は明示的にスキップされます。
-3. **修飾名の存在と関係集合の包含**: `from.schema.empty() || to.schema.empty()` を拒絶し、さらに `memo.ContainsRelation({from.schema, to.schema})` が真であることを要求します。
+1. **共有スキャン強化の確認**: `SelectionMayStrengthenSharedScans(memo, group)` が偽の場合は何もしません。
+2. **等式連言の検出**: 結合述語の連言のうち、両辺が `kColumnValue` である等号式（`kEquals`）を推論の伝播路として抽出します。
+3. **不等号連言の抽出**: `from` 側の単一表グループの scan filter を走査し、「列 OP 定数」または「定数 OP 列」の連言のうち、`OP` が `kNotEquals` / `kLessThan` / `kLessThanEquals` / `kGreaterThan` / `kGreaterThanEquals` のいずれかであるものだけを対象とします。等号式（`kEquals`）を含むホワイトリスト外の演算子はスキップされます。
+4. **修飾名の存在と関係集合の包含**: `from.schema.empty() || to.schema.empty()` を拒絶し、さらに `memo.ContainsRelation({from.schema, to.schema})` が真であることを要求します。
 
 ## 意味論的根拠と三値論理・代数的一致
 
@@ -53,7 +55,7 @@ graph TD
 
 内側結合の出力行は結合述語 `t1.x = t2.y` を必ず満たします。三値論理において、どちらかが NULL の場合、比較結果は UNKNOWN となり内側結合の出力から除外されます。また、`t1` 側スキャンを通過する行は `t1.x > 10` を満たす必要があります（NULL の場合は除外済み）。したがって、結合出力行において `t2.y = t1.x > 10` が成立するため、`t2.y > 10` を `t2` 側のスキャンフィルタに追加しても、元々出力されるはずだった行が不当に除外されることはなく、代数的一致性が保たれます。
 
-本 Rule において等号式をスキップする理由は、等式からの定数推論は `infer_join_predicates` が専任で担っており、最適化 Rule 間の責務分担を明確にするためです。
+本 Rule が対象とするのは上記 5 演算子のホワイトリストだけです。等号式（`kEquals`）がこれに含まれないのは、等式からの定数推論は `infer_join_predicates` が専任で担っており、最適化 Rule 間の責務分担を明確にするためです。ホワイトリスト外の他の演算子も同様に除外されます。
 
 外部結合に対する適用禁止（`kJoin` 限定）の理由は、外部結合における NULL 補完行の存在に起因します。`t1 LEFT JOIN t2 ON t1.x = t2.y` において、`t2` 側にマッチする行が存在しない場合、`t2.y` は NULL として保持される必要があります。推論された不等号を `t2` のスキャンへ適用すると、本来 NULL 補完行として残るべき結合候補が消失し、結果が壊れます。
 
@@ -70,7 +72,12 @@ graph TD
           continue;
         }
         const auto& f_bin = filter_conjunct->AsBinaryExpression();
-        if (f_bin.Op() == BinaryOperation::kEquals) {
+        const BinaryOperation op = f_bin.Op();
+        if (op != BinaryOperation::kNotEquals &&
+            op != BinaryOperation::kLessThan &&
+            op != BinaryOperation::kLessThanEquals &&
+            op != BinaryOperation::kGreaterThan &&
+            op != BinaryOperation::kGreaterThanEquals) {
           continue;
         }
         if (f_bin.Left()->Type() == TypeTag::kColumnValue &&

@@ -18,7 +18,7 @@ Lean 4 で機械検証（`sorry` ゼロ）します。
    - 対象: **Q08**, **Q15**, **Q79**, **Q62**, **Q99**
 3. **二値全域述語（`IS [NOT] NULL / TRUE / FALSE`）上の `NOT` 対合正規化 (`two_valued_predicate_not_involution_sound`)**
    - 対象: **Q97**, **Q72**, **Q51**, **Q83**
-4. **事前構築 `EXISTS / NOT EXISTS` の外側非 NULL ドメイン制限 ＆ 結合前プッシュダウン (`prebuilt_exists_outer_domain_and_pushdown_sound`)**
+4. **事前構築 `EXISTS / NOT EXISTS` の外側非 NULL ドメイン制限 ＆ 結合前プッシュダウン (`prebuilt_exists_outer_domain_filter_sound` / `single_source_exists_pushdown_before_inner_join_sound`)**
    - 対象: **Q10**, **Q35**, **Q69**, **Q16**
 5. **融合 `AntiJoin` グループ集約カーネル (`fused_antijoin_groupby_sound`)**
    - 対象: **Q78**（`(sales ⋈ date_dim) ▷ returns` の中間表マテリアライズ完全排除・`GroupedOutputSink` 直結）
@@ -182,7 +182,7 @@ def sqlIsNotFalse : SqlBool → SqlBool
   | .tFalse => .tFalse
   | _       => .tTrue
 
-/-- ❌ **罠 3 (`sqlNot_eq_not_neq_on_null_trap`)**:
+/-- ❌ **罠 3 (`isNull_family_never_tNull_trap`)**:
     一般の比較 `a = b` は `tNull` を返し得るが、`IS NULL` 系は決して `tNull` を返さない。 -/
 theorem sqlIsNull_never_tNull {α : Type} (v : SqlVal α) :
     sqlIsNull v ≠ .tNull ∧ sqlIsNotNull v ≠ .tNull := by
@@ -1788,7 +1788,7 @@ theorem trap_singleton_cross_join_sum_not_idempotent :
 --   従って `e` を含む比較述語 `P(r, e)` を JOIN / CTE 境界を越えてプッシュダウンしても、
 --   評価回数減少によって例外観測が消滅することはない (`isSome (evalRow r) = true`)。
 
-/-- ✅ **定理 24 (`closed_const_non_throwing_eval_independent_of_row`)**:
+/-- ✅ **定理 19 (`closed_const_non_throwing_eval_independent_of_row`)**:
     入力行に依存しない純粋閉部分式 `evalRow : Row → Option Val` (`∀ r, evalRow r = evalClosed`) が
     空環境で `evalClosed = some v` に成功するならば、すべての行 `r` で例外なく同一値 `some v` を返す。 -/
 theorem closed_const_non_throwing_eval_independent_of_row
@@ -1816,7 +1816,7 @@ theorem trap_throwing_closed_const_not_droppable :
 --     (TPC-DS Q41: 3,097ms → <2ms)
 -- ============================================================================
 
-/-- ✅ **定理 25 (`kleene_and_or_distrib_left_sound`)**:
+/-- ✅ **定理 20 (`kleene_and_or_distrib_left_sound`)**:
     Kleene 3 値論理 (`SqlBool`) においても、`AND` の `OR` に対する左分配律
     `(a AND b) OR (a AND c) = a AND (b OR c)` は全 27 通りすべてで厳密に恒等である。
     これにより相関サブクエリ内の `(i_manufact = i1.i_manufact AND P₁) OR (i_manufact = i1.i_manufact AND P₂)`
@@ -1902,7 +1902,7 @@ theorem filter_eq_nonEmpty_eq_in_filterMap
             rw [List.filterMap_cons_some hK, List.any_cons, hEq, Bool.false_or]
             exact ih
 
-/-- ✅ **定理 26 (`correlated_count_gt_zero_to_in_subquery_sound`)**:
+/-- ✅ **定理 21 (`correlated_count_gt_zero_to_in_subquery_sound`)**:
     最上位 `WHERE` 連言における相関 `(SELECT COUNT(*) FROM S WHERE innerKey(s) = outerKey(o) AND innerPred(s)) > 0`
     は、外部キー `outerKey(o)` が `NULL` の場合も含め、`outerKey(o) IN (SELECT innerKey(s) FROM S WHERE innerPred(s) AND innerKey(s) IS NOT NULL)`
     と 100% 同値である。 -/
@@ -1954,7 +1954,7 @@ def sqlOptSumCombine : Option Int → Option Int → Option Int
   | some a, none => some a
   | some a, some b => some (a + b)
 
-/-- ✅ **定理 27 (`rollup_sum_homomorphic_arbitrary_expr_sound`)**:
+/-- ✅ **定理 22 (`rollup_sum_homomorphic_arbitrary_expr_sound`)**:
     任意の純粋行式 `f : Row → Option Int`（`COALESCE(a * b, 0)` を含む）に対し、
     分割された行リスト `xs ++ ys` 上の `SUM` は、部分 `SUM` 同士の `sqlOptSumCombine`（すなわち外側の `SUM`）と
     空入力・全 NULL グループを含めて完全に一致する。 -/
@@ -1976,7 +1976,7 @@ theorem rollup_sum_homomorphic_arbitrary_expr_sound
       cases sqlOptSum (List.map f xs') <;> cases sqlOptSum (List.map f ys) <;>
         simp [sqlOptSumCombine, Int.add_assoc]
 
-/-- ✅ **定理 28 (`interleaved_worker_partition_bijection_sound`)**:
+/-- ✅ **定理 23 (`interleaved_worker_partition_bijection_sound`)**:
     ブロック番号 `b < B` を `w = b % W` (`W > 0`) により各ワーカー `w ∈ 0..W-1` に静的インターリーブ割当すると、
     すべてのブロック `b` は一意なワーカー `w < W` に属し、実行ごとに各ワーカーが訪問するブロック列が
     100% 決定論的に定まる（アトミック競合による浮動小数点加算順の揺らぎを根絶する）。 -/
@@ -2016,7 +2016,7 @@ theorem leftJoinRowMatches_true_implies_any
     rcases hMem with ⟨r, ⟨hrMem, hrEq⟩, rfl⟩
     exact List.any_eq_true.mpr ⟨r, hrMem, by simp [hrEq, hPred]⟩
 
-/-- ✅ **定理 29 (`left_join_disjunctive_null_rejecting_semi_filter_sound`)**:
+/-- ✅ **定理 24 (`left_join_disjunctive_null_rejecting_semi_filter_sound`)**:
     `L LEFT JOIN R₁ ... LEFT JOIN R₂ ... WHERE P₁(r₁) OR P₂(r₂)` において、
     各枝 `P₁, P₂` が全 NULL パディング行を棄却する（`P₁(none) = false`, `P₂(none) = false`、
     例: `COALESCE(ws_qty, 0) > 0`）ならば、生存するすべての左行 `l ∈ L` は
@@ -2083,7 +2083,7 @@ theorem trap_left_join_non_strict_predicate_semi_unsound :
     R1s.any (fun r1 => sqlEqOptBool (some 42) (some r1) && P1 (some r1)) = false := by
   exact ⟨rfl, rfl⟩
 
-/-- ✅ **定理 30 (`packed_int32_pair_bijection_sound`)**:
+/-- ✅ **定理 25 (`packed_int32_pair_bijection_sound`)**:
     符号付き 32 ビット整数領域 `[-2^31, 2^31 - 1]` に収まる 2 列 `(a, b)` を
     `pack(a, b) = (a + 2^31) * 2^32 + (b + 2^31)` で単一 64 ビット整数へパックすると完全単射となる。 -/
 def packInt32Pair (a b : Int) : Int :=
@@ -2120,7 +2120,7 @@ def evalCondCaseCellFast {L R : Type}
   | true => expr l
   | false => some 0
 
-/-- ✅ **定理 31 (`conditional_case_double_arith_cell_eval_sound`)**:
+/-- ✅ **定理 26 (`conditional_case_double_arith_cell_eval_sound`)**:
     `expr(l)` が無例外な純粋算術式であるとき、`cond(r) = false` の行で左列ロードと算術評価を完全にスキップする
     `evalCondCaseCellFast` は、`SUM` および `COUNT` の両アキュムレータで標準 `CASE` 評価と厳密に一致する。 -/
 theorem conditional_case_double_arith_cell_eval_sound
@@ -2132,7 +2132,7 @@ theorem conditional_case_double_arith_cell_eval_sound
   unfold evalCondCaseCellFast evalCondCaseElseZero
   cases cond p.2 <;> rfl
 
-/-- ✅ **定理 32 (`multi_join_shared_unique_dim_deferral_sound`)**:
+/-- ✅ **定理 27 (`multi_join_shared_unique_dim_deferral_sound`)**:
     次元表関数 `ukOfPk : PK → UK` が単射（`c_customer_sk ↔ c_customer_id` の双方向 UNIQUE NOT NULL）であるとき、
     各チャネル集計側で先に `D` を結合してから `ukOfPk fk₁ == ukOfPk fk₂` で外部結合する式と、
     整数サロゲートキー `fk₁ == fk₂` で直接結合した後に `D` を 1 回だけ適用する式は 100% 同値である。 -/

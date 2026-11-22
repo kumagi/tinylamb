@@ -25,8 +25,8 @@
 #include <cstdlib>
 #include <limits>
 #include <string>
-#include <vector>
 #include <system_error>
+#include <vector>
 
 #include "common/platform/os.hpp"
 
@@ -268,13 +268,28 @@ int Dup(int fd) {
 
 ssize_t Write(int fd, const void* buf, size_t count) {
 #ifdef TINYLAMB_OS_WINDOWS
-  const auto capped = static_cast<unsigned int>(
-      std::min<size_t>(count, static_cast<size_t>(INT_MAX)));
-  const int r = ::_write(fd, buf, capped);
-  if (r < 0 && errno == EACCES) {
-    errno = EBADF;
+  // _write takes an unsigned int byte count. Loop so a bulk write larger than
+  // INT_MAX is not silently truncated to its first chunk (POSIX ::write gets
+  // the full size_t count in one call).
+  const auto* bytes = static_cast<const unsigned char*>(buf);
+  size_t written = 0;
+  while (written < count) {
+    const auto capped = static_cast<unsigned int>(
+        std::min<size_t>(count - written, static_cast<size_t>(INT_MAX)));
+    const int r = ::_write(fd, bytes + written, capped);
+    if (r < 0) {
+      if (errno == EACCES) {
+        errno = EBADF;
+      }
+      // Match POSIX: report partial progress rather than discarding it.
+      return written == 0 ? -1 : static_cast<ssize_t>(written);
+    }
+    if (r == 0) {
+      break;  // No progress: avoid spinning forever on a short write.
+    }
+    written += static_cast<size_t>(r);
   }
-  return r;
+  return static_cast<ssize_t>(written);
 #else
   return ::write(fd, buf, count);
 #endif
@@ -436,10 +451,10 @@ int SyncDirectory(const std::filesystem::path& dir) {
 #ifdef TINYLAMB_OS_WINDOWS
   // Flush the directory entry itself so a rename is durable across a power
   // loss. FILE_FLAG_BACKUP_SEMANTICS is required to open a directory handle.
-  HANDLE h = ::CreateFileW(dir.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING,
-                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  HANDLE h = ::CreateFileW(
+      dir.c_str(), GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (h == INVALID_HANDLE_VALUE) {
     errno = MapWin32ErrorToErrno(::GetLastError());
     return -1;
@@ -486,16 +501,28 @@ int DataSync(int fd) {
     const DWORD err = ::GetLastError();
     if (err == ERROR_ACCESS_DENIED) {
       // Windows cannot FlushFileBuffers through a read-only handle. Recover
-      // the file name and flush via a writable handle so callers still get
-      // a real durability barrier (matching POSIX fdatasync on O_RDONLY).
-      alignas(FILE_NAME_INFO) char buf[sizeof(FILE_NAME_INFO) +
-                                       (MAX_PATH + 1) * sizeof(wchar_t)];
-      auto* info = reinterpret_cast<FILE_NAME_INFO*>(buf);
-      if (::GetFileInformationByHandleEx(reinterpret_cast<HANDLE>(raw),
-                                         FileNameInfo, buf, sizeof(buf)) &&
-          info->FileNameLength > 0) {
-        std::wstring path(info->FileName,
-                          info->FileNameLength / sizeof(wchar_t));
+      // the file's full path and flush via a writable handle so callers still
+      // get a real durability barrier (matching POSIX fdatasync on O_RDONLY).
+      // GetFinalPathNameByHandleW returns a DOS path including the drive
+      // letter; FILE_NAME_INFO's volume-relative name resolves against the
+      // current drive and would target the wrong file (or fail) when the DB
+      // lives on a different drive than the CWD.
+      const HANDLE handle = reinterpret_cast<HANDLE>(raw);
+      std::wstring path;
+      const DWORD path_chars = ::GetFinalPathNameByHandleW(
+          handle, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+      if (path_chars > 0) {
+        path.resize(path_chars);
+        const DWORD written =
+            ::GetFinalPathNameByHandleW(handle, path.data(), path_chars,
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (written > 0 && written < path_chars) {
+          path.resize(written);
+        } else {
+          path.clear();
+        }
+      }
+      if (!path.empty()) {
         HANDLE writable = ::CreateFileW(
             path.c_str(), GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -588,7 +615,11 @@ void AdviseMemoryRange(const uint8_t* base, size_t map_size, size_t offset,
   const size_t page_size =
       raw_page > 0 ? static_cast<size_t>(raw_page) : static_cast<size_t>(4096);
   const size_t aligned_offset = offset & ~(page_size - 1);
-  const size_t aligned_len = (offset - aligned_offset) + clamped_len;
+  // clamped_len already ends at or before map_size, so extending the start
+  // down to the page boundary keeps the advised range inside the mapping:
+  // aligned_offset + aligned_len == offset + clamped_len <= map_size.
+  const size_t aligned_end = offset + clamped_len;
+  const size_t aligned_len = aligned_end - aligned_offset;
   // POSIX madvise takes non-const void* even for read-only mappings.
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
   (void)::madvise(const_cast<uint8_t*>(base + aligned_offset), aligned_len,

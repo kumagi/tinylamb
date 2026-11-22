@@ -5,6 +5,7 @@
 #include <atomic>
 #include <barrier>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -497,12 +498,13 @@ void SelfTest() {
 }
 
 size_t Number(const std::string& text) {
-  size_t used = 0;
-  const auto value = std::stoull(text, &used);
-  if (used != text.size() || text.starts_with('-') || value > SIZE_MAX) {
+  size_t value = 0;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size()) {
     throw std::invalid_argument("invalid unsigned option");
   }
-  return static_cast<size_t>(value);
+  return value;
 }
 Options Parse(int argc, char** argv) {
   Options o;

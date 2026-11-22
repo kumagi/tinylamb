@@ -85,9 +85,11 @@ class Session final : public TpccSqlSession {
     }
     return Receive(&ignored);
   }
-  Status Begin(bool /*read_only*/) override {
+  Status Begin(bool read_only) override {
     std::vector<Row> ignored;
-    return Execute("BEGIN", &ignored);
+    // Match the in-process session contract: OrderStatus/StockLevel open a
+    // read-only transaction, which the server can serve without write intents.
+    return Execute(read_only ? "BEGIN READ ONLY" : "BEGIN", &ignored);
   }
   Status Commit() override {
     std::vector<Row> ignored;
@@ -466,7 +468,9 @@ int main(int argc, char** argv) {
         // One worker only, diagnostics only. Never use traced latency/TPS in
         // comparisons: trace formatting and output alter the generator's pace.
         if (trace_sql && i == 0) {
-          static_cast<Session*>(session.get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+          static_cast<Session*>(
+              session
+                  .get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               ->TraceTransaction(++trace_sequence, t);
         }
         const auto before = Clock::now();

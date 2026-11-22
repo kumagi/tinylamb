@@ -35,15 +35,15 @@ graph TD
 5. 冗長連言の除去が行われ（`reduced == true`）、かつ残余の連言が 1 つ以上存在すること（`!kept.empty()`）。
 
 ```cpp
-                    if ((bin.Op() == BinaryOperation::kLessThanEquals &&
-                         k <= bound) ||
-                        (bin.Op() == BinaryOperation::kGreaterThanEquals &&
-                         k >= bound) ||
-                        (bin.Op() == BinaryOperation::kLessThan && k < bound) ||
-                        (bin.Op() == BinaryOperation::kGreaterThan &&
-                         k > bound)) {
-                      reduced = true;
-                      continue;
+                    if (!k.IsNull() && !bound.IsNull() &&
+                        k.type == bound.type) {
+                      const StatusOr<Value> eval =
+                          TryEvaluateBinary(bin.Op(), k, bound);
+                      if (eval.HasValue() && !eval.Value().IsNull() &&
+                          eval.Value().Truthy()) {
+                        reduced = true;
+                        continue;
+                      }
                     }
 ```
 
@@ -71,17 +71,26 @@ $$(x = k) \land (x \le b) \equiv (x = k)$$
 ```cpp
           std::unordered_map<std::string, Value> eq_constants;
           for (const auto& conj : conjuncts) {
-            if (conj && conj->Type() == TypeTag::kBinaryExp) {
+            if (conj && conj->Type() == TypeTag::kBinaryExp &&
+                !ContainsParameterSlot(conj)) {
               const auto& bin = conj->AsBinaryExpression();
               if (bin.Op() == BinaryOperation::kEquals) {
                 if (bin.Left()->Type() == TypeTag::kColumnValue &&
                     bin.Right()->Type() == TypeTag::kConstantValue) {
-                  eq_constants
-                      [bin.Left()->AsColumnValue().GetColumnName().ToString()] =
-                          bin.Right()->AsConstantValue().GetValue();
+                  const Value& val = bin.Right()->AsConstantValue().GetValue();
+                  if (!val.IsNull()) {
+                    eq_constants.try_emplace(
+                        bin.Left()->AsColumnValue().GetColumnName().ToString(),
+                        val);
+                  }
                 } else if (bin.Right()->Type() == TypeTag::kColumnValue &&
                            bin.Left()->Type() == TypeTag::kConstantValue) {
-                  // 定数が左辺の場合の抽出処理
+                  const Value& val = bin.Left()->AsConstantValue().GetValue();
+                  if (!val.IsNull()) {
+                    eq_constants.try_emplace(
+                        bin.Right()->AsColumnValue().GetColumnName().ToString(),
+                        val);
+                  }
                 }
               }
             }

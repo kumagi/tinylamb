@@ -96,7 +96,7 @@ namespace detail {
 // in place: the previous std::string copy plus std::stringstream double-
 // copied every payload (index-key decode runs per entry on scan hot paths).
 // The default underflow() reports EOF once the area is consumed, which is
-// exactly the failbit behaviour the istream-based Decoder relies on, and
+// exactly the failbit behavior the istream-based Decoder relies on, and
 // peek()-at-end keeps AtEnd()'s optional-trailing-field contract intact.
 class StringViewBuffer final : public std::streambuf {
  public:
@@ -112,10 +112,10 @@ class StringViewBuffer final : public std::streambuf {
 }  // namespace detail
 
 // Decode an object from its in-memory encoded form. Returns a Corrupt status
-// when the stream runs out mid-decode so callers never receive a partially
-// built object. T must be default constructible and provide `Decoder&
-// operator>>(Decoder&, T&)`. |src| must outlive the call (it always does:
-// decoding completes before Decode returns).
+// when decoding fails or bytes remain, so callers never receive a partial
+// object or silently accept a malformed trailing payload. T must be default
+// constructible and provide `Decoder& operator>>(Decoder&, T&)`. |src| must
+// outlive the call (it always does: decoding completes before Decode returns).
 template <typename T>
 StatusOr<T> Decode(std::string_view src) {
   detail::StringViewBuffer buffer(src);
@@ -123,7 +123,7 @@ StatusOr<T> Decode(std::string_view src) {
   Decoder dec(is);
   T ret;
   dec >> ret;
-  if (!is) {
+  if (!is || buffer.sgetc() != std::char_traits<char>::eof()) {
     return StatusError(StatusCode::kCorrupt,
                        "Decode failed: truncated or corrupt input");
   }

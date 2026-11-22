@@ -2,22 +2,54 @@
 #include "expression/jit.hpp"
 
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "common/regex_guard.hpp"
+#include "expression/bytecode.hpp"
+#include "expression/expression.hpp"
 #include "gtest/gtest.h"
 
 namespace tinylamb {
+
+TEST(JitTest, BranchlessProgramsSurviveCacheEviction) {
+  const Schema schema("input", {Column("x", ValueType::kInt64)});
+  std::vector<JitBranchlessProgram> programs;
+  for (int64_t i = 0; i < 70; ++i) {
+    auto expression = BinaryExpressionExp(
+        ColumnValueExp("x"), BinaryOperation::kAdd, ConstantValueExp(Value(i)));
+    auto bytecode = BytecodeCompiler::Compile(expression, schema);
+    ASSERT_TRUE(bytecode.has_value());
+    auto compiled = JitBranchlessProgram::Compile(*bytecode, schema);
+    if (!compiled) {
+      GTEST_SKIP() << "LLVM JIT unavailable";
+    }
+    programs.push_back(std::move(*compiled));
+  }
+  const int64_t value = 12;
+  const std::array<JitColumnInput, 1> columns{{{.values = &value}}};
+  for (size_t i = 0; i < programs.size(); ++i) {
+    int64_t output = 0;
+    uint8_t is_null = 0;
+    bool any_null = false;
+    ASSERT_TRUE(programs[i].Evaluate(columns, 1, &output, &is_null, &any_null));
+    EXPECT_EQ(output, 12 + static_cast<int64_t>(i));
+    EXPECT_FALSE(any_null);
+  }
+}
 
 TEST(JitTest, DelimitedCaptureAgreesWithGreedyRegexReplacement) {
   constexpr std::string_view pattern =
@@ -279,11 +311,12 @@ TEST(JitTest, JitKernel_MoveAssignment_TransfersKernel) {
   auto filter = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   auto projection = JitInt64Kernels::CompileProjection();
   if (!filter.has_value() || !projection.has_value()) {
-  // JIT is optional; skip the kernel tests when LLVM is unavailable.
-  if (!JitInt64Kernels::CompileFilter(BinaryOperation::kEquals).has_value()) {
-    GTEST_SKIP() << "JIT disabled";
-  }
-    GTEST_FAIL() << "failed";
+    // JIT is optional; skip when LLVM is unavailable (no filter kernel).
+    // Reaching here with a filter but no projection is a real failure.
+    if (!filter.has_value()) {
+      GTEST_SKIP() << "JIT disabled";
+    }
+    GTEST_FAIL() << "projection kernel compilation failed";
     return;
   }
   std::vector<int64_t> input{1, 2, 3};
@@ -350,6 +383,480 @@ TEST(JitTest, JitKernel_WhenInvokingWrongAccessor_ThrowsLogicError) {
                "not a sum kernel");
   EXPECT_DEATH(sum->Project(input.data(), output.data(), input.size(), 1, 1),
                "not a projection kernel");
+}
+
+TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
+  auto scatter = JitDenseSplitRadixAgg::CompileScatter(/*part_shift=*/2);
+  auto accum_avg = JitDenseSplitRadixAgg::CompileAccum(/*is_avg=*/true,
+                                                       /*check_inf=*/false);
+  auto accum_inf = JitDenseSplitRadixAgg::CompileAccum(/*is_avg=*/false,
+                                                       /*check_inf=*/true);
+  if (!scatter.has_value() || !accum_avg.has_value() ||
+      !accum_inf.has_value()) {
+    GTEST_SKIP() << "JIT disabled";
+  }
+
+  // Test kMulDoubleInt across 2 partitions (part_shift=2 -> 4 local gids/part).
+  auto ext_mul =
+      JitDenseSplitRadixAgg::CompileExtract(JitDenseSplitRadixAgg::ExtractSpec{
+          .op = JitDenseSplitRadixAgg::ExprOp::kMulDoubleInt,
+          .use_sel = true,
+          .jk_has_null = true,
+          .pk0_has_null = true,
+          .val_null_mask = 0x03U,
+          .part_shift = 2,
+      });
+  auto ext_coal =
+      JitDenseSplitRadixAgg::CompileExtract(JitDenseSplitRadixAgg::ExtractSpec{
+          .op = JitDenseSplitRadixAgg::ExprOp::kCoalesceMulZero,
+          .use_sel = false,
+          .jk_has_null = false,
+          .pk0_has_null = false,
+          .val_null_mask = 0x03U,
+          .part_shift = 2,
+      });
+  ASSERT_TRUE(ext_mul.has_value());
+  ASSERT_TRUE(ext_coal.has_value());
+
+  // 2 parts * 4 local gids/part = 8 total gids (r_card=4, pk0_card=2).
+  // jk_min = 10, key_to_rsubgid: [0, UINT32_MAX, 2, 3] (10->0, 11->skip, 12->2,
+  // 13->3) pk0_min = 100, pk0_subgid: [0, 1] (100->0, 101->1) Expect gid =
+  // r_subgid * 2 + p_subgid:
+  //   (10,100)->gid 0 (part 0, lg 0)
+  //   (12,101)->gid 5 (part 1, lg 1)
+  //   (13,101)->gid 7 (part 1, lg 3)
+  const std::vector<uint32_t> key_to_r{0, UINT32_MAX, 2, 3};
+  const std::vector<uint32_t> pk0_lut{0, 1};
+
+  const std::vector<int64_t> jk_vals{10, 10, 11, 12, 13, 12, 10, 99};
+  const std::vector<uint8_t> jk_nulls{0, 1, 0, 0, 0, 0, 0, 0};
+  const std::vector<int64_t> pk0_vals{100, 100, 100, 101, 101, 101, 100, 100};
+  const std::vector<uint8_t> pk0_nulls{0, 0, 0, 0, 1, 0, 0, 0};
+  const std::vector<int64_t> v0{
+      std::bit_cast<int64_t>(2.5), std::bit_cast<int64_t>(9.0),
+      std::bit_cast<int64_t>(9.0), std::bit_cast<int64_t>(4.0),
+      std::bit_cast<int64_t>(9.0), std::bit_cast<int64_t>(1.5),
+      std::bit_cast<int64_t>(5.0), std::bit_cast<int64_t>(9.0),
+  };
+  const std::vector<uint8_t> n0{0, 0, 0, 0, 0, 1, 0, 0};
+  const std::vector<int64_t> v1{3, 9, 9, 5, 9, 7, 2, 9};
+  const std::vector<uint8_t> n1{0, 0, 0, 0, 0, 0, 0, 0};
+  // sel touches rows 0..7 (skips NULL jk[1], miss jk[2], NULL pk0[4],
+  // out-of-range jk[7]). Valid rows: 0 (gid 0, 2.5*3=7.5), 3 (gid 5, 4*5=20.0),
+  // 5 (gid 5, NULL -> all-NULL? wait add another row!), 6 (gid 0, 5*2=10.0).
+  const std::vector<uint32_t> sel{0, 1, 2, 3, 4, 6, 7, 5};
+  std::vector<uint32_t> out_tg(sel.size(), 0);
+  std::vector<double> out_v(sel.size(), 0.0);
+  std::array<uint32_t, 2> hist{0, 0};
+
+  // Empty count = 0 check.
+  EXPECT_EQ(ext_mul->Run(0, sel.data(), jk_vals.data(), jk_nulls.data(), 10,
+                         key_to_r.size(), key_to_r.data(), pk0_vals.data(),
+                         pk0_nulls.data(), 100, pk0_lut.size(), pk0_lut.data(),
+                         2, v0.data(), n0.data(), v1.data(), n1.data(), nullptr,
+                         nullptr, nullptr, nullptr, 1.0, out_tg.data(),
+                         out_v.data(), hist.data()),
+            0U);
+
+  const uint32_t m = ext_mul->Run(
+      static_cast<uint32_t>(sel.size()), sel.data(), jk_vals.data(),
+      jk_nulls.data(), 10, key_to_r.size(), key_to_r.data(), pk0_vals.data(),
+      pk0_nulls.data(), 100, pk0_lut.size(), pk0_lut.data(), 2, v0.data(),
+      n0.data(), v1.data(), n1.data(), nullptr, nullptr, nullptr, nullptr, 1.0,
+      out_tg.data(), out_v.data(), hist.data());
+  ASSERT_EQ(m, 4U);
+  EXPECT_EQ(hist[0], 2U);  // gid 0 twice
+  EXPECT_EQ(hist[1], 2U);  // gid 5 twice (one valid, one NULL)
+
+  std::array<std::vector<uint32_t>, 2> part_tg{std::vector<uint32_t>(hist[0]),
+                                               std::vector<uint32_t>(hist[1])};
+  std::array<std::vector<double>, 2> part_v{std::vector<double>(hist[0]),
+                                            std::vector<double>(hist[1])};
+  std::array<uint32_t*, 2> dst_gids{part_tg[0].data(), part_tg[1].data()};
+  std::array<double*, 2> dst_vals{part_v[0].data(), part_v[1].data()};
+  std::array<uint32_t, 2> dst_pos{0, 0};
+  scatter->Run(0, out_tg.data(), out_v.data(), dst_gids.data(), dst_vals.data(),
+               dst_pos.data());
+  scatter->Run(m, out_tg.data(), out_v.data(), dst_gids.data(), dst_vals.data(),
+               dst_pos.data());
+  EXPECT_EQ(dst_pos[0], hist[0]);
+  EXPECT_EQ(dst_pos[1], hist[1]);
+
+  // Verify accum on part 0 & part 1 plus all-NULL group lg=3.
+  for (size_t p = 0; p < 2; ++p) {
+    if (p == 1) {
+      // Inject an all-NULL tuple for local gid 3 (sign bit set).
+      part_tg[1].push_back(0x80000003U);
+      part_v[1].push_back(999.0);
+    }
+    std::array<double, 4> sums{};
+    std::array<uint64_t, 4> counts{};
+    uint64_t mb = 0;
+    uint64_t nb = 0;
+    uint8_t inf = 0;
+    accum_avg->Run(0, part_tg[p].data(), part_v[p].data(), sums.data(),
+                   counts.data(), &mb, &nb, &inf);
+    EXPECT_EQ(mb, 0ULL);
+    accum_avg->Run(static_cast<uint32_t>(part_tg[p].size()), part_tg[p].data(),
+                   part_v[p].data(), sums.data(), counts.data(), &mb, &nb,
+                   &inf);
+    if (p == 0) {
+      EXPECT_EQ(mb, 1ULL);
+      EXPECT_EQ(nb, 1ULL);
+      EXPECT_DOUBLE_EQ(sums[0], 17.5);
+      EXPECT_EQ(counts[0], 2ULL);
+    } else {
+      EXPECT_EQ(mb, (uint64_t{1} << 1U) | (uint64_t{1} << 3U));
+      EXPECT_EQ(nb, (uint64_t{1} << 1U));  // lg=3 was NULL-only -> nonnull=0
+      EXPECT_DOUBLE_EQ(sums[1], 20.0);
+      EXPECT_EQ(counts[1], 1ULL);
+    }
+  }
+
+  // Test kCoalesceMulZero: NULL value produces 0.0 and valid nonnull=1 bit!
+  const std::vector<int64_t> c_jk{10};
+  const std::vector<int64_t> c_pk{101};
+  const std::vector<int64_t> c_v0{std::bit_cast<int64_t>(9.5)};
+  const std::vector<uint8_t> c_n0{1};  // NULL!
+  const std::vector<int64_t> c_v1{4};
+  const std::vector<uint8_t> c_n1{0};
+  std::vector<uint32_t> c_tg(1);
+  std::vector<double> c_val(1);
+  std::array<uint32_t, 2> c_hist{0, 0};
+  ASSERT_EQ(
+      ext_coal->Run(1, nullptr, c_jk.data(), nullptr, 10, key_to_r.size(),
+                    key_to_r.data(), c_pk.data(), nullptr, 100, pk0_lut.size(),
+                    pk0_lut.data(), 2, c_v0.data(), c_n0.data(), c_v1.data(),
+                    c_n1.data(), nullptr, nullptr, nullptr, nullptr, 1.0,
+                    c_tg.data(), c_val.data(), c_hist.data()),
+      1U);
+  EXPECT_EQ(c_tg[0], 1U);  // sign bit NOT set for COALESCE
+  EXPECT_DOUBLE_EQ(c_val[0], 0.0);
+
+  // Test check_inf=true overflow detection (finite + finite -> +inf).
+  std::array<uint32_t, 2> inf_gids{2U, 2U};
+  std::array<double, 2> inf_vals{1e308, 1e308};
+  std::array<double, 4> inf_sums{};
+  uint64_t imb = 0;
+  uint64_t inb = 0;
+  uint8_t inf_flag = 0;
+  accum_inf->Run(2, inf_gids.data(), inf_vals.data(), inf_sums.data(), nullptr,
+                 &imb, &inb, &inf_flag);
+  EXPECT_EQ(inf_flag, 1U);
+  EXPECT_TRUE(std::isinf(inf_sums[2]));
+}
+
+TEST(JitTest, JitPacked2x32HashProbe_ProbeBloomAndBias) {
+  auto probe_nobias =
+      JitPacked2x32HashProbe::Compile(false, false, false, false);
+  auto probe_full = JitPacked2x32HashProbe::Compile(true, true, true, true);
+  if (!probe_nobias.has_value() || !probe_full.has_value()) {
+    GTEST_SKIP() << "JIT disabled";
+  }
+
+  constexpr size_t kHtCap = 16;
+  constexpr uint64_t kHtMask = kHtCap - 1;
+  constexpr size_t kBloomWords = 4;
+  constexpr uint64_t kBloomMask = kBloomWords - 1;
+  std::vector<uint64_t> ht_keys(kHtCap, 0);
+  std::vector<uint32_t> ht_heads(kHtCap, UINT32_MAX);
+  std::vector<uint64_t> bloom(kBloomWords, 0);
+
+  const auto pack_pair = [](int32_t a, int32_t b) noexcept -> uint64_t {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32U) |
+           static_cast<uint64_t>(static_cast<uint32_t>(b));
+  };
+  const std::vector<std::pair<int32_t, int32_t>> build_pairs{
+      {0, 0},
+      {-1, -1},
+      {std::numeric_limits<int32_t>::min(),
+       std::numeric_limits<int32_t>::max()},
+      {42, 7},
+  };
+  for (uint32_t bid = 0; bid < build_pairs.size(); ++bid) {
+    const uint64_t pk =
+        pack_pair(build_pairs[bid].first, build_pairs[bid].second);
+    const uint64_t h = HashPacked2x32Key(pk);
+    InsertPacked2x32Bloom(h, bloom.data(), kBloomMask);
+    size_t slot = static_cast<size_t>(h & kHtMask);
+    while (ht_heads[slot] != UINT32_MAX) {
+      slot = (slot + 1) & kHtMask;
+    }
+    ht_keys[slot] = pk;
+    ht_heads[slot] = bid;
+  }
+
+  // Test no-bias empty + hit/miss including boundary int32 keys & out-of-int32.
+  std::vector<uint32_t> out(8, 123);
+  probe_nobias->Probe(0, nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, 0,
+                      ht_keys.data(), ht_heads.data(), kHtMask, out.data());
+  EXPECT_EQ(out[0], 123U);
+
+  const std::vector<int64_t> p0{
+      0, -1, std::numeric_limits<int32_t>::min(), 42, int64_t{1} << 33, 99};
+  const std::vector<int64_t> p1{0, -1, std::numeric_limits<int32_t>::max(),
+                                7, 0,  99};
+  probe_nobias->Probe(static_cast<uint32_t>(p0.size()), p0.data(), nullptr,
+                      p1.data(), nullptr, 0, 0, nullptr, 0, ht_keys.data(),
+                      ht_heads.data(), kHtMask, out.data());
+  EXPECT_EQ(out[0], 0U);
+  EXPECT_EQ(out[1], 1U);
+  EXPECT_EQ(out[2], 2U);
+  EXPECT_EQ(out[3], 3U);
+  EXPECT_EQ(out[4], UINT32_MAX);
+  EXPECT_EQ(out[5], UINT32_MAX);
+
+  // Test nulls + bloom + bias (including signed int32/int64 bias + overflow).
+  const std::vector<int64_t> bp0{-10, -11, 32,
+                                 0,   0,   std::numeric_limits<int32_t>::max()};
+  const std::vector<uint8_t> bn0{0, 0, 0, 1, 0, 0};
+  const std::vector<int64_t> bp1{-5, -6, 2, 0, 0, 0};
+  const std::vector<uint8_t> bn1{0, 0, 0, 0, 1, 0};
+  // bias0 = +10, bias1 = +5 -> row 0 becomes (0,0), row 1 becomes (-1,-1),
+  // row 2 becomes (42,7), rows 3&4 are NULL, row 5 overflows int32 after bias!
+  std::vector<uint32_t> out_full(bp0.size(), 999);
+  probe_full->Probe(static_cast<uint32_t>(bp0.size()), bp0.data(), bn0.data(),
+                    bp1.data(), bn1.data(), 10, 5, bloom.data(), kBloomMask,
+                    ht_keys.data(), ht_heads.data(), kHtMask, out_full.data());
+  EXPECT_EQ(out_full[0], 0U);
+  EXPECT_EQ(out_full[1], 1U);
+  EXPECT_EQ(out_full[2], 3U);
+  EXPECT_EQ(out_full[3], UINT32_MAX);
+  EXPECT_EQ(out_full[4], UINT32_MAX);
+  EXPECT_EQ(out_full[5], UINT32_MAX);
+}
+
+TEST(JitTest, JitPacked2x32RadixDedup_PackScatterAndGrowResume) {
+  auto pack_nosel = JitPacked2x32RadixDedup::CompilePack(
+      /*has_null0=*/true, /*has_null1=*/true, /*use_sel=*/false,
+      /*part_shift=*/62);  // 4 partitions (0..3)
+  auto pack_sel = JitPacked2x32RadixDedup::CompilePack(
+      /*has_null0=*/false, /*has_null1=*/true, /*use_sel=*/true,
+      /*part_shift=*/62);
+  auto scatter = JitPacked2x32RadixDedup::CompileScatter(/*part_shift=*/62);
+  auto dedup = JitPacked2x32RadixDedup::CompileOpenAddrDedup();
+  if (!pack_nosel.has_value() || !pack_sel.has_value() ||
+      !scatter.has_value() || !dedup.has_value()) {
+    GTEST_SKIP() << "JIT disabled";
+  }
+
+  // Exercise duplicates, (0,0), (-1,-1), NULLs, and out-of-int32.
+  const std::vector<int64_t> k0{0,  -1, 0, 10, 11, 12, 13, 14, int64_t{1} << 40,
+                                -1, 10, 0};
+  const std::vector<uint8_t> n0{0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  const std::vector<int64_t> k1{0, -1, 5, 20, 21, 22, 23, 24, 9, -1, 20, 0};
+  const std::vector<uint8_t> n1{0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0};
+
+  std::vector<uint64_t> out_packed(k0.size());
+  std::array<uint32_t, 4> hist{};
+  std::vector<uint32_t> fb_rows(k0.size());
+  uint32_t packed_cnt = 99;
+  uint32_t fb_cnt = 99;
+
+  // Empty count = 0 check.
+  pack_nosel->Run(0, nullptr, k0.data(), n0.data(), k1.data(), n1.data(),
+                  out_packed.data(), hist.data(), fb_rows.data(), &packed_cnt,
+                  &fb_cnt);
+  EXPECT_EQ(packed_cnt, 0U);
+  EXPECT_EQ(fb_cnt, 0U);
+
+  pack_nosel->Run(static_cast<uint32_t>(k0.size()), nullptr, k0.data(),
+                  n0.data(), k1.data(), n1.data(), out_packed.data(),
+                  hist.data(), fb_rows.data(), &packed_cnt, &fb_cnt);
+  EXPECT_EQ(fb_cnt, 3U);  // rows 2 (n0), 5 (n1), 8 (out-of-int32)
+  EXPECT_EQ(fb_rows[0], 2U);
+  EXPECT_EQ(fb_rows[1], 5U);
+  EXPECT_EQ(fb_rows[2], 8U);
+  EXPECT_EQ(packed_cnt, 9U);
+  EXPECT_EQ(hist[0] + hist[1] + hist[2] + hist[3], packed_cnt);
+
+  // Selection vector run on non-null k0 rows {0, 1, 5, 10}.
+  const std::vector<uint32_t> sel{0, 1, 5, 10};
+  std::vector<uint64_t> sel_packed(sel.size());
+  std::array<uint32_t, 4> sel_hist{};
+  std::vector<uint32_t> sel_fb(sel.size());
+  uint32_t sel_pc = 0;
+  uint32_t sel_fc = 0;
+  pack_sel->Run(static_cast<uint32_t>(sel.size()), sel.data(), k0.data(),
+                nullptr, k1.data(), n1.data(), sel_packed.data(),
+                sel_hist.data(), sel_fb.data(), &sel_pc, &sel_fc);
+  EXPECT_EQ(sel_fc, 1U);
+  EXPECT_EQ(sel_fb[0], 5U);
+  EXPECT_EQ(sel_pc, 3U);
+
+  // Scatter into per-partition buffers, then dedup with forced grow/resume.
+  std::array<std::vector<uint64_t>, 4> parts;
+  std::array<uint64_t*, 4> dst_ptrs{};
+  std::array<uint32_t, 4> dst_pos{0, 0, 0, 0};
+  for (size_t p = 0; p < 4; ++p) {
+    parts[p].resize(hist[p]);
+    dst_ptrs[p] = parts[p].empty() ? nullptr : parts[p].data();
+  }
+  scatter->Run(packed_cnt, out_packed.data(), dst_ptrs.data(), dst_pos.data());
+  for (size_t p = 0; p < 4; ++p) {
+    EXPECT_EQ(dst_pos[p], hist[p]);
+  }
+
+  // Test DedupKernel::Run with tiny initial cap=4 (max_load=2) to force
+  // grow/resume.
+  std::vector<uint64_t> keys_all(out_packed.begin(),
+                                 out_packed.begin() + packed_cnt);
+  size_t ht_cap = 4;
+  std::vector<uint64_t> ht_keys(ht_cap, 0);
+  std::vector<uint32_t> ht_gens(ht_cap, 0);
+  uint32_t cur_gen = 1;
+  auto max_load = static_cast<uint32_t>((ht_cap * 7) / 10);  // 2
+  uint32_t n_occ = 0;
+  std::vector<int64_t> uk0(max_load);
+  std::vector<int64_t> uk1(max_load);
+  size_t off = 0;
+  size_t resizes = 0;
+  while (off < keys_all.size()) {
+    const uint32_t done =
+        dedup->Run(static_cast<uint32_t>(keys_all.size() - off),
+                   keys_all.data() + off, ht_keys.data(), ht_gens.data(),
+                   cur_gen, static_cast<uint64_t>(ht_cap - 1), max_load, &n_occ,
+                   uk0.data(), uk1.data());
+    off += done;
+    if (off < keys_all.size()) {
+      ++resizes;
+      ht_cap *= 2;
+      ht_keys.assign(ht_cap, 0);
+      ht_gens.assign(ht_cap, 0);
+      const uint64_t nmask = static_cast<uint64_t>(ht_cap - 1);
+      for (uint32_t j = 0; j < n_occ; ++j) {
+        const uint64_t pk =
+            (static_cast<uint64_t>(
+                 static_cast<uint32_t>(static_cast<int32_t>(uk0[j])))
+             << 32U) |
+            static_cast<uint64_t>(
+                static_cast<uint32_t>(static_cast<int32_t>(uk1[j])));
+        auto slot = static_cast<size_t>(HashPacked2x32Key(pk) & nmask);
+        while (ht_gens[slot] == cur_gen) {
+          slot = (slot + 1) & static_cast<size_t>(nmask);
+        }
+        ht_keys[slot] = pk;
+        ht_gens[slot] = cur_gen;
+      }
+      max_load = static_cast<uint32_t>((ht_cap * 7) / 10);
+      uk0.resize(max_load);
+      uk1.resize(max_load);
+    }
+  }
+  EXPECT_GE(resizes, 1U);
+  EXPECT_EQ(n_occ, 6U);  // {(0,0), (-1,-1), (10,20), (11,21), (13,23), (14,24)}
+}
+
+TEST(JitTest, JitRadixKeyDoubleAgg_AccumulateGrowAndInf) {
+  auto agg = JitRadixKeyDoubleAgg::Compile(/*check_inf=*/false);
+  auto agg_inf = JitRadixKeyDoubleAgg::Compile(/*check_inf=*/true);
+  if (!agg.has_value() || !agg_inf.has_value()) {
+    GTEST_SKIP() << "JIT disabled";
+  }
+
+  // Test valid + invalid tuples across 12 rows (more than prefetch tail 8)
+  // forcing table resize from ht_cap=4 (max_load=2).
+  const std::vector<uint64_t> in_keys{100, 200, 100, 300, 400, 500,
+                                      600, 200, 500, 700, 100, 600};
+  const std::vector<double> in_vals{1.5,  2.0, 2.5, 9.9, 0.5, 4.0,
+                                    99.0, 3.0, 1.0, 7.0, 6.0, 88.0};
+  const std::vector<uint8_t> in_valids{1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 0};
+
+  size_t cap = 4;
+  std::vector<uint64_t> ht_keys(cap, 0);
+  std::vector<double> ht_sums(cap, 0.0);
+  std::vector<uint64_t> ht_counts(cap, 0);
+  std::vector<uint32_t> ht_gens(cap, 0);
+  uint32_t cur_gen = 1;
+  auto max_load = static_cast<uint32_t>((cap * 7) / 10);  // 2
+  std::vector<uint32_t> occupied(max_load);
+  uint32_t n_occ = 0;
+
+  // Empty count = 0 check.
+  EXPECT_EQ(agg->Accumulate(0, in_keys.data(), in_vals.data(), in_valids.data(),
+                            ht_keys.data(), ht_sums.data(), ht_counts.data(),
+                            ht_gens.data(), nullptr, cur_gen,
+                            static_cast<uint64_t>(cap - 1), max_load,
+                            occupied.data(), &n_occ),
+            0U);
+
+  size_t off = 0;
+  size_t resizes = 0;
+  while (off < in_keys.size()) {
+    const uint32_t done = agg->Accumulate(
+        static_cast<uint32_t>(in_keys.size() - off), in_keys.data() + off,
+        in_vals.data() + off, in_valids.data() + off, ht_keys.data(),
+        ht_sums.data(), ht_counts.data(), ht_gens.data(), nullptr, cur_gen,
+        static_cast<uint64_t>(cap - 1), max_load, occupied.data(), &n_occ);
+    off += done;
+    if (off < in_keys.size()) {
+      ++resizes;
+      const size_t new_cap = cap * 2;
+      std::vector<uint64_t> nk(new_cap, 0);
+      std::vector<double> ns(new_cap, 0.0);
+      std::vector<uint64_t> nc(new_cap, 0);
+      std::vector<uint32_t> ng(new_cap, 0);
+      const auto nml = static_cast<uint32_t>((new_cap * 7) / 10);
+      std::vector<uint32_t> nocc(nml);
+      const size_t nmask = new_cap - 1;
+      for (uint32_t j = 0; j < n_occ; ++j) {
+        const uint32_t op = occupied[j];
+        const uint64_t k = ht_keys[op];
+        auto pos = static_cast<size_t>(HashPacked2x32Key(k)) & nmask;
+        while (ng[pos] == cur_gen) {
+          pos = (pos + 1) & nmask;
+        }
+        nk[pos] = k;
+        ns[pos] = ht_sums[op];
+        nc[pos] = ht_counts[op];
+        ng[pos] = cur_gen;
+        nocc[j] = static_cast<uint32_t>(pos);
+      }
+      ht_keys.swap(nk);
+      ht_sums.swap(ns);
+      ht_counts.swap(nc);
+      ht_gens.swap(ng);
+      occupied.swap(nocc);
+      cap = new_cap;
+      max_load = nml;
+    }
+  }
+  EXPECT_GE(resizes, 2U);
+  ASSERT_EQ(n_occ, 7U);
+
+  std::unordered_map<uint64_t, std::pair<double, uint64_t>> got;
+  for (uint32_t j = 0; j < n_occ; ++j) {
+    const uint32_t pos = occupied[j];
+    got[ht_keys[pos]] = {ht_sums[pos], ht_counts[pos]};
+  }
+  EXPECT_DOUBLE_EQ(got[100].first, 10.0);
+  EXPECT_EQ(got[100].second, 3ULL);
+  EXPECT_DOUBLE_EQ(got[200].first, 5.0);
+  EXPECT_EQ(got[200].second, 2ULL);
+  EXPECT_DOUBLE_EQ(got[300].first, 0.0);
+  EXPECT_EQ(got[300].second, 0ULL);  // valid=0 group created with count=0
+  EXPECT_DOUBLE_EQ(got[600].first, 0.0);
+  EXPECT_EQ(got[600].second, 0ULL);
+  EXPECT_DOUBLE_EQ(got[700].first, 7.0);
+  EXPECT_EQ(got[700].second, 1ULL);
+
+  // Generation reuse + check_inf=true overflow check.
+  ++cur_gen;
+  std::vector<uint8_t> ht_inf(cap, 0);
+  n_occ = 0;
+  occupied.resize(max_load);
+  const std::vector<uint64_t> inf_k{42, 42};
+  const std::vector<double> inf_v{1e308, 1e308};
+  const std::vector<uint8_t> inf_vld{1, 1};
+  ASSERT_EQ(agg_inf->Accumulate(2, inf_k.data(), inf_v.data(), inf_vld.data(),
+                                ht_keys.data(), ht_sums.data(),
+                                ht_counts.data(), ht_gens.data(), ht_inf.data(),
+                                cur_gen, static_cast<uint64_t>(cap - 1),
+                                max_load, occupied.data(), &n_occ),
+            2U);
+  ASSERT_EQ(n_occ, 1U);
+  EXPECT_EQ(ht_inf[occupied[0]], 1U);
+  EXPECT_TRUE(std::isinf(ht_sums[occupied[0]]));
 }
 
 }  // namespace tinylamb

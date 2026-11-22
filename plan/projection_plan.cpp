@@ -219,10 +219,14 @@ bool ProjectionPlan::IsOrderedBy(const std::vector<Expression>& expressions,
     if (expression && expression->Type() == TypeTag::kColumnValue) {
       const std::string& name =
           expression->AsColumnValue().GetColumnName().name;
+      bool matched = false;
       for (const NamedExpression& column : columns_) {
         if (column.name == name) {
+          if (matched) {
+            return false;
+          }
+          matched = true;
           translated = column.expression;
-          break;
         }
       }
     }
@@ -245,10 +249,14 @@ bool ProjectionPlan::IsOrderedBy(
     if (expression && expression->Type() == TypeTag::kColumnValue) {
       const std::string& name =
           expression->AsColumnValue().GetColumnName().name;
+      bool matched = false;
       for (const NamedExpression& column : columns_) {
         if (column.name == name) {
+          if (matched) {
+            return false;
+          }
+          matched = true;
           translated = column.expression;
-          break;
         }
       }
     }

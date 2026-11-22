@@ -184,8 +184,8 @@ class HashSemiReductionSqlTest : public ::testing::Test {
           std::pair{Value(), Value(int64_t{99})}}) {
       ASSERT_SUCCESS(probe.Insert(setup.txn_, Row({key, value})).GetStatus());
     }
-    // `build`: the huge fact on the BUILD side. Only 0..1 also live in `probe`,
-    // so the domain removes ~197 of the 200 rows.
+    // `build`: the fact on the BUILD side. Only keys 1 and 2 also occur in
+    // `probe`, so the domain removes 198 of the 200 rows.
     ASSIGN_OR_ASSERT_FAIL(
         Table, build,
         database_->CreateTable(
@@ -297,9 +297,9 @@ class HashSemiReductionSqlTest : public ::testing::Test {
 
 TEST_F(HashSemiReductionSqlTest, SemiJoinReducesTheHashBuildAndKeepsTheRows) {
   // `probe` is 5 rows and `build` is 200, so the build side shrinks to the
-  // distinct probe keys (1, 2, 9) plus nothing else. The semi output is
-  // unchanged: k=1 twice, k=2 once; k=9 has no build row and the NULL key never
-  // matches.
+  // distinct probe keys (1, 2, 300) plus nothing else. The semi output is
+  // unchanged: k=1 twice, k=2 once; k=300 has no build row and the NULL key
+  // never matches.
   std::vector<Row> rows;
   ASSERT_SUCCESS(
       Run("SELECT p.v FROM probe p WHERE p.k IN "

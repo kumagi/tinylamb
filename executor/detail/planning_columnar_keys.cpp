@@ -257,7 +257,7 @@ bool CanBorrowJoinKeys(const Relation& a, const Relation& b,
           continue;
         }
         // INTERVAL-tagged VARCHAR needs canonical interval equality (hash
-        // normalises it but BorrowedJoinKey::operator== compares raw bytes),
+        // normalizes it but BorrowedJoinKey::operator== compares raw bytes),
         // so keep such rows on the general join path.
         if (value.type != input.schema.GetColumn(columns[k]).Type() ||
             value.IsUnsigned() || value.IsCaseInsensitive() ||
@@ -420,7 +420,8 @@ void AppendMemcomparableValue(const Value& value, std::string* output) {
   }
 }
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
+// intentional
 static void EncodeJoinKeyIntoBuffer(const Row& row,
                                     const std::vector<slot_t>& columns,
                                     bool null_safe, bool fold_zero,

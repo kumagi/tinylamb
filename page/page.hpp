@@ -48,7 +48,11 @@ class Page {
     evicted_.store(false, std::memory_order_release);
     referenced_.store(false, std::memory_order_relaxed);
     // A reused Page object must not inherit the previous generation's
-    // eviction/accounting state.
+    // eviction/accounting state, nor a stale exclusive latch owner. Recovery
+    // and abort paths call PageInit without a PageRef, so a leftover thread
+    // id would make IsExclusivelyOwnedByCurrentThread() spuriously true and
+    // cause lock_page_if_needed to skip the content latch (data race).
+    exclusive_owner_.store(std::thread::id{}, std::memory_order_relaxed);
     in_eviction_queue_ = false;
     accounted_bytes_ = 0;
     accounted_emergency_bytes_ = 0;
@@ -83,7 +87,8 @@ class Page {
   [[nodiscard]] lsn_t PageLSN() const { return page_lsn_; }
   // LSN fields are read by checkpoint liveness snapshots (max_dirty_lsn).
   // Callers must hold the owning PageRef's latch while using these setters;
-  // the fields are deliberately plain (not atomic) and are not self-synchronized.
+  // the fields are deliberately plain (not atomic) and are not
+  // self-synchronized.
   void SetPageLSN(lsn_t new_lsn) { page_lsn_ = new_lsn; }
   void SetRecLSN(lsn_t new_lsn) {
     if (recovery_lsn_ == 0) {

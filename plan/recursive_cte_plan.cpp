@@ -2,6 +2,7 @@
 #include "plan/recursive_cte_plan.hpp"
 
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -31,6 +32,16 @@ TableStatistics MakeStats(const Schema& schema, size_t rows) {
   TableStatistics stats(schema);
   stats.Assign(rows, std::move(columns));
   return stats;
+}
+
+// Mirror EmitRowCount() so stats_ agrees with the saturated row estimate.
+size_t EstimatedRows(const Plan& child) {
+  constexpr size_t kMaxRows = std::numeric_limits<size_t>::max();
+  constexpr size_t kRecursionEstimate = 10;
+  const size_t anchor_rows = child ? child->EmitRowCount() : 1;
+  return anchor_rows > kMaxRows / kRecursionEstimate
+             ? kMaxRows
+             : anchor_rows * kRecursionEstimate;
 }
 
 Schema BuildRecursiveCteSchema(
@@ -71,7 +82,7 @@ RecursiveCtePlan::RecursiveCtePlan(Plan child, std::string cte_name,
       depth_spec_(std::move(depth_spec)),
       schema_(BuildRecursiveCteSchema(child_, cte_name_, body_, depth_spec_,
                                       std::move(schema))),
-      stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
+      stats_(MakeStats(schema_, EstimatedRows(child_))) {}
 
 RecursiveCtePlan::RecursiveCtePlan(Plan child, Plan recursive_child,
                                    std::string cte_name,
@@ -85,7 +96,7 @@ RecursiveCtePlan::RecursiveCtePlan(Plan child, Plan recursive_child,
       depth_spec_(std::move(depth_spec)),
       schema_(BuildRecursiveCteSchema(child_, cte_name_, body_, depth_spec_,
                                       std::move(schema))),
-      stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
+      stats_(MakeStats(schema_, EstimatedRows(child_))) {}
 
 void RecursiveCtePlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << "RecursiveCtePlan: ["

@@ -53,6 +53,14 @@ TEST(StatusOrTest, ConvertingValuesAndErrorsRemainDistinct) {
   EXPECT_EQ(SqlStateForStatus(Status::kConflicts), "40001");
   EXPECT_EQ(SqlStateForStatus(Status::kDuplicates), "23505");
   EXPECT_EQ(ToString(StatusCode::kQueryCanceled), "QueryCanceled");
+  // Exhaustiveness: the pins above fix each spelling, but only this range
+  // walk notices a NEW StatusCode -- it fails with "INVALID STATUS" until
+  // the enumerator gets a ToString case (and a spelling pin above).
+  for (uint32_t v = 0; v < static_cast<uint32_t>(StatusCode::kStatusCodeCount);
+       ++v) {
+    EXPECT_NE(ToString(static_cast<StatusCode>(v)), "INVALID STATUS")
+        << "StatusCode value " << v << " has no ToString case";
+  }
   EXPECT_EQ(SqlStateForStatus(Status::kQueryCanceled), "57014");
   EXPECT_EQ(SqlStateForStatus(Status::kQueryCanceled, "XX000"), "57014");
   // P2839: kNotImplemented is feature_not_supported, never a syntax error.

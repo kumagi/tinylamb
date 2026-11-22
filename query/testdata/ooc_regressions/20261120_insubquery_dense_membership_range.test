@@ -4,6 +4,7 @@
 -- LSTable blocks (seed 14, 91 rows expected, 73 returned).
 -- seed: 14
 -- profile: pool=131072 columnar=1048576 opmem=0 spill=0 temp=0 route=1
+-- failure: IN-subquery dense membership range undercount :: 91 rows expected, 73 returned
 create t1 1 7 1 2 11 1
 create t2 2 137 1 7 11 1
 ins_bulk t1 1 5078 555

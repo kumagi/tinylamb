@@ -27,7 +27,7 @@ std::atomic<std::thread::id> g_measuring_thread;
 inline void CountAllocationIfActive() {
   if (g_counting.load(std::memory_order_relaxed) &&
       std::this_thread::get_id() ==
-      g_measuring_thread.load(std::memory_order_relaxed)) {
+          g_measuring_thread.load(std::memory_order_relaxed)) {
     g_alloc_count.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -36,7 +36,8 @@ inline void CountAllocationIfActive() {
 
 void* operator new(std::size_t n) {
   CountAllocationIfActive();
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+  // intentional in this code
   void* p = std::malloc(n == 0 ? 1 : n);
   // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
   if (p == nullptr) {
@@ -64,28 +65,44 @@ void* operator new(std::size_t n, std::align_val_t a) {
 void* operator new[](std::size_t n, std::align_val_t a) {
   return operator new(n, a);
 }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
 void operator delete(void* p) noexcept { std::free(p); }
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
 void operator delete[](void* p) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
 void operator delete(void* p, std::size_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
-void operator delete[](void* p, std::size_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
-void operator delete(void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
-void operator delete[](void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-void operator delete(void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
+void operator delete[](void* p, std::size_t /*unused*/) noexcept {
+  std::free(p);
+}
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
+void operator delete(void* p, std::align_val_t /*unused*/) noexcept {
   std::free(p);
 }
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-void operator delete[](void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory) intentional in this code
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+// intentional in this code
+void operator delete[](void* p, std::align_val_t /*unused*/) noexcept {
+  std::free(p);
+}
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+void operator delete(void* p, std::size_t /*unused*/,
+                     std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+  // intentional in this code
+  std::free(p);
+}
+// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
+void operator delete[](void* p, std::size_t /*unused*/,
+                       std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+  // intentional in this code
   std::free(p);
 }
 
@@ -125,6 +142,16 @@ TEST(StringUtilTest,
   for (const auto* const value : {"", "abc", "%"}) {
     EXPECT_TRUE(all->Matches(value)) << value;
   }
+}
+
+TEST(StringUtilTest, EscapedLikeWildcardsRemainLiteral) {
+  EXPECT_FALSE(LiteralLikePattern::Compile("abc\\%"));
+  EXPECT_TRUE(EscapedLikeMatch("abc%", "abc\\%"));
+  EXPECT_FALSE(EscapedLikeMatch("abcxyz", "abc\\%"));
+  EXPECT_TRUE(EscapedLikeMatch("x_a", "%\\_a"));
+  EXPECT_FALSE(EscapedLikeMatch("xxa", "%\\_a"));
+  EXPECT_TRUE(EscapedLikeMatch("é%", "_\\%"));
+  EXPECT_TRUE(EscapedLikeMatch("a\\tail", "a\\\\%"));
 }
 
 TEST(StringUtilTest, AsciiCaseConversion) {
@@ -212,13 +239,14 @@ TEST(StringUtilTest, TrimCodePointsDoesNotAllocateForTypicalCutsets) {
   const std::string text = "  hello world, this string has some padding   ";
   const std::string_view ascii_cutset = " \t\n\r\f\v";
   // Warm up any lazy static init outside the window.
-  constexpr std::string_view trimmed = "hello world, this string has some padding";
+  constexpr std::string_view trimmed =
+      "hello world, this string has some padding";
   EXPECT_EQ(TrimCodePoints(text, ascii_cutset, true, true), trimmed);
   std::atomic<uint64_t> sink{0};
   const auto measure = [&](std::string_view cutset) {
     g_alloc_count.store(0, std::memory_order_relaxed);
     g_measuring_thread.store(std::this_thread::get_id(),
-                                  std::memory_order_relaxed);
+                             std::memory_order_relaxed);
     struct StopCountingOnExit {
       ~StopCountingOnExit() {
         g_counting.store(false, std::memory_order_seq_cst);
@@ -243,6 +271,13 @@ TEST(StringUtilTest, TrimCodePointsDoesNotAllocateForTypicalCutsets) {
 // start sequences under the old masking, so TRIM/LIKE consumed malformed
 // bytes as one character while the canonical validator (IsValidUtf8Text)
 // accepts only C2..DF / E0..EF / F0..F4 leads.  Same window now.
+TEST(StringUtilTest, Utf8ValidatorAcceptsLastTwoByteLead) {
+  EXPECT_TRUE(IsValidUtf8Text("\xDF\x80"));
+  EXPECT_TRUE(IsValidUtf8Text("\xDF\xBF"));
+  EXPECT_FALSE(IsValidUtf8Text("\xDF"));
+  EXPECT_FALSE(IsValidUtf8Text("\xDF\xC0"));
+}
+
 TEST(StringUtilTest, Utf8SequenceLengthMatchesValidatorWindow) {
   EXPECT_EQ(Utf8SequenceLength(0x00), 1U);
   EXPECT_EQ(Utf8SequenceLength(0x7F), 1U);

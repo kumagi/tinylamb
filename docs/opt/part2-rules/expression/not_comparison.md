@@ -27,7 +27,7 @@ graph TD
 
 ## 適用条件
 
-パターンは「単項否定演算子（`kNot`）の子ノードが任意の二項演算子」である構造を照合します。適用判定（guard）は以下の 2 段階で構成されます（`expression/rewrite.cpp`）。
+パターンは「単項否定演算子（`kNot`）の子ノードが任意の二項演算子」である構造を照合します。適用判定（guard）は比較演算子の判定に加え、順序比較ではスキーマ有無の確認と 3 種類の DOUBLE 可能性検査を組み合わせて構成されます（`expression/rewrite.cpp`）。
 
 ```cpp
           if (!IsComparison(operation)) {
@@ -38,17 +38,29 @@ graph TD
             case BinaryOperation::kEquals:
             case BinaryOperation::kNotEquals:
               break;
-            default:
+            default: {
+              if (ActiveRewriteSchema() == nullptr) {
+                return Expression{};
+              }
+              const Expression& bin = bindings.at("binary");
+              const Expression& left = bin->AsBinaryExpression().Left();
+              const Expression& right = bin->AsBinaryExpression().Right();
               if (StaticallyDouble(bindings.at("left")) ||
-                  StaticallyDouble(bindings.at("right"))) {
+                  StaticallyDouble(bindings.at("right")) ||
+                  SubtreeHasDoubleLiteral(left) ||
+                  SubtreeHasDoubleLiteral(right) ||
+                  (ActiveRewriteSchema() != nullptr &&
+                   (SideCanBeDouble(left, *ActiveRewriteSchema()) ||
+                    SideCanBeDouble(right, *ActiveRewriteSchema())))) {
                 return Expression{};
               }
               break;
+            }
           }
 ```
 
 1. **比較演算子判定**: 子ノードの演算子が `=`、`!=`、`<`、`<=`、`>`、`>=` の 6 種類の比較演算子（`IsComparison`）のいずれかであること。
-2. **IEEE 754 NaN 保護**: 等号・不等号（`=` / `!=`）を除く順序比較（`<`、`<=`、`>`、`>=`）の場合、左右の被演算子のいずれもが静的に確定した DOUBLE 型（`StaticallyDouble`）でないこと。
+2. **IEEE 754 NaN 保護**: 順序比較（`IsComparison` のうち `=` / `!=` 以外）では、まず `ActiveRewriteSchema() != nullptr` を要求します。さらに左右の被演算子について (a) `StaticallyDouble`（静的に DOUBLE 型と分かる場合）、(b) `SubtreeHasDoubleLiteral`（部分木に DOUBLE リテラルがある場合）、(c) `SideCanBeDouble`（スキーマに照らして DOUBLE になり得る列参照を含む場合）のいずれかが真なら変換しません。等号・不等号（`=` / `!=`）にはこのガードを適用しません。
 
 これらをすべて満たす場合のみ、演算子を反転させた比較式が返されます。
 
@@ -68,10 +80,8 @@ IEEE 754 規格および AST 参照実装において、NaN を含む順序比�
 
 一方、等号および不等号（`=` / `!=`）においては、$\text{NaN} = y$ は `FALSE`、$\text{NaN} \ne y$ は `TRUE` となるため、$\neg(\text{NaN} = y) \equiv (\text{NaN} \ne y)$ の同値関係が維持されます。したがって、ガード条件は順序比較にのみ課されます。
 
-### 3. スキーマ非依存リライタの残存課題と外部安全弁
-式書き換えエンジンはスキーマ情報を持たない純粋構文木上で動作するため、スキーマを参照しなければ型を決定できない列参照（例: `CAST` やリテラルを伴わない裸の列参照 `col_double`）は `StaticallyDouble` を通過してしまいます。
-
-この制約だけでは、スキーマを見なければ DOUBLE 型だと分からない列参照を判定できません。そのため、スキーマ情報を持つ上位層では `ContainsNotOfOrderedDoubleComparison` で式木内の順序比較を検査します。また、本 Rule を除いた Rule セット `NotComparisonFreeRules()` も提供しています。
+### 3. スキーマ非依存リライタと列参照の検査
+裸の列参照は構文だけでは DOUBLE 型か判定できず、`StaticallyDouble` だけでは見逃されます。現行の本 Rule 自身がその隙間を塞いでいます。すなわち順序比較では `ActiveRewriteSchema() == nullptr` なら不発火とし、スキーマが得られる場合は `SideCanBeDouble` で左右の部分木（裸の列参照を含む）が DOUBLE になり得るかを検査するため、`col_double` のような列参照は反転の対象から弾かれます。さらに上位層向けの安全弁として `ContainsNotOfOrderedDoubleComparison` と、本 Rule を除いた Rule セット `NotComparisonFreeRules()` も提供しています。
 
 ```cpp
 bool ContainsNotOfOrderedDoubleComparison(const Expression& expression,

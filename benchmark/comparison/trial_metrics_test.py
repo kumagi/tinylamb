@@ -33,5 +33,13 @@ class TrialMetricsTest(unittest.TestCase):
         self.assertEqual(result['deferred_replies_per_sync'],4)
         self.assertIsNone(result['own_wal_wait_ms_per_commit'])
 
+    def test_duplicate_timestamps_have_no_rate_window(self):
+        def sample(n):
+            return dict(time_ns=1_000_000_000,tasks=n,queue_ns=0,execution_ns=0,
+                wal_wait_ns=0,wal_wait_count=0,wal_sync_count=0,wal_sync_ns=0,
+                wal_buffered_bytes=0,pending_tasks=0,version_chains=0,
+                current_commit_ts=0,oldest_snapshot_ts=0)
+        self.assertIsNone(window_metrics([sample(0),sample(1)],0,1))
+
 
 if __name__ == '__main__': unittest.main()

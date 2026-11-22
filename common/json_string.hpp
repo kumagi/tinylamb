@@ -58,7 +58,9 @@ inline std::string EncodeJsonString(std::string_view text) {
   return out;
 }
 
-// Decode one complete JSON string, including UTF-16 escape pairs.
+// Decode one complete JSON string, including UTF-16 escape pairs. Escaped
+// U+0000 is valid JSON and is retained in the length-bearing result; a raw
+// control byte in the JSON text is rejected.
 inline std::optional<std::string> DecodeJsonString(std::string_view text) {
   if (text.size() < 2 || text.front() != '"' || text.back() != '"') {
     return std::nullopt;

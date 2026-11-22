@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tinylamb {
@@ -38,6 +39,13 @@ struct GriffinTrace {
   std::vector<std::string> statements;  // the executed session, in order
   std::string failure;                  // one-line summary of the mismatch
   bool ran_select = false;  // guards against vacuous, all-skipped sessions
+  // Number of statements executed when this trace was captured. A live
+  // failure truncates the shuffled session at the diverging statement, so
+  // replay compares this against statements.size() to reject a file whose
+  // trailing statements were silently trimmed (which would still pass a pure
+  // prefix check but no longer reproduce the failure). 0 = not recorded,
+  // i.e. a legacy trace for which the length check is skipped.
+  size_t executed_count = 0;
 
   bool operator==(const GriffinTrace&) const = default;
 };

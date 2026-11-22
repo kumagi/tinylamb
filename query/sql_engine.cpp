@@ -74,6 +74,7 @@
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/sql_udf.hpp"
+#include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "plan/cascades.hpp"
 #include "plan/empty_plan.hpp"
@@ -257,7 +258,7 @@ void SqlEngine::EnsureViewsRegistered(TransactionContext& ctx) {
       complete = false;
       continue;
     }
-    RegisterViewDefinition(name, *query);
+    RegisterViewDefinition(name, *query, text.Value());
   }
   // A transient catalog/parser failure must be retried even if no DDL changes
   // the epoch. Successful individual definitions may already be registered.
@@ -976,9 +977,10 @@ Executor RetainCompiledPlan(Executor executor, const CompiledPlanPtr& plan) {
   return std::make_shared<RetainedExecutor>(std::move(executor), plan);
 }
 
-// Times one SELECT replay. The first completion becomes the baseline. A later
-// completion that is both slower than 50ms and at least 8x that baseline
-// drops the thread-local plan so the next execution is planned again.
+// Times one SELECT replay. The first *successful* completion becomes the
+// baseline. A later successful completion that is both slower than 50ms and
+// at least 8x that baseline drops the thread-local plan so the next execution
+// is planned again.
 class TimedSelectReuse final : public ExecutorBase {
  public:
   TimedSelectReuse(const TimedSelectReuse&) = delete;
@@ -1015,6 +1017,12 @@ class TimedSelectReuse final : public ExecutorBase {
       return;
     }
     finished_ = true;
+    // rows == 0 is returned both at EOF and after FailWith. A replay that
+    // ended in error is not a timing sample: measure only successful runs so
+    // a transient spill/OOM error cannot retire an otherwise healthy plan.
+    if (inner_->GetStatus() != Status::kSuccess) {
+      return;
+    }
     const auto elapsed = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started_)
@@ -1107,8 +1115,7 @@ void RememberTemplate(const std::string& fingerprint,
                       std::unique_ptr<Statement> statement, uint64_t epoch) {
   // NOLINTNEXTLINE(modernize-use-designated-initializers) positional init is
   // clear
-  const CachedTemplate shared{  // NOLINT(modernize-use-designated-initializers)
-      // NOLINT(modernize-use-designated-initializers)
+  const CachedTemplate shared{
       std::shared_ptr<Statement>(std::move(
           statement)),  // NOLINT(modernize-use-designated-initializers)
       epoch, g_template_use_clock.fetch_add(1, std::memory_order_relaxed)};
@@ -1164,10 +1171,18 @@ std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint,
   }
   if (local_templates.size() >= kMaxCachedTemplates &&
       !local_templates.contains(fingerprint)) {
-    local_templates.erase(local_templates.begin());
+    // Match RememberTemplate: evict the least-recently-used entry, not an
+    // arbitrary unordered_map bucket head (which can be a hot template).
+    auto oldest = local_templates.begin();
+    for (auto it = std::next(oldest); it != local_templates.end(); ++it) {
+      if (it->second.last_used < oldest->second.last_used) {
+        oldest = it;
+      }
+    }
+    local_templates.erase(oldest);
   }
-  cached->second.last_used = g_template_use_clock.fetch_add(
-      1, std::memory_order_relaxed);
+  cached->second.last_used =
+      g_template_use_clock.fetch_add(1, std::memory_order_relaxed);
   local_templates.insert_or_assign(fingerprint, cached->second);
   return cached->second.statement;
 }
@@ -1348,7 +1363,8 @@ std::string_view SkipSqlQuoted(std::string_view sql, size_t& i) {
 }
 
 bool IsWordChar(char c) {
-  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';  // NOLINT(readability-implicit-bool-conversion)
+  return std::isalnum(static_cast<unsigned char>(c)) ||
+         c == '_';  // NOLINT(readability-implicit-bool-conversion)
 }
 
 // Matches the keyword `word` at pos (case-insensitive, word-bounded);
@@ -1376,7 +1392,8 @@ size_t MatchKeyword(std::string_view sql, size_t pos, std::string_view word) {
 // Skips whitespace and comments; returns the next significant position.
 size_t SkipBlanks(std::string_view sql, size_t pos) {
   while (pos < sql.size()) {
-    if (std::isspace(static_cast<unsigned char>(sql[pos]))) {  // NOLINT(readability-implicit-bool-conversion)
+    if (std::isspace(static_cast<unsigned char>(
+            sql[pos]))) {  // NOLINT(readability-implicit-bool-conversion)
       ++pos;
     } else if (sql.compare(pos, 2, "--") == 0) {
       pos = sql.find_first_of("\r\n", pos);
@@ -1438,12 +1455,16 @@ std::string OrderByOrdinalFingerprintSuffix(std::string_view sql) {
         end = SkipBlanks(sql, end);
         continue;
       }
-      if (std::isdigit(static_cast<unsigned char>(e)) &&  // NOLINT(readability-implicit-bool-conversion)
+      if (std::isdigit(static_cast<unsigned char>(
+              e)) &&  // NOLINT(readability-implicit-bool-conversion)
           (end == i || !IsWordChar(sql[end - 1])) &&
-          !(end > 0 && sql[end - 1] == '.')) {  // NOLINT(readability-simplify-boolean-expr)
+          !(end > 0 && sql[end - 1] ==
+                           '.')) {  // NOLINT(readability-simplify-boolean-expr)
         size_t digit_end = end;
-        while (digit_end < sql.size() &&
-               std::isdigit(static_cast<unsigned char>(sql[digit_end]))) {  // NOLINT(readability-implicit-bool-conversion)
+        while (
+            digit_end < sql.size() &&
+            std::isdigit(static_cast<unsigned char>(
+                sql[digit_end]))) {  // NOLINT(readability-implicit-bool-conversion)
           ++digit_end;
         }
         if (digit_end == sql.size() || !IsWordChar(sql[digit_end])) {
@@ -1486,6 +1507,71 @@ bool ContainsStructOrProtoKeyword(std::string_view sql) {
     ++i;
   }
   return false;
+}
+
+// True when SQL carries a FOR UPDATE clause outside quotes/comments. The two
+// keywords may be separated by any whitespace/comment run (newline, two
+// spaces, tab) and still parse, so a raw find("FOR UPDATE") lets those
+// spellings share a fingerprint with the plain kWait plan -- a kNoWait engine
+// would then replay a plan whose scan was compiled with blocking lock
+// acquisition baked in.
+bool ContainsForUpdateClause(std::string_view sql) {
+  size_t i = 0;
+  while (i < sql.size()) {
+    const char c = sql[i];
+    if (c == '\'' || c == '"' || c == '`') {
+      SkipSqlQuoted(sql, i);
+      continue;
+    }
+    if ((c == '-' && sql.compare(i, 2, "--") == 0) ||
+        (c == '/' && sql.compare(i, 2, "/*") == 0)) {
+      i = SkipBlanks(sql, i);
+      continue;
+    }
+    const size_t after_for = MatchKeyword(sql, i, "FOR");
+    if (after_for == std::string_view::npos) {
+      ++i;
+      continue;
+    }
+    if (MatchKeyword(sql, SkipBlanks(sql, after_for), "UPDATE") !=
+        std::string_view::npos) {
+      return true;
+    }
+    i = after_for;
+  }
+  return false;
+}
+
+// Returns the INT64 value of an ORDER BY item that is a constant integer.
+// GoogleSQL parses `-1` as UnaryExp(kMinus, IntLiteral(1)), so a bare
+// kConstantValue check misses negative ordinals and leaves a constant sort
+// key that silently orders nothing. Unwrap a constant unary minus so such
+// ordinals reach the existing range check and are rejected.
+std::optional<int64_t> ConstantIntegerOrdinal(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) {
+    return std::nullopt;
+  }
+  if (expression->Type() == TypeTag::kConstantValue) {
+    const Value& value = expression->AsConstantValue().GetValue();
+    if (value.type != ValueType::kInt64 || value.IsNull()) {
+      return std::nullopt;
+    }
+    return value.value.int_value;
+  }
+  if (expression->Type() == TypeTag::kUnaryExp) {
+    const auto& unary = expression->AsUnaryExpression();
+    const std::optional<int64_t> child = ConstantIntegerOrdinal(unary.Child());
+    if (!child.has_value() || unary.Op() != UnaryOperation::kMinus) {
+      return std::nullopt;
+    }
+    // Negating INT64_MIN is undefined; it is far outside any ordinal range.
+    if (*child == std::numeric_limits<int64_t>::min()) {
+      return std::nullopt;
+    }
+    return -*child;
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -1571,16 +1657,13 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   if (ContainsStructOrProtoKeyword(query_sql)) {
     templated.templatable = false;
   }
-  std::string upper_query(query_sql);
-  std::transform(
-      upper_query.begin(), upper_query.end(), upper_query.begin(),
-      [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
   // The FOR UPDATE wait policy is baked into the plan (it becomes the scan's
   // lock mode) and GoogleSQL has no syntax for it, so the policy joins the
   // fingerprint: a cached plan filled under kWait must never replay a blocking
-  // acquisition for a kNoWait engine.
+  // acquisition for a kNoWait engine. Detect the clause token-wise: FOR and
+  // UPDATE may be separated by any whitespace/comment run.
   if (for_update_wait_mode_ == ForUpdateWaitMode::kNoWait &&
-      upper_query.find("FOR UPDATE") != std::string::npos) {
+      ContainsForUpdateClause(query_sql)) {
     templated.fingerprint.append("\n-- for-update-nowait");
   }
   // Consult the compiled-plan cache before any parse/bind/plan
@@ -1588,8 +1671,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   // an audited immutable artifact under its exact fingerprint.
   // A transaction with staged catalog changes can see an index that other
   // transactions cannot use and that may disappear on rollback.
-  const bool use_compiled_cache =
-      !force_relational_fallback_ && !ctx.txn_.IsCatalogDirty();
+  const bool catalog_clean = !ctx.txn_.IsCatalogDirty();
+  const bool use_compiled_cache = !force_relational_fallback_ && catalog_clean;
   if (!explain && use_compiled_cache &&
       (templated.templatable || templated.parameters.empty())) {
     if (std::optional<Executor> served =
@@ -1602,7 +1685,11 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   // Read before any parse so a template is never stamped newer than the schema
   // it was parsed against.
   const uint64_t template_epoch = database_->SchemaEpoch();
-  if (templated.templatable) {
+  // A staged catalog change is as dangerous for the parsed-tree cache as for
+  // the compiled-plan cache: a tree bound to an uncommitted table/column can
+  // survive rollback and later resolve against a schema that no longer has
+  // it. Neither read nor fill a template while the txn's catalog is dirty.
+  if (templated.templatable && catalog_clean) {
     if (const std::shared_ptr<Statement> cached =
             FindTemplate(templated.fingerprint, template_epoch)) {
       if (auto rebound = BindStatementLiterals(*cached, templated.parameters);
@@ -1650,7 +1737,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     }
   }
   if (!explain && statement->Type() == StatementType::kSelect) {
-    const auto& select = static_cast<const SelectStatement&>(*statement);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& select = static_cast<const SelectStatement&>(
+        *statement);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto literal = [&](const auto& self,
                              const Expression& expression) -> bool {
       if (!expression) {
@@ -1681,19 +1769,26 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
                             });
   }
   if (explain) {
-    return ExecuteExplain(ctx, query_sql, *explain, std::move(statement));
+    // EXPLAIN ANALYZE drains the prepared executor too, so it needs the same
+    // statement-timeout wrapper as every other Prepare result (executors
+    // without their own per-batch timeout check would otherwise overrun).
+    return FinishPrepareWithTimeout(
+        ctx.txn_,
+        ExecuteExplain(ctx, query_sql, *explain, std::move(statement)),
+        &last_error_);
   }
 
   if (statement->Type() == StatementType::kUpdate &&
-      static_cast<const UpdateStatement&>(*statement).HasNestedDml()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+      static_cast<const UpdateStatement&>(*statement)
+          .HasNestedDml()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     // BindStatementLiterals walks SET/WHERE/NestedItems structurally while
     // Templatize extracts literals in text order: rebinding a nested-DML
     // template mis-binds the slots (the outer WHERE takes the first nested
     // constant), so keep such statements out of the template cache.
     templated.templatable = false;
   }
-  if (templated.templatable && !cache_hit && !force_relational_fallback_ &&
-      !IsExplicitZeroLimit(*statement)) {
+  if (templated.templatable && !cache_hit && catalog_clean &&
+      !force_relational_fallback_ && !IsExplicitZeroLimit(*statement)) {
     // Template caching is best-effort; a bind failure just means the
     // statement is parsed verbatim next time.
     if (auto rebound = BindStatementLiterals(*statement, templated.parameters);
@@ -1906,6 +2001,23 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
     combined = std::move(next_combined);
   }
 
+  // The operand types collected above are only the FIRST branch's
+  // declarations. SetOperationExecutor folds every operand to each column's
+  // common type (INT64+DOUBLE -> DOUBLE, numeric+STRING -> VARCHAR), so the
+  // rows in `combined` already carry the type actually emitted. Publish that
+  // type: pgwire builds RowDescription from result_column_types_, and claiming
+  // INT8 for a DOUBLE row makes typed clients misparse it. All non-NULL cells
+  // of one column share the folded type; NULLs keep the previous declaration
+  // ("unknown"), which is the documented meaning of kNull here.
+  for (const Row& row : combined) {
+    const size_t columns = std::min(output_types.size(), row.values_.size());
+    for (size_t column = 0; column < columns; ++column) {
+      const Value& value = row.values_[column];
+      if (!value.IsNull()) {
+        output_types[column] = value.type;
+      }
+    }
+  }
   // The recursive operand prepares above clobbered result_column_names_;
   // restore the outer statement's labels.  PostgreSQL derives set-operation
   // output names from the FIRST branch, and Execute() publishes this member
@@ -1925,26 +2037,25 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
     keys.reserve(select.OrderBy().size());
     for (const auto& term : select.OrderBy()) {
       Expression key = term.expression;
-      // GoogleSQL: an unsigned integer ORDER BY item sorts by the
-      // SELECT-list ordinal, not by the constant itself.  The combined
-      // schema carries the first branch's output names, so bind the key to
-      // that output column (a bare constant would encode identically for
-      // every row and the sort would silently do nothing).
-      if (key && key->Type() == TypeTag::kConstantValue) {
-        const Value& ordinal_value = key->AsConstantValue().GetValue();
-        if (ordinal_value.type == ValueType::kInt64 &&
-            !ordinal_value.IsNull() && ordinal_value.value.int_value >= 0) {
-          const auto ordinal =
-              static_cast<size_t>(ordinal_value.value.int_value);
-          if (ordinal < 1 || ordinal > output_names.size()) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "ORDER BY ordinal out of range");
-          }
-          // `ORDER BY 1 COLLATE 'und:ci'` collates the SELECT-list item, not
-          // the ordinal constant, so the clause survives the substitution.
-          key = ReapplyCollation(
-              ColumnValueExp(ColumnName(output_names[ordinal - 1])), key);
+      // GoogleSQL: an integer ORDER BY item sorts by the SELECT-list
+      // ordinal, not by the constant itself.  The combined schema carries
+      // the first branch's output names, so bind the key to that output
+      // column (a bare constant would encode identically for every row and
+      // the sort would silently do nothing). Negative values, including
+      // `-1` (a unary-minus expression), are rejected as out of range.
+      if (const std::optional<int64_t> ordinal_value =
+              ConstantIntegerOrdinal(key);
+          ordinal_value.has_value()) {
+        if (*ordinal_value < 1 ||
+            std::cmp_greater(*ordinal_value, output_names.size())) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "ORDER BY ordinal out of range");
         }
+        const auto ordinal = static_cast<size_t>(*ordinal_value);
+        // `ORDER BY 1 COLLATE 'und:ci'` collates the SELECT-list item, not
+        // the ordinal constant, so the clause survives the substitution.
+        key = ReapplyCollation(
+            ColumnValueExp(ColumnName(output_names[ordinal - 1])), key);
       }
       keys.push_back({std::move(key), term.ascending, term.nulls_first});
     }
@@ -2158,7 +2269,7 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     for (const Expression& child : ExpressionChildren(expression)) {
       rewritten.push_back(substitute_aliases(child));
     }
-    return WithExpressionChildren(expression, rewritten);
+    return WithExpressionChildren(expression, std::move(rewritten));
   };
   for (const Expression& expression : select.GroupBy()) {
     require(substitute_aliases(expression));
@@ -2680,7 +2791,8 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       }
 
       if (current_group == cascades::kInvalidGroup) {
-        const std::string rec_cte_tag = "rec_cte_" + std::to_string(rec_cte_idx++);
+        const std::string rec_cte_tag =
+            "rec_cte_" + std::to_string(rec_cte_idx++);
         current_group = memo.EnsureDerivedGroup(current_relations, rec_cte_tag);
         memo.AddExpression(
             current_group,
@@ -2697,7 +2809,8 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
                 .depth_spec = opt_depth,
             });
       } else {
-        const std::string rec_cte_tag = "rec_cte_" + std::to_string(rec_cte_idx++);
+        const std::string rec_cte_tag =
+            "rec_cte_" + std::to_string(rec_cte_idx++);
         const cascades::GroupId next_group =
             memo.EnsureDerivedGroup(current_relations, rec_cte_tag);
         memo.AddExpression(
@@ -3182,8 +3295,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       return ExecuteCreateTable(
           ctx, dynamic_cast<const CreateTableStatement&>(*statement));
     case StatementType::kInsert:
-      return ExecuteInsert(ctx,
-                           dynamic_cast<InsertStatement&>(*statement));
+      return ExecuteInsert(ctx, dynamic_cast<InsertStatement&>(*statement));
     case StatementType::kSelect: {
       auto* select_ptr = dynamic_cast<SelectStatement*>(statement.get());
       if (select_ptr == nullptr) {
@@ -3191,12 +3303,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         return Status::kUnknown;
       }
       return ExecuteSelect(
-          ctx, std::unique_ptr<SelectStatement>(
-                   static_cast<SelectStatement*>(statement.release())));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+          ctx,
+          std::unique_ptr<SelectStatement>(static_cast<SelectStatement*>(
+              statement
+                  .release())));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     }
     case StatementType::kUpdate:
-      return ExecuteUpdate(ctx,
-                           dynamic_cast<UpdateStatement&>(*statement));
+      return ExecuteUpdate(ctx, dynamic_cast<UpdateStatement&>(*statement));
     case StatementType::kMerge:
       return ExecuteMerge(ctx, dynamic_cast<const MergeStatement&>(*statement));
     case StatementType::kDelete:
@@ -3311,8 +3424,8 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     }
     if (DistributeZeroPaddedUnionGroupBy(select.get(), ctx)) {
       if (PullInnerJoinsBeforeLeftJoins(select.get(), ctx)) {
-      ++inner_prefix_pullups_;
-    }
+        ++inner_prefix_pullups_;
+      }
       dml_fold_applied_ = true;
       plan_cache_fingerprint_.clear();
       plan_cache_parameters_.clear();
@@ -3328,6 +3441,26 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
       plan_cache_parameters_.clear();
     }
     if (FoldSingletonPartitionRankToOne(select.get())) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewriteDistributeJoinOverUnionAll(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (PushTransitiveGroupedSubqueryDimSemiFilter(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewriteCorrelatedSelfAvgToWindow(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewriteScalarAggCrossJoinMerge(select.get(), ctx)) {
       dml_fold_applied_ = true;
       plan_cache_fingerprint_.clear();
       plan_cache_parameters_.clear();
@@ -3372,6 +3505,26 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
       plan_cache_fingerprint_.clear();
       plan_cache_parameters_.clear();
     }
+    if (RewriteHavingGlobalSumFubini(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewriteSelfJoinUniqueDimCorrelatedAgg(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewritePushOuterSemiJoinDomainIntoInSubquery(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewriteDisjunctiveLeftJoinCteKeyDomain(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
     if (PruneRedundantGroupByKeys(select.get())) {
       dml_fold_applied_ = true;
       plan_cache_fingerprint_.clear();
@@ -3397,8 +3550,8 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
         PushSharedGroupedCteKeyRestrictions(select.get(), ctx);
     if (DistributeZeroPaddedUnionGroupBy(select.get(), ctx)) {
       if (PullInnerJoinsBeforeLeftJoins(select.get(), ctx)) {
-      ++inner_prefix_pullups_;
-    }
+        ++inner_prefix_pullups_;
+      }
       post_inline_rewritten = true;
     }
     post_inline_rewritten |= DistributeDistinctUnionDimJoins(select.get(), ctx);
@@ -3409,6 +3562,8 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     post_inline_rewritten |= DeferUniqueDimJoinPastGroupBy(select.get(), ctx);
     post_inline_rewritten |=
         CollapseSharedUniqueDimAcrossJoinedSubqueries(select.get(), ctx);
+    post_inline_rewritten |=
+        RewriteDistributeGroupedSumOverUnionAll(select.get(), ctx);
     if (post_inline_rewritten) {
       dml_fold_applied_ = true;
       plan_cache_fingerprint_.clear();
@@ -3466,6 +3621,7 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     tpch_rewritten |= DecorrelateCorrelatedSumComparisons(select.get(), ctx);
     tpch_rewritten |=
         RewriteCorrelatedPositiveCountToInSubquery(select.get(), ctx);
+    tpch_rewritten |= RewriteHavingCountDistinctToMinMax(select.get(), ctx);
     tpch_rewritten |= SynthesizeTransitiveEquijoins(select.get(), ctx);
     tpch_rewritten |=
         DeferUniqueDimensionAttributesAfterTopN(select.get(), ctx);
@@ -4036,9 +4192,11 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
               type == AggregationType::kCount && aggregate.Child() != nullptr &&
               aggregate.Child()->Type() == TypeTag::kColumnValue &&
               !is_star_column(aggregate.Child());
-          if (!((!aggregate.Distinct() || single_column_count_distinct) &&  // NOLINT(readability-simplify-boolean-expr)
-                !aggregate.HasWhereFilter() && !aggregate.NeedsGroupContext() &&
-                supported_type && valid_child)) {
+          if (!((!aggregate.Distinct() ||
+                 single_column_count_distinct) &&  // NOLINT(readability-simplify-boolean-expr)
+                !aggregate.HasWhereFilter() &&
+                !aggregate.NeedsGroupContext() && supported_type &&
+                valid_child)) {
             return false;
           }
           scalar_aggs.push_back(&aggregate);
@@ -4056,9 +4214,8 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
       const auto table = ctx.GetTable(select->Sources()[0].table);
       const auto stats = ctx.GetStats(select->Sources()[0].table);
       const bool clean_tlcs =
-          table.HasValue() &&
-          relational_detail::ResolveCleanBackingTlcs(*table.Value(), ctx) !=
-              nullptr;
+          table.HasValue() && relational_detail::ResolveCleanBackingTlcs(
+                                  *table.Value(), ctx) != nullptr;
       const bool allow_simple_count_star =
           !simple_count_star ||
           (clean_tlcs && table.Value()->IndexCount() == 0 &&
@@ -4342,11 +4499,11 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
                 expanded.emplace_back(ColumnName(
                     relation, source_schema.GetColumn(i).Name().name));
               }
-              if (column.schema.empty() && sample_spec != nullptr &&
-                  sample_spec->with_weight) {
+              if (sample_spec != nullptr && sample_spec->with_weight) {
                 expanded.emplace_back(
                     sample_spec->weight_alias,
-                    ColumnValueExp(sample_spec->weight_alias));
+                    ColumnValueExp(
+                        ColumnName(relation, sample_spec->weight_alias)));
               }
               continue;
             }
@@ -4374,11 +4531,11 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
                                {ColumnValueExp(base),
                                 ConstantValueExp(Value(std::string(field)))}));
               }
-              if (column.schema.empty() && sample_spec != nullptr &&
-                  sample_spec->with_weight) {
+              if (sample_spec != nullptr && sample_spec->with_weight) {
                 expanded.emplace_back(
                     sample_spec->weight_alias,
-                    ColumnValueExp(sample_spec->weight_alias));
+                    ColumnValueExp(
+                        ColumnName(relation, sample_spec->weight_alias)));
               }
               continue;
             }
@@ -4391,10 +4548,10 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
                     relation, source_schema.GetColumn(i).Name().name));
               }
             }
-            if (column.schema.empty() && sample_spec != nullptr &&
-                sample_spec->with_weight) {
+            if (sample_spec != nullptr && sample_spec->with_weight) {
               expanded.emplace_back(sample_spec->weight_alias,
-                                    ColumnValueExp(sample_spec->weight_alias));
+                                    ColumnValueExp(ColumnName(
+                                        relation, sample_spec->weight_alias)));
             }
           }
           // Modifier names that matched no FROM relation would silently
@@ -4454,21 +4611,24 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     bool orders_changed = false;
     for (SelectStatement::OrderByTerm& order : resolved_orders) {
       const Expression& expression = order.expression;
-      if (!expression || expression->Type() != TypeTag::kConstantValue ||
-          dynamic_cast<const ParameterSlot*>(expression.get()) != nullptr) {
+      if (dynamic_cast<const ParameterSlot*>(expression.get()) != nullptr) {
         continue;
       }
-      const Value& ordinal_value = expression->AsConstantValue().GetValue();
-      if (ordinal_value.type != ValueType::kInt64 || ordinal_value.IsNull()) {
+      // `-1` parses as UnaryExp(kMinus, 1) rather than a ConstantValue, so
+      // recognize the constant unary form as an ordinal too and reject it
+      // instead of leaving a no-op sort key.
+      const std::optional<int64_t> ordinal_value =
+          ConstantIntegerOrdinal(expression);
+      if (!ordinal_value.has_value()) {
         continue;
       }
-      if (ordinal_value.value.int_value < 1) {
+      if (*ordinal_value < 1) {
         // A bare constant ordinal here would survive as a no-op sort key;
         // the visitor/relational paths reject it, so do the same here.
         last_error_ = "ORDER BY ordinal out of range";
         return Status::kInvalidArgument;
       }
-      const auto ordinal = static_cast<size_t>(ordinal_value.value.int_value);
+      const auto ordinal = static_cast<size_t>(*ordinal_value);
       const Expression& target = ordinal <= query.select_.size()
                                      ? query.select_[ordinal - 1].expression
                                      : nullptr;
@@ -4501,34 +4661,38 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     // unexpanded star; the list is expanded here, so swap the constant
     // for the ordinal's source expression and let the normal binding
     // below handle aliases and output naming.
-    if (order.expression &&
-        order.expression->Type() == TypeTag::kConstantValue) {
-      const Value& ordinal_value =
-          order.expression->AsConstantValue().GetValue();
-      if (ordinal_value.type == ValueType::kInt64 && !ordinal_value.IsNull() &&
-          ordinal_value.value.int_value >= 1) {
-        const auto ordinal = static_cast<size_t>(ordinal_value.value.int_value);
-        if (ordinal > query.select_.size() ||
-            !query.select_[ordinal - 1].expression) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "ORDER BY ordinal out of range");
-        }
-        // A COLLATE clause on the ordinal applies to the SELECT-list item
-        // it names, so it must survive the substitution.
-        order.expression = ReapplyCollation(
-            query.select_[ordinal - 1].expression, order.expression);
+    if (const std::optional<int64_t> ordinal_value =
+            ConstantIntegerOrdinal(order.expression);
+        ordinal_value.has_value() && *ordinal_value >= 1) {
+      const auto ordinal = static_cast<size_t>(*ordinal_value);
+      if (ordinal > query.select_.size() ||
+          !query.select_[ordinal - 1].expression) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ORDER BY ordinal out of range");
       }
+      // A COLLATE clause on the ordinal applies to the SELECT-list item
+      // it names, so it must survive the substitution.
+      order.expression = ReapplyCollation(query.select_[ordinal - 1].expression,
+                                          order.expression);
     } else if (const std::optional<CollatedOrdinal> collated =
                    AsCollatedOrdinal(order.expression);
-               collated.has_value() && collated->ordinal >= 1 &&
-               static_cast<size_t>(collated->ordinal) <= query.select_.size() &&
-               query.select_[static_cast<size_t>(collated->ordinal) - 1]
-                   .expression) {
+               collated.has_value()) {
       // `ORDER BY 1 COLLATE 'und:ci'`: the ordinal is a constant wrapped in
       // the collator, so it never looks like an ordinal above. Resolving
       // it here keeps the clause on the SELECT-list item it names —
       // leaving the constant in place would sort on a value every row
-      // shares and silently order nothing.
+      // shares and silently order nothing. An out-of-range collated
+      // ordinal gets the same error as the bare-integer form; without
+      // this check it degrades to a constant sort key on routes that
+      // never reach ApplyOrderBy's own ordinal validation.
+      const bool in_range =
+          collated->ordinal >= 1 &&
+          static_cast<size_t>(collated->ordinal) <= query.select_.size() &&
+          query.select_[static_cast<size_t>(collated->ordinal) - 1].expression;
+      if (!in_range) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ORDER BY ordinal out of range");
+      }
       order.expression = ApplyCollationSpec(
           query.select_[static_cast<size_t>(collated->ordinal) - 1].expression,
           collated->spec);
@@ -4735,11 +4899,11 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
       const int offset = scan_table->GetSchema().Offset(distinct_column);
       if (offset >= 0 && index_only->GetIndex().sc_.key_.front() ==
                              static_cast<slot_t>(offset)) {
-        std::vector<NamedExpression> select_items = index_only->SelectItems();
-        if (select_items.empty()) {
-          select_items.emplace_back(distinct_column.name,
-                                    ColumnValueExp(distinct_column));
-        }
+        // IndexOnlyScanPlan carries no projection of its own; synthesize the
+        // distinct key as the skip-scan output item.
+        std::vector<NamedExpression> select_items;
+        select_items.emplace_back(distinct_column.name,
+                                  ColumnValueExp(distinct_column));
         Executor skip_scan_executor = std::make_shared<SkipScanDistinct>(
             ctx.txn_, *scan_table, index_only->GetIndex(), std::vector<Value>{},
             std::vector<Value>{}, index_only->IsAscending(),

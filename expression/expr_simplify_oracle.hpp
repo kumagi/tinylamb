@@ -66,6 +66,10 @@ std::string CheckSimplifyEquivalence(const Expression& expr);
 // sign-insensitive), +inf == +inf, -inf == -inf; otherwise Value::operator==.
 // Doubles compare exactly: both sides run the same deterministic IEEE
 // arithmetic, so no epsilon is needed (and an epsilon would hide real bugs).
+// Exception (P561): +0.0 and -0.0 are NOT equal here -- their signbit is
+// compared explicitly. Unlike Value::operator== (which folds the sign), the
+// oracle checks rewrite equivalence at the bit level, so a rewrite such as
+// x*0 or 0-x that flips the sign of zero is correctly reported as a mismatch.
 [[nodiscard]] bool SimplifyValuesEqual(const Value& a, const Value& b);
 
 // Renders a reference value for trace files: NULL/nan/inf/-inf/integers/
